@@ -1,45 +1,42 @@
 #!/usr/bin/env python3
 """Run the backtest matrix strategy queue conservatively.
 
-Two cron sessions can call this script. A flock-held lock file guarantees that
-only one session runs at a time: acquisition is race-free (the kernel arbitrates
-the lock), and a lock belonging to a live process is never removed. If a session
-dies, the OS releases its flock and the next cron tick retakes the lock.
+Two cron sessions can call this script. A lock file guarantees that only one
+session runs at a time. If a session dies, the next cron tick retakes the lock.
 """
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO = Path(os.environ.get("TRADING_PLATFORM_REPO", "/home/ubuntu/Desktop/trading-platform"))
-VENV_PYTHON = Path(os.environ.get("PYTHON_BIN", REPO / ".venv" / "bin" / "python"))
-MATRIX_DIR = Path(os.environ.get("MATRIX_OUTPUT_DIR", "/mnt/block-volume-data/backtests/matrix_runner_v2"))
+from filelock import FileLock, Timeout
+
+REPO = Path(
+    os.environ.get("TRADING_PLATFORM_REPO", str(Path(__file__).resolve().parents[1]))
+)
+VENV_PYTHON = Path(os.environ.get("PYTHON_BIN", sys.executable))
+MATRIX_DIR = Path(
+    os.environ.get("MATRIX_OUTPUT_DIR", str(REPO / "data" / "backtests" / "matrix_runner_v2"))
+)
 STATE_PATH = MATRIX_DIR / "queue_state.json"
 LOCK_PATH = MATRIX_DIR / "queue.lock"
 MAX_WORKERS = os.environ.get("MATRIX_MAX_WORKERS", "2")
 TIMEOUT_SECONDS = os.environ.get("MATRIX_TIMEOUT_SECONDS", "3600")
 ENGINE = os.environ.get("MATRIX_ENGINE", "vectorbt")
 
-# Handle for the flock currently held by this process (None when unlocked).
 _LOCK_HANDLE = None
 
-sys.path.insert(0, str(REPO))
-# Ensure this script's own checkout wins over the hardcoded REPO default when the
-# script is executed from a different worktree (tests import it via importlib).
-_HERE = str(Path(__file__).resolve().parent.parent)
-if _HERE != str(REPO) and _HERE in sys.path:
-    sys.path.remove(_HERE)
-    sys.path.insert(0, _HERE)
-    sys.path.insert(1, str(REPO))
 
-from runner.agent_process import build_backtest_child_env
-from shared.strategy_registry import iter_strategy_files, strategy_slug_for_path  # noqa: E402
+def _ensure_repo_on_path() -> None:
+    repo = str(REPO)
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
 
 
 def now_iso() -> str:
@@ -47,6 +44,9 @@ def now_iso() -> str:
 
 
 def strategy_slugs() -> list[str]:
+    _ensure_repo_on_path()
+    from shared.strategy_registry import iter_strategy_files, strategy_slug_for_path
+
     slugs: list[str] = []
     for path in iter_strategy_files(REPO / "strategies"):
         if path.name.endswith("_context.py"):
@@ -77,9 +77,12 @@ def save_state(state: dict) -> None:
 
 def any_matrix_process_running() -> bool:
     """Liveness probe (diagnostics only — never used for lock decisions)."""
+    pgrep = shutil.which("pgrep")
+    if pgrep is None:
+        return False
     try:
         proc = subprocess.run(
-            ["pgrep", "-f", r"python.*runner\.cli matrix"],
+            [pgrep, "-f", r"python.*runner\.cli matrix"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -91,57 +94,32 @@ def any_matrix_process_running() -> bool:
 
 
 def acquire_lock() -> bool:
-    """Take the queue lock for this process.
-
-    The lock is an exclusive ``flock`` on ``queue.lock``: the kernel arbitrates
-    acquisition, so there is no check-then-create race and no mtime/TTL
-    heuristic. A lock held by a live process is never deleted; a file left
-    behind by a crashed writer is simply re-locked (its owner died, so the OS
-    released the flock) and its timestamp refreshed.
-    """
+    """Take the queue lock for this process."""
     MATRIX_DIR.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(LOCK_PATH))
     try:
-        lock_handle = LOCK_PATH.open("a+", encoding="utf-8")
+        lock.acquire(timeout=0)
+        LOCK_PATH.write_text(now_iso() + "\n", encoding="utf-8")
+    except Timeout:
+        return False
     except OSError:
-        return False
-
-    try:
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            lock_handle.close()
-            return False
-
-        lock_handle.seek(0)
-        lock_handle.truncate()
-        lock_handle.write(now_iso() + "\n")
-        lock_handle.flush()
-        # Keep the handle open for the lifetime of the lock: closing it would
-        # release the flock.
-        global _LOCK_HANDLE
-        _LOCK_HANDLE = lock_handle
-        return True
-    except Exception:
         with contextlib.suppress(Exception):
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        with contextlib.suppress(Exception):
-            lock_handle.close()
+            lock.release()
         return False
+    global _LOCK_HANDLE
+    _LOCK_HANDLE = lock
+    return True
 
 
 def release_lock() -> None:
     """Release the queue lock held by this process, if any."""
     global _LOCK_HANDLE
-    handle = _LOCK_HANDLE
-    if handle is None:
+    lock = _LOCK_HANDLE
+    if lock is None:
         return
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
+        lock.release()
     finally:
-        with contextlib.suppress(Exception):
-            handle.close()
         _LOCK_HANDLE = None
 
 
@@ -159,8 +137,15 @@ def refresh_strategy_states(state: dict) -> None:
     rows = []
     for slug in strategy_slugs():
         summary = grid_summary(slug)
-        existing = next((row for row in state.get("strategies", []) if row.get("strategy") == slug), {})
-        trades = len(list((MATRIX_DIR / slug).glob("*.trades.json"))) if (MATRIX_DIR / slug).exists() else 0
+        existing = next(
+            (row for row in state.get("strategies", []) if row.get("strategy") == slug),
+            {},
+        )
+        trades = (
+            len(list((MATRIX_DIR / slug).glob("*.trades.json")))
+            if (MATRIX_DIR / slug).exists()
+            else 0
+        )
         if summary and not summary.get("load_error"):
             status = "done" if summary.get("failed", 0) == 0 else "failed"
             row = {
@@ -206,11 +191,17 @@ def next_pending_strategy(state: dict) -> str | None:
     candidates = [r for r in state.get("strategies", []) if r.get("status") in priority]
     if not candidates:
         return None
-    return min(candidates, key=lambda r: (priority[r.get("status")], r.get("strategy", "")))["strategy"]
+    return min(
+        candidates,
+        key=lambda r: (priority[r.get("status")], r.get("strategy", "")),
+    )["strategy"]
 
 
 def run_strategy(slug: str) -> dict:
     """Run one strategy matrix cell in a subprocess and return its result payload."""
+    _ensure_repo_on_path()
+    from runner.agent_process import build_backtest_child_env
+
     cmd = [
         str(VENV_PYTHON),
         "-m",
@@ -242,9 +233,15 @@ def run_strategy(slug: str) -> dict:
         )
         output_tail = proc.stdout[-8000:] if proc.stdout else ""
         summary = grid_summary(slug)
+        completed = (
+            proc.returncode == 0
+            and bool(summary)
+            and not summary.get("load_error")
+            and summary.get("failed", 0) == 0
+        )
         return {
             "strategy": slug,
-            "status": "done" if proc.returncode == 0 and summary and not summary.get("load_error") and summary.get("failed", 0) == 0 else "failed",
+            "status": "done" if completed else "failed",
             "returncode": proc.returncode,
             "started_at": started,
             "finished_at": now_iso(),
@@ -309,12 +306,20 @@ def render_state(state: dict) -> str:
     trades = sum(int(r.get("trades", 0)) for r in rows)
     cells_ok = sum(int(r.get("ok", 0)) for r in rows)
     cells_total = sum(int(r.get("requested", 0)) for r in rows)
+    current = (
+        state.get("current_strategy")
+        or (state.get("last_run") or {}).get("strategy")
+        or "none"
+    )
     lines = [
         "🧭 Backtest Matrix Queue",
         f"Output: `{MATRIX_DIR}`",
-        f"Strategy progress: `{done}/{len(rows)}` done · failed `{failed}` · partial `{partial}` · pending `{pending}`",
+        (
+            f"Strategy progress: `{done}/{len(rows)}` done · failed `{failed}` · "
+            f"partial `{partial}` · pending `{pending}`"
+        ),
         f"Cells: `{cells_ok}/{cells_total}` ok · Trade JSONs: `{trades}`",
-        f"Current/last: `{state.get('current_strategy') or (state.get('last_run') or {}).get('strategy') or 'none'}`",
+        f"Current/last: `{current}`",
         "",
         "Strategies:",
     ]

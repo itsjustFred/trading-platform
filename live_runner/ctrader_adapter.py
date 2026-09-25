@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
-import fcntl
 import math
 import os
 import tempfile
@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
+
+from filelock import FileLock
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
@@ -369,31 +371,35 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
         )
     target = Path(resolved)
     lock_path = target.with_name(f"{target.name}.lock")
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
-            seen: set[str] = set()
-            for index, line in enumerate(lines):
-                key, separator, _value = line.partition("=")
-                if not separator or key not in updates:
-                    continue
-                lines[index] = f"{key}={updates[key]}"
-                seen.add(key)
-            for key, value in updates.items():
-                if key not in seen:
-                    lines.append(f"{key}={value}")
+    with FileLock(str(lock_path)):
+        lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+        seen: set[str] = set()
+        for index, line in enumerate(lines):
+            key, separator, _value = line.partition("=")
+            if not separator or key not in updates:
+                continue
+            lines[index] = f"{key}={updates[key]}"
+            seen.add(key)
+        for key, value in updates.items():
+            if key not in seen:
+                lines.append(f"{key}={value}")
 
-            tmp_fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-            )
-            tmp_path = Path(tmp_name)
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_handle:
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            tmp_handle = os.fdopen(tmp_fd, "w", encoding="utf-8")
+            tmp_fd = -1
+            with tmp_handle:
                 tmp_handle.write("\n".join(lines) + "\n")
             tmp_path.chmod(0o600)
             os.replace(tmp_path, target)
         finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            if tmp_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(tmp_fd)
+            tmp_path.unlink(missing_ok=True)
 
 
 def _write_env_key(path: Path, key: str, value: str) -> None:

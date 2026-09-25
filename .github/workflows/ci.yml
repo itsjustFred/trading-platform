@@ -1,34 +1,82 @@
-# B3: minimal CI — pytest + ruff on every push/PR.
 name: ci
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  python:
+    name: Python ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install uv
-        # Pinned (Sonar: no unlocked installs); uv ships wheels only.
-        run: pip install "uv==0.10.4"
-      - name: Sync dependencies
-        # All extras: the suite imports optional engines (vectorbt, lean,
-        # ctrader, …) unconditionally; a subset install fails collection.
+        run: python -m pip install uv==0.10.4
+      - name: Validate lockfile
+        run: uv lock --check
+      - name: Install locked dependencies
         run: uv sync --frozen --all-extras
-      # Advisory until the legacy debt is cleared (1144 pre-existing
-      # findings on main): new code is held to ruff-parity with main in
-      # review instead of a repo-wide gate that can never pass.
+      - name: Validate generated requirements
+        run: uv run --no-sync python scripts/check_requirements_drift.py
+      - name: Lint packaging and import seams
+        if: runner.os == 'Linux'
+        run: >-
+          uv run --no-sync ruff check
+          live_runner/__init__.py
+          live_runner/account_discovery.py
+          live_runner/ctrader_adapter.py
+          scripts/sync_requirements_from_lock.py
+          scripts/check_requirements_drift.py
+          scripts/matrix_queue_runner.py
+          scripts/verify_ctrader_order.py
+          scripts/wheel_smoke.py
+          tests/test_packaging.py
       - name: Lint (advisory)
         continue-on-error: true
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
       - name: Tests
-        run: uv run pytest -q -p no:cacheprovider -m "not slow" --ignore=tests/strategies
+        if: runner.os == 'Linux'
+        run: >-
+          uv run --no-sync pytest -q -p no:cacheprovider -m "not slow"
+          --ignore=tests/strategies
       - name: Strategy tests
-        run: uv run pytest -q -p no:cacheprovider tests/strategies
+        if: runner.os == 'Linux'
+        run: uv run --no-sync pytest -q -p no:cacheprovider tests/strategies
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist --no-create-gitignore
+      - name: Wheel and import smoke
+        run: uv run --no-sync python scripts/wheel_smoke.py
+
+  frontend:
+    name: Frontend focused checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Frontend test lint
+        run: npx eslint tests/optimizationEvidence.test.ts
+      - name: Frontend focused tests
+        run: npm run test:optimization-evidence

@@ -11,25 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Discovery uses raw TLS sockets and must not install or mutate a process-wide
-# Twisted reactor at import time. The live adapter bootstraps its asyncio reactor
-# lazily against the running event loop before importing OpenApiPy's Client.
-from ctrader_open_api import Protobuf
-from ctrader_open_api.messages import OpenApiMessages_pb2 as _OpenApiMessages_pb2
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoHeartbeatEvent, ProtoMessage
-from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-    ProtoOAAccountAuthReq,
-    ProtoOAAccountAuthRes,
-    ProtoOAApplicationAuthReq,
-    ProtoOAApplicationAuthRes,
-    ProtoOAErrorRes,
-    ProtoOAGetAccountListByAccessTokenReq,
-    ProtoOAGetAccountListByAccessTokenRes,
-    ProtoOATraderReq,
-    ProtoOATraderRes,
-)
-from google.protobuf.json_format import MessageToDict
-
 from live_runner.alpaca_adapter import (
     _alpaca_acc_indexes,
     _alpaca_credential_block,
@@ -46,12 +27,91 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
-_PROTO_OA_CTID_TRADER_ACCOUNT_REQ: Any = getattr(
-    _OpenApiMessages_pb2, "ProtoOACtidTraderAccountReq", None
-)
-_PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = getattr(
-    _OpenApiMessages_pb2, "ProtoOACtidTraderAccountRes", None
-)
+
+
+class CTraderUnavailableError(RuntimeError):
+    pass
+
+
+CTRADER_UNAVAILABLE_STATUS = "unavailable"
+_Protobuf: Any = None
+_OpenApiMessages_pb2: Any = None
+_ProtoHeartbeatEvent: Any = None
+_ProtoMessage: Any = None
+_ProtoOAAccountAuthReq: Any = None
+_ProtoOAAccountAuthRes: Any = None
+_ProtoOAApplicationAuthReq: Any = None
+_ProtoOAApplicationAuthRes: Any = None
+_ProtoOAErrorRes: Any = None
+_ProtoOAGetAccountListByAccessTokenReq: Any = None
+_ProtoOAGetAccountListByAccessTokenRes: Any = None
+_ProtoOATraderReq: Any = None
+_ProtoOATraderRes: Any = None
+_PROTO_OA_CTID_TRADER_ACCOUNT_REQ: Any = None
+_PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = None
+
+
+def _load_ctrader_protocol() -> None:
+    global _OpenApiMessages_pb2
+    global _ProtoHeartbeatEvent
+    global _ProtoMessage
+    global _ProtoOAAccountAuthReq
+    global _ProtoOAAccountAuthRes
+    global _ProtoOAApplicationAuthReq
+    global _ProtoOAApplicationAuthRes
+    global _ProtoOAErrorRes
+    global _ProtoOAGetAccountListByAccessTokenReq
+    global _ProtoOAGetAccountListByAccessTokenRes
+    global _ProtoOATraderReq
+    global _ProtoOATraderRes
+    global _PROTO_OA_CTID_TRADER_ACCOUNT_REQ
+    global _PROTO_OA_CTID_TRADER_ACCOUNT_RES
+    global _Protobuf
+    if _Protobuf is not None:
+        return
+    try:
+        from ctrader_open_api import Protobuf
+        from ctrader_open_api.messages import OpenApiMessages_pb2
+        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
+            ProtoHeartbeatEvent,
+            ProtoMessage,
+        )
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAAccountAuthReq,
+            ProtoOAAccountAuthRes,
+            ProtoOAApplicationAuthReq,
+            ProtoOAApplicationAuthRes,
+            ProtoOAErrorRes,
+            ProtoOAGetAccountListByAccessTokenReq,
+            ProtoOAGetAccountListByAccessTokenRes,
+            ProtoOATraderReq,
+            ProtoOATraderRes,
+        )
+    except ImportError as exc:
+        raise CTraderUnavailableError(
+            "cTrader account discovery requires the optional ctrader extra."
+        ) from exc
+    _Protobuf = Protobuf
+    _OpenApiMessages_pb2 = OpenApiMessages_pb2
+    _ProtoHeartbeatEvent = ProtoHeartbeatEvent
+    _ProtoMessage = ProtoMessage
+    _ProtoOAAccountAuthReq = ProtoOAAccountAuthReq
+    _ProtoOAAccountAuthRes = ProtoOAAccountAuthRes
+    _ProtoOAApplicationAuthReq = ProtoOAApplicationAuthReq
+    _ProtoOAApplicationAuthRes = ProtoOAApplicationAuthRes
+    _ProtoOAErrorRes = ProtoOAErrorRes
+    _ProtoOAGetAccountListByAccessTokenReq = ProtoOAGetAccountListByAccessTokenReq
+    _ProtoOAGetAccountListByAccessTokenRes = ProtoOAGetAccountListByAccessTokenRes
+    _ProtoOATraderReq = ProtoOATraderReq
+    _ProtoOATraderRes = ProtoOATraderRes
+    _PROTO_OA_CTID_TRADER_ACCOUNT_REQ = getattr(
+        OpenApiMessages_pb2, "ProtoOACtidTraderAccountReq", None
+    )
+    _PROTO_OA_CTID_TRADER_ACCOUNT_RES = getattr(
+        OpenApiMessages_pb2, "ProtoOACtidTraderAccountRes", None
+    )
+
+
 _CTRADER_ACCOUNT_NAME_FIELDS = (
     "name",
     "accountName",
@@ -340,6 +400,8 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
         return {}
     if hasattr(message, "DESCRIPTOR"):
         try:
+            from google.protobuf.json_format import MessageToDict
+
             payload = MessageToDict(
                 message,
                 preserving_proto_field_name=True,
@@ -376,7 +438,8 @@ def _ctrader_recv_exact(sock_obj: ssl.SSLSocket, size: int) -> bytes:
 
 
 def _ctrader_send_message(sock_obj: ssl.SSLSocket, message: Any, client_msg_id: str) -> None:
-    envelope = ProtoMessage(
+    _load_ctrader_protocol()
+    envelope = _ProtoMessage(
         payloadType=int(message.payloadType),
         payload=message.SerializeToString(),
         clientMsgId=client_msg_id,
@@ -388,8 +451,9 @@ def _ctrader_send_message(sock_obj: ssl.SSLSocket, message: Any, client_msg_id: 
 def _ctrader_wait_response(
     sock_obj: ssl.SSLSocket, client_msg_id: str, timeout_seconds: float
 ) -> Any:
+    _load_ctrader_protocol()
     deadline = time.time() + timeout_seconds
-    heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
+    heartbeat_payload_type = _ProtoHeartbeatEvent().payloadType
 
     while True:
         remaining = deadline - time.time()
@@ -398,18 +462,18 @@ def _ctrader_wait_response(
         sock_obj.settimeout(remaining)
         frame_size = struct.unpack(">I", _ctrader_recv_exact(sock_obj, 4))[0]
         frame_payload = _ctrader_recv_exact(sock_obj, frame_size)
-        envelope = ProtoMessage()
+        envelope = _ProtoMessage()
         envelope.ParseFromString(frame_payload)
 
         if envelope.payloadType == heartbeat_payload_type:
-            heartbeat = ProtoHeartbeatEvent()
+            heartbeat = _ProtoHeartbeatEvent()
             _ctrader_send_message(sock_obj, heartbeat, "")
             continue
 
-        payload = Protobuf.extract(envelope)
+        payload = _Protobuf.extract(envelope)
         if envelope.clientMsgId != client_msg_id:
             continue
-        if isinstance(payload, ProtoOAErrorRes):
+        if isinstance(payload, _ProtoOAErrorRes):
             raise RuntimeError(f"{payload.errorCode}: {payload.description}")
         return payload
 
@@ -420,13 +484,13 @@ def _authenticate_ctrader_application(
     app_id: str,
     app_secret: str,
 ) -> None:
-    app_auth_req = ProtoOAApplicationAuthReq()
+    app_auth_req = _ProtoOAApplicationAuthReq()
     app_auth_req.clientId = app_id
     app_auth_req.clientSecret = app_secret
     app_auth_client_msg_id = str(uuid.uuid4())
     _ctrader_send_message(sock, app_auth_req, app_auth_client_msg_id)
     app_auth_res = _ctrader_wait_response(sock, app_auth_client_msg_id, 20)
-    if not isinstance(app_auth_res, ProtoOAApplicationAuthRes):
+    if not isinstance(app_auth_res, _ProtoOAApplicationAuthRes):
         raise RuntimeError(f"Unexpected application auth response: {type(app_auth_res).__name__}")
 
 
@@ -435,12 +499,12 @@ def _request_ctrader_account_list(
     *,
     access_token: str,
 ) -> Any:
-    list_req = ProtoOAGetAccountListByAccessTokenReq()
+    list_req = _ProtoOAGetAccountListByAccessTokenReq()
     list_req.accessToken = access_token
     list_client_msg_id = str(uuid.uuid4())
     _ctrader_send_message(sock, list_req, list_client_msg_id)
     list_res = _ctrader_wait_response(sock, list_client_msg_id, 20)
-    if not isinstance(list_res, ProtoOAGetAccountListByAccessTokenRes):
+    if not isinstance(list_res, _ProtoOAGetAccountListByAccessTokenRes):
         raise RuntimeError(f"Unexpected account list response: {type(list_res).__name__}")
     return list_res
 
@@ -592,21 +656,22 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
 
 
 def _load_ctrader_trader_details(ctx: _CtraderAccountContext, account_id: int) -> None:
-    account_auth_req = ProtoOAAccountAuthReq()
+    _load_ctrader_protocol()
+    account_auth_req = _ProtoOAAccountAuthReq()
     account_auth_req.ctidTraderAccountId = account_id
     account_auth_req.accessToken = ctx.access_token
     account_auth_client_msg_id = str(uuid.uuid4())
     _ctrader_send_message(ctx.sock, account_auth_req, account_auth_client_msg_id)
     account_auth_res = _ctrader_wait_response(ctx.sock, account_auth_client_msg_id, 20)
-    if not isinstance(account_auth_res, ProtoOAAccountAuthRes):
+    if not isinstance(account_auth_res, _ProtoOAAccountAuthRes):
         raise RuntimeError(f"Unexpected account auth response: {type(account_auth_res).__name__}")
 
-    trader_req = ProtoOATraderReq()
+    trader_req = _ProtoOATraderReq()
     trader_req.ctidTraderAccountId = account_id
     trader_client_msg_id = str(uuid.uuid4())
     _ctrader_send_message(ctx.sock, trader_req, trader_client_msg_id)
     trader_res = _ctrader_wait_response(ctx.sock, trader_client_msg_id, 20)
-    if not isinstance(trader_res, ProtoOATraderRes):
+    if not isinstance(trader_res, _ProtoOATraderRes):
         return
     logger.debug(
         "Resolved cTrader trader payload",
@@ -757,6 +822,7 @@ async def discover_ctrader_accounts(
     access_token = access_token.strip()
     if not app_id or not app_secret or not access_token:
         return []
+    _load_ctrader_protocol()
 
     hosts = ["demo.ctraderapi.com", "live.ctraderapi.com"]
     by_id: dict[str, LiveAccount] = {}
@@ -774,8 +840,16 @@ async def discover_ctrader_accounts(
             error_text = repr(exc)
             if _is_expected_ctrader_host_route_error(error_text):
                 logger.info(
-                    "cTrader account discovery unavailable on host; skipping environment-incompatible endpoint",
-                    extra={"data": {"host": host, "error": error_text}},
+                    "cTrader account discovery unavailable on host; "
+                    "skipping environment-incompatible endpoint",
+                    extra={
+                        "data": {
+                            "broker": "ctrader",
+                            "status": CTRADER_UNAVAILABLE_STATUS,
+                            "host": host,
+                            "error": error_text,
+                        }
+                    },
                 )
             else:
                 logger.warning(
@@ -813,6 +887,17 @@ async def discover_configured_accounts(
             )
             for account in ctrader_accounts:
                 discovered_accounts[(account.broker, account.id)] = account
+        except CTraderUnavailableError as exc:
+            logger.warning(
+                "cTrader account discovery unavailable",
+                extra={
+                    "data": {
+                        "broker": "ctrader",
+                        "status": CTRADER_UNAVAILABLE_STATUS,
+                        "error": str(exc),
+                    }
+                },
+            )
         except Exception as exc:
             logger.warning(
                 "Skipping cTrader account discovery because of runtime error",

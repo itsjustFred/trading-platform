@@ -45,6 +45,8 @@ Thumbs.db
 .env.*
 !*.env.example
 .accounts.env
+/live_deployments.yaml
+/reports/
 live_integration_report.json
 live_smoke_*.json
 docs/reports/live_daemon_*.log
