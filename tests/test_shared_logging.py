@@ -114,6 +114,24 @@ def test_redact_value_handles_camel_case_sensitive_keys():
     assert redacted == {"apiKey": "[Filtered]", "refreshToken": "[Filtered]"}
 
 
+def test_redact_value_filters_sensitive_keys_with_innocuous_values():
+    from shared.logging import redact_value
+
+    redacted = redact_value(
+        {
+            "Authorization": "opaque-value",
+            "apiKey": "opaque-value",
+            "password": "opaque-value",
+        }
+    )
+
+    assert redacted == {
+        "Authorization": "[Filtered]",
+        "apiKey": "[Filtered]",
+        "password": "[Filtered]",
+    }
+
+
 def test_redact_text_handles_secret_key_and_authorization_values():
     from shared.logging import redact_text
 

@@ -44,6 +44,25 @@ test("partial maintenance deletion failures are surfaced as errors", () => {
   assert.match(result.message, /1 failed/);
 });
 
+test("maintenance deletion notices use item statuses over a conflicting reported count", () => {
+  const underreported = formatMaintenanceDeletionResult("backtest(s)", 0, [
+    deletionItem("one", "deleted"),
+  ]);
+  const overreported = formatMaintenanceDeletionResult("backtest(s)", 2, [
+    deletionItem("one", "deleted"),
+    deletionItem("two", "failed"),
+  ]);
+
+  assert.deepEqual(underreported, {
+    message: "Deleted 1 backtest(s).",
+    tone: "success",
+  });
+  assert.deepEqual(overreported, {
+    message: "Deleted 1 backtest(s); 1 failed.",
+    tone: "error",
+  });
+});
+
 test("maintenance cleanup pending is never reported as success", () => {
   const partial = formatMaintenanceDeletionResult("backtest(s)", 1, [
     deletionItem("one", "deleted"),
