@@ -56,7 +56,7 @@ class _DummyEngine:
                 EquityPoint(time="2024-01-01T00:00:00+00:00", equity=config.initial_capital),
                 EquityPoint(time="2024-02-01T00:00:00+00:00", equity=config.initial_capital * 1.05),
             ],
-            stats={"engine_metric": 99},
+            stats={"engine_metric": 99, "total_pnl": -1.0},
         )
 
 
@@ -88,6 +88,7 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["meta"]["parameters"] == {"window": 20}
     assert payload["stats"]["engine_metric"] == 99
+    assert payload["stats"]["total_pnl"] == 5000.0
     assert payload["stats"]["cagr"] > 0
     assert payload["stats"]["total_return"] == 0.05
 

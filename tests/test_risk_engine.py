@@ -56,6 +56,36 @@ def test_calculate_position_size_normal_case():
     assert sized.decision.metadata["stop_source"] == "signal"
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("account_balance", math.nan),
+        ("pip_value", math.nan),
+        ("current_exposure", math.nan),
+    ],
+)
+def test_calculate_position_size_rejects_non_finite_inputs(
+    field_name: str, value: float
+) -> None:
+    sizing_inputs = {
+        "account_balance": 10_000.0,
+        "pip_value": 1.0,
+        "current_exposure": 0.0,
+    }
+    sizing_inputs[field_name] = value
+    signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        timeframe="1h",
+    )
+
+    with pytest.raises(ValueError, match=f"{field_name} must be finite"):
+        RiskEngine().calculate_position_size(signal=signal, **sizing_inputs)
+
+
 def test_calculate_position_size_notional_cap_respects_entry_price():
     """The cap converts notional into quantity at the signal's own entry price."""
     engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
