@@ -79,9 +79,9 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 - Das Erzwingen passiert **einmal pro Stop-Transition**. Wird eine Deployment
   erneut `ACTIVE` und danach wieder `STOPPED`, wird erneut storniert und
   glattgestellt.
-- Kann ein Adapter eine Aktion nicht (Alpaca kann beides, cTrader derzeit keines
-  von beiden), meldet der Daemon einen Fehler und markiert die Deployment
-  **nicht** als erzwungen. Sie wird im nächsten Sync erneut versucht. Eine
+- Kann ein Adapter eine Aktion nicht (beide unterstützten sie inzwischen, aber ein
+  künftiger Broker oder ein cTrader-Fehlerfall kann es), meldet der Daemon einen
+  Fehler und markiert die Deployment **nicht** als erzwungen. Sie wird im nächsten Sync erneut versucht. Eine
   Deployment wird also nie als "gestoppt/flat" gemeldet, wenn der Broker nicht
   tatsächlich flach gestellt wurde.
 

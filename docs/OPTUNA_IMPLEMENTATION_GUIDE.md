@@ -600,12 +600,16 @@ trusted.
 ```
 
 - `embargo_pct` (default `0.0`, max `0.4`) drops a gap between the train and test
-  windows. A trade opened just before the split can close inside the test window,
-  so its label is partly test information; without a gap that leaks backwards into
-  training. The gap is also reported in bars via the context timeframe.
-- `walk_forward_splits` (default `3`) reports repeated sequential folds, so a
-  result is not a single lucky split. Folds never overlap and never train on an
-  earlier fold's test window.
+  windows **and is applied to the windows that actually run**: `run_optimization`
+  forwards it into `_split_backtest_period`, so no trial ever sees data across the
+  gap. A trade opened just before the split can close inside the test window, so
+  its label is partly test information; without the gap that leaks backwards into
+  training. The gap is additionally reported in bars via the context timeframe.
+- `walk_forward_splits` (default `3`) is **report-only**. The repeated sequential
+  folds are computed and published as a robustness diagnostic, but the selected
+  parameters still come from the single train/test split above; the backtest is
+  not re-run per fold. Folds never overlap and never train on an earlier fold's
+  test window.
 - `plateau.is_plateau` is false when only the winning parameter scores within
   `tolerance` of the best. A lone spike is the classic overfitting signature.
 - `multiple_testing.survives_selection_bias` compares the observed metric with

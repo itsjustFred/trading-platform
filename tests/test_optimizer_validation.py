@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 import math
 from pathlib import Path
 
@@ -202,7 +203,7 @@ class TestNoTradeTrialsCannotWin:
         )
         monkeypatch.setattr(
             optimizer_module, "_split_backtest_period",
-            lambda s, e, pct: (
+            lambda s, e, pct, embargo_pct=0.0: (
                 {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
@@ -413,3 +414,124 @@ class TestBestTrialExcludesNoTrade:
         )
         best = optimizer_module._best_trial_or_raise(study)
         assert best.value == pytest.approx(0.5)
+
+
+# ─── embargo is applied to the windows that actually run ────────────────────
+
+
+def test_split_period_applies_an_embargo_gap():
+    """The embargo must move the real test start, not only be reported."""
+    import pandas as pd
+    import runner.optimizer as opt
+
+    train, test = opt._split_backtest_period(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        0.7,
+        embargo_pct=0.1,
+    )
+    train_end = pd.Timestamp(train["end"])
+    test_start = pd.Timestamp(test["start"])
+    assert test_start > train_end
+    # 10-day window, 10% embargo => about a day of dead time.
+    assert (test_start - train_end) == pytest.approx(
+        pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1)
+    )
+
+
+def test_split_period_without_embargo_stays_contiguous():
+    import pandas as pd
+    import runner.optimizer as opt
+
+    train, test = opt._split_backtest_period(
+        "2024-01-01T00:00:00+00:00", "2024-01-11T00:00:00+00:00", 0.7
+    )
+    assert pd.Timestamp(test["start"]) - pd.Timestamp(train["end"]) == pytest.approx(
+        pd.Timedelta(microseconds=1), abs=pd.Timedelta(seconds=1)
+    )
+
+
+def test_split_period_rejects_an_embargo_that_eats_the_test_window():
+    import runner.optimizer as opt
+
+    with pytest.raises(ValueError, match="empty train or test period"):
+        opt._split_backtest_period(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            0.9,
+            embargo_pct=0.5,
+        )
+
+
+def test_split_period_rejects_a_negative_embargo():
+    import runner.optimizer as opt
+
+    with pytest.raises(ValueError, match="must not be negative"):
+        opt._split_backtest_period(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            0.7,
+            embargo_pct=-0.1,
+        )
+
+
+def test_reported_split_geometry_matches_the_applied_split():
+    """The diagnostics must describe the windows that actually ran.
+
+    Previously the embargo was applied only in the report, so the payload
+    described a dead gap that the optimizer never used.
+    """
+    import pandas as pd
+    import runner.optimizer as opt
+    from types import SimpleNamespace
+
+    config = opt.OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=2,
+        train_split_pct=0.7,
+        embargo_pct=0.1,
+        walk_forward_splits=2,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 3}},
+    )
+    train, test = opt._split_backtest_period(
+        "2024-01-01T00:00:00+00:00",
+        "2024-07-01T00:00:00+00:00",
+        config.train_split_pct,
+        embargo_pct=config.embargo_pct,
+    )
+    payload = opt._build_diagnostics_payload(
+        trials=[SimpleNamespace(params={"window": 2}, value=1.0)],
+        config=config,
+        train_period=train,
+        test_period=test,
+        target_metric="sharpe_ratio",
+    )
+    reported_gap = pd.Timestamp(payload["split"]["test"]["start"]) - pd.Timestamp(
+        payload["split"]["train"]["end"]
+    )
+    assert reported_gap > pd.Timedelta(0), (
+        "the reported embargo must be a real gap, not a contiguous boundary"
+    )
+    # The reported train/test boundaries must match the applied ones.
+    assert payload["split"]["train"]["start"] == train["start"]
+    assert payload["split"]["test"]["end"] == test["end"]
+
+
+def test_run_optimization_forwards_the_configured_embargo():
+    """Wiring guard: `run_optimization` must forward `config.embargo_pct`.
+
+    Testing `_split_backtest_period` alone does not cover this: the bug it
+    guards against was that the function applied an embargo correctly while the
+    caller never passed the configured value, so the optimizer ran contiguous
+    windows and the diagnostics described a gap that did not exist.
+    """
+    import inspect
+
+    source = inspect.getsource(optimizer_module.run_optimization)
+    call = re.search(r"_split_backtest_period\((.*?)\)\s*\n", source, re.S)
+    assert call is not None, "run_optimization no longer calls _split_backtest_period"
+    assert "embargo_pct" in call.group(1), (
+        "run_optimization must pass embargo_pct into _split_backtest_period; "
+        "without it the embargo is never applied to the windows that run"
+    )

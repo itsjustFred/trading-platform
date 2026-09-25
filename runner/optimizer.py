@@ -325,6 +325,7 @@ def run_optimization(
         backtest_start,
         backtest_end,
         config.train_split_pct,
+        embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
     )
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
@@ -759,7 +760,19 @@ def _split_backtest_period(
     start_value: str,
     end_value: str,
     train_split_pct: float,
+    embargo_pct: float = 0.0,
 ) -> tuple[dict[str, str], dict[str, str]]:
+    """Split into train / embargo-gap / test windows.
+
+    ``embargo_pct`` drops a gap between the two windows. A trade opened just
+    before the split can still be open during the test window, so its label
+    contains test information; without the gap that leaks backwards into
+    training. The gap is applied here, to the windows that actually run, rather
+    than only being reported by the diagnostics.
+    """
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
     start_ts = _parse_period_boundary(start_value, is_end=False)
     end_ts = _parse_period_boundary(end_value, is_end=True)
     if end_ts <= start_ts:
@@ -777,10 +790,12 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
-    test_start_ts = split_ts + pd.Timedelta(microseconds=1)
+    embargo_duration = (end_ts - start_ts) * embargo_pct
+    test_start_ts = split_ts + embargo_duration + pd.Timedelta(microseconds=1)
     if split_ts <= start_ts or test_start_ts >= end_ts:
         raise ValueError(
-            "train_split_pct produces an empty train or test period for the base backtest range"
+            "train_split_pct/embargo_pct produce an empty train or test period "
+            "for the base backtest range"
         )
 
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
