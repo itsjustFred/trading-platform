@@ -346,3 +346,51 @@ def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
     )
     assert report["status"] != "failed", f"regular weekly data must not fail: {report}"
     assert not report["gaps"], f"regular weekly data must report no gaps: {report}"
+
+
+def test_nominal_days_scales_by_the_numeric_prefix():
+    """`4w` bars are four weeks apart and `5m` bars are five minutes apart.
+
+    Ignoring the prefix sized the allowed hole against the wrong spacing, so a
+    4-week series would be judged against a 3-day threshold.
+    """
+    from data_tools.auto_download import timeframe_nominal_days
+
+    assert timeframe_nominal_days("4w") == 28.0
+    assert timeframe_nominal_days("1w") == 7.0
+    assert timeframe_nominal_days("3mo") == 90.0
+    assert timeframe_nominal_days("1mo") == 30.0
+    assert timeframe_nominal_days("5m") == pytest.approx(5 / 1440)
+    assert timeframe_nominal_days("4h") == pytest.approx(4 / 24)
+    assert timeframe_nominal_days("2d") == 2.0
+    # Unparseable input falls back to daily rather than raising.
+    assert timeframe_nominal_days("nonsense") == 1.0
+    assert timeframe_nominal_days("") == 1.0
+
+
+def test_multi_week_timeframes_get_a_wider_gap_threshold():
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    assert scaled_gap_threshold_days("4w", 1) == 84.0
+    assert scaled_gap_threshold_days("2w", 1) == 42.0
+
+
+def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
+    """With no timeframe there is no spacing to scale against.
+
+    Widening anyway would only hide real holes, so the floor is kept.
+    """
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    # 2 days apart with no timeframe given: must still be reported. Scaling
+    # would raise the bar to 3 days and hide it.
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "custom.parquet",
+        pd.date_range("2024-01-01", periods=12, freq="2D", tz="UTC"),
+    )
+    gaps = find_internal_gaps(symbol_dir, None)
+    assert gaps and gaps[0]["gap_days"] == pytest.approx(2.0), (
+        f"a 2-day hole must be reported when no timeframe is known: {gaps}"
+    )

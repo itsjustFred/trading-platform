@@ -346,6 +346,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOADealStatus: Any = None
         self._ProtoOAPositionStatus: Any = None
         self._ProtoOAOrderType: Any = None
+        self._ProtoOAOrderStatus: Any = None
         self._ProtoOATradeSide: Any = None
         self._ProtoOAExecutionType: Any = None
         self._ProtoOATimeInForce: Any = None
@@ -390,6 +391,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
                 ProtoOAExecutionType,
+                ProtoOAOrderStatus,
                 ProtoOAOrderType,
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
@@ -430,6 +432,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOADealStatus = ProtoOADealStatus
         self._ProtoOAPositionStatus = ProtoOAPositionStatus
         self._ProtoOAOrderType = ProtoOAOrderType
+        self._ProtoOAOrderStatus = ProtoOAOrderStatus
         self._ProtoOATradeSide = ProtoOATradeSide
         self._ProtoOAExecutionType = ProtoOAExecutionType
         self._ProtoOATimeInForce = ProtoOATimeInForce
@@ -1737,12 +1740,33 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._ProtoOAOrderType.STOP_LIMIT,
             self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
         }
+        # A filled or already-cancelled order must not be sent for cancellation:
+        # cTrader rejects it, and because that rejection propagates it would
+        # abort the loop and leave the *other* orders resting. Only ACCEPTED
+        # orders are working; anything else is already terminal.
+        #
+        # If the status enum is unavailable we cannot tell, and the unsafe
+        # direction is leaving an order resting, so we cancel on type alone.
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        working_statuses: set[int] | None = None
+        if status_enum is not None:
+            working_statuses = {int(status_enum.ORDER_STATUS_ACCEPTED)}
         cancelled = 0
         # ProtoOAOrderListRes names the repeated field `order`, not `orders`.
         for order in getattr(order_list_res, "order", []) or []:
             order_type = int(getattr(order, "orderType", 0) or 0)
             if order_type not in cancellable:
                 continue
+            # Newer protos expose `orderStatus`; older ones only `status`.
+            raw_status = getattr(order, "orderStatus", None)
+            if raw_status is None:
+                raw_status = getattr(order, "status", None)
+            if working_statuses is not None and raw_status is not None:
+                try:
+                    if int(raw_status) not in working_statuses:
+                        continue
+                except (TypeError, ValueError):
+                    continue
             # orderId is a protobuf int64: assigning the string form raises
             # TypeError on the wire, so coerce and skip anything unparseable.
             try:

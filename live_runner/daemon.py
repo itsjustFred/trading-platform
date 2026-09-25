@@ -1093,22 +1093,29 @@ def _deployment_service_name(deployment: LiveDeploymentConfig) -> str:
 def _resolve_account_discord_token(
     accounts_env_values: Mapping[str, str],
     deployment: LiveDeploymentConfig,
-) -> str:
+) -> tuple[str, str]:
+    """Return the deployment's Discord token and the key it came from.
+
+    The source key matters as much as the token: a token found under a per-bot
+    key is configured with that bot's auth scheme, while one falling back to the
+    global ``DISCORD_BOT_TOKEN`` is configured with the global scheme. Sending a
+    per-bot scheme with a global token is a 401.
+    """
     service_name = _deployment_service_name(deployment)
     token_env_key = ""
     if service_name:
         canonical_name = discord_bot_env_canonical_name(service_name)
         token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
-    discord_token = ""
     if token_env_key:
         _resolved = str(accounts_env_values.get(token_env_key) or "").strip()
         if not _resolved:
             _resolved = str(os.environ.get(token_env_key, "")).strip()
         if _resolved:
-            discord_token = _resolved
-    if not discord_token:
-        discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
-    return discord_token
+            return _resolved, token_env_key
+    global_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+    if global_token:
+        return global_token, "DISCORD_BOT_TOKEN"
+    return "", ""
 
 
 def _resolve_account_discord_credentials(
@@ -1123,10 +1130,24 @@ def _resolve_account_discord_credentials(
     `Bot` header for an account token and got a 401. Returning both from one
     place makes that split unrepresentable.
     """
-    service_name = _deployment_service_name(deployment)
-    return (
-        _resolve_account_discord_token(accounts_env_values, deployment),
-        _resolve_discord_auth_scheme(service_name, accounts_env_values),
+    token, token_source_key = _resolve_account_discord_token(
+        accounts_env_values, deployment
+    )
+    if not token:
+        return "", _resolve_discord_auth_scheme(
+            _deployment_service_name(deployment), accounts_env_values
+        )
+    # The scheme is a property of the credential, not of the deployment, so it
+    # must be read from the scope the token actually came from. Only the global
+    # fallback needs special handling: a per-bot token was found under a key
+    # derived from this deployment's service name, which is exactly the scope
+    # `_resolve_discord_auth_scheme` already reads.
+    if token_source_key == "DISCORD_BOT_TOKEN":
+        scheme = str(accounts_env_values.get("DISCORD_AUTH_SCHEME") or "").strip()
+        scheme = scheme or str(os.environ.get("DISCORD_AUTH_SCHEME", "")).strip()
+        return token, (scheme.lower() or "bot")
+    return token, _resolve_discord_auth_scheme(
+        _deployment_service_name(deployment), accounts_env_values
     )
 
 

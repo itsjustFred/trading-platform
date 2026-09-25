@@ -212,19 +212,34 @@ MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
 
 
 def timeframe_nominal_days(timeframe: str | None) -> float:
-    """Nominal calendar spacing of one bar in ``timeframe``."""
+    """Nominal calendar spacing of one bar in ``timeframe``.
+
+    The numeric prefix is part of the timeframe: ``5m`` bars are five minutes
+    apart and ``4w`` bars are four weeks apart, so ignoring it would size the
+    allowed hole against the wrong spacing.
+    """
     normalized = str(timeframe or "").strip().lower()
-    if normalized.endswith("mo"):
-        return 30.0
-    if normalized.endswith("w"):
-        return 7.0
-    if normalized.endswith("d"):
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(mo|[a-z]+)$", normalized)
+    if match is None:
         return 1.0
-    if normalized.endswith("h"):
-        return 1.0 / 24.0
-    if normalized.endswith("m"):
-        return 1.0 / 1440.0
-    return 1.0
+    try:
+        count = float(match.group(1))
+    except ValueError:  # pragma: no cover - guarded by the regex above
+        return 1.0
+    unit = match.group(2)
+    if unit == "mo":
+        return count * 30.0
+    if unit == "w":
+        return count * 7.0
+    if unit == "d":
+        return count
+    if unit == "h":
+        return count / 24.0
+    if unit == "m":
+        return count / 1440.0
+    if unit == "s":
+        return count / 86_400.0
+    return count
 
 
 def scaled_gap_threshold_days(timeframe: str | None, base_days: float) -> float:
@@ -421,8 +436,12 @@ def find_internal_gaps(
         )
 
     if threshold_days is None:
-        threshold_days = scaled_gap_threshold_days(
-            timeframe, INTERNAL_GAP_WARN_DAYS
+        # Without a timeframe there is no nominal spacing to scale against, so
+        # widening would only hide real holes. Keep the fixed floor.
+        threshold_days = (
+            scaled_gap_threshold_days(timeframe, INTERNAL_GAP_WARN_DAYS)
+            if timeframe
+            else INTERNAL_GAP_WARN_DAYS
         )
 
     parquet_paths = sorted(

@@ -1607,3 +1607,85 @@ def test_active_deployments_are_never_included_in_enforcement_accounts():
         signal_source="discord",
     )
     assert daemon._account_ids_needing_stopped_enforcement([active], set()) == set()
+
+
+def test_global_token_fallback_uses_the_global_auth_scheme(monkeypatch):
+    """A global token is configured with the global scheme, not a per-bot one.
+
+    Finding the token under `DISCORD_BOT_TOKEN` while resolving the scheme from
+    the deployment's per-bot key sent an account header for a bot token, which
+    is a 401.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "global-token")
+    monkeypatch.setenv("DISCORD_AUTH_SCHEME", "bot")
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",  # per-bot override
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "global-token", "must fall back to the global token"
+    assert scheme == "bot", (
+        f"a global token must use the global scheme, got {scheme!r}"
+    )
+
+
+def test_per_bot_token_uses_the_per_bot_auth_scheme(monkeypatch):
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "global-token")
+    monkeypatch.setenv("DISCORD_AUTH_SCHEME", "bot")
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_TOKEN": "ramjet-account-token",
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",
+        "DISCORD_AUTH_SCHEME": "bot",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "ramjet-account-token"
+    assert scheme == "account", f"a per-bot token must use its per-bot scheme, got {scheme!r}"
+
+
+def test_per_bot_scheme_falls_back_to_the_global_scheme(monkeypatch):
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "rocketfuel"},
+    )
+    values = {
+        "DISCORD_BOT_ROCKETFUEL_TOKEN": "tok",
+        "DISCORD_AUTH_SCHEME": "account",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "tok"
+    assert scheme == "account", "the global scheme applies when no per-bot override exists"

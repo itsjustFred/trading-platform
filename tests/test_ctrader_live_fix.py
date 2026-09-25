@@ -856,16 +856,6 @@ def test_both_brokers_now_advertise_the_controls():
     assert bare.supports_flatten is False
 
 
-def _real_order(order_id: int, order_type: int):
-    """A real ProtoOAOrder with the fields the adapter reads."""
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAOrder
-
-    order = ProtoOAOrder()
-    order.orderId = order_id
-    order.orderType = order_type
-    return order
-
-
 def _real_position(position_id: int, volume: int):
     """A real ProtoOAPosition with the fields the adapter reads."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition
@@ -877,3 +867,148 @@ def _real_position(position_id: int, volume: int):
     trade_data.symbolId = 1
     trade_data.volume = volume
     return position
+
+
+# ─── only working orders may be cancelled ───────────────────────────────────
+
+
+def _make_cancel_adapter(tmp_path: Path, orders):
+    """Adapter whose transport answers the order list, then records cancels."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOACancelOrderReq,
+        ProtoOAOrderListReq,
+        ProtoOAOrderListRes,
+    )
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAOrderListReq = ProtoOAOrderListReq
+    adapter._ProtoOAOrderListRes = ProtoOAOrderListRes
+    adapter._ProtoOACancelOrderReq = ProtoOACancelOrderReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+
+    response = ProtoOAOrderListRes()
+    for order in orders:
+        response.order.add().CopyFrom(order)
+
+    cancelled: list[int] = []
+    state = {"listed": False}
+
+    async def _fake_send(request, **_kwargs):
+        if isinstance(request, ProtoOAOrderListReq):
+            state["listed"] = True
+            return response
+        if isinstance(request, ProtoOACancelOrderReq):
+            cancelled.append(int(request.orderId))
+            return ProtoOAOrderListRes()
+        raise AssertionError(f"unexpected request {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    adapter.cancelled_ids = cancelled
+    return adapter
+
+
+def test_cancel_open_orders_skips_filled_and_cancelled_orders(tmp_path):
+    """A terminal order must not be sent for cancellation.
+
+    cTrader rejects it, and the rejection propagates out of the loop, so the
+    remaining working orders would stay resting after a STOP.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    def _order(order_id: int, status: int) -> "ProtoOAOrder":
+        order = ProtoOAOrder()
+        order.orderId = order_id
+        order.orderType = ProtoOAOrderType.LIMIT
+        order.orderStatus = status
+        return order
+
+    adapter = _make_cancel_adapter(
+        tmp_path,
+        [
+            _order(11, ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED),
+            _order(22, ProtoOAOrderStatus.ORDER_STATUS_FILLED),
+            _order(33, ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
+            _order(44, ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            _order(55, ProtoOAOrderStatus.ORDER_STATUS_EXPIRED),
+        ],
+    )
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [11], (
+        f"only the accepted order may be cancelled, got {adapter.cancelled_ids}"
+    )
+    assert count == 1
+
+
+def test_cancel_open_orders_still_cancels_working_orders_of_every_type(tmp_path):
+    """Status filtering must not narrow the cancellable-type set."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    orders = []
+    for index, order_type in enumerate(
+        (
+            ProtoOAOrderType.LIMIT,
+            ProtoOAOrderType.STOP,
+            ProtoOAOrderType.STOP_LIMIT,
+        ),
+        start=1,
+    ):
+        order = ProtoOAOrder()
+        order.orderId = index
+        order.orderType = order_type
+        order.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+        orders.append(order)
+
+    # MARKET orders fill immediately and cannot be cancelled.
+    market = ProtoOAOrder()
+    market.orderId = 99
+    market.orderType = ProtoOAOrderType.MARKET
+    market.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    orders.append(market)
+
+    adapter = _make_cancel_adapter(tmp_path, orders)
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [1, 2, 3]
+    assert count == 3
+
+
+def test_cancel_open_orders_treats_a_missing_status_as_working(tmp_path):
+    """An unrecognised response shape must not silently leave orders resting."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderType,
+    )
+
+    order = ProtoOAOrder()  # orderStatus left at its default (unset)
+    order.orderId = 77
+    order.orderType = ProtoOAOrderType.LIMIT
+
+    adapter = _make_cancel_adapter(tmp_path, [order])
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [77], (
+        f"a missing status must still be cancelled, got {adapter.cancelled_ids}"
+    )
+    assert count == 1

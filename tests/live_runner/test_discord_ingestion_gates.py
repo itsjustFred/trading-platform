@@ -690,11 +690,14 @@ def test_discord_runtime_groups_route_token_per_channel_group() -> None:
         channel_id="channel-1",
         service_name="RAMJET",
     )
-    token = daemon._resolve_account_discord_token(
+    # The resolver also reports which key the token came from, so the auth
+    # scheme is read from the same scope. Both halves are asserted here.
+    token, source_key = daemon._resolve_account_discord_token(
         {"DISCORD_BOT_RAMJET_TOKEN": "ramjet-token"},
         deployment,
     )
     assert token == "ramjet-token"
+    assert source_key == "DISCORD_BOT_RAMJET_TOKEN"
 
 
 # ── C-3 wiring: the trusted-author gate reaches the running listener ──────────
