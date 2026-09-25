@@ -577,10 +577,13 @@ class TradeEngine:
         )
         fees = (entry_notional + exit_notional) * fee_rate + fee_flat
         net_pnl = pnl - fees
+        self._realized_pnl -= fees
         risk_per_share = abs(
             position.entry_price - (position.stop_loss or position.entry_price * 0.98)
         )
         risk_amount = risk_per_share * position.quantity
+        equity_at_entry = float((position.meta or {}).get("equity_at_entry") or 0.0)
+        risk_percent = (risk_amount / equity_at_entry) if equity_at_entry > 0 else None
         r_multiple = (net_pnl / risk_amount) if risk_amount > 0 else None
 
         last_exit = position.exits[-1]
@@ -602,12 +605,15 @@ class TradeEngine:
             pnl_pct=float(pnl_pct),
             fees=fees,
             net_pnl=float(net_pnl),
+            risk_amount=float(risk_amount),
+            risk_percent=float(risk_percent) if risk_percent is not None else None,
             r_multiple=float(r_multiple) if r_multiple is not None else None,
             mae=float(position.mae),
             mfe=float(position.mfe),
             holding_bars=max(0, int(exit_index - position.entry_index)),
             meta={
                 "exit_reason": last_exit.reason or "signal",
+                "stop_loss": position.stop_loss,
                 "execution_model": self._execution_model.to_dict(),
                 "entry_fill": {
                     "order_type": position.order_type,
@@ -643,6 +649,7 @@ class TradeEngine:
         next_positions: list[Position] = []
 
         for position in self.positions:
+            self._record_bar_excursion(position, row)
             exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
             self._close_partial(
                 position,
@@ -748,6 +755,22 @@ class TradeEngine:
             return None, None
         return resolve_ask_high_low(row, self._bar_spread(row))
 
+    def _record_bar_excursion(self, position: Position, row: pd.Series) -> None:
+        qty = float(position.remaining_qty)
+        if qty <= 0:
+            return
+        if position.direction == "LONG":
+            favorable = (float(row["high"]) - position.entry_price) * qty
+            adverse = (float(row["low"]) - position.entry_price) * qty
+        else:
+            ask_high, ask_low = self._ask_bar(row)
+            ref_high = ask_high if ask_high is not None else float(row["high"])
+            ref_low = ask_low if ask_low is not None else float(row["low"])
+            favorable = (position.entry_price - ref_low) * qty
+            adverse = (position.entry_price - ref_high) * qty
+        position.mfe = max(position.mfe, favorable)
+        position.mae = min(position.mae, adverse)
+
     def _check_stops(
         self,
         row: pd.Series,
@@ -774,6 +797,7 @@ class TradeEngine:
             if only_entry_index is not None and position.entry_index != only_entry_index:
                 remaining_positions.append(position)
                 continue
+            self._record_bar_excursion(position, row)
             if position.direction == "LONG":
                 stop_hit = position.stop_loss is not None and bar_low <= float(position.stop_loss)
             else:
@@ -888,21 +912,9 @@ class TradeEngine:
         for position in self.positions:
             if position.direction == "LONG":
                 unrealized += (close_price - position.entry_price) * position.remaining_qty
-                high_pnl = (float(row["high"]) - position.entry_price) * position.remaining_qty
-                low_pnl = (float(row["low"]) - position.entry_price) * position.remaining_qty
             else:
-                # A-L5: SHORT exits trigger on the ASK when ask_ohlc is
-                # enabled — MAE/MFE must be measured on the same side the
-                # position would actually trade, not on bid high/low.
-                ask_high, ask_low = self._ask_bar(row)
-                ref_high = ask_high if ask_high is not None else float(row["high"])
-                ref_low = ask_low if ask_low is not None else float(row["low"])
                 unrealized += (position.entry_price - close_price) * position.remaining_qty
-                high_pnl = (position.entry_price - ref_low) * position.remaining_qty
-                low_pnl = (position.entry_price - ref_high) * position.remaining_qty
-
-            position.mfe = max(position.mfe, high_pnl)
-            position.mae = min(position.mae, low_pnl)
+            self._record_bar_excursion(position, row)
 
         self.equity = self.config.initial_capital + self._realized_pnl + unrealized
         self.equity_curve.append(

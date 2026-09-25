@@ -161,6 +161,7 @@ class LiveAccountConfig(BaseModel):
     name: str = ""
     broker_login: str | None = None
     ctid: str | None = None
+    is_demo: bool = False
 
 
 class LiveAccount(BaseModel):
@@ -211,6 +212,15 @@ class LiveDeploymentStatusUpdateRequest(BaseModel):
     """Payload for updating a deployment runtime status via API."""
 
     status: Literal["ACTIVE", "PAUSED", "STOPPED"]
+
+
+class LiveDeploymentAccountUpdateRequest(BaseModel):
+    """Payload for re-pointing a deployment at a different broker account."""
+
+    account_id: str
+    # Re-pointing an ACTIVE deployment leaves the running listener holding the
+    # old account until the next sync, so it must be opted into explicitly.
+    allow_active: bool = False
 
 
 class LiveSignal(BaseModel):

@@ -497,6 +497,7 @@ class MT5XLSXImporter(BaseImporter):
         col_direction = MT5XLSXImporter._find_col(trades_df, ["Richtung"])
         col_volume = MT5XLSXImporter._find_col(trades_df, ["Volumen"])
         col_price = MT5XLSXImporter._find_col(trades_df, ["Preis"])
+        col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
         col_order_id = MT5XLSXImporter._find_col(trades_df, ["Auftrag"])
         col_commission = MT5XLSXImporter._find_col(trades_df, ["Kommission"])
         col_swap = MT5XLSXImporter._find_col(trades_df, ["Swap"])

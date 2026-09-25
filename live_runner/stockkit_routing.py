@@ -60,8 +60,73 @@ def expected_account_for_stockkit_route(route: str) -> str:
     return STOCKKIT_ACCOUNT_ROUTES[route]
 
 
+# Obvious scaffolding values that must never be treated as a real Discord
+# channel. A deployment carrying one of these looks configured but can never
+# match a real message, so it would sit silent forever.
+_PLACEHOLDER_CHANNEL_IDS = frozenset(
+    {
+        "0",
+        "1",
+        "123",
+        "1234",
+        "12345",
+        "123456",
+        "1234567",
+        "12345678",
+        "123456789",
+        "987654321",
+        "000000000000000000",
+        "111111111111111111",
+        "222222222222222222",
+    }
+)
+
+# Snowflake ids issued by Discord are strictly increasing integers well above
+# the 17-19 digit range. Anything shorter is not a real channel id.
+_MIN_PLAUSIBLE_CHANNEL_ID_LENGTH = 17
+
+
+def validate_discord_deployment_signal_config(
+    deployment: LiveDeploymentConfig,
+) -> None:
+    """Fail closed on Discord deployment config that could never fire.
+
+    Catches the two silent-failure modes seen in real data:
+
+    * a placeholder channel id (scaffolding that was never filled in), and
+    * a channel id that is not a syntactically plausible Discord snowflake.
+    """
+    if str(deployment.signal_source or "").lower() != "discord":
+        return
+
+    config = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
+    raw_channel = config.get("channel_id")
+    if raw_channel is None:
+        return
+
+    channel_id = str(raw_channel).strip()
+    if not channel_id:
+        raise ValueError("Discord deployment has an empty channel_id")
+    if not channel_id.isdigit():
+        raise ValueError(
+            f"Discord deployment channel_id '{channel_id}' is not numeric"
+        )
+    if channel_id in _PLACEHOLDER_CHANNEL_IDS or len(channel_id) < _MIN_PLAUSIBLE_CHANNEL_ID_LENGTH:
+        raise ValueError(
+            f"Discord deployment channel_id '{channel_id}' looks like a placeholder; "
+            "it can never match a real Discord channel, so this deployment would "
+            "silently never receive signals"
+        )
+
+
 def validate_stockkit_deployment_route(deployment: LiveDeploymentConfig) -> None:
-    """Fail closed when a known StockKit Discord bot targets the wrong account."""
+    """Fail closed on Discord deployment config and StockKit account routing.
+
+    This is the single chokepoint every Discord deployment passes through (DB
+    create, viewer API, daemon sync, smoke script), so the config sanity check
+    lives here to guarantee it cannot be bypassed by a new call site.
+    """
+    validate_discord_deployment_signal_config(deployment)
     if str(deployment.signal_source or "").lower() != "discord":
         return
     route = infer_stockkit_route(

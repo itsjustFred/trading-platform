@@ -71,6 +71,7 @@ from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
     EquityPoint,
+    LiveAccountConfig,
     Service,
     ServiceStatus,
     ServiceType,
@@ -89,6 +90,7 @@ from shared.database import (
     ensure_live_account,
     get_background_task_record,
     get_live_account,
+    get_live_deployment,
     get_service,
     get_latest_live_balance,
     get_latest_live_balances,
@@ -120,10 +122,14 @@ from shared.database import (
     save_portfolio as save_portfolio_record,
     upsert_verification_evidence,
     upsert_background_task_record,
+    count_live_deployment_submissions,
     create_service,
     delete_service,
+    record_live_account_demo_verification,
+    update_live_deployment_account,
     update_live_deployment_status,
     update_service_status,
+    upsert_live_accounts,
 )
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from risk.config import RiskConfig
@@ -136,6 +142,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
 from shared.models import (
+    LiveDeploymentAccountUpdateRequest,
     LiveDeploymentConfig,
     LiveDeploymentCreateRequest,
     LiveDeploymentStatusUpdateRequest,
@@ -518,6 +525,10 @@ def _resume_interrupted_tasks() -> None:
             raw_config = dict(record.get("config_json") or {})
 
             if task_type == "backtest":
+                restart_config = raw_config.get("restart_config")
+                backtest_config = (
+                    dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
+                )
                 strategy = str(backtest_config.get("strategy") or "").strip()
                 symbols = backtest_config.get("symbols")
                 if not strategy or not isinstance(symbols, list) or not symbols:
@@ -539,6 +550,7 @@ def _resume_interrupted_tasks() -> None:
                     engine=str(backtest_config.get("engine") or "native"),
                     symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
                     timeframe=str(backtest_config.get("timeframe") or "1d"),
+                    data_source=str(backtest_config.get("data_source") or ""),
                     start=str(backtest_config.get("start") or ""),
                     end=str(backtest_config.get("end") or ""),
                     capital=float(backtest_config.get("capital") or 100000.0),
@@ -581,70 +593,6 @@ def _resume_interrupted_tasks() -> None:
                 _resume_interrupted_data_task(record, task_id, raw_config)
         except Exception as exc:
             logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
-
-
-def _resume_interrupted_backtest_task(
-    record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
-) -> None:
-    restart_config = raw_config.get("restart_config")
-    backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
-    strategy = str(backtest_config.get("strategy") or "").strip()
-    symbols = backtest_config.get("symbols")
-    if not strategy or not isinstance(symbols, list) or not symbols:
-        logger.warning(
-            "Skipping auto-recovery for task %s: incomplete backtest restart config",
-            task_id,
-        )
-        return
-
-    logger.info(
-        "Auto-restarting backtest task %s (%s %s %s)",
-        task_id,
-        strategy,
-        ",".join(str(symbol) for symbol in symbols),
-        str(backtest_config.get("timeframe") or "1d"),
-    )
-    request_payload = BacktestRunRequest(
-        strategy=strategy,
-        engine=str(backtest_config.get("engine") or "native"),
-        symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-        timeframe=str(backtest_config.get("timeframe") or "1d"),
-        start=str(backtest_config.get("start") or ""),
-        end=str(backtest_config.get("end") or ""),
-        capital=float(backtest_config.get("capital") or 100000.0),
-        risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
-        max_position_pct=backtest_config.get("max_position_pct"),
-        max_leverage=backtest_config.get("max_leverage"),
-        modeling_resolution=(
-            str(backtest_config.get("modeling_resolution"))
-            if backtest_config.get("modeling_resolution") is not None
-            else None
-        ),
-        intrabar_resolution=(
-            str(backtest_config.get("intrabar_resolution"))
-            if backtest_config.get("intrabar_resolution") is not None
-            else None
-        ),
-        parameters=dict(backtest_config.get("parameters") or {}),
-    )
-    restarted = asyncio.run(run_backtest(request_payload))
-    restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
-    upsert_background_task_record(
-        task_id=task_id,
-        task_type=str(record.get("type") or ""),
-        status="completed",
-        config_json=raw_config,
-        progress_message=(
-            f"Auto-restarted as task {restarted_task_id}"
-            if restarted_task_id
-            else "Auto-restarted as new task"
-        ),
-        name=str(record.get("name") or ""),
-        description=str(record.get("description") or ""),
-        source=str(record.get("source") or ""),
-        created_at=str(record.get("created_at") or ""),
-        updated_at=_now_iso(),
-    )
 
 
 def _resume_interrupted_data_task(
@@ -994,12 +942,13 @@ class BacktestRunRequest(SQLModel):
     engine: str = "native"
     symbols: list[str]
     timeframe: str = "1d"
+    data_source: str = ""
     start: str = ""
     end: str = ""
     capital: float = 100000.0
-    risk_per_trade_pct: float | None = None
-    max_position_pct: float | None = None
-    max_leverage: float | None = None
+    risk_per_trade_pct: float | None = PydanticField(default=None, ge=0.0, lt=1.0)
+    max_position_pct: float | None = PydanticField(default=None, gt=0.0, le=1.0)
+    max_leverage: float | None = PydanticField(default=None, gt=0.0)
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
     parameters: dict[str, Any] = {}
@@ -2632,6 +2581,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     start = str(meta.get("start_date") or "")
     end = str(meta.get("end_date") or "")
     total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
+    total_pnl = _safe_float(meta.get("total_pnl"), 0.0)
+    initial_capital = _safe_float(meta.get("initial_capital"), 0.0)
+    net_profit_pct = (
+        total_pnl / initial_capital * 100.0
+        if initial_capital > 0
+        else total_return_decimal * 100.0
+    )
     cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
     sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
     psr = _safe_float(meta.get("psr"), 0.0)
@@ -2661,8 +2617,8 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "sharpe_ratio": sharpe_ratio,
         "cagr": round(cagr_decimal * 100.0, 2),
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
-        "net_profit": 0.0,
-        "net_profit_pct": round(total_return_decimal * 100.0, 2),
+        "net_profit": round(total_pnl, 6),
+        "net_profit_pct": round(net_profit_pct, 2),
         "psr": round(psr, 4),
         "p_value": round(p_value, 6),
         "win_rate": round(win_rate, 6) if win_rate is not None else None,
@@ -2690,6 +2646,8 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
         "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_pnl": _safe_float(meta.get("total_pnl"), 0.0),
+        "initial_capital": _safe_float(meta.get("initial_capital"), 100_000.0),
         "sharpe_ratio": _safe_float(meta.get("sharpe_ratio"), 0.0),
         "psr": _safe_float(meta.get("psr"), 0.0),
         "p_value": _safe_float(meta.get("p_value"), 1.0),
@@ -3734,6 +3692,7 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
         "broker_login": normalized_login,
         "login": normalized_login,
         "ctid": str(ctid).strip() if ctid else None,
+        "is_demo": bool(getattr(account, "is_demo", False)),
     }
 
 
@@ -3766,6 +3725,35 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
     }
 
 
+def _record_discovered_account_verification(
+    account_id: str,
+    *,
+    is_demo: bool,
+    ctid: str | None,
+    broker_login: str | None,
+) -> None:
+    """Persist a broker demo verification for a freshly discovered account.
+
+    Discovery is the only place that has just spoken to the broker, so it is the
+    only legitimate writer of the verification stamp that ACTIVE transitions
+    require. Failure is logged and swallowed: discovery must still return the
+    account list even when the write fails, and the account simply stays
+    unverified (fail-closed) until the next successful discovery.
+    """
+    try:
+        record_live_account_demo_verification(
+            account_id,
+            is_demo=is_demo,
+            ctid=ctid,
+            broker_login=broker_login,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not persist broker demo verification for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+
+
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
     discovered = _run_coroutine_sync(discover_configured_accounts)
     payload: list[dict[str, Any]] = []
@@ -3779,23 +3767,41 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 if account.get("broker_login") or account.get("login")
                 else None
             )
+            normalized_ctid = (
+                str(account.get("ctid")).strip() if account.get("ctid") else None
+            )
+            is_demo = bool(account.get("is_demo", False))
+            _record_discovered_account_verification(
+                account_id,
+                is_demo=is_demo,
+                ctid=normalized_ctid,
+                broker_login=normalized_login,
+            )
             payload.append(
                 {
                     "id": account_id,
                     "name": str(account.get("name") or account_id),
                     "broker": str(account.get("broker") or "unknown"),
                     "balance": _safe_float(account.get("balance"), 0.0),
-                    "is_demo": bool(account.get("is_demo", False)),
+                    "is_demo": is_demo,
                     "broker_login": normalized_login,
                     "login": normalized_login,
-                    "ctid": (
-                        str(account.get("ctid")).strip() if account.get("ctid") else None
-                    ),
+                    "ctid": normalized_ctid,
                 }
             )
             continue
         normalized_login = (
             str(account.broker_login).strip() if getattr(account, "broker_login", None) else None
+        )
+        normalized_ctid = (
+            str(account.ctid).strip() if getattr(account, "ctid", None) else None
+        )
+        is_demo = bool(account.is_demo)
+        _record_discovered_account_verification(
+            account.id,
+            is_demo=is_demo,
+            ctid=normalized_ctid,
+            broker_login=normalized_login,
         )
         payload.append(
             {
@@ -3803,12 +3809,10 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 "name": account.name,
                 "broker": account.broker,
                 "balance": float(account.balance),
-                "is_demo": bool(account.is_demo),
+                "is_demo": is_demo,
                 "broker_login": normalized_login,
                 "login": normalized_login,
-                "ctid": (
-                    str(account.ctid).strip() if getattr(account, "ctid", None) else None
-                ),
+                "ctid": normalized_ctid,
             }
         )
     return payload
@@ -4207,6 +4211,7 @@ def _ensure_live_account_for_deployment(account_id: str) -> dict[str, Any]:
             name=name,
             ctid=ctid,
             broker_login=broker_login,
+            is_demo=bool(discovered.get("is_demo", False)),
         )
         return _serialize_live_account_payload(account)
 
@@ -8464,8 +8469,12 @@ def _compare_backtests_payload(ids: str) -> dict[str, Any]:
                     "stats": stats,
                     "trades": {
                         "total_trades": len(result.trades),
-                        "winning_trades": sum(1 for trade in result.trades if trade.pnl > 0),
-                        "losing_trades": sum(1 for trade in result.trades if trade.pnl <= 0),
+                        "winning_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+                        ),
+                        "losing_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) <= 0
+                        ),
                     },
                 }
             )
@@ -8500,7 +8509,9 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         )
     )
     win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
-    winning_trades = sum(1 for trade in result.trades if _safe_float(trade.pnl, 0.0) > 0)
+    winning_trades = sum(
+        1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+    )
     losing_trades = max(len(result.trades) - winning_trades, 0)
 
     return {
@@ -8539,6 +8550,7 @@ def _run_backtest_process(
     output_path: str,
     backtest_id: str,
     report_stage: Callable[..., None],
+    watchdog_timed_out: threading.Event,
 ) -> tuple[Any, str, str, str]:
     """Launch the runner process and drain its stdout.
 
@@ -8562,8 +8574,21 @@ def _run_backtest_process(
         env=env,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     _update_task_fields(task_id, pid=proc.pid, process=proc)
+
+    watchdog = threading.Thread(
+        target=_monitor_backtest_process,
+        args=(proc,),
+        kwargs={
+            "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
+            "timed_out": watchdog_timed_out,
+        },
+        daemon=True,
+        name=f"backtest-watchdog-{task_id}",
+    )
+    watchdog.start()
 
     latest_message = ""
     if proc.stdout is not None:
@@ -8788,6 +8813,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
     engine = str(payload.engine or "native").strip() or "native"
     timeframe = normalize_timeframe(str(payload.timeframe or "1d"))
+    data_source = str(payload.data_source or "").strip()
     start = str(payload.start or "")
     end = str(payload.end or "")
     capital = float(payload.capital or 100000.0)
@@ -8837,6 +8863,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             "engine": engine,
             "symbols": symbols,
             "timeframe": timeframe,
+            "data_source": data_source,
             "start": start,
             "end": end,
             "capital": capital,
@@ -8867,6 +8894,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             *symbols,
             "--timeframe",
             timeframe,
+            *([] if not data_source else ["--data-source", data_source]),
             "--capital",
             str(capital),
             "--progress-stdout",
@@ -8930,11 +8958,10 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
         with log_file.open("a", encoding="utf-8", buffering=1) as handle:
             try:
-                _set_task_status(task_id, "running")
                 _set_job_status(task_id, "running")
-                report_stage(handle, percent=10.0, message="Loading market data...")
-
-                missing_downloads = _ensure_backtest_data_availability(
+                _prepare_backtest_runner_data(
+                    task_id=task_id,
+                    handle=handle,
                     symbols=symbols,
                     timeframe=timeframe,
                     start=start,
@@ -8948,26 +8975,12 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                     handle=handle,
                     cmd=cmd,
                     env=env,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
+                    output_path=output_path,
+                    backtest_id=backtest_id,
+                    report_stage=report_stage,
+                    watchdog_timed_out=watchdog_timed_out,
                 )
                 _update_task_fields(task_id, pid=proc.pid, process=proc)
-
-                # Watchdog bounds the whole child lifetime: it fires even if
-                # a hung child never closes stdout (a post-EOF proc.wait()
-                # timeout would never cover that case).
-                watchdog = threading.Thread(
-                    target=_monitor_backtest_process,
-                    args=(proc,),
-                    kwargs={
-                        "timeout_seconds": BACKTEST_WATCHDOG_TIMEOUT_SECONDS,
-                        "timed_out": watchdog_timed_out,
-                    },
-                    daemon=True,
-                    name=f"backtest-watchdog-{task_id}",
-                )
-                watchdog.start()
 
                 if proc.stdout is not None:
                     for raw_line in proc.stdout:
@@ -9382,8 +9395,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         start_dt=start_dt,
         end_dt=end_dt,
     )
-    with DATA_TASKS_LOCK:
-        DATA_TASKS[task_id] = record
     _set_task_status(task_id, "queued")
     _update_task_fields(
         task_id,
@@ -10536,7 +10547,27 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
 @app.get("/api/live/accounts")
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
-    return await asyncio.to_thread(_cached_live_accounts_payload)
+    discovered = await asyncio.to_thread(_cached_live_accounts_payload)
+    persisted: list[LiveAccountConfig] = []
+    for item in discovered:
+        broker = str(item.get("broker") or "").strip().lower()
+        account_id = str(item.get("id") or "").strip()
+        if broker not in {"alpaca", "ctrader"} or not account_id:
+            continue
+        persisted.append(
+            LiveAccountConfig(
+                id=account_id,
+                broker=broker,
+                name=str(item.get("name") or account_id),
+                broker_login=str(item.get("broker_login") or item.get("login") or "").strip()
+                or None,
+                ctid=str(item.get("ctid") or "").strip() or None,
+                is_demo=bool(item.get("is_demo", False)),
+            )
+        )
+    if persisted:
+        await asyncio.to_thread(upsert_live_accounts, persisted)
+    return discovered
 
 
 @app.get("/api/services")
@@ -11026,6 +11057,57 @@ async def create_live_deployment_endpoint(
     return _serialize_live_deployment_payload(created)
 
 
+async def _drain_live_deployment_submissions(
+    deployment_id: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> tuple[bool, int]:
+    deadline = asyncio.get_running_loop().time() + max(float(timeout_seconds), 0.0)
+    while True:
+        remaining = await asyncio.to_thread(
+            count_live_deployment_submissions, deployment_id
+        )
+        if remaining <= 0:
+            return True, 0
+        if asyncio.get_running_loop().time() >= deadline:
+            return False, remaining
+        await asyncio.sleep(0.05)
+
+
+async def _reverify_account_against_broker(account_id: str) -> bool:
+    """Ask the broker whether ``account_id`` is still a demo account.
+
+    Returns True only when discovery positively reports the account as demo and
+    the fresh verification is persisted. Any error, missing account, or non-demo
+    answer returns False so the caller fails closed.
+    """
+    try:
+        discovered = await asyncio.to_thread(_discover_live_accounts_payload)
+    except Exception as exc:
+        logger.error(
+            "Broker re-verification failed; refusing activation",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return False
+
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if not bool(account.get("is_demo")):
+            logger.error(
+                "Broker reports account is not a demo account; refusing activation",
+                extra={"data": {"account_id": account_id}},
+            )
+            return False
+        return True
+
+    logger.error(
+        "Broker discovery did not return the account; refusing activation",
+        extra={"data": {"account_id": account_id}},
+    )
+    return False
+
+
 @app.put("/api/live/deployments/{deployment_id}/status")
 async def update_live_deployment_status_endpoint(
     deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
@@ -11035,9 +11117,80 @@ async def update_live_deployment_status_endpoint(
         deployment_id=deployment_id,
         status=payload.status,
     )
+    requested_status = str(payload.status or "").strip().upper()
+
+    if requested_status == "ACTIVE":
+        # Re-verify the account against the broker immediately before arming.
+        # The DB gate also enforces verification freshness, so a stale
+        # confirmation can never be reused to arm a deployment.
+        deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+        if deployment is None:
+            raise HTTPException(status_code=404, detail="Live deployment not found")
+        if not await _reverify_account_against_broker(deployment.account_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Broker could not confirm the account is a demo account; "
+                    "refusing to activate"
+                ),
+            )
+
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_status, deployment_id, payload.status
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    payload = _serialize_live_deployment_payload(updated)
+    if updated.status != "ACTIVE":
+        drained, remaining = await _drain_live_deployment_submissions(deployment_id)
+        payload["submission_drain_complete"] = drained
+        payload["in_flight_submissions"] = remaining
+        if not drained:
+            logger.error(
+                "Live deployment status persisted but submission drain did not complete",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "status": updated.status,
+                        "in_flight_submissions": remaining,
+                    }
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Deployment status changed but in-flight submissions remain",
+                    "deployment_id": deployment_id,
+                    "status": updated.status,
+                    "in_flight_submissions": remaining,
+                },
+            )
+    return payload
+
+
+@app.put("/api/live/deployments/{deployment_id}/account")
+async def update_live_deployment_account_endpoint(
+    deployment_id: str, payload: LiveDeploymentAccountUpdateRequest
+) -> dict[str, Any]:
+    """Re-point a deployment at a different broker account.
+
+    Guarded on the DB side: the target must be a known, verified demo account,
+    the deployment must not be ACTIVE unless explicitly overridden, and any
+    in-flight submissions must have drained first.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/account",
+        deployment_id=deployment_id,
+    )
+    try:
+        updated = await asyncio.to_thread(
+            update_live_deployment_account,
+            deployment_id,
+            payload.account_id,
+            allow_active=bool(payload.allow_active),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

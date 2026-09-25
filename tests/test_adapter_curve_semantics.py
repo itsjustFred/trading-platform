@@ -1,12 +1,10 @@
 """Adapter-level curve semantics regressions (Cleanup 16-D1 hardening).
 
-Kills the survived mutation-testing mutants on the adapter equity-curve
-builders:
-
-- native/pynecore: the curve must replay trades in last_exit_time order,
-  stamp exit times (not entry times), credit FULL pnl per trade, and carry
-  the loaded bar count in ``meta.total_bars``.
-- trade renumbering must stay deterministic (entry-time sort before ids).
+- native single-symbol curves are per-bar mark-to-market and must reconcile
+  final equity with realized net PnL.
+- multi-symbol curves replay portfolio PnL at exit time.
+- ``meta.total_bars`` carries the loaded bar count, not the trade count.
+- trade renumbering stays deterministic (entry-time sort before ids).
 """
 
 from __future__ import annotations
@@ -52,36 +50,22 @@ def curve_env(tmp_path: Path):
 
 
 class TestNativeCurveSemantics:
-    def test_curve_credits_full_pnl_in_exit_order(self, curve_env):
+    def test_curve_is_mark_to_market_and_reconciles_final_pnl(self, curve_env):
         config, strategy_path = curve_env
         result = NativeAdapter().run(config, str(strategy_path))
         assert result.trades, "the fixture must produce trades"
         assert result.equity_curve, "the fixture must produce an equity curve"
 
-        # Full PnL credited exactly once per trade: the last curve point is
-        # capital plus the realized PnL of every trade.
-        expected_final = config.initial_capital + sum(t.pnl for t in result.trades)
-        assert result.equity_curve[-1].equity == pytest.approx(round(expected_final, 2)), (
-            "the curve must credit the FULL pnl of every trade — half/zero "
-            "credit means the realized replay is broken"
+        expected_final = config.initial_capital + sum(
+            t.net_pnl if t.net_pnl is not None else t.pnl for t in result.trades
         )
+        assert len(result.equity_curve) >= result.meta.total_bars
+        assert result.equity_curve[0].equity == pytest.approx(config.initial_capital)
+        assert result.equity_curve[-1].equity == pytest.approx(round(expected_final, 2))
 
         timestamps = [pd.Timestamp(point.time) for point in result.equity_curve]
-        assert timestamps == sorted(timestamps), (
-            "curve timestamps must be non-decreasing (exit-time order), not "
-            "entry order with exit stamps"
-        )
-
-        exit_times = {str(t.last_exit_time) for t in result.trades}
-        entry_times = {str(t.entry_time) for t in result.trades}
-        assert set(point.time for point in result.equity_curve) <= exit_times | entry_times
-        # At least the first point must sit on an exit stamp (not an entry).
-        first_exit = min(
-            pd.Timestamp(t.last_exit_time) for t in result.trades
-        )
-        assert pd.Timestamp(result.equity_curve[0].time) >= first_exit - pd.Timedelta(0), (
-            "curve points must be stamped at exits, not entries"
-        )
+        assert timestamps == sorted(timestamps)
+        assert set(timestamps) != {pd.Timestamp(t.last_exit_time) for t in result.trades}
 
     def test_meta_total_bars_is_bar_count(self, curve_env):
         config, strategy_path = curve_env
@@ -134,11 +118,7 @@ def generate_signals(df, params):
 
 
 class TestNativeCurveExitOrder:
-    def test_overlapping_trades_replay_in_exit_order(self, tmp_path: Path):
-        # F5: the single-symbol curve credits closed PnL at EXIT time, so
-        # with overlapping trades (entry order A,B vs exit order B,A) the
-        # curve must be stamped B-exit then A-exit — entry order with exit
-        # stamps would run backwards in time.
+    def test_overlapping_trades_keep_mark_to_market_curve(self, tmp_path: Path):
         (tmp_path / "strategies").mkdir()
         strategy_path = tmp_path / "strategies" / "overlap_curve.py"
         strategy_path.write_text(_OVERLAP_STRATEGY)
@@ -157,9 +137,7 @@ class TestNativeCurveExitOrder:
         )
         result = NativeAdapter().run(config, str(strategy_path))
         assert len(result.trades) == 2
-        assert len(result.equity_curve) == 2
-        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
-        assert pd.Timestamp(result.equity_curve[0].time) == first_exit
+        assert len(result.equity_curve) > len(result.trades)
         stamps = [pd.Timestamp(p.time) for p in result.equity_curve]
         assert stamps == sorted(stamps)
         expected = config.initial_capital + sum(t.pnl for t in result.trades)

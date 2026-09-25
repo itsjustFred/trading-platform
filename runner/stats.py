@@ -56,7 +56,7 @@ def compute_stats(
         return _empty_stats()
 
     if trades:
-        pnls = [t.pnl for t in trades]
+        pnls = [_net_trade_pnl(trade) for trade in trades]
         winners = [p for p in pnls if p > 0]
         losers = [p for p in pnls if p < 0]
 
@@ -217,6 +217,12 @@ def merge_canonical_stats(result: BacktestResult, risk_free_rate: float = 0.04) 
     result.stats = {**result.stats, **compute_stats_for_result(result, risk_free_rate)}
 
 
+def _net_trade_pnl(trade: Trade) -> float:
+    if trade.net_pnl is not None:
+        return float(trade.net_pnl)
+    return float(trade.pnl) - float(trade.fees or 0.0)
+
+
 # ─── QuantStats helpers ──────────────────────────────────────────────────────
 
 
@@ -320,6 +326,18 @@ def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[
 def _resolve_backtest_period_bounds(
     *, equity_curve: list[EquityPoint], trades: list[Trade]
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
+    try:
+        equity_times = [
+            pd.Timestamp(ts)
+            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+            if not pd.isna(ts)
+        ]
+    except Exception:
+        equity_times = []
+
+    if len(equity_times) >= 2:
+        return min(equity_times), max(equity_times)
+
     trade_start_times: list[pd.Timestamp] = []
     trade_end_times: list[pd.Timestamp] = []
 
@@ -334,18 +352,6 @@ def _resolve_backtest_period_bounds(
 
     if trade_start_times and trade_end_times:
         return min(trade_start_times), max(trade_end_times)
-
-    try:
-        equity_times = [
-            pd.Timestamp(ts)
-            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
-            if not pd.isna(ts)
-        ]
-    except Exception:
-        equity_times = []
-
-    if len(equity_times) >= 2:
-        return min(equity_times), max(equity_times)
 
     fallback_start = pd.Timestamp.now(tz="UTC")
     return fallback_start, fallback_start
@@ -464,14 +470,18 @@ def _one_sided_p_value(returns: list[float]) -> float:
         return 1.0
 
 
+def _period_risk_free_rate(risk_free_rate: float, periods: int = 252) -> float:
+    return math.pow(1.0 + float(risk_free_rate), 1.0 / periods) - 1.0
+
+
 def _sharpe_manual(returns: list[float], risk_free_rate: float) -> float:
-    """Annualized Sharpe ratio (manual)."""
-    if not returns:
+    """Annualized Sharpe ratio matching the quantstats definition."""
+    if len(returns) < 2:
         return 0.0
-    daily_rf = risk_free_rate / 252
-    excess = [r - daily_rf for r in returns]
+    period_rf = _period_risk_free_rate(risk_free_rate)
+    excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
-    variance = sum((r - mean_excess) ** 2 for r in excess) / len(excess)
+    variance = sum((value - mean_excess) ** 2 for value in excess) / (len(excess) - 1)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
@@ -479,20 +489,17 @@ def _sharpe_manual(returns: list[float], risk_free_rate: float) -> float:
 
 
 def _sortino_manual(returns: list[float], risk_free_rate: float) -> float:
-    """Annualized Sortino ratio (manual)."""
-    if not returns:
+    """Annualized Sortino ratio matching the quantstats definition."""
+    if len(returns) < 2:
         return 0.0
-    daily_rf = risk_free_rate / 252
-    mean_return = sum(returns) / len(returns)
-    downside = [r for r in returns if r < 0]
-    if len(downside) < 2:
-        return 0.0
-    downside_var = sum(r**2 for r in downside) / len(downside)
-    downside_std = math.sqrt(downside_var) if downside_var > 0 else 0
+    period_rf = _period_risk_free_rate(risk_free_rate)
+    excess = [float(value) - period_rf for value in returns]
+    mean_excess = sum(excess) / len(excess)
+    downside_variance = sum(min(value, 0.0) ** 2 for value in excess) / len(excess)
+    downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0
     if downside_std == 0:
         return 0.0
-    excess_mean = mean_return - daily_rf
-    return (excess_mean / downside_std) * math.sqrt(252)
+    return (mean_excess / downside_std) * math.sqrt(252)
 
 
 def _probabilistic_sharpe(

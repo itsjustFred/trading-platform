@@ -106,6 +106,7 @@ class BacktestConfig(BaseModel):
     # equity curve starts at start_date. Empty (default) = legacy behavior.
     warmup_start: str = ""
     data_dir: str = ""
+    data_source: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:

@@ -17,6 +17,7 @@ from shared.database import (
     EquityPointModel,
     save_result_to_sqlite,
     get_session,
+    load_backtest_result,
     _table_column_names,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
@@ -143,6 +144,8 @@ def test_save_result_to_sqlite_includes_equity_curve(isolated_db) -> None:
         initial_capital=100000.0,
         parameters={},
         notes="Test backtest",
+        duration_days=30,
+        total_bars=744,
     )
 
     result = BacktestResult(
@@ -163,6 +166,13 @@ def test_save_result_to_sqlite_includes_equity_curve(isolated_db) -> None:
         assert len(record.equity_curve) == 2, (
             f"equity_curve should have 2 points, got {len(record.equity_curve)}"
         )
+        assert record.data["duration_days"] == 30
+        assert record.data["total_bars"] == 744
+
+        loaded = load_backtest_result(backtest_id)
+        assert loaded is not None
+        assert loaded.meta.duration_days == 30
+        assert loaded.meta.total_bars == 744
 
 
 def test_equity_curve_migration_on_existing_table(isolated_db) -> None:

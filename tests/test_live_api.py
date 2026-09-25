@@ -209,6 +209,40 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     assert stats_payload["current_equity"] == 10_010.0
 
 
+def test_live_account_discovery_persists_demo_identity(monkeypatch):
+    import asyncio
+
+    import viewer.main as viewer_main_module
+
+    discovered = [
+        {
+            "id": "acc-demo",
+            "name": "Demo",
+            "broker": "alpaca",
+            "is_demo": True,
+            "broker_login": "login-1",
+            "ctid": None,
+        }
+    ]
+    persisted: list[LiveAccountConfig] = []
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda _force_refresh=False: discovered,
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "upsert_live_accounts",
+        lambda accounts: persisted.extend(accounts),
+    )
+
+    result = asyncio.run(viewer_main_module.get_live_accounts())
+
+    assert result == discovered
+    assert persisted[0].is_demo is True
+    assert persisted[0].broker_login == "login-1"
+
+
 def test_live_deployments_crud_endpoints(monkeypatch):
     import viewer.main as viewer_main_module
 
@@ -225,7 +259,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
         "signal_source_type": "discord",
         "signal_source_id": "RAMJET",
         "signal_source": "discord",
-        "signal_config": {"channel_id": "123", "wait_candle_close": True},
+        "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -238,7 +272,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
                 name="RAMJET",
                 type=ServiceType.DISCORD_BOT,
                 status=ServiceStatus.RUNNING,
-                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "1431465140905185452"},
                 created_at=datetime.now(timezone.utc),
             )
         ],
@@ -302,7 +336,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "signal_source_id": "RAMJET",
             "symbol_filter": ["AAPL", "MSFT"],
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "wait_candle_close": True},
+            "signal_config": {"channel_id": "1431465140905185452", "wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -314,7 +348,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
     assert created["signal_source_id"] == "RAMJET"
     assert created["symbol_filter"] == ["AAPL", "MSFT"]
     assert created["signal_source"] == "discord"
-    assert created["signal_config"]["channel_id"] == "123"
+    assert created["signal_config"]["channel_id"] == "1431465140905185452"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -437,7 +471,7 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
                 name="RAMJET",
                 type=ServiceType.DISCORD_BOT,
                 status=ServiceStatus.RUNNING,
-                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+                config={"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "1431465140905185452"},
                 created_at=datetime.now(timezone.utc),
             )
         ],
@@ -459,7 +493,7 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
             "signal_source_type": "discord",
             "signal_source_id": "RAMJET",
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "signal_processor": "ramjet"},
+            "signal_config": {"channel_id": "1431465140905185452", "signal_processor": "ramjet"},
         },
     )
 
@@ -538,7 +572,7 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
             "name": "RAMJET",
             "type": "discord_bot",
             "status": "running",
-            "config": {"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "123"},
+            "config": {"token_env_key": "DISCORD_BOT_RAMJET_TOKEN", "channel_id": "1431465140905185452"},
         },
     )
     assert create_response.status_code == 201

@@ -13,7 +13,6 @@ from typing import Any
 from uuid import UUID
 
 from live_runner.base_adapter import BaseLiveAdapter
-from risk.live import size_live_signal
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -256,21 +255,6 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
         )
     if not reactor.running:
         reactor.startRunning(installSignalHandlers=False)
-
-
-def _explicit_metadata_volume(metadata: dict[str, Any]) -> int | None:
-    """Explicit broker-volume overrides from metadata ('ctrader_volume', 'volume')."""
-    for key in ("ctrader_volume", "volume"):
-        if key not in metadata:
-            continue
-        try:
-            explicit = int(float(metadata[key]))
-        except (TypeError, ValueError):
-            raise ValueError(f"Invalid '{key}' in signal metadata.")
-        if explicit <= 0:
-            raise ValueError(f"'{key}' must be > 0.")
-        return explicit
-    return None
 
 
 class CTraderLiveAdapter(BaseLiveAdapter):
@@ -813,19 +797,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return None
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
-        """Resolve the broker volume for an order from signal metadata 'qty'.
-
-        Unit contract: 'qty' is in risk-engine quantity units; broker volume is
-        qty * QTY_VOLUME_SCALE (see module docstring). The raw broker-unit keys
-        ('ctrader_volume', 'volume') are operator-supplied overrides from the
-        (untrusted) signal payload; per the Main contract they stay readable so
-        exit-only flatten payloads keep their explicit broker volume.
-        """
+        """Resolve broker volume from the trusted risk-engine quantity."""
         metadata = signal.metadata or {}
-        explicit = _explicit_metadata_volume(metadata)
-        if explicit is not None:
-            return explicit
-
         if "qty" in metadata:
             qty = _to_float(metadata.get("qty"), default=0.0)
             if math.isfinite(qty) and qty > 0:
@@ -837,10 +810,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     )
                 return volume
 
-        # Fail closed: never trade a default size, and never silently upsize a
-        # risk-sized quantity to the broker minimum.
         raise ValueError(
-            "Signal has no positive quantity ('qty', 'ctrader_volume' or 'volume'); "
+            "Signal has no positive quantity ('qty'); "
             "refusing to submit an order with a default size."
         )
 
@@ -1386,7 +1357,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "persist or submit the signal."
             )
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self._raise_if_terminal_auth_failed()
         signal_id = str(signal.id)
         existing_order_id = await asyncio.to_thread(
@@ -1399,19 +1370,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 pass
             return existing_order_id
 
-        if not self._connected or not self._authenticated:
-            await self.connect()
-
         self._validate_pre_persistence(signal)
 
-        balance, _ = await self.get_balance()
-        sized_order = size_live_signal(signal, account_balance=balance)
-        sized_qty = _to_float((signal.metadata or {}).get("qty"), default=0.0)
-        if sized_qty <= 0:
+        if qty is None:
             raise ValueError(
-                "Risk engine returned non-positive quantity; order blocked "
-                f"(risk_percent={sized_order.risk_percent:.4f})."
+                "cTrader submit_order requires an explicit risk-sized quantity"
             )
+        qty_value = _to_float(qty, default=0.0)
+        if not math.isfinite(qty_value) or qty_value <= 0:
+            raise ValueError(
+                f"cTrader order quantity must be finite and positive, got {qty!r}"
+            )
+        signal = signal.model_copy(
+            update={
+                "metadata": {
+                    **{
+                        key: value
+                        for key, value in (signal.metadata or {}).items()
+                        if key not in {"ctrader_volume", "volume"}
+                    },
+                    "qty": qty_value,
+                    "explicit_qty": qty_value,
+                }
+            }
+        )
+        self._resolve_order_volume(signal)
+
+        if not self._connected or not self._authenticated:
+            await self.connect()
 
         persisted_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, signal_id
@@ -1542,7 +1528,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
         )
         take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            signal.action == "sell"
+            and metadata.get("exit_only") is True
+            and str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        )
         if stop_loss is None or take_profit is None:
             if exit_only:
                 # Exit-only orders close an existing position; they reduce

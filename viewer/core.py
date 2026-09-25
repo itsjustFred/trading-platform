@@ -14,7 +14,6 @@ import json
 import logging
 import math
 import os
-import re
 import shutil
 import subprocess
 import threading
@@ -311,7 +310,15 @@ def _backtest_info_payload(result: BacktestResult) -> dict:
         if meta.data.get("timeframes")
         else "1h",
         "timeframes": meta.data.get("timeframes", []),
+        "data_source": meta.data.get("source", ""),
+        "requested_data_source": meta.data.get("requested_data_source", ""),
+        "asset_classes": meta.data.get("asset_classes", []),
+        "data_files": meta.data.get("data_files", []),
+        "pnl_basis": meta.data.get("pnl_basis", {}),
+        "risk_config": meta.data.get("risk_config", {}),
         "initial_capital": meta.initial_capital,
+        "duration_days": meta.duration_days,
+        "total_bars": meta.total_bars,
         "created_at": meta.created_at,
         "trade_count": len(result.trades),
         "parameters": meta.parameters,
@@ -355,6 +362,17 @@ def _normalize_equity_points(points: list[dict]) -> list[dict]:
     return collapsed
 
 
+def _trade_net_pnl(trade: Trade) -> float:
+    value = getattr(trade, "net_pnl", None)
+    if value is not None:
+        numeric = _safe_float(value, float("nan"))
+        if math.isfinite(numeric):
+            return numeric
+    return _safe_float(getattr(trade, "pnl", 0.0), 0.0) - _safe_float(
+        getattr(trade, "fees", 0.0), 0.0
+    )
+
+
 def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
     if not result.trades:
         return []
@@ -379,7 +397,7 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
         event_time = _iso_to_unix(trade.last_exit_time or trade.entry_time)
         if event_time <= 0:
             continue
-        running_equity += _safe_float(trade.pnl, 0.0)
+        running_equity += _trade_net_pnl(trade)
         points.append({"time": event_time, "equity": round(running_equity, 2)})
 
     return _normalize_equity_points(points)
@@ -414,6 +432,7 @@ def _trade_to_viewer(trade) -> dict:
     if exit_reason is None and isinstance(trade_meta.get("exit_reason"), str):
         exit_reason = str(trade_meta.get("exit_reason"))
 
+    net_pnl = _trade_net_pnl(trade)
     payload = {
         "nr": trade.id,
         "symbol": trade.symbol,
@@ -429,7 +448,9 @@ def _trade_to_viewer(trade) -> dict:
         "risk_amount": risk_amount,
         "risk_percent": risk_percent,
         "exit_reason": exit_reason,
-        "pnl": trade.pnl,
+        "pnl": net_pnl,
+        "gross_pnl": trade.pnl,
+        "net_pnl": net_pnl,
         "pnl_pct": trade.pnl_pct,
         "r_multiple": trade.r_multiple,
         "holding_bars": trade.holding_bars,
@@ -486,7 +507,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
             except (ValueError, KeyError):
                 df = pd.read_parquet(path)
         except (ValueError, KeyError, OSError) as exc:
-            logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
+            logger.warning("Could not load OHLCV segment from %s: %s", str(path), exc)
             continue
         df.columns = [str(column).lower() for column in df.columns]
         if "timestamp" in df.columns:
@@ -1085,18 +1106,26 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     raw = _canonical_stats_from_result(result)
 
     pnls = [
-        _safe_float(trade.pnl, 0.0)
+        _trade_net_pnl(trade)
         for trade in (result.trades or [])
-        if _safe_float(trade.pnl, 0.0) != 0.0
+        if _trade_net_pnl(trade) != 0.0
     ]
     best_trade = max(pnls) if pnls else 0
     worst_trade = min(pnls) if pnls else 0
 
+    total_return = _safe_float(raw.get("total_return"), float("nan"))
+    if not math.isfinite(total_return):
+        total_return = raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000)
+
+    avg_trade_pnl = round(
+        raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2
+    )
     stats = {
         "net_profit": raw.get("total_pnl", 0),
         "net_profit_pct": round(
             raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100, 2
         ),
+        "total_return": round(total_return * 100, 2),
         "sharpe": raw.get("sharpe_ratio", 0),
         "sortino": raw.get("sortino_ratio", 0),
         "calmar": raw.get("calmar_ratio", 0),
@@ -1108,19 +1137,14 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "losers": raw.get("losers", 0),
         "avg_winner": raw.get("avg_winner", 0),
         "avg_loser": raw.get("avg_loser", 0),
-        "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
+        "avg_trade_pnl": avg_trade_pnl,
         "avg_bars_held": raw.get("avg_holding_bars", 0),
         "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
-        "expectancy": 0,  # computed below
+        "expectancy": avg_trade_pnl,
     }
-    # Expectancy
-    wr = raw.get("win_rate", 0)
-    stats["expectancy"] = round(
-        wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
-    )
     # PSR / p-value
     stats["psr"] = raw.get("psr")
     stats["p_value"] = raw.get("p_value", 1.0)
@@ -1582,6 +1606,9 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
         "backtests": backtests,
         "portfolios": _strategy_portfolios(entry),
     }
+
+
+_DOLTHUB_REPOS = Path.home() / "data" / "dolthub"
 
 
 def _dolthub_pull():

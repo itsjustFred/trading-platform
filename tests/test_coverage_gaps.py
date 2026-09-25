@@ -114,6 +114,27 @@ class TestInternalGapDetection:
         assert report["status"] == "failed"
         assert "error" in report
 
+    def test_gap_outside_required_window_does_not_fail(self, tmp_path):
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [
+                "2019-01-01T00:00:00Z",
+                "2019-01-01T01:00:00Z",
+                "2024-06-01T00:00:00Z",
+                "2024-06-01T01:00:00Z",
+                "2024-06-01T02:00:00Z",
+            ],
+        )
+
+        report = analyze_ohlcv_coverage(
+            tmp_path,
+            DataRequirement(
+                symbol="EURUSD", timeframe="1h", start="2024-06-01", end="2024-06-01"
+            ),
+        )
+
+        assert report["status"] != "failed"
+
 
 class TestFailedDownloadVisibility:
     def test_ensure_backtest_data_raises_when_download_produces_nothing(
@@ -150,6 +171,30 @@ class TestFailedDownloadVisibility:
         assert not has_ohlcv_bars_in_range(
             symbol="EURUSD", timeframe="1h", start="2024-01-01", end="2024-01-02", data_dir=tmp_path
         )
+
+
+class TestEnsureBacktestDataGapGate:
+    def test_internal_gap_fails_coverage(self, tmp_path, monkeypatch):
+        early = pd.date_range("2024-01-01", "2024-01-05", freq="1h", tz="UTC")
+        late = pd.date_range("2024-01-15", "2024-01-20", freq="1h", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in [*early, *late]],
+        )
+        monkeypatch.setattr(
+            auto_download,
+            "_download_missing_ohlcv_data",
+            lambda **kwargs: None,
+        )
+
+        with pytest.raises(RuntimeError, match="internal gaps"):
+            auto_download.ensure_backtest_data(
+                symbols=["EURUSD"],
+                timeframe="1h",
+                start="2024-01-01",
+                end="2024-01-20",
+                data_dir=tmp_path,
+            )
 
 
 class TestGapDetectionSingleFile:

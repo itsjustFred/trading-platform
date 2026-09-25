@@ -71,16 +71,62 @@ def test_split_backtest_period_rejects_range_too_short_for_both_segments():
         )
 
 
+def _execution_context(
+    *,
+    symbols: list[str],
+    data_dir: Path | None = None,
+    engine: str = "vectorbt",
+) -> dict:
+    """Build the execution_context the optimizer requires on base artifacts.
+
+    The optimizer fails closed when a base result has no persisted
+    execution_context, so every base-backtest fixture must carry one that
+    matches the artifact engine.
+    """
+    return {
+        "engine": engine,
+        "data_dir": str(data_dir) if data_dir is not None else "",
+        "data_source": "test",
+        "symbols": list(symbols),
+        "timeframe": "1d",
+        "initial_capital": 100000.0,
+        "risk_config": {
+            "risk_per_trade_pct": 0.01,
+            "max_position_exposure_pct": 0.05,
+            "max_leverage": 1.0,
+        },
+    }
+
+
+def _fake_strategy_entry(tmp_path: Path, slug: str) -> SimpleNamespace:
+    """Materialize a strategy source file and return its resolved entry.
+
+    The optimizer fingerprints the strategy source bytes together with the
+    execution context, so a resolved entry must exist on disk.
+    """
+    strategy_path = tmp_path / "strategies" / f"{slug}.py"
+    strategy_path.parent.mkdir(parents=True, exist_ok=True)
+    strategy_path.write_text(
+        f'"""Deterministic {slug} strategy source for optimizer fingerprinting."""\n',
+        encoding="utf-8",
+    )
+    return SimpleNamespace(file_path=strategy_path, slug=slug)
+
+
 def _write_base_backtest(
     backtests_dir: Path,
     *,
     symbols: list[str] | None = None,
     data_dir: Path | None = None,
 ) -> None:
+    resolved_symbols = symbols or ["AAPL"]
     data = {
-        "symbols": symbols or ["AAPL"],
+        "symbols": resolved_symbols,
         "timeframes": ["1d"],
         "source": "test",
+        "execution_context": _execution_context(
+            symbols=resolved_symbols, data_dir=data_dir
+        ),
     }
     if data_dir is not None:
         data["data_dir"] = str(data_dir)
@@ -216,6 +262,9 @@ def _write_risk_parity_base_backtest(backtests_dir: Path, *, data_dir: Path | No
                 "symbols": ["SPY", "TLT", "GLD"],
                 "timeframes": ["1d"],
                 "source": "test",
+                "execution_context": _execution_context(
+                    symbols=["SPY", "TLT", "GLD"], data_dir=data_dir
+                ),
                 **({"data_dir": str(data_dir)} if data_dir is not None else {}),
             },
             parameters={"rebalance_period": 21},
@@ -294,10 +343,7 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "example_sma"),
     )
     ensure_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -343,10 +389,7 @@ def test_run_optimization_rejects_empty_train_bar_segment_before_study(
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "example_sma"),
     )
     monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: [])
     monkeypatch.setattr(
@@ -379,10 +422,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "example_sma"),
     )
     ensure_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -508,10 +548,7 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "risk_parity.py",
-            slug="risk_parity",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "risk_parity"),
     )
     monkeypatch.setattr(
         optimizer_module,
@@ -610,10 +647,7 @@ def _patch_optimizer_env(
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "example_sma"),
     )
     if pass_through_stats:
         monkeypatch.setattr(
@@ -662,10 +696,7 @@ def test_all_trials_failing_raises_informative_error(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         optimizer_module,
         "find_strategy_entry",
-        lambda _: SimpleNamespace(
-            file_path=tmp_path / "strategies" / "example_sma.py",
-            slug="example_sma",
-        ),
+        lambda _: _fake_strategy_entry(tmp_path, "example_sma"),
     )
     original_create_study = optuna.create_study
     monkeypatch.setattr(

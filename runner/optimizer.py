@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -19,6 +20,7 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
+from shared.database import load_backtest_result
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
 
@@ -216,6 +218,79 @@ class OptimizationConfig(BaseModel):
         return self
 
 
+def _execution_context_from_result(result: BacktestResult) -> dict[str, Any]:
+    raw = result.meta.data.get("execution_context")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(
+            "Base backtest has no persisted execution_context; rerun the base "
+            "backtest before optimizing so data, risk, and modeling settings "
+            "cannot be silently replaced with defaults."
+        )
+    context = dict(raw)
+    risk = context.get("risk_config")
+    if not isinstance(risk, dict):
+        raise ValueError("Base backtest execution_context is missing risk_config")
+    required = {
+        "engine",
+        "data_dir",
+        "data_source",
+        "symbols",
+        "timeframe",
+        "initial_capital",
+    }
+    missing = sorted(key for key in required if key not in context)
+    if missing:
+        raise ValueError(
+            "Base backtest execution_context is missing: " + ", ".join(missing)
+        )
+    if str(context.get("engine")) != str(result.meta.engine):
+        raise ValueError(
+            "Base backtest execution_context engine does not match artifact engine"
+        )
+    context["risk_config"] = dict(risk)
+    return context
+
+
+def _context_fingerprint(context: dict[str, Any], strategy_path: Path) -> str:
+    payload = {
+        "context": context,
+        "strategy_sha256": hashlib.sha256(strategy_path.read_bytes()).hexdigest(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _optimizer_backtest_config(
+    *,
+    strategy_slug: str,
+    symbols: list[str],
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    initial_capital: float,
+    parameters: dict[str, Any],
+    context: dict[str, Any],
+) -> BacktestConfig:
+    risk = dict(context.get("risk_config") or {})
+    return BacktestConfig(
+        strategy_name=strategy_slug,
+        symbols=list(symbols),
+        timeframe=timeframe,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        risk_per_trade_pct=risk.get("risk_per_trade_pct"),
+        max_position_exposure_pct=risk.get("max_position_exposure_pct"),
+        max_leverage=risk.get("max_leverage"),
+        modeling_resolution=str(risk.get("modeling_resolution") or "open_close"),
+        signal_exit_fill=str(risk.get("signal_exit_fill") or "close"),
+        warmup_start=str(risk.get("warmup_start") or ""),
+        data_dir=str(context.get("data_dir") or ""),
+        data_source=str(context.get("data_source") or ""),
+        parameters=dict(parameters),
+    )
+
+
 def run_optimization(
     config: OptimizationConfig,
     progress_callback: ProgressCallback | None = None,
@@ -248,6 +323,8 @@ def run_optimization(
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
+    execution_context = _execution_context_from_result(base_result)
+    context_fingerprint = _context_fingerprint(execution_context, strategy_path)
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -270,6 +347,8 @@ def run_optimization(
             train_period=train_period,
             test_period=test_period,
             base_parameters=base_parameters,
+            execution_context=execution_context,
+            context_fingerprint=context_fingerprint,
             progress_callback=progress_callback,
         )
 
@@ -280,7 +359,7 @@ def run_optimization(
             for symbol in universe
         )
     )
-    data_dir = str(base_result.meta.data.get("data_dir") or "")
+    data_dir = str(execution_context.get("data_dir") or "")
     ensure_backtest_data(
         symbols=required_symbols,
         timeframe=timeframe,
@@ -330,14 +409,15 @@ def run_optimization(
 
         try:
             train_result = _run_vectorbt_backtest(
-                BacktestConfig(
-                    strategy_name=strategy_slug,
+                _optimizer_backtest_config(
+                    strategy_slug=strategy_slug,
                     symbols=trial_symbols,
                     timeframe=timeframe,
                     start_date=train_period["start"],
                     end_date=train_period["end"],
                     initial_capital=initial_capital,
                     parameters=combined_params,
+                    context=execution_context,
                 ),
                 strategy_path,
             )
@@ -347,6 +427,7 @@ def run_optimization(
         trial.set_user_attr("train_stats", _json_safe(train_stats))
         trial.set_user_attr("effective_parameters", _json_safe(combined_params))
         trial.set_user_attr("symbols", _json_safe(trial_symbols))
+        trial.set_user_attr("execution_context_fingerprint", context_fingerprint)
         trial.set_user_attr("trade_count", len(train_result.trades))
 
         if not train_result.trades:
@@ -431,14 +512,15 @@ def run_optimization(
     best_value = best_trial.value
 
     test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
+        _optimizer_backtest_config(
+            strategy_slug=strategy_slug,
             symbols=best_symbols,
             timeframe=timeframe,
             start_date=test_period["start"],
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            context=execution_context,
         ),
         strategy_path,
     )
@@ -468,6 +550,9 @@ def run_optimization(
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
+        "execution_context": _json_safe(execution_context),
+        "execution_context_fingerprint": context_fingerprint,
+        "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(best_value),
@@ -486,9 +571,12 @@ def run_optimization(
 
 def _load_base_backtest(backtest_id: str) -> BacktestResult:
     path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Base backtest {backtest_id!r} not found at {path}")
-    return BacktestResult.load(path)
+    if path.exists():
+        return BacktestResult.load(path)
+    stored = load_backtest_result(str(backtest_id))
+    if stored is not None:
+        return stored
+    raise FileNotFoundError(f"Base backtest {backtest_id!r} not found at {path}")
 
 
 def _resolve_strategy_reference(result: BacktestResult) -> tuple[str, Path, str]:
@@ -659,6 +747,8 @@ def _run_risk_parity_covariance_optimization(
     train_period: dict[str, str],
     test_period: dict[str, str],
     base_parameters: dict[str, Any],
+    execution_context: dict[str, Any],
+    context_fingerprint: str,
     progress_callback: ProgressCallback | None,
 ) -> dict[str, Any]:
     _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
@@ -673,7 +763,7 @@ def _run_risk_parity_covariance_optimization(
         timeframe=timeframe,
         start=train_period["start"],
         end=train_period["end"],
-        data_dir=str(base_result.meta.data.get("data_dir") or ""),
+        data_dir=str(execution_context.get("data_dir") or ""),
     )
     if returns_frame.empty or len(returns_frame.columns) < 2:
         returns_frame = _asset_returns_frame_from_base_result(base_result)
@@ -696,14 +786,15 @@ def _run_risk_parity_covariance_optimization(
         progress_callback, 70.0, "Running OOS backtest for selected risk parity universe."
     )
     test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
+        _optimizer_backtest_config(
+            strategy_slug=strategy_slug,
             symbols=best_symbols,
             timeframe=timeframe,
             start_date=test_period["start"],
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            context=execution_context,
         ),
         strategy_path,
     )
@@ -733,6 +824,9 @@ def _run_risk_parity_covariance_optimization(
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
+        "execution_context": _json_safe(execution_context),
+        "execution_context_fingerprint": context_fingerprint,
+        "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": {},
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(selection["best_score"]),

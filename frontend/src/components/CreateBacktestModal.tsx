@@ -25,6 +25,13 @@ const TIMEFRAME_LABELS: Record<string, string> = {
   "1d": "1 Day",
   "1w": "1 Week",
 };
+const ENGINE_BADGE_TONES: Record<string, CSSProperties> = {
+  native: { background: "rgba(52, 211, 153, 0.14)", color: "#6ee7b7" },
+  vectorbt: { background: "rgba(96, 165, 250, 0.14)", color: "#93c5fd" },
+  pynecore: { background: "rgba(167, 139, 250, 0.14)", color: "#c4b5fd" },
+  lean: { background: "rgba(251, 146, 60, 0.14)", color: "#fdba74" },
+  default: { background: "rgba(148, 163, 184, 0.14)", color: "#cbd5e1" },
+};
 
 function getModelingTimeframes(mainTf: string): string[] {
   const idx = TIMEFRAME_ORDER.indexOf(mainTf as (typeof TIMEFRAME_ORDER)[number]);

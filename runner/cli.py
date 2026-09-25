@@ -28,6 +28,7 @@ from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_param
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines import contract
 from runner.stats import merge_canonical_stats
 from runner.walkforward import run_walkforward
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -91,7 +92,12 @@ def _resolve_strategy_type(strategy_path: str) -> StrategyType:
     return detect_strategy_type(resolved, resolved.parent)
 
 
-def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -> tuple[str, str]:
+def _detect_date_range(
+    symbols: list[str],
+    timeframe: str,
+    data_dir: str = "",
+    data_source: str = "",
+) -> tuple[str, str]:
     """Auto-detect date range from available OHLCV data files.
 
     For multiple symbols, returns the intersection (common period).
@@ -102,7 +108,8 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     per-symbol facet in ``runner.backtest_grid._detect_date_range``; both share
     the same loud-failure contract (F19) over the same parquet layout.
     """
-    ohlcv_root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
+    data_root = Path(data_dir) if data_dir else DATA_DIR
+    ohlcv_root = data_root / "ohlcv"
     normalized_timeframe = normalize_timeframe(timeframe)
     starts, ends = [], []
 
@@ -112,11 +119,13 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
         )
 
     for symbol in symbols:
-        matches = list(ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"))
-        if not matches:
-            # Try without exact timeframe match — find any parquet for symbol
-            matches = list(ohlcv_root.rglob(f"**/{symbol}/*.parquet"))
-        if not matches:
+        selected, candidates = contract.select_ohlcv_path(
+            data_root,
+            symbol,
+            normalized_timeframe,
+            data_source=data_source,
+        )
+        if selected is None or not candidates:
             raise ValueError(
                 f"No OHLCV data found for {symbol}/{normalized_timeframe} under "
                 f"{ohlcv_root}; refusing to fabricate a backtest date range"
@@ -124,7 +133,7 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
         try:
             import pandas as pd
 
-            df = pd.read_parquet(matches[0])
+            df = pd.read_parquet(selected)
             df.columns = [c.lower() for c in df.columns]
             if "timestamp" in df.columns:
                 ts = pd.to_datetime(df["timestamp"])
@@ -133,10 +142,10 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
             else:
                 logger.warning(
                     "No timestamp column in %s; symbol %s cannot contribute a date range",
-                    matches[0], symbol,
+                    selected, symbol,
                 )
         except Exception as e:
-            logger.warning("Could not read date range from %s: %s", matches[0], e)
+            logger.warning("Could not read date range from %s: %s", selected, e)
 
     # A symbol whose file could not be read must not silently shrink the
     # intersection — every requested symbol has to contribute a range.
@@ -188,7 +197,10 @@ def cmd_run(args):
     end = args.end
     if not start or not end:
         detected_start, detected_end = _detect_date_range(
-            args.symbols, normalized_timeframe, args.data_dir or ""
+            args.symbols,
+            normalized_timeframe,
+            args.data_dir or "",
+            getattr(args, "data_source", "") or "",
         )
         if not start:
             start = detected_start
@@ -222,6 +234,7 @@ def cmd_run(args):
             max_leverage=getattr(args, "max_leverage", None),
             modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
             data_dir=args.data_dir or "",
+            data_source=getattr(args, "data_source", "") or "",
             parameters=resolved_parameters,
         )
     except ValidationError as exc:
@@ -252,6 +265,32 @@ def cmd_run(args):
     result_id = str(getattr(args, "result_id", "") or "").strip()
     if result_id:
         result.meta.id = result_id
+    result.meta.data["pnl_basis"] = {
+        "pnl": "gross",
+        "net_pnl": "net_after_fees",
+    }
+    result.meta.data["risk_config"] = {
+        "risk_per_trade_pct": config.risk_per_trade_pct,
+        "max_position_exposure_pct": config.max_position_exposure_pct,
+        "max_leverage": config.max_leverage,
+        "modeling_resolution": config.modeling_resolution,
+        "signal_exit_fill": config.signal_exit_fill,
+        "warmup_start": config.warmup_start,
+        "max_position_exposure_semantics": (
+            "aggregate_open_risk"
+            if engine.name == "native"
+            else "per_position_notional"
+        ),
+    }
+    result.meta.data["execution_context"] = {
+        "engine": engine.name,
+        "data_dir": str(Path(config.data_dir) if config.data_dir else DATA_DIR),
+        "data_source": config.data_source,
+        "symbols": list(config.symbols),
+        "timeframe": config.timeframe,
+        "initial_capital": float(config.initial_capital),
+        "risk_config": dict(result.meta.data["risk_config"]),
+    }
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)
@@ -278,7 +317,12 @@ def cmd_run(args):
         except Exception as exc:
             logger.warning("Could not persist backtest to SQLite: %s", exc)
     logger.info(
-        "Result: %d trades, total PnL: $%.2f", len(result.trades), sum(t.pnl for t in result.trades)
+        "Result: %d trades, total net PnL: $%.2f",
+        len(result.trades),
+        sum(
+            t.net_pnl if t.net_pnl is not None else t.pnl - (t.fees or 0.0)
+            for t in result.trades
+        ),
     )
     logger.info("Saved to: %s", output_path)
     _emit_progress(progress_callback, 100.0, f"Completed - {len(result.trades)} trades found")
@@ -494,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help=HELP_OVERRIDE_DATA_DIR)
+    run_p.add_argument("--data-source", default="", help="Preferred provider or asset class")
     run_p.add_argument(
         "--keep-indicators",
         action="store_true",

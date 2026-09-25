@@ -24,6 +24,56 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimizer import OptimizationConfig, run_optimization
 
 
+class TestExecutionContextPropagation:
+    def test_base_backtest_falls_back_to_sqlite_by_id(self, tmp_path, monkeypatch):
+        expected = _base_result(tmp_path)
+        monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", tmp_path / "empty")
+        monkeypatch.setattr(
+            optimizer_module, "load_backtest_result", lambda _backtest_id: expected
+        )
+
+        assert optimizer_module._load_base_backtest("bt_x") is expected
+
+    def test_missing_execution_context_fails_closed(self, tmp_path):
+        result = _base_result(tmp_path)
+        result.meta.data.pop("execution_context")
+
+        with pytest.raises(ValueError, match="execution_context"):
+            optimizer_module._execution_context_from_result(result)
+
+    def test_optimizer_config_preserves_risk_data_and_modeling_context(self, tmp_path):
+        result = _base_result(tmp_path)
+        context = optimizer_module._execution_context_from_result(result)
+
+        config = optimizer_module._optimizer_backtest_config(
+            strategy_slug="golden_sma",
+            symbols=["GOLD1"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-06-01",
+            initial_capital=100000.0,
+            parameters={"fast_length": 3},
+            context=context,
+        )
+
+        assert config.risk_per_trade_pct == 0.01
+        assert config.max_position_exposure_pct == 0.05
+        assert config.max_leverage == 1.0
+        assert config.modeling_resolution == "open_close"
+        assert config.signal_exit_fill == "close"
+        assert config.data_dir == str(tmp_path)
+        assert config.data_source == ""
+
+    def test_context_fingerprint_changes_with_strategy_source(self, tmp_path):
+        strategy_path = tmp_path / "strategy.py"
+        strategy_path.write_text("VALUE = 1\n", encoding="utf-8")
+        first = optimizer_module._context_fingerprint({}, strategy_path)
+        strategy_path.write_text("VALUE = 2\n", encoding="utf-8")
+        second = optimizer_module._context_fingerprint({}, strategy_path)
+
+        assert first != second
+
+
 # ─── F30: covariance from market data, not trade-PnL pseudo-equity ──────────
 
 
@@ -68,10 +118,24 @@ class TestRiskParityCovarianceSource:
                 index=pd.date_range("2024-01-01", periods=3, tz="UTC"),
             ),
         )
+        captured_config: dict[str, object] = {}
+
+        def _capture_config(config, strategy_path):
+            captured_config.update(
+                {
+                    "risk_per_trade_pct": config.risk_per_trade_pct,
+                    "max_position_exposure_pct": config.max_position_exposure_pct,
+                    "max_leverage": config.max_leverage,
+                    "data_dir": config.data_dir,
+                    "data_source": config.data_source,
+                }
+            )
+            return _empty_vectorbt_result(config)
+
         monkeypatch.setattr(
             optimizer_module,
             "_run_vectorbt_backtest",
-            lambda config, strategy_path: _empty_vectorbt_result(config),
+            _capture_config,
         )
 
         base_result = _base_result(tmp_path)
@@ -80,7 +144,7 @@ class TestRiskParityCovarianceSource:
             target_metric="sharpe_ratio",
             optimization_mode="risk_parity_covariance",
         )
-        optimizer_module._run_risk_parity_covariance_optimization(
+        result = optimizer_module._run_risk_parity_covariance_optimization(
             config=config,
             base_result=base_result,
             strategy_identifier="golden_sma",
@@ -93,6 +157,8 @@ class TestRiskParityCovarianceSource:
             train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
             test_period={"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             base_parameters={},
+            execution_context=base_result.meta.data["execution_context"],
+            context_fingerprint="context-fp",
             progress_callback=None,
         )
 
@@ -101,6 +167,12 @@ class TestRiskParityCovarianceSource:
             "covariance must be computed from asset-price returns; got the "
             f"trade-PnL pseudo-equity columns {sorted(columns)}"
         )
+        assert captured_config["risk_per_trade_pct"] == 0.01
+        assert captured_config["max_position_exposure_pct"] == 0.05
+        assert captured_config["max_leverage"] == 1.0
+        assert captured_config["data_dir"] == str(tmp_path)
+        assert result["execution_context_fingerprint"] == "context-fp"
+        assert result["execution_context"]["risk_config"]["risk_per_trade_pct"] == 0.01
 
 
 # ─── No-trade trials cannot win (AC 2) ──────────────────────────────────────
@@ -135,7 +207,13 @@ class TestNoTradeTrialsCannotWin:
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
         )
-        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("/tmp/s.py"), "s"))
+        strategy_path = tmp_path / "s.py"
+        strategy_path.write_text("def generate_signals():\n    pass\n", encoding="utf-8")
+        monkeypatch.setattr(
+            optimizer_module,
+            "_resolve_strategy_reference",
+            lambda _result: ("s", strategy_path, "s"),
+        )
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
         monkeypatch.setattr(
             optimizer_module,
@@ -150,7 +228,7 @@ class TestNoTradeTrialsCannotWin:
             def get_trials(self, deepcopy: bool = True, states=None):
                 return list(self.trials)
 
-            def optimize(self, objective, n_trials, callbacks=None):
+            def optimize(self, objective, n_trials, callbacks=None, catch=None):
                 class _Trial:
                     def suggest_int(self, name, low, high, step=1):
                         return low
@@ -187,7 +265,10 @@ class TestNoTradeTrialsCannotWin:
             n_trials=2,
             parameter_ranges={"fast_length": {"type": "int", "min": 2, "max": 10}},
         )
-        with pytest.raises(RuntimeError, match="no-trade|no trades|no completed"):
+        with pytest.raises(
+            RuntimeError,
+            match="no-trade|no trades|no completed|No optimization trial",
+        ):
             run_optimization(config, progress_callback=None)
 
         # Whatever the value is, it must carry the explicit no-trade penalty marker.
@@ -227,7 +308,26 @@ def _base_result(tmp_path: Path):
         backtest_start="2024-01-01",
         backtest_end="2024-12-31",
         total_bars=100,
-        data={"symbols": ["GOLD1", "GOLD2"], "timeframes": ["1h"], "data_dir": str(tmp_path)},
+        data={
+            "symbols": ["GOLD1", "GOLD2"],
+            "timeframes": ["1h"],
+            "execution_context": {
+                "engine": "vectorbt",
+                "data_dir": str(tmp_path),
+                "data_source": "",
+                "symbols": ["GOLD1", "GOLD2"],
+                "timeframe": "1h",
+                "initial_capital": 100_000.0,
+                "risk_config": {
+                    "risk_per_trade_pct": 0.01,
+                    "max_position_exposure_pct": 0.05,
+                    "max_leverage": 1.0,
+                    "modeling_resolution": "open_close",
+                    "signal_exit_fill": "close",
+                    "warmup_start": "",
+                },
+            },
+        },
         initial_capital=100_000,
         parameters={"fast_length": 5, "slow_length": 20},
     )

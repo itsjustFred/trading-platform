@@ -485,7 +485,10 @@ def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
 def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
     """Saving and reading broker_order_id must be symmetric."""
     database = isolated_db
-    database.ensure_live_account("acc-1", "ctrader")
+    # ACTIVE deployments require a fresh broker demo verification in addition
+    # to the is_demo flag, mirroring what account discovery records.
+    database.ensure_live_account("acc-1", "ctrader", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
         symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
@@ -512,7 +515,10 @@ def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
 def test_get_live_signal_broker_order_id_missing(isolated_db):
     """Missing broker_order_id must return None or empty."""
     database = isolated_db
-    database.ensure_live_account("acc-1", "ctrader")
+    # ACTIVE deployments require a fresh broker demo verification in addition
+    # to the is_demo flag, mirroring what account discovery records.
+    database.ensure_live_account("acc-1", "ctrader", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
         symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",

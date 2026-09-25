@@ -126,6 +126,48 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
     }
 
 
+def test_trade_engine_mae_includes_signal_exit_bar_excursion():
+    records = []
+    for index in range(25):
+        low = 80.0 if index == 10 else 99.0
+        close = 105.0 if index == 10 else 101.0
+        records.append(
+            {
+                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+                "open": 100.0,
+                "high": 110.0,
+                "low": low,
+                "close": close,
+                "volume": 1000,
+            }
+        )
+    data = pd.DataFrame.from_records(records)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[1] = True
+        exits.iloc[10] = True
+        return entries, exits, {}, []
+
+    cfg = BacktestConfig(
+        strategy_name="mae-exit-bar",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000,
+        parameters={},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.mae == pytest.approx((80.0 - trade.entry_price) * trade.quantity)
+    assert trade.mfe == pytest.approx((110.0 - trade.entry_price) * trade.quantity)
+
+
 def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
     data = _synthetic_ohlcv(100)
 
@@ -170,6 +212,9 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
 
     # 1% risk sizing => roughly -1000 PnL for a 2-point stop distance
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+    assert trade.risk_amount == pytest.approx(1000.0, abs=0.5)
+    assert trade.risk_percent == pytest.approx(0.01, abs=1e-6)
+    assert trade.meta["stop_loss"] == pytest.approx(109.0)
 
 
 def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
@@ -265,8 +310,8 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
     ``stop_first``.
     """
     data = _synthetic_ohlcv(100)
-    data.loc[12, "high"] = 113.0
-    data.loc[12, "low"] = 109.0
+    data.loc[11, "high"] = 113.0
+    data.loc[11, "low"] = 109.0
 
     def strategy_fn(df: pd.DataFrame, params: dict):
         entries = pd.Series(False, index=df.index)

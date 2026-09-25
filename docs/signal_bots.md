@@ -110,3 +110,21 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf
   `FAILED`; der Reconnect wird nach einem Backoff-Floor (30 s) erneut versucht.
+
+## Live-Signal-Härtung
+
+- `max_signal_age_seconds` ist ein optionales `signal_config`-Limit. Ohne
+  expliziten Wert gilt automatisch `max(300, 2 × Timeframe-Dauer)`, damit ein
+  regulärer Candle-Close-Wait auf `15m`, `1h` oder `1d` kein gültiges Signal
+  grundsätzlich verwirft. Die Prüfung läuft **vor** dem Wait; ein Discord-Signal
+  ohne parsebares `received_at` wird fail-closed abgewiesen.
+- `signal_processor_market_data_bars` steuert die Anzahl echter Broker-Bars
+  (20–1000, Standard 200). Der Alpaca-Adapter lädt den Bar-Schnitt aus dem
+  aktuellen Zeitfenster, nimmt die neuesten N Bars und verwirft Daten, deren
+  jüngster Bar älter als 72 Stunden (bzw. 7 Tage bei `1d`) ist.
+- Nach dem Candle-Close-Wait muss der Processor dieselbe Timeframe beibehalten,
+  die auch für das Wait verwendet wurde; ein nachträglicher Timeframe-Wechsel
+  wird verworfen.
+- Vor jeder Submission werden Deployment-Status, Demo-Modus und die
+  PAUSE-Concurrency nochmals geprüft. Exit-only-Metadaten sind nur für SELL
+  erlaubt und werden bei Entries entfernt.

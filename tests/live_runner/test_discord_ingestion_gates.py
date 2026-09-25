@@ -11,11 +11,23 @@ from types import SimpleNamespace
 
 import pytest
 
+import live_runner.daemon as daemon
 from live_runner.signal_sources import discord_source as ds
 from live_runner.signal_sources.discord_source import (
     DiscordSignalSource,
     _parse_trade_signal_from_message,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_submission_claims(monkeypatch):
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(daemon, "_deployment_account_is_demo", lambda _account_id: True)
 
 
 def _message(
@@ -504,7 +516,7 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty=None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 
@@ -563,7 +575,7 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty=None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 
@@ -620,7 +632,7 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty=None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 

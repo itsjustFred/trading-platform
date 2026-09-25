@@ -93,24 +93,6 @@ def _scoped_view(
     )
 
 
-def _windowed_curve(
-    result: BacktestResult, start_bound: datetime | None, end_bound: datetime | None
-) -> list[EquityPoint] | None:
-    """The engine-provided curve scoped to the same window as the aggregation.
-
-    Delegates to ``_scoped_view``: with a window it is the windowed curve,
-    without one the engine curve passes through unchanged (pre-mortem 16-B #7).
-    """
-    return _scoped_view(result, start_bound, end_bound).equity_curve
-
-
-def _preserves_engine_curve(
-    preserved_curve: list[EquityPoint] | None, daily_points: list[EquityPoint]
-) -> bool:
-    """Keep the engine curve only when it has more points than the daily build."""
-    return bool(preserved_curve) and len(preserved_curve) > len(daily_points)
-
-
 def _attach_daily_stats(result: BacktestResult, daily_returns: list[dict[str, Any]]) -> None:
     """Record the daily aggregation on stats and meta."""
     result.stats = result.stats or {}
@@ -121,20 +103,93 @@ def _attach_daily_stats(result: BacktestResult, daily_returns: list[dict[str, An
     result.meta.data["daily_return_count"] = len(daily_returns)
 
 
+def _trade_net_value(trade: Trade) -> float:
+    value = (
+        float(trade.net_pnl)
+        if trade.net_pnl is not None
+        else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
+    )
+    return value if math.isfinite(value) else 0.0
+
+
+def _daily_points_from_engine_curve(
+    result: BacktestResult,
+) -> tuple[list[EquityPoint], list[dict[str, Any]]] | None:
+    if not result.trades:
+        return None
+
+    curve: list[tuple[datetime, float]] = []
+    for point in result.equity_curve or []:
+        parsed = _parse_ts(point.time)
+        equity = float(point.equity)
+        if parsed is None or not math.isfinite(equity):
+            continue
+        curve.append((parsed.astimezone(timezone.utc), equity))
+    if len(curve) < 2:
+        return None
+    curve.sort(key=lambda item: item[0])
+
+    initial_capital = float(result.meta.initial_capital)
+    tolerance = max(0.05, abs(initial_capital) * 1e-9)
+    if result.trades:
+        expected_final = initial_capital + sum(_trade_net_value(trade) for trade in result.trades)
+        if abs(curve[-1][1] - expected_final) > tolerance:
+            return None
+
+    start = _parse_ts(result.meta.backtest_start)
+    if start is None:
+        start = curve[0][0]
+    baseline = start.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    points = [EquityPoint(time=baseline.isoformat(), equity=round(initial_capital, 2))]
+    daily_returns: list[dict[str, Any]] = []
+    previous_equity = initial_capital
+
+    start_index = 0
+    if (
+        curve[0][0].date() == baseline.date()
+        and abs(curve[0][1] - initial_capital) <= tolerance
+    ):
+        start_index = 1
+
+    last_by_day: dict[str, tuple[datetime, float]] = {}
+    for timestamp, equity in curve[start_index:]:
+        last_by_day[timestamp.date().isoformat()] = (timestamp, equity)
+
+    for day in sorted(last_by_day):
+        timestamp, equity = last_by_day[day]
+        points.append(EquityPoint(time=timestamp.isoformat(), equity=round(equity, 2)))
+        daily_return = (equity - previous_equity) / previous_equity if previous_equity > 0 else 0.0
+        daily_returns.append({"date": day, "return": daily_return, "equity": equity})
+        previous_equity = equity
+
+    if len(points) < 2:
+        return None
+    return points, daily_returns
+
+
 def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint], list[dict[str, Any]]]:
     """
-    Build a daily equity curve from trade PnL.
+    Build a daily equity curve, preferring the engine's mark-to-market series.
 
-    Returns (equity_points, daily_returns) where equity_points is a list of
-    EquityPoint objects and daily_returns is a list of dicts with
-    'date', 'return', 'equity'.
+    Realized trade PnL is the fallback when no reconciling engine curve exists.
+    Returns (equity_points, daily_returns).
     """
+    engine_curve = _daily_points_from_engine_curve(result)
+    if engine_curve is not None:
+        return engine_curve
+
     initial_capital = result.meta.initial_capital
     equity_by_day: dict[str, float] = defaultdict(float)
 
     # Aggregate PnL per day from trades
     for trade in result.trades:
-        pnl = trade.pnl or 0.0
+        pnl = (
+            float(trade.net_pnl)
+            if trade.net_pnl is not None
+            else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
+        )
         # Skip non-finite PnL values (nan, inf, -inf)
         if not math.isfinite(pnl):
             continue
@@ -150,8 +205,24 @@ def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint],
                 # Skip trades with invalid exit times
                 continue
 
-    # Build daily equity points
-    daily_points = []
+    if not equity_by_day:
+        return [], []
+
+    first_trade_day = min(equity_by_day)
+    initial_time = _parse_ts(result.meta.backtest_start)
+    if initial_time is None or initial_time.date().isoformat() > first_trade_day:
+        initial_time = datetime.fromisoformat(first_trade_day).replace(tzinfo=timezone.utc)
+    else:
+        initial_time = initial_time.astimezone(timezone.utc).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    initial_day = initial_time.date().isoformat()
+    daily_points = [
+        EquityPoint(time=initial_time.isoformat(), equity=round(initial_capital, 2))
+    ]
     daily_returns = []
     running_equity = initial_capital
 
@@ -159,7 +230,11 @@ def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint],
     for day in sorted(equity_by_day.keys()):
         running_equity += equity_by_day[day]
         # EquityPoint expects 'time' field (ISO datetime), use start of day UTC
-        time_str = f"{day}T00:00:00+00:00"
+        time_str = (
+            f"{day}T23:59:59.999999+00:00"
+            if day == initial_day
+            else f"{day}T00:00:00+00:00"
+        )
         daily_points.append(EquityPoint(time=time_str, equity=running_equity))
         # Calculate daily return
         prev_equity = running_equity - equity_by_day[day]
@@ -201,7 +276,7 @@ def attach_daily_equity(
         result.stats["daily_return_count"] = 0
         return result
 
-    # Build daily equity from trades, restricted to the requested window
+    # Build daily equity from mark-to-market or trades, restricted to the window
     scoped_result = _scoped_view(result, start_bound, end_bound)
     daily_points, daily_returns = build_daily_equity_curve(scoped_result)
 
@@ -217,18 +292,6 @@ def attach_daily_equity(
         result.stats["daily_return_count"] = 0
         return result
 
-    # When a window is active, an engine-provided curve must be scoped to the
-    # same bounds before the length comparison: preserving the full unwindowed
-    # curve next to window-scoped daily_returns would make the curve and the
-    # reported daily returns describe different periods (pre-mortem 16-B #7).
-    # _scoped_view computes exactly this view; reuse it instead of re-filtering.
-    preserved_curve = _windowed_curve(result, start_bound, end_bound)
-    if _preserves_engine_curve(preserved_curve, daily_points):
-        _attach_daily_stats(result, daily_returns)
-        result.equity_curve = preserved_curve
-        return result
-
-    # Attach the daily equity curve
     result.equity_curve = daily_points
     _attach_daily_stats(result, daily_returns)
 

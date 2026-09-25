@@ -5,6 +5,7 @@ import { getLogContent, getLogs } from "../api/client";
 import { useToast } from "../components/ToastProvider";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { stringifyUnknownValue } from "../lib/unknownValue";
 
 const ALL_LOGS = "ALL_LOGS";
 const LEVEL_OPTIONS = ["ERROR", "WARNING", "INFO", "DEBUG"] as const;

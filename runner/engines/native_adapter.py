@@ -37,12 +37,23 @@ def _load_strategy_module(path: str):
     return module
 
 
-def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
-    matches = list((data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"))
-    if not matches:
+def _load_ohlcv(
+    data_root: Path,
+    symbol: str,
+    timeframe: str,
+    start: str,
+    end: str,
+    *,
+    data_source: str = "",
+) -> pd.DataFrame | None:
+    selected_path, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
+    )
+    if selected_path is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = pd.read_parquet(selected_path)
+    df.attrs["ohlcv_source_path"] = str(selected_path)
     df.columns = [str(col).lower() for col in df.columns]
     df = contract.normalize_ohlcv_frame(df)
     if "timestamp" not in df.columns:
@@ -70,6 +81,8 @@ def _load_intrabar_data(
     modeling_resolution: str,
     start: str,
     end: str,
+    *,
+    data_source: str = "",
 ) -> pd.DataFrame | None:
     # Conformance (Cleanup 16-A, F8): resolve the spelling through the shared
     # resolver so native and vectorbt always agree on which intrabar frame a
@@ -78,7 +91,14 @@ def _load_intrabar_data(
     selected = contract.resolve_intrabar_timeframe(base_timeframe, modeling_resolution)
     if not selected:
         return None
-    return _load_ohlcv(data_root, symbol, selected, start, end)
+    return _load_ohlcv(
+        data_root,
+        symbol,
+        selected,
+        start,
+        end,
+        data_source=data_source,
+    )
 
 
 class NativeAdapter(EngineAdapter):
@@ -107,10 +127,12 @@ class NativeAdapter(EngineAdapter):
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
 
         all_trades = []
+        all_data_paths: list[str] = []
         all_drawings: list[dict[str, Any]] = []
         used_timeframes = [config.timeframe]
         symbols_total = max(len(config.symbols), 1)
         total_loaded_bars = 0
+        single_symbol_curve: list[EquityPoint] = []
 
         for symbol_index, symbol in enumerate(config.symbols):
             # warmup_start extends the
@@ -118,13 +140,23 @@ class NativeAdapter(EngineAdapter):
             # trading to start_date..end_date.
             warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
             load_start = warmup_raw or config.start_date
-            data = _load_ohlcv(data_root, symbol, config.timeframe, load_start, config.end_date)
+            data = _load_ohlcv(
+                data_root,
+                symbol,
+                config.timeframe,
+                load_start,
+                config.end_date,
+                data_source=config.data_source,
+            )
             if data is None or data.empty:
                 raise RuntimeError(
                     f"No OHLCV data for {symbol}/{config.timeframe} in "
                     f"{config.start_date}..{config.end_date} under {data_root}; "
                     "refusing to run a silent empty backtest"
                 )
+            source_path = str(data.attrs.get("ohlcv_source_path") or "")
+            if source_path:
+                all_data_paths.append(source_path)
             total_loaded_bars += len(data)
 
             symbol_start = 10.0 + (80.0 * symbol_index / symbols_total)
@@ -143,6 +175,7 @@ class NativeAdapter(EngineAdapter):
                 config.modeling_resolution,
                 load_start,
                 config.end_date,
+                data_source=config.data_source,
             )
             if intrabar is not None and not intrabar.empty and config.modeling_resolution not in used_timeframes:
                 used_timeframes.append(config.modeling_resolution)
@@ -159,6 +192,8 @@ class NativeAdapter(EngineAdapter):
             symbol_result = engine.run(data, strategy_module.generate_signals)
 
             all_trades.extend(symbol_result.trades)
+            if len(config.symbols) == 1:
+                single_symbol_curve = list(symbol_result.equity_curve)
             for drawing in symbol_result.drawings:
                 payload = dict(drawing)
                 payload.setdefault("symbol", symbol)
@@ -175,12 +210,11 @@ class NativeAdapter(EngineAdapter):
         # 1; the replay re-scales quantities chronologically from shared
         # equity (position size is linear in equity). Single-symbol runs keep
         # the legacy path bit-identical (no replay).
-        # Realized-PnL portfolio curve over EXIT time (Cleanup 16-D1, F5):
-        # per-symbol engines each compound sizing from full capital; a
-        # portfolio curve must not sum those per-symbol equities (it would
-        # multiply capital by the symbol count). The aggregate curve replays
-        # closed PnL once per portfolio, credited at exit — documented in the
-        # cross-engine contract.
+        # Multi-symbol curves replay closed portfolio PnL over EXIT time
+        # (Cleanup 16-D1, F5): per-symbol engines each compound sizing from
+        # full capital, so summing their equities would multiply capital by
+        # the symbol count. Single-symbol runs keep the engine's per-bar
+        # mark-to-market curve so open-position risk is represented.
         equity_curve: list[EquityPoint] = []
         shared_summary: dict[str, Any] = {}
         if len(config.symbols) > 1 and all_trades:
@@ -193,10 +227,12 @@ class NativeAdapter(EngineAdapter):
             for index, trade in enumerate(all_trades, start=1):
                 trade.id = index
             equity_curve = replayed_curve
+        elif single_symbol_curve:
+            equity_curve = single_symbol_curve
         else:
             running = config.initial_capital
             for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                running += trade.pnl
+                running += trade.net_pnl if trade.net_pnl is not None else trade.pnl
                 equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running, 2)))
         emit_progress(90.0, "Calculating statistics...")
 
@@ -210,6 +246,11 @@ class NativeAdapter(EngineAdapter):
         strategy_name = config.strategy_name
         if hasattr(strategy_module, "STRATEGY_META") and isinstance(strategy_module.STRATEGY_META, dict):
             strategy_name = strategy_module.STRATEGY_META.get("name", strategy_name)
+        path_metadata = [contract.ohlcv_path_metadata(path) for path in all_data_paths]
+        selected_sources = sorted({item["source"] for item in path_metadata if item["source"]})
+        selected_asset_classes = sorted(
+            {item["asset_class"] for item in path_metadata if item["asset_class"]}
+        )
 
         meta = BacktestMeta(
             id=f"native-{config.strategy_name}-{now.strftime('%Y%m%d-%H%M%S')}",
@@ -224,7 +265,10 @@ class NativeAdapter(EngineAdapter):
                 "timeframes": used_timeframes,
                 "symbols": config.symbols,
                 "universe": "",
-                "source": "ohlcv",
+                "source": ",".join(selected_sources) or "ohlcv",
+                "asset_classes": selected_asset_classes,
+                "data_files": all_data_paths,
+                "requested_data_source": config.data_source,
                 # A-M4 (D5): shared-equity replay summary for multi-symbol
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,

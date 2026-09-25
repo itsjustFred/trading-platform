@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -8,7 +9,7 @@ import subprocess
 import threading
 import contextlib
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -586,6 +587,14 @@ class LiveAccountModel(SQLModel, table=True):
     name: str = Field(default="", index=True)
     ctid: str | None = Field(default=None, index=True)
     broker_login: str | None = Field(default=None, index=True)
+    is_demo: bool = Field(default=False, index=True)
+    # When is_demo was last confirmed against the broker. ACTIVE transitions are
+    # only allowed while this is fresh, so a demo flag cannot be trusted forever
+    # after the account is re-pointed or the credentials are rotated.
+    demo_verified_at: datetime | None = Field(default=None, index=True)
+    # Broker-reported identity, captured at verification time. Persisting it lets
+    # the daemon notice a mismatch between what we verified and what we later see.
+    identity_fingerprint: str | None = Field(default=None)
 
     @classmethod
     def from_live_account(cls, account: LiveAccountConfig) -> "LiveAccountModel":
@@ -595,6 +604,7 @@ class LiveAccountModel(SQLModel, table=True):
             name=account.name,
             ctid=account.ctid,
             broker_login=account.broker_login,
+            is_demo=bool(account.is_demo),
         )
 
     def to_live_account(self) -> LiveAccountConfig:
@@ -604,6 +614,7 @@ class LiveAccountModel(SQLModel, table=True):
             name=self.name,
             ctid=self.ctid or "",
             broker_login=self.broker_login or "",
+            is_demo=bool(self.is_demo),
         )
 
 
@@ -747,6 +758,15 @@ class LiveDeploymentModel(SQLModel, table=True):
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
         )
+
+
+class LiveDeploymentSubmissionClaimModel(SQLModel, table=True):
+    __tablename__ = "live_deployment_submission_claims"
+
+    token: str = Field(primary_key=True)
+    deployment_id: str = Field(index=True)
+    claimed_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    expires_at: datetime = Field(index=True)
 
 
 class BackgroundTaskRecord(SQLModel, table=True):
@@ -1273,6 +1293,24 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
     if "broker_login" not in column_names:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
+    if "is_demo" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
+    if "demo_verified_at" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_accounts ADD COLUMN demo_verified_at DATETIME")
+        )
+        # Existing rows carry an unverified flag. Null means "never confirmed
+        # against the broker", which ACTIVATION treats as not verified, so this
+        # fails closed rather than grandfathering unknown accounts as safe.
+        connection.execute(text("UPDATE live_accounts SET demo_verified_at = NULL"))
+    if "identity_fingerprint" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_accounts ADD COLUMN identity_fingerprint TEXT")
+        )
 
 
 def _add_background_task_columns(connection: Connection) -> None:
@@ -1778,6 +1816,7 @@ def _create_live_account_record(
     name: str,
     ctid: str | None,
     broker_login: str | None,
+    is_demo: bool,
 ) -> LiveAccountConfig:
     """Insert a brand-new live account row."""
     account = LiveAccountModel(
@@ -1786,6 +1825,7 @@ def _create_live_account_record(
         name=name or account_id,
         ctid=_optional_trimmed(ctid),
         broker_login=_optional_trimmed(broker_login),
+        is_demo=bool(is_demo),
     )
     session.add(account)
     session.commit()
@@ -1801,6 +1841,7 @@ def _apply_live_account_updates(
     name: str,
     ctid: str | None,
     broker_login: str | None,
+    is_demo: bool | None,
 ) -> bool:
     """Overwrite non-empty fields on an existing live account row."""
     changed = False
@@ -1818,6 +1859,9 @@ def _apply_live_account_updates(
     if broker_login is not None and current.broker_login != normalized_broker_login:
         current.broker_login = normalized_broker_login
         changed = True
+    if is_demo is not None and bool(current.is_demo) != bool(is_demo):
+        current.is_demo = bool(is_demo)
+        changed = True
     if changed:
         session.add(current)
         session.commit()
@@ -1832,6 +1876,7 @@ def ensure_live_account(
     name: str = "",
     ctid: str | None = None,
     broker_login: str | None = None,
+    is_demo: bool | None = None,
 ) -> LiveAccountConfig:
     init_db()
     with get_session() as session:
@@ -1844,6 +1889,7 @@ def ensure_live_account(
                 name=name,
                 ctid=ctid,
                 broker_login=broker_login,
+                is_demo=bool(is_demo),
             )
 
         _apply_live_account_updates(
@@ -1853,6 +1899,7 @@ def ensure_live_account(
             name=name,
             ctid=ctid,
             broker_login=broker_login,
+            is_demo=None if is_demo is None else bool(is_demo),
         )
         return current.to_live_account()
 
@@ -1869,6 +1916,7 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
             current.name = account.name
             current.ctid = account.ctid
             current.broker_login = account.broker_login
+            current.is_demo = bool(account.is_demo)
             session.add(current)
         session.commit()
 
@@ -2052,6 +2100,12 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
+        if deployment_status == "ACTIVE":
+            block_reason = _activation_block_reason(account)
+            if block_reason is not None:
+                raise ValueError(
+                    f"Refusing to create an ACTIVE deployment: {block_reason}"
+                )
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
         symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
@@ -2067,18 +2121,266 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+def claim_live_deployment_submission(
+    deployment_id: str,
+    token: str,
+    *,
+    ttl_seconds: float = 30.0,
+) -> bool:
+    normalized_id = str(deployment_id or "").strip()
+    normalized_token = str(token or "").strip()
+    if not normalized_id or not normalized_token:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    with get_session() as session:
+        session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+                & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+            )
+        )
+        result = session.execute(
+            text(
+                "INSERT INTO live_deployment_submission_claims "
+                "(token, deployment_id, claimed_at, expires_at) "
+                "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
+                "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+            ),
+            {
+                "token": normalized_token,
+                "claimed_at": now,
+                "expires_at": expires_at,
+                "deployment_id": normalized_id,
+            },
+        )
+        session.commit()
+        return int(result.rowcount or 0) == 1
+
+
+def release_live_deployment_submission(token: str) -> bool:
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    init_db()
+    with get_session() as session:
+        result = session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                LiveDeploymentSubmissionClaimModel.token == normalized_token
+            )
+        )
+        session.commit()
+        return int(result.rowcount or 0) > 0
+
+
+def count_live_deployment_submissions(deployment_id: str) -> int:
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return 0
+    init_db()
+    now = _utcnow_naive()
+    with get_session() as session:
+        expired = session.exec(
+            select(LiveDeploymentSubmissionClaimModel.token)
+            .where(
+                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+                & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+            )
+            .limit(1)
+        ).first()
+        if expired is not None:
+            session.exec(
+                delete(LiveDeploymentSubmissionClaimModel).where(
+                    (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+                    & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+                )
+            )
+            session.commit()
+        count = session.exec(
+            select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
+                LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id
+            )
+        ).one()
+    return int(count or 0)
+
+
+def live_account_identity_fingerprint(
+    broker: str,
+    *,
+    ctid: str | None,
+    broker_login: str | None,
+) -> str:
+    """Stable hash of the broker-reported identity of an account.
+
+    Persisted at verification time and re-checked before activation, so a
+    credential that is silently re-pointed at a different (or live) account
+    cannot inherit an old, trusted verification.
+    """
+    payload = "|".join(
+        (
+            str(broker or "").strip().lower(),
+            str(ctid or "").strip(),
+            str(broker_login or "").strip(),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# How long a broker demo verification stays trustworthy. Short enough that a
+# re-pointed credential cannot keep trading on a stale confirmation, long
+# enough that an operator does not have to re-verify every click.
+DEMO_VERIFICATION_TTL_SECONDS = 900
+
+
+def record_live_account_demo_verification(
+    account_id: str,
+    *,
+    is_demo: bool,
+    ctid: str | None = None,
+    broker_login: str | None = None,
+) -> LiveAccountConfig:
+    """Stamp an account as freshly broker-verified (or explicitly not demo).
+
+    Only call this from a path that has just talked to the broker. It is the
+    single writer of ``demo_verified_at``/``identity_fingerprint``.
+    """
+    normalized_id = str(account_id or "").strip()
+    if not normalized_id:
+        raise ValueError("account_id is required to record a demo verification")
+    init_db()
+    now = _utcnow_naive()
+    with get_session() as session:
+        record = session.get(LiveAccountModel, normalized_id)
+        if record is None:
+            raise ValueError(f"Unknown live account '{account_id}'")
+        record.is_demo = bool(is_demo)
+        if ctid is not None:
+            record.ctid = ctid
+        if broker_login is not None:
+            record.broker_login = broker_login
+        record.identity_fingerprint = live_account_identity_fingerprint(
+            record.broker, ctid=record.ctid, broker_login=record.broker_login
+        )
+        record.demo_verified_at = now
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record.to_live_account()
+
+
+def _activation_block_reason(account: LiveAccountModel | None) -> str | None:
+    """Return why activation must be refused, or None when it may proceed.
+
+    Fail-closed on every uncertainty: unknown account, not verified demo, no
+    verification on record, or a verification that has aged out.
+    """
+    if account is None:
+        return "account is unknown"
+    if not bool(account.is_demo):
+        return "account is non-demo and not verified as demo"
+    verified_at = account.demo_verified_at
+    if verified_at is None:
+        return "account has no broker demo verification on record"
+    if isinstance(verified_at, datetime):
+        age = (_utcnow_naive() - verified_at).total_seconds()
+    else:
+        try:
+            age = (_utcnow_naive() - datetime.fromisoformat(str(verified_at))).total_seconds()
+        except ValueError:
+            return "account demo verification timestamp is unreadable"
+    if age > DEMO_VERIFICATION_TTL_SECONDS:
+        return (
+            "account demo verification is older than "
+            f"{DEMO_VERIFICATION_TTL_SECONDS}s; re-verify with the broker"
+        )
+    return None
+
+
 def update_live_deployment_status(
     deployment_id: str, status: str
 ) -> LiveDeploymentConfig | None:
+    normalized_id = str(deployment_id or "").strip()
     next_status = str(status or "").upper()
     if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
         raise ValueError(f"Invalid live deployment status '{status}'")
     init_db()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, deployment_id)
+        record = session.get(LiveDeploymentModel, normalized_id)
         if record is None:
             return None
+        if next_status == "ACTIVE":
+            account = session.get(LiveAccountModel, record.account_id)
+            block_reason = _activation_block_reason(account)
+            if block_reason is not None:
+                raise ValueError(
+                    f"Refusing to activate a deployment: {block_reason}"
+                )
         record.status = next_status
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_live_deployment()
+
+
+def update_live_deployment_account(
+    deployment_id: str,
+    account_id: str,
+    *,
+    allow_active: bool = False,
+) -> LiveDeploymentConfig | None:
+    """Re-point a deployment at a different broker account.
+
+    This is a safety-critical operation, so it is deliberately narrow:
+
+    * the target account must exist and be a verified demo account;
+    * an ACTIVE deployment is never re-pointed unless ``allow_active`` is set
+      explicitly, because the running listener and its adapter still hold the
+      old account until the next sync;
+    * submissions already in flight for the old account are refused, since
+      letting them land would trade the old account after the re-point.
+
+    Returns None when the deployment does not exist.
+    """
+    normalized_deployment = str(deployment_id or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_deployment or not normalized_account:
+        raise ValueError("deployment_id and account_id are required")
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized_deployment)
+        if record is None:
+            return None
+
+        account = session.get(LiveAccountModel, normalized_account)
+        if account is None:
+            raise ValueError(f"Refusing to re-point at unknown account '{account_id}'")
+        if not bool(account.is_demo):
+            raise ValueError(
+                "Refusing to re-point a deployment at an account that is not "
+                "verified as demo"
+            )
+
+        current_status = str(record.status or "").strip().upper()
+        if current_status == "ACTIVE" and not allow_active:
+            raise ValueError(
+                "Refusing to re-point an ACTIVE deployment; pause it first "
+                "(or pass allow_active=True once the listener is stopped)"
+            )
+
+        in_flight = session.exec(
+            select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
+                LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment
+            )
+        ).one()
+        if int(in_flight or 0) > 0:
+            raise ValueError(
+                "Refusing to re-point a deployment with in-flight submissions; "
+                "drain them first"
+            )
+
+        record.account_id = normalized_account
         record.updated_at = _utcnow_naive()
         session.add(record)
         session.commit()
@@ -2092,6 +2394,11 @@ def delete_live_deployment(deployment_id: str) -> bool:
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return False
+        session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                LiveDeploymentSubmissionClaimModel.deployment_id == deployment_id
+            )
+        )
         session.delete(record)
         session.commit()
     return True
@@ -2473,13 +2780,17 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.exec(delete(DrawingRecord).where(DrawingRecord.backtest_id == backtest_id))
         session.exec(delete(IndicatorRecord).where(IndicatorRecord.backtest_id == backtest_id))
 
+        persisted_data = dict(result.meta.data or {})
+        persisted_data.setdefault("duration_days", int(result.meta.duration_days or 0))
+        persisted_data.setdefault("total_bars", int(result.meta.total_bars or 0))
+
         backtest_record = BacktestRecord(
             id=backtest_id,
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,
             backtest_end=result.meta.backtest_end,
-            data=result.meta.data,
+            data=persisted_data,
             initial_capital=result.meta.initial_capital,
             parameters=result.meta.parameters,
             tags_json=result.meta.tags or [],
@@ -2687,6 +2998,10 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "timeframe": timeframe,
         "start_date": str(backtest.backtest_start or ""),
         "end_date": str(backtest.backtest_end or ""),
+        "duration_days": max(int(_safe_stat_number(data.get("duration_days"), 0.0)), 0),
+        "total_bars": max(int(_safe_stat_number(data.get("total_bars"), 0.0)), 0),
+        "initial_capital": _safe_stat_number(backtest.initial_capital, 100_000.0),
+        "total_pnl": _safe_stat_number(stats.get("total_pnl"), 0.0),
         "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
         "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
         "sharpe_ratio": _safe_stat_number(stats.get("sharpe_ratio"), 0.0),
@@ -3740,6 +4055,9 @@ def _build_backtest_equity_curve(equity_rows: list[Any]) -> list[EquityPointMode
 
 
 def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
+    data = dict(backtest.data or {})
+    duration_days = max(int(_safe_stat_number(data.get("duration_days"), 0.0)), 0)
+    total_bars = max(int(_safe_stat_number(data.get("total_bars"), 0.0)), 0)
     return BacktestMeta(
         id=backtest.id,
         created_at=backtest.created_at,
@@ -3747,11 +4065,13 @@ def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
         strategies=backtest.strategies or [],
         backtest_start=backtest.backtest_start,
         backtest_end=backtest.backtest_end,
-        data=backtest.data or {},
+        data=data,
         initial_capital=backtest.initial_capital,
         parameters=backtest.parameters or {},
         tags=backtest.tags_json or [],
         notes=backtest.notes or "",
+        duration_days=duration_days,
+        total_bars=total_bars,
     )
 
 

@@ -125,6 +125,7 @@ def ensure_backtest_data(
         if not _has_required_coverage(data_root, requirement)
     ]
     if not missing:
+        _fail_on_internal_gaps(data_root, requirements)
         return []
 
     downloaded: list[dict[str, Any]] = []
@@ -189,6 +190,7 @@ def ensure_backtest_data(
                 f"Downloaded data for {requirement.symbol} {requirement.timeframe}",
             )
 
+    _fail_on_internal_gaps(data_root, requirements)
     _invalidate_catalog_cache(data_root)
     return downloaded
 
@@ -197,6 +199,17 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     if data_dir:
         return Path(data_dir).expanduser().resolve()
     return DATA_DIR
+
+
+def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    for requirement in requirements:
+        report = analyze_ohlcv_coverage(data_root, requirement)
+        if report.get("status") == "failed":
+            raise RuntimeError(
+                "OHLCV coverage has internal gaps for "
+                f"{requirement.symbol} {requirement.timeframe}: "
+                f"{report.get('gaps') or report.get('error')}"
+            )
 
 
 def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
@@ -547,6 +560,18 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
     return min(starts), max(ends)
 
 
+def _gaps_overlapping_window(
+    gaps: list[dict[str, object]], start: str | None, end: str | None
+) -> list[dict[str, object]]:
+    if start is None or end is None:
+        return gaps
+    return [
+        gap
+        for gap in gaps
+        if str(gap.get("end", "")) > start and str(gap.get("start", "")) < end
+    ]
+
+
 def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dict[str, Any]:
     """Report coverage for one requirement, including internal holes.
 
@@ -564,13 +589,13 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         gaps.extend(find_internal_gaps(candidate, timeframe))
 
     error: str | None = None
+    required_start = _normalize_coverage_date(requirement.start)
+    required_end = _normalize_coverage_date(requirement.end)
     if bounds is None:
         error = (
             f"No {requirement.symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
         )
     else:
-        required_start = _normalize_coverage_date(requirement.start)
-        required_end = _normalize_coverage_date(requirement.end)
         if required_start is not None and required_start < bounds[0]:
             error = (
                 f"Requested start {required_start} is before stored coverage start {bounds[0]}"
@@ -578,9 +603,15 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         elif required_end is not None and required_end > bounds[1]:
             error = f"Requested end {required_end} is after stored coverage end {bounds[1]}"
 
-    significant_gaps = [
-        gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
-    ]
+    significant_gaps = _gaps_overlapping_window(
+        [
+            gap
+            for gap in gaps
+            if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
+        ],
+        required_start,
+        required_end,
+    )
 
     if error or significant_gaps:
         status = "failed"

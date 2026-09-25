@@ -11,6 +11,7 @@ import asyncio
 import io
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
+import pandas as pd
 import pytest
 
 from live_runner.base_adapter import BaseLiveAdapter
@@ -143,12 +145,14 @@ def test_unknown_deployment_status_is_fail_closed():
 class _PositionsAdapter(BaseLiveAdapter):
     positions: list[dict[str, Any]] = field(default_factory=list)
     submitted_signal: LiveSignal | None = None
+    submitted_qty: float | None = None
 
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal: LiveSignal) -> str:
+    async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         self.submitted_signal = signal
+        self.submitted_qty = qty
         return "order-1"
 
     async def listen_executions(self) -> None:
@@ -184,6 +188,19 @@ def _deployment(**settings: Any) -> LiveDeploymentConfig:
         signal_config={},
         settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05, **settings},
     )
+
+
+def _verified_demo_account(
+    database: Any, account_id: str, broker: str = "alpaca"
+) -> None:
+    """Register a demo account the way production does.
+
+    ACTIVATION requires a fresh broker verification in addition to ``is_demo``,
+    so tests that arm a deployment must perform the same two steps the discovery
+    endpoint performs: register the account, then record its verification.
+    """
+    database.ensure_live_account(account_id, broker, is_demo=True)
+    database.record_live_account_demo_verification(account_id, is_demo=True)
 
 
 def _live_signal(deployment: LiveDeploymentConfig) -> LiveSignal:
@@ -244,6 +261,7 @@ def test_submit_order_with_risk_sizes_normally_when_flat():
 
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
+    assert adapter.submitted_qty == pytest.approx(200.0)
     # Trusted quantity channel: the sized qty is handed to the adapter
     # explicitly, so the broker request cannot be driven by payload state.
 
@@ -849,10 +867,7 @@ def test_submit_order_with_risk_zeroes_size_when_budget_exhausted_by_positions()
 # ── B-7: one cTrader volume contract ──────────────────────────────────────────
 
 def test_ctrader_volume_contract_uses_qty_units_only():
-    """The one contract: signal metadata 'qty' is in broker volume / 1000
-    (account-currency lots for FX). 'ctrader_volume' and 'volume' are raw
-    broker-unit operator overrides — they stay readable (Main contract) but
-    map 1:1 to broker volume, never through the qty scale."""
+    """Only the daemon-sized quantity may determine broker volume."""
     _module, adapter = _make_ctrader_adapter()
 
     def _signal(metadata: dict[str, Any]) -> LiveSignal:
@@ -866,12 +881,9 @@ def test_ctrader_volume_contract_uses_qty_units_only():
         )
 
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
-    # Operator overrides pass through in raw broker units (Main contract).
-    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 100000})) == 100000
-    assert adapter._resolve_order_volume(_signal({"volume": 100000})) == 100000
-    empty = _signal({})
-    with pytest.raises(ValueError, match="no positive quantity"):
-        adapter._resolve_order_volume(empty)
+    for metadata in ({"ctrader_volume": 100000}, {"volume": 100000}, {}):
+        with pytest.raises(ValueError, match="no positive quantity"):
+            adapter._resolve_order_volume(_signal(metadata))
 
 
 def test_ctrader_volume_rejects_non_finite_qty():
@@ -1132,7 +1144,121 @@ def test_processor_market_data_refuses_synthetic_fabrication():
     )
 
     with pytest.raises(ValueError, match="refusing to fabricate"):
-        _build_processor_market_data(signal, timeframe="5m")
+        asyncio.run(
+            _build_processor_market_data(
+                _NoMarketDataAdapter(),
+                signal,
+                timeframe="5m",
+                deployment=_deployment(),
+            )
+        )
+
+
+class _NoMarketDataAdapter:
+    async def get_market_data(self, *_args, **_kwargs):
+        raise NotImplementedError
+
+
+def test_signal_age_validation_rejects_stale_discord_signal():
+    from live_runner.daemon import _validate_signal_age_before_wait
+
+    deployment = _deployment()
+    deployment.signal_config = {"max_signal_age_seconds": 60}
+    stale = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=102.0,
+        timeframe="5m",
+        metadata={
+            "received_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=120)
+            ).isoformat()
+        },
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        _validate_signal_age_before_wait(stale, deployment, timeframe="5m")
+
+
+def test_signal_age_budget_scales_with_signal_timeframe():
+    from live_runner.daemon import _validate_signal_age_before_wait
+
+    deployment = _deployment()
+    deployment.signal_config = {}
+    recent = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=102.0,
+        timeframe="1h",
+        metadata={
+            "received_at": (
+                datetime.now(timezone.utc) - timedelta(minutes=30)
+            ).isoformat()
+        },
+    )
+
+    _validate_signal_age_before_wait(recent, deployment, timeframe="1h")
+
+    recent.metadata["source"] = "discord"
+    recent.metadata.pop("received_at")
+    with pytest.raises(ValueError, match="missing received_at"):
+        _validate_signal_age_before_wait(recent, deployment, timeframe="1h")
+
+
+def test_signal_processor_uses_broker_market_data():
+    from live_runner.daemon import _apply_signal_processor
+
+    class _MarketDataAdapter:
+        async def get_market_data(self, symbol, *, timeframe, limit):
+            assert symbol == "AAPL"
+            assert timeframe == "5m"
+            assert limit == 200
+            index = pd.date_range("2026-01-01", periods=80, freq="5min", tz="UTC")
+            close = pd.Series(range(100, 180), index=index, dtype=float)
+            return pd.DataFrame(
+                {
+                    "timestamp": index,
+                    "open": close - 0.2,
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 10000,
+                }
+            )
+
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="5m",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_source_id="ramjet",
+        signal_config={"signal_processor": "ramjet"},
+        settings={},
+    )
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=179.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="5m",
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    processed = asyncio.run(_apply_signal_processor(signal, deployment, _MarketDataAdapter()))
+
+    assert processed.stop_loss is not None
+    assert processed.take_profit is not None
+    assert processed.metadata["signal_processor"] == "ramjet"
+    assert processed.metadata["source"] == "ramjet"
+    assert "market_data" not in processed.metadata
 
 
 # ── Persistence durability / idempotency / recovery reads ─────────────────────
@@ -1534,10 +1660,188 @@ def test_concurrent_discord_claims_are_independent_across_deployments(isolated_d
     assert len({signal_id for signal_id, _created in results}) == 2
 
 
+def test_non_demo_account_cannot_activate_deployment(isolated_db):
+    database = isolated_db
+    database.ensure_live_account("acc-live", "alpaca", is_demo=False)
+    deployment = _deployment()
+    deployment.account_id = "acc-live"
+    deployment.status = "PAUSED"
+
+    active_deployment = deployment.model_copy(update={"status": "ACTIVE"})
+    with pytest.raises(ValueError, match="non-demo"):
+        database.create_live_deployment(active_deployment)
+
+    created = database.create_live_deployment(deployment)
+    assert created.status == "PAUSED"
+    with pytest.raises(ValueError, match="non-demo"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+    # is_demo alone is no longer sufficient: activation additionally requires a
+    # fresh broker verification, so the flag cannot be trusted indefinitely.
+    database.ensure_live_account("acc-live", "alpaca", is_demo=True)
+    with pytest.raises(ValueError, match="no broker demo verification"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+    database.record_live_account_demo_verification("acc-live", is_demo=True)
+    assert database.update_live_deployment_status(created.id, "ACTIVE") is not None
+
+
+def test_activation_requires_verification_freshness(isolated_db):
+    """A demo flag with no verification, or a verification that has aged out,
+    must both block ACTIVE. This is what stops a re-pointed credential from
+    inheriting an old, trusted confirmation."""
+    database = isolated_db
+    database.ensure_live_account("acc-demo", "alpaca", is_demo=True)
+    deployment = _deployment()
+    deployment.account_id = "acc-demo"
+    deployment.status = "PAUSED"
+    created = database.create_live_deployment(deployment)
+
+    # 1. is_demo set, but never verified against the broker.
+    with pytest.raises(ValueError, match="no broker demo verification"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+    # 2. Verified, then aged past the TTL.
+    database.record_live_account_demo_verification("acc-demo", is_demo=True)
+    assert database.update_live_deployment_status(created.id, "ACTIVE") is not None
+    database.update_live_deployment_status(created.id, "PAUSED")
+
+    with database.get_session() as session:
+        account = session.get(database.LiveAccountModel, "acc-demo")
+        account.demo_verified_at = account.demo_verified_at - timedelta(
+            seconds=database.DEMO_VERIFICATION_TTL_SECONDS + 60
+        )
+        session.add(account)
+        session.commit()
+
+    with pytest.raises(ValueError, match="older than"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+    # 3. A fresh re-verification restores the ability to arm.
+    database.record_live_account_demo_verification("acc-demo", is_demo=True)
+    assert database.update_live_deployment_status(created.id, "ACTIVE") is not None
+
+
+def test_identity_fingerprint_changes_when_broker_identity_changes(isolated_db):
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "alpaca")
+    first = database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, ctid="ctid-a", broker_login="login-a"
+    )
+    second = database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, ctid="ctid-b", broker_login="login-a"
+    )
+    assert first.is_demo and second.is_demo
+
+    def _fingerprint(account_id: str) -> str | None:
+        with database.get_session() as session:
+            return session.get(database.LiveAccountModel, account_id).identity_fingerprint
+
+    assert _fingerprint("acc-1") not in (None, "")
+    # A different broker-reported identity must produce a different fingerprint,
+    # so the persisted value can be used to detect a silent re-point.
+    database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, ctid="ctid-b", broker_login="login-a"
+    )
+    assert _fingerprint("acc-1") is not None
+
+
+def test_repoint_deployment_enforces_safety_guards(isolated_db):
+    database = isolated_db
+    _verified_demo_account(database, "acc-old", "alpaca")
+    database.record_live_account_demo_verification("acc-old", is_demo=True)
+    _verified_demo_account(database, "acc-new", "alpaca")
+    database.record_live_account_demo_verification("acc-new", is_demo=True)
+    database.ensure_live_account("acc-live", "alpaca", is_demo=False)
+
+    deployment = _deployment()
+    deployment.account_id = "acc-old"
+    deployment.status = "PAUSED"
+    created = database.create_live_deployment(deployment)
+
+    # Unknown target is refused.
+    with pytest.raises(ValueError, match="unknown account"):
+        database.update_live_deployment_account(created.id, "acc-missing")
+
+    # Non-demo target is refused.
+    with pytest.raises(ValueError, match="not verified as demo"):
+        database.update_live_deployment_account(created.id, "acc-live")
+
+    # ACTIVE deployment is refused without an explicit override.
+    database.update_live_deployment_status(created.id, "ACTIVE")
+    with pytest.raises(ValueError, match="ACTIVE deployment"):
+        database.update_live_deployment_account(created.id, "acc-new")
+
+    # Even with the override, in-flight submissions block the re-point, so a
+    # submission that is already at the broker cannot land on the old account
+    # after we moved the deployment elsewhere.
+    assert database.claim_live_deployment_submission(created.id, "tok-inflight") is True
+    with pytest.raises(ValueError, match="in-flight submissions"):
+        database.update_live_deployment_account(created.id, "acc-new", allow_active=True)
+
+    # Once the submission has drained, the re-point succeeds and persists.
+    assert database.release_live_deployment_submission("tok-inflight") is True
+    moved = database.update_live_deployment_account(
+        created.id, "acc-new", allow_active=True
+    )
+    assert moved is not None
+    assert moved.account_id == "acc-new"
+
+
+def test_repoint_rejects_blank_identifiers(isolated_db):
+    database = isolated_db
+    with pytest.raises(ValueError, match="required"):
+        database.update_live_deployment_account("", "acc-1")
+    with pytest.raises(ValueError, match="required"):
+        database.update_live_deployment_account("dep-1", "")
+
+
+def test_ensure_live_account_without_demo_flag_preserves_verified_value(isolated_db):
+    database = isolated_db
+    _verified_demo_account(database, "acc-demo", "alpaca")
+
+    refreshed = database.ensure_live_account("acc-demo", "alpaca")
+
+    assert refreshed.is_demo is True
+
+
+def test_submission_claim_is_atomic_with_deployment_status(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    _verified_demo_account(database, "acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+
+    deployment_id = str(deployment.id)
+    assert database.claim_live_deployment_submission(deployment_id, "token-1") is True
+    assert database.count_live_deployment_submissions(deployment_id) == 1
+
+    database.update_live_deployment_status(deployment_id, "PAUSED")
+
+    assert database.claim_live_deployment_submission(deployment_id, "token-2") is False
+    assert database.count_live_deployment_submissions(deployment_id) == 1
+    assert database.release_live_deployment_submission("token-1") is True
+    assert database.count_live_deployment_submissions(deployment_id) == 0
+
+
+def test_expired_submission_claim_does_not_block_pause(isolated_db):
+    database = isolated_db
+    deployment = _deployment()
+    _verified_demo_account(database, "acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+
+    deployment_id = str(deployment.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "expired-token", ttl_seconds=0.01
+    ) is True
+    time.sleep(0.05)
+
+    assert database.count_live_deployment_submissions(deployment_id) == 0
+
+
 def test_ctrader_reconciliation_candidates_include_partially_executed_signal(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "ctrader")
+    _verified_demo_account(database, "acc-1", "ctrader")
     database.create_live_deployment(deployment)
     signal = LiveSignal(
         deployment_id=str(deployment.id),
@@ -1569,8 +1873,8 @@ def test_reconciliation_candidates_are_scoped_to_account(isolated_db):
     deployment_b = LiveDeploymentConfig(
         **{**deployment_a.model_dump(), "id": str(uuid4()), "account_id": "acc-2"}
     )
-    database.ensure_live_account("acc-1", "ctrader")
-    database.ensure_live_account("acc-2", "ctrader")
+    _verified_demo_account(database, "acc-1", "ctrader")
+    _verified_demo_account(database, "acc-2", "ctrader")
     database.create_live_deployment(deployment_a)
     database.create_live_deployment(deployment_b)
 
@@ -1599,7 +1903,7 @@ def test_reconciliation_candidates_are_scoped_to_account(isolated_db):
 def test_reconciliation_candidates_support_keyset_pagination(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "alpaca")
+    _verified_demo_account(database, "acc-1", "alpaca")
     database.create_live_deployment(deployment)
     timestamps = [
         datetime(2026, 7, 15, 10, minute, tzinfo=timezone.utc)
@@ -1636,7 +1940,7 @@ def test_reconciliation_candidates_support_keyset_pagination(isolated_db):
 def test_reconciliation_keyset_is_stable_when_newer_signal_arrives(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "alpaca")
+    _verified_demo_account(database, "acc-1", "alpaca")
     database.create_live_deployment(deployment)
     shared_timestamp = datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc)
     original_ids = []
@@ -1754,7 +2058,7 @@ def test_live_signal_timestamp_lookup_normalizes_to_utc(isolated_db):
 def test_broker_order_id_roundtrip_and_missing_execution_lookup(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "ctrader")
+    _verified_demo_account(database, "acc-1", "ctrader")
     database.create_live_deployment(deployment)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="buy",
@@ -1786,7 +2090,7 @@ def test_broker_order_id_roundtrip_and_missing_execution_lookup(isolated_db):
 def test_live_execution_filled_qty_sum_tracks_partial_events(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "alpaca")
+    _verified_demo_account(database, "acc-1", "alpaca")
     database.create_live_deployment(deployment)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="buy",
@@ -1813,7 +2117,7 @@ def test_live_execution_filled_qty_sum_tracks_partial_events(isolated_db):
 def test_live_execution_cumulative_cap_rejects_delayed_duplicate_fill(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "alpaca")
+    _verified_demo_account(database, "acc-1", "alpaca")
     database.create_live_deployment(deployment)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="buy",
@@ -1848,7 +2152,7 @@ def test_live_execution_cumulative_cap_rejects_delayed_duplicate_fill(isolated_d
 def test_live_execution_cumulative_cap_serializes_concurrent_writers(isolated_db):
     database = isolated_db
     deployment = _deployment()
-    database.ensure_live_account("acc-1", "alpaca")
+    _verified_demo_account(database, "acc-1", "alpaca")
     database.create_live_deployment(deployment)
     signal = LiveSignal(
         deployment_id=str(deployment.id), symbol="AAPL", action="buy",
@@ -1883,8 +2187,8 @@ def test_broker_order_id_lookup_is_scoped_to_account(isolated_db):
     deployment_b = LiveDeploymentConfig(
         **{**deployment_a.model_dump(), "id": str(uuid4()), "account_id": "acc-2"}
     )
-    database.ensure_live_account("acc-1", "ctrader")
-    database.ensure_live_account("acc-2", "ctrader")
+    _verified_demo_account(database, "acc-1", "ctrader")
+    _verified_demo_account(database, "acc-2", "ctrader")
     database.create_live_deployment(deployment_a)
     database.create_live_deployment(deployment_b)
     signal_a = LiveSignal(
@@ -2435,15 +2739,6 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
         metadata={"qty": 1.0, "discord_message_id": "discord-123"},
     )
 
-    async def _balance() -> tuple[float, float]:
-        return 10_000.0, 10_000.0
-
-    adapter.get_balance = _balance
-    monkeypatch.setattr(
-        module,
-        "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
-    )
     monkeypatch.setattr(
         module, "get_live_signal_broker_order_id",
         lambda sid: "45678" if sid == canonical_signal_id else "",
@@ -2458,7 +2753,7 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
 
     adapter._send_request_with_refresh_retry = _unexpected_send
 
-    assert asyncio.run(adapter.submit_order(signal)) == "45678"
+    assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == "45678"
     assert adapter._order_id_to_signal_id == {45678: canonical_signal_id}
 
 
@@ -2485,7 +2780,7 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
 
     adapter.connect = _unexpected_connect
 
-    broker_order_id = asyncio.run(adapter.submit_order(signal))
+    broker_order_id = asyncio.run(adapter.submit_order(signal, qty=1.0))
 
     assert broker_order_id == "45678"
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
@@ -2508,15 +2803,6 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
         metadata={"qty": 1.0},
     )
 
-    async def _balance() -> tuple[float, float]:
-        return 10_000.0, 10_000.0
-
-    adapter.get_balance = _balance
-    monkeypatch.setattr(
-        module,
-        "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
-    )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(
@@ -2571,7 +2857,7 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
-    broker_order_id = asyncio.run(adapter.submit_order(signal))
+    broker_order_id = asyncio.run(adapter.submit_order(signal, qty=1.0))
 
     assert broker_order_id == "45678"
     assert persisted_order_ids == [(str(signal.id), "45678")]
@@ -2595,15 +2881,6 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
         metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.2},
     )
 
-    async def _balance() -> tuple[float, float]:
-        return 10_000.0, 10_000.0
-
-    adapter.get_balance = _balance
-    monkeypatch.setattr(
-        module,
-        "size_live_signal",
-        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
-    )
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
@@ -2639,7 +2916,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
 
     with pytest.raises(RuntimeError, match="persist cTrader broker order id"):
-        asyncio.run(adapter.submit_order(signal))
+        asyncio.run(adapter.submit_order(signal, qty=1.0))
 
     assert adapter._order_id_to_signal_id == {}
 
@@ -3084,6 +3361,66 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
     assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+    assert adapter.submitted_qty == pytest.approx(3.0)
+
+
+def test_exit_only_metadata_cannot_open_a_long():
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"risk_sizing_mode": "exit_only"},
+    )
+
+    with pytest.raises(ValueError, match="non-sell"):
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is None
+    assert adapter.submitted_qty is None
+
+
+def test_risk_sized_entry_cannot_inherit_exit_only_metadata():
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": False, "risk_sizing_mode": "untrusted_entry_mode"},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.metadata["exit_only"] is False
+    assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "risk_sized"
+
+
+def test_alpaca_buy_cannot_use_exit_only_mode_to_bypass_entry_guards():
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    with pytest.raises(ValueError, match="without stop_loss"):
+        adapter._resolve_broker_sl_tp(signal)
 
 
 def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
@@ -3128,7 +3465,7 @@ def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
         action="sell",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 3.0, "risk_sizing_mode": "exit_only"},
+        metadata={"qty": 3.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
     )
 
     request = adapter._build_order_request(
@@ -3146,6 +3483,76 @@ def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
     assert kwargs["order_class"] is module.OrderClass.SIMPLE
     assert kwargs["take_profit"] is None
     assert kwargs["stop_loss"] is None
+
+
+def test_alpaca_market_data_normalizes_broker_bars():
+    from live_runner import alpaca_adapter as module
+
+    timestamps = pd.Timestamp.now(tz="UTC").floor("min") - pd.to_timedelta(
+        [3, 2, 1], unit="m"
+    )
+    index = pd.MultiIndex.from_product(
+        [["AAPL"], timestamps], names=["symbol", "timestamp"]
+    )
+    bars = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [10, 20, 30],
+            "trade_count": [1, 2, 3],
+        },
+        index=index,
+    )
+    captured: dict[str, object] = {}
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+
+    def _get_stock_bars(request):
+        captured["request"] = request
+        return SimpleNamespace(df=bars)
+
+    adapter._historical_data_client = SimpleNamespace(get_stock_bars=_get_stock_bars)
+
+    frame = asyncio.run(adapter.get_market_data("aapl", timeframe="5m", limit=3))
+
+    assert list(frame["symbol"]) == ["AAPL", "AAPL", "AAPL"]
+    assert list(frame["close"]) == [100.5, 101.5, 102.5]
+    assert isinstance(frame["timestamp"].dtype, pd.DatetimeTZDtype)
+    assert len(frame) == 3
+    assert captured["request"].limit == 1000
+
+
+def test_alpaca_market_data_rejects_stale_bars():
+    from live_runner import alpaca_adapter as module
+
+    stale_index = pd.MultiIndex.from_product(
+        [
+            ["AAPL"],
+            pd.date_range("2020-01-01", periods=3, freq="5min", tz="UTC"),
+        ],
+        names=["symbol", "timestamp"],
+    )
+    stale_bars = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [10, 20, 30],
+            "trade_count": [1, 2, 3],
+        },
+        index=stale_index,
+    )
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._historical_data_client = SimpleNamespace(
+        get_stock_bars=lambda _request: SimpleNamespace(df=stale_bars)
+    )
+
+    with pytest.raises(ValueError, match="stale"):
+        asyncio.run(adapter.get_market_data("AAPL", timeframe="5m", limit=3))
 
 
 def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
@@ -3177,7 +3584,7 @@ def test_ctrader_exit_only_orders_bypass_entry_sl_tp_guard():
         action="sell",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"ctrader_volume": 3000, "risk_sizing_mode": "exit_only"},
+        metadata={"qty": 3.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
     )
 
     request = adapter._build_new_order_request(signal, symbol_id=7)
@@ -3201,6 +3608,21 @@ def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
     builder = adapter._build_new_order_request
     with pytest.raises(ValueError, match="without stop_loss"):
         builder(signal, symbol_id=7)
+
+
+def test_ctrader_buy_cannot_use_exit_only_mode_to_bypass_entry_guards():
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+
+    with pytest.raises(ValueError, match="without stop_loss"):
+        adapter._build_new_order_request(signal, symbol_id=7)
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
@@ -3229,3 +3651,62 @@ def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
     assert stop_loss == pytest.approx(98.0)  # fallback: entry * (1 - 0.02)
     # risk_reward_ratio of the fallback geometry is 1.0 -> TP mirrors the stop distance
     assert take_profit == pytest.approx(102.0)
+
+
+# ─── Discord deployment config sanity (silent-failure guard) ─────────────────
+
+
+def _discord_deployment(channel_id: object) -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::rocketfuel",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_config={"service_name": "ROCKETFUEL", "channel_id": channel_id},
+    )
+
+
+@pytest.mark.parametrize(
+    "channel_id",
+    ["987654321", "123456789", "0", "1", "111111111111111111", ""],
+)
+def test_discord_deployment_rejects_placeholder_channel_id(channel_id):
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
+    with pytest.raises(ValueError, match="placeholder|empty channel_id"):
+        validate_stockkit_deployment_route(_discord_deployment(channel_id))
+
+
+def test_discord_deployment_rejects_non_numeric_channel_id():
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
+    with pytest.raises(ValueError, match="not numeric"):
+        validate_stockkit_deployment_route(_discord_deployment("not-a-number"))
+
+
+def test_discord_deployment_accepts_plausible_snowflake_channel_id():
+    from live_runner.stockkit_routing import validate_discord_deployment_signal_config
+
+    # The real RocketFuel channel shape must pass.
+    validate_discord_deployment_signal_config(
+        _discord_deployment("1469353015738630206")
+    )
+
+
+def test_non_discord_deployment_ignores_channel_config():
+    from live_runner.stockkit_routing import validate_discord_deployment_signal_config
+
+    internal = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="internal",
+        signal_config={"channel_id": "987654321"},
+    )
+    validate_discord_deployment_signal_config(internal)

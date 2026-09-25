@@ -12,7 +12,6 @@ import ast
 import csv
 import inspect
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -250,6 +249,7 @@ class PyneCoreAdapter(EngineAdapter):
         # Fail before any per-symbol work when the CLI is absent.
         _resolve_pyne_bin()
         all_trades: list[Trade] = []
+        all_data_paths: list[str] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
         trade_counter = 0
@@ -264,7 +264,12 @@ class PyneCoreAdapter(EngineAdapter):
             # after parsing.
             load_start = _effective_load_start(config)
             df = _load_ohlcv(
-                data_root, symbol, config.timeframe, load_start, config.end_date
+                data_root,
+                symbol,
+                config.timeframe,
+                load_start,
+                config.end_date,
+                data_source=config.data_source,
             )
             if df is None or df.empty:
                 # Same rule as the native/vectorbt adapters (F24): a symbol with
@@ -275,6 +280,9 @@ class PyneCoreAdapter(EngineAdapter):
                     "refusing to run a silent empty PyneCore backtest"
                 )
 
+            source_path = str(df.attrs.get("ohlcv_source_path") or "")
+            if source_path:
+                all_data_paths.append(source_path)
             total_bars += len(df)
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
@@ -302,6 +310,16 @@ class PyneCoreAdapter(EngineAdapter):
             stats=all_stats,
             drawings=all_drawings,
         )
+        path_metadata = [contract.ohlcv_path_metadata(path) for path in all_data_paths]
+        result.meta.data = result.meta.data or {}
+        result.meta.data["source"] = ",".join(
+            sorted({item["source"] for item in path_metadata if item["source"]})
+        ) or "ohlcv"
+        result.meta.data["asset_classes"] = sorted(
+            {item["asset_class"] for item in path_metadata if item["asset_class"]}
+        )
+        result.meta.data["data_files"] = all_data_paths
+        result.meta.data["requested_data_source"] = config.data_source
         # Conformance (Cleanup 16-A): every engine exposes the canonical
         # BacktestStats key set; the engine-specific strategy stats are merged
         # on top of the derived ones. Contract §6: engine keys may add, never
@@ -327,6 +345,7 @@ class PyneCoreAdapter(EngineAdapter):
             Path(config.data_dir) if config.data_dir else DATA_DIR,
             symbol,
             config.timeframe,
+            data_source=config.data_source,
         )
         trades: list[Trade] = []
         stats: dict[str, Any] = {}
@@ -468,7 +487,7 @@ def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -
     equity = config.initial_capital
     curve: list[EquityPoint] = []
     for trade in sorted(all_trades, key=lambda item: item.entry_time):
-        equity += trade.pnl
+        equity += trade.net_pnl if trade.net_pnl is not None else trade.pnl
         curve.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
     return curve
 
@@ -919,14 +938,18 @@ def _load_ohlcv(
     timeframe: str,
     start_date: str,
     end_date: str,
+    *,
+    data_source: str = "",
 ) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol."""
-    ohlcv_root = data_root / "ohlcv"
-    matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
-    if not matches:
+    selected_path, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
+    )
+    if selected_path is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = pd.read_parquet(selected_path)
+    df.attrs["ohlcv_source_path"] = str(selected_path)
     df.columns = [c.lower() for c in df.columns]
     df = contract.normalize_ohlcv_frame(df)
 
@@ -939,16 +962,15 @@ def _load_ohlcv(
     return df.reset_index(drop=True)
 
 
-def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
-    matches = list((data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"))
-    if not matches:
+def _infer_asset_class(
+    data_root: Path, symbol: str, timeframe: str, *, data_source: str = ""
+) -> str:
+    selected, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
+    )
+    if selected is None:
         return "unknown"
-    parts = matches[0].parts
-    try:
-        ohlcv_idx = parts.index("ohlcv")
-        return parts[ohlcv_idx + 2].lower()
-    except (ValueError, IndexError):
-        return "unknown"
+    return contract.ohlcv_path_metadata(selected)["asset_class"] or "unknown"
 
 
 def _normalize_trade_exits(trades: list[Trade]) -> None:

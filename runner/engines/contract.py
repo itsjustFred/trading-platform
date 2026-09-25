@@ -25,6 +25,7 @@ with different semantics. It does not unify the three execution-timing models
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
@@ -36,6 +37,8 @@ __all__ = [
     "flag_missing_intrabar",
     "parse_date_bound",
     "resolve_same_bar_exit",
+    "select_ohlcv_path",
+    "ohlcv_path_metadata",
     "normalize_intrabar_resolution",
     "resolve_intrabar_timeframe",
     "EngineStatsKeys",
@@ -183,6 +186,77 @@ def apply_date_filter(
             frame[timestamp_column] <= parse_date_bound(end, is_end=True)
         ]
     return frame
+
+
+def ohlcv_path_metadata(path: str | Path) -> dict[str, str]:
+    resolved = Path(path)
+    parts = list(resolved.parts)
+    try:
+        root_index = next(
+            index for index, part in enumerate(parts) if part.lower() == "ohlcv"
+        )
+    except StopIteration:
+        return {"source": "", "asset_class": "", "region": ""}
+    tail = parts[root_index + 1 :]
+    source = tail[0].lower() if len(tail) >= 1 else ""
+    asset_class = tail[1].lower() if len(tail) >= 2 else ""
+    region = tail[2].lower() if len(tail) >= 4 else ""
+    return {"source": source, "asset_class": asset_class, "region": region}
+
+
+def select_ohlcv_path(
+    data_root: str | Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    data_source: str = "",
+) -> tuple[Path | None, list[Path]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = str(timeframe or "").strip().lower()
+    root = Path(data_root) / "ohlcv"
+    candidates = sorted(
+        root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet")
+    )
+    if not candidates:
+        return None, []
+    requested_source = str(data_source or "").strip().lower()
+    if requested_source:
+        candidates = [
+            path
+            for path in candidates
+            if requested_source
+            in {
+                value
+                for value in ohlcv_path_metadata(path).values()
+                if value
+            }
+        ]
+        if not candidates:
+            raise ValueError(
+                f"No OHLCV candidate for {normalized_symbol}/{normalized_timeframe} "
+                f"matches data_source={data_source!r}"
+            )
+
+    metal_symbols = {"XAUUSD", "XAGUSD", "XAUEUR", "XAGEUR", "XAUGBP", "XAGGBP"}
+
+    def rank(path: Path) -> tuple[int, int, str]:
+        metadata = ohlcv_path_metadata(path)
+        asset_class = metadata["asset_class"]
+        if normalized_symbol in metal_symbols:
+            asset_rank = 0 if asset_class == "metals" else 1
+        elif len(normalized_symbol) == 6 and normalized_symbol.isalpha():
+            asset_rank = 0 if asset_class == "forex" else 1
+        else:
+            asset_rank = 0 if asset_class in {"equity", "equities", "stocks"} else 1
+        source_rank = {
+            "huggingface": 0,
+            "dukascopy": 1,
+            "yfinance": 2,
+            "alpaca": 3,
+        }.get(metadata["source"], 4)
+        return asset_rank, source_rank, str(path)
+
+    return min(candidates, key=rank), candidates
 
 
 # ─── OHLCV column normalization (bid_/ask_-prefixed feeds) ─────────────────
