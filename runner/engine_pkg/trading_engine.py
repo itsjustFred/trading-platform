@@ -602,6 +602,12 @@ class TradeEngine:
         # #84: exit legs accumulated gross into _realized_pnl — back the
         # costs out here so the equity path is net.
         self._realized_pnl -= fees
+        take_profit = None
+        if position.take_profit_levels:
+            first_level = position.take_profit_levels[0]
+            if first_level.get("price") is not None:
+                take_profit = float(first_level["price"])
+
         risk_per_share = abs(
             position.entry_price - (position.stop_loss or position.entry_price * 0.98)
         )
@@ -627,6 +633,8 @@ class TradeEngine:
             pnl_pct=float(pnl_pct),
             fees=fees,
             net_pnl=float(net_pnl),
+            stop_loss=position.stop_loss,
+            take_profit=take_profit,
             r_multiple=float(r_multiple) if r_multiple is not None else None,
             mae=float(position.mae),
             mfe=float(position.mfe),
@@ -682,7 +690,12 @@ class TradeEngine:
 
         self.positions = next_positions
 
-    def _flag_same_bar_fallback(self, position: Position, bar_time: pd.Timestamp, next_time: pd.Timestamp | None) -> None:
+    def _flag_same_bar_fallback(
+        self,
+        position: Position,
+        bar_time: pd.Timestamp,
+        next_time: pd.Timestamp | None,
+    ) -> None:
         """Record the stop-first fallback flag on the position's future trade.
 
         Decision Record (Cleanup 16-A): when intrabar data was requested but

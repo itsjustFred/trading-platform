@@ -6,7 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from shared.models import BacktestResult, Trade, TradeExit
+from shared.models import BacktestResult, EquityPoint, Trade, TradeExit
 from validation.reference import ALLOWED_FRAMEWORKS, ALLOWED_STATUSES, ValidationReference
 
 
@@ -117,6 +117,25 @@ class TestToBacktestResult:
         assert result.equity_curve == []
         assert result.indicators == []
         assert result.drawings == []
+
+    def test_missing_equity_evidence_is_explicit(self):
+        ref = _make_minimal_valid_reference()
+        result = ref.to_backtest_result()
+        assert ref.equity_evidence_status == "missing"
+        assert result.equity_curve == []
+        assert result.equity_evidence_status == "missing"
+
+    def test_equity_curve_is_preserved_with_available_status(self):
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0)]
+        ref = _make_minimal_valid_reference(equity_curve=curve)
+        result = ref.to_backtest_result()
+        assert ref.equity_evidence_status == "available"
+        assert result.equity_curve == curve
+        assert result.equity_evidence_status == "available"
+
+    def test_available_status_requires_curve(self):
+        with pytest.raises(ValueError, match="requires an equity curve"):
+            _make_minimal_valid_reference(equity_evidence_status="available")
 
     def test_notes_contains_source_info(self):
         ref = _make_minimal_valid_reference(source_path="/tmp/report.xlsx")

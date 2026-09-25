@@ -623,6 +623,8 @@ def test_real_export_keeps_metric_bases_and_equity_ohlc_separate(golden_referenc
     ]
     assert equity["last_point"][-1] == pytest.approx(1937840.1796)
     assert len(equity["points"]) == 5471
+    assert len(ref.equity_curve) == 5471
+    assert ref.equity_evidence_status == "available"
     assert "equity_curve" not in raw
 
 

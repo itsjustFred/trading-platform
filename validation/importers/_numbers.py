@@ -13,6 +13,7 @@ detected first (:func:`detect_decimal_comma`) and handed to
 
 from __future__ import annotations
 
+import math
 import re
 
 # German grouping: 1-3 leading digits then groups of exactly three, followed
@@ -25,18 +26,24 @@ def detect_decimal_comma(values: list[str | None]) -> bool:
     """Return True when any value proves the report uses German formatting.
 
     A value matching the German grouped pattern ("1.234,56") selects the
-    German convention; an ASCII grouped value ("12,345.67") would select the
-    ASCII convention.  Ambiguous or ungrouped values decide nothing.
+    German convention; an ASCII grouped value ("12,345.67") selects the
+    ASCII convention. Conflicting evidence raises ``ValueError``; ambiguous
+    or ungrouped values decide nothing.
     """
+    detected: bool | None = None
     for raw in values:
         text = _normalise_number(raw)
         if text is None:
             continue
         if _GERMAN_GROUPED.match(text):
-            return True
-        if _ASCII_GROUPED.match(text):
-            return False
-    return False
+            if detected is False:
+                raise ValueError("conflicting German and ASCII number formats")
+            detected = True
+        elif _ASCII_GROUPED.match(text):
+            if detected is True:
+                raise ValueError("conflicting German and ASCII number formats")
+            detected = False
+    return bool(detected)
 
 def _normalise_number(raw: str | None) -> str | None:
     """Return the stripped, separator-free text of *raw* (or None)."""
@@ -140,6 +147,8 @@ def parse_locale_number(raw: str | None, decimal_comma: bool) -> float | None:
         return None
 
     value = float(f"{digits}.{decimal}" if decimal else digits)
+    if not math.isfinite(value):
+        return None
     return -value if negative else value
 
 

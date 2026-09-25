@@ -295,6 +295,14 @@ class TestCostBasedTieBreak:
         assert len(result.matched) == 1
         assert result.matched[0][1].id == 3
 
+    def test_nonfinite_match_options_are_rejected(self) -> None:
+        from validation.comparison.matcher import TradeMatcher
+
+        with pytest.raises(ValueError, match="finite"):
+            TradeMatcher.match([], [], time_tolerance_seconds=float("nan"))
+        with pytest.raises(ValueError, match="finite"):
+            TradeMatcher.match([], [], price_weight=float("inf"))
+
     def test_exact_tie_keeps_lowest_index(self) -> None:
         from validation.comparison.matcher import TradeMatcher
 

@@ -354,6 +354,8 @@ class Trade:
     holding_bars: int | None = None  # entry to last exit
     tags: list[str] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -379,6 +381,8 @@ class Trade:
             "mae",
             "mfe",
             "holding_bars",
+            "stop_loss",
+            "take_profit",
         ):
             val = getattr(self, fld)
             if val is not None:
@@ -413,6 +417,8 @@ class Trade:
             holding_bars=d.get("holding_bars"),
             tags=d.get("tags", []),
             meta=d.get("meta", {}),
+            stop_loss=d.get("stop_loss"),
+            take_profit=d.get("take_profit"),
         )
 
     @property
@@ -719,6 +725,13 @@ class BacktestResult:
     stats: dict[str, Any] = field(default_factory=dict)
     indicators: list[IndicatorSeries] = field(default_factory=list)
     drawings: list[dict[str, Any]] = field(default_factory=list)
+    equity_evidence_status: Literal["unknown", "available", "missing"] = "unknown"
+
+    def __post_init__(self) -> None:
+        if self.equity_curve and self.equity_evidence_status == "unknown":
+            self.equity_evidence_status = "available"
+        if self.equity_evidence_status == "available" and not self.equity_curve:
+            raise ValueError("equity_evidence_status=available requires an equity curve")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -733,6 +746,8 @@ class BacktestResult:
             d["indicators"] = [i.to_dict() for i in self.indicators]
         if self.drawings:
             d["drawings"] = self.drawings
+        if self.equity_evidence_status != "unknown":
+            d["equity_evidence_status"] = self.equity_evidence_status
         return d
 
     @classmethod
@@ -744,6 +759,7 @@ class BacktestResult:
             stats=d.get("stats", {}),
             indicators=[IndicatorSeries.from_dict(i) for i in d.get("indicators", [])],
             drawings=d.get("drawings", []),
+            equity_evidence_status=d.get("equity_evidence_status", "unknown"),
         )
 
     def to_json(self, indent: int = 2) -> str:

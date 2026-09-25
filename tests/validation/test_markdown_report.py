@@ -3,29 +3,27 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
-from typing import Any
 
-import pytest
-
-from validation.comparison.anomalies import AnomalyDetector
-from validation.comparison.comparison import (
-    MatchedTrade,
-    TradeComparisonResult,
-    TradeComparator,
+from tests.validation.data_factory import (
+    make_passing_risk_evidence as _make_passing_risk_evidence,
 )
-from validation.comparison.delta_report import (
-    DeltaReportBuilder,
-    FieldDelta,
-    TradeDeltaReport,
+from tests.validation.data_factory import (
+    make_platform_result as _make_platform_result,
 )
-from validation.comparison.matcher import MatchKey, TradeMatcher
+from tests.validation.data_factory import (
+    make_reference as _make_reference,
+)
+from tests.validation.data_factory import (
+    make_trade as _make_trade,
+)
 from validation.reporting.json_report import (
-    ReportSummary,
-    StatDelta,
     ValidationReport,
-    generate_json_report,
-    generate_markdown_report,
+)
+from validation.reporting.json_report import (
+    generate_json_report as _generate_json_report,
+)
+from validation.reporting.json_report import (
+    generate_markdown_report as _generate_markdown_report,
 )
 
 
@@ -34,11 +32,14 @@ from validation.reporting.json_report import (
 # ---------------------------------------------------------------------------
 
 
-from tests.validation.data_factory import (
-    make_platform_result as _make_platform_result,
-    make_reference as _make_reference,
-    make_trade as _make_trade,
-)
+def generate_json_report(*args, **kwargs):
+    kwargs.setdefault("risk_delta_report", _make_passing_risk_evidence())
+    return _generate_json_report(*args, **kwargs)
+
+
+def generate_markdown_report(*args, **kwargs):
+    kwargs.setdefault("risk_delta_report", _make_passing_risk_evidence())
+    return _generate_markdown_report(*args, **kwargs)
 
 
 class TestMarkdownReportBasics:

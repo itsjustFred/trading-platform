@@ -26,7 +26,9 @@ from validation.comparison.delta_report import (
     TradeDelta,
     TradeDeltaReport,
 )
-from validation.comparison.matcher import TradeMatcher
+from validation.comparison.matcher import MatchResult, TradeMatcher
+from validation.comparison.tolerances import finite_tolerance, relative_difference
+from validation.readiness.models import ReadinessReport
 from validation.reference import ValidationReference
 from validation.stats.calculator import TradeStatistics, compute_trade_statistics
 
@@ -59,19 +61,29 @@ def _sanitize_json_numbers(obj: Any) -> Any:
     return _sanitize_for_json(obj)
 
 
-def _stats_from_reference(reference: ValidationReference) -> TradeStatistics:
-    """Build TradeStatistics from reference.stats when no trades are present.
-
-    Legacy fallback, kept for direct callers. Report generation
-    (:func:`generate_json_report`) always recomputes from trades instead —
-    single canonical computation path (C4), never stored/curated numbers.
-    """
+def _stats_from_values(
+    values: dict[str, Any],
+    source_framework: str | None = None,
+) -> TradeStatistics:
+    """Build canonical TradeStatistics from a raw stats mapping."""
     allowed_fields = set(TradeStatistics.model_fields.keys())
-    filtered = {k: v for k, v in reference.stats.items() if k in allowed_fields}
+    filtered = {k: v for k, v in values.items() if k in allowed_fields}
+    if source_framework in {"mt5_xlsx", "mt5_html"}:
+        for field in ("win_rate", "max_drawdown_pct"):
+            value = filtered.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                filtered[field] = float(value) / 100.0
     return TradeStatistics(**filtered)
+
+
+def _stats_from_reference(reference: ValidationReference) -> TradeStatistics:
+    """Build canonical TradeStatistics from reference stats when trades are absent."""
+    return _stats_from_values(reference.stats, reference.source_framework)
+
 
 # Statistics fields compared when no pre-computed stats_delta is provided.
 _STATS_FIELDS = [
+    "risk_free_rate",
     "win_rate",
     "profit_factor",
     "net_profit",
@@ -94,10 +106,7 @@ def _abs_diff(a: float, b: float) -> float:
 
 
 def _rel_diff(expected: float, actual: float) -> float:
-    denom = max(abs(expected), abs(actual))
-    if denom == 0.0:
-        return 0.0 if expected == actual else 1.0
-    return abs(expected - actual) / denom
+    return relative_difference(expected, actual)
 
 
 def _build_stat_explanation(
@@ -147,6 +156,10 @@ def _compare_stats(
     tolerance holds (AND).  Infinite values (DV-B34) compare symmetrically:
     identical infinities match, any other infinite combination fails.
     """
+    abs_tol_value = finite_tolerance(abs_tol, "stats_abs_tol")
+    rel_tol_value = finite_tolerance(rel_tol, "stats_rel_tol")
+    abs_tol = abs_tol_value or 0.0
+    rel_tol = rel_tol_value or 0.0
     deltas: list[StatDelta] = []
     for field in _STATS_FIELDS:
         exp_val = getattr(expected, field)
@@ -207,7 +220,7 @@ def _compare_stats(
         explanation = _build_stat_explanation(
             field, exp_val, act_val, abs_diff, rel_diff, passed
         )
-        severity = "info" if passed else "warning"
+        severity = "info" if passed else "error"
 
         deltas.append(
             StatDelta(
@@ -265,7 +278,11 @@ class ValidationReport(BaseModel):
 
     trade_passed: bool = False
     stat_passed: bool = False
-    risk_passed: bool = True
+    risk_passed: bool = False
+    risk_evidence_present: bool = False
+    risk_evidence_status: str = "missing"
+    equity_evidence_status: str = "missing"
+    readiness: ReadinessReport | None = None
 
     trade_summary: ReportSummary = Field(default_factory=ReportSummary)
     stat_summary: ReportSummary = Field(default_factory=ReportSummary)
@@ -313,14 +330,20 @@ def _to_backtest_result(
 def _build_trade_delta_report(
     reference: ValidationReference,
     platform_result: BacktestResult,
-    time_tolerance_seconds: int = 0,
+    time_tolerance_seconds: float = 0,
     trade_comparison_config: TradeComparisonConfig | None = None,
+    match_result: MatchResult | None = None,
 ) -> TradeDeltaReport:
     """Run the full trade matching / comparison / anomaly pipeline."""
-    match_result = TradeMatcher.match(
-        reference.trades, platform_result.trades,
-        time_tolerance_seconds=time_tolerance_seconds,
+    time_tolerance = finite_tolerance(
+        time_tolerance_seconds, "time_tolerance_seconds"
     )
+    if match_result is None:
+        match_result = TradeMatcher.match(
+            reference.trades,
+            platform_result.trades,
+            time_tolerance_seconds=time_tolerance,
+        )
 
     comparison_results: list[Any] = []
     for ref_trade, act_trade, key in match_result.matched:
@@ -329,8 +352,10 @@ def _build_trade_delta_report(
         comparison_results.append(comparator.compare(matched))
 
     anomalies = AnomalyDetector.detect(
-        reference, platform_result.trades, comparison_results,
-        time_tolerance_seconds=time_tolerance_seconds,
+        reference,
+        platform_result.trades,
+        comparison_results,
+        match_result=match_result,
     )
 
     return DeltaReportBuilder.build(
@@ -339,48 +364,79 @@ def _build_trade_delta_report(
 
 
 def _extract_risk_deltas(risk_delta_report: Any) -> list[StatDelta]:
-    """Extract StatDeltas from a RiskComparisonReport (or similar)."""
-    risk_deltas: list[StatDelta] = []
+    """Extract risk deltas and retain structural failures as evidence."""
     if risk_delta_report is None:
-        return risk_deltas
+        return []
 
-    # Accept RiskComparisonReport (has trade_results with field_results)
+    risk_deltas: list[StatDelta] = []
     if hasattr(risk_delta_report, "trade_results"):
         for result in risk_delta_report.trade_results:
-            if hasattr(result, "field_results"):
-                for fcr in result.field_results.values():
-                    risk_deltas.append(
-                        StatDelta(
-                            field=f"risk_{fcr.field}",
-                            expected=fcr.expected,
-                            actual=fcr.actual,
-                            passed=fcr.passed,
-                            explanation=fcr.message,
-                            severity="warning" if not fcr.passed else "info",
-                        )
+            field_results = getattr(result, "field_results", {}) or {}
+            for fcr in field_results.values():
+                risk_deltas.append(
+                    StatDelta(
+                        field=f"risk_{fcr.field}",
+                        expected=fcr.expected,
+                        actual=fcr.actual,
+                        passed=fcr.passed,
+                        explanation=fcr.message,
+                        severity="warning" if not fcr.passed else "info",
                     )
-    # Accept a plain list of StatDelta / FieldDelta
+                )
+            if not field_results and not result.passed:
+                risk_deltas.append(
+                    StatDelta(
+                        field="risk_trade_result",
+                        expected=result.expected_trade.id
+                        if result.expected_trade is not None
+                        else None,
+                        actual=result.actual_trade.id
+                        if result.actual_trade is not None
+                        else None,
+                        passed=False,
+                        explanation=result.explanation
+                        or "Risk comparison result has no field evidence",
+                        severity="error",
+                    )
+                )
     elif isinstance(risk_delta_report, list):
         for item in risk_delta_report:
             if isinstance(item, StatDelta):
                 risk_deltas.append(item)
             elif isinstance(item, FieldDelta):
                 risk_deltas.append(_field_delta_to_stat_delta(item))
-
     return risk_deltas
 
 
-def generate_json_report(
+def _risk_evidence(
+    risk_delta_report: Any,
+) -> tuple[list[StatDelta], bool, bool, str]:
+    risk_deltas = _extract_risk_deltas(risk_delta_report)
+    if risk_delta_report is None:
+        return risk_deltas, False, False, "missing"
+    if not risk_deltas:
+        return risk_deltas, False, False, "empty"
+    if all(delta.expected is None and delta.actual is None for delta in risk_deltas):
+        return risk_deltas, False, False, "empty"
+    if hasattr(risk_delta_report, "passed"):
+        passed = bool(risk_delta_report.passed) and all(d.passed for d in risk_deltas)
+    else:
+        passed = all(d.passed for d in risk_deltas)
+    return risk_deltas, True, passed, "complete" if passed else "failed"
+
+
+def _build_validation_report(
     reference: ValidationReference,
     platform_result: ValidationReference | list[Trade],
     trade_delta_report: TradeDeltaReport | None = None,
     stats_delta: list[StatDelta] | list[FieldDelta] | None = None,
     risk_delta_report: Any | None = None,
-    time_tolerance_seconds: int = 0,
+    time_tolerance_seconds: float = 0,
     trade_comparison_config: TradeComparisonConfig | None = None,
     stats_abs_tol: float = 0.01,
     stats_rel_tol: float = 0.001,
-) -> str:
+    readiness: ReadinessReport | None = None,
+) -> ValidationReport:
     """Generate a complete JSON validation report.
 
     Parameters
@@ -401,13 +457,19 @@ def generate_json_report(
     str
         Pretty-printed JSON string.
     """
+    time_tolerance = finite_tolerance(
+        time_tolerance_seconds, "time_tolerance_seconds"
+    )
+    stats_abs_tol_value = finite_tolerance(stats_abs_tol, "stats_abs_tol")
+    stats_rel_tol_value = finite_tolerance(stats_rel_tol, "stats_rel_tol")
     platform_bt = _to_backtest_result(platform_result)
 
     # --- trade deltas --------------------------------------------------
     if trade_delta_report is None:
         trade_delta_report = _build_trade_delta_report(
-            reference, platform_bt,
-            time_tolerance_seconds=time_tolerance_seconds,
+            reference,
+            platform_bt,
+            time_tolerance_seconds=time_tolerance,
             trade_comparison_config=trade_comparison_config,
         )
 
@@ -418,27 +480,64 @@ def generate_json_report(
         # (comparing recomputed vs stored stats is apples vs oranges).
         reference_initial_capital = reference.to_backtest_result().meta.initial_capital
         platform_initial_capital = platform_bt.meta.initial_capital
-        ref_stats = compute_trade_statistics(
-            reference.trades,
-            initial_capital=reference_initial_capital,
-        )
-        act_stats = compute_trade_statistics(
-            platform_bt.trades,
-            initial_capital=platform_initial_capital,
-        )
-        stat_deltas: list[StatDelta] = _compare_stats(
-            ref_stats, act_stats, abs_tol=stats_abs_tol, rel_tol=stats_rel_tol
-        )
+        if not reference.trades and not platform_bt.trades:
+            stat_deltas = [
+                StatDelta(
+                    field="statistics_evidence",
+                    expected="non-empty statistics",
+                    actual="empty",
+                    passed=False,
+                    explanation="Statistics evidence is empty",
+                    severity="error",
+                )
+            ]
+        else:
+            ref_stats = compute_trade_statistics(
+                reference.trades,
+                initial_capital=reference_initial_capital,
+            )
+            act_stats = compute_trade_statistics(
+                platform_bt.trades,
+                initial_capital=platform_initial_capital,
+            )
+            stat_deltas = _compare_stats(
+                ref_stats,
+                act_stats,
+                abs_tol=stats_abs_tol_value or 0.0,
+                rel_tol=stats_rel_tol_value or 0.0,
+            )
     else:
         stat_deltas = [
             _field_delta_to_stat_delta(d) if isinstance(d, FieldDelta) else d
             for d in stats_delta
         ]
 
+    if not stat_deltas:
+        stat_deltas = [
+            StatDelta(
+                field="statistics_evidence",
+                expected="non-empty statistics",
+                actual="empty",
+                passed=False,
+                explanation="Statistics evidence is empty",
+                severity="error",
+            )
+        ]
+
     # --- risk deltas ---------------------------------------------------
-    risk_deltas = _extract_risk_deltas(risk_delta_report)
+    risk_deltas, risk_evidence_present, risk_evidence_passed, risk_evidence_status = _risk_evidence(
+        risk_delta_report
+    )
 
     # --- summaries -----------------------------------------------------
+    platform_equity_status = getattr(platform_bt, "equity_evidence_status", "unknown")
+    equity_evidence_status = (
+        "available"
+        if reference.equity_evidence_status == "available"
+        and platform_equity_status == "available"
+        else "missing"
+    )
+
     all_trade_deltas = (
         trade_delta_report.matched_trades
         + trade_delta_report.missing_trades
@@ -461,9 +560,9 @@ def generate_json_report(
         missing=0,
         extra=0,
         mismatched=sum(1 for d in stat_deltas if not d.passed),
-        passed=1 if all(d.passed for d in stat_deltas) else 0,
-        errors=0,
-        warnings=sum(1 for d in stat_deltas if not d.passed),
+        passed=1 if bool(stat_deltas) and all(d.passed for d in stat_deltas) else 0,
+        errors=sum(1 for d in stat_deltas if d.severity == "error"),
+        warnings=sum(1 for d in stat_deltas if d.severity == "warning"),
     )
 
     # --- anomalies -----------------------------------------------------
@@ -484,18 +583,29 @@ def generate_json_report(
         explanations.append(
             f"Stats deviations: {stat_issues} field(s) out of tolerance."
         )
-    if risk_deltas:
-        risk_issues = sum(1 for d in risk_deltas if not d.passed)
-        if risk_issues:
-            explanations.append(
-                f"Risk deviations: {risk_issues} field(s) out of tolerance."
-            )
+    risk_issues = sum(1 for d in risk_deltas if not d.passed)
+    if not risk_evidence_present:
+        explanations.append(
+            "Risk evidence is missing or empty; risk readiness cannot be certified."
+        )
+    elif risk_issues or not risk_evidence_passed:
+        explanations.append(
+            f"Risk deviations: {risk_issues or 1} field/result(s) failed or "
+            "the producer verdict failed."
+        )
+    if equity_evidence_status != "available":
+        explanations.append(
+            "Equity evidence is incomplete; calendar-window metrics are not certified."
+        )
+    if readiness is not None and not readiness.passed:
+        explanations.append("Readiness validation did not certify paper-trading readiness.")
 
     # --- overall passed ------------------------------------------------
     trade_passed = trade_delta_report.passed
-    stat_passed = all(d.passed for d in stat_deltas)
-    risk_passed = all(d.passed for d in risk_deltas) if risk_deltas else True
-    overall_passed = trade_passed and stat_passed and risk_passed
+    stat_passed = bool(stat_deltas) and all(d.passed for d in stat_deltas)
+    risk_passed = risk_evidence_present and risk_evidence_passed
+    readiness_passed = readiness is None or readiness.passed
+    overall_passed = trade_passed and stat_passed and risk_passed and readiness_passed
 
     report = ValidationReport(
         strategy_name=reference.strategy_name,
@@ -506,6 +616,10 @@ def generate_json_report(
         trade_passed=trade_passed,
         stat_passed=stat_passed,
         risk_passed=risk_passed,
+        risk_evidence_present=risk_evidence_present,
+        risk_evidence_status=risk_evidence_status,
+        equity_evidence_status=equity_evidence_status,
+        readiness=readiness,
         trade_summary=trade_summary,
         stat_summary=stat_summary,
         trade_deltas=trade_delta_report.matched_trades,
@@ -515,6 +629,11 @@ def generate_json_report(
         explanations=explanations,
     )
 
+    return report
+
+
+def serialize_validation_report(report: ValidationReport) -> str:
+    """Serialize a built validation report as strict JSON."""
     return json.dumps(
         report.model_dump(mode="json"),
         indent=2,
@@ -523,12 +642,42 @@ def generate_json_report(
     )
 
 
+def generate_json_report(
+    reference: ValidationReference,
+    platform_result: ValidationReference | list[Trade],
+    trade_delta_report: TradeDeltaReport | None = None,
+    stats_delta: list[StatDelta] | list[FieldDelta] | None = None,
+    risk_delta_report: Any | None = None,
+    time_tolerance_seconds: float = 0,
+    trade_comparison_config: TradeComparisonConfig | None = None,
+    stats_abs_tol: float = 0.01,
+    stats_rel_tol: float = 0.001,
+    readiness: ReadinessReport | None = None,
+) -> str:
+    """Generate a complete strict JSON validation report."""
+    report = _build_validation_report(
+        reference=reference,
+        platform_result=platform_result,
+        trade_delta_report=trade_delta_report,
+        stats_delta=stats_delta,
+        risk_delta_report=risk_delta_report,
+        readiness=readiness,
+        time_tolerance_seconds=time_tolerance_seconds,
+        trade_comparison_config=trade_comparison_config,
+        stats_abs_tol=stats_abs_tol,
+        stats_rel_tol=stats_rel_tol,
+    )
+    return serialize_validation_report(report)
+
+
 def _build_recommendation(data: dict[str, Any]) -> list[str]:
     """Build a short recommendation paragraph based on the report data."""
     lines: list[str] = []
     passed = data.get("passed", False)
     trade_passed = data.get("trade_passed", False)
     stat_passed = data.get("stat_passed", False)
+    risk_passed = data.get("risk_passed", False)
+    readiness = data.get("readiness")
 
     if passed:
         lines.append(
@@ -550,6 +699,13 @@ def _build_recommendation(data: dict[str, Any]) -> list[str]:
             issues.append("error-level discrepancies")
     if not stat_passed:
         issues.append("statistical deviations")
+    if not risk_passed:
+        if not data.get("risk_evidence_present", False):
+            issues.append("missing or empty risk evidence")
+        else:
+            issues.append("risk deviations")
+    if readiness is not None and not readiness.get("passed", False):
+        issues.append("readiness validation")
 
     if issues:
         lines.append(
@@ -568,10 +724,11 @@ def generate_markdown_report(
     trade_delta_report: TradeDeltaReport | None = None,
     stats_delta: list[StatDelta] | list[FieldDelta] | None = None,
     risk_delta_report: Any | None = None,
-    time_tolerance_seconds: int = 0,
+    time_tolerance_seconds: float = 0,
     trade_comparison_config: TradeComparisonConfig | None = None,
     stats_abs_tol: float = 0.01,
     stats_rel_tol: float = 0.001,
+    readiness: ReadinessReport | None = None,
 ) -> str:
     """Generate a human-readable Markdown validation report.
 
@@ -586,18 +743,19 @@ def generate_markdown_report(
             raise ValueError(
                 "platform_result is required when reference is not a ValidationReport"
             )
-        json_str = generate_json_report(
+        report = _build_validation_report(
             reference=reference,
             platform_result=platform_result,
             trade_delta_report=trade_delta_report,
             stats_delta=stats_delta,
             risk_delta_report=risk_delta_report,
+            readiness=readiness,
             time_tolerance_seconds=time_tolerance_seconds,
             trade_comparison_config=trade_comparison_config,
             stats_abs_tol=stats_abs_tol,
             stats_rel_tol=stats_rel_tol,
         )
-        data = json.loads(json_str)
+        data = report.model_dump(mode="json")
 
     lines: list[str] = []
     lines.append(f"# Validation Report: {data.get('strategy_name', 'Unknown')}")
@@ -609,7 +767,13 @@ def generate_markdown_report(
         f"- **Generated At**: {data.get('generated_at', datetime.now(timezone.utc).isoformat())}"
     )
     lines.append(f"- **Overall Passed**: {'Yes' if data.get('passed') else 'No'}")
+    lines.append(f"- **Equity Evidence**: {data.get('equity_evidence_status', 'missing')}")
     lines.append("")
+    readiness_data = data.get("readiness")
+    if readiness_data:
+        lines.append(f"- **Readiness Level**: {readiness_data.get('level')}")
+        lines.append(f"- **Readiness Passed**: {'Yes' if readiness_data.get('passed') else 'No'}")
+        lines.append("")
 
     # ── Summary ──────────────────────────────────────────────────────────
     lines.append("## Summary")

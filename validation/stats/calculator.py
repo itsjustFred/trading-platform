@@ -21,11 +21,10 @@ Mathematical conventions (kept explicit so results are reproducible):
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
   fraction (0..1) of the running peak.
 * **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
-  Sortino, drawdown, ``avg_trade`` and the largest winner/loser use the
-  *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus ``fees``,
-  else the exit PnL sum).  ``gross_profit``/``gross_loss``/``avg_winner``/
-  ``avg_loser`` stay gross so they remain comparable with MT5's
-  Bruttogewinn/Bruttoverlust labels.
+  Sortino, drawdown, ``profit_factor``, averages and the largest winner/loser
+  use the *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus
+  ``fees``, else the exit PnL sum). ``gross_profit`` and ``gross_loss`` remain
+  explicit gross fields for source-header reconciliation.
 """
 
 from __future__ import annotations
@@ -55,6 +54,7 @@ class TradeStatistics(BaseModel):
     """Canonical trade-based performance statistics."""
 
     total_trades: int = 0
+    risk_free_rate: float = 0.0
     winning_trades: int = 0
     losing_trades: int = 0
     win_rate: float = 0.0
@@ -115,20 +115,28 @@ def _net_realized_pnl(trade: Trade) -> float:
 
 def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
     """Return (max_drawdown_absolute, max_drawdown_pct) from trade PnLs."""
-    peak = 0.0
+    if not realized_pnls:
+        return 0.0, 0.0
+
     running = 0.0
+    peak = 0.0
+    percentage_peak: float | None = None
     max_dd = 0.0
     max_dd_pct = 0.0
 
     for pnl in realized_pnls:
         running += pnl
+        if percentage_peak is None:
+            percentage_peak = running
         if running > peak:
             peak = running
         dd = peak - running
         if dd > max_dd:
             max_dd = dd
-        if peak > 0:
-            dd_pct = dd / peak
+        if running > percentage_peak:
+            percentage_peak = running
+        if percentage_peak != 0.0:
+            dd_pct = (percentage_peak - running) / abs(percentage_peak)
             if dd_pct > max_dd_pct:
                 max_dd_pct = dd_pct
 
@@ -299,9 +307,11 @@ def compute_trade_statistics(
     net_profit = sum(realized_pnls)
     gross_profit = sum(p for p in gross_pnls if p > 0)
     gross_loss = sum(p for p in gross_pnls if p < 0)
+    net_profit_series = [p for p in realized_pnls if p > 0]
+    net_loss_series = [p for p in realized_pnls if p < 0]
 
-    if not math.isclose(gross_loss, 0.0, abs_tol=_ZERO_TOL):
-        profit_factor = abs(gross_profit / gross_loss)
+    if not math.isclose(sum(net_loss_series), 0.0, abs_tol=_ZERO_TOL):
+        profit_factor = abs(sum(net_profit_series) / sum(net_loss_series))
     else:
         profit_factor = float("inf")
 
@@ -336,8 +346,8 @@ def compute_trade_statistics(
     else:
         recovery_factor = float("inf")
 
-    avg_winner = gross_profit / winning_trades if winning_trades > 0 else 0.0
-    avg_loser = gross_loss / losing_trades if losing_trades > 0 else 0.0
+    avg_winner = sum(net_profit_series) / winning_trades if winning_trades > 0 else 0.0
+    avg_loser = sum(net_loss_series) / losing_trades if losing_trades > 0 else 0.0
     avg_trade = net_profit / total_trades if total_trades > 0 else 0.0
 
     largest_winner = max((p for p in realized_pnls if p > 0), default=0.0)

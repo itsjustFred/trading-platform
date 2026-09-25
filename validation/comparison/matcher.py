@@ -8,13 +8,13 @@ differences in bar-timestamp resolution do not break the comparison.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from shared.models import Trade
-
+from validation.comparison.tolerances import finite_float, finite_tolerance
 
 # datetime.fromisoformat does not understand "Z" in Python < 3.11
 _UTC_SUFFIX_Z = "Z"
@@ -135,11 +135,18 @@ class TradeMatcher:
         MatchResult
             Container with ``matched``, ``missing`` and ``extra`` trade lists.
         """
-        tolerance_seconds: int = int(options.get("time_tolerance_seconds", 0))
+        tolerance_value = finite_tolerance(
+            options.get("time_tolerance_seconds", 0), "time_tolerance_seconds"
+        )
+        tolerance_seconds = int(tolerance_value or 0)
         match_symbol: bool = bool(options.get("match_symbol", True))
-        time_weight = float(options.get("time_weight", 1.0))
-        price_weight = float(options.get("price_weight", 1.0))
-        quantity_weight = float(options.get("quantity_weight", 1.0))
+        time_weight = finite_float(options.get("time_weight", 1.0), "time_weight")
+        price_weight = finite_float(options.get("price_weight", 1.0), "price_weight")
+        quantity_weight = finite_float(
+            options.get("quantity_weight", 1.0), "quantity_weight"
+        )
+        if time_weight < 0.0 or price_weight < 0.0 or quantity_weight < 0.0:
+            raise ValueError("match weights must be >= 0")
 
         # Pre-compute normalized timestamps so that we do not re-parse inside
         # the inner loop.

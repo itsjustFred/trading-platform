@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from shared.models import BacktestMeta, BacktestResult, Trade
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade
 
 ALLOWED_FRAMEWORKS = frozenset(
     {
@@ -44,6 +44,8 @@ class ValidationReference(BaseModel):
     trades: list[Trade]
     stats: dict[str, Any]
     raw_metadata: dict[str, Any]
+    equity_curve: list[EquityPoint] = Field(default_factory=list)
+    equity_evidence_status: Literal["available", "missing"] = "missing"
 
     # ── Optional fields ──────────────────────────────────────────────────
     source_path: str | None = None
@@ -80,17 +82,19 @@ class ValidationReference(BaseModel):
     def _check_trades_not_empty(self) -> "ValidationReference":
         if not self.allow_empty and len(self.trades) == 0:
             raise ValueError("trades must not be empty when allow_empty=False")
+        if self.equity_curve:
+            self.equity_evidence_status = "available"
+        elif self.equity_evidence_status == "available":
+            raise ValueError("equity_evidence_status=available requires an equity curve")
         return self
 
     def to_backtest_result(self) -> BacktestResult:
         """Convert this ValidationReference into a platform-native BacktestResult.
 
         Fields that are not available on the external import are populated
-        with sensible defaults or ``None``. The equity curve is always empty
-        here by design — no importer ships curves, they are rebuilt
-        downstream from trades (compute_stats_for_result / daily equity).
-        Callers needing a curve must build it explicitly instead of
-        assuming this one is populated.
+        with sensible defaults or ``None``. An explicitly supplied equity
+        curve and its evidence status are preserved; absent curve evidence
+        remains explicit rather than being converted into numeric zeroes.
         """
         raw_initial_capital = self.settings.get("initial_capital")
         try:
@@ -121,7 +125,8 @@ class ValidationReference(BaseModel):
             meta=meta,
             trades=self.trades,
             stats=self.stats,
-            equity_curve=[],
+            equity_curve=list(self.equity_curve),
             indicators=[],
             drawings=[],
+            equity_evidence_status=self.equity_evidence_status,
         )

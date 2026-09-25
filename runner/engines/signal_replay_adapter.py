@@ -374,6 +374,8 @@ class SignalReplayAdapter:
             pnl_pct=float(pnl_pct),
             fees=fees,
             net_pnl=round(float(pnl) - fees, 2),
+            stop_loss=position.stop_loss,
+            take_profit=position.take_profit,
             r_multiple=float(r_multiple) if r_multiple is not None else None,
             mae=float(position.mae),
             mfe=float(position.mfe),
@@ -735,7 +737,11 @@ class SignalReplayAdapter:
                 equity_curve.append(point)
 
         signal_sources = self._collect_signal_sources(replay_signals)
-        tags = ["signal-replay", "signal_replay", *[f"source:{source}" for source in signal_sources]]
+        tags = [
+            "signal-replay",
+            "signal_replay",
+            *[f"source:{source}" for source in signal_sources],
+        ]
         created_at = datetime.now(timezone.utc).isoformat()
         inferred_start = backtest_start or replay_signals[0].timestamp.date().isoformat()
         inferred_end = backtest_end or replay_signals[-1].timestamp.date().isoformat()

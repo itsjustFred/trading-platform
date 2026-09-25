@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from shared.models import Trade, VALID_DIRECTIONS
+from shared.models import VALID_DIRECTIONS
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
 
@@ -91,6 +91,8 @@ class TestEURUSDH1:
             tp = trade.meta.get("take_profit")
             assert sl is None or isinstance(sl, float)
             assert tp is None or isinstance(tp, float)
+            assert trade.stop_loss == sl
+            assert trade.take_profit == tp
 
     def test_stats_contains_known_keys(self, importer: MT5XLSXImporter):
         ref = importer.load(_eurusd_path())
@@ -234,6 +236,11 @@ class TestHelpers:
     def test_extract_first_percent(self):
         assert MT5XLSXImporter._extract_first_percent("5.52% (6 617.58)") == 5.52
         assert MT5XLSXImporter._extract_first_percent(None) is None
+
+    def test_stat_label_value_groups_accepts_two_column_layout(self):
+        assert MT5XLSXImporter._stat_label_value_groups(
+            ["Nettogewinn gesamt:", "100.0"]
+        ) == [("Nettogewinn gesamt:", "100.0")]
 
     def test_parse_count_pct(self):
         count, pct = MT5XLSXImporter._parse_count_pct("222 (45.12%)")
@@ -439,17 +446,36 @@ class TestOrphanOutDeal:
         assert [t.meta["position_id"] for t in ref.trades] == ["position-1", "position-2"]
 
 
+class TestPositionFillClassification:
+    def test_partial_open_and_orphan_fills_are_evidence_only(self):
+        deals = pd.DataFrame(
+            [
+                ["2024.01.01 09:00:00", "", "EURUSD", "sell", "out", "0.10", 1.09, 901, 0, 0, 50, 100050, "TP"],
+                ["2024.01.02 08:00:00", 1, "EURUSD", "buy", "in", "0.15", 1.08, 902, 0, 0, 0, 100000, "Entry"],
+                ["2024.01.02 16:00:00", 1, "EURUSD", "sell", "out", "0.05", 1.09, 903, 0, 0, 25, 100025, "Partial"],
+                ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.09, 904, 0, 0, 0, 100025, "Open"],
+            ],
+            columns=["Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Auftrag", "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"],
+        )
+        trades, evidence = MT5XLSXImporter._build_trades(deals, {})
+        assert trades == []
+        assert evidence["partial_position_count"] == 1
+        assert evidence["open_position_count"] == 2
+        assert evidence["open_only_count"] == 1
+        assert evidence["orphan_exit_count"] == 1
+        assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
+        assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)
+
+
 class TestTotalReturnFraction:
     """#84: total_return is a fraction (parity with runner stats)."""
 
     def test_total_return_is_fraction_not_percent(self, importer: MT5XLSXImporter):
         ref = importer.load(_eurusd_path())
-        total_return = ref.stats.get("total_return")
-        if total_return is None:
-            pytest.skip("fixture report carries no total_return")
-        # A percent-scale value (>= 1.0 for any double-digit return) would
-        # diverge by factor 100 against the runner's fraction.
-        assert abs(float(total_return)) < 10.0
+        total_return = ref.stats["total_return"]
+        initial_capital = ref.raw_metadata["parsed_meta"]["initial_capital"]
+        assert total_return == pytest.approx(ref.stats["total_pnl"] / initial_capital)
+        assert total_return == pytest.approx(0.2186881)
 
 
 def test_build_trades_empty_frame_returns_tuple_shape() -> None:

@@ -196,12 +196,11 @@ def test_max_drawdown_pct() -> None:
     assert stats.max_drawdown_pct == pytest.approx(0.7)
 
 
-def test_max_drawdown_never_positive_equity() -> None:
-    # Always losing — peak stays at 0, so pct DD stays 0 to avoid /0
+def test_max_drawdown_uses_first_observed_equity_peak() -> None:
     trades = [_make_trade(i, [-10.0]) for i in range(3)]
     stats = compute_trade_statistics(trades)
     assert stats.max_drawdown == pytest.approx(30.0)
-    assert stats.max_drawdown_pct == pytest.approx(0.0)
+    assert stats.max_drawdown_pct == pytest.approx(2.0)
 
 
 def test_max_drawdown_new_higher_peak() -> None:
@@ -453,7 +452,21 @@ def test_fees_subtracted_from_gross_when_no_net() -> None:
     assert stats.gross_profit == pytest.approx(100.0)
 
 
-def test_fees_alone_do_not_make_a_winner_a_loser() -> None:
+def test_net_aggregates_follow_net_winner_classification() -> None:
+    trades = [
+        _make_fee_trade(1, 1.0, fees=5.0),
+        _make_fee_trade(2, 10.0, fees=1.0),
+    ]
+    stats = compute_trade_statistics(trades)
+    assert stats.winning_trades == 1
+    assert stats.losing_trades == 1
+    assert stats.profit_factor == pytest.approx(9.0 / 4.0)
+    assert stats.avg_winner == pytest.approx(9.0)
+    assert stats.avg_loser == pytest.approx(-4.0)
+    assert stats.gross_profit == pytest.approx(11.0)
+    assert stats.gross_loss == pytest.approx(0.0)
+
+
     trades = [_make_fee_trade(1, 10.0, fees=1.0)]
     stats = compute_trade_statistics(trades)
     assert stats.winning_trades == 1

@@ -17,7 +17,8 @@ from validation.comparison.delta_report import (
     TradeDelta,
     TradeDeltaReport,
 )
-from validation.comparison.matcher import TradeMatcher
+from validation.comparison.matcher import MatchResult, TradeMatcher
+from validation.comparison.tolerances import finite_tolerance
 from validation.reference import ValidationReference
 from validation.risk.adapter import RiskAdapter
 from validation.risk.fixed_risk import FixedRiskConfig
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _pct_diff(a: float, b: float) -> float:
-    """Relative difference using max(|a|, |b|) as denominator."""
+    """Relative difference using the larger magnitude as the risk baseline."""
     denom = max(abs(a), abs(b))
     if denom == 0.0:
         return 0.0 if a == b else 1.0
@@ -58,6 +59,22 @@ class RiskComparisonConfig:
     #: default (#85). A strict count threshold is explicit opt-in only —
     #: mirrors ``ReadinessConfig.max_extra_trades`` (default 0).
     max_extra_trades: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "stop_distance_pct",
+            "stop_distance_abs",
+            "risk_per_trade_pct",
+            "risk_per_trade_abs",
+            "position_size_pct",
+            "position_size_abs",
+        ):
+            value = finite_tolerance(
+                getattr(self, name), name, optional=getattr(self, name) is None
+            )
+            setattr(self, name, value)
+        if not isinstance(self.max_extra_trades, int) or self.max_extra_trades < 0:
+            raise ValueError("max_extra_trades must be a non-negative integer")
 
 
 @dataclass
@@ -106,6 +123,7 @@ class RiskComparator:
         self,
         expected: ValidationReference | list[Trade],
         actual: ValidationReference | list[Trade],
+        match_result: MatchResult | None = None,
     ) -> RiskComparisonReport:
         """Run the full risk comparison and return a report."""
         expected_trades = (
@@ -115,12 +133,13 @@ class RiskComparator:
             actual.trades if isinstance(actual, ValidationReference) else actual
         )
 
-        match_result = TradeMatcher.match(
-            reference_trades=expected_trades,
-            actual_trades=actual_trades,
-            time_tolerance_seconds=self.config.time_tolerance_seconds,
-            match_symbol=self.config.match_symbol,
-        )
+        if match_result is None:
+            match_result = TradeMatcher.match(
+                reference_trades=expected_trades,
+                actual_trades=actual_trades,
+                time_tolerance_seconds=self.config.time_tolerance_seconds,
+                match_symbol=self.config.match_symbol,
+            )
 
         results: list[RiskComparisonResult] = []
 
@@ -371,7 +390,7 @@ class RiskComparator:
             "severity_counts": severity_counts,
         }
 
-        passed = all(r.passed for r in results)
+        passed = bool(results) and all(r.passed for r in results)
 
         if passed:
             explanation = (

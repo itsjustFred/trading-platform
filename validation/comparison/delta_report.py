@@ -17,6 +17,7 @@ from validation.comparison.comparison import (
     FieldComparisonResult,
     TradeComparisonResult,
 )
+from validation.comparison.tolerances import relative_difference
 from validation.reference import ValidationReference
 
 
@@ -29,10 +30,7 @@ def _abs_diff(a: float, b: float) -> float:
 
 
 def _rel_diff(expected: float, actual: float) -> float:
-    denom = max(abs(expected), abs(actual))
-    if denom == 0.0:
-        return 0.0 if expected == actual else 1.0
-    return abs(expected - actual) / denom
+    return relative_difference(expected, actual)
 
 
 def _build_field_explanation(field_delta: FieldDelta) -> str:
@@ -158,9 +156,7 @@ class DeltaReportBuilder:
                 f"Trade id={ref.id} (expected) / id={act.id} (actual) matches perfectly"
             )
         else:
-            error_fields = {"direction", "pnl"}
-            has_error = any(name in error_fields for name in comp.mismatches)
-            severity = "error" if has_error else "warning"
+            severity = "error"
             mismatch_str = ", ".join(comp.mismatches)
             explanation = (
                 f"Trade id={ref.id} (expected) / id={act.id} (actual) has "
@@ -270,9 +266,10 @@ class DeltaReportBuilder:
         # Determine passed: no errors, no missing, no extra
         all_deltas = matched_trades + missing_trades + extra_trades
         has_error = any(d.severity == "error" for d in all_deltas)
+        has_mismatch = any(d.anomaly_type == "mismatch" for d in matched_trades)
         has_missing = len(missing_trades) > 0
         has_extra = len(extra_trades) > 0
-        passed = not has_error and not has_missing and not has_extra
+        passed = not has_error and not has_mismatch and not has_missing and not has_extra
 
         # Build summary
         severity_counts: dict[str, int] = {}

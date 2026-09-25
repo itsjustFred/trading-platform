@@ -455,6 +455,7 @@ def _process_symbol(
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
+            take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
             risk_target_usd: float | None = None
             stop_distance: float | None = None
             max_position_exposure_pct: float | None = None
@@ -474,7 +475,7 @@ def _process_symbol(
                 entry_time=entry_ts,
                 scheduled_exit_time=exit_ts,
                 stop_price=_resolve_level_value(stop_loss_series, entry_idx),
-                take_profit_price=_resolve_level_value(take_profit_series, entry_idx),
+                take_profit_price=take_profit_price,
                 parameters=resolved_parameters,
             )
             if intrabar_exit is not None:
@@ -562,7 +563,9 @@ def _process_symbol(
                 "sizing_mode": sizing_mode,
                 "equity_at_entry": round(equity, 2),
                 "risk_target_usd": (
-                    round(risk_target_usd, 2) if risk_target_usd is not None else None
+                    round(risk_target_usd, 2)
+                    if risk_target_usd is not None
+                    else None
                 ),
                 "entry_price": round(entry_price, 6),
                 "sl_price": round(stop_price, 6) if stop_price is not None else None,
@@ -631,6 +634,8 @@ def _process_symbol(
                 pnl=round(pnl, 2),
                 fees=round(fees, 2),
                 net_pnl=round(pnl - fees, 2),
+                stop_loss=stop_price,
+                take_profit=take_profit_price,
                 holding_bars=i - entry_idx,
                 tags=["vectorbt"],
                 meta=trade_meta,

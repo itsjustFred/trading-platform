@@ -25,6 +25,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import (
     _apply_fill_parity,
     _apply_risk_sizing,
+    _enrich_trades_with_context,
     _gate_warmup_trades,
     _pyne_cli_end_bound,
     _pyne_cli_start_bound,
@@ -66,6 +67,15 @@ def _trade(
         pnl=0.0,
         meta=meta,
     )
+
+
+def test_enrich_trades_with_context_materializes_canonical_levels() -> None:
+    trade = _trade()
+    trade.meta = {"sl_price": 99.0, "tp_price": 102.0}
+    context = {"rsi": (pd.Series([50.0, 51.0]), "entry")}
+    _enrich_trades_with_context([trade], context, _frame())
+    assert trade.stop_loss == pytest.approx(99.0)
+    assert trade.take_profit == pytest.approx(102.0)
 
 
 def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:

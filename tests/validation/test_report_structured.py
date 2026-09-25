@@ -8,26 +8,36 @@ from typing import Any
 
 import pytest
 
+from tests.validation.data_factory import (
+    make_passing_risk_evidence as _make_passing_risk_evidence,
+)
+from tests.validation.data_factory import (
+    make_platform_result as _make_platform_result,
+)
+from tests.validation.data_factory import (
+    make_reference as _make_reference,
+)
+from tests.validation.data_factory import (
+    make_trade as _make_trade,
+)
 from validation.comparison.anomalies import AnomalyDetector
 from validation.comparison.comparison import (
     MatchedTrade,
-    TradeComparisonResult,
     TradeComparator,
 )
 from validation.comparison.delta_report import (
     DeltaReportBuilder,
-    FieldDelta,
-    TradeDeltaReport,
 )
-from validation.comparison.matcher import MatchKey, TradeMatcher
+from validation.comparison.matcher import MatchKey
 from validation.reporting.json_report import (
     ReportSummary,
     StatDelta,
     ValidationReport,
-    generate_json_report,
     generate_markdown_report,
 )
-from validation.stats.calculator import TradeStatistics, compute_trade_statistics
+from validation.reporting.json_report import (
+    generate_json_report as _generate_json_report,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,11 +45,9 @@ from validation.stats.calculator import TradeStatistics, compute_trade_statistic
 # ---------------------------------------------------------------------------
 
 
-from tests.validation.data_factory import (
-    make_platform_result as _make_platform_result,
-    make_reference as _make_reference,
-    make_trade as _make_trade,
-)
+def generate_json_report(*args, **kwargs):
+    kwargs.setdefault("risk_delta_report", _make_passing_risk_evidence())
+    return _generate_json_report(*args, **kwargs)
 
 
 class TestJsonReportBasics:
@@ -131,7 +139,7 @@ class TestJsonReportBasics:
         assert data["trade_summary"]["mismatched"] == 1
         trade_delta = data["trade_deltas"][0]
         assert trade_delta["anomaly_type"] == "mismatch"
-        assert trade_delta["severity"] == "warning"
+        assert trade_delta["severity"] == "error"
         field_deltas = trade_delta["field_deltas"]
         entry_fd = next((fd for fd in field_deltas if fd["field"] == "entry_price"), None)
         assert entry_fd is not None
@@ -232,7 +240,6 @@ class TestJsonReportBasics:
         ref = _make_reference([ref_trade])
         platform = _make_platform_result([act_trade])
 
-        match_result = TradeMatcher.match([ref_trade], [act_trade])
         matched = MatchedTrade(
             reference=ref_trade,
             actual=act_trade,
@@ -250,7 +257,7 @@ class TestJsonReportBasics:
         json_str = generate_json_report(ref, platform, trade_delta_report=tdr)
         data = json.loads(json_str)
         assert data["trade_summary"]["mismatched"] == 1
-        assert data["passed"] is True  # entry_price is warning only
+        assert data["passed"] is False
 
     def test_with_precomputed_stats_delta(self):
         ref = _make_reference([_make_trade(trade_id=1, pnl=100.0)])

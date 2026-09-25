@@ -62,6 +62,20 @@ def make_reference(
     )
 
 
+def make_passing_risk_evidence():
+    from validation.reporting.json_report import StatDelta
+
+    return [
+        StatDelta(
+            field="risk_position_size",
+            expected=1.0,
+            actual=1.0,
+            passed=True,
+            explanation="risk position size matches",
+        )
+    ]
+
+
 def make_platform_result(trades: list[Trade]) -> BacktestResult:
     """Build a bare platform-side backtest result."""
     meta = BacktestMeta(

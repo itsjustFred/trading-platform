@@ -35,6 +35,7 @@ def test_framework_statistics_comparison_passes_identical_trade_stats() -> None:
     deltas = _compare_stats(stats, stats, RegressionConfig())
 
     assert {delta.field for delta in deltas} == {
+        "risk_free_rate",
         "win_rate",
         "profit_factor",
         "net_profit",

@@ -362,7 +362,15 @@ class PyneCoreAdapter(EngineAdapter):
             stats_csv = tmpdir_path / "stats.csv"
 
             self._run_pyne_cli(
-                config, symbol, strategy_copy_path, csv_path, trade_csv, stats_csv, workdir_path, tmpdir_path, len(df)
+                config,
+                symbol,
+                strategy_copy_path,
+                csv_path,
+                trade_csv,
+                stats_csv,
+                workdir_path,
+                tmpdir_path,
+                len(df),
             )
 
             if trade_csv.exists():
@@ -934,6 +942,20 @@ def _locate_trade_bar(timestamp_series: pd.Series, raw_time: str) -> int | None:
     return None
 
 
+def _finite_meta_value(meta: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = meta.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
 def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_prefix: str) -> None:
     long_key = f"{key_prefix}_long"
     short_key = f"{key_prefix}_short"
@@ -969,6 +991,14 @@ def _enrich_trades_with_context(
         _promote_directional_price_meta(meta, trade.direction, "sl_price")
         _promote_directional_price_meta(meta, trade.direction, "tp_price")
         _materialize_exit_price_levels(meta, trade)
+        trade.stop_loss = _finite_meta_value(
+            meta,
+            ("sl_price_at_exit", "sl_price"),
+        )
+        trade.take_profit = _finite_meta_value(
+            meta,
+            ("tp_price_at_exit", "tp_price"),
+        )
         trade.meta = meta or None
         if trade.exits:
             inferred_reason = None

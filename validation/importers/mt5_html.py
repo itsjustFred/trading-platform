@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from validation.importers._numbers import detect_decimal_comma, parse_locale_num
 from validation.importers._pairing import (
     closed_positions,
     group_position_fills,
-    open_position_summary,
+    position_fill_summary,
 )
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
@@ -76,7 +77,12 @@ for label, key in _STAT_LABELS:
 class MT5HTMLImporter(BaseImporter):
     """Import MT5 Strategy Tester HTML reports (German UI)."""
 
-    def load(self, source: str | Path, source_timezone: str | None = None, **kwargs: Any) -> ValidationReference:
+    def load(
+        self,
+        source: str | Path,
+        source_timezone: str | None = None,
+        **kwargs: Any,
+    ) -> ValidationReference:
             """Read an MT5 HTML report and return a ``ValidationReference``.
 
             Parameters
@@ -101,12 +107,20 @@ class MT5HTMLImporter(BaseImporter):
 
             meta = self._parse_meta(soup)
             settings = meta.pop("settings", {})
-            stats = self._parse_stats(soup)
+            stats = self._parse_stats(soup, initial_capital=meta.get("initial_capital"))
             raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
 
             # Locate Orders and Trades tables
-            orders_table = self._find_table_by_header_keywords(soup, _ORDERS_LABELS, required_cols=["Auftrag"])
-            trades_table = self._find_table_by_header_keywords(soup, _TRADES_LABELS, required_cols=["Zeit", "Richtung"])
+            orders_table = self._find_table_by_header_keywords(
+                soup,
+                _ORDERS_LABELS,
+                required_cols=["Auftrag"],
+            )
+            trades_table = self._find_table_by_header_keywords(
+                soup,
+                _TRADES_LABELS,
+                required_cols=["Zeit", "Richtung"],
+            )
 
             if orders_table is None:
                 raise ValueError("Could not locate 'Orders' table in the HTML report.")
@@ -114,14 +128,19 @@ class MT5HTMLImporter(BaseImporter):
                 raise ValueError("Could not locate 'Trades' table in the HTML report.")
 
             sltp_map = self._build_sltp_map(orders_table)
-            trades, open_summary = self._build_trades(trades_table, sltp_map, source_timezone)
-            # C4: open positions are accounted explicitly (counts + ids).
-            raw_metadata["open_positions"] = open_summary
-            if open_summary.get("open_position_count"):
+            trades, fill_summary = self._build_trades(trades_table, sltp_map, source_timezone)
+            raw_metadata["position_fills"] = fill_summary
+            raw_metadata["open_positions"] = fill_summary
+            if fill_summary.get("open_position_count_including_partial"):
                 logger.warning(
-                    "MT5 HTML report ends with %d open position(s): %s",
-                    open_summary["open_position_count"],
-                    open_summary["open_position_ids"],
+                    "MT5 HTML report ends with %d open or partial position(s): %s",
+                    fill_summary["open_position_count_including_partial"],
+                    fill_summary["open_position_ids"],
+                )
+            if fill_summary.get("orphan_exit_count"):
+                logger.warning(
+                    "MT5 HTML report contains %d orphan exit position(s)",
+                    fill_summary["orphan_exit_count"],
                 )
 
             return ValidationReference(
@@ -159,7 +178,10 @@ class MT5HTMLImporter(BaseImporter):
                 continue
 
             header_text = header_row.get_text(separator=" ", strip=True).lower()
-            header_cells = [cell.get_text(strip=True).lower() for cell in header_row.find_all(("td", "th"))]
+            header_cells = [
+                cell.get_text(strip=True).lower()
+                for cell in header_row.find_all(("td", "th"))
+            ]
 
             # Also check preceding sibling heading or caption
             preceding_text = ""
@@ -275,7 +297,10 @@ class MT5HTMLImporter(BaseImporter):
     # ── stats parsing ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_stats(soup: BeautifulSoup) -> dict[str, Any]:
+    def _parse_stats(
+        soup: BeautifulSoup,
+        initial_capital: Any | None = None,
+    ) -> dict[str, Any]:
         stats: dict[str, Any] = {}
 
         for table in soup.find_all("table"):
@@ -290,8 +315,26 @@ class MT5HTMLImporter(BaseImporter):
                     MT5HTMLImporter._apply_stat(label, val, stats)
                 # Also handle 4-column layouts: label, val, label, val
                 if len(cells) == 4:
-                    MT5HTMLImporter._apply_stat(cells[0].get_text(strip=True), cells[1].get_text(strip=True), stats)
-                    MT5HTMLImporter._apply_stat(cells[2].get_text(strip=True), cells[3].get_text(strip=True), stats)
+                    MT5HTMLImporter._apply_stat(
+                        cells[0].get_text(strip=True),
+                        cells[1].get_text(strip=True),
+                        stats,
+                    )
+                    MT5HTMLImporter._apply_stat(
+                        cells[2].get_text(strip=True),
+                        cells[3].get_text(strip=True),
+                        stats,
+                    )
+
+        if "total_pnl" in stats and initial_capital is not None:
+            try:
+                capital = float(initial_capital)
+                total_pnl = float(stats["total_pnl"])
+            except (TypeError, ValueError):
+                capital = 0.0
+                total_pnl = 0.0
+            if capital > 0.0 and math.isfinite(capital) and math.isfinite(total_pnl):
+                stats["total_return"] = total_pnl / capital
 
         return stats
 
@@ -313,9 +356,9 @@ class MT5HTMLImporter(BaseImporter):
                 stats["win_rate"] = pct
             return
         if key == "losers_with_pct":
-            l, pct = MT5HTMLImporter._parse_count_pct(val)
-            if l is not None:
-                stats["losers"] = l
+            losses, pct = MT5HTMLImporter._parse_count_pct(val)
+            if losses is not None:
+                stats["losers"] = losses
             return
         if key in ("max_drawdown_pct", "max_drawdown_max"):
             pct = MT5HTMLImporter._extract_first_percent(val)
@@ -454,13 +497,12 @@ class MT5HTMLImporter(BaseImporter):
     ) -> tuple[list[Trade], dict[str, Any]]:
         rows = MT5HTMLImporter._table_to_rows(trades_table)
         if not rows:
-            return [], open_position_summary([])
+            return [], position_fill_summary([])
 
         header = rows[0]
         data_rows = rows[1:]
 
         col_time = MT5HTMLImporter._find_col_index(header, ["Zeit"])
-        col_trade_id = MT5HTMLImporter._find_col_index(header, ["Auftrag", "Trade"])
         col_typ = MT5HTMLImporter._find_col_index(header, ["Typ"])
         col_direction = MT5HTMLImporter._find_col_index(header, ["Richtung"])
         col_symbol = MT5HTMLImporter._find_col_index(header, ["Symbol"])
@@ -475,9 +517,21 @@ class MT5HTMLImporter(BaseImporter):
         # DV-B42: direction is derived from the Typ column, so it must be
         # present.  Without this check a missing or locale-variant Typ column
         # silently relabels every trade as SHORT.
-        if col_time is None or col_direction is None or col_typ is None:
+        required_columns = {
+            "Zeit": col_time,
+            "Typ": col_typ,
+            "Richtung": col_direction,
+            "Symbol": col_symbol,
+            "Volumen": col_volume,
+            "Preis": col_price,
+            "Gewinn": col_profit,
+        }
+        missing_columns = [name for name, index in required_columns.items() if index is None]
+        if missing_columns:
             raise ValueError(
-                "Trades table is missing required columns (Zeit / Typ / Richtung)."
+                "Trades table is missing required columns "
+                "(Zeit / Typ / Richtung / Symbol / Volumen / Preis / Gewinn): "
+                + ", ".join(missing_columns)
             )
 
         # DV-B43: group all fills per position id (the Trade column; Auftrag
@@ -490,13 +544,26 @@ class MT5HTMLImporter(BaseImporter):
             return MT5HTMLImporter._get_str(row, col_direction, "").lower()
 
         def _row_position_id(row: list[str]) -> str:
-            return MT5HTMLImporter._get_str(row, col_position_id, "") if col_position_id is not None else ""
+            return (
+                MT5HTMLImporter._get_str(row, col_position_id, "")
+                if col_position_id is not None
+                else ""
+            )
+
+        def _row_quantity(row: list[str]) -> float:
+            value = MT5HTMLImporter._to_float(row, col_volume)
+            if value is None or not math.isfinite(value) or value <= 0.0:
+                raise ValueError("Trade fill quantity must be a positive finite number")
+            return value
 
         position_fills = group_position_fills(
             data_rows,
             position_id_of=_row_position_id,
             direction_of=_row_direction,
-            is_trade_row=lambda row: MT5HTMLImporter._get_str(row, col_typ, "").lower() != "balance",
+            is_trade_row=lambda row: (
+                MT5HTMLImporter._get_str(row, col_typ, "").lower() != "balance"
+            ),
+            quantity_of=_row_quantity,
         )
 
         trades: list[Trade] = []
@@ -581,6 +648,8 @@ class MT5HTMLImporter(BaseImporter):
                 pnl=pnl,
                 fees=fees if fees != 0.0 else None,
                 net_pnl=pnl - fees,
+                stop_loss=sl,
+                take_profit=tp,
                 exit_reason=exit_reason,
                 tags=tags,
                 meta={
@@ -595,7 +664,7 @@ class MT5HTMLImporter(BaseImporter):
             trades.append(trade)
             trade_id_counter += 1
 
-        return trades, open_position_summary(position_fills)
+        return trades, position_fill_summary(position_fills)
 
     @staticmethod
     def _group_trade_rows(
@@ -618,7 +687,11 @@ class MT5HTMLImporter(BaseImporter):
             if typ == "balance" or direction not in ("in", "out"):
                 continue
 
-            tid = MT5HTMLImporter._get_str(row, col_trade_id, "") if col_trade_id is not None else ""
+            tid = (
+                MT5HTMLImporter._get_str(row, col_trade_id, "")
+                if col_trade_id is not None
+                else ""
+            )
             if not tid:
                 continue
 

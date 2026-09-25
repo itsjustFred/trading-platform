@@ -13,6 +13,7 @@ from typing import Any
 
 from shared.models import Trade
 from validation.comparison.matcher import MatchKey
+from validation.comparison.tolerances import finite_tolerance, relative_difference
 
 
 def _normalize_timestamp(ts: str) -> datetime:
@@ -29,11 +30,8 @@ _MISMATCH_SUFFIX = " (mismatch)"
 
 
 def _pct_diff(a: float, b: float) -> float:
-    """Return the relative difference, using max(|a|, |b|) as denominator."""
-    denom = max(abs(a), abs(b))
-    if denom == 0.0:
-        return 0.0 if a == b else 1.0
-    return abs(a - b) / denom
+    """Return relative drift using the expected value as the denominator."""
+    return relative_difference(a, b)
 
 
 def _abs_diff(a: float, b: float) -> float:
@@ -59,6 +57,22 @@ class TradeComparisonConfig:
     pnl_abs: float = 0.01
     sl_price_pct: float = 0.0001
     tp_price_pct: float = 0.0001
+
+    def __post_init__(self) -> None:
+        for name in (
+            "entry_time_seconds",
+            "exit_time_seconds",
+            "entry_price_pct",
+            "exit_price_pct",
+            "volume_pct",
+            "position_size_pct",
+            "pnl_pct",
+            "pnl_abs",
+            "sl_price_pct",
+            "tp_price_pct",
+        ):
+            value = finite_tolerance(getattr(self, name), name)
+            setattr(self, name, value)
 
 
 @dataclass
@@ -224,34 +238,40 @@ class TradeComparator:
         )
 
     def _resolve_stop_level(self, trade: Trade, attr: str, keys: tuple[str, ...]) -> float | None:
-        """Resolve a stop level (SL or TP) from a trade (#85).
-
-        Precedence: Position-level attribute *attr* (``stop_loss`` or
-        ``take_profit``) first — the native engine carries its stops there —
-        then the meta keys in *keys* order. Returns ``None`` only when no
-        source carries a finite value; a missing level is a mismatch against
-        a present one, never a "both None (match)".
-        """
-        value = getattr(trade, attr, None)
-        if value is not None:
+        """Resolve a stop level from canonical fields and legacy metadata."""
+        def _finite(value: Any) -> float | None:
+            if value is None:
+                return None
             try:
                 numeric = float(value)
             except (TypeError, ValueError):
-                pass
-            else:
-                if math.isfinite(numeric):
-                    return numeric
-        if trade.meta:
-            for key in keys:
-                value = trade.meta.get(key)
-                if value is None:
-                    continue
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if math.isfinite(numeric):
-                    return numeric
+                return None
+            return numeric if math.isfinite(numeric) else None
+
+        direct = _finite(getattr(trade, attr, None))
+        if direct is not None:
+            return direct
+
+        metadata = trade.meta or {}
+        sources: list[dict[str, Any]] = [metadata]
+        for nested_key in ("risk_math", "risk", "execution"):
+            nested = metadata.get(nested_key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+
+        legacy_keys = tuple(keys) + (
+            "final_stop_loss",
+            "final_take_profit",
+            "signal_stop_loss",
+            "signal_take_profit",
+            "initial_stop_loss",
+            "initial_take_profit",
+        )
+        for source in sources:
+            for key in legacy_keys:
+                value = _finite(source.get(key))
+                if value is not None:
+                    return value
         return None
 
     def _compare_optional_pct(

@@ -29,6 +29,8 @@ def _make_sample_trade(
         quantity=1000.0,
         exits=[TradeExit(time="2024-01-01T11:00:00Z", price=1.1050, quantity=1000.0)],
         pnl=pnl,
+        stop_loss=1.0000,
+        take_profit=1.2000,
     )
 
 
@@ -80,6 +82,7 @@ class TestCliHelp:
         assert "usage:" in result.stdout.lower()
         assert "--reference" in result.stdout
         assert "--platform" in result.stdout
+        assert "quantconnect" in result.stdout
 
 
 class TestCliJsonOutput:
@@ -198,6 +201,22 @@ class TestCliExitCode0OnPerfectMatch:
             "--format", "json",
         ])
         assert result.returncode == 0
+
+    def test_cli_runs_readiness_when_golden_is_supplied(
+        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+    ):
+        golden_path = tmp_path / "golden.json"
+        golden_path.write_text(tmp_reference_json.read_text(encoding="utf-8"), encoding="utf-8")
+        result = _invoke_cli([
+            "--reference", str(tmp_reference_json),
+            "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(golden_path),
+            "--format", "json",
+        ])
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["readiness"]["level"] == "READY"
+        assert data["readiness"]["passed"] is True
 
 
 class TestCliTimeToleranceArgument:

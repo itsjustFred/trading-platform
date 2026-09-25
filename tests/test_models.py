@@ -1,6 +1,5 @@
 """Tests for shared.models — universal trade format."""
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -128,6 +127,26 @@ class TestTrade:
         assert len(t2.exits) == 1
         assert t2.exits[0].reason == "rsi_target"
 
+    def test_stop_levels_roundtrip(self):
+        trade = Trade(
+            id=1,
+            symbol="X",
+            direction="LONG",
+            entry_time="2024-01-01T00:00:00Z",
+            entry_price=100.0,
+            quantity=1.0,
+            exits=[TradeExit(time="2024-01-02T00:00:00Z", price=105.0, quantity=1.0)],
+            pnl=5.0,
+            stop_loss=95.0,
+            take_profit=110.0,
+        )
+        payload = trade.to_dict()
+        restored = Trade.from_dict(payload)
+        assert payload["stop_loss"] == 95.0
+        assert payload["take_profit"] == 110.0
+        assert restored.stop_loss == 95.0
+        assert restored.take_profit == 110.0
+
     def test_partial_exit_roundtrip(self):
         t = _make_partial_exit_trade()
         d = t.to_dict()
@@ -181,6 +200,7 @@ class TestBacktestResult:
         assert len(r2.equity_curve) == 2
         assert r2.stats["total_trades"] == 2
         assert len(r2.drawings) == 2
+        assert r2.equity_evidence_status == "available"
 
     def test_file_roundtrip(self):
         r = _make_result()
