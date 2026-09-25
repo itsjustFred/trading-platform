@@ -91,3 +91,19 @@ def test_run_backtest_returns_output_on_success(monkeypatch):
     returncode, output = auto_agent._run_backtest(["python", "-c", "ok"], log=None)
     assert returncode == 0
     assert "line one" in output
+
+
+def test_timeout_helper_raises_runtime_error_with_the_real_limit():
+    """The kill-and-report path must not blow up with its own NameError.
+
+    `_timeout` builds the message for the operator. Referencing an undefined
+    name there replaced the intended timeout RuntimeError with a NameError, so
+    the caller saw "name '_backtest_timeout' is not defined" instead of which
+    command hung and for how long.
+    """
+    proc = FakeProc()
+    with pytest.raises(RuntimeError, match="timed out after"):
+        auto_agent._timeout(proc, ["python", "-c", "hang"])
+    assert proc.killed
+    with pytest.raises(RuntimeError, match="python -c hang"):
+        auto_agent._timeout(FakeProc(), ["python", "-c", "hang"])
