@@ -2524,6 +2524,142 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     assert cancel_resp.json()["status"] == "cancelled"
 
 
+def _seed_controllable_task(viewer_app_module, task_id, log_file, tmp_path):
+    """Register a paused-capable task so control transitions can be driven."""
+    log_path = log_file / f"task_{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Resample EURUSD 1h",
+        description="Resample EURUSD 1h bars from tick data.",
+        kind="data",
+        source="dukascopy",
+        total_items=4,
+        log_file=log_path,
+        control_mode="thread",
+        supports_control=True,
+    )
+    assert tmp_path is not None
+    return log_path
+
+
+def test_task_control_flags_track_the_pause_resume_cycle(viewer_client, tmp_path):
+    """`can_pause`/`can_resume` must describe what the endpoints will accept.
+
+    These flags are the contract the UI renders its buttons from, so a task
+    that advertises `can_resume: false` while the endpoint still flips it to
+    `running` is a lie the operator cannot see.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "control-flags-task"
+    _seed_controllable_task(viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path)
+    viewer_app_module._set_task_status(task_id, "running")
+
+    def controls():
+        listed = next(
+            item
+            for item in viewer_client.get("/api/data/tasks").json()["tasks"]
+            if item["id"] == task_id
+        )
+        return listed["can_pause"], listed["can_resume"]
+
+    assert controls() == (True, False)
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/pause").status_code == 200
+    assert controls() == (False, True)
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/resume").status_code == 200
+    assert controls() == (True, False)
+
+    viewer_app_module._mark_task_finished(task_id, status="completed", returncode=0)
+    assert controls() == (False, False)
+
+
+def test_task_resume_requires_a_paused_task(viewer_client, tmp_path):
+    """Resume must refuse a task that was never paused.
+
+    Before this guard the endpoint only short-circuited on final statuses, so
+    POSTing resume against a `starting` task silently promoted it to `running`:
+    a task that had not begun work yet would be reported as executing, and its
+    elapsed/ETA figures would be wrong.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "resume-not-paused-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    # `_create_task_record` starts every task in `starting`.
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+    resp = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
+    assert resp.status_code == 409
+    assert "paused" in (resp.json().get("error") or resp.json().get("detail", ""))
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+
+def test_task_pause_requires_a_runnable_task(viewer_client, tmp_path):
+    """Pause must refuse a task that is not queued/starting/running.
+
+    Mirror of the resume guard: `can_pause` is advertised as false once a task
+    is paused or finished, so the endpoint has to agree instead of re-pausing
+    a finished task or flipping `queued` straight to `paused`.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "pause-not-runnable-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/pause").status_code == 200
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "paused"
+
+    resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
+    assert resp.status_code == 409
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "paused"
+
+
+def test_paused_task_resumes_and_runs_to_completion(viewer_client, tmp_path):
+    """The full operator journey: running -> paused -> running -> completed.
+
+    Regression cover for the missing resume control: `resumeDataTask` and
+    `can_resume` existed in the API but nothing ever drove them, so a paused
+    task could only be abandoned or cancelled.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "pause-resume-complete-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+
+    paused = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["can_resume"] is True
+    assert viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+
+    resumed = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
+    assert resumed.json()["can_pause"] is True
+    assert not viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+
+    viewer_app_module._mark_task_finished(task_id, status="completed", returncode=0)
+
+    detail = viewer_client.get(f"/api/data/tasks/{task_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "completed"
+    assert detail.json()["can_pause"] is False
+    assert detail.json()["can_resume"] is False
+    assert detail.json()["can_cancel"] is False
+
+
 def test_tasks_alias_returns_enriched_fields(viewer_client, tmp_path):
     import viewer.main as viewer_app_module
 

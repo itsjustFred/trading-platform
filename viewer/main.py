@@ -297,6 +297,12 @@ DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
+# Statuses a task can be paused from. `starting` and `queued` are included
+# deliberately: pausing before work begins is how an operator stops a task that
+# has not started yet, and the pause takes effect at the first checkpoint.
+# `paused` is excluded, because re-pausing an already paused task used to
+# silently succeed and left `can_pause` disagreeing with the endpoint.
+PAUSABLE_TASK_STATUSES = frozenset({"running", "starting", "queued"})
 _running_jobs = legacy_viewer._running_jobs
 _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
@@ -11974,6 +11980,14 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if task.get("status") in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
+    # Only a task that is actually pending or executing can be paused. Without
+    # this guard an already paused task was silently "paused" again, so the UI
+    # advertised can_pause for a task the endpoint would not act on.
+    if str(task.get("status") or "") not in PAUSABLE_TASK_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task cannot be paused from status {task.get('status')!r}",
+        )
 
     task["pause_event"].set()
     if task.get("control_mode") == "process":
@@ -11994,6 +12008,15 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
     if task.get("status") in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
+    # Only a paused task can be resumed. Previously the endpoint only
+    # short-circuited on final statuses, so POSTing resume against a `starting`
+    # or `queued` task promoted it to `running`: the task was reported as
+    # executing when it had not begun, and its elapsed/ETA figures were wrong.
+    if str(task.get("status") or "") != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is not paused (status={task.get('status')!r})",
+        )
 
     task["pause_event"].clear()
     if task.get("control_mode") == "process":
