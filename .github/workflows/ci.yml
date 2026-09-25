@@ -18,7 +18,9 @@ jobs:
       - name: Install uv
         run: pip install uv
       - name: Sync dependencies
-        run: uv sync --frozen --extra dev
+        # All extras: the suite imports optional engines (vectorbt, lean,
+        # ctrader, …) unconditionally; a subset install fails collection.
+        run: uv sync --frozen --all-extras
       # Advisory until the legacy debt is cleared (1144 pre-existing
       # findings on main): new code is held to ruff-parity with main in
       # review instead of a repo-wide gate that can never pass.
