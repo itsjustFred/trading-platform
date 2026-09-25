@@ -324,6 +324,18 @@ class TestCostBasedTieBreak:
         with pytest.raises(ValueError, match="match weights must be >= 0"):
             TradeMatcher.match([], [], **{weight_name: -1.0})
 
+    def test_zero_match_cost_weights_are_accepted(self) -> None:
+        result = TradeMatcher.match(
+            [],
+            [],
+            time_weight=0.0,
+            price_weight=0.0,
+            quantity_weight=0.0,
+        )
+        assert result.matched == []
+        assert result.missing == []
+        assert result.extra == []
+
     def test_exact_tie_keeps_lowest_index(self) -> None:
         from validation.comparison.matcher import TradeMatcher
 
