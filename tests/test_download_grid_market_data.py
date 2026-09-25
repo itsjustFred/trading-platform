@@ -259,8 +259,8 @@ def test_normalize_bid_priority_with_provenance():
         normalize_ohlcv_columns(path)
 
         result = pd.read_parquet(path)
-        assert result["open"].tolist() == [1.0, 2.0, None] or True  # NA-tolerant below
         assert result["open"].iloc[0] == 1.0  # bid wins
         assert result["open"].iloc[1] == 2.0  # ask fills bid gap
+        assert result["open"].isna().iloc[2]  # both sides missing stays NA
         assert OHLCV_SOURCE_COLUMN in result.columns
         assert result[OHLCV_SOURCE_COLUMN].tolist() == ["bid", "ask", "unresolved"]

@@ -18,6 +18,7 @@ from validation.reporting.json_report import (
     StatDelta,
     TradeStatistics,
     _compare_stats,
+    generate_json_report,
 )
 
 
@@ -120,3 +121,54 @@ class TestStatDeltaDefaults:
     def test_missing_fields_still_compared(self, field: str) -> None:
         deltas = _compare_stats(TradeStatistics(), TradeStatistics())
         assert field in {d.field for d in deltas}
+
+
+class TestCanonicalStatsPath:
+    def test_stored_platform_stats_never_preferred(self) -> None:
+        """C4: single canonical computation path — recompute from trades.
+
+        A platform result with empty trades but curated stored stats must
+        compare recomputed zeros, never the stored numbers.
+        """
+        import json
+
+        from shared.models import Trade, TradeExit
+        from tests.validation.data_factory import make_reference
+        from validation.reference import ValidationReference
+
+        winning = Trade(
+            id=1,
+            symbol="EURUSD",
+            direction="LONG",
+            entry_time="2024-01-01T10:00:00Z",
+            entry_price=1.1000,
+            quantity=1000.0,
+            exits=[
+                TradeExit(
+                    time="2024-01-01T11:00:00Z",
+                    price=1.1050,
+                    quantity=1000.0,
+                    pnl=50.0,
+                )
+            ],
+            pnl=50.0,
+        )
+        ref = make_reference([winning])
+        platform = ValidationReference(
+            strategy_name="test_strategy",
+            source_framework="unknown",
+            symbol="EURUSD",
+            timeframe="1h",
+            settings={},
+            trades=[],
+            stats={"net_profit": 999999.0},
+            raw_metadata={},
+            allow_empty=True,
+        )
+        data = json.loads(generate_json_report(ref, platform))
+        net = _delta(
+            [StatDelta(**d) for d in data["stat_deltas"]],
+            "net_profit",
+        )
+        assert net.actual == 0.0
+        assert net.passed is False

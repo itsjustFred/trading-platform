@@ -43,9 +43,10 @@ class TestMaxSignalAge:
         fresh = (now - timedelta(minutes=5)).isoformat()
         assert signal_is_fresh(_signal(fresh), "1h", now=now) is True
 
-    def test_missing_timestamp_is_fresh(self) -> None:
-        # Age cannot be judged — replay/internal paths must not break.
-        assert signal_is_fresh(_signal(None), "1h") is True
+    def test_missing_timestamp_is_stale(self) -> None:
+        # Fail-closed (B2): unknown age must not trade. The Discord path
+        # always stamps received_at; only stamp-bypassers land here.
+        assert signal_is_fresh(_signal(None), "1h") is False
 
 
 class TestWeeklyAnchor:

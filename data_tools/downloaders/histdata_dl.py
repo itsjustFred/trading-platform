@@ -51,7 +51,7 @@ def _read_histdata_zip(content: bytes, *, symbol: str, year: int) -> pd.DataFram
         )
     logger.info(
         "histdata archive sha256=%s (%d bytes) for %s/%d",
-        hashlib.sha256(content).hexdigest()[:16],
+        hashlib.sha256(content).hexdigest(),
         len(content),
         symbol,
         year,
