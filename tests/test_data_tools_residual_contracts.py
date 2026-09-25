@@ -37,6 +37,18 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
         validate_dataset_component(component)
 
 
+def test_dataset_component_rejects_explicit_parent_component() -> None:
+    with pytest.raises(ValueError, match="traversal component"):
+        validate_dataset_component("..")
+
+
+def test_dataset_path_rejects_parent_traversal_in_root(tmp_path: Path) -> None:
+    root = tmp_path / "unused" / ".." / "datasets"
+
+    with pytest.raises(ValueError, match="dataset root must not traverse upward"):
+        build_dataset_path(root, "EURUSD", "1m.parquet")
+
+
 def test_dataset_path_rejects_symlink_escape(tmp_path: Path) -> None:
     root = tmp_path / "data"
     outside = tmp_path / "outside"

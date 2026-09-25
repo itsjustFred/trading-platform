@@ -42,12 +42,28 @@ class TestPerfectMatch:
 
     def test_multiple_trades_match(self):
         ref = [
-            _make_trade(trade_id=1, entry_time="2024-01-01T10:00:00Z", exit_time="2024-01-01T11:00:00Z"),
-            _make_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z", exit_time="2024-01-02T11:00:00Z"),
+            _make_trade(
+                trade_id=1,
+                entry_time="2024-01-01T10:00:00Z",
+                exit_time="2024-01-01T11:00:00Z",
+            ),
+            _make_trade(
+                trade_id=2,
+                entry_time="2024-01-02T10:00:00Z",
+                exit_time="2024-01-02T11:00:00Z",
+            ),
         ]
         act = [
-            _make_trade(trade_id=10, entry_time="2024-01-01T10:00:00Z", exit_time="2024-01-01T11:00:00Z"),
-            _make_trade(trade_id=20, entry_time="2024-01-02T10:00:00Z", exit_time="2024-01-02T11:00:00Z"),
+            _make_trade(
+                trade_id=10,
+                entry_time="2024-01-01T10:00:00Z",
+                exit_time="2024-01-01T11:00:00Z",
+            ),
+            _make_trade(
+                trade_id=20,
+                entry_time="2024-01-02T10:00:00Z",
+                exit_time="2024-01-02T11:00:00Z",
+            ),
         ]
         result = TradeMatcher.match(ref, act)
         assert len(result.matched) == 2
@@ -302,6 +318,11 @@ class TestCostBasedTieBreak:
             TradeMatcher.match([], [], time_tolerance_seconds=float("nan"))
         with pytest.raises(ValueError, match="finite"):
             TradeMatcher.match([], [], price_weight=float("inf"))
+
+    @pytest.mark.parametrize("weight_name", ["time_weight", "price_weight", "quantity_weight"])
+    def test_negative_match_cost_weights_are_rejected(self, weight_name: str) -> None:
+        with pytest.raises(ValueError, match="match weights must be >= 0"):
+            TradeMatcher.match([], [], **{weight_name: -1.0})
 
     def test_exact_tie_keeps_lowest_index(self) -> None:
         from validation.comparison.matcher import TradeMatcher
