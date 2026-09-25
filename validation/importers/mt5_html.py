@@ -454,7 +454,7 @@ class MT5HTMLImporter(BaseImporter):
     ) -> tuple[list[Trade], dict[str, Any]]:
         rows = MT5HTMLImporter._table_to_rows(trades_table)
         if not rows:
-            return []
+            return [], open_position_summary([])
 
         header = rows[0]
         data_rows = rows[1:]

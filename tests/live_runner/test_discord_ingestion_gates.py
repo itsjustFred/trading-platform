@@ -526,7 +526,12 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -585,7 +590,13 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1", "discord_author_id": "bot-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "bot-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -640,7 +651,12 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):

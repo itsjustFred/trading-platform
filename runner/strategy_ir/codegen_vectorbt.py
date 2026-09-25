@@ -216,12 +216,26 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
         [indicator for indicator in indicators]
     )
     by_name = {spec["label"]: spec for spec in indicator_specs}
+    secondary_slug = (
+        by_name[declared_secondary.name]["slug"]
+        if declared_secondary is not None and declared_secondary.name in by_name
+        else None
+    )
     primary_signal = "close"
     secondary_signal = "close.shift(1)"
     if declared_primary is not None:
         primary_signal = f"indicator_{by_name[declared_primary.name]['slug']}"
     elif indicator_specs:
-        primary_signal = f"indicator_{indicator_specs[0]['slug']}"
+        # CodeRabbit round: the fallback must not pick the indicator
+        # already assigned to secondary. When every spec IS the secondary
+        # indicator, keep the "close" default instead of wiring both
+        # roles to the same line.
+        first_other = next(
+            (spec for spec in indicator_specs if spec["slug"] != secondary_slug),
+            None,
+        )
+        if first_other is not None:
+            primary_signal = f"indicator_{first_other['slug']}"
     if declared_secondary is not None:
         secondary_signal = f"indicator_{by_name[declared_secondary.name]['slug']}"
     elif len(indicator_specs) > 1 and declared_primary is None:

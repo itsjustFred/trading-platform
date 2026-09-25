@@ -1,5 +1,7 @@
 from shared.models import LiveAccountConfig
 
+import pytest
+
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan, top_backtests_for_ctrader
 
 
@@ -95,6 +97,6 @@ def test_score_is_unit_normalized() -> None:
         "trade_count": 12,
     }
     # 0.5 + 0.2 + 0.8 - 0.06
-    assert score_backtest_for_live(modest) == (
+    assert score_backtest_for_live(modest) == pytest.approx(
         1.5 / 3.0 + 0.2 + 0.8 - 0.06
     )

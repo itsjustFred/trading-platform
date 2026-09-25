@@ -277,3 +277,13 @@ class TestGermanNumberParsing:
         assert 1234.56 in sl_values
         assert 2.5 in tp_values
         assert 1.095 in tp_values
+
+
+def test_build_trades_empty_table_returns_tuple_shape() -> None:
+    """CodeRabbit round: the empty path must keep the declared tuple shape."""
+    from bs4 import BeautifulSoup
+
+    empty = BeautifulSoup("<table></table>", "html.parser").find("table")
+    trades, summary = MT5HTMLImporter._build_trades(empty, {})
+    assert trades == []
+    assert summary["open_position_count"] == 0

@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -879,7 +880,12 @@ def _trade_signal() -> object:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
 

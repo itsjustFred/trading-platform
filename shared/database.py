@@ -1596,6 +1596,16 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         session.commit()
     except IntegrityError:
         session.rollback()
+        # CodeRabbit round: the conflict is only a duplicate when the
+        # dedupe_key row actually exists — anything else (FK, NOT NULL,
+        # CHECK) must propagate instead of masquerading as a skip.
+        raced = session.exec(
+            select(LiveExecutionModel)
+            .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
+            .limit(1)
+        ).first()
+        if raced is None:
+            raise
         logger.info(
             "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
             record.dedupe_key,

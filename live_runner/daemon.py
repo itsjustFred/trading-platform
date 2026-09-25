@@ -869,19 +869,27 @@ def _trade_signal_to_live_signal(
     # differ by price/levels/time. Discord redeliveries keep using their
     # discord_message_id.
     if not metadata.get("discord_message_id") and not metadata.get("idempotency_key"):
-        key_material = "|".join(
-            [
-                str(deployment.id),
-                str(signal.symbol).upper(),
-                str(signal.action).lower(),
-                repr(float(signal.entry_price)),
-                repr(signal.stop_loss),
-                repr(signal.take_profit),
-                str(signal.timeframe),
-                str(metadata.get("signal_timestamp") or metadata.get("timestamp") or ""),
-            ]
-        )
-        metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:32]
+        # CodeRabbit round: only mint a key from real producer identity. An
+        # empty timestamp slot would make distinct timestamp-less signals
+        # share one key and wrongly dedupe — leave it unset instead (the
+        # execution layer derives a fill-content key downstream).
+        producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
+        if producer_stamp:
+            key_material = "|".join(
+                [
+                    str(deployment.id),
+                    str(signal.symbol).upper(),
+                    str(signal.action).lower(),
+                    repr(float(signal.entry_price)),
+                    repr(signal.stop_loss),
+                    repr(signal.take_profit),
+                    str(signal.timeframe),
+                    str(producer_stamp),
+                ]
+            )
+            metadata["idempotency_key"] = hashlib.sha256(
+                key_material.encode("utf-8")
+            ).hexdigest()[:32]
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE

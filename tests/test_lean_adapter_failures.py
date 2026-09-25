@@ -102,3 +102,18 @@ def test_find_result_returns_none_when_nothing_validates(tmp_path: Path) -> None
     (out / "config.json").write_text(json.dumps({"config": True}))
     adapter = LeanAdapter.__new__(LeanAdapter)
     assert adapter._find_result(out) is None
+
+
+def test_find_result_accepts_dict_shaped_orders(tmp_path: Path) -> None:
+    """CodeRabbit round (critical): LEAN writes orders dict-shaped keyed
+    by order id — the finder must accept what the converter consumes."""
+    import json
+
+    from runner.engines.lean_adapter import LeanAdapter
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "result.json").write_text(json.dumps(LEAN_FIXTURE))
+    adapter = LeanAdapter.__new__(LeanAdapter)
+    found = adapter._find_result(out)
+    assert found is not None and found.name == "result.json"

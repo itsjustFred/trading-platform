@@ -140,8 +140,9 @@ class LeanAdapter(EngineAdapter):
         """Find the LEAN result JSON in output directory (C2).
 
         First JSON shaped like a result wins — deterministically (sorted),
-        requiring a dict with list-typed `orders`/`trades` when present, so
-        a config echo or log-shaped JSON is never mistaken for a result.
+        requiring a dict with `orders`/`trades` when present. LEAN writes
+        orders dict-shaped (keyed by order id); lists are accepted too —
+        matching what :mod:`runner.converters.lean_converter` consumes.
         Returns None (caller fails loudly) when nothing validates.
         """
         for pattern in ["*.json", "**/*.json"]:
@@ -156,7 +157,9 @@ class LeanAdapter(EngineAdapter):
                     continue
                 orders = data.get("orders", [])
                 trades = data.get("trades", [])
-                if not isinstance(orders, list) or not isinstance(trades, list):
+                if not isinstance(orders, (list, dict)) or not isinstance(
+                    trades, (list, dict)
+                ):
                     continue
                 logger.info("Using LEAN result file: %s", f)
                 return f

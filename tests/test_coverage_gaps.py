@@ -404,3 +404,45 @@ def test_segment_ending_on_weekend_counts_trading_bars_only(tmp_path):
         symbol="EURUSD", timeframe="1d",
         start="2024-01-01", end="2024-01-06", data_dir=tmp_path,
     )
+
+
+def test_gap_outside_required_window_does_not_fail(tmp_path: Path) -> None:
+    """CodeRabbit round: ancient history outside [start, end] must not
+    fail a requirement that never touches it."""
+    _write_bars(
+        tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+        [
+            "2019-01-01T00:00:00Z",
+            "2019-01-01T01:00:00Z",
+            "2024-06-01T00:00:00Z",
+            "2024-06-01T01:00:00Z",
+            "2024-06-01T02:00:00Z",
+        ],
+    )
+    report = analyze_ohlcv_coverage(
+        tmp_path,
+        DataRequirement(
+            symbol="EURUSD", timeframe="1h", start="2024-06-01", end="2024-06-01"
+        ),
+    )
+    assert report["status"] != "failed"
+
+
+def test_gap_inside_required_window_still_fails(tmp_path: Path) -> None:
+    """The window scope must not swallow holes that matter."""
+    _write_bars(
+        tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+        [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T01:00:00Z",
+            "2024-06-01T00:00:00Z",
+            "2024-06-01T01:00:00Z",
+        ],
+    )
+    report = analyze_ohlcv_coverage(
+        tmp_path,
+        DataRequirement(
+            symbol="EURUSD", timeframe="1h", start="2024-01-01", end="2024-06-30"
+        ),
+    )
+    assert report["status"] == "failed"

@@ -516,7 +516,7 @@ class MT5XLSXImporter(BaseImporter):
         source_timezone: str | tzinfo | None = None,
     ) -> tuple[list[Trade], dict[str, Any]]:
         if trades_df.empty:
-            return []
+            return [], open_position_summary([])
 
         col_time = MT5XLSXImporter._find_col(trades_df, ["Zeit"])
         col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])

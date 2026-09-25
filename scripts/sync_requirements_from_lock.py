@@ -14,11 +14,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _normalize_name(name: str) -> str:
+    """PEP 503 normalization for lock/requirements key matching."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def load_lock_versions(lock_path: Path) -> dict[str, str]:
     versions: dict[str, str] = {}
     pattern = re.compile(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"')
     for match in pattern.finditer(lock_path.read_text(encoding="utf-8")):
-        versions[match.group(1).lower()] = match.group(2)
+        versions[_normalize_name(match.group(1))] = match.group(2)
     return versions
 
 
@@ -32,17 +37,24 @@ def main() -> int:
         if not stripped or stripped.startswith("#"):
             output.append(line)
             continue
-        match = re.match(r"([A-Za-z0-9_.\-]+)(\[[^\]]+\])?==(.*)", stripped)
+        match = re.match(
+            r"([A-Za-z0-9_.\-]+)(\[[^\]]+\])?==([^;#\s]+)(.*)", stripped
+        )
         if not match:
             output.append(line)
             continue
-        name, extra, _ = match.group(1), match.group(2) or "", match.group(3)
-        locked = lock_versions.get(name.lower())
+        name, extra, _, trailing = (
+            match.group(1),
+            match.group(2) or "",
+            match.group(3),
+            match.group(4) or "",
+        )
+        locked = lock_versions.get(_normalize_name(name))
         if locked is None:
             missing.append(name)
             output.append(line)
         else:
-            output.append(f"{name}{extra}=={locked}")
+            output.append(f"{name}{extra}=={locked}{trailing}")
     req_path.write_text("\n".join(output) + "\n", encoding="utf-8")
     if missing:
         print(f"kept stale pins (absent from uv.lock): {', '.join(missing)}")

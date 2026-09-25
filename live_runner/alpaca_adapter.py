@@ -550,6 +550,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if missing:
             if unbounded_tp and stop_loss is not None:
+                # CodeRabbit round: the early return must not bypass the
+                # finite/positive validation below — an invalid stop would
+                # reach StopLossRequest unchecked.
+                if math.isnan(stop_loss) or math.isinf(stop_loss) or stop_loss <= 0:
+                    raise ValueError(
+                        f"Invalid stop_loss price for {signal.symbol}: {stop_loss!r}; "
+                        "refusing to submit."
+                    )
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):

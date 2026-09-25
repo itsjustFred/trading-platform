@@ -524,3 +524,8 @@ class TestMatchTolerancePlumbing:
             config=RegressionConfig(match_time_tolerance_seconds=60),
         )
         assert len(lenient.trade_delta_report.matched_trades) == 1
+        # CodeRabbit round: anomaly detection must reuse the configured
+        # tolerance — the within-tolerance pair is neither missing nor
+        # failing.
+        assert lenient.trade_delta_report.missing_trades == []
+        assert lenient.passed is True

@@ -3350,6 +3350,36 @@ def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
     assert converted.action == "sell"
 
 
+def test_conversion_mints_key_only_with_producer_stamp():
+    """CodeRabbit round: timestamp-less signals must not share a minted key."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+
+    deployment = _deployment()
+
+    def _signal(metadata: dict) -> TradeSignal:
+        return TradeSignal(
+            action="buy",
+            symbol="AAPL",
+            entry_price=100.0,
+            stop_loss=98.0,
+            take_profit=104.0,
+            timeframe="1h",
+            metadata=metadata,
+        )
+
+    naked = _trade_signal_to_live_signal(_signal({}), deployment)
+    assert "idempotency_key" not in naked.metadata
+
+    stamped = _trade_signal_to_live_signal(
+        _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
+    )
+    restamped = _trade_signal_to_live_signal(
+        _signal({"signal_timestamp": "2026-07-15T10:00:00+00:00"}), deployment
+    )
+    assert stamped.metadata["idempotency_key"]
+    assert restamped.metadata["idempotency_key"] == stamped.metadata["idempotency_key"]
+
+
 def test_alpaca_exit_only_orders_bypass_entry_sl_tp_guard():
     """Exit-only closes reduce exposure and carry no SL/TP; the adapter's
     entry guard must not block them, and the order must go out as a plain
@@ -3401,6 +3431,32 @@ def test_alpaca_entry_guard_still_blocks_naked_non_exit_orders():
     resolve = adapter._resolve_broker_sl_tp
     with pytest.raises(ValueError, match="without stop_loss"):
         resolve(signal)
+
+
+def test_alpaca_unbounded_tp_rejects_invalid_stop() -> None:
+    """CodeRabbit round: the unbounded early-return must validate the stop."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+
+    def _signal(stop: object) -> LiveSignal:
+        return LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "stop_loss": stop,
+                "take_profit_policy": "unbounded_exit_on_opposite_signal",
+            },
+        )
+
+    stop, _ = adapter._resolve_broker_sl_tp(_signal(95.0))
+    assert stop == pytest.approx(95.0)
+    for bad in (float("nan"), float("inf"), -5.0, 0.0):
+        with pytest.raises(ValueError, match="Invalid stop_loss"):
+            adapter._resolve_broker_sl_tp(_signal(bad))
 
 
 def test_ctrader_exit_only_orders_bypass_entry_sl_tp_guard():
@@ -3783,6 +3839,46 @@ def test_is_unbounded_tp_rejects_non_dict_metadata() -> None:
     assert is_unbounded_tp("unbounded_exit_on_opposite_signal") is False
     assert is_unbounded_tp({"take_profit_policy": UNBOUNDED_TP_POLICY}) is True
     assert is_unbounded_tp({"take_profit_policy": "bounded"}) is False
+
+
+def test_non_duplicate_integrity_error_propagates(isolated_db) -> None:
+    """C1/CodeRabbit: only a real dedupe_key conflict counts as duplicate."""
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    import shared.database as database
+
+    signal = _persist_signal(database)
+    execution = LiveExecution(
+        signal_id=signal.id,
+        actual_price=100.5,
+        filled_qty=10.0,
+        commission=0.0,
+        timestamp=datetime.now(timezone.utc),
+        broker_order_id="bo-1",
+        dedupe_key="alpaca:exec:conflict-check",
+    )
+    record = database.LiveExecutionModel.from_live_execution(execution)
+
+    class _ExplodingSession:
+        def exec(self, *args, **kwargs):
+            class _Empty:
+                def first(self):
+                    return None
+
+            return _Empty()
+
+        def add(self, *args, **kwargs):
+            return None
+
+        def commit(self):
+            raise IntegrityError("INSERT", {}, Exception("CHECK failed"))
+
+        def rollback(self):
+            return None
+
+    with pytest.raises(IntegrityError):
+        database._insert_live_execution_locked(_ExplodingSession(), record)
 
 
 def test_processor_signal_price_attribution_is_explicit() -> None:

@@ -450,3 +450,10 @@ class TestTotalReturnFraction:
         # A percent-scale value (>= 1.0 for any double-digit return) would
         # diverge by factor 100 against the runner's fraction.
         assert abs(float(total_return)) < 10.0
+
+
+def test_build_trades_empty_frame_returns_tuple_shape() -> None:
+    """CodeRabbit round: the empty path must keep the declared tuple shape."""
+    trades, summary = MT5XLSXImporter._build_trades(pd.DataFrame(), {})
+    assert trades == []
+    assert summary["open_position_count"] == 0

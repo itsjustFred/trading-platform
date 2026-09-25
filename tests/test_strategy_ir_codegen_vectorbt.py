@@ -486,3 +486,24 @@ def test_declared_roles_drive_signal_selection() -> None:
                 IndicatorRef(name="Two", params={}, role="primary"),
             ]
         )
+
+
+def test_primary_fallback_avoids_declared_secondary() -> None:
+    """CodeRabbit round: single-indicator IR with a declared secondary
+    must not wire primary to the same indicator line (which compiled to
+    the always-false `indicator_only > indicator_only`)."""
+    ir = StrategyIR(
+        name="Single Secondary",
+        parameters=[],
+        indicators=[IndicatorRef(name="Only", params={}, role="secondary")],
+        entry_conditions=[
+            Condition(expression="Only greater than 50", when=ConditionWhen.ENTRY)
+        ],
+        exit_signals=[],
+        confidence=1.0,
+        engine_hint=EngineHint.VECTORBT,
+        metadata={"version": "1.0.0"},
+    )
+    code = generate_vectorbt_strategy_code(ir)
+    assert "(close > indicator_only)" in code
+    assert "(indicator_only > indicator_only)" not in code

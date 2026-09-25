@@ -345,7 +345,13 @@ def run_regression(
         comparison_results.append(comparator.compare(matched))
 
     anomalies = AnomalyDetector.detect(
-        golden_ref, current_ref.trades, comparison_results
+        golden_ref,
+        current_ref.trades,
+        comparison_results,
+        # CodeRabbit round: reuse the configured-tolerance match — the
+        # default re-match inside detect() would use tolerance 0 and
+        # contradict the matcher's own verdict.
+        match_result=match_result,
     )
 
     trade_delta_report = DeltaReportBuilder.build(

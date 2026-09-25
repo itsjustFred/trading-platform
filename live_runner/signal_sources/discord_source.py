@@ -43,6 +43,7 @@ class DiscordChannelForbiddenError(RuntimeError):
     """
 
     def __init__(self, channel_id: str, message: str = "") -> None:
+        self.channel_id = channel_id
         super().__init__(message or f"Discord channel forbidden (403): {channel_id}")
         self.channel_id = channel_id
 
@@ -534,7 +535,7 @@ class DiscordSignalSource(BaseSignalSource):
             # B2: 403 is per-channel (missing access), not a dead token —
             # skip the channel, never kill the whole source.
             raise DiscordChannelForbiddenError(
-                f"Discord channel forbidden (403) for {channel_id}"
+                channel_id, f"Discord channel forbidden (403) for {channel_id}"
             )
         if response.status_code == 429:
             try:
