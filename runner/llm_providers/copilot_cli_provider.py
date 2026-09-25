@@ -82,11 +82,13 @@ def _extract_jsonl_content(stdout: str) -> str:
                 message="copilot_cli provider returned a non-object JSON event envelope.",
             )
         event_type = payload.get("type")
-        if not isinstance(event_type, str) or event_type not in _COPILOT_CLI_EVENT_TYPES:
+        if not isinstance(event_type, str):
             raise CliInvocationError(
                 status="error",
                 message="copilot_cli provider returned an unknown JSON event envelope.",
             )
+        if event_type not in _COPILOT_CLI_EVENT_TYPES:
+            continue
         if event_type == "result":
             exit_code = payload.get("exitCode")
             if exit_code is not None and (not isinstance(exit_code, int) or exit_code != 0):

@@ -87,14 +87,14 @@ def _build_windows(
     windows: list[dict[str, str]] = []
     while True:
         train_start = cursor
-        train_end = (
+        unpurged_train_end = (
             train_start
             + pd.DateOffset(months=train_months)
             - pd.Timedelta(microseconds=1)
-            - pd.Timedelta(days=purge_days)
         )
+        train_end = unpurged_train_end - pd.Timedelta(days=purge_days)
         test_start = (
-            train_end
+            unpurged_train_end
             + pd.Timedelta(microseconds=1)
             + pd.Timedelta(days=embargo_days)
         )
@@ -234,7 +234,17 @@ def _daily_close_series(curve: list[dict[str, Any]]) -> pd.Series:
         dtype=float,
     ).sort_index(kind="stable")
     series = series[~series.index.duplicated(keep="last")]
-    return series.resample("D").last().ffill().dropna()
+    return series.resample("D").last().dropna()
+
+
+def _gap_contains_only_weekend(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    cursor = start.normalize() + pd.Timedelta(days=1)
+    end_day = end.normalize()
+    while cursor < end_day:
+        if cursor.weekday() < 5:
+            return False
+        cursor += pd.Timedelta(days=1)
+    return True
 
 
 def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, float | None]:
@@ -244,8 +254,16 @@ def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, f
         if not curve:
             continue
         daily_equity = _daily_close_series(curve)
-        values = daily_equity.to_numpy(dtype=float)
-        for start, end in zip(values, values[1:], strict=False):
+        for previous_timestamp, timestamp in zip(
+            daily_equity.index[:-1], daily_equity.index[1:], strict=False
+        ):
+            gap_days = (timestamp.normalize() - previous_timestamp.normalize()).days
+            if gap_days > 1 and not _gap_contains_only_weekend(
+                previous_timestamp, timestamp
+            ):
+                continue
+            start = float(daily_equity.loc[previous_timestamp])
+            end = float(daily_equity.loc[timestamp])
             if start > 0 and math.isfinite(start) and math.isfinite(end):
                 return_values.append(float(end / start - 1.0))
     if len(return_values) < 2:

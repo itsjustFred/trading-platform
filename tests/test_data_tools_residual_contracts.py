@@ -38,7 +38,9 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
         validate_dataset_component(component)
 
 
-def test_validation_uses_custom_ohlcv_root_for_relative_inference(tmp_path: Path) -> None:
+def test_validation_uses_custom_ohlcv_root_for_relative_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "custom" / "ohlcv" / "source" / "equity" / "AAPL" / "1d.parquet"
     path.parent.mkdir(parents=True)
     pd.DataFrame(
@@ -52,7 +54,8 @@ def test_validation_uses_custom_ohlcv_root_for_relative_inference(tmp_path: Path
         }
     ).to_parquet(path, index=False)
 
-    results = validation.validate_all(tmp_path / "custom")
+    monkeypatch.chdir(tmp_path)
+    results = validation.validate_all(Path("custom"))
 
     assert len(results) == 1
     assert results[0].source == "source"

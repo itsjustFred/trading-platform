@@ -128,7 +128,11 @@ def _explicit_session_window(
 
 
 def _observed_session_window(
-    stamps: list[pd.Timestamp], step_minutes: float
+    stamps: list[pd.Timestamp],
+    step_minutes: float,
+    *,
+    start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
 ) -> tuple[int, int] | None:
     if step_minutes >= 1440.0 or len(stamps) < 4:
         return None
@@ -137,12 +141,55 @@ def _observed_session_window(
         by_day.setdefault(stamp.normalize(), []).append(stamp)
     if len(by_day) < 2 or max(len(rows) for rows in by_day.values()) < 2:
         return None
-    start_minutes = min(
-        int(stamp.hour * 60 + stamp.minute) for stamp in stamps
-    )
-    end_minutes = max(
-        int(stamp.hour * 60 + stamp.minute) for stamp in stamps
-    ) + int(step_minutes)
+    day_windows = [
+        (
+            day,
+            min(int(stamp.hour * 60 + stamp.minute) for stamp in rows),
+            max(int(stamp.hour * 60 + stamp.minute) for stamp in rows)
+            + int(step_minutes),
+        )
+        for day, rows in sorted(by_day.items())
+    ]
+    windows = {(start, end) for _, start, end in day_windows}
+    if len(windows) == 1:
+        start_minutes, end_minutes = next(iter(windows))
+    else:
+        if start_ts is None or end_ts is None or len(day_windows) < 2:
+            return None
+        first_day = day_windows[0][0]
+        last_day = day_windows[-1][0]
+        interior_windows = {
+            (start, end)
+            for day, start, end in day_windows
+            if first_day < day < last_day
+        }
+        if len(interior_windows) > 1:
+            return None
+        if interior_windows:
+            start_minutes, end_minutes = next(iter(interior_windows))
+        else:
+            start_minutes = day_windows[-1][1]
+            end_minutes = day_windows[0][2]
+        step = pd.Timedelta(minutes=int(step_minutes))
+        for day, window_start, window_end in day_windows:
+            if window_start != start_minutes and not (
+                day == first_day
+                and start_ts.normalize() == first_day
+                and start_ts > day + pd.Timedelta(minutes=start_minutes)
+                and day + pd.Timedelta(minutes=window_start)
+                <= start_ts
+                <= day + pd.Timedelta(minutes=window_start) + step
+            ):
+                return None
+            if window_end != end_minutes and not (
+                day == last_day
+                and end_ts.normalize() == last_day
+                and end_ts < day + pd.Timedelta(minutes=end_minutes)
+                and day + pd.Timedelta(minutes=window_end - int(step_minutes))
+                <= end_ts
+                <= day + pd.Timedelta(minutes=window_end)
+            ):
+                return None
     if end_minutes - start_minutes < step_minutes * 3:
         return None
     return start_minutes, end_minutes
@@ -725,7 +772,12 @@ def has_sufficient_segment_coverage(
     if step_minutes >= 1440.0:
         session_window = None
     else:
-        session_window = explicit_session or _observed_session_window(stamps, step_minutes)
+        session_window = explicit_session or _observed_session_window(
+            stamps,
+            step_minutes,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
     expected = max(
         _expected_trading_bars(start_ts, end_ts, step_minutes, session_window),
         1,

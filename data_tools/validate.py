@@ -251,6 +251,8 @@ def _interval_has_weekend(start: pd.Timestamp, end: pd.Timestamp) -> bool:
 def _weekend_boundary(start: pd.Timestamp, end: pd.Timestamp) -> bool:
     start_day = start.normalize()
     end_day = end.normalize()
+    if (end_day - start_day) > pd.Timedelta(days=3):
+        return False
     if start_day.weekday() == 4 and start.time() >= pd.Timestamp("20:00").time():
         return end_day.weekday() in {5, 6, 0} and end.time() <= pd.Timestamp("02:00").time()
     if start_day.weekday() == 5:
@@ -683,6 +685,7 @@ def validate_parquet(
 
 def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[ValidationResult]:
     """Validate all Parquet files in the OHLCV directory."""
+    data_dir = Path(data_dir).expanduser().resolve()
     ohlcv_root = data_dir / "ohlcv"
     if not ohlcv_root.exists():
         logger.error("OHLCV directory not found: %s", ohlcv_root)
@@ -706,7 +709,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         if symbol_filter and parquet.parent.name.upper() != symbol_filter.upper():
             continue
 
-        logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root.resolve()))
+        logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root))
         r = validate_parquet(validated_path, ohlcv_root=ohlcv_root)
 
         status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
