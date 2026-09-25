@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -459,10 +460,17 @@ def test_write_env_key_uses_portable_lock_around_atomic_replace(monkeypatch, tmp
             self.active = False
             events.append("lock-exit")
 
-    def tracking_lock(lock_file: str):
+    @contextmanager
+    def tracking_lock(handle):
         nonlocal active_lock
-        active_lock = _TrackingLock(lock_file)
-        return active_lock
+        active_lock = _TrackingLock(handle.name)
+        active_lock.active = True
+        events.append("lock-enter")
+        try:
+            yield
+        finally:
+            active_lock.active = False
+            events.append("lock-exit")
 
     def tracked_replace(source: Path, destination: Path) -> None:
         nonlocal replacement
@@ -472,7 +480,7 @@ def test_write_env_key_uses_portable_lock_around_atomic_replace(monkeypatch, tmp
         events.append("replace")
         real_replace(source, destination)
 
-    monkeypatch.setattr(module, "FileLock", tracking_lock)
+    monkeypatch.setattr(module, "_exclusive_file_lock", tracking_lock)
     monkeypatch.setattr(module.os, "replace", tracked_replace)
 
     module._write_env_key(env_path, "CTRADER_ACCESS_TOKEN", "new")
