@@ -57,14 +57,33 @@ def _alpaca_timeframe(value: str):
     return TimeFrame(amount=amount, unit=unit), normalized
 
 
-def _alpaca_market_data_start(timeframe: str, limit: int) -> datetime:
+# Markets are closed for most of the calendar: weekends alone remove two days in
+# seven, and daily bars additionally lose public holidays. A flat "3x" multiplier
+# under-requests intraday history, so the adapter received fewer bars than the
+# caller asked for and then silently truncated to a shorter series than the
+# backtest used, shifting every indicator that depends on lookback length. Size
+# the window by trading time instead, and verify the result below.
+_CALENDAR_TO_TRADING_SLACK = 2.2
+_DAILY_CALENDAR_TO_TRADING_SLACK = 1.6
+
+
+def _alpaca_market_data_start(
+    timeframe: str,
+    limit: int,
+    *,
+    slack_multiplier: float = 1.0,
+) -> datetime:
     normalized = str(timeframe or "").strip().lower()
-    bars = max(int(limit), 1)
+    bars = max(int(limit), 1) * max(float(slack_multiplier), 1.0)
     if normalized.endswith("m"):
-        return datetime.now(timezone.utc) - timedelta(minutes=bars * 3)
+        return datetime.now(timezone.utc) - timedelta(
+            minutes=bars * _CALENDAR_TO_TRADING_SLACK
+        )
     if normalized.endswith("h"):
-        return datetime.now(timezone.utc) - timedelta(hours=bars * 3)
-    return datetime.now(timezone.utc) - timedelta(days=bars * 3)
+        return datetime.now(timezone.utc) - timedelta(hours=bars * _CALENDAR_TO_TRADING_SLACK)
+    return datetime.now(timezone.utc) - timedelta(
+        days=bars * _DAILY_CALENDAR_TO_TRADING_SLACK
+    )
 
 
 def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
@@ -731,18 +750,35 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca adapter must be connected before requesting market data"
             )
 
-        def _fetch() -> pd.DataFrame:
+        def _fetch(slack_multiplier: float) -> pd.DataFrame:
             request = StockBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,
-                start=_alpaca_market_data_start(timeframe, bounded_limit),
+                start=_alpaca_market_data_start(
+                    timeframe, bounded_limit, slack_multiplier=slack_multiplier
+                ),
                 limit=1000,
                 adjustment="raw",
                 feed="iex",
             )
             return self._historical_data_client.get_stock_bars(request).df
 
-        frame = await asyncio.to_thread(_fetch)
+        # A short history is not a cosmetic problem: indicators would be computed
+        # over fewer bars than the backtest used, so the live strategy would
+        # quietly behave differently from the one that was validated. Widen once
+        # if the first window came back short, then fail loudly rather than
+        # shipping the truncated series.
+        frame = await asyncio.to_thread(_fetch, 1.0)
+        if frame is not None and len(frame.index) < bounded_limit:
+            widened = await asyncio.to_thread(_fetch, 4.0)
+            if widened is not None and len(widened.index) > len(frame.index):
+                frame = widened
+        if frame is not None and 0 < len(frame.index) < bounded_limit:
+            raise ValueError(
+                f"Alpaca returned only {len(frame.index)} of {bounded_limit} requested "
+                f"{timeframe} bars for {normalized_symbol}; refusing to compute "
+                "indicators on a shorter history than requested"
+            )
         if frame is None or frame.empty:
             raise ValueError(
                 f"Alpaca returned no {timeframe} market data for {normalized_symbol}"

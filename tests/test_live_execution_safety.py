@@ -3826,3 +3826,73 @@ def test_route_validation_uses_static_fallback_when_env_is_empty():
         validate_stockkit_deployment_route(
             deployment, account_broker_login="PA-SOMETHING-ELSE", accounts_env_values={}
         )
+
+
+# ─── market data lookback must survive closed-market time ───────────────────
+
+
+def test_market_data_start_scales_past_weekends_for_intraday_bars():
+    """Weekends and holidays are closed market time, not missing data.
+
+    A flat 3x calendar multiplier under-requests intraday history: 500 hourly
+    bars over 62 calendar days yields only ~434 trading hours, so the adapter
+    silently shipped a shorter series than requested.
+    """
+    from live_runner.alpaca_adapter import _alpaca_market_data_start
+    from datetime import datetime, timezone
+
+    start = _alpaca_market_data_start("1h", 500)
+    span_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+    trading_hours = span_hours * (5 / 7)  # weekends closed
+    assert trading_hours >= 500, (
+        f"lookback must cover {500} trading hours, only ~{trading_hours:.0f} available"
+    )
+
+
+def test_market_data_start_scales_past_holidays_for_daily_bars():
+    from live_runner.alpaca_adapter import _alpaca_market_data_start
+    from datetime import datetime, timezone
+
+    start = _alpaca_market_data_start("1d", 300)
+    span_days = (datetime.now(timezone.utc) - start).days
+    trading_days = span_days * (5 / 7)
+    assert trading_days >= 300, f"only ~{trading_days:.0f} trading days covered"
+
+
+def test_market_data_start_honours_a_widening_multiplier():
+    from live_runner.alpaca_adapter import _alpaca_market_data_start
+
+    narrow = _alpaca_market_data_start("1h", 200, slack_multiplier=1.0)
+    wide = _alpaca_market_data_start("1h", 200, slack_multiplier=4.0)
+    assert wide < narrow, "a larger multiplier must reach further back"
+
+
+def test_short_market_data_history_is_refused_not_truncated():
+    """A short history silently shifts every lookback-dependent indicator."""
+    import pandas as pd
+    from live_runner import alpaca_adapter as mod
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=5, freq="1h", tz="UTC"),
+            "open": [1.0] * 5, "high": [1.0] * 5, "low": [1.0] * 5, "close": [1.0] * 5,
+        }
+    ).set_index("timestamp")
+
+    class _Client:
+        def __init__(self):
+            self.starts = []
+
+        def get_stock_bars(self, request):
+            self.starts.append(request.start)
+            return type("R", (), {"df": frame})()
+
+    adapter = mod.AlpacaLiveAdapter.__new__(mod.AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._historical_data_client = _Client()
+    adapter.credentials = None
+
+    with pytest.raises(ValueError, match="refusing to compute indicators on a shorter history"):
+        asyncio.run(adapter.get_market_data("AAPL", timeframe="1h", limit=100))
+    # It must have tried to widen before giving up.
+    assert len(adapter._historical_data_client.starts) == 2
