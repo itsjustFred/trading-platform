@@ -201,6 +201,38 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     return DATA_DIR
 
 
+# A bar-to-bar hole only means something when it is far larger than the normal
+# spacing of the series. Judging holes by an absolute calendar-day count instead
+# misreports perfectly regular data: weekly bars sit 7 days apart, so every
+# single one looked like a week-long hole and weekly coverage always failed.
+# Sub-daily timeframes keep the fixed floor, because an overnight or weekend
+# closure is legitimately longer than several bars of an intraday series.
+GAP_SPACING_MULTIPLE = 3.0
+MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
+
+
+def timeframe_nominal_days(timeframe: str | None) -> float:
+    """Nominal calendar spacing of one bar in ``timeframe``."""
+    normalized = str(timeframe or "").strip().lower()
+    if normalized.endswith("mo"):
+        return 30.0
+    if normalized.endswith("w"):
+        return 7.0
+    if normalized.endswith("d"):
+        return 1.0
+    if normalized.endswith("h"):
+        return 1.0 / 24.0
+    if normalized.endswith("m"):
+        return 1.0 / 1440.0
+    return 1.0
+
+
+def scaled_gap_threshold_days(timeframe: str | None, base_days: float) -> float:
+    """Allowed hole length for ``timeframe``, widened for long-spaced series."""
+    scaled = timeframe_nominal_days(timeframe) * GAP_SPACING_MULTIPLE
+    return max(float(base_days), scaled, MIN_INTERNAL_GAP_THRESHOLD_DAYS)
+
+
 def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
     for requirement in requirements:
         report = analyze_ohlcv_coverage(data_root, requirement)
@@ -366,7 +398,7 @@ def find_internal_gaps(
     symbol_dir: Path,
     timeframe: str | None = None,
     *,
-    threshold_days: float = INTERNAL_GAP_WARN_DAYS,
+    threshold_days: float | None = None,
 ) -> list[dict[str, object]]:
     """Detect holes *inside* the stored timestamp range of one symbol directory.
 
@@ -386,6 +418,11 @@ def find_internal_gaps(
             stem == normalized
             or stem.startswith(f"{normalized}_")
             or stem.startswith(f"{normalized}-")
+        )
+
+    if threshold_days is None:
+        threshold_days = scaled_gap_threshold_days(
+            timeframe, INTERNAL_GAP_WARN_DAYS
         )
 
     parquet_paths = sorted(
