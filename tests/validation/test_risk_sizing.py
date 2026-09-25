@@ -355,3 +355,18 @@ def test_trade_to_signal_none_take_profit() -> None:
     trade = _make_trade(take_profit=None)
     signal = _trade_to_signal(trade, "EURUSD", "1h")
     assert signal.take_profit is None
+
+
+@pytest.mark.parametrize("risk_percent", [0.0, 1.0])
+def test_percent_risk_config_accepts_fraction_boundaries(risk_percent: float) -> None:
+    from validation.risk.percent_risk import PercentRiskConfig
+
+    assert PercentRiskConfig(risk_percent=risk_percent).risk_percent == risk_percent
+
+
+@pytest.mark.parametrize("risk_percent", [-0.01, 1.01])
+def test_percent_risk_config_rejects_values_outside_fraction_range(risk_percent: float) -> None:
+    from validation.risk.percent_risk import PercentRiskConfig
+
+    with pytest.raises(ValueError, match="risk_percent must be between 0 and 1"):
+        PercentRiskConfig(risk_percent=risk_percent)

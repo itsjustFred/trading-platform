@@ -26,8 +26,7 @@ Hinweis: `--backtest-ids` nimmt eine oder mehrere IDs als getrennte Argumente en
 
 ## Output
 
-- **JSON Output:** Ergebnisse werden nach `data/optimizations/portfolio_*.json` geschrieben; die Artefakt-ID enthält einen UUID-Suffix.
-- Equity-Kurven werden vor Gewichtung, Korrelation und OOS-Metriken auf ihre jeweilige erste Beobachtung normalisiert.
+- **JSON Output:** Ergebnisse werden nach `data/optimizations/portfolio_*.json` geschrieben.
 - **Metrics:** In-Sample Sharpe, OOS Sharpe bei `--test-months`, PSR-ready Korrelationsmatrix, Max Drawdown.
 - **API:** Viewer-Endpunkte können die JSON-Dateien bzw. persistierte Backtest/Grid-Daten weiterverarbeiten.
 
