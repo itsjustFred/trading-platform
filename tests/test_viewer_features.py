@@ -5652,6 +5652,36 @@ def test_singleflight_requester_cannot_renew_existing_owner_lease(monkeypatch):
     core.DATA_TASKS.clear()
 
 
+def test_singleflight_requester_invalidates_reservation_from_old_boot(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    now = time.monotonic()
+    existing = {
+        "id": "task-old-boot-reservation",
+        "status": "running",
+        "download_request_key": "same-request",
+        "owner_pid": core.os.getpid(),
+        "owner_token": "old-owner",
+        "singleflight_owner_boot_id": "old-boot",
+        "singleflight_heartbeat_at": now,
+        "singleflight_lease_until": now + 100,
+    }
+    core.DATA_TASKS[existing["id"]] = existing
+
+    result = core._register_download_task(
+        {"id": "task-new-boot-owner", "status": "starting"},
+        "same-request",
+        owner_token="new-owner",
+    )
+
+    assert result is None
+    assert existing["status"] == "failed"
+    assert "download_request_key" not in existing
+    assert core.DATA_TASKS["task-new-boot-owner"]["download_request_key"] == "same-request"
+    core.DATA_TASKS.clear()
+
+
 def test_singleflight_reservation_is_invalidated_after_restart():
     import viewer.main as viewer_app_module
 

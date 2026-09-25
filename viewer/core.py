@@ -2268,6 +2268,16 @@ def _singleflight_lease_expired(task: dict[str, Any], now: float) -> bool:
         return True
 
 
+def _singleflight_reservation_is_owned_by_current_process(task: dict[str, Any]) -> bool:
+    if str(task.get("singleflight_owner_boot_id") or "") != SINGLEFLIGHT_BOOT_ID:
+        return False
+    try:
+        owner_pid = int(task.get("owner_pid"))
+    except (TypeError, ValueError):
+        return False
+    return owner_pid == os.getpid() and bool(task.get("owner_token"))
+
+
 def _touch_singleflight_lease(
     task: dict[str, Any],
     now: float | None = None,
@@ -2311,7 +2321,10 @@ def _register_download_task(
                 if task.get("download_request_key") != request_key:
                     continue
                 if _normalized_task_status(task.get("status")) in ACTIVE_TASK_STATUSES:
-                    if not _singleflight_lease_expired(task, now):
+                    if (
+                        _singleflight_reservation_is_owned_by_current_process(task)
+                        and not _singleflight_lease_expired(task, now)
+                    ):
                         return dict(task)
                     task["status"] = "failed"
                     task["error"] = "singleflight reservation lease expired"
