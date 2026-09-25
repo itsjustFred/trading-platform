@@ -213,10 +213,16 @@ _OHLCV_SOURCE_PRIORITY = {
     "dolthub": 4,
 }
 _OHLCV_DF_CACHE_LOCK = threading.RLock()
+_OHLCV_SOURCE_SIGNATURE = tuple[tuple[str, int, int], ...]
 _OHLCV_DF_CACHE: dict[
     tuple[str, str],
-    tuple[tuple[tuple[str, int, int], ...], pd.DataFrame],
+    tuple[_OHLCV_SOURCE_SIGNATURE, int, pd.DataFrame | None],
 ] = {}
+
+
+def _invalidate_ohlcv_cache(cache_key: tuple[str, str]) -> None:
+    with _OHLCV_DF_CACHE_LOCK:
+        _OHLCV_DF_CACHE.pop(cache_key, None)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -596,8 +602,10 @@ def _read_parquet_frame_bounded(path: Path, max_rows: int) -> pd.DataFrame | Non
     row_limit = max(0, int(max_rows))
     parquet_file = pq.ParquetFile(path)
     try:
-        schema_names = [str(name).lower() for name in parquet_file.schema.names]
-        canonical_names = {name: name for name in schema_names}
+        schema_names = [str(name) for name in parquet_file.schema.names]
+        canonical_names: dict[str, str] = {}
+        for schema_name in schema_names:
+            canonical_names.setdefault(schema_name.lower(), schema_name)
         missing = [column for column in _OHLCV_COLUMNS if column not in canonical_names]
         if missing:
             raise ValueError(f"OHLCV parquet is missing canonical columns: {missing}")
@@ -642,57 +650,66 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         _OHLCV_SYMBOL_RE.fullmatch(normalized_symbol) is None
         or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
     ):
-        with _OHLCV_DF_CACHE_LOCK:
-            _OHLCV_DF_CACHE.pop(cache_key, None)
+        _invalidate_ohlcv_cache(cache_key)
         return None
 
     ohlcv_root = (DATA_DIR / "ohlcv").resolve()
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
-        with _OHLCV_DF_CACHE_LOCK:
-            _OHLCV_DF_CACHE.pop(cache_key, None)
+        _invalidate_ohlcv_cache(cache_key)
         return None
 
     signature_parts: list[tuple[str, int, int]] = []
     total_bytes = 0
-    total_rows = 0
     for path in matches:
         try:
             stat = path.stat()
-            row_count = _parquet_row_count(path)
-        except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
-            with _OHLCV_DF_CACHE_LOCK:
-                _OHLCV_DF_CACHE.pop(cache_key, None)
-            logger.warning("Could not inspect OHLCV metadata from %s: %s", _log_safe(path), exc)
+        except OSError as exc:
+            _invalidate_ohlcv_cache(cache_key)
+            logger.warning("Could not stat OHLCV source %s: %s", _log_safe(path), exc)
             return None
         total_bytes += int(stat.st_size)
-        total_rows += row_count
         if total_bytes > _OHLCV_MAX_BYTES:
-            with _OHLCV_DF_CACHE_LOCK:
-                _OHLCV_DF_CACHE.pop(cache_key, None)
+            _invalidate_ohlcv_cache(cache_key)
             logger.warning(
                 "OHLCV byte budget exceeded for %s %s",
                 normalized_symbol,
                 normalized_timeframe,
             )
             return None
-        if total_rows > _OHLCV_MAX_ROWS:
-            with _OHLCV_DF_CACHE_LOCK:
-                _OHLCV_DF_CACHE.pop(cache_key, None)
-            logger.warning(
-                "OHLCV row budget exceeded for %s %s",
-                normalized_symbol,
-                normalized_timeframe,
-            )
-            return None
         signature_parts.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
-    signature: tuple[tuple[str, int, int], ...] = tuple(signature_parts)
+    signature: _OHLCV_SOURCE_SIGNATURE = tuple(signature_parts)
+
     with _OHLCV_DF_CACHE_LOCK:
         cached_entry = _OHLCV_DF_CACHE.get(cache_key)
-        if cached_entry is not None:
-            cached_signature, cached_df = cached_entry
-            if cached_signature == signature:
-                return cached_df.copy(deep=False)
+    cached = cached_entry if cached_entry is not None and cached_entry[0] == signature else None
+    if cached is not None and cached[2] is not None:
+        return cached[2].copy(deep=False)
+
+    if cached is not None:
+        total_rows = cached[1]
+    else:
+        total_rows = 0
+        for path in matches:
+            try:
+                total_rows += _parquet_row_count(path)
+            except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
+                _invalidate_ohlcv_cache(cache_key)
+                logger.warning("Could not inspect OHLCV metadata from %s: %s", _log_safe(path), exc)
+                return None
+
+    if total_rows > _OHLCV_MAX_ROWS:
+        _invalidate_ohlcv_cache(cache_key)
+        logger.warning(
+            "OHLCV row budget exceeded for %s %s",
+            normalized_symbol,
+            normalized_timeframe,
+        )
+        return None
+
+    if cached is None:
+        with _OHLCV_DF_CACHE_LOCK:
+            _OHLCV_DF_CACHE[cache_key] = (signature, total_rows, None)
 
     frames: list[pd.DataFrame] = []
     materialized_rows = 0
@@ -706,8 +723,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
             logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
         if frame is None:
-            with _OHLCV_DF_CACHE_LOCK:
-                _OHLCV_DF_CACHE.pop(cache_key, None)
+            _invalidate_ohlcv_cache(cache_key)
             logger.warning(
                 "OHLCV row budget exceeded while streaming %s %s",
                 normalized_symbol,
@@ -740,7 +756,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         merged = merged.drop_duplicates().reset_index(drop=True)
 
     with _OHLCV_DF_CACHE_LOCK:
-        _OHLCV_DF_CACHE[cache_key] = (signature, merged)
+        _OHLCV_DF_CACHE[cache_key] = (signature, total_rows, merged)
     return merged.copy(deep=False)
 
 
@@ -1927,11 +1943,38 @@ def _read_log_tail(path: Path, max_bytes: int) -> str:
         return ""
 
 
+def _parse_log_entry_payload(line: str) -> dict | None:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return redact_value(parsed)
+
+
+def _build_log_entry(
+    safe_line: str,
+    payload: dict | None,
+    *,
+    path: Path,
+    line_number: int,
+) -> dict:
+    return {
+        "line": safe_line,
+        "timestamp": _parse_log_timestamp(payload.get("timestamp")) if payload else None,
+        "level": _extract_log_level(safe_line, payload),
+        "path": path.name,
+        "line_number": line_number,
+    }
+
+
 def _collect_log_entries(
     paths: list[Path],
     *,
     max_bytes: int = GENERAL_LOG_MAX_BYTES,
     max_lines: int = GENERAL_LOG_MAX_LINES,
+    predicate: Callable[[str, dict | None], bool] | None = None,
 ) -> list[dict]:
     line_limit = max(0, int(max_lines))
     byte_limit = max(0, int(max_bytes))
@@ -1963,7 +2006,7 @@ def _collect_log_entries(
         file_lines.append(list(enumerate(text.splitlines())) if text else [])
 
     offsets = [len(lines) - 1 for lines in file_lines]
-    selected: list[tuple[int, int, str, Path]] = []
+    selected: list[tuple[int, int, dict]] = []
     while len(selected) < line_limit:
         added = False
         for file_index, lines in enumerate(file_lines):
@@ -1971,37 +2014,31 @@ def _collect_log_entries(
             if line_index < 0:
                 continue
             line_number, line = lines[line_index]
-            selected.append((file_index, line_number, line, unique_paths[file_index]))
             offsets[file_index] -= 1
             added = True
+            safe_line = redact_text(line)
+            payload = _parse_log_entry_payload(line)
+            if predicate is not None and not predicate(safe_line, payload):
+                continue
+            selected.append(
+                (
+                    file_index,
+                    line_number,
+                    _build_log_entry(
+                        safe_line,
+                        payload,
+                        path=unique_paths[file_index],
+                        line_number=line_number,
+                    ),
+                )
+            )
             if len(selected) >= line_limit:
                 break
         if not added:
             break
 
     selected.sort(key=lambda item: (item[0], item[1]))
-    entries: list[dict] = []
-    for _, line_number, line, path in selected:
-        safe_line = redact_text(line)
-        payload: dict | None = None
-        timestamp: datetime | None = None
-        try:
-            parsed = json.loads(line)
-            if isinstance(parsed, dict):
-                payload = redact_value(parsed)
-                timestamp = _parse_log_timestamp(parsed.get("timestamp"))
-        except json.JSONDecodeError:
-            payload = None
-        entries.append(
-            {
-                "line": safe_line,
-                "timestamp": timestamp,
-                "level": _extract_log_level(safe_line, payload),
-                "path": path.name,
-                "line_number": line_number,
-            }
-        )
-    return entries
+    return [entry for _, _, entry in selected]
 
 
 def _warning_message_from_entry(entry: dict) -> str | None:

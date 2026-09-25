@@ -4547,6 +4547,168 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     assert trades_payload[0]["timeframe"] == "1d"
 
 
+def test_create_portfolio_applies_component_weight_to_trade_fields(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="portfolio-weight-source",
+            created_at="2026-03-10T12:00:00Z",
+            engine="vectorbt",
+            strategies=["Weighted Strategy"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-10T00:00:00+00:00",
+                        price=105.0,
+                        quantity=10.0,
+                        pnl=50.0,
+                    )
+                ],
+                pnl=50.0,
+                fees=5.0,
+            )
+        ],
+        equity_curve=_equity_curve_from_returns([0.010, 0.012, 0.009, 0.014]),
+    )
+    result.save(backtests_dir / "portfolio-weight-source.trades.json")
+
+    response = viewer_client.post(
+        "/api/portfolios",
+        json={
+            "name": "Weighted Basket",
+            "account_capital": 100000,
+            "components": [
+                {
+                    "strategy_name": "Weighted Strategy",
+                    "symbol": "AAPL",
+                    "timeframe": "1d",
+                    "weight": 0.5,
+                    "risk_config": {"max_positions": 5},
+                    "settings": {},
+                    "backtest_id": "portfolio-weight-source",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert len(payload["trades"]) == 1
+    trade = payload["trades"][0]
+    assert trade["gross_pnl"] == pytest.approx(25.0, abs=1e-6)
+    assert trade["net_pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert trade["pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert trade["fees"] == pytest.approx(2.5, abs=1e-6)
+
+
+def test_portfolio_trade_pnl_survives_payload_normalization(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    backtest_trade = {
+        "nr": 7,
+        "symbol": "AAPL",
+        "direction": "LONG",
+        "entry_time_iso": "2024-01-02T00:00:00+00:00",
+        "exit_time_iso": "2024-01-10T00:00:00+00:00",
+        "entry_price": 100.0,
+        "exit_price": 105.0,
+        "quantity": 10.0,
+        "position_size": 10.0,
+        "pnl": 45.0,
+        "net_pnl": 45.0,
+        "gross_pnl": 50.0,
+        "fees": 5.0,
+    }
+    result = SimpleNamespace(
+        meta=SimpleNamespace(initial_capital=100000.0),
+        stats={},
+        trades=[
+            SimpleNamespace(
+                id=7,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                position_size=10.0,
+                exits=[],
+                exit_reason=None,
+                pnl=50.0,
+                net_pnl=45.0,
+                pnl_pct=0.05,
+                r_multiple=1.0,
+                holding_bars=8,
+                fees=5.0,
+                tags=[],
+                meta={},
+            )
+        ],
+        equity_curve=[],
+    )
+    monkeypatch.setattr(viewer_app_module, "_load_result", lambda _backtest_id: result)
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_trade_to_viewer",
+        lambda _trade: dict(backtest_trade),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_ensure_equity_curve",
+        lambda _result, *, initial_capital: [
+            EquityPoint(time="2024-01-02T00:00:00+00:00", equity=initial_capital * 1.01)
+        ],
+    )
+
+    components, component_returns, trades = (
+        viewer_app_module._build_portfolio_components_from_backtests(
+            [
+                {
+                    "component_id": "component-weight",
+                    "strategy_name": "Weighted Strategy",
+                    "symbol": "AAPL",
+                    "timeframe": "1d",
+                    "weight": 0.5,
+                    "risk_config": {},
+                    "settings": {},
+                    "backtest_id": "portfolio-weight-source",
+                }
+            ],
+            account_capital=100000.0,
+        )
+    )
+    normalized = viewer_app_module._normalize_portfolio_payload(
+        {
+            "id": "portfolio-weight",
+            "account_capital": 100000.0,
+            "components": components,
+            "combined_stats": {},
+            "trades": trades,
+        }
+    )
+
+    assert len(component_returns) == 1
+    normalized_trade = normalized["trades"][0]
+    assert normalized_trade["gross_pnl"] == pytest.approx(25.0, abs=1e-6)
+    assert normalized_trade["net_pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert normalized_trade["pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert normalized_trade["fees"] == pytest.approx(2.5, abs=1e-6)
+    assert normalized["combined_stats"]["net_profit"] == pytest.approx(22.5, abs=1e-6)
+
+
 def test_create_portfolio_allows_empty_components(viewer_client):
     response = viewer_client.post(
         "/api/portfolios",
@@ -5117,7 +5279,7 @@ def test_log_endpoints_cap_response_lines(viewer_client, monkeypatch, path):
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer,
         "_collect_log_entries",
-        lambda _paths: entries,
+        lambda _paths, **_kwargs: entries,
     )
     monkeypatch.setattr(
         viewer_app_module,
@@ -5146,6 +5308,135 @@ def test_log_endpoints_cap_response_lines(viewer_client, monkeypatch, path):
     assert capped_lines[0] == "line-1"
     assert capped_lines[-1] == "line-2000"
     assert capped.json()["total_lines"] == 2001
+
+
+def test_logs_endpoint_level_filter_matches_older_lines_beyond_line_budget(viewer_client, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    error_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "ERROR",
+                "message": f"error-{index}",
+            }
+        )
+        for index in range(100)
+    ]
+    info_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "INFO",
+                "message": f"info-{index}",
+            }
+        )
+        for index in range(2000)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(error_lines + info_lines) + "\n", encoding="utf-8"
+    )
+
+    resp = viewer_client.get("/api/logs/ALL_LOGS?level=ERROR&lines=3")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 100
+    assert [json.loads(line)["message"] for line in payload["lines"]] == [
+        "error-97",
+        "error-98",
+        "error-99",
+    ]
+
+
+def test_logs_endpoint_search_filter_reaches_lines_beyond_line_budget(viewer_client, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    needle_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "INFO",
+                "message": f"needle-{index}",
+            }
+        )
+        for index in range(50)
+    ]
+    noise_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "INFO",
+                "message": f"noise-{index}",
+            }
+        )
+        for index in range(2000)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(needle_lines + noise_lines) + "\n", encoding="utf-8"
+    )
+
+    resp = viewer_client.get("/api/logs/ALL_LOGS?search=NEEDLE-&lines=2")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 50
+    assert [json.loads(line)["message"] for line in payload["lines"]] == ["needle-48", "needle-49"]
+
+
+def test_service_logs_endpoint_filters_before_line_budget(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    service_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "ERROR",
+                "message": f"runner-fail-{index}",
+            }
+        )
+        for index in range(60)
+    ]
+    noise_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "ERROR",
+                "message": f"noise-{index}",
+            }
+        )
+        for index in range(2100)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(service_lines + noise_lines) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_service",
+        lambda _service_id: SimpleNamespace(
+            id="service-log-bulk",
+            name="service-log-bulk",
+            config={},
+            type=SimpleNamespace(value="runner"),
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_entry_matches_service_log",
+        lambda *_args, **_kwargs: True,
+    )
+
+    resp = viewer_client.get("/api/services/service-log-bulk/logs?search=runner-fail&lines=2")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 60
+    assert [json.loads(line)["message"] for line in payload["lines"]] == [
+        "runner-fail-58",
+        "runner-fail-59",
+    ]
 
 
 def test_logs_endpoint_sorts_space_separated_timestamps(viewer_client, tmp_path):
@@ -5591,6 +5882,70 @@ def test_general_log_collection_spreads_line_budget_across_files(tmp_path):
     assert all(sum(entry["path"] == path.name for entry in entries) == 2 for path in paths)
 
 
+def test_general_log_collection_counts_only_matching_lines_toward_line_budget(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            json.dumps({"level": "INFO" if index % 2 else "ERROR", "message": f"line-{index}"})
+            for index in range(20)
+        ),
+        encoding="utf-8",
+    )
+
+    entries = core._collect_log_entries(
+        [log_path],
+        max_bytes=1024 * 1024,
+        max_lines=3,
+        predicate=lambda safe_line, payload: core._extract_log_level(safe_line, payload)
+        == "ERROR",
+    )
+
+    assert [entry["line"] for entry in entries] == [
+        json.dumps({"level": "ERROR", "message": f"line-{index}"}) for index in (14, 16, 18)
+    ]
+    assert all(entry["level"] == "ERROR" for entry in entries)
+
+
+def test_general_log_collection_predicate_receives_redacted_line_and_payload(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"level": "ERROR", "message": "api_key=needle-secret"}),
+                json.dumps({"level": "INFO", "message": "plain"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    seen: list[tuple[str, dict | None]] = []
+
+    entries = core._collect_log_entries(
+        [log_path],
+        max_bytes=1024 * 1024,
+        max_lines=5,
+        predicate=lambda safe_line, payload: (
+            seen.append((safe_line, payload)) or "api_key=[Filtered]" in safe_line
+        ),
+    )
+
+    assert len(entries) == 1
+    assert "needle-secret" not in entries[0]["line"]
+    assert seen == [
+        (
+            json.dumps({"level": "INFO", "message": "plain"}),
+            {"level": "INFO", "message": "plain"},
+        ),
+        (
+            json.dumps({"level": "ERROR", "message": "api_key=[Filtered]"}),
+            {"level": "ERROR", "message": "api_key=[Filtered]"},
+        ),
+    ]
+
+
 def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
     import importlib.util
 
@@ -5976,7 +6331,7 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
 
     class _Unknown:
         def __str__(self):
-            return "opaque-secret"
+            return "gateway api_key=gateway-key-secret status=ok"
 
     safe = viewer_app_module._redact_ws_message(
         {
@@ -5996,5 +6351,5 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
     assert safe["data"]["secret_key"] == "[Filtered]"
     assert safe["data"]["headers"]["Authorization"] == "[Filtered]"
     assert safe["data"]["opaque"] == "[Filtered]"
-    assert safe["data"]["unknown"] == "[Unserializable]"
+    assert safe["data"]["unknown"] == "gateway api_key=[Filtered] status=ok"
     assert safe["data"]["safe"] == "visible"

@@ -514,7 +514,7 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
     monkeypatch.setattr(
         viewer_main_module.legacy_viewer,
         "_collect_log_entries",
-        lambda _paths: [
+        lambda _paths, **_kwargs: [
             {
                 "line": "Started Discord bot RAMJET",
                 "level": "info",

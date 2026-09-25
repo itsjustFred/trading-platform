@@ -205,9 +205,7 @@ def _redact_value(value: Any, seen: set[int]) -> Any:
         return redact_text(value)
     if isinstance(value, (bytes, bytearray)):
         return redact_text(bytes(value).decode("utf-8", errors="replace"))
-    if isinstance(value, BaseException):
-        return redact_text(value)
-    return "[Unserializable]"
+    return redact_text(value)
 
 
 class JsonFormatter(logging.Formatter):

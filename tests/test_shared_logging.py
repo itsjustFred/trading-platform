@@ -68,12 +68,12 @@ def test_redact_value_handles_nested_sensitive_data_and_exception_text():
     assert "exception-secret" not in redacted["error"]
 
 
-def test_redact_value_fails_closed_for_unknown_objects_and_opaque_secret_values():
+def test_redact_value_keeps_unknown_object_text_and_masks_unstringifiable_objects():
     from shared.logging import redact_text, redact_value
 
     class _Unknown:
         def __str__(self):
-            return "opaque-secret"
+            return "broker api_key=unknown-key-secret status=ok"
 
     class _Unserializable:
         def __str__(self):
@@ -88,9 +88,22 @@ def test_redact_value_fails_closed_for_unknown_objects_and_opaque_secret_values(
     )
 
     assert redacted["opaque"] == "[Filtered]"
-    assert redacted["unknown"] == "[Unserializable]"
+    assert redacted["unknown"] == "broker api_key=[Filtered] status=ok"
     assert redacted["broken"] == "[Unserializable]"
     assert redact_text(_Unserializable()) == "[Unserializable]"
+
+
+def test_redact_value_keeps_nested_unknown_object_text_inside_containers():
+    from shared.logging import redact_value
+
+    class _Order:
+        def __str__(self):
+            return "order-42 token=token-secret"
+
+    redacted = redact_value({"orders": (_Order(),), "primary": _Order()})
+
+    assert redacted["orders"] == ("order-42 token=[Filtered]",)
+    assert redacted["primary"] == "order-42 token=[Filtered]"
 
 
 def test_redact_value_handles_camel_case_sensitive_keys():

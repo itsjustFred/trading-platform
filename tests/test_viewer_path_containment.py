@@ -700,6 +700,141 @@ def test_viewer_ohlcv_loader_rejects_noncanonical_schema_before_read(monkeypatch
     core._OHLCV_DF_CACHE.clear()
 
 
+def test_viewer_ohlcv_loader_maps_mixed_case_columns_to_canonical_names(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "Open": [1.0, 1.1],
+            "HIGH": [1.2, 1.3],
+            "low": [0.9, 1.0],
+            "Close": [1.1, 1.2],
+            "Volume": [2, 3],
+            "untrusted_extra": ["x", "y"],
+        }
+    ).to_parquet(path, index=False)
+    observed: dict[str, object] = {}
+    original = core.pq.ParquetFile.iter_batches
+
+    def tracked_iter_batches(self, *args, **kwargs):
+        observed["columns"] = kwargs.get("columns")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(core.pq.ParquetFile, "iter_batches", tracked_iter_batches)
+
+    loaded = core._load_ohlcv_df("EURUSD", "1h")
+
+    assert loaded is not None
+    assert observed["columns"] == ["Timestamp", "Open", "HIGH", "low", "Close", "Volume"]
+    assert list(loaded.columns) == core._OHLCV_COLUMNS
+    assert len(loaded) == 2
+    assert "untrusted_extra" not in loaded.columns
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_rejects_mixed_case_schema_missing_canonical_column(
+    monkeypatch, tmp_path
+):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "MIXED" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "Timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "Open": [1.0, 1.1],
+            "High": [1.2, 1.3],
+            "Low": [0.9, 1.0],
+            "Close": [1.1, 1.2],
+        }
+    ).to_parquet(path, index=False)
+
+    def fail_iter_batches(*_args, **_kwargs):
+        raise AssertionError("incomplete mixed-case parquet must be rejected before batching")
+
+    monkeypatch.setattr(core.pq.ParquetFile, "iter_batches", fail_iter_batches)
+
+    assert core._load_ohlcv_df("MIXED", "1h") is None
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_defers_footer_reads_to_signature_cache_misses(
+    monkeypatch, tmp_path
+):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "INCOMPLETE" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h", tz="UTC"),
+            "open": [1.0, 1.1],
+            "high": [1.2, 1.3],
+            "low": [0.9, 1.0],
+            "close": [1.1, 1.2],
+        }
+    ).to_parquet(path, index=False)
+
+    assert core._load_ohlcv_df("INCOMPLETE", "1h") is None
+
+    def fail_row_count(*_args, **_kwargs):
+        raise AssertionError("parquet footer must not be read for an unchanged signature")
+
+    monkeypatch.setattr(core, "_parquet_row_count", fail_row_count)
+
+    assert core._load_ohlcv_df("INCOMPLETE", "1h") is None
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_rechecks_signature_when_source_changes(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    path = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    _make_parquet(path)
+
+    first = core._load_ohlcv_df("EURUSD", "1h")
+
+    assert first is not None
+    assert len(first) == 4
+
+    footer_reads: list[str] = []
+    parquet_row_count = core._parquet_row_count
+
+    def tracked_row_count(target):
+        footer_reads.append(str(target))
+        return parquet_row_count(target)
+
+    monkeypatch.setattr(core, "_parquet_row_count", tracked_row_count)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01T00:00:00Z", periods=6, freq="1h"),
+            "open": [1.0] * 6,
+            "high": [1.1] * 6,
+            "low": [0.9] * 6,
+            "close": [1.05] * 6,
+            "volume": [10] * 6,
+        }
+    ).to_parquet(path, index=False)
+
+    second = core._load_ohlcv_df("EURUSD", "1h")
+
+    assert footer_reads == [str(path)]
+    assert second is not None
+    assert len(second) == 6
+    core._OHLCV_DF_CACHE.clear()
+
+
 def test_task_routes_reject_invalid_task_ids(viewer_client):
     import viewer.main as viewer_app_module
 

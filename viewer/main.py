@@ -11019,6 +11019,12 @@ async def remove_empty_portfolios() -> dict[str, Any]:
     }
 
 
+def _weighted_trade_value(value: Any, weight: float) -> float | None:
+    if value is None:
+        return None
+    return round(_safe_float(value, 0.0) * weight, 6)
+
+
 def _build_portfolio_components_from_backtests(
     component_payloads: list[dict[str, Any]],
     *,
@@ -11090,6 +11096,9 @@ def _build_portfolio_components_from_backtests(
                     "timeframe": timeframe,
                     "backtest_id": backtest_id,
                     "pnl": round(_safe_float(viewer_trade.get("pnl"), 0.0) * weight, 6),
+                    "net_pnl": _weighted_trade_value(viewer_trade.get("net_pnl"), weight),
+                    "gross_pnl": _weighted_trade_value(viewer_trade.get("gross_pnl"), weight),
+                    "fees": _weighted_trade_value(viewer_trade.get("fees"), weight),
                 }
             )
             trade_payload["time"] = _component_trade_time(trade_payload)
@@ -11690,6 +11699,26 @@ def _entry_matches_service_log(entry: dict[str, Any], *, service: Service, token
     return False
 
 
+def _log_entry_level_search_predicate(
+    level: str,
+    search: str,
+) -> Callable[[str, dict[str, Any] | None], bool] | None:
+    level_filter = legacy_viewer._normalize_log_levels(level)
+    query = search.lower() if search else ""
+    if not level_filter and not query:
+        return None
+
+    def matches(safe_line: str, payload: dict[str, Any] | None) -> bool:
+        if query and query not in safe_line.lower():
+            return False
+        if not level_filter:
+            return True
+        entry_level = legacy_viewer._extract_log_level(safe_line, payload)
+        return entry_level in level_filter
+
+    return matches
+
+
 @app.get("/api/services/{service_id}/logs")
 async def get_service_logs_endpoint(
     service_id: str,
@@ -11701,19 +11730,16 @@ async def get_service_logs_endpoint(
     if service is None:
         raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     try:
-        entries = legacy_viewer._collect_log_entries(legacy_viewer._available_log_files())
-        level_filter = legacy_viewer._normalize_log_levels(level)
-        if level_filter:
-            entries = [entry for entry in entries if entry.get("level") in level_filter]
+        entries = legacy_viewer._collect_log_entries(
+            legacy_viewer._available_log_files(),
+            predicate=_log_entry_level_search_predicate(level, search),
+        )
         service_terms = _service_log_tokens(service)
         entries = [
             entry
             for entry in entries
             if _entry_matches_service_log(entry, service=service, tokens=service_terms)
         ]
-        if search:
-            query_lower = search.lower()
-            entries = [entry for entry in entries if query_lower in entry["line"].lower()]
         total_lines = len(entries)
         response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
         recent_entries = entries[-response_limit:] if len(entries) > response_limit else entries
@@ -13090,7 +13116,10 @@ async def get_log(
         raise HTTPException(status_code=404, detail="Log file not found")
 
     try:
-        entries = legacy_viewer._collect_log_entries(paths)
+        entries = legacy_viewer._collect_log_entries(
+            paths,
+            predicate=_log_entry_level_search_predicate(level, search),
+        )
         if log_name == ALL_LOGS_NAME:
             entries.sort(
                 key=lambda item: (
@@ -13100,14 +13129,6 @@ async def get_log(
                     item["line_number"],
                 )
             )
-
-        level_filter = legacy_viewer._normalize_log_levels(level)
-        if level_filter:
-            entries = [entry for entry in entries if entry.get("level") in level_filter]
-
-        if search:
-            query_lower = search.lower()
-            entries = [entry for entry in entries if query_lower in entry["line"].lower()]
 
         total_lines = len(entries)
         response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
