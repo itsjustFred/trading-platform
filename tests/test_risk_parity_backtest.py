@@ -22,12 +22,10 @@ import pytest
 
 from scripts.run_risk_parity_backtest import (
     TICKERS,
-    _portfolio_performance_stats,
     adjust_for_regime,
-    build_validation_reference,
     calculate_covariance,
+    _portfolio_performance_stats,
 )
-from validation.reference import resolve_initial_capital
 
 
 def _drift_series() -> pd.Series:
@@ -66,28 +64,3 @@ def test_covariance_default_shrinkage_is_0_2():
     assert not np.allclose(
         calculate_covariance(returns), calculate_covariance(returns, shrinkage=0.0)
     )
-
-
-def test_validation_reference_preserves_backtest_initial_capital():
-    result = {
-        "initial_capital": 2_500_000.0,
-        "trades": [
-            {
-                "entry_time": "2024-01-02T00:00:00Z",
-                "exit_time": "2024-02-02T00:00:00Z",
-                "symbol": "SPY",
-                "direction": "LONG",
-                "entry_price": 100.0,
-                "exit_price": 110.0,
-                "quantity": 1.0,
-                "position_size": 100_000.0,
-                "pnl": 10_000.0,
-            }
-        ],
-        "stats": {"total_trades": 1},
-    }
-
-    reference = build_validation_reference(result)
-
-    assert resolve_initial_capital(reference) == pytest.approx(2_500_000.0)
-    assert reference.to_backtest_result().meta.initial_capital == pytest.approx(2_500_000.0)

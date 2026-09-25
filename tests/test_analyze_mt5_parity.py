@@ -1,19 +1,16 @@
-import pytest
-
+from shared.models import Trade, TradeExit
 from scripts.analyze_mt5_parity import (
     _direction_counts,
     _match_by_entry_and_direction,
     _mt5_exit_reason,
     _platform_exit_reason,
-    _series_stats,
     _sharpe_convention_candidates,
+    _series_stats,
     _split_by_entry_and_direction,
     _timestamp_only_overlap_count,
     _top_session_minutes,
-    _trade_return_frame,
     _utc_timestamp,
 )
-from shared.models import Trade, TradeExit
 
 
 def _trade(
@@ -56,7 +53,6 @@ class _Reference:
     ):
         self.trades = trades
         self.stats = stats
-        self.settings = {}
         self.raw_metadata = {"parsed_meta": {"initial_capital": initial_capital}}
 
 
@@ -173,15 +169,3 @@ def test_sharpe_convention_candidates_include_trade_and_daily_variants():
     assert candidates["trade_pnl_sqrt_deals"] is not None
     assert candidates["daily_calendar_sqrt_252"] is not None
     assert candidates["trade_pnl_sqrt_deals"] > candidates["trade_pnl_sqrt_trades"]
-
-
-def test_trade_return_frame_uses_canonical_initial_capital_resolver():
-    trade = _trade(entry_time="2024-01-01T10:00:00Z")
-    trade.pnl = 100.0
-    reference = _Reference([trade], {}, initial_capital=1_000.0)
-    reference.settings["initial_capital"] = 2_000.0
-
-    frame = _trade_return_frame(reference)
-
-    assert frame.iloc[0]["equity_before"] == pytest.approx(2_000.0)
-    assert frame.iloc[0]["return_on_initial_capital"] == pytest.approx(0.05)

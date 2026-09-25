@@ -15,19 +15,20 @@ from __future__ import annotations
 
 import argparse
 import json
-
-# Ensure project root is importable when called directly
-import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from scipy.optimize import minimize
 
 from shared.constants import ensure_path_within_workspace
 from shared.logging import get_logger
+import yfinance as yf
+from scipy.optimize import minimize
+
+# Ensure project root is importable when called directly
+import sys
 
 logger = get_logger("scripts.run-risk-parity-backtest")
 
@@ -36,7 +37,7 @@ _ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from validation.reference import ValidationReference, resolve_initial_capital
+from validation.reference import ValidationReference
 
 ASSETS: dict[str, dict[str, str]] = {
     "SPY": {"class": "equity", "sub": "us_large"},
@@ -614,7 +615,6 @@ def run_backtest(
         "portfolio_target_signals": portfolio_target_signals,
         "trades": trades,
         "stats": stats,
-        "initial_capital": float(initial_cash),
     }
 
 
@@ -651,7 +651,7 @@ def build_validation_reference(result: dict[str, Any]) -> ValidationReference:
             )
         )
 
-    reference = ValidationReference(
+    return ValidationReference(
         strategy_name="RiskParityStrategy",
         source_framework="unknown",
         symbol="PORTFOLIO",
@@ -663,7 +663,6 @@ def build_validation_reference(result: dict[str, Any]) -> ValidationReference:
             "lookback_correlation": 120,
             "min_weight": 0.02,
             "max_weight": 0.30,
-            "initial_capital": result.get("initial_capital"),
         },
         trades=trades,
         stats=result["stats"],
@@ -672,8 +671,6 @@ def build_validation_reference(result: dict[str, Any]) -> ValidationReference:
             "assets": TICKERS,
         },
     )
-    reference.settings["initial_capital"] = resolve_initial_capital(reference)
-    return reference
 
 
 def main() -> int:
