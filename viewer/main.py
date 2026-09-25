@@ -297,12 +297,14 @@ DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
-# Statuses a task can be paused from. `starting` and `queued` are included
-# deliberately: pausing before work begins is how an operator stops a task that
-# has not started yet, and the pause takes effect at the first checkpoint.
-# `paused` is excluded, because re-pausing an already paused task used to
-# silently succeed and left `can_pause` disagreeing with the endpoint.
-PAUSABLE_TASK_STATUSES = frozenset({"running", "starting", "queued"})
+# Statuses a task can be paused from. This must stay exactly in step with
+# `_task_controls_payload`'s `can_pause` in viewer/core.py, because that flag is
+# the contract the UI renders its buttons from: if the endpoint accepts a status
+# the flag hides, the operator has no way to act; if the flag offers a status the
+# endpoint refuses, the button just errors.
+# `starting` is included so an operator can stop a task before it runs; `paused`
+# is excluded because re-pausing silently used to succeed.
+PAUSABLE_TASK_STATUSES = frozenset({"running", "starting"})
 _running_jobs = legacy_viewer._running_jobs
 _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
@@ -11979,7 +11981,12 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if task.get("status") in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+        # Answer honestly: a finished task cannot be paused. Returning 200 here
+        # reported success for a no-op while `can_pause` was already false.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task already finished (status={task.get('status')!r})",
+        )
     # Only a task that is actually pending or executing can be paused. Without
     # this guard an already paused task was silently "paused" again, so the UI
     # advertised can_pause for a task the endpoint would not act on.
@@ -12007,7 +12014,10 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
     if task.get("status") in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task already finished (status={task.get('status')!r})",
+        )
     # Only a paused task can be resumed. Previously the endpoint only
     # short-circuited on final statuses, so POSTing resume against a `starting`
     # or `queued` task promoted it to `running`: the task was reported as

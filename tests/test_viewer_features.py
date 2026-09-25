@@ -5285,3 +5285,45 @@ def test_repoint_endpoint_returns_404_for_unknown_deployment(
     )
 
     assert resp.status_code == 404
+
+
+def test_task_control_flags_agree_with_endpoint_acceptance(viewer_client, tmp_path):
+    """`can_pause`/`can_resume` are the contract the UI renders from.
+
+    The endpoint must accept exactly the statuses the flags advertise. A status
+    the endpoint accepts but the flag hides leaves the operator unable to act; a
+    status the flag offers but the endpoint refuses produces a button that only
+    errors.
+    """
+    import viewer.main as viewer_app_module
+    from viewer.core import _task_controls_payload
+
+    for status in ("starting", "running", "paused", "queued", "completed", "failed"):
+        # Separate task per probe: calling pause mutates the status, so probing
+        # both controls on one task would test a status nobody actually sees.
+        pause_id = f"agreement-pause-{status}"
+        resume_id = f"agreement-resume-{status}"
+        for task_id in (pause_id, resume_id):
+            _seed_controllable_task(
+                viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+            )
+            viewer_app_module._set_task_status(task_id, status)
+
+        tasks = {
+            item["id"]: item
+            for item in viewer_client.get("/api/data/tasks").json()["tasks"]
+        }
+        pause_code = viewer_client.post(f"/api/data/tasks/{pause_id}/pause").status_code
+        resume_code = viewer_client.post(f"/api/data/tasks/{resume_id}/resume").status_code
+        listed = tasks[pause_id]
+        resume_listed = tasks[resume_id]
+
+        assert pause_code == (200 if listed["can_pause"] else 409), (
+            f"status={status!r}: flag can_pause={listed['can_pause']} but the "
+            f"endpoint answered {pause_code}"
+        )
+        assert resume_code == (200 if resume_listed["can_resume"] else 409), (
+            f"status={status!r}: flag can_resume={resume_listed['can_resume']} but the "
+            f"endpoint answered {resume_code}"
+        )
+    assert _task_controls_payload  # the shared helper under test

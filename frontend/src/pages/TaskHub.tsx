@@ -1,13 +1,21 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Link } from "react-router-dom";
-import { Activity, ArrowRight, Pause, RefreshCw, Square } from "lucide-react";
+import {
+  Activity,
+  ArrowRight,
+  Pause,
+  Play,
+  RefreshCw,
+  Square,
+} from "lucide-react";
 
 import {
   cancelDataTask,
   listTasks,
   pauseDataTask,
   restartDataTask,
+  resumeDataTask,
 } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
 import { useToast } from "../components/ToastProvider";
@@ -356,6 +364,23 @@ export function TaskHubPage() {
                   <div
                     style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
                   >
+                    {task.can_resume ? (
+                      <button
+                        type="button"
+                        disabled={isBusy || !taskId}
+                        onClick={() =>
+                          taskId &&
+                          void runAction(
+                            taskId,
+                            () => resumeDataTask(taskId),
+                            "Task resumed.",
+                          )
+                        }
+                        style={buttonStyle("#bbf7d0")}
+                      >
+                        <Play size={14} /> Resume
+                      </button>
+                    ) : null}
                     {task.can_pause ? (
                       <button
                         type="button"
@@ -390,7 +415,9 @@ export function TaskHubPage() {
                         <Square size={14} /> Cancel
                       </button>
                     ) : null}
-                    {!task.can_pause && !task.can_cancel ? (
+                    {!task.can_pause &&
+                    !task.can_resume &&
+                    !task.can_cancel ? (
                       <span
                         style={{
                           color: "var(--color-text-muted)",
