@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { TerminalSquare } from "lucide-react";
 
 import { buildWebSocketUrl, useWebSocket, type WebSocketStatus } from "../hooks/useWebSocket";
+import { isTerminalTaskStatus, normalizeTaskStatus } from "../lib/taskStatus";
 
 interface LiveTerminalProps {
   jobId: string | null;
@@ -11,11 +12,14 @@ interface LiveTerminalProps {
 
 /** Log text parsed out of the task feed: `[task:<id>] status=<word>`. */
 const TASK_STATUS_LINE = /\[task:[^\]]+\]\s+status=(\w+)/i;
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const TERMINAL_STATUS_TONES: Record<string, string> = {
   completed: "#86efac",
   failed: "#f87171",
+  interrupted: "#f87171",
   cancelled: "#fbbf24",
+  manual_required: "#f87171",
+  cleanup_pending: "#fbbf24",
+  cleanup_exhausted: "#f87171",
   connected: "#67e8f9",
   connecting: "#fbbf24",
   disconnected: "#f87171",
@@ -26,8 +30,9 @@ function deriveFeedStatus(
   wsStatus: WebSocketStatus,
   taskStatus: string | null,
 ): string {
-  if (taskStatus && TERMINAL_TASK_STATUSES.has(taskStatus)) {
-    return taskStatus;
+  const normalizedTaskStatus = normalizeTaskStatus(taskStatus);
+  if (isTerminalTaskStatus(normalizedTaskStatus)) {
+    return normalizedTaskStatus;
   }
   switch (wsStatus) {
     case "connected":
@@ -39,7 +44,7 @@ function deriveFeedStatus(
     case "error":
       return "disconnected";
     default:
-      return taskStatus ?? "idle";
+      return normalizedTaskStatus || "idle";
   }
 }
 
@@ -50,8 +55,7 @@ export function LiveTerminal({
 }: LiveTerminalProps) {
   // Raw log text; reset when the job changes so a feed never shows another job's output.
   const [logs, setLogs] = useState("");
-  // Terminal status parsed from the feed itself (completed/failed/cancelled); the
-  // connection status is derived from the shared hook instead of mirrored in state.
+  // Terminal status parsed from the feed; connection status is derived from the shared hook.
   const [taskStatus, setTaskStatus] = useState<string | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const onStatusChangeRef = useRef(onStatusChange);
@@ -69,7 +73,7 @@ export function LiveTerminal({
   // The server closes the socket once the task reaches a terminal status; without
   // this gate the hook would reconnect forever and onOpen's reset would flap the
   // reported status between "completed" and "connecting".
-  const taskFinished = taskStatus != null && TERMINAL_TASK_STATUSES.has(taskStatus);
+  const taskFinished = isTerminalTaskStatus(taskStatus);
 
   const stream = useWebSocket<string>(wsUrl, {
     enabled: Boolean(wsUrl) && !taskFinished,

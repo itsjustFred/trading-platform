@@ -76,7 +76,13 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
         run: npm ci --ignore-scripts
-      - name: Frontend test lint
-        run: ./node_modules/.bin/eslint tests/optimizationEvidence.test.ts
+      - name: Frontend focused test lint
+        run: >-
+          ./node_modules/.bin/eslint
+          tests/frontendResilience.test.ts
+          tests/liveTerminal.test.ts
+          tests/optimizationEvidence.test.ts
       - name: Frontend focused tests
-        run: npm run test:optimization-evidence
+        run: npm run test:focused
+      - name: Frontend TypeScript and production build
+        run: npm run build

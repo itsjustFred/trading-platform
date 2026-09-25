@@ -24,6 +24,7 @@ import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { useToast } from "../components/ToastProvider";
+import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 let componentIdCounter = 0;
@@ -487,7 +488,12 @@ export function PortfoliosPage() {
     if (!window.confirm(`Delete ${ids.length} selected portfolios?`)) return;
     try {
       const result = await deletePortfoliosBulk(ids);
-      showToast(`Deleted ${result.deleted} portfolio(s).`, "success");
+      const notice = formatMaintenanceDeletionResult(
+        "portfolio(s)",
+        result.deleted,
+        result.items,
+      );
+      showToast(notice.message, notice.tone);
       setSelectedIds(new Set());
       loadPortfolios();
     } catch (error: unknown) {
@@ -516,10 +522,12 @@ export function PortfoliosPage() {
     setRunningDeduplicate(true);
     try {
       const payload = await deduplicatePortfolios();
-      showToast(
-        `Removed ${payload.deleted_ids.length} duplicate portfolio(s).`,
-        "success",
+      const notice = formatMaintenanceDeletionResult(
+        "duplicate portfolio(s)",
+        payload.deleted_ids.length,
+        payload.items,
       );
+      showToast(notice.message, notice.tone);
       setShowDuplicatesModal(false);
       loadPortfolios();
     } catch (error: unknown) {
@@ -534,7 +542,12 @@ export function PortfoliosPage() {
   const handleRemoveEmpty = async () => {
     try {
       const payload = await removeEmptyPortfolios();
-      showToast(`Removed ${payload.removed} empty portfolio(s).`, "success");
+      const notice = formatMaintenanceDeletionResult(
+        "empty portfolio(s)",
+        payload.removed,
+        payload.items,
+      );
+      showToast(notice.message, notice.tone);
       setSelectedIds(new Set());
       loadPortfolios();
     } catch (error: unknown) {

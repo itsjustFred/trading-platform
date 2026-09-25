@@ -4,8 +4,7 @@ import { Activity } from "lucide-react";
 
 import { listDataTasks } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
-
-const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
+import { isActiveTaskStatus } from "../lib/taskStatus";
 
 export function TaskManager() {
   const [tasks, setTasks] = useState<DataTaskStatusResponse[]>([]);
@@ -40,10 +39,7 @@ export function TaskManager() {
   }, []);
 
   const activeTasks = useMemo(
-    () =>
-      tasks.filter((task) =>
-        ACTIVE_STATUSES.has(String(task.status || "").toLowerCase()),
-      ),
+    () => tasks.filter((task) => isActiveTaskStatus(task.status)),
     [tasks],
   );
   const runningCount = useMemo(
