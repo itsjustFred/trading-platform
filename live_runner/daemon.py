@@ -2499,11 +2499,15 @@ async def _enforce_stopped_deployments(
 
         adapter = active_adapters.get(deployment.account_id)
         if adapter is None:
-            # No adapter means nothing is connected for this account, so there is
-            # nothing resting or open that this daemon could have created.
-            already_enforced.add(deployment_id)
+            # Deliberately NOT recorded as enforced. "No adapter" does not mean
+            # "nothing is open": `active_adapters` is empty for every account
+            # immediately after a restart, so recording this would permanently
+            # skip the cancel/flatten for a genuinely stopped deployment that
+            # still has positions. Leaving it out of the ledger makes the next
+            # sync retry once a connection exists. The retry is bounded because a
+            # STOPPED deployment cannot submit anything in the meantime.
             logger.info(
-                "Stopped deployment has no active adapter; nothing to cancel or flatten",
+                "Stopped deployment has no active adapter yet; will retry cancel/flatten",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,

@@ -1424,7 +1424,14 @@ def test_stopped_deployment_not_marked_enforced_when_cancel_fails(monkeypatch):
     assert adapter.flatten_calls == 0, "must not flatten when cancel failed"
 
 
-def test_stopped_deployment_without_adapter_is_a_noop(monkeypatch):
+def test_stopped_deployment_without_adapter_is_retried_not_marked_enforced(monkeypatch):
+    """No adapter does NOT mean "nothing is open".
+
+    `active_adapters` is empty for every account right after a daemon restart, so
+    recording a stopped deployment as enforced here would permanently skip the
+    cancel/flatten for a deployment that really does still hold positions. It must
+    stay out of the ledger so the next sync retries once a connection exists.
+    """
     enforced: set[str] = set()
 
     async def _run() -> None:
@@ -1434,6 +1441,17 @@ def test_stopped_deployment_without_adapter_is_a_noop(monkeypatch):
 
     asyncio.run(_run())
 
+    assert "44444444-4444-4444-8444-444444444444" not in enforced
+
+    # Once an adapter exists, the stop is enforced and only then recorded.
+    adapter = _RecordingAdapter()
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+    )
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
     assert "44444444-4444-4444-8444-444444444444" in enforced
 
 
