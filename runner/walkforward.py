@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import pandas as pd
 
+from data_tools.auto_download import is_us_equity_holiday
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import (
     BacktestConfig,
@@ -241,7 +242,7 @@ def _gap_contains_only_weekend(start: pd.Timestamp, end: pd.Timestamp) -> bool:
     cursor = start.normalize() + pd.Timedelta(days=1)
     end_day = end.normalize()
     while cursor < end_day:
-        if cursor.weekday() < 5:
+        if cursor.weekday() < 5 and not is_us_equity_holiday(cursor):
             return False
         cursor += pd.Timedelta(days=1)
     return True
@@ -249,11 +250,13 @@ def _gap_contains_only_weekend(start: pd.Timestamp, end: pd.Timestamp) -> bool:
 
 def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, float | None]:
     return_values: list[float] = []
+    max_drawdown = 0.0
     for fold in folds:
         curve = fold.get("oos_equity_curve")
         if not curve:
             continue
         daily_equity = _daily_close_series(curve)
+        fold_returns: list[float] = []
         for previous_timestamp, timestamp in zip(
             daily_equity.index[:-1], daily_equity.index[1:], strict=False
         ):
@@ -265,20 +268,20 @@ def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, f
             start = float(daily_equity.loc[previous_timestamp])
             end = float(daily_equity.loc[timestamp])
             if start > 0 and math.isfinite(start) and math.isfinite(end):
-                return_values.append(float(end / start - 1.0))
+                fold_returns.append(float(end / start - 1.0))
+        return_values.extend(fold_returns)
+        running = 1.0
+        peak = 1.0
+        for value in fold_returns:
+            running *= 1.0 + value
+            peak = max(peak, running)
+            max_drawdown = max(max_drawdown, (peak - running) / peak)
     if len(return_values) < 2:
         return None, None
     mean = sum(return_values) / len(return_values)
     variance = sum((value - mean) ** 2 for value in return_values) / len(return_values)
     std = math.sqrt(variance)
     sharpe = mean / std * math.sqrt(252.0) if std > 0 else 0.0
-    running = 1.0
-    peak = 1.0
-    max_drawdown = 0.0
-    for value in return_values:
-        running *= 1.0 + value
-        peak = max(peak, running)
-        max_drawdown = max(max_drawdown, (peak - running) / peak)
     return sharpe, max_drawdown
 
 

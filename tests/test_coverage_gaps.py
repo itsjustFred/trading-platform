@@ -223,10 +223,31 @@ class TestValidateGapBounds:
         target = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
         target.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(target, index=False)
-        result = validate_parquet(target)
+        result = validate_parquet(target, ohlcv_root=tmp_path / "ohlcv")
         assert result.gaps, "the 4-day hole must be reported"
         assert "2024-01-01" in result.gaps[0]["start"] and "01:00" in result.gaps[0]["start"]
         assert "2024-01-05" in result.gaps[0]["end"] and "00:00" in result.gaps[0]["end"]
+
+    def test_rejects_path_outside_configured_root(self, tmp_path, monkeypatch):
+        import data_tools.validate as validate_module
+
+        configured_root = tmp_path / "configured"
+        outside = tmp_path / "outside" / "1d.parquet"
+        outside.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-02T00:00:00Z"], utc=True),
+                "open": [1.0],
+                "high": [1.1],
+                "low": [0.9],
+                "close": [1.0],
+                "volume": [10.0],
+            }
+        ).to_parquet(outside, index=False)
+        monkeypatch.setattr(validate_module, "DATA_DIR", configured_root)
+
+        with pytest.raises(ValueError, match="escapes its root"):
+            validate_module.validate_parquet(outside)
 
 
 class TestGapDetectionSingleFile:
@@ -277,6 +298,78 @@ class TestSegmentCoverageWeekends:
         assert has_sufficient_segment_coverage(
             symbol="AAPL", timeframe="1d",
             start="2024-01-01", end="2024-01-12", data_dir=tmp_path,
+        )
+
+    def test_us_equity_holiday_does_not_reduce_expected_coverage(self, tmp_path):
+        stamps = pd.to_datetime(
+            ["2024-07-03T00:00:00Z", "2024-07-05T00:00:00Z", "2024-07-08T00:00:00Z"],
+            utc=True,
+        )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-07-03",
+            end="2024-07-08",
+            data_dir=tmp_path,
+        )
+
+    def test_us_equity_holiday_does_not_hide_weekday_outage(self, tmp_path):
+        stamps = pd.to_datetime(
+            ["2024-07-03T00:00:00Z", "2024-07-08T00:00:00Z"],
+            utc=True,
+        )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-07-03",
+            end="2024-07-08",
+            data_dir=tmp_path,
+        )
+
+    def test_non_us_equity_venue_does_not_use_nyse_calendar(self, tmp_path):
+        stamps = [
+            *pd.date_range("2024-07-03T00:00:00", periods=24, freq="1h", tz="UTC"),
+            *pd.date_range("2024-07-05T00:00:00", periods=3, freq="1h", tz="UTC"),
+        ]
+        _write_bars(
+            tmp_path / "ohlcv" / "international" / "equity" / "ASX" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="ASX",
+            timeframe="1h",
+            start="2024-07-03",
+            end="2024-07-05T02:00:00Z",
+            data_dir=tmp_path,
+        )
+
+    def test_crypto_symbol_does_not_use_us_equity_holiday_calendar(self, tmp_path):
+        stamps = [
+            *pd.date_range("2024-07-03T00:00:00", periods=24, freq="1h", tz="UTC"),
+            *pd.date_range("2024-07-05T00:00:00", periods=3, freq="1h", tz="UTC"),
+        ]
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "crypto" / "bch-usd" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="BCH-USD",
+            timeframe="1h",
+            start="2024-07-03",
+            end="2024-07-05T02:00:00Z",
+            data_dir=tmp_path,
         )
 
     def test_hourly_segment_with_weekend_gap_passes(self, tmp_path):
@@ -338,6 +431,33 @@ class TestSegmentCoverageWeekends:
 
 class TestValidateHolidayCalendar:
     """B3: NYSE holidays are not data holes (equity-like paths only)."""
+
+    @pytest.mark.parametrize("date_text", ["2021-06-18", "2021-12-31"])
+    def test_new_year_exception_and_pre_2022_juneteenth_stay_open(
+        self, date_text: str
+    ) -> None:
+        assert not auto_download.is_us_equity_holiday(date_text)
+
+    @pytest.mark.parametrize("date_text", ["2020-07-03", "2021-12-24"])
+    def test_saturday_holidays_are_observed_on_preceding_friday(
+        self, date_text: str
+    ) -> None:
+        assert auto_download.is_us_equity_holiday(date_text)
+
+    def test_sunday_holiday_is_observed_monday(self) -> None:
+        assert auto_download.is_us_equity_holiday("2022-06-20")
+
+    def test_weekend_holiday_is_not_double_subtracted(self) -> None:
+        start = pd.Timestamp("2024-07-05T22:00:00Z")
+        end = pd.Timestamp("2024-07-07T01:00:00Z")
+        baseline = auto_download._trading_minutes_between(start, end)
+        minutes = auto_download._trading_minutes_between(
+            start,
+            end,
+            frozenset({pd.Timestamp("2024-07-06").date()}),
+        )
+
+        assert minutes == pytest.approx(baseline)
 
     def test_weekend_boundary_rejects_more_than_three_calendar_days(self) -> None:
         from data_tools.validate import _weekend_boundary

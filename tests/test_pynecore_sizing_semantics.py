@@ -27,6 +27,7 @@ from runner.engines.pynecore_adapter import (
     _apply_risk_sizing,
     _enrich_trades_with_context,
     _gate_warmup_trades,
+    _normalize_trade_exits,
     _pyne_cli_end_bound,
     _pyne_cli_start_bound,
 )
@@ -132,6 +133,48 @@ def test_enrich_trades_with_context_materializes_canonical_levels() -> None:
     _enrich_trades_with_context([trade], context, _frame())
     assert trade.stop_loss == pytest.approx(99.0)
     assert trade.take_profit == pytest.approx(102.0)
+
+
+def test_final_exit_levels_and_reason_do_not_rewrite_earlier_legs() -> None:
+    trade = _trade()
+    trade.exits = [
+        TradeExit(
+            time="2024-01-02T00:00:00+00:00",
+            price=97.0,
+            quantity=0.5,
+            pnl=-150.0,
+            reason="partial",
+        ),
+        TradeExit(
+            time="2024-01-03T00:00:00+00:00",
+            price=102.0,
+            quantity=0.5,
+            pnl=100.0,
+            reason=None,
+        ),
+    ]
+    context = {
+        "initial_sl": (pd.Series([99.0, 98.0]), "exit"),
+        "initial_tp": (pd.Series([105.0, 101.0]), "exit"),
+        "exit_reason": (pd.Series([None, "take_profit"]), "exit"),
+    }
+
+    _enrich_trades_with_context([trade], context, _frame())
+    _normalize_trade_exits([trade])
+
+    assert trade.exits[0].price == pytest.approx(97.0)
+    assert trade.exits[0].reason == "partial"
+    assert trade.exits[1].price == pytest.approx(101.0)
+    assert trade.exits[1].reason == "take_profit"
+
+
+def test_context_rejects_exit_before_entry() -> None:
+    trade = _trade(entry_time="2024-01-03T00:00:00+00:00")
+    trade.exits[0].time = "2024-01-02T00:00:00+00:00"
+    context = {"exit_reason": (pd.Series([None, "signal"]), "exit")}
+
+    with pytest.raises(ValueError, match="before entry"):
+        _enrich_trades_with_context([trade], context, _frame())
 
 
 def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:

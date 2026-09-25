@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from data_tools.auto_download import TIMEFRAME_MINUTES
+from data_tools.auto_download import TIMEFRAME_MINUTES, _nyse_holidays
 from data_tools.path_safety import ensure_dataset_path_within
 from shared.constants import DATA_DIR, normalize_timeframe
 
@@ -61,64 +61,6 @@ GAP_THRESHOLD_MINUTES = {
 #: real data holes there).
 _EQUITY_LIKE_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf", "index"})
 _EXPECTED_GAP_CLASSIFICATIONS = frozenset({"overnight", "weekend", "holiday"})
-
-
-def _easter_sunday(year: int) -> tuple[int, int]:
-    """Month/day of Easter Sunday (Anonymous Gregorian algorithm)."""
-    a = year % 19
-    b, c = divmod(year, 100)
-    d, e = divmod(b, 4)
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = divmod(c, 4)
-    weekday_corr = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * weekday_corr) // 451
-    month = (h + weekday_corr - 7 * m + 114) // 31
-    day = ((h + weekday_corr - 7 * m + 114) % 31) + 1
-    return month, day
-
-
-def _nyse_holidays(year: int) -> set[str]:
-    """NYSE holiday dates (ISO) for one year, incl. observed shifts (B3)."""
-    from datetime import date, timedelta
-
-    def observed(month: int, day: int) -> date:
-        day_date = date(year, month, day)
-        if day_date.weekday() == 5:  # Saturday -> preceding Friday
-            return day_date - timedelta(days=1)
-        if day_date.weekday() == 6:  # Sunday -> following Monday
-            return day_date + timedelta(days=1)
-        return day_date
-
-    def nth_weekday(month: int, weekday: int, n: int) -> date:
-        first = date(year, month, 1)
-        offset = (weekday - first.weekday()) % 7
-        return first + timedelta(days=offset + 7 * (n - 1))
-
-    def last_weekday(month: int, weekday: int) -> date:
-        if month == 12:
-            probe = date(year + 1, 1, 1) - timedelta(days=1)
-        else:
-            probe = date(year, month + 1, 1) - timedelta(days=1)
-        offset = (probe.weekday() - weekday) % 7
-        return probe - timedelta(days=offset)
-
-    holidays = {
-        observed(1, 1),  # New Year's Day
-        nth_weekday(1, 0, 3),  # MLK Day
-        nth_weekday(2, 0, 3),  # Presidents Day
-        last_weekday(5, 0),  # Memorial Day
-        observed(6, 19) if year >= 2021 else None,  # Juneteenth (from 2021)
-        observed(7, 4),  # Independence Day
-        nth_weekday(9, 0, 1),  # Labor Day
-        nth_weekday(11, 3, 4),  # Thanksgiving
-        observed(12, 25),  # Christmas
-    }
-    easter_month, easter_day = _easter_sunday(year)
-    good_friday = date(year, easter_month, easter_day) - timedelta(days=2)
-    holidays.add(good_friday)
-    return {day.isoformat() for day in holidays if day is not None and day.year == year}
 
 
 def _utc_timestamp(value: object) -> pd.Timestamp:
@@ -187,7 +129,7 @@ def _holiday_dates(
             if not pd.isna(parsed):
                 dates.add(pd.Timestamp(parsed).date().isoformat())
     if include_nyse:
-        for year in range(start_year, end_year + 1):
+        for year in range(start_year - 1, end_year + 2):
             dates |= _nyse_holidays(year)
     return dates
 
@@ -485,12 +427,9 @@ def validate_parquet(
         session = {"start": session_start, "end": session_end}
     if holidays is None and holiday_dates is not None:
         holidays = holiday_dates
-    candidate = Path(path).expanduser()
-    try:
-        configured_root = (ohlcv_root or (DATA_DIR / "ohlcv")).resolve()
-        rel = candidate.resolve().relative_to(configured_root)
-    except (OSError, RuntimeError, ValueError):
-        rel = candidate
+    configured_root = (ohlcv_root or (DATA_DIR / "ohlcv")).resolve()
+    candidate = ensure_dataset_path_within(configured_root, Path(path).expanduser())
+    rel = candidate.relative_to(configured_root)
     parts = rel.parts
 
     # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet

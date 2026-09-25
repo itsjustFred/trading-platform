@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pandas as pd
 import pytest
 
 from runner.daily_equity import attach_daily_equity, build_daily_equity_curve
@@ -261,8 +262,7 @@ class TestAttachDailyEquity:
         assert len(result.equity_curve) > 2
         assert result.meta.data["equity_frequency"] == "daily"
 
-    def test_preserves_existing_equity_curve_when_longer(self):
-        """Test that existing equity curve is preserved when it has more points."""
+    def test_rejects_sparse_existing_equity_curve(self):
         result = make_result(
             trades=[make_trade(pnl=500.0)],
             equity_curve=[
@@ -274,16 +274,13 @@ class TestAttachDailyEquity:
         )
         attach_daily_equity(result)
 
-        # Should keep original 4-point curve, not replace with 1-point daily curve
-        assert len(result.equity_curve) == 4
+        assert len(result.equity_curve) == 33
         assert result.equity_curve[0].equity == 100000.0
-        assert result.equity_curve[-1].equity == 105000.0
+        assert result.equity_curve[-1].equity == 100500.0
         assert result.meta.data["equity_frequency"] == "daily"
         assert result.stats["daily_return_count"] == 32
 
-    def test_preserves_engine_curve_even_when_daily_curve_is_longer(self):
-        """The engine curve remains the canonical realized path."""
-        # Build a case where daily curve would have multiple points
+    def test_rejects_endpoint_only_curve_with_matching_endpoints(self):
         trade1 = make_trade(
             entry_time="2024-01-10T10:00:00Z", exit_time="2024-01-10T15:00:00Z", pnl=500.0
         )
@@ -297,14 +294,55 @@ class TestAttachDailyEquity:
             trades=[trade1, trade2, trade3],
             equity_curve=[
                 EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
-                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=105000.0),
+                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=101000.0),
             ]
         )
         attach_daily_equity(result)
 
-        assert len(result.equity_curve) == 2
+        assert len(result.equity_curve) == 33
         assert result.equity_curve[0].equity == 100000.0
-        assert result.equity_curve[1].equity == 105000.0
+        assert result.equity_curve[-1].equity == 101000.0
+        assert result.meta.data["equity_frequency"] == "daily"
+
+    def test_preserves_dense_business_day_curve_within_daily_boundaries(self):
+        timestamps = pd.date_range("2024-01-02", "2024-01-31", freq="B", tz="UTC")
+        curve = [
+            EquityPoint(
+                time=timestamp.isoformat(),
+                equity=100500.0 if timestamp == timestamps[-1] else 100000.0,
+            )
+            for timestamp in timestamps
+        ]
+        result = make_result(trades=[make_trade()], equity_curve=curve)
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve == curve
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 32
+
+    def test_preserves_dense_curve_across_nyse_holiday(self):
+        timestamps = pd.date_range("2024-12-20", "2025-01-05", freq="D", tz="UTC")
+        curve = [
+            EquityPoint(time=timestamp.isoformat(), equity=100000.0)
+            for timestamp in timestamps
+            if timestamp.date() != pd.Timestamp("2024-12-25").date()
+        ]
+        trade = make_trade(
+            entry_time="2024-12-20T10:00:00Z",
+            exit_time="2024-12-20T15:00:00Z",
+            pnl=0.0,
+        )
+        result = make_result(
+            trades=[trade],
+            equity_curve=curve,
+            backtest_start="2024-12-20",
+            backtest_end="2025-01-05",
+        )
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve == curve
 
     def test_start_end_params_accepted(self):
         """Test that start and end parameters are accepted."""

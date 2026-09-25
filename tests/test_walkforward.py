@@ -516,6 +516,45 @@ def test_aggregate_oos_metrics_keeps_returns_across_weekends() -> None:
     assert drawdown == pytest.approx(0.0)
 
 
+def test_aggregate_oos_metrics_keeps_returns_across_us_equity_holiday() -> None:
+    curve = [
+        {"time": "2024-07-02T23:00:00+00:00", "equity": 100.0},
+        {"time": "2024-07-03T23:00:00+00:00", "equity": 110.0},
+        {"time": "2024-07-05T23:00:00+00:00", "equity": 115.5},
+        {"time": "2024-07-08T23:00:00+00:00", "equity": 126.945},
+    ]
+
+    sharpe, drawdown = wf_module._aggregate_oos_metrics(
+        [{"oos_equity_curve": curve}]
+    )
+
+    assert sharpe > 0.0
+    assert drawdown == pytest.approx(0.0)
+
+
+def test_aggregate_oos_metrics_drawdown_resets_between_folds() -> None:
+    folds = [
+        {
+            "oos_equity_curve": [
+                {"time": "2024-01-02", "equity": 100.0},
+                {"time": "2024-01-03", "equity": 110.0},
+                {"time": "2024-01-04", "equity": 99.0},
+            ]
+        },
+        {
+            "oos_equity_curve": [
+                {"time": "2024-01-08", "equity": 100.0},
+                {"time": "2024-01-09", "equity": 100.0},
+                {"time": "2024-01-10", "equity": 95.0},
+            ]
+        },
+    ]
+
+    _sharpe, drawdown = wf_module._aggregate_oos_metrics(folds)
+
+    assert drawdown == pytest.approx(0.10)
+
+
 def test_aggregate_oos_metrics_uses_daily_closes_and_epoch_seconds() -> None:
     curve = [
         {"time": 1_703_980_800, "equity": 100.0},
