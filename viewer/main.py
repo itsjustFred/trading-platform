@@ -11047,7 +11047,13 @@ async def create_live_deployment_endpoint(
         settings=payload.settings or {},
     )
     try:
-        validate_stockkit_deployment_route(deployment)
+        account_record = _ensure_live_account_for_deployment(payload.account_id)
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=str(
+                account_record.get("broker_login") or account_record.get("ctid") or ""
+            ),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:

@@ -1011,9 +1011,13 @@ def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monke
 
 
 def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
+    # account_id is a local UUID; the Alpaca account number is broker identity
+    # and is supplied separately, because comparing a UUID against an account
+    # number is comparing two different identifier spaces.
+    ramjet_number = "PA3T0MQAGQ51"
     deployment = LiveDeploymentConfig(
         strategy_name="discord::ramjet",
-        account_id="PA3T0MQAGQ51",
+        account_id="59d94c55-f6d3-4c38-ba4d-ec1e22abdbcf",
         symbols=["AAPL"],
         timeframe="1h",
         status="ACTIVE",
@@ -1022,14 +1026,27 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
         signal_source_id="RAMJET",
         signal_config={"signal_processor": "ramjet"},
     )
+    route_env = {"ALPACA_ACCOUNT_NAME_ACC2": "RamJet", "ALPACA_ACCOUNT_NUMBER_ACC2": ramjet_number}
 
     assert daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "RAMJET"},
+        account_broker_login=ramjet_number,
+        accounts_env_values=route_env,
     )
     assert not daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "NITRO"},
+        account_broker_login=ramjet_number,
+        accounts_env_values=route_env,
+    )
+    # Correctly routed account, but the deployment sits on the wrong broker
+    # account: must be refused rather than dispatched.
+    assert not daemon._deployment_matches_stockkit_route(
+        deployment,
+        {"discord_bot_name": "RAMJET"},
+        account_broker_login="PA-SOME-OTHER-ACCOUNT",
+        accounts_env_values=route_env,
     )
 
 

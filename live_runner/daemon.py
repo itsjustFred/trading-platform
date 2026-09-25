@@ -444,9 +444,34 @@ def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
     ).strip().lower()
 
 
+def _live_account_broker_login(account_id: str) -> str:
+    """Return the broker-reported account number for a local account id.
+
+    Alpaca reports an account number (e.g. ``PA35HB6T7815``) and cTrader a
+    ctid; both live in ``broker_login``/``ctid``. Routing checks compare against
+    that broker identity because the local id is a different identifier space.
+    Returns an empty string when the account is unknown, which makes routing
+    validation fail closed.
+    """
+    try:
+        account = get_live_account(str(account_id))
+    except Exception as exc:
+        logger.error(
+            "Could not resolve broker identity for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return ""
+    if account is None:
+        return ""
+    return str(getattr(account, "broker_login", "") or getattr(account, "ctid", "") or "")
+
+
 def _deployment_matches_stockkit_route(
     deployment: LiveDeploymentConfig,
     signal_metadata: Mapping[str, object],
+    *,
+    account_broker_login: str | None = None,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     route = infer_stockkit_route(
         signal_source_id=deployment.signal_source_id,
@@ -457,7 +482,11 @@ def _deployment_matches_stockkit_route(
     if not route:
         return True
     try:
-        validate_stockkit_deployment_route(deployment)
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        )
     except ValueError as exc:
         logger.warning(
             "Blocking misrouted StockKit deployment",
@@ -1356,10 +1385,18 @@ async def _dispatch_discord_trade_signal(
     # channel/symbol — the one that traded was picked by DB row order.
     signal_author_id = str(trade_signal.metadata.get("discord_author_id", "")).strip().lower()
     dispatched_to_any = False
+    # Resolve the broker-reported account number once: routing must be validated
+    # against broker identity, not the local account id.
+    account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
         if not _deployment_is_currently_active(deployment):
             continue
-        if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+        if not _deployment_matches_stockkit_route(
+            deployment,
+            trade_signal.metadata,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        ):
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue

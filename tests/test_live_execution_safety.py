@@ -3710,3 +3710,119 @@ def test_non_discord_deployment_ignores_channel_config():
         signal_config={"channel_id": "987654321"},
     )
     validate_discord_deployment_signal_config(internal)
+
+
+# ─── StockKit route resolution: broker identity, not the local account id ────
+
+
+def test_expected_account_number_prefers_configured_label_over_stale_table():
+    """Paper accounts get re-created, which silently invalidates hardcoded
+    account numbers. Resolution must follow the configured label."""
+    from live_runner.stockkit_routing import expected_account_number_for_route
+
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-NEW-NITRO",
+        "ALPACA_ACCOUNT_NAME_ACC2": "RocketFuel",
+        "ALPACA_ACCOUNT_NUMBER_ACC2": "PA-NEW-ROCKET",
+    }
+    assert expected_account_number_for_route("nitro", env) == "PA-NEW-NITRO"
+    assert expected_account_number_for_route("rocketfuel", env) == "PA-NEW-ROCKET"
+    # Unlabelled route falls back to the static table.
+    assert expected_account_number_for_route("ramjet", env) == "PA3T0MQAGQ51"
+
+
+def test_expected_account_number_honours_explicit_override():
+    from live_runner.stockkit_routing import expected_account_number_for_route
+
+    env = {
+        "STOCKKIT_ACCOUNT_NUMBER_NITRO": "PA-EXPLICIT",
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED",
+    }
+    assert expected_account_number_for_route("nitro", env) == "PA-EXPLICIT"
+
+
+def test_route_validation_compares_broker_identity_not_local_account_id():
+    """Regression: the check used to compare the local account UUID against an
+    Alpaca account number, two different identifier spaces, so every StockKit
+    deployment was rejected including correctly routed ones."""
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-NITRO-1",
+    }
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::nitro",
+        account_id="c419ca33-a759-4e6b-8bb1-299d13da27c3",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_config={"service_name": "nitro", "channel_id": "1469353015738630206"},
+    )
+
+    # Correct broker identity passes even though the local id is unrelated.
+    validate_stockkit_deployment_route(
+        deployment, account_broker_login="PA-NITRO-1", accounts_env_values=env
+    )
+
+    # A different broker account is rejected.
+    with pytest.raises(ValueError, match="must route to Alpaca account PA-NITRO-1"):
+        validate_stockkit_deployment_route(
+            deployment, account_broker_login="PA-SOMEONE-ELSE", accounts_env_values=env
+        )
+
+    # An unknown account (no reported number) is rejected rather than waved through.
+    with pytest.raises(ValueError, match="no reported number"):
+        validate_stockkit_deployment_route(
+            deployment, account_broker_login="", accounts_env_values=env
+        )
+
+
+def test_route_validation_fails_closed_when_no_account_number_configured(monkeypatch):
+    """With neither config nor a fallback entry, the check must refuse rather
+    than silently allow an unroutable StockKit deployment."""
+    import live_runner.stockkit_routing as routing
+
+    monkeypatch.setattr(routing, "STOCKKIT_ACCOUNT_ROUTES", {})
+
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::nitro",
+        account_id="c419ca33-a759-4e6b-8bb1-299d13da27c3",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_config={"service_name": "nitro", "channel_id": "1469353015738630206"},
+    )
+    with pytest.raises(ValueError, match="No Alpaca account number is configured"):
+        routing.validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login="PA-NITRO-1",
+            accounts_env_values={},
+        )
+
+
+def test_route_validation_uses_static_fallback_when_env_is_empty():
+    """Without a labelled config block the static table is still consulted, so
+    the result is a mismatch refusal rather than an accidental pass."""
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::nitro",
+        account_id="c419ca33-a759-4e6b-8bb1-299d13da27c3",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_config={"service_name": "nitro", "channel_id": "1469353015738630206"},
+    )
+    with pytest.raises(ValueError, match="must route to Alpaca account"):
+        validate_stockkit_deployment_route(
+            deployment, account_broker_login="PA-SOMETHING-ELSE", accounts_env_values={}
+        )

@@ -246,7 +246,9 @@ def test_live_account_discovery_persists_demo_identity(monkeypatch):
 def test_live_deployments_crud_endpoints(monkeypatch):
     import viewer.main as viewer_main_module
 
-    account_id = "PA3T0MQAGQ51"
+    # Local account id is a UUID; the Alpaca account number is broker identity.
+    account_id = "59d94c55-f6d3-4c38-ba4d-ec1e22abdbcf"
+    ramjet_account_number = "PA3T0MQAGQ51"
     deployment_id = "44444444-4444-4444-4444-444444444444"
     created_deployment = {
         "id": deployment_id,
@@ -284,6 +286,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "id": _account_id,
             "broker": "alpaca",
             "name": "Alpaca Paper",
+            # Broker-reported identity. Routing is validated against this, not
+            # against the local account id, which is a different id space.
+            "broker_login": ramjet_account_number,
         },
     )
     monkeypatch.setattr(
