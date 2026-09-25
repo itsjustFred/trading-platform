@@ -112,7 +112,45 @@ class TestInternalGapDetection:
             tmp_path,
             DataRequirement(symbol="USDCAD", timeframe="1h", start="2024-01-01", end="2024-01-02"),
         )
-        assert report["status"] == "failed"
+    assert report["status"] == "failed"
+
+
+def test_observed_session_does_not_merge_different_daily_windows() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=4, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T14:00", periods=4, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(stamps, 60.0) is None
+
+
+def test_observed_session_does_not_shrink_for_a_truncated_day() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=2, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(stamps, 60.0) is None
+
+
+def test_observed_session_allows_a_final_day_cut_at_the_requested_end() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=2, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T00:00:00Z"),
+        end_ts=pd.Timestamp("2024-01-03T10:00:00Z"),
+    ) == (540, 840)
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T00:00:00Z"),
+        end_ts=pd.Timestamp("2024-01-03T13:00:00Z"),
+    ) is None
         assert "error" in report
 
 
