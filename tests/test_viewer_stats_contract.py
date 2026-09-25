@@ -239,3 +239,77 @@ def test_database_risk_fallback_accepts_explicit_realized_values():
         75.0,
         0.0075,
     )
+
+
+def test_core_stats_payload_preserves_zero_net_pnl_for_flat_trade():
+    from viewer import core
+
+    trade = Trade(
+        id=1,
+        symbol="X",
+        direction="LONG",
+        entry_time="2021-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=10,
+        exits=[],
+        pnl=100.0,
+        fees=100.0,
+        net_pnl=0.0,
+    )
+    result = _result([trade])
+    result.stats = {"total_pnl": 999.0}
+
+    payload = core._stats_payload_from_result(result)
+
+    assert payload["net_profit"] == 0.0
+    assert payload["net_profit_pct"] == 0.0
+    assert payload["total_trades"] == 1
+    assert payload["winners"] == 0
+    assert payload["losers"] == 0
+
+
+def test_portfolio_summary_preserves_zero_pnl_trade_count():
+    import viewer.main as viewer_app_module
+
+    summary = viewer_app_module._portfolio_summary_from_payload(
+        {
+            "account_capital": 100000.0,
+            "combined_stats": {},
+            "trades": [
+                {
+                    "entry_time": "2026-01-01T00:00:00Z",
+                    "exit_time": "2026-01-02T00:00:00Z",
+                    "pnl": 100.0,
+                    "fees": 100.0,
+                    "net_pnl": 0.0,
+                }
+            ],
+        }
+    )
+
+    assert summary["trade_count"] == 1
+    assert summary["net_profit"] == 0.0
+    assert summary["total_return"] == 0.0
+    assert summary["win_rate"] == 0.0
+
+
+def test_optimization_summary_preserves_zero_oos_baseline():
+    from viewer import core
+
+    summary = core._optimization_summary_payload(
+        {
+            "id": "opt-zero",
+            "best_value": 0.0,
+            "best_params": {},
+            "effective_best_parameters": {},
+            "train_stats": {"total_pnl": 0.0},
+            "test_stats": {"total_pnl": 0.0},
+            "oos_status": "available",
+        },
+        Path("opt-zero.json"),
+    )
+
+    assert summary["best_value"] == 0.0
+    assert summary["train_stats"]["total_pnl"] == 0.0
+    assert summary["test_stats"]["total_pnl"] == 0.0
+    assert summary["oos_status"] == "available"

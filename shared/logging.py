@@ -51,14 +51,45 @@ _SENSITIVE_MARKERS = (
     "token",
     "webhook",
 )
+_SENSITIVE_KEY_PARTS = (
+    "apikey",
+    "appsecret",
+    "authorization",
+    "brokerlogin",
+    "cookie",
+    "credential",
+    "dsn",
+    "githubtoken",
+    "password",
+    "privatekey",
+    "refreshtoken",
+    "secret",
+    "session",
+    "token",
+    "webhook",
+)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(?:api[_-]?key|app[_-]?secret|broker[_-]?login|credential|"
+    r"github[_-]?token|password|passwd|private[_-]?key|refresh[_-]?token|"
+    r"secret|session[_-]?id|webhook|(?:^|[^a-z])token(?:[^a-z]|$))"
+)
 _SENSITIVE_QUERY_RE = re.compile(
-    r"(?i)([?&](?:access_token|api_key|apikey|broker_login|credential|dsn|key|password|refresh_token|secret|session|token)=)([^&#\s]+)"
+    r"(?i)([?&](?:access_token|accessToken|api_key|apiKey|apikey|broker_login|"
+    r"brokerLogin|credential|dsn|key|password|refresh_token|refreshToken|secret|"
+    r"session|sessionId|token)=)([^&#\s]+)"
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)([\"']?(?:access_token|api_key|apikey|app_secret|broker_login|cookie|credential|dsn|github_token|password|private_key|refresh_token|secret|session|token|webhook)[\"']?\s*[:=]\s*[\"']?)([^\"',;&\s}]+)"
+    r"(?i)([\"']?(?:access_token|accessToken|api_key|apiKey|apikey|app_secret|"
+    r"appSecret|broker_login|brokerLogin|cookie|credential|dsn|github_token|"
+    r"githubToken|password|private_key|privateKey|refresh_token|refreshToken|secret|"
+    r"session|sessionId|token|webhook)[\"']?\s*[:=]\s*[\"']?)([^\"',;&\s}]+)"
 )
 _SENSITIVE_QUOTED_ASSIGNMENT_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?(?:access_token|api_key|apikey|app_secret|broker_login|cookie|credential|dsn|github_token|password|private_key|refresh_token|secret|session|token|webhook)[\"']?\s*[:=]\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+    r"(?i)(?P<prefix>[\"']?(?:access_token|accessToken|api_key|apiKey|apikey|"
+    r"app_secret|appSecret|broker_login|brokerLogin|cookie|credential|dsn|"
+    r"github_token|githubToken|password|private_key|privateKey|refresh_token|"
+    r"refreshToken|secret|session|sessionId|token|webhook)[\"']?\s*[:=]\s*)"
+    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
 )
 _AUTHORIZATION_RE = re.compile(
     r"(?i)(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+"
@@ -74,12 +105,16 @@ _loggers: dict[str, logging.Logger] = {}
 
 
 def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).strip().lower().replace("-", "_")
-    return any(marker in normalized for marker in _SENSITIVE_MARKERS)
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).strip().lower())
+    return any(marker in normalized for marker in _SENSITIVE_KEY_PARTS)
 
 
-def redact_text(value: str) -> str:
-    redacted = _AUTHORIZATION_RE.sub(r"\1\2 [Filtered]", str(value))
+def redact_text(value: object) -> str:
+    try:
+        raw = str(value)
+    except Exception:
+        return "[Unserializable]"
+    redacted = _AUTHORIZATION_RE.sub(r"\1\2 [Filtered]", raw)
     redacted = _BEARER_TOKEN_RE.sub("Bearer [Filtered]", redacted)
     redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
     redacted = _SENSITIVE_QUOTED_ASSIGNMENT_RE.sub(
@@ -97,24 +132,68 @@ def redact_text(value: str) -> str:
 
 
 def redact_value(value: Any) -> Any:
+    return _redact_value(value, set())
+
+
+def _redact_value(value: Any, seen: set[int]) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
     if isinstance(value, Mapping):
-        return {
-            key: _REDACTED if _is_sensitive_key(key) else redact_value(child)
-            for key, child in value.items()
-        }
+        identity = id(value)
+        if identity in seen:
+            return _REDACTED
+        seen.add(identity)
+        try:
+            redacted: dict[Any, Any] = {}
+            for key, child in value.items():
+                if _is_sensitive_key(key):
+                    redacted[key] = _REDACTED
+                    continue
+                if (
+                    isinstance(child, str)
+                    and _SENSITIVE_VALUE_RE.search(child)
+                    and not any(separator in child for separator in ("=", ":", "?"))
+                ):
+                    redacted[key] = _REDACTED
+                else:
+                    redacted[key] = _redact_value(child, seen)
+            return redacted
+        finally:
+            seen.remove(identity)
     if isinstance(value, list):
-        return [redact_value(child) for child in value]
+        identity = id(value)
+        if identity in seen:
+            return _REDACTED
+        seen.add(identity)
+        try:
+            return [_redact_value(child, seen) for child in value]
+        finally:
+            seen.remove(identity)
     if isinstance(value, tuple):
-        return tuple(redact_value(child) for child in value)
+        identity = id(value)
+        if identity in seen:
+            return _REDACTED
+        seen.add(identity)
+        try:
+            return tuple(_redact_value(child, seen) for child in value)
+        finally:
+            seen.remove(identity)
     if isinstance(value, set):
-        return {redact_value(child) for child in value}
+        identity = id(value)
+        if identity in seen:
+            return _REDACTED
+        seen.add(identity)
+        try:
+            return {_redact_value(child, seen) for child in value}
+        finally:
+            seen.remove(identity)
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, (bytes, bytearray)):
         return redact_text(bytes(value).decode("utf-8", errors="replace"))
     if isinstance(value, BaseException):
-        return redact_text(str(value))
-    return value
+        return redact_text(value)
+    return "[Unserializable]"
 
 
 class JsonFormatter(logging.Formatter):

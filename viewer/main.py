@@ -116,6 +116,7 @@ from shared.database import (
     load_portfolio as load_portfolio_record,
     mark_background_tasks_interrupted,
     migrate_json_to_sqlite,
+    normalize_task_status,
     save_result_to_sqlite,
     save_portfolio as save_portfolio_record,
     upsert_verification_evidence,
@@ -511,10 +512,49 @@ _RECOVERY_DOWNLOAD_SOURCES = {"yfinance", "huggingface", "alpaca", "dolthub", "d
 _RECOVERY_OPERATIONS = {"download", "resample", "harvest", "validate", "calibrate"}
 _RECOVERY_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
 _RECOVERY_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+_RECOVERY_EXECUTABLE_KEYS = {
+    "argv",
+    "cmd",
+    "command",
+    "commandline",
+    "entrypoint",
+    "executable",
+    "shell",
+}
+
+
+def _is_executable_recovery_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _RECOVERY_EXECUTABLE_KEYS
+
+
+def _contains_executable_command(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _is_executable_recovery_key(key) or _contains_executable_command(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_executable_command(child) for child in value)
+    return False
+
+
+def _strip_executable_command_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_executable_command_fields(child)
+            for key, child in value.items()
+            if not _is_executable_recovery_key(key)
+        }
+    if isinstance(value, list):
+        return [_strip_executable_command_fields(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_executable_command_fields(child) for child in value)
+    return value
 
 
 class _BacktestRecoveryParameters(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     strategy: str
     engine: str = "native"
@@ -577,6 +617,8 @@ def _parse_recovery_spec(
         return None
     candidate = raw_config.get("task_spec")
     if not isinstance(candidate, dict):
+        return None
+    if _contains_executable_command(candidate):
         return None
     kind = str(candidate.get("kind") or "").strip().lower()
     if kind != expected_kind:
@@ -762,17 +804,19 @@ def _mark_task_manual_required(
     record: dict[str, Any], task_id: str, raw_config: dict[str, Any], reason: str
 ) -> None:
     config = dict(raw_config)
-    for key in ("command", "cmd", "restart_config"):
+    for key in _RECOVERY_EXECUTABLE_KEYS:
         config.pop(key, None)
+    config.pop("restart_config", None)
     config["recovery_rejected"] = redact_text(str(reason))
     config["recovery_mode"] = "manual"
+    config = _strip_executable_command_fields(config)
     task = None
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is not None:
             was_failed = str(task.get("status") or "").lower() == "failed"
-            task.pop("command", None)
-            task.pop("cmd", None)
+            for key in _RECOVERY_EXECUTABLE_KEYS:
+                task.pop(key, None)
             task.pop("restart_config", None)
             task["status"] = "manual_required"
             task["error"] = config["recovery_rejected"]
@@ -919,13 +963,22 @@ def _resume_interrupted_backtest_task(
         ",".join(request_payload.symbols),
         request_payload.timeframe,
     )
-    restarted = _run_backtest_sync(run_backtest, request_payload)
+    try:
+        restarted = _run_backtest_sync(run_backtest, request_payload)
+    except Exception as exc:
+        _mark_task_manual_required(
+            record,
+            task_id,
+            raw_config,
+            f"backtest recovery failed: {exc}",
+        )
+        return
     restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
     upsert_background_task_record(
         task_id=task_id,
         task_type=str(record.get("type") or "backtest"),
         status="completed",
-        config_json=raw_config,
+        config_json=_strip_executable_command_fields(raw_config),
         progress_message=(
             f"Auto-restarted as task {restarted_task_id}"
             if restarted_task_id
@@ -1647,7 +1700,7 @@ def _task_status(task_id: str) -> str | None:
         return None
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(normalized)
-        return task.get("status") if task else None
+        return _task_status_or_manual(task.get("status")) if task else None
 
 
 def _task_action_payload(task_id: str) -> dict[str, Any]:
@@ -1661,7 +1714,7 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
-    current_status = str(task.get("status") or "").lower()
+    current_status = _task_status_or_manual(task.get("status"))
     if current_status not in {"interrupted", "failed"}:
         raise HTTPException(
             status_code=409,
@@ -1686,11 +1739,17 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
         except (HTTPException, TypeError, ValueError) as exc:
             _mark_task_manual_required(record, task_id, raw_config, str(exc))
             return _task_action_payload(task_id)
-        restarted = _run_backtest_sync(run_backtest, request_payload)
-        completed_config = dict(raw_config)
-        completed_config.pop("command", None)
-        completed_config.pop("cmd", None)
-        completed_config.pop("restart_config", None)
+        try:
+            restarted = _run_backtest_sync(run_backtest, request_payload)
+        except Exception as exc:
+            _mark_task_manual_required(
+                record,
+                task_id,
+                raw_config,
+                f"backtest restart failed: {exc}",
+            )
+            return _task_action_payload(task_id)
+        completed_config = _strip_executable_command_fields(raw_config)
         _update_task_fields(
             task_id,
             status="completed",
@@ -1769,10 +1828,13 @@ _TASK_STATUS_WEIGHTS: dict[str, float] = {
     "queued": 5.0,
     "starting": 10.0,
     "running": 50.0,
+    "paused": 50.0,
     "completed": 100.0,
     "failed": 100.0,
     "cancelled": 100.0,
     "interrupted": 100.0,
+    "partial": 100.0,
+    "skipped": 100.0,
     "manual_required": 100.0,
     "cleanup_pending": 100.0,
     "cleanup_exhausted": 100.0,
@@ -2025,6 +2087,17 @@ def _sanitize_progress_history(entries: Any) -> list[dict[str, Any]]:
     return history[-120:]
 
 
+def _task_status_or_manual(value: object) -> str:
+    try:
+        return normalize_task_status(value)
+    except ValueError:
+        return "manual_required"
+
+
+def _task_status_weight(value: object) -> float:
+    return _TASK_STATUS_WEIGHTS.get(_task_status_or_manual(value), 100.0)
+
+
 def _ensure_task_runtime_metadata(task: dict[str, Any]) -> None:
     started_at = str(task.get("started_at") or task.get("created_at") or _now_iso())
     task["started_at"] = started_at
@@ -2056,6 +2129,7 @@ def _append_task_progress_history(task: dict[str, Any], percent: Any) -> None:
 
 
 def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
+    status = _task_status_or_manual(status)
     started = _parse_iso_datetime(task.get("started_at") or task.get("created_at"))
     if started is None:
         return None
@@ -2072,6 +2146,7 @@ def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
 
 
 def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
+    status = _task_status_or_manual(status)
     if elapsed_seconds is None or status in FINAL_TASK_STATUSES:
         return None
     progress = _safe_float(task.get("progress"), 0.0)
@@ -2571,6 +2646,8 @@ def _recover_maintenance_delete_journal(
     if staged.is_symlink():
         return False
     phase = str(payload.get("phase") or "prepared")
+    if phase == "rollback_failed":
+        return False
     if staged.exists():
         if not staged.is_file():
             return False
@@ -2579,25 +2656,24 @@ def _recover_maintenance_delete_journal(
                 db_delete(task_id)
             except Exception:
                 return False
-            try:
-                _write_maintenance_journal(
-                    journal_path,
-                    {**payload, "phase": "db_deleted"},
-                )
-            except OSError:
-                pass
+        try:
+            _write_maintenance_journal(
+                journal_path,
+                {**payload, "phase": "db_deleted"},
+            )
+        except OSError:
+            return False
         try:
             staged.unlink()
         except OSError:
             return False
-        _remove_maintenance_journal(journal_path)
-        return True
+        return _remove_maintenance_journal(journal_path)
     if original.exists():
         _remove_maintenance_journal(journal_path)
         return False
     if phase == "db_deleted":
-        _remove_maintenance_journal(journal_path)
-        return True
+        return _remove_maintenance_journal(journal_path)
+
     return False
 
 
@@ -2689,6 +2765,8 @@ def _delete_asset_with_artifacts(
             status="cleanup_pending",
             database="unknown",
             artifact="staged",
+            recovery_required=True,
+            manual_required=True,
             error="previous delete is awaiting cleanup",
         )
         return result
@@ -2709,12 +2787,39 @@ def _delete_asset_with_artifacts(
             staged = True
             _write_maintenance_journal(journal_path, {**payload, "phase": "staged"})
         except OSError as exc:
+            rollback_error: OSError | None = None
             if staged and staged_path.exists() and not raw_path.exists():
                 try:
                     os.replace(staged_path, raw_path)
+                except OSError as restore_exc:
+                    rollback_error = restore_exc
+            if rollback_error is not None:
+                try:
+                    _write_maintenance_journal(
+                        journal_path,
+                        {**payload, "phase": "rollback_failed"},
+                    )
                 except OSError:
                     pass
-            _remove_maintenance_journal(journal_path)
+                result.update(
+                    status="cleanup_pending",
+                    artifact="staged",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(rollback_error))[:300],
+                )
+                return result
+            if not _remove_maintenance_journal(journal_path):
+                result.update(
+                    status="cleanup_pending",
+                    artifact="restored",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(exc))[:300],
+                )
+                return result
             result["artifact"] = "failed"
             result["error"] = redact_text(str(exc))[:300]
             return result
@@ -2725,11 +2830,33 @@ def _delete_asset_with_artifacts(
         if staged:
             try:
                 os.replace(staged_path, raw_path)
-                _remove_maintenance_journal(journal_path)
-                result["artifact"] = "restored"
+                if not _remove_maintenance_journal(journal_path):
+                    result.update(
+                        status="cleanup_pending",
+                        artifact="restored",
+                        recovery_required=True,
+                        manual_required=True,
+                        journal_pending=True,
+                        error=redact_text(str(exc))[:300],
+                    )
+                else:
+                    result["artifact"] = "restored"
             except OSError as restore_exc:
-                result["artifact"] = "staged"
-                result["error"] = redact_text(str(restore_exc))[:300]
+                try:
+                    _write_maintenance_journal(
+                        journal_path,
+                        {**payload, "phase": "rollback_failed"},
+                    )
+                except OSError:
+                    pass
+                result.update(
+                    status="cleanup_pending",
+                    artifact="staged",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(restore_exc))[:300],
+                )
         else:
             result["artifact"] = "absent"
             result["error"] = redact_text(str(exc))[:300]
@@ -2750,21 +2877,37 @@ def _delete_asset_with_artifacts(
                     "phase": "db_deleted",
                 },
             )
-        except OSError:
-            pass
+        except OSError as exc:
+            result.update(
+                status="cleanup_pending",
+                artifact="staged",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
+                error=redact_text(str(exc))[:300],
+            )
+            return result
         try:
             staged_path.unlink()
         except OSError as exc:
             result.update(
                 status="cleanup_pending",
                 artifact="staged",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
                 error=redact_text(str(exc))[:300],
             )
             return result
         result["artifact"] = "deleted"
         result["status"] = "deleted"
         if not _remove_maintenance_journal(journal_path):
-            result["journal_pending"] = True
+            result.update(
+                status="cleanup_pending",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
+            )
         return result
 
     result["artifact"] = "absent"
@@ -3362,8 +3505,6 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
     }
     if task.get("pid") is not None:
         payload["pid"] = task.get("pid")
-    if task.get("command") is not None:
-        payload["command"] = _json_safe(task.get("command"))
     if task.get("downloader") is not None:
         payload["downloader"] = _json_safe(task.get("downloader"))
     for key in (
@@ -3381,20 +3522,22 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in task and task.get(key) is not None:
             payload[key] = _json_safe(task.get(key))
-    return payload
+    return _strip_executable_command_fields(payload)
 
 
 def _persist_task_snapshot(task_id: str, task: dict[str, Any]) -> None:
     try:
         _ensure_task_runtime_metadata(task)
-        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        status = _task_status_or_manual(task.get("status"))
+        task["status"] = status
+        if status in FINAL_TASK_STATUSES and not task.get("finished_at"):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         progress_detail = dict(task.get("progress_detail") or {})
         progress_message = str(progress_detail.get("current") or "")
         upsert_background_task_record(
             task_id=task_id,
             task_type=str(task.get("kind") or "unknown"),
-            status=str(task.get("status") or "unknown"),
+            status=status,
             config_json=_task_config_payload(task),
             progress_message=progress_message,
             name=str(task.get("name") or ""),
@@ -3426,7 +3569,9 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     if task.get("kind") in (None, ""):
         task["kind"] = record.get("type", "data")
     if task.get("status") in (None, ""):
-        task["status"] = record.get("status", "unknown")
+        task["status"] = _task_status_or_manual(record.get("status"))
+    else:
+        task["status"] = _task_status_or_manual(task.get("status"))
 
     config_payload = dict(record.get("config_json") or {})
     task["category"] = _normalize_task_category(
@@ -3449,7 +3594,7 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     progress_detail.setdefault("total", max(total_items, 0))
     progress_detail.setdefault(
         "percent",
-        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(str(task.get("status")), 0.0))),
+        float(config_payload.get("progress_percent", _task_status_weight(task.get("status")))),
     )
     progress_detail.setdefault(
         "current",
@@ -3481,14 +3626,18 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
     task_id = str(record.get("id") or "").strip()
     config_payload = dict(record.get("config_json") or {})
     total_items = int(config_payload.get("total_items", 0) or 0)
-    status = str(record.get("status") or "unknown")
+    raw_status = str(record.get("status") or "").strip().lower()
+    status = _task_status_or_manual(raw_status)
+    status_error = None
+    if status == "manual_required" and raw_status != "manual_required":
+        status_error = "Unknown persisted task status; manual review required"
     progress_detail = dict(config_payload.get("progress_detail") or {})
     progress_detail.setdefault("completed", 0)
     progress_detail.setdefault("failed", 0)
     progress_detail.setdefault("total", max(total_items, 0))
     progress_detail.setdefault(
         "percent",
-        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(status, 0.0))),
+        float(config_payload.get("progress_percent", _task_status_weight(status))),
     )
     progress_detail.setdefault(
         "current",
@@ -3510,7 +3659,9 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "control_mode": str(config_payload.get("control_mode", "thread") or "thread"),
         "created_at": str(record.get("created_at") or _now_iso()),
         "updated_at": str(record.get("updated_at") or _now_iso()),
-        "started_at": str(config_payload.get("started_at") or record.get("created_at") or _now_iso()),
+        "started_at": str(
+            config_payload.get("started_at") or record.get("created_at") or _now_iso()
+        ),
         "finished_at": str(config_payload.get("finished_at") or ""),
         "category": _normalize_task_category(
             config_payload.get("category"),
@@ -3520,13 +3671,11 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "progress_history": _sanitize_progress_history(config_payload.get("progress_history")),
         "pause_event": threading.Event(),
         "stop_event": threading.Event(),
-        "error": redact_text(str(raw_error)) if raw_error is not None else None,
+        "error": redact_text(str(raw_error)) if raw_error is not None else status_error,
         "result": config_payload.get("result"),
     }
     if config_payload.get("pid") is not None:
         task["pid"] = config_payload.get("pid")
-    if config_payload.get("command") is not None:
-        task["command"] = config_payload.get("command")
     if config_payload.get("downloader") is not None:
         task["downloader"] = config_payload.get("downloader")
     if config_payload.get("task_spec") is not None:
@@ -3535,7 +3684,6 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         if config_payload.get(key) is not None:
             task[key] = config_payload[key]
     for key in (
-
         "symbols",
         "timeframes",
         "start",
@@ -3549,7 +3697,10 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "query_timeout_seconds",
     ):
         if key in config_payload and config_payload.get(key) is not None:
-            task[key] = config_payload.get(key)
+            task[key] = config_payload[key]
+    if status_error:
+        task["recovery_mode"] = "manual"
+        task["recovery_rejected"] = status_error
     _ensure_task_runtime_metadata(task)
     return task
 
@@ -3576,8 +3727,9 @@ def _apply_recovery_data_metadata(
     if task is None:
         logger.warning("Cannot apply recovery metadata for unknown task %s", task_id)
         return
+    with DATA_TASKS_LOCK:
+        task["command"] = [str(part) for part in command]
     payload_updates: dict[str, Any] = {}
-    payload_updates["command"] = list(command)
     if task_spec is not None:
         payload_updates["task_spec"] = _json_safe(task_spec)
     if downloader is not None:
@@ -3680,12 +3832,18 @@ def _clear_coalesced_cleanup_state(task_id: str) -> None:
 
 
 def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
-    return bool(dict(record.get("config_json") or {}).get("coalesced_cleanup_pending"))
+    config = dict(record.get("config_json") or {})
+    return bool(config.get("coalesced_cleanup_pending"))
 
 
 def _is_coalesced_cleanup_pending(record: dict[str, Any]) -> bool:
-    if _is_coalesced_cleanup_marker(record):
+    status = _task_status_or_manual(record.get("status"))
+    if status == "cleanup_exhausted":
+        return False
+    if status == "cleanup_pending" or _is_coalesced_cleanup_marker(record):
         return True
+    if status not in {"queued", "starting", "running", "paused"}:
+        return False
     task_id = str(record.get("id") or "").strip()
     state = _load_coalesced_cleanup_state().get(task_id, {})
     if state.get("exhausted"):
@@ -3695,10 +3853,11 @@ def _is_coalesced_cleanup_pending(record: dict[str, Any]) -> bool:
 
 def _is_coalesced_cleanup_exhausted(record: dict[str, Any]) -> bool:
     config = dict(record.get("config_json") or {})
-    if config.get("coalesced_cleanup_exhausted"):
+    status = _task_status_or_manual(record.get("status"))
+    if status == "cleanup_exhausted" or config.get("coalesced_cleanup_exhausted"):
         return True
-    if str(record.get("status") or "").lower() == "cleanup_exhausted":
-        return True
+    if status == "cleanup_pending":
+        return False
     task_id = str(record.get("id") or "").strip()
     state = _load_coalesced_cleanup_state().get(task_id, {})
     return bool(state.get("exhausted"))
@@ -3963,7 +4122,7 @@ def _hydrate_background_task_records(
                 task_id,
             )
             for task_id, task in DATA_TASKS.items()
-            if task.get("status") in FINAL_TASK_STATUSES
+            if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
         )
         max_terminal_tasks = int(getattr(legacy_viewer, "MAX_TERMINAL_TASKS", 1024))
         excess = len(terminal) - max_terminal_tasks
@@ -3997,7 +4156,10 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
     task = _LEGACY_UPDATE_TASK_FIELDS(task_id, **updates)
     if task is not None:
         _ensure_task_runtime_metadata(task)
-        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        if (
+            _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
+            and not task.get("finished_at")
+        ):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         if "progress" in updates:
             _append_task_progress_history(task, task.get("progress"))
@@ -4009,7 +4171,7 @@ def _set_task_status(task_id: str, status: str) -> dict[str, Any] | None:
     task = _LEGACY_SET_TASK_STATUS(task_id, status)
     if task is not None:
         _ensure_task_runtime_metadata(task)
-        if str(status).lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        if _task_status_or_manual(status) in FINAL_TASK_STATUSES and not task.get("finished_at"):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
@@ -4240,7 +4402,7 @@ def _serialize_task(
         include_log=include_log,
         max_log_bytes=max_log_bytes,
     )
-    status = str(payload.get("status") or task.get("status") or "").lower()
+    status = _task_status_or_manual(payload.get("status") or task.get("status"))
     elapsed_seconds = _task_elapsed_seconds(task, status)
     eta_seconds = _task_eta_seconds(task, status, elapsed_seconds)
     progress_payload = dict(payload.get("progress") or {})
@@ -4274,7 +4436,8 @@ def _serialize_task(
     payload["error_message"] = error_message
     payload["provider"] = task.get("provider")
     payload["model"] = task.get("model")
-    return payload
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 _LEGACY_HOOKS_INSTALLED = False
@@ -4316,9 +4479,17 @@ def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]
 
 def _stable_payload_signature(payload: Any) -> str:
     try:
-        return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+        safe_payload = redact_value(payload)
+        return json.dumps(safe_payload, sort_keys=True, default=str, separators=(",", ":"))
     except Exception:
-        return repr(payload)
+        return redact_text(repr(payload))
+
+
+def _redact_ws_message(message: Any) -> dict[str, Any]:
+    safe_message = redact_value(message)
+    if isinstance(safe_message, dict):
+        return safe_message
+    return {"type": "error", "error": "Live stream unavailable"}
 
 
 async def _queue_live_ws_message(
@@ -4328,7 +4499,7 @@ async def _queue_live_ws_message(
     if queue.full():
         with suppress(asyncio.QueueEmpty):
             queue.get_nowait()
-    await queue.put(message)
+    await queue.put(_redact_ws_message(message))
 
 
 def _live_ws_error_detail(exc: Exception) -> str:
@@ -4389,18 +4560,23 @@ async def _stream_live_payload(
         initial_payload = await fetch_payload()
     except Exception as exc:
         error_message = _live_ws_error_detail(exc)
-        await websocket.send_json({"type": "error", "topic": topic, "error": error_message})
+        await websocket.send_json(
+            _redact_ws_message({"type": "error", "topic": topic, "error": error_message})
+        )
+
         with suppress(Exception):
             await websocket.close(code=1008)
         return
 
     await websocket.send_json(
-        {
-            "type": "snapshot",
-            "topic": topic,
-            "data": initial_payload,
-            "ts": time.time(),
-        }
+        _redact_ws_message(
+            {
+                "type": "snapshot",
+                "topic": topic,
+                "data": initial_payload,
+                "ts": time.time(),
+            }
+        )
     )
 
     queue = await _LIVE_STREAM_BROKER.subscribe(
@@ -4421,7 +4597,7 @@ async def _stream_live_payload(
                     return
             except asyncio.TimeoutError:
                 outbound = {"type": "ping", "topic": topic, "ts": time.time()}
-            await websocket.send_json(outbound)
+            await websocket.send_json(_redact_ws_message(outbound))
     except WebSocketDisconnect:
         return
     except Exception:
@@ -9297,7 +9473,7 @@ def _run_backtest_process(
 
     Returns ``(proc, latest_message, output_path, backtest_id)``.
     """
-    command_display = " ".join(str(part) for part in cmd)
+    command_display = redact_text(" ".join(str(part) for part in cmd))
     _write_task_log_line(
         handle,
         task_id,
@@ -9664,7 +9840,10 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             cmd.extend(["--max-leverage", str(max_leverage)])
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
-        _update_task_fields(task_id, command=list(cmd))
+        with DATA_TASKS_LOCK:
+            task = DATA_TASKS.get(task_id)
+            if task is not None:
+                task["command"] = list(cmd)
         return cmd
 
     def _run() -> None:
@@ -12643,7 +12822,7 @@ async def list_data_tasks() -> dict[str, Any]:
         snapshots = [(task_id, dict(task)) for task_id, task in DATA_TASKS.items()]
     payload: list[dict[str, Any]] = []
     for task_id, task in snapshots:
-        status = str(task.get("status") or "").lower()
+        status = _task_status_or_manual(task.get("status"))
         include_log = status not in FINAL_TASK_STATUSES
         item = _serialize_task(task_id, task, include_log=include_log, max_log_bytes=64)
         item.pop("log", None)
@@ -12685,7 +12864,7 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["pause_event"].set()
@@ -12706,7 +12885,7 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["pause_event"].clear()
@@ -12727,7 +12906,7 @@ async def cancel_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be cancelled")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["stop_event"].set()
@@ -12746,7 +12925,7 @@ async def get_data_task_logs(task_id: str) -> dict[str, Any]:
     task_id, task, log_file = _task_for_log_access(task_id)
     return {
         "logs": _read_task_log(log_file, max_bytes=64 * 1024),
-        "status": task.get("status", "unknown"),
+        "status": _task_status_or_manual(task.get("status")),
     }
 
 
@@ -12757,7 +12936,7 @@ async def delete_data_task(task_id: str) -> dict[str, Any]:
         task = DATA_TASKS.get(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
-        if task.get("status") not in FINAL_TASK_STATUSES:
+        if _task_status_or_manual(task.get("status")) not in FINAL_TASK_STATUSES:
             raise HTTPException(
                 status_code=409,
                 detail="Only completed, failed, or cancelled tasks can be removed",

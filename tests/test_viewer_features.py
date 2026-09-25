@@ -1363,7 +1363,7 @@ def test_download_registry_coalesces_concurrent_identical_requests(viewer_client
 
     def register(index: int) -> None:
         barrier.wait()
-        record = {"id": f"task-{index}", "status": "starting"}
+        record = {"id": f"task-{index:03d}", "status": "starting"}
         existing = viewer_app_module.legacy_viewer._register_download_task(
             record, request_key
         )
@@ -5475,3 +5475,266 @@ def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
         assert output_path.stat().st_mode & 0o777 == 0o600
         assert output_path.parent.stat().st_mode & 0o777 == 0o700
     assert json.loads(output_path.read_text(encoding="utf-8"))["verified"] is True
+
+
+def test_core_task_id_boundaries_are_exact():
+    from viewer import core
+
+    assert core._normalized_task_id("a" * 7) == ""
+    assert core._normalized_task_id("a" * 8) == "a" * 8
+    assert core._normalized_task_id("a" * 64) == "a" * 64
+    assert core._normalized_task_id("a" * 65) == ""
+    core.DATA_TASKS["../escape"] = {"id": "../escape", "status": "running"}
+    assert core._update_task_fields("../escape", status="failed") is None
+    core.DATA_TASKS.pop("../escape", None)
+
+
+def test_singleflight_lease_boundary_and_owner_authorization(monkeypatch):
+    from viewer import core
+
+    task = {
+        "status": "running",
+        "download_request_key": "request",
+        "singleflight_lease_until": 100.0,
+    }
+    assert core._singleflight_lease_expired(task, 99.999) is False
+    assert core._singleflight_lease_expired(task, 100.0) is True
+
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 100.0)
+    monkeypatch.setattr(core, "SINGLEFLIGHT_HEARTBEAT_SECONDS", 10.0)
+    owner_token = "owner-token"
+    task.update(
+        {
+            "owner_pid": core.os.getpid(),
+            "owner_token": owner_token,
+            "singleflight_heartbeat_at": 100.0,
+            "singleflight_lease_until": 200.0,
+        }
+    )
+    assert core._touch_singleflight_lease(task, 105.0, owner_token=owner_token) is False
+    assert task["singleflight_lease_until"] == 200.0
+    assert core._touch_singleflight_lease(task, 105.0, owner_token="wrong-token") is False
+    assert task["singleflight_lease_until"] == 200.0
+    task["owner_pid"] = core.os.getpid() + 1
+    assert core._touch_singleflight_lease(task, 110.0, owner_token=owner_token) is False
+    assert task["singleflight_lease_until"] == 200.0
+    task["owner_pid"] = core.os.getpid()
+    assert core._touch_singleflight_lease(task, 110.0, owner_token=owner_token) is True
+    assert task["singleflight_lease_until"] == 210.0
+
+
+def test_task_status_evidence_mapping_is_exhaustive_and_fail_closed():
+    import viewer.main as viewer_app_module
+    from shared import database
+    from viewer import core
+
+    assert core.TASK_STATUS_VALUES == database.TASK_STATUS_VALUES
+    assert set(viewer_app_module._TASK_STATUS_WEIGHTS) == set(database.TASK_STATUS_VALUES)
+    assert set(database._TASK_STATUS_TO_EVIDENCE_STATUS) == set(database.TASK_STATUS_VALUES)
+    assert database._task_status_to_evidence_status("completed") == "success"
+    assert database._task_status_to_evidence_status("cleanup_pending") == "partial"
+    assert database._task_status_to_evidence_status("cleanup_exhausted") == "failed"
+    assert database.is_final_task_status("cleanup_pending") is True
+    assert database.is_final_task_status("mystery") is False
+    with pytest.raises(ValueError, match="unknown task status"):
+        database.normalize_task_status("mystery")
+
+
+def test_unknown_persisted_task_status_requires_manual_review():
+    import viewer.main as viewer_app_module
+
+    task = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-unknown",
+            "type": "data",
+            "status": "mystery",
+            "config_json": {},
+        }
+    )
+
+    assert task["status"] == "manual_required"
+    assert task["recovery_mode"] == "manual"
+    assert "Unknown persisted task status" in task["recovery_rejected"]
+
+
+def test_task_snapshot_does_not_persist_executable_command_fields(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    viewer_app_module._persist_task_snapshot(
+        "task-command",
+        {
+            "id": "task-command",
+            "kind": "data",
+            "status": "running",
+            "command": ["/bin/sh", "-c", "echo secret"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "download",
+                "parameters": {"commandLine": "echo secret"},
+            },
+            "restart_config": {"executable": "/bin/sh"},
+        },
+    )
+
+    config = persisted[-1]["config_json"]
+    assert "command" not in config
+    assert "commandLine" not in config["task_spec"]["parameters"]
+    assert "executable" not in config["restart_config"]
+
+
+def test_database_task_config_strips_nested_executable_fields():
+    from shared.database import _strip_executable_command_fields
+
+    sanitized = _strip_executable_command_fields(
+        {
+            "commandLine": "echo secret",
+            "nested": {"argv": ["echo", "secret"], "safe": "value"},
+            "items": [{"executable": "/bin/sh"}],
+        }
+    )
+
+    assert sanitized == {"nested": {"safe": "value"}, "items": [{}]}
+
+
+def test_recovery_spec_round_trip_uses_typed_data_fields():
+    import viewer.main as viewer_app_module
+
+    request = viewer_app_module._PreparedDownloadRequest(
+        source="yfinance",
+        symbols="AAPL",
+        timeframes="1d,5m",
+        start="2026-01-01",
+        end="2026-01-02",
+        offer_side="bid",
+        merge_tick=True,
+        merge_s1=False,
+        batch_size=10,
+        pause_ms=1000,
+        query_timeout_seconds=900,
+        symbol_list=["AAPL"],
+        timeframe_list=["1d", "5m"],
+    )
+    spec = viewer_app_module._download_task_spec(request)
+    parsed = viewer_app_module._parse_recovery_spec({"task_spec": spec}, "data")
+    assert parsed is not None
+    recovered = viewer_app_module._download_request_from_recovery_spec(parsed)
+    assert recovered.symbol_list == request.symbol_list
+    assert recovered.timeframe_list == request.timeframe_list
+    assert recovered.merge_tick is True
+    assert "command" not in spec
+
+    backtest_spec = {
+        "version": 1,
+        "kind": "backtest",
+        "operation": "run",
+        "parameters": {
+            "strategy": "demo",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000.0,
+        },
+    }
+    parsed_backtest = viewer_app_module._parse_recovery_spec(
+        {"task_spec": backtest_spec},
+        "backtest",
+    )
+    assert parsed_backtest is not None
+    backtest_request = viewer_app_module._backtest_request_from_recovery_spec(parsed_backtest)
+    assert backtest_request.strategy == "demo"
+    assert backtest_request.symbols == ["AAPL"]
+    assert backtest_request.timeframe == "1d"
+
+
+def test_recovery_parser_rejects_nested_executable_fields():
+    import viewer.main as viewer_app_module
+
+    raw_config = {
+        "task_spec": {
+            "version": 1,
+            "kind": "data",
+            "operation": "download",
+            "source": "yfinance",
+            "symbols": ["AAPL"],
+            "timeframes": ["1d"],
+            "parameters": {"commandLine": ["/bin/sh", "-c", "echo secret"]},
+        }
+    }
+
+    assert viewer_app_module._parse_recovery_spec(raw_config, "data") is None
+
+
+def test_failed_backtest_recovery_persists_final_manual_record(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    persisted: list[dict] = []
+    record = {
+        "id": "task-backtest-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {
+            "task_spec": {
+                "version": 1,
+                "kind": "backtest",
+                "operation": "run",
+                "parameters": {
+                    "strategy": "demo",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1d",
+                },
+            }
+        },
+    }
+    def fail_recovery(*_args):
+        raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(viewer_app_module, "_run_backtest_sync", fail_recovery)
+    monkeypatch.setattr(viewer_app_module, "_persist_task_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    viewer_app_module.DATA_TASKS.pop(record["id"], None)
+
+    viewer_app_module._resume_interrupted_backtest_task(
+        record,
+        record["id"],
+        record["config_json"],
+    )
+
+    assert persisted[-1]["status"] == "manual_required"
+    assert persisted[-1]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in persisted[-1]["config_json"]
+
+
+def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
+    import viewer.main as viewer_app_module
+
+    class _Unknown:
+        def __str__(self):
+            return "opaque-secret"
+
+    safe = viewer_app_module._redact_ws_message(
+        {
+            "type": "snapshot",
+            "data": {
+                "apiKey": "key-secret",
+                "opaque": "opaque-secret",
+                "unknown": _Unknown(),
+                "safe": "visible",
+            },
+        }
+    )
+
+    assert safe["data"]["apiKey"] == "[Filtered]"
+    assert safe["data"]["opaque"] == "[Filtered]"
+    assert safe["data"]["unknown"] == "[Unserializable]"
+    assert safe["data"]["safe"] == "visible"

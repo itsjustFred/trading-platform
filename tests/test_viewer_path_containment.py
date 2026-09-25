@@ -650,3 +650,63 @@ def test_task_routes_reject_invalid_task_ids(viewer_client):
     with pytest.raises(HTTPException) as exc_info:
         viewer_app_module._validated_task_id("../escape")
     assert exc_info.value.status_code == 400
+
+
+def test_viewer_ohlcv_loader_rejects_row_budget_before_materialization(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(core, "_OHLCV_MAX_ROWS", 3)
+    core._OHLCV_DF_CACHE.clear()
+    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+    def fail_materialization(*_args):
+        raise AssertionError("rows were materialized")
+
+    monkeypatch.setattr(core, "_read_parquet_frame_bounded", fail_materialization)
+
+    assert core._load_ohlcv_df("EURUSD", "1h") is None
+
+
+def test_failed_maintenance_rollback_retains_journal_and_requires_manual_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    import viewer.main as viewer_app_module
+
+    artifact = tmp_path / "asset-1.json"
+    artifact.write_text("payload", encoding="utf-8")
+    journal = viewer_app_module._maintenance_journal_path(artifact)
+    staged = viewer_app_module._maintenance_staged_path(artifact)
+    real_replace = viewer_app_module.os.replace
+
+    def fail_restore(source, destination):
+        if Path(source) == staged and Path(destination) == artifact:
+            raise OSError("restore failed")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(viewer_app_module.os, "replace", fail_restore)
+
+    def fail_database_delete(_asset_id):
+        raise OSError("database delete failed")
+
+    result = viewer_app_module._delete_asset_with_artifacts(
+        "asset-1",
+        kind="portfolio",
+        artifact_path=artifact,
+        db_delete=fail_database_delete,
+    )
+
+    assert result["status"] == "cleanup_pending"
+    assert result["manual_required"] is True
+    assert result["recovery_required"] is True
+    assert journal.exists()
+    assert staged.exists()
+    assert not artifact.exists()
+    assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == "rollback_failed"
+    assert not viewer_app_module._recover_maintenance_delete_journal(
+        journal,
+        kind="portfolio",
+        expected_path=artifact,
+        db_delete=lambda _asset_id: True,
+    )
+    assert journal.exists()

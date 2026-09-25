@@ -66,3 +66,36 @@ def test_redact_value_handles_nested_sensitive_data_and_exception_text():
     assert redacted["value"]["Authorization"] == "[Filtered]"
     assert redacted["value"]["items"][0]["api_key"] == "[Filtered]"
     assert "exception-secret" not in redacted["error"]
+
+
+def test_redact_value_fails_closed_for_unknown_objects_and_opaque_secret_values():
+    from shared.logging import redact_text, redact_value
+
+    class _Unknown:
+        def __str__(self):
+            return "opaque-secret"
+
+    class _Unserializable:
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    redacted = redact_value(
+        {
+            "opaque": "opaque-secret",
+            "unknown": _Unknown(),
+            "broken": _Unserializable(),
+        }
+    )
+
+    assert redacted["opaque"] == "[Filtered]"
+    assert redacted["unknown"] == "[Unserializable]"
+    assert redacted["broken"] == "[Unserializable]"
+    assert redact_text(_Unserializable()) == "[Unserializable]"
+
+
+def test_redact_value_handles_camel_case_sensitive_keys():
+    from shared.logging import redact_value
+
+    redacted = redact_value({"apiKey": "key-secret", "refreshToken": "token-secret"})
+
+    assert redacted == {"apiKey": "[Filtered]", "refreshToken": "[Filtered]"}

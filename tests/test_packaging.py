@@ -94,19 +94,17 @@ def test_wheel_smoke_imports_account_discovery_and_propagates_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wheel_path = tmp_path / "trading_platform-0.1.0-py3-none-any.whl"
-    entries = (
-        *wheel_smoke.PACKAGE_ENTRIES,
-        *wheel_smoke.RESOURCE_ENTRIES,
-        "live_runner/account_discovery.py",
-    )
+    entries = (*wheel_smoke.PACKAGE_ENTRIES, *wheel_smoke.RESOURCE_ENTRIES)
     with zipfile.ZipFile(wheel_path, "w") as archive:
         for entry in entries:
             archive.writestr(entry, b"")
+    observed_command: list[str] = []
     observed_code = ""
 
     def checked_run(command: list[str], *, check: bool, **_kwargs):
-        nonlocal observed_code
-        observed_code = command[-1]
+        nonlocal observed_command, observed_code
+        observed_command = command
+        observed_code = command[-2]
         if not check:
             return subprocess.CompletedProcess(command, returncode=1)
         raise subprocess.CalledProcessError(1, command)
@@ -116,7 +114,10 @@ def test_wheel_smoke_imports_account_discovery_and_propagates_failure(
     with pytest.raises(subprocess.CalledProcessError):
         wheel_smoke.smoke(wheel_path)
 
+    assert "-E" in observed_command
+    assert wheel_smoke.APPLICATION_ENTRYPOINT in observed_code
     assert "'live_runner.account_discovery'" in observed_code
+    assert repr(wheel_smoke.DEEP_IMPORTS) in observed_code
 
 
 def test_wheel_smoke_propagates_missing_account_discovery_import(tmp_path: Path) -> None:

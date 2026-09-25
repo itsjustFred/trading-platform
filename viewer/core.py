@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -25,13 +26,17 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
 from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
-from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
+from runner.optimizer import OptimizationConfig
+from runner.optimizer import run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
+from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 from shared.logging import get_logger, redact_text, redact_value
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
@@ -40,15 +45,14 @@ from shared.strategy_registry import (
     iter_strategy_files,
     load_strategy_meta,
     matches_strategy_identifier,
+    read_strategy_documentation,
     strategy_documentation_path,
     strategy_relative_file,
     strategy_slug_for_path,
-    read_strategy_documentation,
     update_strategy_display_name,
 )
 from viewer.comparison import compare_backtests, compute_drawdown_pct
 
-from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 logger = get_logger("viewer")
 
 
@@ -557,6 +561,55 @@ def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
     return [item[2] for item in candidates if item[1] == selected_source]
 
 
+def _parquet_row_count(path: Path) -> int:
+    metadata = pq.ParquetFile(path).metadata
+    if metadata is None:
+        raise ValueError("Parquet metadata is unavailable")
+    rows = int(metadata.num_rows)
+    if rows < 0:
+        raise ValueError("Parquet row count is invalid")
+    return rows
+
+
+def _read_parquet_frame_bounded(path: Path, max_rows: int) -> pd.DataFrame | None:
+    row_limit = max(0, int(max_rows))
+    parquet_file = pq.ParquetFile(path)
+    try:
+        columns = None
+        if set(_OHLCV_COLUMNS).issubset(set(parquet_file.schema.names)):
+            columns = list(_OHLCV_COLUMNS)
+        batches = iter(
+            parquet_file.iter_batches(
+                columns=columns,
+                batch_size=min(65_536, max(1, row_limit)),
+            )
+        )
+        frames: list[pd.DataFrame] = []
+        rows = 0
+        while True:
+            if rows >= row_limit:
+                extra = next(batches, None)
+                if extra is not None and extra.num_rows:
+                    return None
+                break
+            batch = next(batches, None)
+            if batch is None:
+                break
+            if rows + int(batch.num_rows) > row_limit:
+                return None
+            frame = batch.to_pandas()
+            rows += int(batch.num_rows)
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame()
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, ignore_index=True, sort=False)
+    finally:
+        parquet_file.close()
+
+
 def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
@@ -578,17 +631,32 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
 
     signature_parts: list[tuple[str, int, int]] = []
     total_bytes = 0
+    total_rows = 0
     for path in matches:
         try:
             stat = path.stat()
-        except OSError:
-            continue
+            row_count = _parquet_row_count(path)
+        except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
+            with _OHLCV_DF_CACHE_LOCK:
+                _OHLCV_DF_CACHE.pop(cache_key, None)
+            logger.warning("Could not inspect OHLCV metadata from %s: %s", _log_safe(path), exc)
+            return None
         total_bytes += int(stat.st_size)
+        total_rows += row_count
         if total_bytes > _OHLCV_MAX_BYTES:
             with _OHLCV_DF_CACHE_LOCK:
                 _OHLCV_DF_CACHE.pop(cache_key, None)
             logger.warning(
                 "OHLCV byte budget exceeded for %s %s",
+                normalized_symbol,
+                normalized_timeframe,
+            )
+            return None
+        if total_rows > _OHLCV_MAX_ROWS:
+            with _OHLCV_DF_CACHE_LOCK:
+                _OHLCV_DF_CACHE.pop(cache_key, None)
+            logger.warning(
+                "OHLCV row budget exceeded for %s %s",
                 normalized_symbol,
                 normalized_timeframe,
             )
@@ -603,26 +671,26 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
                 return cached_df.copy(deep=False)
 
     frames: list[pd.DataFrame] = []
-    total_rows = 0
+    materialized_rows = 0
     for path in matches:
         try:
-            try:
-                frame = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
-            except (ValueError, KeyError):
-                frame = pd.read_parquet(path)
-        except (ValueError, KeyError, OSError) as exc:
+            frame = _read_parquet_frame_bounded(
+                path,
+                _OHLCV_MAX_ROWS - materialized_rows,
+            )
+        except (ValueError, KeyError, OSError, pa.ArrowException) as exc:
             logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
-        total_rows += len(frame)
-        if total_rows > _OHLCV_MAX_ROWS:
+        if frame is None:
             with _OHLCV_DF_CACHE_LOCK:
                 _OHLCV_DF_CACHE.pop(cache_key, None)
             logger.warning(
-                "OHLCV row budget exceeded for %s %s",
+                "OHLCV row budget exceeded while streaming %s %s",
                 normalized_symbol,
                 normalized_timeframe,
             )
             return None
+        materialized_rows += len(frame)
         frame.columns = [str(column).lower() for column in frame.columns]
         if "timestamp" in frame.columns:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
@@ -1990,22 +2058,54 @@ def _refresh_catalog() -> None:
 
 DATA_TASKS: dict[str, dict[str, Any]] = {}
 DATA_TASKS_LOCK = threading.Lock()
-ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
-FINAL_TASK_STATUSES = {
-    "completed",
-    "failed",
-    "cancelled",
-    "manual_required",
-    "cleanup_pending",
-    "cleanup_exhausted",
-}
+TASK_STATUS_VALUES = frozenset(
+    {
+        "queued",
+        "starting",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+ACTIVE_TASK_STATUSES = frozenset({"queued", "starting", "running", "paused"})
+FINAL_TASK_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+
+
+def _normalized_task_status(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in TASK_STATUS_VALUES else "unknown"
+
+
+def _task_status_or_manual(value: object) -> str:
+    normalized = _normalized_task_status(value)
+    return "manual_required" if normalized == "unknown" else normalized
 
 
 def _prune_terminal_tasks_locked() -> None:
     terminal = [
         (str(task.get("updated_at") or ""), task_id)
         for task_id, task in DATA_TASKS.items()
-        if task.get("status") in FINAL_TASK_STATUSES
+        if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
     ]
     terminal.sort()
     excess = len(terminal) - MAX_TERMINAL_TASKS
@@ -2045,36 +2145,94 @@ def _download_request_key(identity: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+_SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
+
+
+def _new_singleflight_owner_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _current_singleflight_owner_token() -> str | None:
+    token = getattr(_SINGLEFLIGHT_OWNER_CONTEXT, "token", None)
+    return str(token) if token else None
+
+
+def _set_singleflight_owner_token(token: str | None) -> None:
+    _SINGLEFLIGHT_OWNER_CONTEXT.token = token
+
+
+def _singleflight_owner_matches(
+    task: dict[str, Any], owner_token: str | None = None
+) -> bool:
+    expected_token = (
+        owner_token if owner_token is not None else _current_singleflight_owner_token()
+    )
+    if not expected_token:
+        return False
+    try:
+        owner_pid = int(task.get("owner_pid"))
+    except (TypeError, ValueError):
+        return False
+    return owner_pid == os.getpid() and str(task.get("owner_token") or "") == expected_token
+
+
 def _singleflight_lease_expired(task: dict[str, Any], now: float) -> bool:
-    if task.get("status") not in ACTIVE_TASK_STATUSES:
+    if _normalized_task_status(task.get("status")) not in ACTIVE_TASK_STATUSES:
         return False
     lease_until = task.get("singleflight_lease_until")
     if lease_until is None:
         return True
     try:
-        return now >= float(lease_until)
+        lease_until_value = float(lease_until)
+        if not math.isfinite(lease_until_value) or not math.isfinite(float(now)):
+            return True
+        return now >= lease_until_value
     except (TypeError, ValueError):
         return True
 
 
-def _touch_singleflight_lease(task: dict[str, Any], now: float | None = None) -> None:
+def _touch_singleflight_lease(
+    task: dict[str, Any],
+    now: float | None = None,
+    owner_token: str | None = None,
+) -> bool:
+    if task.get("download_request_key") and not _singleflight_owner_matches(task, owner_token):
+        return False
     current = time.monotonic() if now is None else now
+    last_heartbeat = task.get("singleflight_heartbeat_at")
+    if last_heartbeat is not None:
+        try:
+            heartbeat_interval = min(
+                float(SINGLEFLIGHT_HEARTBEAT_SECONDS), float(SINGLEFLIGHT_LEASE_SECONDS)
+            )
+            if current < float(last_heartbeat) + max(0.0, heartbeat_interval):
+                return False
+        except (TypeError, ValueError):
+            pass
     task["singleflight_heartbeat_at"] = current
     task["singleflight_lease_until"] = current + SINGLEFLIGHT_LEASE_SECONDS
+    return True
 
 
 def _register_download_task(
-    record: dict[str, Any], request_key: str | None
+    record: dict[str, Any],
+    request_key: str | None,
+    owner_token: str | None = None,
 ) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(record.get("id"))
+    if not normalized_task_id:
+        raise ValueError("Invalid task id")
+    record["id"] = normalized_task_id
     now = time.monotonic()
+    reservation_token = owner_token or record.get("owner_token") or _new_singleflight_owner_token()
     with DATA_TASKS_LOCK:
         if request_key:
             for task in DATA_TASKS.values():
                 if task.get("download_request_key") != request_key:
                     continue
-                if task.get("status") in ACTIVE_TASK_STATUSES:
+                if _normalized_task_status(task.get("status")) in ACTIVE_TASK_STATUSES:
                     if not _singleflight_lease_expired(task, now):
-                        _touch_singleflight_lease(task, now)
+                        _touch_singleflight_lease(task, now, owner_token=reservation_token)
                         return dict(task)
                     task["status"] = "failed"
                     task["error"] = "singleflight reservation lease expired"
@@ -2083,9 +2241,10 @@ def _register_download_task(
                 else:
                     task.pop("download_request_key", None)
             record["download_request_key"] = request_key
-        record.setdefault("owner_pid", os.getpid())
-        record.setdefault("owner_thread_id", threading.get_ident())
-        _touch_singleflight_lease(record, now)
+        record["owner_pid"] = os.getpid()
+        record["owner_thread_id"] = threading.get_ident()
+        record["owner_token"] = str(reservation_token)
+        _touch_singleflight_lease(record, now, owner_token=reservation_token)
         DATA_TASKS[record["id"]] = record
         _prune_terminal_tasks_locked()
         return None
@@ -2098,14 +2257,24 @@ def _start_singleflight_download(
     *args: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        raise ValueError("Invalid task id")
+    task_id = normalized_task_id
+    owner_token = _new_singleflight_owner_token()
     reservation = {
         "id": task_id,
         "status": "starting",
         "download_request_key": request_key,
         "owner_pid": os.getpid(),
         "owner_thread_id": threading.get_ident(),
+        "owner_token": owner_token,
     }
-    existing = _register_download_task(reservation, request_key)
+    existing = _register_download_task(
+        reservation,
+        request_key,
+        owner_token=owner_token,
+    )
     if existing is not None:
         return {
             "task_id": existing["id"],
@@ -2113,6 +2282,8 @@ def _start_singleflight_download(
             "coalesced": True,
         }
 
+    previous_token = _current_singleflight_owner_token()
+    _set_singleflight_owner_token(owner_token)
     try:
         return starter(task_id, *args, **kwargs)
     except Exception as exc:
@@ -2121,6 +2292,8 @@ def _start_singleflight_download(
         if current is not None:
             _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         raise
+    finally:
+        _set_singleflight_owner_token(previous_token)
 
 
 def _task_now_iso() -> str:
@@ -2296,6 +2469,7 @@ def _create_task_record(
                 "download_request_key",
                 "owner_pid",
                 "owner_thread_id",
+                "owner_token",
                 "singleflight_heartbeat_at",
                 "singleflight_lease_until",
             ):
@@ -2325,12 +2499,18 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return None
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
             return None
         task.update(updates)
-        if task.get("status") in FINAL_TASK_STATUSES:
+        status = _task_status_or_manual(task.get("status"))
+        task["status"] = status
+        if status in FINAL_TASK_STATUSES:
             task.pop("download_request_key", None)
         elif task.get("download_request_key"):
             _touch_singleflight_lease(task)
@@ -2349,6 +2529,10 @@ def _update_task_progress(
     current: str | None = None,
     total: int | None = None,
 ) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return None
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
@@ -2377,6 +2561,10 @@ def _update_task_progress(
 
 
 def _ingest_task_log_line(task_id: str, text: str) -> None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
@@ -2427,7 +2615,7 @@ def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[
         if done > 0:
             percent = min(100.0, done / detail["total"] * 100.0)
 
-    if task.get("status") == "completed":
+    if _normalized_task_status(task.get("status")) == "completed":
         percent = 100.0
 
     detail["percent"] = round(percent, 2)
@@ -2435,7 +2623,7 @@ def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[
 
 
 def _task_controls_payload(task: dict[str, Any]) -> dict[str, bool]:
-    status = task.get("status", "unknown")
+    status = _task_status_or_manual(task.get("status"))
     supports_control = bool(task.get("supports_control", False))
     return {
         "can_pause": supports_control and status in {"starting", "running"},
@@ -2462,14 +2650,15 @@ def _serialize_task(
         "description": task.get("description"),
         "kind": task.get("kind", "data"),
         "source": task.get("source"),
-        "status": task.get("status", "unknown"),
+        "status": _task_status_or_manual(task.get("status")),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
         "progress": _task_progress_payload(task, log_content),
         "log": log_content,
     }
     payload.update(_task_controls_payload(task))
-    return payload
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _mark_task_finished(
@@ -2585,10 +2774,16 @@ def _start_data_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
     def run_proc() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        command_display = " ".join(str(part) for part in cmd)
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
 
@@ -2667,6 +2862,7 @@ def _start_data_task(
             )
         finally:
             _update_task_fields(task_id, process=None)
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_proc, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -2709,8 +2905,12 @@ def _start_dukascopy_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
-    def run_download() -> None:
-        command_display = " ".join(str(part) for part in cmd)
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
+    def _run_download() -> None:
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         downloader = DukascopyNativeDownloader()
@@ -2897,6 +3097,14 @@ def _start_dukascopy_task(
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
+
+    def run_download() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
+        try:
+            _run_download()
+        finally:
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_download, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -3109,8 +3317,12 @@ def _start_jforex_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
-    def run_download() -> None:
-        command_display = " ".join(str(part) for part in cmd)
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
+    def _run_download() -> None:
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         jforex_downloader = JForexDownloader()
@@ -3307,6 +3519,14 @@ def _start_jforex_task(
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
+
+    def run_download() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
+        try:
+            _run_download()
+        finally:
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_download, daemon=True)
     _update_task_fields(task_id, thread=thread)

@@ -9,17 +9,45 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+APPLICATION_ENTRYPOINT = "viewer.main:app"
+DEEP_IMPORTS = (
+    "data_tools",
+    "live_runner",
+    "risk",
+    "runner",
+    "scheduler",
+    "shared",
+    "signal_bots",
+    "strategies",
+    "validation",
+    "viewer",
+    "live_runner.account_discovery",
+    "viewer.core",
+    "runner.cli",
+    "validation.cli",
+    "data_tools.catalog_builder",
+    "live_runner.daemon",
+    "shared.logging",
+)
 PACKAGE_ENTRIES = (
     "data_tools/__init__.py",
+    "data_tools/catalog_builder.py",
     "live_runner/__init__.py",
+    "live_runner/account_discovery.py",
+    "live_runner/daemon.py",
     "risk/__init__.py",
     "runner/__init__.py",
+    "runner/cli.py",
     "scheduler/__init__.py",
     "shared/__init__.py",
+    "shared/logging.py",
     "signal_bots/__init__.py",
     "strategies/__init__.py",
     "validation/__init__.py",
+    "validation/cli.py",
     "viewer/__init__.py",
+    "viewer/main.py",
+    "viewer/core.py",
 )
 RESOURCE_ENTRIES = (
     "data_tools/config/downloader_profiles.json",
@@ -58,14 +86,21 @@ def smoke(wheel: Path) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive.extractall(temp_dir)
             env = os.environ.copy()
-            env["PYTHONPATH"] = os.pathsep.join(
-                filter(None, (temp_dir, env.get("PYTHONPATH", "")))
-            )
+            env.pop("PYTHONPATH", None)
+            env["PYTHONNOUSERSITE"] = "1"
             code = (
                 "import importlib, importlib.resources, sys\n"
-                "for name in ('data_tools', 'live_runner', 'risk', 'runner', "
-                "'scheduler', 'shared', 'signal_bots', 'strategies', "
-                "'validation', 'viewer', 'live_runner.account_discovery'):\n"
+                "sys.path.insert(0, sys.argv.pop(1))\n"
+                "from fastapi import FastAPI\n"
+                f"entrypoint_spec = {APPLICATION_ENTRYPOINT!r}\n"
+                "entrypoint_module, entrypoint_attribute = entrypoint_spec.split(':', 1)\n"
+                "entrypoint = getattr(\n"
+                "    importlib.import_module(entrypoint_module), entrypoint_attribute\n"
+                ")\n"
+
+                "assert isinstance(entrypoint, FastAPI)\n"
+                "assert entrypoint.routes\n"
+                f"for name in {DEEP_IMPORTS!r}:\n"
                 "    importlib.import_module(name)\n"
                 "assert 'ctrader_open_api' not in sys.modules\n"
                 "assert importlib.resources.files('data_tools').joinpath("
@@ -75,7 +110,12 @@ def smoke(wheel: Path) -> None:
                 "assert importlib.resources.files('viewer').joinpath("
                 "'static/index.html').is_file()\n"
             )
-            subprocess.run([sys.executable, "-c", code], cwd=temp_dir, env=env, check=True)
+            subprocess.run(
+                [sys.executable, "-E", "-c", code, temp_dir],
+                cwd=temp_dir,
+                env=env,
+                check=True,
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
