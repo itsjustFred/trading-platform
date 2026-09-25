@@ -77,25 +77,6 @@ function normalizeEquityPoints(
   return deduped;
 }
 
-/** Falls back to the per-trade average PnL when the API does not provide one. */
-function averageTradePnl(trades: Trade[], totalPnl: number): number {
-  if (trades.length === 0) {
-    return 0;
-  }
-  return totalPnl / trades.length;
-}
-
-/** Best or worst per-trade PnL, depending on the chosen extremum. */
-function extremeTradePnl(
-  trades: Trade[],
-  extremum: (...values: number[]) => number,
-): number {
-  if (trades.length === 0) {
-    return 0;
-  }
-  return extremum(...trades.map((trade) => trade.pnl || 0));
-}
-
 interface CapmSectionProps {
   loading: boolean;
   error: string;

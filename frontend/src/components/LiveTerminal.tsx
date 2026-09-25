@@ -12,6 +12,15 @@ interface LiveTerminalProps {
 /** Log text parsed out of the task feed: `[task:<id>] status=<word>`. */
 const TASK_STATUS_LINE = /\[task:[^\]]+\]\s+status=(\w+)/i;
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATUS_TONES: Record<string, string> = {
+  completed: "#86efac",
+  failed: "#f87171",
+  cancelled: "#fbbf24",
+  connected: "#67e8f9",
+  connecting: "#fbbf24",
+  disconnected: "#f87171",
+  idle: "#94a3b8",
+};
 
 function deriveFeedStatus(
   wsStatus: WebSocketStatus,
