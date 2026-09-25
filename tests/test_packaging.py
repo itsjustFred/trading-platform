@@ -87,8 +87,6 @@ assert 'ctrader_open_api' not in sys.modules
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
 def test_wheel_smoke_imports_account_discovery_and_propagates_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -118,6 +116,16 @@ def test_wheel_smoke_imports_account_discovery_and_propagates_failure(
 
     assert "'live_runner.account_discovery'" in observed_code
 
+
+def test_wheel_smoke_propagates_missing_account_discovery_import(tmp_path: Path) -> None:
+    wheel_path = tmp_path / "trading_platform-0.1.0-py3-none-any.whl"
+    entries = (*wheel_smoke.PACKAGE_ENTRIES, *wheel_smoke.RESOURCE_ENTRIES)
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        for entry in entries:
+            archive.writestr(entry, b"")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        wheel_smoke.smoke(wheel_path)
 
 def test_verify_script_import_has_no_broker_side_effects() -> None:
     code = """
