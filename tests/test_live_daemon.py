@@ -1567,3 +1567,43 @@ def test_auth_scheme_is_keyed_like_the_token_for_a_deployment_without_an_id():
     assert scheme == "account", (
         "the per-bot auth scheme must win over the global default, as it does for the token"
     )
+
+
+def test_account_ids_needing_stopped_enforcement_covers_stopped_only_accounts():
+    """A STOPPED-only account must be queued for an adapter.
+
+    The adapter is what performs cancel/flatten, so without this the stop was
+    logged and retried forever and never actually enforced.
+    """
+    stopped = _stopped_deployment()
+    assert daemon._account_ids_needing_stopped_enforcement([stopped], set()) == {
+        stopped.account_id
+    }
+
+
+def test_already_enforced_stopped_accounts_do_not_keep_an_adapter_alive():
+    """Once flattened, the account is released so the adapter is not kept open."""
+    stopped = _stopped_deployment()
+    assert (
+        daemon._account_ids_needing_stopped_enforcement(
+            [stopped], {str(stopped.id)}
+        )
+        == set()
+    )
+
+
+def test_active_deployments_are_never_included_in_enforcement_accounts():
+    """Only STOPPED deployments need enforcement; an ACTIVE one must not be
+    connected on this basis, or it could be flattened by mistake."""
+    from shared.models import LiveDeploymentConfig as _Config
+
+    active = _Config(
+        id="88888888-8888-4888-8888-888888888888",
+        strategy_name="stockkit",
+        account_id="acc-active",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+    )
+    assert daemon._account_ids_needing_stopped_enforcement([active], set()) == set()

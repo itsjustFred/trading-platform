@@ -2481,6 +2481,29 @@ def _log_deployment_status_observations(
         )
 
 
+def _account_ids_needing_stopped_enforcement(
+    deployments: list[LiveDeploymentConfig],
+    already_enforced: set[str],
+) -> set[str]:
+    """Accounts holding a STOPPED deployment whose flatten still has to happen.
+
+    These accounts need a connected adapter, because the adapter is what
+    performs the cancel/flatten. Connecting only runnable accounts meant an
+    account whose deployments were all STOPPED never got one, so the stop was
+    logged and retried forever and never actually enforced.
+
+    Deliberately returns account ids only; whether they may *trade* is decided
+    separately from the runnable set, so connecting for enforcement never grants
+    trading permission.
+    """
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "STOPPED"
+        and str(deployment.id) not in already_enforced
+    }
+
+
 async def _enforce_stopped_deployments(
     deployments: list[LiveDeploymentConfig],
     active_adapters: dict[str, BaseLiveAdapter],
@@ -2885,15 +2908,6 @@ async def sync_deployments_loop(
             _cleanup_finished_discord_tasks(active_discord_tasks)
             _log_deployment_status_observations(deployments, known_deployment_statuses)
 
-            # STOPPED means "cancel resting orders and flatten", enforced here
-            # rather than only in the status endpoint so it also holds when the
-            # status was changed by another operator or by a restart.
-            await _enforce_stopped_deployments(
-                deployments,
-                active_adapters,
-                already_enforced=enforced_stopped_deployments,
-            )
-
             active_account_ids = _deployment_active_account_ids(deployments)
             await _disconnect_blocked_adapters(
                 active_adapters, active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
@@ -2909,12 +2923,25 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
+            # A STOPPED deployment can only be flattened by an adapter, and the
+            # adapter is what performs the cancel/flatten. Connecting only
+            # runnable accounts meant an account whose deployments were all
+            # STOPPED never got one, so the stop was logged and retried forever
+            # and never actually enforced. Connect those accounts too, so the
+            # flatten can happen; they are deliberately excluded from the task
+            # set below, so they are never allowed to trade.
+            enforcement_account_ids = _account_ids_needing_stopped_enforcement(
+                deployments,
+                enforced_stopped_deployments,
+            ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            retained_account_ids = set(active_account_ids) | enforcement_account_ids
+
+            await _disconnect_inactive_adapters(active_adapters, retained_account_ids)
 
             active_discord_account_ids = _discord_active_account_ids(deployments)
 
             await _connect_active_accounts(
-                runnable_account_ids,
+                runnable_account_ids | enforcement_account_ids,
                 account_lookup,
                 active_adapters,
                 accounts_env_values=accounts_env_values,
@@ -2923,6 +2950,17 @@ async def sync_deployments_loop(
 
             _cancel_inactive_tasks(active_tasks, runnable_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)
+
+            # STOPPED means "cancel resting orders and flatten", enforced here
+            # rather than only in the status endpoint so it also holds when the
+            # status was changed by another operator or by a restart. It runs
+            # after the connect above because the adapter is what performs the
+            # cancel/flatten, so running it earlier would always find no adapter.
+            await _enforce_stopped_deployments(
+                deployments,
+                active_adapters,
+                already_enforced=enforced_stopped_deployments,
+            )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,
