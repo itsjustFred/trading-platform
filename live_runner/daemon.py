@@ -5,7 +5,6 @@ import contextlib
 import hashlib
 import inspect
 import os
-import re
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -19,7 +18,11 @@ from live_runner.account_routing import (
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import BaseLiveAdapter
-from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
+from live_runner.credential_env import (
+    accounts_env_mtime,
+    discord_bot_env_canonical_name,
+    load_accounts_env_values,
+)
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
@@ -1094,7 +1097,7 @@ def _resolve_account_discord_token(
     service_name = _deployment_service_name(deployment)
     token_env_key = ""
     if service_name:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
+        canonical_name = discord_bot_env_canonical_name(service_name)
         token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
     discord_token = ""
     if token_env_key:
@@ -1114,6 +1117,28 @@ def _deployment_covers_discord_symbol(
 ) -> bool:
     deployment_symbols = {item.upper() for item in deployment.symbols}
     return not deployment_symbols or symbol.upper() in deployment_symbols
+
+
+def _resolve_discord_auth_scheme(
+    bot_name: str,
+    accounts_env_values: Mapping[str, str],
+) -> str:
+    """Resolve the Discord credential type for a bot service.
+
+    File-first like every other credential: ``DISCORD_BOT_<NAME>_AUTH_SCHEME``
+    then the global ``DISCORD_AUTH_SCHEME``, each falling back to the process
+    environment, defaulting to ``bot``. Bot and account tokens are not
+    interchangeable, so this must never be guessed. The per-bot key is built
+    with the same canonicalisation as the token key, otherwise a punctuated
+    service name would read a key nobody can configure.
+    """
+    canonical_name = discord_bot_env_canonical_name(bot_name)
+    per_bot_keys = (f"DISCORD_BOT_{canonical_name}_AUTH_SCHEME",)
+    for key in (*per_bot_keys, "DISCORD_AUTH_SCHEME"):
+        resolved = str(accounts_env_values.get(key) or os.environ.get(key, "")).strip()
+        if resolved:
+            return resolved.lower()
+    return "bot"
 
 
 def _resolve_discord_service_trusted_author_ids(
@@ -1511,6 +1536,9 @@ async def _run_discord_signal_listener_for_account(
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
+        auth_scheme=_resolve_discord_auth_scheme(
+            str(primary_deployment.signal_source_id or ""), accounts_env_values
+        ),
     )
     await source.connect()
     try:
@@ -1727,7 +1755,7 @@ def _resolve_discord_bot_runtime(
     config = service.config if isinstance(service.config, dict) else {}
     token_env_key = _service_config_string(config, "token_env_key")
     if not token_env_key:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", str(service.name or "").upper())
+        canonical_name = discord_bot_env_canonical_name(service.name)
         token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
     token = str(accounts_env_values.get(token_env_key) or os.environ.get(token_env_key, "")).strip()
     channel_id = _service_config_string(config, "channel_id")
@@ -1940,6 +1968,7 @@ async def _ensure_discord_bot_source(
     token: str,
     channel_id: str,
     *,
+    accounts_env_values: Mapping[str, str],
     active_discord_bots: dict[str, DiscordSignalSource],
     active_discord_bot_tasks: dict[str, asyncio.Task[None]],
 ) -> None:
@@ -1960,6 +1989,12 @@ async def _ensure_discord_bot_source(
             token=token,
             channel_id=channel_id,
             service_id=service_id,
+            trusted_author_ids=_resolve_discord_service_trusted_author_ids(
+                service, accounts_env_values=accounts_env_values
+            ),
+            auth_scheme=_resolve_discord_auth_scheme(
+                service.name, accounts_env_values
+            ),
         )
         active_discord_bots[service_id] = source
 
@@ -2013,6 +2048,7 @@ async def _sync_running_discord_bot(
         service,
         token,
         channel_id,
+        accounts_env_values=accounts_env_values,
         active_discord_bots=active_discord_bots,
         active_discord_bot_tasks=active_discord_bot_tasks,
     )

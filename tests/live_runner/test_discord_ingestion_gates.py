@@ -991,3 +991,220 @@ def test_transient_reconnect_failure_is_retried_on_next_sync(monkeypatch) -> Non
     daemon._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(str(service.id), None)
     asyncio.run(_reconnect())
     assert len(attempts) == 2
+
+
+# ─── Credential type: bot tokens and account tokens are not interchangeable ──
+
+
+def test_bot_token_is_sent_with_the_bot_prefix():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    source = DiscordSignalSource(
+        bot_name="NITRO", token="abc123", channel_id="1", trusted_author_ids=["1"]
+    )
+    assert source._authorization_header() == "Bot abc123"
+
+
+def test_account_token_is_sent_raw():
+    """An account token must NOT carry the "Bot " prefix or Discord answers 401."""
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    source = DiscordSignalSource(
+        bot_name="NITRO",
+        token="abc123",
+        channel_id="1",
+        trusted_author_ids=["1"],
+        auth_scheme="account",
+    )
+    assert source._authorization_header() == "abc123"
+
+
+def test_preset_scheme_in_token_is_not_double_prefixed():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    for scheme in ("bot", "account"):
+        source = DiscordSignalSource(
+            bot_name="NITRO",
+            token="Bot preset",
+            channel_id="1",
+            trusted_author_ids=["1"],
+            auth_scheme=scheme,
+        )
+        assert source._authorization_header() == "Bot preset"
+
+
+def test_unknown_auth_scheme_is_rejected():
+    from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        DiscordSignalSource(
+            bot_name="NITRO",
+            token="t",
+            channel_id="1",
+            trusted_author_ids=["1"],
+            auth_scheme="bearer",
+        )
+
+
+def test_daemon_resolves_auth_scheme_file_first_with_per_bot_override():
+    import live_runner.daemon as daemon
+
+    env = {"DISCORD_AUTH_SCHEME": "account"}
+    assert daemon._resolve_discord_auth_scheme("RAMJET", env) == "account"
+    # A per-bot entry wins over the global default.
+    env_override = {**env, "DISCORD_BOT_NITRO_AUTH_SCHEME": "bot"}
+    assert daemon._resolve_discord_auth_scheme("NITRO", env_override) == "bot"
+    # Absent configuration keeps the safe bot default rather than guessing.
+    assert daemon._resolve_discord_auth_scheme("NITRO", {}) == "bot"
+
+
+def test_daemon_resolves_per_bot_auth_scheme_from_process_environment(monkeypatch):
+    """An explicitly exported per-bot scheme must not be ignored.
+
+    The daemon passes a resolved scheme into the source, which bypasses the
+    source's own environment lookup. Every other credential here is file-first
+    and then process-environment, so a scheme exported only in the environment
+    has to win over the default rather than being silently downgraded to 'bot'.
+    """
+    import live_runner.daemon as daemon
+
+    monkeypatch.setenv("DISCORD_BOT_NITRO_AUTH_SCHEME", "account")
+    monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
+    assert daemon._resolve_discord_auth_scheme("NITRO", {}) == "account"
+
+
+def test_daemon_auth_scheme_key_canonicalisation_matches_token_key(monkeypatch):
+    """A service name with punctuation must use the same env key as its token.
+
+    ``_resolve_account_discord_token`` canonicalises the service name before
+    building ``DISCORD_BOT_<NAME>_...``. The scheme resolver has to use the same
+    key, otherwise a service such as "Rocket Fuel" reads a key nobody can set in
+    an env file and the scheme silently falls back to the default.
+    """
+    import live_runner.daemon as daemon
+
+    monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
+    env = {"DISCORD_BOT_ROCKET_FUEL_AUTH_SCHEME": "account"}
+    assert daemon._resolve_discord_auth_scheme("Rocket Fuel", env) == "account"
+    assert daemon._resolve_discord_auth_scheme("  rocket-fuel  ", env) == "account"
+
+
+def test_process_environment_cannot_override_the_accounts_file(monkeypatch):
+    """File-first precedence must hold for the scheme, like every credential."""
+    import live_runner.daemon as daemon
+
+    monkeypatch.setenv("DISCORD_BOT_NITRO_AUTH_SCHEME", "account")
+    env = {"DISCORD_BOT_NITRO_AUTH_SCHEME": "bot"}
+    assert daemon._resolve_discord_auth_scheme("NITRO", env) == "bot"
+
+
+# ─── Real message shapes from the live channels ──────────────────────────────
+#
+# Captured verbatim (structure only) from the three Discord signal channels so
+# the parser is pinned to reality rather than to invented fixtures.
+
+NITRO_OVERSOLD_MESSAGE = (
+    "\U0001f4a5 **NITRO WATCHLIST — BUY SIGNAL**\n\n"
+    "**BE** is down significantly\n\n"
+    "Price:      $256.30\n"
+    "RSI:        29.8\n\n"
+    "**Triggered by:** \U0001f53b RSI Cross-Under\n"
+    "• RSI crossed below 30 (now 29.8)\n"
+)
+
+NITRO_SUMMARY_MESSAGE = (
+    "\U0001f4a5 **Nitro Daily Summary** — 2026-09-25\n\n"
+    "Today:\n• Alerts: 0 | Closed: 0\n\n"
+    "All Time (since 2026-02-25):\n• Alerts: 853 | Closed: 249 | Open: 19\n"
+)
+
+ROCKETFUEL_OVERBOUGHT_MESSAGE = (
+    "⚡ **OVERBOUGHT ALERT**\n\n"
+    "**MXL** is overbought\n\n"
+    "Price: $93.80\n"
+    "RSI: 71.4\n\n"
+    "RSI has crossed above 70\n"
+)
+
+
+def _live_channel_message(content: str, *, author_id: str = "1484753770645553192"):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id="900000000000000001",
+        content=content,
+        channel=SimpleNamespace(id="1484749160824574124"),
+        author=SimpleNamespace(id=author_id, bot=True),
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def test_nitro_oversold_alert_parses_into_a_buy_signal():
+    """Nitro formats its ticker as "**BE**" with no space after the asterisks,
+    and never uses the word "oversold"; both details used to drop the signal."""
+    from live_runner.signal_sources.discord_source import (
+        _parse_trade_signal_from_message,
+    )
+
+    signal = _parse_trade_signal_from_message(
+        _live_channel_message(NITRO_OVERSOLD_MESSAGE), default_timeframe="1h"
+    )
+    assert signal is not None, "a real Nitro alert must produce a signal"
+    assert signal.action == "buy"
+    assert signal.symbol == "BE"
+    assert signal.entry_price == pytest.approx(256.30)
+    assert signal.metadata["discord_signal_type"] == "oversold_buy"
+
+
+def test_rocketfuel_overbought_alert_is_deliberately_not_traded():
+    """Overbought is a warning, not an entry. It must never open a short."""
+    from live_runner.signal_sources.discord_source import (
+        _parse_trade_signal_from_message,
+    )
+
+    assert (
+        _parse_trade_signal_from_message(
+            _live_channel_message(ROCKETFUEL_OVERBOUGHT_MESSAGE, author_id="1469353101352767575"),
+            default_timeframe="1h",
+        )
+        is None
+    )
+
+
+def test_daily_summary_message_is_not_mistaken_for_a_signal():
+    """Summary posts mention tickers-free aggregates and must stay inert."""
+    from live_runner.signal_sources.discord_source import (
+        _parse_trade_signal_from_message,
+    )
+
+    assert (
+        _parse_trade_signal_from_message(
+            _live_channel_message(NITRO_SUMMARY_MESSAGE), default_timeframe="1h"
+        )
+        is None
+    )
+
+
+def test_bold_header_is_not_mistaken_for_a_ticker():
+    """A multi-word bold header must not be captured as a symbol."""
+    from live_runner.signal_sources.discord_source import _extract_bold_symbol
+
+    assert _extract_bold_symbol("**NITRO WATCHLIST — BUY SIGNAL**") is None
+    assert _extract_bold_symbol("** $TICKER**") == "TICKER"
+    assert _extract_bold_symbol("**TICKER**") == "TICKER"
+
+
+def test_untrusted_author_is_rejected_even_for_a_valid_nitro_alert():
+    from live_runner.signal_sources.discord_source import (
+        _parse_trade_signal_from_message,
+    )
+
+    assert (
+        _parse_trade_signal_from_message(
+            _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id="1"),
+            default_timeframe="1h",
+            trusted_author_ids=["1484753770645553192"],
+        )
+        is None
+    )

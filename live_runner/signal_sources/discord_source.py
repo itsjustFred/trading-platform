@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from live_runner.credential_env import discord_bot_env_key
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
@@ -60,7 +61,15 @@ _MOMENTUM_REVERSAL_RE = re.compile(r"momentum\s*reversal", re.IGNORECASE)
 _GOLDEN_CROSS_RE = re.compile(r"golden\s*cross", re.IGNORECASE)
 _DEATH_CROSS_RE = re.compile(r"death\s*cross", re.IGNORECASE)
 _OVERBOUGHT_RE = re.compile(r"overbought", re.IGNORECASE)
-_OVERSOLD_RE = re.compile(r"oversold|rsi\s*<?\s*30|rocket\s*fuel\s*buy\s*signal", re.IGNORECASE)
+_OVERSOLD_RE = re.compile(
+    r"oversold"
+    r"|rsi\s*<?\s*30"
+    r"|rsi\s+(?:has\s+)?crossed\s+(?:below|under)\s*30"
+    r"|\bis\s+down\s+significantly\b"
+    r"|rocket\s*fuel\s*buy\s*signal"
+    r"|nitro\s+watchlist\s*[\u2014\-]\s*buy\s+signal",
+    re.IGNORECASE,
+)
 _SKIP_WORDS = {
     "RSI",
     "DMA",
@@ -156,7 +165,15 @@ def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
 
 
 def _extract_bold_symbol(content: str) -> str | None:
-    return _first_normalized_symbol(re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content))
+    # Accept both "** $TICKER**" and "**TICKER**". The signal bots are not
+    # consistent about the space, and requiring one silently dropped every
+    # Nitro alert, which formats its ticker as "**BE** is down significantly".
+    # The capture is letters-only and immediately followed by "**", so a
+    # multi-word bold header such as "**NITRO WATCHLIST — BUY SIGNAL**" cannot
+    # match.
+    return _first_normalized_symbol(
+        re.findall(r"\*\*\s*\$?([A-Za-z]{1,10})\s*\*\*", content)
+    )
 
 
 def _extract_labeled_symbol(content: str) -> str | None:
@@ -386,12 +403,38 @@ class DiscordSignalSource(BaseSignalSource):
         timeframe: str = "1h",
         service_id: str | None = None,
         trusted_author_ids: Iterable[str] | str | None = None,
+        auth_scheme: str | None = None,
     ) -> None:
         normalized_name = str(bot_name or "discord").strip()
         self.bot_name = normalized_name or "discord"
         self.service_id = str(service_id or "").strip() or None
         self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+        # Discord accepts two different credentials and they are NOT
+        # interchangeable: an application/bot token needs the "Bot " prefix, while
+        # a user (account) token must be sent raw. Sending an account token with
+        # the bot prefix is rejected with HTTP 401, so the scheme must be
+        # explicit rather than guessed.
+        per_bot_scheme_key = discord_bot_env_key(self.bot_name, "AUTH_SCHEME")
+        scheme = str(
+            auth_scheme
+            or os.environ.get(per_bot_scheme_key, "")
+            or os.environ.get("DISCORD_AUTH_SCHEME", "")
+            or "bot"
+        ).strip().lower()
+        if scheme not in {"bot", "account"}:
+            raise ValueError(
+                f"Unsupported Discord auth_scheme '{scheme}'; expected 'bot' or 'account'"
+            )
+        self.auth_scheme = scheme
+        if scheme == "account":
+            logger.warning(
+                "Discord source configured with an ACCOUNT (user) token. That is a "
+                "self-bot: it violates Discord's Terms of Service and can get the "
+                "account terminated. Use a Developer Portal bot token for unattended "
+                "trading.",
+                extra={"data": {"bot_name": self.bot_name}},
+            )
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
         if fallback_channel_id:
@@ -456,9 +499,21 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
 
+    def _authorization_header(self) -> str:
+        """Build the Authorization header for the configured credential type.
+
+        A token that already carries a scheme prefix is left alone so operators
+        can paste a fully-formed header value.
+        """
+        token = str(self.token or "").strip()
+        if token.lower().startswith("bot "):
+            return token
+        if self.auth_scheme == "account":
+            return token
+        return f"Bot {token}"
+
     async def _fetch_messages(self, channel_id: str) -> list[dict[str, Any]]:
-        token = self.token if self.token.lower().startswith("bot ") else f"Bot {self.token}"
-        headers = {"Authorization": token}
+        headers = {"Authorization": self._authorization_header()}
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={POLL_LIMIT}"
 
         def _do_request() -> requests.Response:
