@@ -87,6 +87,8 @@ assert 'ctrader_open_api' not in sys.modules
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
 def test_wheel_smoke_imports_account_discovery_and_propagates_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -126,6 +128,7 @@ def test_wheel_smoke_propagates_missing_account_discovery_import(tmp_path: Path)
 
     with pytest.raises(subprocess.CalledProcessError):
         wheel_smoke.smoke(wheel_path)
+
 
 def test_verify_script_import_has_no_broker_side_effects() -> None:
     code = """
