@@ -31,16 +31,16 @@ Persisted artifacts keep the historical key `max_position_pct` inside
 SQLite `risk_percent` fallback stay stable; the key's meaning is the one
 documented here.
 
-## Engine mapping (documented divergence — F7)
+## Engine mapping
 
 - **vectorbt / pynecore**: `max_position_exposure_pct` caps the per-position
   notional (`equity × max_position_exposure_pct`); asset-class defaults apply
   when unset (equities 100%, other 20%). `risk_per_trade_pct` sizes from the
   stop distance; the position is filled up to the cap, never beyond.
-- **native (`TradeEngine`)**: the flag feeds the single-symbol risk engine's
-  `RiskConfig.max_total_exposure` explicitly — an undocumented silent 5%
-  default divergence no longer exists; unset keeps the `RiskConfig` default
-  (`0.05`).
+- **native (`TradeEngine`)**: the flag caps one position's notional at
+  `equity × max_position_exposure_pct`; the aggregate `RiskConfig.max_total_exposure`
+  remains the risk engine default (`0.05`). `max_leverage` is an independent
+  ceiling, so an omitted position cap preserves the native leverage behavior.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.

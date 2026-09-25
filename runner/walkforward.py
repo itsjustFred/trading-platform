@@ -10,6 +10,7 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -22,6 +23,7 @@ from runner.engines.base import (
 )
 from runner.portfolio_optimizer import optimize_portfolio_allocation
 from runner.stats import merge_canonical_stats
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 WALKFORWARD_OUTPUT_DIR = DATA_DIR / "walkforward_results"
@@ -79,6 +81,8 @@ def _build_windows(
 
     cursor = _parse_boundary(start)
     final_end = _parse_boundary(end, is_end=True)
+    if final_end <= cursor:
+        raise ValueError("Walk-forward end must be after start.")
     windows: list[dict[str, str]] = []
     while True:
         train_start = cursor
@@ -107,6 +111,8 @@ def _build_windows(
         cursor = cursor + pd.DateOffset(months=step_months)
     if not windows:
         raise ValueError("No walk-forward folds fit inside the requested date range.")
+    if step_months < test_months:
+        raise ValueError("step_months must be >= test_months to avoid overlapping OOS folds.")
     return windows
 
 
@@ -226,9 +232,9 @@ def _write_payload(payload: dict[str, Any], output_dir: str | Path | None = None
     target_dir = Path(output_dir) if output_dir else WALKFORWARD_OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    out_path = target_dir / f"wf_{now.strftime('%Y%m%d_%H%M%S')}.json"
+    out_path = target_dir / f"wf_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}.json"
     payload["output_path"] = str(out_path)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_text_atomically(out_path, json.dumps(payload, indent=2, ensure_ascii=False))
     return out_path
 
 
@@ -237,7 +243,7 @@ def _run_portfolio_walkforward(
     backtest_ids: list[str],
     train_months: int,
     test_months: int,
-    step_months: int,
+    step_months: int | None,
     n_trials: int,
     output_dir: str | Path | None,
     start: str = "",
@@ -245,14 +251,23 @@ def _run_portfolio_walkforward(
     purge_days: int = 0,
     embargo_days: int = 0,
 ) -> dict[str, Any]:
+    effective_step_months = test_months if step_months is None else step_months
     windows = None
+    if (not start or not end) and (
+        (step_months is not None and step_months != 1)
+        or purge_days != 0
+        or embargo_days != 0
+    ):
+        raise ValueError(
+            "start and end are required when portfolio walk-forward shaping is configured"
+        )
     if start and end:
         windows = _build_windows(
             start=start,
             end=end,
             train_months=train_months,
             test_months=test_months,
-            step_months=step_months,
+            step_months=effective_step_months,
             purge_days=purge_days,
             embargo_days=embargo_days,
         )
@@ -292,7 +307,7 @@ def _run_portfolio_walkforward(
             "end": end,
             "train_months": train_months,
             "test_months": test_months,
-            "step_months": step_months,
+            "step_months": effective_step_months,
             "purge_days": purge_days,
             "embargo_days": embargo_days,
             "n_trials": n_trials,
@@ -317,7 +332,7 @@ def run_walkforward(
     capital: float = 100000.0,
     train_months: int = 12,
     test_months: int = 3,
-    step_months: int = 1,
+    step_months: int | None = None,
     risk_pct: float | None = None,
     max_position_exposure_pct: float | None = None,
     max_leverage: float | None = None,
@@ -374,12 +389,13 @@ def run_walkforward(
     normalized_timeframe = normalize_timeframe(timeframe)
     strategy_name = Path(strategy).stem
     parameters = resolve_strategy_parameters(strategy, params or {})
+    effective_step_months = test_months if step_months is None else step_months
     windows = _build_windows(
         start=start,
         end=end,
         train_months=train_months,
         test_months=test_months,
-        step_months=step_months,
+        step_months=effective_step_months,
         purge_days=purge_days,
         embargo_days=embargo_days,
     )
@@ -437,7 +453,7 @@ def run_walkforward(
             "capital": capital,
             "train_months": train_months,
             "test_months": test_months,
-            "step_months": step_months,
+            "step_months": effective_step_months,
             "purge_days": purge_days,
             "embargo_days": embargo_days,
             "risk_pct": risk_pct,

@@ -36,6 +36,14 @@ class FixedRiskConfig(BaseModel):
         for name, value in values.items():
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
+        if self.risk_amount <= 0:
+            raise ValueError("risk_amount must be > 0")
+        if self.min_position_size < 0:
+            raise ValueError("min_position_size must be >= 0")
+        if self.lot_size < 0:
+            raise ValueError("lot_size must be >= 0")
+        if self.max_position_size is not None and self.max_position_size <= 0:
+            raise ValueError("max_position_size must be > 0")
         return self
 
 

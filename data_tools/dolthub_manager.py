@@ -209,7 +209,7 @@ def _export_stocks() -> None:
     logger.info(f"Found {len(symbols)} symbols to export.")
 
     for i, symbol in enumerate(symbols):
-        if not _SYMBOL_RE.match(symbol):
+        if not _is_safe_symbol(symbol):
             logger.warning("Skipping unexpected symbol value: %r", symbol)
             continue
 
@@ -237,10 +237,14 @@ def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
 
 
+def _is_safe_symbol(value: str) -> bool:
+    return value not in {".", ".."} and _SYMBOL_RE.fullmatch(value) is not None
+
+
 def _export_symbol_csv(
     stocks_repo: Path, table_name: str, symbol: str, target_dir: Path, out_parquet: Path
 ) -> None:
-    if not _SYMBOL_RE.match(symbol):
+    if not _is_safe_symbol(symbol):
         logger.warning("Skipping unexpected symbol value: %r", symbol)
         return
     try:
@@ -286,10 +290,14 @@ def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for table in _list_tables(repo_path):
-        out_parquet = build_dataset_path(output_dir, f"{table}.parquet")
-        if out_parquet.exists():
+        if not _is_safe_symbol(table):
+            logger.warning("Skipping unexpected table value: %r", table)
             continue
+        csv_path: Path | None = None
         try:
+            out_parquet = build_dataset_path(output_dir, f"{table}.parquet")
+            if out_parquet.exists():
+                continue
             csv_path = build_dataset_path(output_dir, f"{table}.csv")
             _export_table_csv(repo_path, table, csv_path)
             df = pd.read_csv(csv_path)
@@ -299,7 +307,8 @@ def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
         except Exception as e:
             logger.warning(f"Failed to export {repo_name}/{table}: {e}")
         finally:
-            csv_path.unlink(missing_ok=True)
+            if csv_path is not None:
+                csv_path.unlink(missing_ok=True)
 
 
 def export_data():
@@ -340,16 +349,20 @@ def export_data():
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):
-                out_parquet = _stock_export_path(target_dir, symbol)
-                if out_parquet.exists():
-                    continue  # skip already exported
-
+                if not _is_safe_symbol(symbol):
+                    logger.warning("Skipping unexpected symbol value: %r", symbol)
+                    continue
                 if i % 500 == 0:
                     logger.info(f"  Progress: {i}/{len(symbols)} symbols...")
 
+                csv_path: Path | None = None
                 try:
+                    out_parquet = _stock_export_path(target_dir, symbol)
+                    if out_parquet.exists():
+                        continue  # skip already exported
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
                     sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
+                    csv_path = sym_csv
 
                     def _write_csv(target: Path) -> None:
                         with target.open("w", encoding="utf-8", newline="") as handle:
@@ -375,9 +388,8 @@ def export_data():
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:
-                    csv_path = build_dataset_path(target_dir, f"{symbol}.csv")
-                    if csv_path.exists():
-                        csv_path.unlink()
+                    if csv_path is not None:
+                        csv_path.unlink(missing_ok=True)
 
     # Export Earnings — whole tables as parquet
     _export_repo_tables(

@@ -41,6 +41,11 @@ def test_empty_list_returns_defaults() -> None:
     assert stats.net_profit == 0.0
 
 
+def test_initial_capital_is_validated_even_without_trades() -> None:
+    with pytest.raises(ValueError, match="initial_capital"):
+        compute_trade_statistics([], initial_capital=0.0)
+
+
 # ── 2. Single trade scenarios ──────────────────────────────────────────────
 
 
@@ -196,11 +201,18 @@ def test_max_drawdown_pct() -> None:
     assert stats.max_drawdown_pct == pytest.approx(0.7)
 
 
-def test_max_drawdown_uses_first_observed_equity_peak() -> None:
+def test_max_drawdown_without_initial_capital_keeps_legacy_pnl_basis() -> None:
     trades = [_make_trade(i, [-10.0]) for i in range(3)]
     stats = compute_trade_statistics(trades)
     assert stats.max_drawdown == pytest.approx(30.0)
-    assert stats.max_drawdown_pct == pytest.approx(2.0)
+    assert stats.max_drawdown_pct == pytest.approx(0.0)
+
+
+def test_max_drawdown_pct_uses_initial_account_equity() -> None:
+    trades = [_make_trade(i, [-10.0]) for i in range(3)]
+    stats = compute_trade_statistics(trades, initial_capital=100.0)
+    assert stats.max_drawdown == pytest.approx(30.0)
+    assert stats.max_drawdown_pct == pytest.approx(0.3)
 
 
 def test_max_drawdown_new_higher_peak() -> None:

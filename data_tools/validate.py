@@ -464,6 +464,7 @@ class ValidationResult:
 def validate_parquet(
     path: Path,
     *,
+    ohlcv_root: Path | None = None,
     session: object = None,
     holidays: object = None,
     calendar: object = None,
@@ -480,7 +481,7 @@ def validate_parquet(
         holidays = holiday_dates
     candidate = Path(path).expanduser()
     try:
-        configured_root = (DATA_DIR / "ohlcv").resolve()
+        configured_root = (ohlcv_root or (DATA_DIR / "ohlcv")).resolve()
         rel = candidate.resolve().relative_to(configured_root)
     except (OSError, RuntimeError, ValueError):
         rel = candidate
@@ -702,7 +703,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
             continue
 
         logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root.resolve()))
-        r = validate_parquet(validated_path)
+        r = validate_parquet(validated_path, ohlcv_root=ohlcv_root)
 
         status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
         logger.info(

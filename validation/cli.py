@@ -254,8 +254,12 @@ def _readiness_report(
         regression=regression,
         risk_report=risk_report,
         stats=(
-            compute_trade_statistics(reference.trades),
-            compute_trade_statistics(platform.trades),
+            compute_trade_statistics(
+                reference.trades, initial_capital=_initial_capital(reference)
+            ),
+            compute_trade_statistics(
+                platform.trades, initial_capital=_initial_capital(platform)
+            ),
         ),
         config=ReadinessConfig(
             stats_win_rate_tolerance_pct=stats_tolerance,

@@ -2324,7 +2324,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 filled_volume=filled_volume,
             ),
         )
-        await asyncio.to_thread(save_live_execution, execution)
+        persisted = await asyncio.to_thread(save_live_execution, execution)
+        if not persisted:
+            logger.info(
+                "Skipped duplicate cTrader execution fill",
+                extra={
+                    "data": {
+                        "signal_id": str(execution.signal_id),
+                        "broker_order_id": execution.broker_order_id,
+                        "execution_type": execution_type,
+                    }
+                },
+            )
+            return
         logger.info(
             "Persisted cTrader execution fill",
             extra={

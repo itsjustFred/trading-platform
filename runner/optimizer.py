@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, NoReturn
+from uuid import uuid4
 
 import optuna
 import pandas as pd
@@ -19,6 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
@@ -629,7 +631,9 @@ def run_optimization(
     test_stats = _canonical_stats(test_result)
 
     now = datetime.now(timezone.utc)
-    optimization_id = f"opt_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+    optimization_id = (
+        f"opt_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
+    )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     payload = {
         "id": optimization_id,
@@ -676,7 +680,7 @@ def run_optimization(
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    write_text_atomically(output_path, json.dumps(_json_safe(payload), indent=2))
     _emit_progress(progress_callback, 100.0, f"Optimization finished: {output_path.name}")
     return payload
 
@@ -968,7 +972,9 @@ def _run_risk_parity_covariance_optimization(
     test_stats = _canonical_stats(test_result)
 
     now = datetime.now(timezone.utc)
-    optimization_id = f"rp_cov_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+    optimization_id = (
+        f"rp_cov_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
+    )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     payload = {
         "id": optimization_id,
@@ -1010,7 +1016,7 @@ def _run_risk_parity_covariance_optimization(
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    write_text_atomically(output_path, json.dumps(_json_safe(payload), indent=2))
     _emit_progress(
         progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}"
     )

@@ -1556,6 +1556,12 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
+    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
+        logger.warning(
+            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
+            existing.id,
+        )
+        return
     else:
         logger.info(
             "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
@@ -1737,9 +1743,6 @@ def save_live_execution_up_to_cumulative(
                 session.rollback()
                 return 0.0
             return persisted_qty
-        except IntegrityError:
-            session.rollback()
-            return 0.0
         except Exception:
             session.rollback()
             raise
@@ -1768,9 +1771,15 @@ def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> boo
         return False
     init_db()
     with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         record = session.get(LiveSignalModel, normalized_signal_id)
         if record is None:
             return False
+        existing_order_id = str(record.broker_order_id or "").strip()
+        if existing_order_id and existing_order_id != normalized_order_id:
+            return False
+        if existing_order_id == normalized_order_id:
+            return True
         record.broker_order_id = normalized_order_id
         metadata = dict(record.metadata_json or {})
         metadata["broker_order_id"] = normalized_order_id

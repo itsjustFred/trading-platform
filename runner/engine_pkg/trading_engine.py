@@ -78,12 +78,12 @@ class TradeEngine:
         # fallback is gone — unset means the RiskConfig default, named
         # explicitly.
         _position_cap = self.config.max_position_exposure_pct
-        max_total_exposure = (
-            float(_position_cap)
-            if _position_cap is not None
-            else RiskConfig().max_total_exposure
+        self._max_position_exposure_pct = (
+            float(_position_cap) if _position_cap is not None else None
         )
+        max_total_exposure = RiskConfig().max_total_exposure
         max_leverage = float(self.config.max_leverage or 1.0)
+        self._max_leverage = max_leverage
         # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
         # policy is engine configuration only. It is intentionally NOT read
         # from ``config.parameters`` — strategy parameters must not silently
@@ -95,7 +95,7 @@ class TradeEngine:
                 max_total_exposure=max_total_exposure,
                 max_positions=TRADE_ENGINE_MAX_POSITIONS,
                 default_sl_atr_multiplier=2.0,
-                max_notional_per_trade=min(max_leverage, 1.0),
+                max_notional_per_trade=1.0,
                 allow_fallback_stop=bool(self.config.allow_fallback_stop),
                 reject_missing_stop=bool(self.config.reject_missing_stop),
             )
@@ -200,7 +200,9 @@ class TradeEngine:
         direction = str(row.get("direction", "LONG")).upper()
         return "SHORT" if direction == "SHORT" else "LONG"
 
-    def _current_risk_exposure(self, reference_price: float) -> float:
+    def _current_risk_exposure(
+        self, reference_price: float, exclude_order: Order | None = None
+    ) -> float:
         if self.equity <= 0:
             return 0.0
 
@@ -218,6 +220,8 @@ class TradeEngine:
             risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
 
         for order in self.pending_orders:
+            if exclude_order is not None and order is exclude_order:
+                continue
             stop_loss = order.stop_loss
             if stop_loss is None:
                 stop_loss = getattr(order, "_sizing_stop_loss", None)
@@ -253,8 +257,14 @@ class TradeEngine:
         direction: str,
         take_profit_price: float | None = None,
         stop_distance: float | None = None,
+        exclude_order: Order | None = None,
     ) -> float:
-        max_leverage = float(self.config.max_leverage or 1.0)
+        max_leverage = self._max_leverage
+        position_notional_limit = (
+            max_leverage
+            if self._max_position_exposure_pct is None
+            else min(self._max_position_exposure_pct, max_leverage)
+        )
         fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
         if fixed_risk_amount is None:
             fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
@@ -285,10 +295,16 @@ class TradeEngine:
                 if max_lot > 0:
                     shares = min(shares, max_lot)
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self.equity * max_leverage
+                    max_value = self.equity * position_notional_limit
+                    shares = min(shares, max_value / entry_price)
+                elif self._max_position_exposure_pct is not None:
+                    max_value = self.equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
                 return max(shares, 0.0)
 
+        pending_positions = sum(
+            order is not exclude_order for order in self.pending_orders
+        )
         if self._risk_enabled:
             signal = TradeSignal(
                 action="buy" if str(direction).upper() == "LONG" else "sell",
@@ -300,15 +316,18 @@ class TradeEngine:
                 metadata={
                     # C2: pending orders count toward max_positions — a
                     # pending order is committed intent, not free capacity.
-                    "current_positions": len(self.positions) + len(self.pending_orders),
-                    "pending_positions": len(self.pending_orders),
+                    "current_positions": len(self.positions) + pending_positions,
+                    "pending_positions": pending_positions,
                 },
             )
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
                 account_balance=float(self.equity),
                 pip_value=1.0,
-                current_exposure=self._current_risk_exposure(float(entry_price)),
+                current_exposure=self._current_risk_exposure(
+                    float(entry_price), exclude_order=exclude_order
+                ),
+                max_notional_per_trade=position_notional_limit,
             )
             shares = float(sized_order.position_size)
         else:
@@ -320,7 +339,7 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        max_value = self.equity * max_leverage
+        max_value = self.equity * position_notional_limit
         shares = min(shares, max_value / entry_price)
         return max(shares, 0.0)
 
@@ -395,6 +414,7 @@ class TradeEngine:
             take_profit_levels=tp_levels,
         )
         order._sizing_stop_loss = exposure_stop
+        order._sizing_only_stop = stop_loss is None and sizing_only_stop is not None
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
         # order's quantity — it still tracks exposure and credits PnL.
@@ -490,7 +510,7 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
-                if order.stop_loss is None:
+                if order.stop_loss is None and getattr(order, "_sizing_stop_loss", None) is None:
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     fallback_distance = (
                         float(order.stop_distance)
@@ -504,6 +524,7 @@ class TradeEngine:
                     order.order_type == OrderType.MARKET
                     and order.stop_distance is not None
                     and order.stop_distance > 0
+                    and not getattr(order, "_sizing_only_stop", False)
                 ):
                     distance = float(order.stop_distance)
                     order.stop_loss = (
@@ -533,27 +554,56 @@ class TradeEngine:
                             else None
                         ),
                         stop_distance=order.stop_distance,
+                        exclude_order=order,
                     )
                     if order.quantity <= 0:
                         continue
-                if order.order_type == OrderType.MARKET and order.stop_loss is not None:
-                    # MARKET: no stop → no risk-based re-size; the creation
-                    # estimate (signal-bar close) is the documented fallback
-                    # for stopless market entries.
-                    take_profit = (
-                        float(order.take_profit_levels[0]["price"])
-                        if order.take_profit_levels
-                        else None
-                    )
-                    order.quantity = self._calculate_position_size(
-                        entry_price=float(fill_price),
-                        stop_loss_price=order.stop_loss,
-                        direction=order.direction,
-                        take_profit_price=take_profit,
-                        stop_distance=order.stop_distance,
-                    )
-                    if order.quantity <= 0:
-                        continue
+                if order.order_type == OrderType.MARKET:
+                    sizing_stop = order.stop_loss
+                    if sizing_stop is None and getattr(order, "_sizing_only_stop", False):
+                        sizing_stop = getattr(order, "_sizing_stop_loss", None)
+                    if sizing_stop is not None:
+                        try:
+                            sizing_stop_value = float(sizing_stop)
+                        except (TypeError, ValueError) as exc:
+                            logger.warning(
+                                "Skipping market order with invalid sizing stop at fill: %s",
+                                exc,
+                            )
+                            continue
+                        wrong_side = (
+                            order.direction == "LONG"
+                            and sizing_stop_value >= float(fill_price)
+                        ) or (
+                            order.direction != "LONG"
+                            and sizing_stop_value <= float(fill_price)
+                        )
+                        if (
+                            not math.isfinite(sizing_stop_value)
+                            or math.isclose(
+                                sizing_stop_value, float(fill_price), abs_tol=1e-12
+                            )
+                            or wrong_side
+                        ):
+                            logger.warning(
+                                "Skipping market order with invalid sizing stop at fill"
+                            )
+                            continue
+                        take_profit = (
+                            float(order.take_profit_levels[0]["price"])
+                            if order.take_profit_levels
+                            else None
+                        )
+                        order.quantity = self._calculate_position_size(
+                            entry_price=float(fill_price),
+                            stop_loss_price=sizing_stop_value,
+                            direction=order.direction,
+                            take_profit_price=take_profit,
+                            stop_distance=order.stop_distance,
+                            exclude_order=order,
+                        )
+                        if order.quantity <= 0:
+                            continue
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT
                 # stop <= entry) would produce an instantly-triggered,
@@ -647,9 +697,9 @@ class TradeEngine:
             if first_level.get("price") is not None:
                 take_profit = float(first_level["price"])
 
-        risk_per_share = abs(
-            position.entry_price - (position.stop_loss or position.entry_price * 0.98)
-        )
+        sizing_stop = position.meta.get("sizing_stop_loss")
+        risk_reference = position.stop_loss or sizing_stop or position.entry_price * 0.98
+        risk_per_share = abs(position.entry_price - float(risk_reference))
         risk_amount = risk_per_share * position.quantity
         r_multiple = (net_pnl / risk_amount) if risk_amount > 0 else None
 

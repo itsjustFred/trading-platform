@@ -34,7 +34,13 @@ python -m runner.cli walkforward --strategy my_strat --symbols EURUSD,GBPUSD,USD
 |-----------|--------------|---------|
 | `train_months` | Monate für Training | 12 |
 | `test_months` | Monate für Test/OOS | 3 |
-| `step_months` | Schrittweite | 1 (relativ zum Test-Ende) |
+| `step_months` | Schrittweite; muss mindestens so groß wie `test_months` sein, damit OOS-Folds sich nicht überlappen | `test_months` |
+| `purge_days` | Vor jedem Test-Fold aus dem Training entfernen | 0 |
+| `embargo_days` | Abstand zwischen Training und Test | 0 |
+
+Portfolio Walk-Forward benötigt `start` und `end`, sobald `step_months`,
+`purge_days` oder `embargo_days` gesetzt sind. Ohne diese Parameter bleibt der
+portfolio-optimierte Einzelfall erhalten.
 
 ## Metriken
 

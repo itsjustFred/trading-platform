@@ -9,7 +9,7 @@ from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.daemon import submit_order_with_risk
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.models import RiskDecision, TradeSignal
+from risk.models import RiskDecision, SizedOrder, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
 
@@ -30,6 +30,50 @@ def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
 def test_risk_config_accepts_upper_fraction_boundary(field_name):
     config = RiskConfig(**{field_name: 1.0})
     assert getattr(config, field_name) == 1.0
+
+
+def _risk_decision(risk_percent: float) -> RiskDecision:
+    return RiskDecision(
+        signal_id="signal",
+        accepted=True,
+        quantity=1.0,
+        risk_amount=1.0,
+        risk_percent=risk_percent,
+        risk_distance=1.0,
+        stop_price_used=99.0,
+        take_profit_used=None,
+    )
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, math.nan, math.inf])
+def test_risk_decision_rejects_non_fraction_risk_percent(value: float) -> None:
+    with pytest.raises(ValueError, match="risk_percent must"):
+        _risk_decision(value)
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_risk_decision_accepts_fraction_boundaries(value: float) -> None:
+    assert _risk_decision(value).risk_percent == value
+
+
+def test_sized_order_rejects_non_fraction_risk_percent() -> None:
+    signal = TradeSignal(
+        action="buy",
+        symbol="X",
+        entry_price=100.0,
+        stop_loss=99.0,
+        take_profit=None,
+        timeframe="1d",
+        metadata={},
+    )
+    with pytest.raises(ValueError, match="risk_percent must be between 0 and 1"):
+        SizedOrder(
+            signal=signal,
+            position_size=1.0,
+            risk_amount=1.0,
+            risk_percent=1.01,
+            risk_reward_ratio=None,
+        )
 
 
 def test_calculate_position_size_normal_case():
