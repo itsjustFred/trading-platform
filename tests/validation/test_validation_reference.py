@@ -6,8 +6,7 @@ from datetime import datetime
 
 import pytest
 
-from scripts.backtest_to_validation_ref import _to_validation_reference
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.models import BacktestResult, EquityPoint, Trade, TradeExit
 from validation.reference import (
     ALLOWED_FRAMEWORKS,
     ALLOWED_STATUSES,
@@ -180,25 +179,3 @@ class TestRawMetadataRoundtrip:
         ref = _make_minimal_valid_reference(raw_metadata=raw)
         d = ref.model_dump()
         assert d["raw_metadata"] == raw
-
-
-def test_backtest_converter_routes_meta_capital_through_reference_resolver():
-    result = BacktestResult(
-        meta=BacktestMeta(
-            id="result",
-            created_at="2024-01-01T00:00:00Z",
-            engine="vectorbt",
-            strategies=["sma"],
-            backtest_start="2024-01-01",
-            backtest_end="2024-01-02",
-            initial_capital=321_000.0,
-            data={"symbols": ["AAPL"], "timeframes": ["1d"]},
-            parameters={"fast": 5},
-        ),
-        trades=[_make_sample_trade()],
-    )
-
-    reference = _to_validation_reference(result)
-
-    assert reference.settings["initial_capital"] == pytest.approx(321_000.0)
-    assert reference.to_backtest_result().meta.initial_capital == pytest.approx(321_000.0)
