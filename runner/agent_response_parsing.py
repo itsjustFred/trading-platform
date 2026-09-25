@@ -115,6 +115,7 @@ def normalize_strategy_meta(
         resolved_title
     )
     normalized["version"] = str(normalized.get("version") or "1.0.0")
+    normalized["provenance"] = {"generated": True, "generator": "auto_agent"}
 
     parameters = normalized.get("parameters")
     if parameters is None:

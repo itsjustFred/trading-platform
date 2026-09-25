@@ -7,10 +7,8 @@ wrapper used by every stage.
 from __future__ import annotations
 
 import os
-import select
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,10 +25,27 @@ BACKTEST_ENV_ALLOWLIST = (
     "PYTHONHASHSEED",
     "VIRTUAL_ENV",
     "TMPDIR",
+    "TEMP",
+    "TMP",
     "DATA_DIR",
     "LOG_DIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "NUMBER_OF_PROCESSORS",
 )
 BACKTEST_ENV_ALWAYS_SET = {"PYTHONUNBUFFERED": "1"}
+_BACKTEST_ENV_ALLOWLIST_CASEFOLD = frozenset(
+    key.upper() for key in BACKTEST_ENV_ALLOWLIST
+)
 
 TaskLogger = Callable[..., None]
 
@@ -39,7 +54,7 @@ def build_backtest_child_env() -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if key in set(BACKTEST_ENV_ALLOWLIST)
+        if key.upper() in _BACKTEST_ENV_ALLOWLIST_CASEFOLD
     }
     env.update(BACKTEST_ENV_ALWAYS_SET)
     return env
@@ -106,7 +121,6 @@ def run_backtest(
     env = build_backtest_child_env()
     log_message(log, "Launching backtest command: " + " ".join(cmd))
 
-    output_lines: list[str] = []
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -116,66 +130,41 @@ def run_backtest(
         text=True,
         bufsize=1,
     )
-
-    deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
-
-    def _remaining() -> float | None:
-        return None if deadline is None else max(0.0, deadline - time.monotonic())
-
     timed_out = False
+    partial_output = ""
     try:
-        stdout_fd = proc.stdout.fileno() if proc.stdout is not None else None
-        buffered = b""
-        while True:
-            remaining = _remaining()
-            if remaining is not None and remaining <= 0:
-                raise subprocess.TimeoutExpired(cmd, timeout_seconds or 0)
-
-            poll_timeout = min(0.5, remaining) if remaining is not None else 0.5
-            ready, _, _ = (
-                select.select([stdout_fd], [], [], poll_timeout)
-                if stdout_fd is not None
-                else ([], [], [])
-            )
-            if ready:
-                chunk = os.read(stdout_fd, 65536)
-                if not chunk:
-                    if buffered:  # flush a trailing partial line without newline
-                        line = buffered.decode("utf-8", errors="replace")
-                        buffered = b""
-                        output_lines.append(line + "\n")
-                        log_message(log, line, stream="stdout")
-                    break
-                buffered += chunk
-                while b"\n" in buffered:
-                    raw_line, buffered = buffered.split(b"\n", 1)
-                    line = raw_line.decode("utf-8", errors="replace")
-                    output_lines.append(line + "\n")
-                    log_message(log, line, stream="stdout")
-            # Child still alive: keep polling until stdout EOF or deadline.
-
-        remaining = _remaining()
-        returncode = proc.wait() if remaining is None else proc.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        proc.kill()
         try:
-            returncode = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover - pathological child
-            returncode = -9
+            proc_output, _ = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            partial_output = exc.output or ""
+            if isinstance(partial_output, bytes):
+                partial_output = partial_output.decode("utf-8", errors="replace")
+            proc.kill()
+            try:
+                proc_output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc_output = ""
+            if isinstance(proc_output, bytes):
+                proc_output = proc_output.decode("utf-8", errors="replace")
     finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
+        stdout = getattr(proc, "stdout", None)
+        close_stdout = getattr(stdout, "close", None)
+        if callable(close_stdout):
+            close_stdout()
 
+    output = proc_output or partial_output
+    for line in output.splitlines(keepends=True):
+        log_message(log, line.rstrip("\r\n"), stream="stdout")
     if timed_out:
         log_message(
             log,
             f"Backtest timed out after {timeout_seconds}s and was terminated.",
             level="error",
         )
-        return 124, "".join(output_lines)
+        return 124, output
 
-    return returncode, "".join(output_lines)
+    return proc.returncode, output
 
 
 def log_message(

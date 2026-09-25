@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 from shared.models import LiveSignal
@@ -21,6 +22,18 @@ def is_unbounded_tp(metadata: object) -> bool:
     if not isinstance(metadata, dict):
         return False
     return str(metadata.get("take_profit_policy") or "") == UNBOUNDED_TP_POLICY
+
+
+def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field_name} must be finite and positive")
+    return parsed
 
 
 class BaseLiveAdapter(ABC):

@@ -95,6 +95,57 @@ def test_connect_override_limits_attempts(monkeypatch) -> None:
     assert attempts == 1
 
 
+def test_connect_reconciliation_failure_is_retried_without_reconnect(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+        connect_max_attempts=1,
+    )
+    client = SimpleNamespace(running=False)
+
+    def start_service() -> None:
+        client.running = True
+        adapter._on_connected(client)
+
+    client.startService = start_service
+    create_calls = 0
+
+    def create_client():
+        nonlocal create_calls
+        create_calls += 1
+        return client
+
+    async def authenticate() -> None:
+        adapter._authenticated = True
+
+    async def fail_reconciliation(*, max_signals: int = 200) -> int:
+        raise RuntimeError("temporary reconciliation failure")
+
+    monkeypatch.setattr(adapter, "_load_openapi_types", lambda: None)
+    monkeypatch.setattr(adapter, "_create_client", create_client)
+    monkeypatch.setattr(adapter, "_authenticate", authenticate)
+    monkeypatch.setattr(adapter, "reconcile_executions", fail_reconciliation)
+
+    asyncio.run(adapter.connect())
+
+    assert create_calls == 1
+    assert adapter._connected is True
+    assert adapter._authenticated is True
+    assert adapter._reconciliation_required is True
+    assert adapter._reconciliation_retry_at == 0.0
+
+    async def succeed_reconciliation(*, max_signals: int = 200) -> int:
+        return 0
+
+    monkeypatch.setattr(adapter, "reconcile_executions", succeed_reconciliation)
+    asyncio.run(adapter._run_pending_reconciliation(2))
+
+    assert create_calls == 1
+    assert adapter._reconciliation_required is False
+
+
 def test_on_message_marks_terminal_auth_failure_for_not_authorized() -> None:
     adapter = CTraderLiveAdapter(
         app_id="app",

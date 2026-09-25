@@ -1738,6 +1738,19 @@ def get_live_signal_broker_order_id(signal_id: str) -> str | None:
     return broker_order_id or None
 
 
+def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return None
+        metadata = dict(record.metadata_json or {})
+    return metadata
+
+
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
     """Return the persisted signal timestamp used for bounded broker recovery."""
     normalized_signal_id = str(signal_id or "").strip()

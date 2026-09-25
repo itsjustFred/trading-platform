@@ -14,8 +14,12 @@ from runner.approval_gate import (
     StrategyNotApprovedError,
     approval_path_for,
     approve_strategy,
+    generated_marker_path_for,
+    is_generated_strategy,
     is_strategy_approved,
+    mark_generated_strategy,
     require_approval,
+    require_generated_strategy_approval,
 )
 
 
@@ -34,6 +38,84 @@ def test_approval_is_bound_to_file_hash(tmp_path):
 
     strategy.write_text("import os\nos.system('boom')\n")
     assert not is_strategy_approved(strategy, strategies_root=tmp_path)
+
+
+def test_generated_source_remains_generated_after_marker_deletion(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text(
+        "STRATEGY_META = {'provenance': {'generated': True}}\n",
+        encoding="utf-8",
+    )
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+    generated_marker_path_for(strategy).unlink()
+
+    assert is_generated_strategy(strategy)
+    assert not is_strategy_approved(strategy, strategies_root=tmp_path)
+
+    with pytest.raises(StrategyNotApprovedError, match="marker or provenance"):
+        require_generated_strategy_approval(strategy, strategies_root=tmp_path)
+
+
+def test_generated_approval_does_not_become_manual_after_sidecar_deletion(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text(
+        "STRATEGY_META = {'provenance': {'generated': True}}\n",
+        encoding="utf-8",
+    )
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+    approve_strategy(strategy, approved_by="alice", strategies_root=tmp_path)
+    generated_marker_path_for(strategy).unlink()
+
+    with pytest.raises(StrategyNotApprovedError, match="marker or provenance"):
+        require_generated_strategy_approval(strategy, strategies_root=tmp_path)
+
+
+def test_malformed_generated_marker_fails_closed(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text("x = 1\n", encoding="utf-8")
+    generated_marker_path_for(strategy).write_text("not-json\n", encoding="utf-8")
+
+    with pytest.raises(StrategyNotApprovedError, match="unreadable"):
+        require_generated_strategy_approval(strategy, strategies_root=tmp_path)
+
+
+def test_generated_marker_with_wrong_provenance_fails_closed(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text("x = 1\n", encoding="utf-8")
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+    marker = generated_marker_path_for(strategy)
+    marker.write_text(
+        marker.read_text(encoding="utf-8").replace('"auto_agent"', '"manual"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StrategyNotApprovedError, match="invalid provenance"):
+        require_generated_strategy_approval(strategy, strategies_root=tmp_path)
+
+
+def test_force_does_not_bypass_generated_marker_requirement(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text(
+        "STRATEGY_META = {'provenance': {'generated': True}}\n",
+        encoding="utf-8",
+    )
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+    approve_strategy(strategy, approved_by="alice", strategies_root=tmp_path)
+    generated_marker_path_for(strategy).unlink()
+
+    with pytest.raises(StrategyNotApprovedError, match="marker or provenance"):
+        require_generated_strategy_approval(
+            strategy, strategies_root=tmp_path, force=True
+        )
+
+
+def test_generated_marker_without_approval_still_fails_closed(tmp_path):
+    strategy = tmp_path / "generated.py"
+    strategy.write_text("x = 1\n", encoding="utf-8")
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+
+    with pytest.raises(StrategyNotApprovedError, match="human review"):
+        require_generated_strategy_approval(strategy, strategies_root=tmp_path)
 
 
 def test_approval_ledger_records_hash_reviewer_and_timestamp(tmp_path):

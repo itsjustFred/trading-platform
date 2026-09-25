@@ -272,6 +272,22 @@ def test_risk_config_rejects_non_positive_notional_cap():
         RiskConfig(max_notional_per_trade=-0.1)
 
 
+@pytest.mark.parametrize(
+    "alias", ["stop_loss", "sl_price", "stop_price", "resolved_stop_loss"]
+)
+def test_size_live_signal_rejects_malformed_stop_alias(alias: str):
+    signal = _signal(
+        {
+            "entry_price": 100.0,
+            alias: "not-a-price",
+            "take_profit": 104.0,
+        }
+    )
+
+    with pytest.raises(ValueError, match=alias):
+        size_live_signal(signal, account_balance=10000.0)
+
+
 def test_size_live_signal_rejects_malformed_present_metadata():
     signal = _signal(
         {

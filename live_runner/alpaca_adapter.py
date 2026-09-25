@@ -17,6 +17,7 @@ from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    coerce_positive_live_qty,
     is_unbounded_tp,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
@@ -82,7 +83,6 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
 
 
 def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
-    """Return the first parseable positive-precision float from metadata keys."""
     for key in keys:
         if key not in metadata:
             continue
@@ -90,9 +90,10 @@ def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) 
         if value is None:
             continue
         try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {key}: {value!r}") from exc
+        return parsed
     return None
 
 
@@ -607,12 +608,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         market_request_cls: Any,
         client_order_id: str,
     ) -> Any:
+        qty = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
         if signal.action not in {"buy", "sell"}:
             # Fail closed: an unmapped action must never fall through to SELL.
             raise ValueError(f"Unsupported signal action: {signal.action}")
         stop_loss_price, take_profit_price = self._resolve_broker_sl_tp(signal)
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
-        limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
         if signal.action == "buy":
             side = order_side.BUY
         else:
@@ -699,17 +700,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
         try:
-            qty_value = float(qty)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"Alpaca order qty is not a number: {qty!r} "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
-            )
-        if not math.isfinite(qty_value) or qty_value <= 0:
+            qty_value = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
+        except ValueError as exc:
             raise ValueError(
                 "Alpaca order qty must be finite and positive, "
                 f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
-            )
+            ) from exc
         qty = qty_value
 
         order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
@@ -847,6 +843,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if parsed is None:
                 return
             event, order, client_order_id, signal_uuid = parsed
+            raw_broker_order_id = getattr(order, "id", None)
+            broker_order_id = _normalize_broker_order_id(raw_broker_order_id)
+            if broker_order_id is None:
+                logger.warning(
+                    "Trade update missing valid broker order id",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "client_order_id": str(client_order_id),
+                            "broker_order_id": str(raw_broker_order_id or ""),
+                        }
+                    },
+                )
+                return
 
             fill_price = getattr(data, "fill_price", None)
             if fill_price is None:
@@ -868,7 +878,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             filled_qty = _to_float(filled_qty_value)
             commission = _to_float(commission_value)
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
-            broker_order_id = str(getattr(order, "id", ""))
 
             execution_id = str(getattr(data, "execution_id", "") or "")
             if execution_id:
