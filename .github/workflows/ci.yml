@@ -24,17 +24,17 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: python -m pip install uv==0.10.4
+        run: python -m pip install --only-binary=:all: uv==0.10.4
       - name: Validate lockfile
         run: uv lock --check
       - name: Install locked dependencies
-        run: uv sync --frozen --all-extras
+        run: uv sync --frozen --all-extras --no-install-project --no-build
       - name: Validate generated requirements
-        run: uv run --no-sync python scripts/check_requirements_drift.py
+        run: uv run --no-sync --no-build python scripts/check_requirements_drift.py
       - name: Lint packaging and import seams
         if: runner.os == 'Linux'
         run: >-
-          uv run --no-sync ruff check
+          uv run --no-sync --no-build ruff check
           live_runner/__init__.py
           live_runner/account_discovery.py
           live_runner/ctrader_adapter.py
@@ -46,19 +46,19 @@ jobs:
           tests/test_packaging.py
       - name: Lint (advisory)
         continue-on-error: true
-        run: uv run --no-sync ruff check .
+        run: uv run --no-sync --no-build ruff check .
       - name: Tests
         if: runner.os == 'Linux'
         run: >-
-          uv run --no-sync pytest -q -p no:cacheprovider -m "not slow"
+          uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
           --ignore=tests/strategies
       - name: Strategy tests
         if: runner.os == 'Linux'
-        run: uv run --no-sync pytest -q -p no:cacheprovider tests/strategies
+        run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies
       - name: Build wheel
         run: uv build --wheel --out-dir dist --no-create-gitignore
       - name: Wheel and import smoke
-        run: uv run --no-sync python scripts/wheel_smoke.py
+        run: uv run --no-sync --no-build python scripts/wheel_smoke.py
 
   frontend:
     name: Frontend focused checks
@@ -75,8 +75,8 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
       - name: Frontend test lint
-        run: npx eslint tests/optimizationEvidence.test.ts
+        run: ./node_modules/.bin/eslint tests/optimizationEvidence.test.ts
       - name: Frontend focused tests
         run: npm run test:optimization-evidence

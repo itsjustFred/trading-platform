@@ -1226,7 +1226,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     raw = _canonical_stats_from_result(result)
 
     net_pnls = [_trade_net_pnl(trade) for trade in (result.trades or [])]
-    pnls = [pnl for pnl in net_pnls if pnl != 0.0]
+    pnls = [pnl for pnl in net_pnls if not math.isclose(pnl, 0.0, abs_tol=1e-12)]
     best_trade = max(pnls) if pnls else 0
     worst_trade = min(pnls) if pnls else 0
     net_total = sum(net_pnls)
