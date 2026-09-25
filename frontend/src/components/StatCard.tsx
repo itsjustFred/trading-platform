@@ -1,6 +1,10 @@
 import { memo } from "react";
 
 import { toPercentPoints, type PercentScale } from "../api/metricScale";
+import {
+  isUnavailableStatValue,
+  UNAVAILABLE_STAT_TEXT,
+} from "../lib/statFormat";
 
 interface StatCardProps {
   label: string;
@@ -38,21 +42,26 @@ export const StatCard = memo(function StatCard({
   format = "none",
   percentScale = "points",
 }: StatCardProps) {
-  const numVal = typeof value === "number" ? value : parseFloat(String(value));
+  const numVal = typeof value === "number" ? value : parseFloat(String(value ?? ""));
   const finite = !Number.isNaN(numVal);
-  let formatted = String(value);
+  // An unavailable metric renders as an em dash, never as 0 / $0 / 0.00%, so a
+  // missing value is never mistaken for a genuine zero.
+  const unavailable = isUnavailableStatValue(value);
+  let formatted = unavailable ? UNAVAILABLE_STAT_TEXT : String(value);
 
-  if (format === "currency" && finite) {
-    const abs = Math.abs(numVal);
-    formatted =
-      numVal >= 0
-        ? `$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
-        : `-$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-  } else if (format === "percent" && finite) {
-    const points = toPercentPoints(numVal, percentScale) ?? 0;
-    formatted = `${points.toFixed(2)}%`;
-  } else if (format === "number" && finite) {
-    formatted = numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (!unavailable) {
+    if (format === "currency") {
+      const abs = Math.abs(numVal);
+      formatted =
+        numVal >= 0
+          ? `$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+          : `-$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
+    } else if (format === "percent" && finite) {
+      const points = toPercentPoints(numVal, percentScale) ?? 0;
+      formatted = `${points.toFixed(2)}%`;
+    } else if (format === "number") {
+      formatted = numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    }
   }
 
   return (
