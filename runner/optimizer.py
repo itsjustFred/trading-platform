@@ -4,10 +4,10 @@ import hashlib
 import json
 import logging
 import math
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
-from collections.abc import Mapping, Sequence
 from typing import Any, Callable, NoReturn
 
 import optuna
@@ -496,7 +496,11 @@ def run_optimization(
     if not completed_trials:
         failure_summary = "; ".join(
             f"trial {trial.number}: {trial.state.name}"
-            + (f" ({trial.user_attrs.get('failure_reason')})" if trial.user_attrs.get("failure_reason") else "")
+            + (
+                f" ({trial.user_attrs.get('failure_reason')})"
+                if trial.user_attrs.get("failure_reason")
+                else ""
+            )
             for trial in study.get_trials(deepcopy=False)[-5:]
         )
         raise RuntimeError(

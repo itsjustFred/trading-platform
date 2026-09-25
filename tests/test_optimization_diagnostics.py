@@ -12,7 +12,6 @@ from runner.optimization_diagnostics import (
     walk_forward_splits,
 )
 
-
 # ─── embargo_split ───────────────────────────────────────────────────────────
 
 
@@ -27,7 +26,9 @@ def test_embargo_split_drops_a_real_gap_between_train_and_test():
     test_start = pd.Timestamp(split.test["start"])
     assert test_start > train_end, "test must start strictly after the train window"
     # 10 days total, 10% embargo => ~1 day gap.
-    assert (test_start - train_end) == pytest.approx(pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1))
+    assert (test_start - train_end) == pytest.approx(
+        pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1)
+    )
 
 
 def test_embargo_split_without_embargo_is_contiguous():
@@ -275,9 +276,9 @@ def test_bar_duration_covers_both_timeframe_spellings():
 
 
 def test_diagnostics_payload_reports_embargo_in_bars():
-    import runner.optimizer as opt
-
     from types import SimpleNamespace
+
+    import runner.optimizer as opt
 
     config = opt.OptimizationConfig(
         base_backtest_id="bt_x",
