@@ -18,8 +18,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from validation.importers.mt5_xlsx import MT5XLSXImporter
-from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
 from runner.engines.base import resolve_strategy_parameters
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
@@ -27,6 +25,9 @@ from scripts.regenerate_mt5_parity_artifacts import (
     _load_ohlcv,
     _opposite_side_series,
 )
+from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
+from validation.importers.mt5_xlsx import MT5XLSXImporter
+from validation.reference import resolve_initial_capital
 
 MT5_SOURCE_TIMEZONE = "Europe/Athens"
 SESSION_TIMEZONE = ZoneInfo("Europe/Athens")
@@ -229,9 +230,7 @@ def _annualized_sortino_like(values: pd.Series, periods: float) -> float | None:
 
 
 def _trade_return_frame(reference: Any) -> pd.DataFrame:
-    initial_capital = float(
-        reference.raw_metadata.get("parsed_meta", {}).get("initial_capital") or 100000.0
-    )
+    initial_capital = resolve_initial_capital(reference)
     rows: list[dict[str, Any]] = []
     equity = initial_capital
     for trade in reference.trades:
@@ -258,9 +257,7 @@ def _daily_returns_from_reference_trades(reference: Any, *, business_days: bool 
     frame = _trade_return_frame(reference)
     if frame.empty:
         return pd.Series(dtype=float)
-    initial_capital = float(
-        reference.raw_metadata.get("parsed_meta", {}).get("initial_capital") or 100000.0
-    )
+    initial_capital = resolve_initial_capital(reference)
     daily_equity = frame.set_index("time").groupby(pd.Grouper(freq="D"))["equity_after"].last()
     full_index = pd.date_range(
         frame["time"].min().normalize(),
