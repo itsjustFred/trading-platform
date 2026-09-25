@@ -3033,6 +3033,10 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
+    thread = task.get("thread")
+    if isinstance(thread, threading.Thread):
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
