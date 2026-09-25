@@ -19,6 +19,7 @@ from data_tools.path_safety import build_dataset_path, validate_dataset_componen
 @pytest.mark.parametrize(
     "component",
     [
+        ".",
         "..",
         "../escape",
         "folder/file",
@@ -40,6 +41,11 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
 def test_dataset_component_rejects_explicit_parent_component() -> None:
     with pytest.raises(ValueError, match="traversal component"):
         validate_dataset_component("..")
+
+
+def test_dataset_component_rejects_current_directory_component() -> None:
+    with pytest.raises(ValueError, match="traversal component"):
+        validate_dataset_component(".")
 
 
 def test_dataset_path_rejects_parent_traversal_in_root(tmp_path: Path) -> None:

@@ -167,7 +167,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         "--readiness-golden",
         "--regression-golden",
         dest="readiness_golden",
-        help="Optional golden reference JSON; enables the full readiness gate.",
+        help="Optional golden reference JSON for the regression readiness check.",
     )
     return parser
 
@@ -222,18 +222,32 @@ def _readiness_report(
     platform: ValidationReference,
     trade_delta_report: TradeDeltaReport,
     risk_report: RiskComparisonReport,
-    golden_path: str,
+    golden_path: str | None,
     trade_config: TradeComparisonConfig,
     time_tolerance: float,
+    stats_tolerance: float = 0.001,
+    stats_absolute_tolerance: float = 0.01,
 ) -> ReadinessReport:
     regression_config = RegressionConfig(
         trade_config=trade_config,
         match_time_tolerance_seconds=int(time_tolerance),
+        default_stats_absolute_tolerance=stats_absolute_tolerance,
+        default_stats_relative_tolerance=stats_tolerance,
     )
-    regression = run_regression(
-        golden_path,
-        current_data=platform,
-        config=regression_config,
+    regression = (
+        run_regression(
+            golden_path,
+            current_data=platform,
+            config=regression_config,
+        )
+        if golden_path
+        else None
+    )
+    equity_evidence_status = (
+        "available"
+        if reference.equity_evidence_status == "available"
+        and platform.equity_evidence_status == "available"
+        else "missing"
     )
     return ReadinessValidator.validate(
         report=trade_delta_report,
@@ -243,7 +257,11 @@ def _readiness_report(
             compute_trade_statistics(reference.trades),
             compute_trade_statistics(platform.trades),
         ),
-        config=ReadinessConfig(),
+        config=ReadinessConfig(
+            stats_win_rate_tolerance_pct=stats_tolerance,
+            stats_net_profit_tolerance_pct=stats_tolerance,
+        ),
+        equity_evidence_status=equity_evidence_status,
     )
 
 
@@ -339,17 +357,17 @@ def main(argv: list[str] | None = None) -> int:
             args.time_tolerance,
             match_result,
         )
-        readiness = None
-        if args.readiness_golden:
-            readiness = _readiness_report(
-                reference,
-                platform,
-                trade_delta_report,
-                risk_report,
-                args.readiness_golden,
-                config,
-                args.time_tolerance,
-            )
+        readiness = _readiness_report(
+            reference,
+            platform,
+            trade_delta_report,
+            risk_report,
+            args.readiness_golden,
+            config,
+            args.time_tolerance,
+            args.stats_tolerance,
+            args.pnl_absolute_tolerance,
+        )
         report: ValidationReport = _build_validation_report(
             reference,
             platform,

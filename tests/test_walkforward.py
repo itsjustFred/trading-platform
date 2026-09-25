@@ -1,8 +1,8 @@
 """Tests for walk-forward analysis module."""
 from __future__ import annotations
 
-import json
 import inspect
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,8 +10,8 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from runner.engines.base import BacktestConfig
 from runner import walkforward as wf_module
+from runner.engines.base import BacktestConfig
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
 
@@ -319,6 +319,35 @@ class TestWalkforwardEdgeCases:
         assert captured_kwargs["train_months"] == 24
         assert captured_kwargs["test_months"] == 6
         assert captured_kwargs["n_trials"] == 200
+
+    def test_portfolio_walkforward_passes_purged_boundaries_to_optimizer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        captured: list[dict[str, Any]] = []
+
+        def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured.append(kwargs)
+            return {"sharpe": 1.0, "oos_sharpe": 0.5}
+
+        monkeypatch.setattr(wf_module, "optimize_portfolio_allocation", mock_optimize)
+
+        wf_module.run_walkforward(
+            backtest_ids=["strat1", "strat2"],
+            start="2024-01-01",
+            end="2024-12-31",
+            train_months=2,
+            test_months=1,
+            step_months=2,
+            purge_days=3,
+            embargo_days=2,
+            n_trials=1,
+            output_dir=tmp_path,
+        )
+
+        assert captured
+        for call in captured:
+            assert call["train_start"] < call["train_end"] < call["test_start"] <= call["test_end"]
+            assert call["train_end"] < call["test_start"]
 
     def test_walkforward_created_at_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Test that created_at uses ISO format with timezone."""

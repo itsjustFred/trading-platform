@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.path_safety import build_dataset_path
+from shared.atomic_io import atomic_replace, write_parquet_atomically
 from shared.constants import DATA_DIR
 from shared.sql import quote_identifier, quote_literal
 
@@ -156,8 +157,16 @@ def _list_tables(repo_path: Path) -> list[str]:
 
 def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     """Export a dolt table to CSV using 'dolt table export'."""
-    with open(output_csv, "w") as f:
-        run_dolt(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
+
+    def _write(target: Path) -> None:
+        with target.open("w", encoding="utf-8", newline="") as handle:
+            run_dolt(
+                ["dolt", "table", "export", "-f", table],
+                cwd=repo_path,
+                stdout=handle,
+            )
+
+    atomic_replace(output_csv, _write)
 
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
@@ -237,24 +246,28 @@ def _export_symbol_csv(
     try:
         out_parquet.parent.mkdir(parents=True, exist_ok=True)
         sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
-        with open(sym_csv, "w") as f:
-            subprocess.check_call(
-                [
-                    "dolt",
-                    "sql",
-                    "-q",
-                    build_ohlcv_select(table_name, symbol),
-                    "-r",
-                    "csv",
-                ],
-                cwd=stocks_repo,
-                stdout=f,
-            )
+
+        def _write_csv(target: Path) -> None:
+            with target.open("w", encoding="utf-8", newline="") as handle:
+                subprocess.check_call(
+                    [
+                        "dolt",
+                        "sql",
+                        "-q",
+                        build_ohlcv_select(table_name, symbol),
+                        "-r",
+                        "csv",
+                    ],
+                    cwd=stocks_repo,
+                    stdout=handle,
+                )
+
+        atomic_replace(sym_csv, _write_csv)
         df = pd.read_csv(sym_csv)
         if not df.empty:
             df.rename(columns={"date": "timestamp"}, inplace=True)
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df.to_parquet(out_parquet, index=False)
+            write_parquet_atomically(out_parquet, df)
     except Exception as e:
         logger.warning(f"Failed to export {symbol}: {e}")
     finally:
@@ -281,11 +294,12 @@ def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
             _export_table_csv(repo_path, table, csv_path)
             df = pd.read_csv(csv_path)
             if not df.empty:
-                df.to_parquet(out_parquet, index=False)
+                write_parquet_atomically(out_parquet, df)
                 logger.info(f"  Exported {table}: {len(df)} rows")
-            csv_path.unlink()
         except Exception as e:
             logger.warning(f"Failed to export {repo_name}/{table}: {e}")
+        finally:
+            csv_path.unlink(missing_ok=True)
 
 
 def export_data():
@@ -336,24 +350,28 @@ def export_data():
                 try:
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
                     sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
-                    with open(sym_csv, "w") as f:
-                        run_dolt(
-                            [
-                                "dolt",
-                                "sql",
-                                "-q",
-                                build_ohlcv_select(table_name, symbol),
-                                "-r",
-                                "csv",
-                            ],
-                            cwd=stocks_repo,
-                            stdout=f,
-                        )
+
+                    def _write_csv(target: Path) -> None:
+                        with target.open("w", encoding="utf-8", newline="") as handle:
+                            run_dolt(
+                                [
+                                    "dolt",
+                                    "sql",
+                                    "-q",
+                                    build_ohlcv_select(table_name, symbol),
+                                    "-r",
+                                    "csv",
+                                ],
+                                cwd=stocks_repo,
+                                stdout=handle,
+                            )
+
+                    atomic_replace(sym_csv, _write_csv)
                     df = pd.read_csv(sym_csv)
                     if not df.empty:
                         df.rename(columns={"date": "timestamp"}, inplace=True)
                         df["timestamp"] = pd.to_datetime(df["timestamp"])
-                        df.to_parquet(out_parquet, index=False)
+                        write_parquet_atomically(out_parquet, df)
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:

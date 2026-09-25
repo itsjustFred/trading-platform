@@ -122,7 +122,10 @@ def _risk_adjusted_metric_value(
         raise ValueError(
             f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
         )
-    sparsity = min(1.0, trade_count / max(int(min_trades_for_full_credit), 1))
+    sparsity = max(
+        0.0,
+        min(1.0, trade_count / max(int(min_trades_for_full_credit), 1)),
+    )
     drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
     return value * sparsity * drawdown_factor, terms

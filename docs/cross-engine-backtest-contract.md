@@ -176,9 +176,10 @@ Implementation:
   across symbols into `trade.meta["portfolio"]`. Trades flagged
   `equity_proportional_sizing=False` (native fixed-amount sizing is
   absolute-$) keep their quantity; exposure is still summed. Single-symbol
-  runs skip the replay (identity). The PyneCore adapter does NOT replay
-  shared equity yet — a multi-symbol PyneCore run still risks
-  N × risk_pct (known limitation).
+  runs skip the replay (identity). PyneCore performs the equivalent merged
+  sizing pass after parsing all symbols: entries are processed in timestamp
+  order against one realized-equity ledger, and the aggregate open notional
+  is capped by shared `max_leverage`.
 
 ## 5. Execution-timing models (documented divergence)
 

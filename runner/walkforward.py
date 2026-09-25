@@ -268,6 +268,10 @@ def _run_portfolio_walkforward(
             test_months=test_months,
             start_date=window["train_start"] if window else None,
             end_date=window["test_end"] if window else None,
+            train_start=window["train_start"] if window else None,
+            train_end=window["train_end"] if window else None,
+            test_start=window["test_start"] if window else None,
+            test_end=window["test_end"] if window else None,
         )
         folds.append(
             {

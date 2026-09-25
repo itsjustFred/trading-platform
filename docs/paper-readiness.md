@@ -23,7 +23,8 @@ Prüfungen durch:
 | f | `stats_net_profit` | Net-Profit-Differenz innerhalb Toleranz |
 | g | `risk_position_size` | Position-Size-Differenz innerhalb Toleranz |
 | h | `risk_stop_distance` | Stop-Distance-Differenz innerhalb Toleranz |
-| i | `regression_status` | Regression bestanden (sofern vorhanden) |
+| i | `regression_status` | Regression bestanden; fehlende Regression-Evidenz ist ein Readiness-Fehler |
+| j | `equity_evidence` | Equity-Evidenz für Referenz und Plattform vorhanden |
 
 Jede Prüfung erzeugt ein :class:`~validation.readiness.models.ReadinessCheck` mit:
 - `name` — maschinenlesbarer Name
@@ -59,6 +60,10 @@ konfigurierbaren Schwellen:
 | `max_stop_distance_diff_pct` | `0.01` (1 %) | Maximale relative Stop-Distance-Abweichung |
 | `stats_win_rate_tolerance_pct` | `0.01` (1 %) | Maximale relative Win-Rate-Abweichung |
 | `stats_net_profit_tolerance_pct` | `0.01` (1 %) | Maximale relative Net-Profit-Abweichung |
+
+Die Validation-CLI führt Readiness immer aus. Ohne Golden-Datei fehlt die
+Regression-Evidenz; ohne Equity-Kurve auf beiden Seiten fehlt die
+Kalender-Evidenz. Beide Fälle blockieren die Zertifizierung.
 
 ## Was würde Paper Trading bedeuten?
 

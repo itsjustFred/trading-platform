@@ -831,6 +831,25 @@ class TestRiskAdjustedObjective:
         )
         assert robust > lucky
 
+    def test_sparsity_credit_is_clamped_to_unit_interval(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        _value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": -10, "max_drawdown_pct": 0.0},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["sparsity_factor"] == 0.0
+
+        _value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 300, "max_drawdown_pct": 0.0},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["sparsity_factor"] == 1.0
+
     def test_full_credit_leaves_value_untouched(self) -> None:
         from runner.optimizer import _risk_adjusted_metric_value
 

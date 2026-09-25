@@ -13,6 +13,25 @@ from risk.models import RiskDecision, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+)
+@pytest.mark.parametrize("value", [0.0, -0.01, 1.01, math.nan, math.inf])
+def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
+    with pytest.raises(ValueError):
+        RiskConfig(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+)
+def test_risk_config_accepts_upper_fraction_boundary(field_name):
+    config = RiskConfig(**{field_name: 1.0})
+    assert getattr(config, field_name) == 1.0
+
+
 def test_calculate_position_size_normal_case():
     engine = RiskEngine(
         RiskConfig(

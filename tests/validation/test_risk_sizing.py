@@ -236,10 +236,8 @@ def test_calculate_trade_risk_total_exposure_zero_size() -> None:
 
 
 def test_adapter_custom_pip_value_changes_position_size() -> None:
-    trade = _make_trade(entry_price=1.1000, stop_loss=1.0900)
-    # Notional cap (default 0.2 * balance) would bind for these FX-sized
-    # positions; lift it so the pip-value scaling relationship stays observable.
-    engine = RiskEngine(RiskConfig(max_notional_per_trade=100.0))
+    trade = _make_trade(entry_price=1.1000, stop_loss=1.0000)
+    engine = RiskEngine(RiskConfig())
     adapter1 = RiskAdapter(engine=engine, pip_value=1.0)
     adapter2 = RiskAdapter(engine=engine, pip_value=2.0)
     profile1 = adapter1.calculate_trade_risk(trade, "EURUSD", "1h", account_balance=10_000.0)

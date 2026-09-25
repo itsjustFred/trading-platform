@@ -249,7 +249,7 @@ class TestRiskTargetMath:
         config = _config(
             tmp_path,
             risk_per_trade_pct=0.02,
-            max_position_pct=10.0,   # no cap binds
+            max_position_pct=1.0,   # no cap binds
             max_leverage=10.0,
         )
         result = VectorbtAdapter().run(config, str(strategy_path))
@@ -343,7 +343,7 @@ class TestCurveReplayOrderAndUncappedSizing:
         config = _config(
             tmp_path,
             risk_per_trade_pct=0.02,
-            max_position_pct=10.0,
+            max_position_pct=1.0,
             max_leverage=10.0,
         )
         result = VectorbtAdapter().run(config, str(strategy_path))
@@ -364,16 +364,16 @@ class TestCurveReplayOrderAndUncappedSizing:
 
 class TestTightCapSizing:
     def test_tight_leverage_caps_notional_exactly(self, sizing_env):
-        """max_leverage=1 with max_position_pct=10: notional == equity * 1.0.
+        """max_leverage=1 with a full-equity position cap: notional == equity.
 
-        Kills the min→max mutant: with max() the notional would follow the
-        position cap (10x) instead of the leverage limit (1x).
+        Kills the min→max mutant: with max() the notional would follow a
+        looser position cap instead of the leverage limit.
         """
         tmp_path, strategy_path = sizing_env
         config = _config(
             tmp_path,
             risk_per_trade_pct=0.5,   # huge risk target, cap must bind
-            max_position_pct=10.0,
+            max_position_pct=1.0,
             max_leverage=1.0,
         )
         result = VectorbtAdapter().run(config, str(strategy_path))
@@ -383,7 +383,7 @@ class TestTightCapSizing:
             notional = trade.entry_price * trade.quantity
             assert notional <= risk_math["equity_at_entry"] * 1.0 + 1e-6, (
                 "the leverage limit (1x) must bind the notional even when the "
-                "position cap is 10x"
+                "position cap is full-equity"
             )
             assert risk_math["capped_by_max_leverage"] is True
 

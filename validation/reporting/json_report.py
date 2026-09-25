@@ -281,6 +281,7 @@ class ValidationReport(BaseModel):
     risk_passed: bool = False
     risk_evidence_present: bool = False
     risk_evidence_status: str = "missing"
+    equity_passed: bool = False
     equity_evidence_status: str = "missing"
     readiness: ReadinessReport | None = None
 
@@ -604,8 +605,15 @@ def _build_validation_report(
     trade_passed = trade_delta_report.passed
     stat_passed = bool(stat_deltas) and all(d.passed for d in stat_deltas)
     risk_passed = risk_evidence_present and risk_evidence_passed
+    equity_passed = equity_evidence_status == "available"
     readiness_passed = readiness is None or readiness.passed
-    overall_passed = trade_passed and stat_passed and risk_passed and readiness_passed
+    overall_passed = (
+        trade_passed
+        and stat_passed
+        and risk_passed
+        and equity_passed
+        and readiness_passed
+    )
 
     report = ValidationReport(
         strategy_name=reference.strategy_name,
@@ -618,6 +626,7 @@ def _build_validation_report(
         risk_passed=risk_passed,
         risk_evidence_present=risk_evidence_present,
         risk_evidence_status=risk_evidence_status,
+        equity_passed=equity_passed,
         equity_evidence_status=equity_evidence_status,
         readiness=readiness,
         trade_summary=trade_summary,
@@ -677,6 +686,7 @@ def _build_recommendation(data: dict[str, Any]) -> list[str]:
     trade_passed = data.get("trade_passed", False)
     stat_passed = data.get("stat_passed", False)
     risk_passed = data.get("risk_passed", False)
+    equity_passed = data.get("equity_passed", False)
     readiness = data.get("readiness")
 
     if passed:
@@ -704,6 +714,8 @@ def _build_recommendation(data: dict[str, Any]) -> list[str]:
             issues.append("missing or empty risk evidence")
         else:
             issues.append("risk deviations")
+    if not equity_passed:
+        issues.append("missing equity evidence")
     if readiness is not None and not readiness.get("passed", False):
         issues.append("readiness validation")
 

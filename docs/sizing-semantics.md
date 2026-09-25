@@ -6,6 +6,10 @@ implemented in Cleanup 16-E (#41). Pinned by `tests/test_sizing_semantics.py`.
 
 ## The three knobs — one documented meaning each
 
+All exposure fractions are validated as finite values in the inclusive range
+`0 < value <= 1`. `max_leverage` is a separate multiple of equity and is not a
+fraction-valued exposure field.
+
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|
 | `max_position_exposure_pct` | `BacktestConfig` field, CLI `--max-position-exposure-pct` | **Position-size semantics**: the maximum notional of ONE position as a fraction of equity (e.g. `0.2` = a single position may reach 20% of equity). Not an aggregate-portfolio limit and not a loss budget. |

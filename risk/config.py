@@ -47,18 +47,18 @@ class RiskConfig:
         self.allow_fallback_stop = self._bool(self.allow_fallback_stop, "allow_fallback_stop")
         self.reject_missing_stop = self._bool(self.reject_missing_stop, "reject_missing_stop")
 
-        if self.max_risk_per_trade <= 0:
-            raise ValueError("max_risk_per_trade must be > 0")
-        if self.max_total_exposure <= 0:
-            raise ValueError("max_total_exposure must be > 0")
+        if not 0 < self.max_risk_per_trade <= 1:
+            raise ValueError("max_risk_per_trade must be > 0 and <= 1")
+        if not 0 < self.max_total_exposure <= 1:
+            raise ValueError("max_total_exposure must be > 0 and <= 1")
         if self.max_positions <= 0:
             raise ValueError("max_positions must be > 0")
         if self.default_sl_atr_multiplier <= 0:
             raise ValueError("default_sl_atr_multiplier must be > 0")
         if not (0 < self.fallback_stop_pct < 1):
             raise ValueError("fallback_stop_pct must be between 0 and 1")
-        if self.max_notional_per_trade <= 0:
-            raise ValueError("max_notional_per_trade must be > 0")
+        if not 0 < self.max_notional_per_trade <= 1:
+            raise ValueError("max_notional_per_trade must be > 0 and <= 1")
 
     @staticmethod
     def _finite_float(value: object, field_name: str) -> float:
