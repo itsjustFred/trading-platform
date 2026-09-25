@@ -50,6 +50,33 @@ test("missing, non-numeric, and non-finite target-metric OOS values are unavaila
   }
 });
 
+test("non-finite in-sample values make OOS evidence unavailable", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  for (const inSampleValue of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    const evidence = classifyOptimizationOosEvidence("sharpe", inSampleValue, { sharpe_ratio: 1.2 });
+
+    assert.equal(evidence.state, "unavailable");
+    assert.equal(evidence.metricKey, "sharpe_ratio");
+    assert.equal(evidence.oosValue, null);
+    assert.match(evidence.message, /in-sample selected score.*not finite/i);
+  }
+});
+
+test("p_value above one is rejected as invalid OOS evidence", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  const boundary = classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 1 });
+  const evidence = classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 1.01 });
+
+  assert.equal(boundary.label, "OOS significance lost");
+  assert.equal(evidence.state, "degraded");
+  assert.equal(evidence.metricKey, "p_value");
+  assert.equal(evidence.oosValue, 1.01);
+  assert.equal(evidence.label, "OOS significance invalid");
+  assert.match(evidence.message, /probability interval 0\.\.1/i);
+});
+
 test("positive in-sample selection degrading to non-positive OOS is explicit", async () => {
   const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
 

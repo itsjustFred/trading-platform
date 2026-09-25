@@ -9,9 +9,13 @@ import re
 import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
+import pytest
+
 from live_runner import account_discovery
+from scripts import verify_ctrader_order, wheel_smoke
 from scripts.sync_requirements_from_lock import requirements_drift
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +89,17 @@ assert 'ctrader_open_api' not in sys.modules
     assert result.returncode == 0, result.stderr
 
 
+def test_wheel_smoke_propagates_missing_account_discovery_import(tmp_path: Path) -> None:
+    wheel_path = tmp_path / "trading_platform-0.1.0-py3-none-any.whl"
+    entries = (*wheel_smoke.PACKAGE_ENTRIES, *wheel_smoke.RESOURCE_ENTRIES)
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        for entry in entries:
+            archive.writestr(entry, b"")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        wheel_smoke.smoke(wheel_path)
+
+
 def test_verify_script_import_has_no_broker_side_effects() -> None:
     code = """
 import runpy, sys
@@ -146,6 +161,151 @@ def test_verify_report_writer_is_atomic_and_private(tmp_path: Path) -> None:
     assert json.loads(out_path.read_text(encoding="utf-8")) == {"verified": True}
     if os.name != "nt":
         assert stat.S_IMODE(out_path.stat().st_mode) == 0o600
+
+
+def test_verify_report_writer_fsyncs_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    real_fsync = verify_ctrader_order.os.fsync
+    real_replace = verify_ctrader_order.os.replace
+
+    def tracked_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+
+    def tracked_replace(source: Path, destination: Path) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(verify_ctrader_order.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(verify_ctrader_order.os, "replace", tracked_replace)
+
+    verify_ctrader_order._write_report_atomic(
+        {"verified": True},
+        tmp_path / "report.json",
+    )
+
+    assert events == ["fsync", "replace"]
+
+
+@pytest.mark.parametrize("failure_point", ["fsync", "replace"])
+def test_verify_report_writer_removes_temp_file_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    if failure_point == "fsync":
+
+        def fail_fsync(_fd: int) -> None:
+            raise OSError("fsync failed")
+
+        monkeypatch.setattr(verify_ctrader_order.os, "fsync", fail_fsync)
+    else:
+
+        def fail_replace(_source: Path, _destination: Path) -> None:
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(verify_ctrader_order.os, "replace", fail_replace)
+
+    out_path = tmp_path / "report.json"
+    out_path.write_text('{"verified": false}\n', encoding="utf-8")
+
+    with pytest.raises(OSError, match=f"{failure_point} failed"):
+        verify_ctrader_order._write_report_atomic({"verified": True}, out_path)
+
+    assert out_path.read_text(encoding="utf-8") == '{"verified": false}\n'
+    assert list(tmp_path.glob(f".{out_path.name}.*.tmp")) == []
+
+
+def test_verify_report_writer_closes_unbound_descriptor_and_temp_file_on_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: dict[str, object] = {}
+    closed_fds: list[int] = []
+    real_mkstemp = verify_ctrader_order.tempfile.mkstemp
+    real_close = verify_ctrader_order.os.close
+
+    def tracked_mkstemp(*args, **kwargs):
+        fd, temp_name = real_mkstemp(*args, **kwargs)
+        created["fd"] = fd
+        created["path"] = Path(temp_name)
+        return fd, temp_name
+
+    def fail_chmod(_path: Path, _mode: int) -> None:
+        raise OSError("chmod failed")
+
+    def tracked_close(fd: int) -> None:
+        closed_fds.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(verify_ctrader_order.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(verify_ctrader_order.os, "chmod", fail_chmod)
+    monkeypatch.setattr(verify_ctrader_order.os, "close", tracked_close)
+
+    with pytest.raises(OSError, match="chmod failed"):
+        verify_ctrader_order._write_report_atomic({"verified": True}, tmp_path / "report.json")
+
+    temp_path = created["path"]
+    assert isinstance(temp_path, Path)
+    assert created["fd"] in closed_fds
+    assert not temp_path.exists()
+
+
+def test_verify_report_writer_cleans_temp_file_after_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Interrupted(BaseException):
+        pass
+
+    def interrupt_replace(_source: Path, _destination: Path) -> None:
+        raise _Interrupted
+
+    monkeypatch.setattr(verify_ctrader_order.os, "replace", interrupt_replace)
+    out_path = tmp_path / "report.json"
+    out_path.write_text('{"verified": false}\n', encoding="utf-8")
+
+    with pytest.raises(_Interrupted):
+        verify_ctrader_order._write_report_atomic({"verified": True}, out_path)
+
+    assert out_path.read_text(encoding="utf-8") == '{"verified": false}\n'
+    assert list(tmp_path.glob(f".{out_path.name}.*.tmp")) == []
+
+
+def test_verify_report_writer_preserves_primary_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_path = tmp_path / "report.json"
+    out_path.write_text('{"verified": false}\n', encoding="utf-8")
+    temp_path: Path | None = None
+    cleanup_attempts: list[Path] = []
+    real_unlink = Path.unlink
+
+    def fail_replace(source: Path, _destination: Path) -> None:
+        nonlocal temp_path
+        temp_path = source
+        raise OSError("replace failed")
+
+    def fail_temp_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.suffix == ".tmp":
+            cleanup_attempts.append(path)
+            raise OSError("cleanup failed")
+        real_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(verify_ctrader_order.os, "replace", fail_replace)
+        patch.setattr(Path, "unlink", fail_temp_unlink)
+        with pytest.raises(OSError, match="replace failed"):
+            verify_ctrader_order._write_report_atomic({"verified": True}, out_path)
+
+    assert temp_path is not None
+    assert cleanup_attempts == [temp_path]
+    assert out_path.read_text(encoding="utf-8") == '{"verified": false}\n'
+    real_unlink(temp_path)
 
 
 def test_live_deployment_file_is_not_tracked_and_example_is_symbolic() -> None:

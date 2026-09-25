@@ -4748,6 +4748,60 @@ def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, 
     ]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/logs/ALL_LOGS",
+        "/api/services/service-log-test/logs",
+    ],
+)
+def test_log_endpoints_cap_response_lines(viewer_client, monkeypatch, path):
+    import viewer.main as viewer_app_module
+
+    entries = [
+        {
+            "line": f"line-{index}",
+            "timestamp": None,
+            "level": "INFO",
+            "path": "viewer.log",
+            "line_number": index,
+        }
+        for index in range(2001)
+    ]
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_collect_log_entries",
+        lambda _paths: entries,
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_service",
+        lambda _service_id: SimpleNamespace(
+            id="service-log-test",
+            name="service-log-test",
+            config={},
+            type=SimpleNamespace(value="runner"),
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_entry_matches_service_log",
+        lambda *_args, **_kwargs: True,
+    )
+
+    requested = viewer_client.get(f"{path}?lines=3")
+    capped = viewer_client.get(f"{path}?lines=100000")
+
+    assert requested.status_code == 200
+    assert requested.json()["lines"] == ["line-1998", "line-1999", "line-2000"]
+    assert capped.status_code == 200
+    capped_lines = capped.json()["lines"]
+    assert len(capped_lines) == 2000
+    assert capped_lines[0] == "line-1"
+    assert capped_lines[-1] == "line-2000"
+    assert capped.json()["total_lines"] == 2001
+
+
 def test_logs_endpoint_sorts_space_separated_timestamps(viewer_client, tmp_path):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
