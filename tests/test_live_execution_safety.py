@@ -3208,8 +3208,6 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
     """Relative distances are signed by trade side at the protocol level; the
     sent magnitude must be the positive distance in 1/100000 price units, and
     wrong-side/non-finite/zero-distance prices must fail closed."""
-    from live_runner import ctrader_adapter as module
-
     module, adapter = _make_ctrader_request_builder_adapter()
 
     def _signal(action, stop_loss, take_profit, theoretical_price=1.1):
