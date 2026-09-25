@@ -110,6 +110,14 @@ Execution and conversion layer.
   documented meaning each — see `docs/sizing-semantics.md`. `max_position_pct` /
   `--max-position-pct` remain as deprecated aliases.
 
+### Optimization and walk-forward artifacts
+
+Portfolio optimization normalizes each equity curve to its first observation
+before correlation, weighting, and OOS metrics. Persisted portfolio artifacts
+carry a UUID suffix to avoid same-second collisions. Walk-forward steps default
+to the test-window length; custom steps, purge windows, and embargo windows
+require explicit start and end boundaries so OOS folds cannot overlap silently.
+
 ### `viewer/`
 
 Operational FastAPI application.

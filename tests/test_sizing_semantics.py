@@ -13,6 +13,7 @@ name) keep old invocations working during migration and emit a
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 import argparse
 import contextlib
@@ -25,7 +26,6 @@ from pydantic import ValidationError
 
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import _resolve_max_position_exposure_pct
-from tests.helpers import with_zero_fees
 
 # ─── BacktestConfig field semantics ─────────────────────────────────────────
 
@@ -279,7 +279,9 @@ class TestCliRunWiring:
 
 
 class TestNativeEngineExposureWiring:
-    """F7, native half: ``max_position_exposure_pct`` is the per-position cap."""
+    """F7, native half: ``max_position_exposure_pct`` is the aggregate exposure
+    input the native TradeEngine feeds into ``RiskConfig.max_total_exposure`` —
+    explicitly, no undocumented 5% default divergence."""
 
     @staticmethod
     def _engine(**overrides):
@@ -298,18 +300,9 @@ class TestNativeEngineExposureWiring:
         payload.update(overrides)
         return TradeEngine(BacktestConfig(**with_zero_fees(payload)), symbol="X")
 
-    def test_exposure_flag_caps_per_position_notional(self):
-        from risk.config import RiskConfig
-
-        engine = self._engine(max_position_exposure_pct=0.4, max_leverage=3.0)
-        assert engine._risk_engine.config.max_total_exposure == RiskConfig().max_total_exposure
-        assert engine._max_position_exposure_pct == pytest.approx(0.4)
-        shares = engine._calculate_position_size(
-            entry_price=100.0,
-            stop_loss_price=99.0,
-            direction="LONG",
-        )
-        assert shares == pytest.approx(400.0)
+    def test_exposure_flag_feeds_max_total_exposure(self):
+        engine = self._engine(max_position_exposure_pct=0.4)
+        assert engine._risk_engine.config.max_total_exposure == 0.4
 
     def test_unset_flag_keeps_the_documented_risk_engine_default(self):
         engine = self._engine()
@@ -331,7 +324,7 @@ class TestNativeEngineExposureWiring:
     def test_deprecated_alias_feeds_the_same_value(self):
         with pytest.warns(DeprecationWarning):
             engine = self._engine(max_position_pct=0.4)
-        assert engine._max_position_exposure_pct == pytest.approx(0.4)
+        assert engine._risk_engine.config.max_total_exposure == 0.4
 
     def test_risk_per_trade_pct_is_the_maximum_loss_per_trade(self):
         engine = self._engine(risk_per_trade_pct=0.01)
@@ -344,15 +337,6 @@ class TestNativeEngineExposureWiring:
         assert sized.risk_amount == pytest.approx(1_000.0)
         assert sized.risk_percent == pytest.approx(0.01)
         assert sized.position_size == pytest.approx(200.0)
-
-    def test_native_leverage_above_one_is_independent_of_risk_model_cap(self):
-        engine = self._engine(max_leverage=2.0)
-        shares = engine._calculate_position_size(
-            entry_price=100.0,
-            stop_loss_price=99.9,
-            direction="LONG",
-        )
-        assert shares == pytest.approx(2_000.0)
 
 
 def _signal(*, entry_price: float, stop_loss: float):
