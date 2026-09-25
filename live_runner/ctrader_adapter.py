@@ -1738,10 +1738,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
         }
         cancelled = 0
-        for order in getattr(order_list_res, "orders", []) or []:
+        # ProtoOAOrderListRes names the repeated field `order`, not `orders`.
+        for order in getattr(order_list_res, "order", []) or []:
             order_type = int(getattr(order, "orderType", 0) or 0)
-            order_id = str(getattr(order, "orderId", "") or "").strip()
-            if not order_id or order_type not in cancellable:
+            if order_type not in cancellable:
+                continue
+            # orderId is a protobuf int64: assigning the string form raises
+            # TypeError on the wire, so coerce and skip anything unparseable.
+            try:
+                order_id = int(getattr(order, "orderId", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if order_id <= 0:
                 continue
             cancel_req = self._ProtoOACancelOrderReq()
             cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
@@ -1761,12 +1769,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         positions = await self._fetch_open_positions()
         closed = 0
         for position in positions:
-            position_id = str(getattr(position, "positionId", "") or "").strip()
-            if not position_id:
+            # positionId and volume are protobuf int64 fields; the string form
+            # cannot be assigned and an unset volume serializes as 0, which
+            # cTrader rejects rather than closing the position.
+            try:
+                position_id = int(getattr(position, "positionId", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if position_id <= 0:
+                continue
+            trade_data = getattr(position, "tradeData", None)
+            # volume is a protobuf integer field: a float raises TypeError on
+            # assignment, and 0 is rejected by cTrader instead of closing.
+            try:
+                volume = int(_to_float(getattr(trade_data, "volume", 0) if trade_data else 0))
+            except (TypeError, ValueError):
+                continue
+            if volume <= 0:
                 continue
             close_req = self._ProtoOAClosePositionReq()
             close_req.ctidTraderAccountId = self.ctid_trader_account_id
             close_req.positionId = position_id
+            close_req.volume = volume
             # volume omitted => close the full position at market.
             try:
                 await self._send_request_with_refresh_retry(

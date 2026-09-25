@@ -17,6 +17,9 @@ from uuid import uuid4
 
 import pytest
 
+import ctrader_open_api.messages.OpenApiMessages_pb2 as _real
+import ctrader_open_api.messages.OpenApiModelMessages_pb2 as _real_model
+
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
 # The reconcile-payload helpers below build real protobuf messages; without
@@ -707,32 +710,21 @@ class _FakeCTraderAdapter:
     def _raise_terminal_auth_from_api_error(self, exc):
         return None
 
-    # Minimal protobuf stand-ins.
-    class _Req:
-        def __init__(self):
-            self.ctidTraderAccountId = 0
-            self.orderId = ""
-            self.positionId = ""
-            self.fromTimestamp = 0
-            self.toTimestamp = 0
+    # Use the REAL protobuf message classes. Hand-rolled stand-ins accepted
+    # whatever the adapter assigned to them, so a str being assigned to an
+    # int64 field (which raises TypeError on the wire) passed these tests.
+    _ProtoOAOrderListReq = _real.ProtoOAOrderListReq
+    _ProtoOACancelOrderReq = _real.ProtoOACancelOrderReq
+    _ProtoOAClosePositionReq = _real.ProtoOAClosePositionReq
+    _ProtoOAOrderType = _real_model.ProtoOAOrderType
 
     class _OrderListRes:
+        """Real response shape: the repeated field is named `order`, not `orders`."""
+
         def __init__(self, orders):
-            self.orders = orders
+            self.order = list(orders)
 
-    class _OrderType:
-        MARKET = 1
-        LIMIT = 2
-        STOP = 3
-        STOP_LOSS_TAKE_PROFIT = 4
-        MARKET_RANGE = 5
-        STOP_LIMIT = 6
-
-    _ProtoOAOrderListReq = _Req
-    _ProtoOACancelOrderReq = _Req
-    _ProtoOAClosePositionReq = _Req
     _ProtoOAOrderListRes = _OrderListRes
-    _ProtoOAOrderType = _OrderType
 
     async def connect(self):
         return None
@@ -750,8 +742,14 @@ class _FakeCTraderAdapter:
         return await source(self)
 
 
-def _order(order_id, order_type):
-    return type("O", (), {"orderId": order_id, "orderType": order_type})()
+def _order(order_id: int, order_type: int):
+    """A real ProtoOAOrder: ids are int64, so a string id would be rejected."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.orderId = order_id
+    order.orderType = order_type
+    return order
 
 
 async def _cancel(orders):
@@ -768,17 +766,17 @@ def test_cancel_skips_market_orders_and_cancels_resting_ones():
     adapter, cancelled = _run(
         _cancel(
             [
-                _order("mkt-1", 1),
-                _order("lim-1", 2),
-                _order("sltp-1", 4),
-                _order("stoplim-1", 6),
+                _order(101, 1),  # MARKET
+                _order(102, 2),  # LIMIT
+                _order(103, 4),  # STOP_LOSS_TAKE_PROFIT
+                _order(104, 6),  # STOP_LIMIT
             ]
         )
     )
     assert cancelled == 3, "market orders fill immediately and cannot be cancelled"
-    ids = [getattr(r, "orderId", "") for r in adapter.sent]
-    assert "mkt-1" not in ids
-    assert {"lim-1", "sltp-1", "stoplim-1"} <= set(ids)
+    ids = [int(getattr(r, "orderId", 0) or 0) for r in adapter.sent if getattr(r, "orderId", 0)]
+    assert 101 not in ids, "market orders fill immediately and cannot be cancelled"
+    assert {102, 103, 104} <= set(ids)
 
 
 def test_cancel_with_no_orders_is_a_no_op():
@@ -802,10 +800,7 @@ def test_cancel_rejects_an_unexpected_response_type():
 def test_flatten_closes_every_open_position():
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
-    positions = [
-        type("P", (), {"positionId": "pos-1", "tradeData": None})(),
-        type("P", (), {"positionId": "pos-2", "tradeData": None})(),
-    ]
+    positions = [_real_position(201, 1000), _real_position(202, 2000)]
     adapter = _FakeCTraderAdapter([], positions)
 
     class _ReconcileRes:
@@ -820,14 +815,16 @@ def test_flatten_closes_every_open_position():
     adapter._fetch_open_positions = _positions
     closed = _run(CTraderLiveAdapter.close_all_positions(adapter))
     assert closed == 2
-    closed_ids = [r.positionId for r in adapter.sent]
-    assert closed_ids == ["pos-1", "pos-2"]
+    closed_ids = [int(r.positionId) for r in adapter.sent]
+    assert closed_ids == [201, 202]
+    # A full close must carry the position volume; cTrader rejects volume 0.
+    assert all(int(r.volume) > 0 for r in adapter.sent)
 
 
 def test_flatten_skips_positions_without_an_id():
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
-    positions = [type("P", (), {"positionId": "", "tradeData": None})()]
+    positions = [_real_position(0, 0)]
     adapter = _FakeCTraderAdapter([], positions)
 
     async def _positions():
@@ -857,3 +854,26 @@ def test_both_brokers_now_advertise_the_controls():
     bare = _Bare()
     assert bare.supports_cancel_orders is False
     assert bare.supports_flatten is False
+
+
+def _real_order(order_id: int, order_type: int):
+    """A real ProtoOAOrder with the fields the adapter reads."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.orderId = order_id
+    order.orderType = order_type
+    return order
+
+
+def _real_position(position_id: int, volume: int):
+    """A real ProtoOAPosition with the fields the adapter reads."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition
+
+    position = ProtoOAPosition()
+    position.positionId = position_id
+    position.positionStatus = 1  # POSITION_STATUS_OPEN
+    trade_data = position.tradeData
+    trade_data.symbolId = 1
+    trade_data.volume = volume
+    return position
