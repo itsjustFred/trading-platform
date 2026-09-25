@@ -1481,3 +1481,89 @@ def test_paused_deployment_is_never_flattened(monkeypatch):
     assert adapter.cancel_calls == 0
     assert adapter.flatten_calls == 0
     assert enforced == set()
+
+
+def test_stopped_deployment_refuses_to_flatten_a_shared_active_account():
+    """cancel/flatten are account-wide.
+
+    If another deployment on the same account is still ACTIVE, flattening would
+    liquidate its positions as collateral damage. The stop must be refused and
+    left un-enforced so it is retried, never reported as honoured.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    stopped = _stopped_deployment()
+    other = _Config(
+        id="66666666-6666-4666-8666-666666666666",
+        strategy_name="other",
+        account_id=stopped.account_id,
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="internal",
+    )
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [stopped, other], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 0, "must not cancel orders on a shared account"
+    assert adapter.flatten_calls == 0, "must not flatten another deployment's positions"
+    assert enforced == set(), "a refused stop must be retried, not marked honoured"
+
+
+def test_stopped_deployment_flattens_when_the_account_is_exclusively_stopped():
+    """The guard must not block the ordinary case where the stopped deployment is
+    the only one on its account."""
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
+def test_auth_scheme_is_keyed_like_the_token_for_a_deployment_without_an_id():
+    """Token and auth scheme must resolve against the same service name.
+
+    `_resolve_account_discord_token` falls back to `signal_config["service_name"]`
+    when `signal_source_id` is empty. Keying the scheme off `signal_source_id`
+    alone meant such a deployment found its token but ignored the per-bot
+    `DISCORD_BOT_<NAME>_AUTH_SCHEME` override, sending a `Bot` header for an
+    account token and getting a 401.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    deployment = _Config(
+        id="77777777-7777-4777-8777-777777777777",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_TOKEN": "tok",
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",
+        "DISCORD_AUTH_SCHEME": "bot",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "tok"
+    assert scheme == "account", (
+        "the per-bot auth scheme must win over the global default, as it does for the token"
+    )

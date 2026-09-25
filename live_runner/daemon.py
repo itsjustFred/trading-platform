@@ -1111,6 +1111,25 @@ def _resolve_account_discord_token(
     return discord_token
 
 
+def _resolve_account_discord_credentials(
+    accounts_env_values: Mapping[str, str],
+    deployment: LiveDeploymentConfig,
+) -> tuple[str, str]:
+    """Resolve a deployment's Discord token and auth scheme together.
+
+    Both must be keyed by the same service name. Resolving them separately let
+    the token fall back to `signal_config["service_name"]` while the scheme read
+    `signal_source_id` alone, so an id-less deployment found its token but sent a
+    `Bot` header for an account token and got a 401. Returning both from one
+    place makes that split unrepresentable.
+    """
+    service_name = _deployment_service_name(deployment)
+    return (
+        _resolve_account_discord_token(accounts_env_values, deployment),
+        _resolve_discord_auth_scheme(service_name, accounts_env_values),
+    )
+
+
 def _deployment_covers_discord_symbol(
     deployment: LiveDeploymentConfig,
     symbol: str,
@@ -1528,17 +1547,16 @@ async def _run_discord_signal_listener_for_account(
             },
         )
         return
+    discord_token, discord_auth_scheme = _resolve_account_discord_credentials(
+        accounts_env_values,
+        primary_deployment,
+    )
     source = DiscordSignalSource(
-        token=_resolve_account_discord_token(
-            accounts_env_values,
-            primary_deployment,
-        ),
+        token=discord_token,
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
-        auth_scheme=_resolve_discord_auth_scheme(
-            str(primary_deployment.signal_source_id or ""), accounts_env_values
-        ),
+        auth_scheme=discord_auth_scheme,
     )
     await source.connect()
     try:
@@ -2492,12 +2510,35 @@ async def _enforce_stopped_deployments(
         {deployment_id for deployment_id in already_enforced if deployment_id not in stopped_ids}
     )
 
+    # cancel/flatten act on the whole broker account, not on one deployment's
+    # positions. If another deployment on the same account is still ACTIVE, its
+    # positions would be liquidated as collateral damage, so refuse and say so
+    # rather than pretending the stop succeeded.
+    active_accounts = {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+    }
+
     for deployment in stopped:
         deployment_id = str(deployment.id)
         if deployment_id in already_enforced:
             continue
 
         adapter = active_adapters.get(deployment.account_id)
+        if deployment.account_id in active_accounts:
+            logger.error(
+                "Refusing to flatten a shared account: another deployment on it is "
+                "still ACTIVE and its positions would be closed too",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
         if adapter is None:
             # Deliberately NOT recorded as enforced. "No adapter" does not mean
             # "nothing is open": `active_adapters` is empty for every account
