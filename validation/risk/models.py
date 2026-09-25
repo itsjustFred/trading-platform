@@ -20,7 +20,7 @@ def _validate_optional_positive(value: float | None, field_name: str) -> None:
 def _validate_optional_fraction(value: float | None, field_name: str) -> None:
     if value is None:
         return
-    if not math.isfinite(value) or not 0 < value <= 1:
+    if not math.isfinite(value) or not 0 <= value <= 1:
         raise ValueError(f"{field_name} must be finite and between 0 and 1")
 
 
@@ -47,6 +47,11 @@ class RiskModelConfig(BaseModel):
     risk_amount: float | None = None
     risk_percent: float | None = None
 
+    @model_validator(mode="after")
+    def _validate_risk_percent(self) -> "RiskModelConfig":
+        _validate_optional_nonnegative(self.risk_amount, "risk_amount")
+        _validate_optional_fraction(self.risk_percent, "risk_percent")
+        return self
 
 
 def enforce_minimum_position_size(position_size: float, min_position_size: float) -> float:
@@ -115,7 +120,7 @@ class TradeRiskProfile(BaseModel):
         _validate_optional_positive(self.take_profit, "take_profit")
         _validate_optional_nonnegative(self.position_size, "position_size")
         _validate_optional_nonnegative(self.risk_amount, "risk_amount")
-        _validate_optional_nonnegative(self.risk_percent, "risk_percent")
+        _validate_optional_fraction(self.risk_percent, "risk_percent")
         _validate_optional_nonnegative(self.stop_distance, "stop_distance")
         _validate_optional_nonnegative(self.risk_reward_ratio, "risk_reward_ratio")
         return self

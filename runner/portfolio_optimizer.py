@@ -16,10 +16,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 import optuna
 import pandas as pd
+
+from shared.atomic_io import write_text_atomically
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +293,23 @@ def _align_equity_curves(
     return np.array(aligned_columns, dtype=float).T
 
 
+def _normalize_equity_matrix(equity_matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(equity_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        return np.empty((0, 0))
+    baseline = matrix[0]
+    if (
+        not np.all(np.isfinite(matrix))
+        or not np.all(np.isfinite(baseline))
+        or np.any(baseline <= 0)
+    ):
+        raise ValueError("equity matrix must be finite and have a positive first observation")
+    normalized = matrix / baseline
+    if not np.all(np.isfinite(normalized)) or np.any(normalized <= 0):
+        raise ValueError("normalized equity matrix must be finite and positive")
+    return normalized
+
+
 def _period_percentage_returns(equity_matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(equity_matrix, dtype=float)
     if matrix.ndim != 2 or matrix.shape[0] < 2:
@@ -378,6 +398,7 @@ def _portfolio_sharpe_from_weights(
     if equity_matrix.size == 0 or equity_matrix.shape[0] < 2 or len(weights) == 0:
         return 0.0, 1.0
 
+    equity_matrix = _normalize_equity_matrix(equity_matrix)
     portfolio_eq = equity_matrix @ weights
     if not np.all(np.isfinite(portfolio_eq)) or np.any(portfolio_eq <= 0):
         raise ValueError("portfolio equity must be finite and positive")
@@ -483,6 +504,7 @@ def _build_oos_equity_curve(
     matrix = _align_equity_curves(test_curves, require_overlap=True)
     if matrix.size == 0 or matrix.shape[0] < 2 or matrix.shape[1] != len(best_weights):
         return []
+    matrix = _normalize_equity_matrix(matrix)
     portfolio = matrix @ best_weights
     return [
         {"time": int(timestamp), "equity": float(equity)}
@@ -537,7 +559,7 @@ def _build_optimization_result(
     """Build the persisted result and its output path."""
     now = datetime.now(timezone.utc)
     optimization_id = (
-        f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}"
+        f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
     )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     result: dict[str, Any] = {
@@ -649,9 +671,8 @@ def _persist_optimization_result(result: dict[str, Any], output_path: Path) -> N
         raise ValueError("Optimization output path must stay inside OPTIMIZATIONS_DIR")
 
     output_directory.mkdir(parents=True, exist_ok=True)
-    output_filename = validated_path.name
-    with (output_directory / output_filename).open("w", encoding="utf-8") as output_file:
-        json.dump(result, output_file, indent=2)
+    output_path = output_directory / validated_path.name
+    write_text_atomically(output_path, json.dumps(result, indent=2))
 
 
 def optimize_portfolio_allocation(
@@ -730,6 +751,8 @@ def optimize_portfolio_allocation(
             "message": "Need at least 2 valid backtest equity curves with overlapping timestamps",
             "backtest_ids": backtest_ids,
         }
+
+    equity_matrix = _normalize_equity_matrix(equity_matrix)
 
     # Overlap alignment validation: warn if insufficient common timestamps
     n_points = equity_matrix.shape[0]

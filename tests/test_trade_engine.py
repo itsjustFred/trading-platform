@@ -139,6 +139,70 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
     }
 
 
+def test_sizing_only_stop_survives_fill_and_is_used_for_risk_metadata():
+    data = _synthetic_ohlcv(6)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        signals = pd.DataFrame(index=df.index)
+        signals["entries"] = False
+        signals["exits"] = False
+        signals["sizing_sl_price"] = float("nan")
+        signals["stop_distance"] = float("nan")
+        signals.loc[0, "entries"] = True
+        signals.loc[2, "exits"] = True
+        signals.loc[0, "sizing_sl_price"] = 99.5
+        signals.loc[0, "stop_distance"] = 0.5
+        return signals
+
+    cfg = BacktestConfig(
+        strategy_name="sizing-only-stop",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        parameters={"fees": "zero"},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.stop_loss is None
+    assert trade.meta["sizing_stop_loss"] == pytest.approx(99.5)
+    assert trade.quantity == pytest.approx(666.6666667)
+    assert trade.r_multiple is not None
+
+
+def test_sizing_only_stop_equal_to_fill_is_skipped():
+    data = _synthetic_ohlcv(4)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        signals = pd.DataFrame(index=df.index)
+        signals["entries"] = False
+        signals["exits"] = False
+        signals["sizing_sl_price"] = float("nan")
+        signals.loc[0, "entries"] = True
+        signals.loc[0, "sizing_sl_price"] = 101.0
+        return signals
+
+    cfg = BacktestConfig(
+        strategy_name="invalid-sizing-stop",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        parameters={"fees": "zero"},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+    assert result.trades == []
+
+
 def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
     data = _synthetic_ohlcv(100)
 
@@ -267,6 +331,38 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.exits[-1].price == pytest.approx(118.0)
     assert trade.exits[-1].reason == "stop_loss"
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+
+
+def test_stop_distance_only_order_gets_fill_anchored_live_stop():
+    data = _synthetic_ohlcv(100)
+    data.loc[12, "low"] = 109.0
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[10] = True
+        indicators = {
+            "direction": pd.Series("LONG", index=df.index),
+            "stop_distance": pd.Series(pd.NA, index=df.index),
+        }
+        indicators["stop_distance"].iloc[10] = 2.0
+        return entries, exits, indicators, []
+
+    cfg = BacktestConfig(
+        strategy_name="stop-distance-only",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        parameters={"fees": "zero"},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].stop_loss == pytest.approx(109.0)
 
 
 def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_stop_first():
@@ -446,6 +542,34 @@ class TestIssueC2ExposureMath:
         )
         with pytest.raises(ValueError, match="stopless pending order"):
             engine._current_risk_exposure(100.0)
+
+    def test_excluded_pending_order_is_not_double_counted(self) -> None:
+        from runner.engine_pkg.orders import Order, OrderType
+
+        engine = self._engine()
+        engine.equity = 100_000.0
+        first = Order(
+            symbol="X",
+            direction="LONG",
+            order_type=OrderType.MARKET,
+            created_index=0,
+            created_time="2024-01-01T00:00:00+00:00",
+            quantity=500.0,
+            stop_loss=99.0,
+        )
+        second = Order(
+            symbol="X",
+            direction="LONG",
+            order_type=OrderType.MARKET,
+            created_index=0,
+            created_time="2024-01-01T00:00:00+00:00",
+            quantity=500.0,
+            stop_loss=99.0,
+        )
+        engine.pending_orders.extend([first, second])
+
+        assert engine._current_risk_exposure(100.0) == pytest.approx(0.01)
+        assert engine._current_risk_exposure(100.0, exclude_order=first) == pytest.approx(0.005)
 
     def test_stopped_legs_contribute_stop_distance(self) -> None:
         from runner.engine_pkg.orders import Position

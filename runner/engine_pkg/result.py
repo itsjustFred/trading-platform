@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 
@@ -55,7 +56,10 @@ def build_result(
     """Assemble the native engine's BacktestResult."""
     created_at = datetime.now(timezone.utc).isoformat()
     meta = BacktestMeta(
-        id=f"native-{config.strategy_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        id=(
+            f"native-{config.strategy_name}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-"
+            f"{uuid4().hex}"
+        ),
         created_at=created_at,
         engine="native",
         strategies=[config.strategy_name],

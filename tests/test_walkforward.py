@@ -41,7 +41,7 @@ class TestWalkforwardSignature:
 
         assert train_default == 12, "Default train_months should be 12 months"
         assert test_default == 3, "Default test_months should be 3 months"
-        assert step_default == 1, "Default step_months should be 1 month"
+        assert step_default is None
         assert trials_default == 100, "Default n_trials should be 100"
 
 
@@ -80,7 +80,7 @@ class TestWalkforwardOutputStructure:
         # Verify config is preserved
         assert result["config"]["train_months"] == 12
         assert result["config"]["test_months"] == 3
-        assert result["config"]["step_months"] == 1
+        assert result["config"]["step_months"] == 3
         assert result["config"]["n_trials"] == 10
 
         # Verify fold metrics
@@ -263,11 +263,10 @@ class TestWalkforwardFileOutput:
         assert len(json_files) == 1
 
         filename = json_files[0].stem
-        # Should match pattern: wf_YYYYMMDD_HHMMSS
-        assert filename.startswith("wf_")
-        # Extract timestamp part - format is YYYYMMDD_HHMMSS (15 chars total)
-        ts_part = filename.split("_", 1)[1] if "_" in filename else ""
-        assert len(ts_part) == 15  # YYYYMMDD_HHMMSS format (8 + 1 + 6 = 15)
+        parts = filename.split("_")
+        assert parts[0] == "wf"
+        assert len("_".join(parts[1:3])) == 15
+        assert len(parts[3]) == 32
 
 
 class TestWalkforwardEdgeCases:
@@ -308,9 +307,11 @@ class TestWalkforwardEdgeCases:
 
         wf_module.run_walkforward(
             backtest_ids=["custom_strat"],
+            start="2024-01-01",
+            end="2026-12-31",
             train_months=24,
             test_months=6,
-            step_months=2,
+            step_months=6,
             n_trials=200,
             output_dir=tmp_path / "walkforward_results",
         )
@@ -545,6 +546,18 @@ class TestWindowBuilderGuards:
                 end="2024-02-01",
                 train_months=12,
                 test_months=3,
+                step_months=1,
+            )
+
+    def test_overlapping_oos_steps_are_rejected(self):
+        from runner.walkforward import _build_windows
+
+        with pytest.raises(ValueError, match="overlapping OOS folds"):
+            _build_windows(
+                start="2024-01-01",
+                end="2026-01-01",
+                train_months=1,
+                test_months=2,
                 step_months=1,
             )
 

@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,7 +35,7 @@ def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monke
     monkeypatch.setattr(
         dolthub_manager,
         "_list_symbols",
-        lambda repo, table: ["AAPL", "../escape", "BAD SYMBOL"],
+        lambda repo, table: ["AAPL", "../escape", "BAD SYMBOL", ".."],
     )
     exported: list[str] = []
 
@@ -54,6 +55,26 @@ def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monke
     warnings = [record.getMessage() for record in caplog.records]
     assert any("../escape" in message for message in warnings)
     assert any("BAD SYMBOL" in message for message in warnings)
+    assert any("'..'" in message for message in warnings)
+
+
+def test_export_data_skips_unsafe_symbols_before_path_construction(tmp_path, monkeypatch):
+    stocks_repo = tmp_path / "dolthub" / "stocks"
+    (stocks_repo / dolthub_manager.DOLT_METADATA_DIR).mkdir(parents=True)
+    monkeypatch.setattr(dolthub_manager, "DOLT_DIR", tmp_path / "dolthub")
+    monkeypatch.setattr(dolthub_manager, "EXPORT_DIR", tmp_path / "exports")
+    monkeypatch.setattr(dolthub_manager, "_list_tables", lambda _repo: ["ohlcv"])
+    monkeypatch.setattr(
+        dolthub_manager,
+        "run_dolt",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="act_symbol\n../escape\nBAD SYMBOL\n..\n"
+        ),
+    )
+
+    dolthub_manager.export_data()
+
+    assert not (tmp_path / "exports" / "equity" / "US" / "escape").exists()
 
 
 def test_export_table_csv_keeps_previous_file_when_dolt_fails(tmp_path, monkeypatch):

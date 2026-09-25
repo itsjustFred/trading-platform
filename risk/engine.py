@@ -156,6 +156,7 @@ class RiskEngine:
         *,
         allow_fallback_stop: bool | None = None,
         reject_missing_stop: bool | None = None,
+        max_notional_per_trade: float | None = None,
     ) -> SizedOrder:
         """Size one signal against the configured risk limits.
 
@@ -163,8 +164,10 @@ class RiskEngine:
         - ``current_exposure``: aggregate open risk, fraction of balance.
         - ``config.max_total_exposure``: aggregate open-risk ceiling, fraction.
         - ``config.max_risk_per_trade``: maximum loss on this trade, fraction.
-        - ``config.max_notional_per_trade``: notional ceiling for the resulting
-          position, as a fraction of balance.
+        - ``config.max_notional_per_trade``: default notional ceiling for the
+          resulting position, as a fraction of balance.
+        - ``max_notional_per_trade``: optional caller-specific ceiling, used by
+          engines whose leverage policy is independent of the risk config.
 
         The returned ``SizedOrder.position_size`` is in account-currency units
         of the traded symbol (shares/lots); it is the only quantity in that
@@ -178,6 +181,13 @@ class RiskEngine:
         pip = self._finite_number(pip_value, "pip_value")
         if pip <= 0:
             raise ValueError("pip_value must be > 0")
+        notional_limit = (
+            self.config.max_notional_per_trade
+            if max_notional_per_trade is None
+            else self._finite_number(max_notional_per_trade, "max_notional_per_trade")
+        )
+        if notional_limit <= 0:
+            raise ValueError("max_notional_per_trade must be > 0")
         exposure = self._finite_number(current_exposure, "current_exposure")
         if exposure < 0:
             raise ValueError("current_exposure must be >= 0")
@@ -333,11 +343,7 @@ class RiskEngine:
         risk_amount = balance * risk_percent
         raw_size = risk_amount / (risk_distance * pip)
         position_size = max(0.0, raw_size)
-        # Notional upper bound: cap the position's account-currency value at
-        # max_notional_per_trade * balance so a tiny stop distance, a broken
-        # pip_value or a misconfigured multiplier can never produce an
-        # unbounded position. Leverage beyond this fraction is never taken.
-        max_notional = balance * self.config.max_notional_per_trade
+        max_notional = balance * notional_limit
         capped_by_notional = False
         if position_size * signal.entry_price > max_notional:
             position_size = max_notional / signal.entry_price
@@ -371,7 +377,7 @@ class RiskEngine:
                     "stop_source": stop_source,
                     "fallback_stop_allowed": fallback_allowed and not reject_missing_stop,
                     "stop_price_provenance": stop_source,
-                    "max_notional_per_trade": self.config.max_notional_per_trade,
+                    "max_notional_per_trade": notional_limit,
                     "capped_by_notional": capped_by_notional,
                     **(
                         {"realized_risk_amount": realized_risk_amount}

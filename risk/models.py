@@ -30,6 +30,13 @@ def _finite_nonnegative(value: Any, field_name: str) -> float:
     return numeric
 
 
+def _finite_fraction(value: Any, field_name: str) -> float:
+    numeric = _finite_float(value, field_name)
+    if not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{field_name} must be between 0 and 1")
+    return numeric
+
+
 def _optional_finite_float(value: Any, field_name: str) -> float | None:
     if value is None:
         return None
@@ -113,7 +120,7 @@ class RiskDecision:
         self.accepted = _parse_bool(self.accepted, "accepted")
         self.quantity = _finite_nonnegative(self.quantity, "quantity")
         self.risk_amount = _finite_nonnegative(self.risk_amount, "risk_amount")
-        self.risk_percent = _finite_nonnegative(self.risk_percent, "risk_percent")
+        self.risk_percent = _finite_fraction(self.risk_percent, "risk_percent")
         self.risk_distance = (
             None
             if self.risk_distance is None
@@ -145,7 +152,7 @@ class SizedOrder:
     def __post_init__(self) -> None:
         self.position_size = _finite_nonnegative(self.position_size, "position_size")
         self.risk_amount = _finite_nonnegative(self.risk_amount, "risk_amount")
-        self.risk_percent = _finite_nonnegative(self.risk_percent, "risk_percent")
+        self.risk_percent = _finite_fraction(self.risk_percent, "risk_percent")
         self.risk_reward_ratio = (
             None
             if self.risk_reward_ratio is None

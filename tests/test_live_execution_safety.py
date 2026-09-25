@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -26,6 +26,10 @@ from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+
+
+def _alpaca_order_id(label: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"alpaca-test:{label}"))
 
 
 def _make_ctrader_adapter():
@@ -516,7 +520,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
                 f"client_order_id={order_data.client_order_id}"
             )
         submitted_requests.append(order_data)
-        return SimpleNamespace(id="alpaca-order-1")
+        return SimpleNamespace(id=_alpaca_order_id("order-1"))
 
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
@@ -557,13 +561,13 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         metadata={"qty": 1.0, "discord_message_id": "discord-123"},
     )
 
-    assert asyncio.run(adapter.submit_order(first, qty=1.0)) == "alpaca-order-1"
+    assert asyncio.run(adapter.submit_order(first, qty=1.0)) == _alpaca_order_id("order-1")
     with pytest.raises(RuntimeError, match="canonical signal already exists"):
         asyncio.run(adapter.submit_order(redelivery, qty=1.0))
 
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
-    assert persisted_order_ids == [(canonical_signal_id, "alpaca-order-1")]
+    assert persisted_order_ids == [(canonical_signal_id, _alpaca_order_id("order-1"))]
 
 
 def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
@@ -587,7 +591,7 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
 
     def _lookup(client_order_id: str):
         lookup_calls.append(client_order_id)
-        return SimpleNamespace(id="alpaca-accepted-before-timeout")
+        return SimpleNamespace(id=_alpaca_order_id("accepted-before-timeout"))
 
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
@@ -604,11 +608,13 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
         lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
     )
 
-    assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == "alpaca-accepted-before-timeout"
+    assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == _alpaca_order_id(
+        "accepted-before-timeout"
+    )
     assert lookup_calls == [canonical_signal_id]
     assert submit_calls == []
     assert persisted_order_ids == [
-        (canonical_signal_id, "alpaca-accepted-before-timeout")
+        (canonical_signal_id, _alpaca_order_id("accepted-before-timeout"))
     ]
 
 
@@ -641,12 +647,14 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
     monkeypatch.setattr(
         module,
         "get_live_signal_broker_order_id",
-        lambda signal_id: "alpaca-already-persisted"
+        lambda signal_id: _alpaca_order_id("already-persisted")
         if signal_id == canonical_signal_id
         else None,
     )
 
-    assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == "alpaca-already-persisted"
+    assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == _alpaca_order_id(
+        "already-persisted"
+    )
 
 
 def test_alpaca_rejects_invalid_persisted_order_id_on_redelivery(monkeypatch):
@@ -700,7 +708,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     )
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
-        submit_order=lambda *, order_data: SimpleNamespace(id="alpaca-order-2"),
+        submit_order=lambda *, order_data: SimpleNamespace(id=_alpaca_order_id("order-2")),
     )
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, True)
@@ -719,7 +727,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     with pytest.raises(RuntimeError, match="Failed to persist Alpaca broker order id"):
         asyncio.run(adapter.submit_order(signal, qty=1.0))
 
-    assert persistence_calls == [(canonical_signal_id, "alpaca-order-2")]
+    assert persistence_calls == [(canonical_signal_id, _alpaca_order_id("order-2"))]
 
 
 
@@ -727,7 +735,7 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "broker_order_id", [None, "", "   ", "None", 0, -1, "-2.5"]
+    "broker_order_id", [None, "", "   ", "None", 0, -1, "-2.5", "not-a-uuid"]
 )
 def test_alpaca_rejects_missing_or_nonpositive_order_id(monkeypatch, broker_order_id) -> None:
     from live_runner import alpaca_adapter as module
@@ -2015,6 +2023,9 @@ def test_broker_order_id_roundtrip_and_missing_execution_lookup(isolated_db):
     database.save_live_signal(signal)
 
     assert database.set_live_signal_broker_order_id(str(signal.id), "bo-42") is True
+    assert database.set_live_signal_broker_order_id(str(signal.id), "bo-42") is True
+    assert database.set_live_signal_broker_order_id(str(signal.id), "bo-43") is False
+    assert database.get_live_signal_broker_order_id(str(signal.id)) == "bo-42"
     assert database.find_live_signal_id_by_broker_order_id("acc-1", "bo-42") == str(signal.id)
     assert database.find_live_signal_id_by_broker_order_id("acc-1", "missing") is None
 
@@ -2095,6 +2106,29 @@ def test_live_execution_cumulative_cap_rejects_delayed_duplicate_fill(isolated_d
     assert database.save_live_execution_up_to_cumulative(delayed_stream, 1.0) == 0.0
     assert database.save_live_execution_up_to_cumulative(delayed_stream, 3.0) == 0.0
     assert database.get_live_signal_filled_qty(str(signal.id)) == pytest.approx(3.0)
+
+
+def test_live_execution_cumulative_propagates_unrelated_integrity_error(isolated_db, monkeypatch):
+    from sqlalchemy.exc import IntegrityError
+
+    database = isolated_db
+    signal = _persist_signal(database)
+    execution = LiveExecution(
+        signal_id=signal.id,
+        actual_price=100.0,
+        filled_qty=1.0,
+        commission=0.0,
+        timestamp=datetime.now(timezone.utc),
+        broker_order_id="bo-integrity",
+        dedupe_key="alpaca:exec:integrity",
+    )
+
+    def _raise(*_args, **_kwargs):
+        raise IntegrityError("INSERT", {}, Exception("CHECK failed"))
+
+    monkeypatch.setattr(database, "_insert_live_execution_locked", _raise)
+    with pytest.raises(IntegrityError):
+        database.save_live_execution_up_to_cumulative(execution, 1.0)
 
 
 def test_live_execution_cumulative_cap_serializes_concurrent_writers(isolated_db):
@@ -2180,7 +2214,7 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
         execution_id="exec-9",
         order=SimpleNamespace(
             client_order_id=signal_id,
-            id="bo-9",
+            id=_alpaca_order_id("partial-fill"),
             filled_qty="3500",  # cumulative - must NOT be persisted
             filled_avg_price="49.9",
             commission=None,
@@ -2192,7 +2226,7 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
     assert len(saved) == 1
     assert saved[0][0].filled_qty == 100.0
     assert saved[0][0].dedupe_key == "alpaca:exec:exec-9"
-    assert saved[0][0].broker_order_id == "bo-9"
+    assert saved[0][0].broker_order_id == _alpaca_order_id("partial-fill")
     assert saved[0][1] == 3500.0
 
 
@@ -2256,7 +2290,7 @@ def test_alpaca_delayed_stream_fill_is_reported_as_duplicate(monkeypatch):
         execution_id="exec-delayed",
         order=SimpleNamespace(
             client_order_id=str(uuid4()),
-            id="bo-delayed",
+            id=_alpaca_order_id("delayed"),
             filled_qty="3",
             filled_avg_price="50.0",
             commission=None,
@@ -2288,7 +2322,7 @@ def test_alpaca_partial_fill_without_event_qty_is_skipped(monkeypatch):
         timestamp=datetime.now(timezone.utc),
         order=SimpleNamespace(
             client_order_id=str(uuid4()),
-            id="bo-10",
+            id=_alpaca_order_id("no-event-qty"),
             filled_qty="3500",
             filled_avg_price="49.9",
             commission=None,
@@ -2323,7 +2357,7 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
 
     _client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
-            id="bo-77",
+            id=_alpaca_order_id("reconcile-fill"),
             filled_qty="25",
             filled_avg_price="101.5",
             filled_at=datetime.now(timezone.utc),
@@ -2336,8 +2370,10 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     assert recovered == 1
     assert queried == [("alpaca-acc-1", 200)]
     assert saved[0][0].filled_qty == 25.0
-    assert saved[0][0].broker_order_id == "bo-77"
-    assert saved[0][0].dedupe_key == "alpaca:order:bo-77:reconciled:25.0"
+    assert saved[0][0].broker_order_id == _alpaca_order_id("reconcile-fill")
+    assert saved[0][0].dedupe_key == (
+        f"alpaca:order:{_alpaca_order_id('reconcile-fill')}:reconciled:25.0"
+    )
     assert str(saved[0][0].signal_id) == signal_id
     assert saved[0][1] == 25.0
 
@@ -2380,7 +2416,7 @@ def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda signal_id: broker_queries.append(signal_id)
         or SimpleNamespace(
-            id=f"order-{signal_id}",
+            id=_alpaca_order_id(signal_id),
             filled_qty="1",
             filled_avg_price="200",
             filled_at=datetime.now(timezone.utc),
@@ -2423,7 +2459,7 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
     )
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
-            id="bo-partial-recovery",
+            id=_alpaca_order_id("partial-recovery"),
             filled_qty="3",
             filled_avg_price="101.5",
             filled_at=datetime.now(timezone.utc),
@@ -2436,7 +2472,9 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
     assert recovered == 1
     assert len(saved) == 1
     assert saved[0][0].filled_qty == pytest.approx(2.0)
-    assert saved[0][0].dedupe_key == "alpaca:order:bo-partial-recovery:reconciled:3.0"
+    assert saved[0][0].dedupe_key == (
+        f"alpaca:order:{_alpaca_order_id('partial-recovery')}:reconciled:3.0"
+    )
     assert saved[0][1] == 3.0
 
 
@@ -2462,7 +2500,7 @@ def test_alpaca_reconcile_skips_non_positive_partial_fill_delta(
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
-            id="bo-no-delta",
+            id=_alpaca_order_id("no-delta"),
             filled_qty="3",
             filled_avg_price="101.5",
             filled_at=datetime.now(timezone.utc),

@@ -578,7 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument(
         "--test-months", type=int, default=3, help="Out-of-sample test window in months"
     )
-    wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
+    wf_p.add_argument(
+        "--step-months",
+        type=int,
+        default=None,
+        help="Rolling step in months; defaults to the test window",
+    )
     wf_p.add_argument(
         "--purge-days", type=int, default=0, help="Days purged before each test fold"
     )

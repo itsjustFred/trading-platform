@@ -8,6 +8,7 @@ from runner.portfolio_optimizer import (
     _align_equity_curves,
     _compute_correlation_matrix,
     _compute_oos_metrics,
+    _normalize_equity_matrix,
     _parse_time_to_ts,
     _period_percentage_returns,
     _persist_optimization_result,
@@ -18,6 +19,14 @@ from runner.portfolio_optimizer import (
     optimize_portfolio_allocation,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
+
+
+def test_normalize_equity_matrix_uses_each_strategy_baseline() -> None:
+    matrix = np.array([[100.0, 1000.0], [110.0, 1000.0]])
+
+    normalized = _normalize_equity_matrix(matrix)
+
+    assert normalized == pytest.approx(np.array([[1.0, 1.0], [1.1, 1.0]]))
 
 
 def test_strategy_equity_point_creation() -> None:

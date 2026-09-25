@@ -307,6 +307,11 @@ def test_trade_risk_profile_model_creation() -> None:
     assert profile.risk_reward_ratio == pytest.approx(2.0)
 
 
+def test_risk_sizing_result_allows_aggregate_percent_above_one() -> None:
+    result = RiskSizingResult(total_risk_percent=1.5)
+    assert result.total_risk_percent == pytest.approx(1.5)
+
+
 def test_risk_sizing_result_model_creation() -> None:
     profile = TradeRiskProfile(
         trade_id=1,

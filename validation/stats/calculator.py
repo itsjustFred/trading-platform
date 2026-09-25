@@ -113,30 +113,33 @@ def _net_realized_pnl(trade: Trade) -> float:
     return recomputed
 
 
-def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
+def _compute_drawdowns(
+    realized_pnls: List[float], initial_capital: float | None = None
+) -> tuple[float, float]:
     """Return (max_drawdown_absolute, max_drawdown_pct) from trade PnLs."""
     if not realized_pnls:
         return 0.0, 0.0
+    if initial_capital is not None:
+        capital = float(initial_capital)
+        if not math.isfinite(capital) or capital <= 0:
+            raise ValueError("initial_capital must be finite and > 0")
+        running = capital
+        peak = capital
+    else:
+        running = 0.0
+        peak = 0.0
 
-    running = 0.0
-    peak = 0.0
-    percentage_peak: float | None = None
     max_dd = 0.0
     max_dd_pct = 0.0
 
     for pnl in realized_pnls:
         running += pnl
-        if percentage_peak is None:
-            percentage_peak = running
-        if running > peak:
-            peak = running
+        peak = max(peak, running)
         dd = peak - running
         if dd > max_dd:
             max_dd = dd
-        if running > percentage_peak:
-            percentage_peak = running
-        if percentage_peak != 0.0:
-            dd_pct = (percentage_peak - running) / abs(percentage_peak)
+        if peak > 0:
+            dd_pct = dd / peak
             if dd_pct > max_dd_pct:
                 max_dd_pct = dd_pct
 
@@ -291,6 +294,10 @@ def compute_trade_statistics(
     risk_free_rate: float = 0.0,
 ) -> TradeStatistics:
     """Compute all trade-based statistics from a list of Trade objects."""
+    if initial_capital is not None:
+        capital = float(initial_capital)
+        if not math.isfinite(capital) or capital <= 0:
+            raise ValueError("initial_capital must be finite and > 0")
     if not trades:
         return TradeStatistics()
 
@@ -315,7 +322,9 @@ def compute_trade_statistics(
     else:
         profit_factor = float("inf")
 
-    max_drawdown, max_drawdown_pct = _compute_drawdowns(realized_pnls)
+    max_drawdown, max_drawdown_pct = _compute_drawdowns(
+        realized_pnls, initial_capital=initial_capital
+    )
 
     # #84: ratio metrics run on the daily-resampled net series with the
     # shared sqrt(252) annualization (same contract as runner/stats.py).

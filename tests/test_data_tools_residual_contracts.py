@@ -38,6 +38,27 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
         validate_dataset_component(component)
 
 
+def test_validation_uses_custom_ohlcv_root_for_relative_inference(tmp_path: Path) -> None:
+    path = tmp_path / "custom" / "ohlcv" / "source" / "equity" / "AAPL" / "1d.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC"),
+            "open": [1.0, 2.0],
+            "high": [2.0, 3.0],
+            "low": [0.0, 1.0],
+            "close": [1.5, 2.5],
+            "volume": [10.0, 11.0],
+        }
+    ).to_parquet(path, index=False)
+
+    results = validation.validate_all(tmp_path / "custom")
+
+    assert len(results) == 1
+    assert results[0].source == "source"
+    assert results[0].path == "source/equity/AAPL/1d.parquet"
+
+
 def test_dataset_component_rejects_explicit_parent_component() -> None:
     with pytest.raises(ValueError, match="traversal component"):
         validate_dataset_component("..")

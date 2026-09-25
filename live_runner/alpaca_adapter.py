@@ -50,17 +50,11 @@ def _normalize_broker_order_id(value: Any) -> str | None:
         return None
     try:
         uuid_value = UUID(normalized)
-    except ValueError:
-        uuid_value = None
-    if uuid_value is not None:
-        return normalized if uuid_value.int > 0 else None
-    try:
-        numeric_value = float(normalized)
-    except (TypeError, ValueError):
-        return normalized
-    if not math.isfinite(numeric_value) or numeric_value <= 0:
+    except (AttributeError, TypeError, ValueError):
         return None
-    return normalized
+    if uuid_value.int == 0:
+        return None
+    return str(uuid_value)
 
 
 def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
