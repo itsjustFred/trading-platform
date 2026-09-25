@@ -4833,3 +4833,248 @@ def test_verify_missing_download_coverage_uses_given_timeframe(monkeypatch):
     )
 
     assert checked == ["1m"]
+
+
+def test_resume_dispatches_backtest_recovery_to_bound_helper(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    calls = []
+    record = {
+        "id": "task-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {"task_spec": {"version": 1, "kind": "backtest", "operation": "run"}},
+    }
+    monkeypatch.setattr(viewer_app_module, "_LEGACY_HOOKS_INSTALLED", True)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda **_kwargs: [record],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_resume_interrupted_backtest_task",
+        lambda received_record, task_id, raw_config: calls.append(
+            (received_record["id"], task_id, raw_config)
+        ),
+    )
+
+    viewer_app_module._resume_interrupted_tasks()
+
+    assert calls == [("task-recovery", "task-recovery", record["config_json"])]
+
+
+def test_backtest_recovery_builds_request_from_typed_spec(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    started = []
+    persisted = []
+    record = {
+        "id": "task-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {
+            "task_spec": {
+                "version": 1,
+                "kind": "backtest",
+                "operation": "run",
+                "parameters": {
+                    "strategy": "demo",
+                    "engine": "vectorbt",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1d",
+                    "capital": 100000,
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_run_backtest_sync",
+        lambda runner, request: started.append((runner, request)) or {"task_id": "task-new"},
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+
+    viewer_app_module._resume_interrupted_backtest_task(
+        record,
+        "task-recovery",
+        record["config_json"],
+    )
+
+    assert len(started) == 1
+    request = started[0][1]
+    assert request.strategy == "demo"
+    assert request.engine == "vectorbt"
+    assert request.symbols == ["AAPL"]
+    assert persisted[0]["status"] == "completed"
+
+
+def test_internal_error_detail_is_generic_and_redacted():
+    import viewer.main as viewer_app_module
+
+    detail = viewer_app_module._internal_error_detail(
+        RuntimeError("Authorization: Bearer api-secret"),
+        "test operation",
+    )
+
+    assert "api-secret" not in detail
+    assert detail.startswith("Internal server error (error_id=")
+
+
+def test_data_recovery_rejects_persisted_command_without_typed_spec(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    updates = []
+    record = {
+        "id": "task-recovery",
+        "type": "data",
+        "status": "interrupted",
+        "config_json": {"command": [sys.executable, "-c", "raise SystemExit('executed')"]},
+    }
+    started = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(record, "task-recovery", record["config_json"])
+
+    assert started == []
+    assert updates[0]["status"] == "queued"
+    assert updates[0]["config_json"]["recovery_rejected"] == "missing typed data spec"
+    assert "command" not in updates[0]["config_json"]
+
+
+def test_typed_data_recovery_rebuilds_request_and_ignores_command(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    started = []
+    record = {
+        "id": "task-recovery",
+        "type": "data",
+        "status": "interrupted",
+        "name": "Download",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "download",
+                "source": "yfinance",
+                "symbols": ["AAPL"],
+                "timeframes": ["1d"],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_generic_download",
+        lambda task_id, request, **kwargs: started.append((task_id, request, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(record, "task-recovery", record["config_json"])
+
+    assert len(started) == 1
+    task_id, request, _ = started[0]
+    assert task_id == "task-recovery"
+    assert request.symbol_list == ["AAPL"]
+    assert request.timeframe_list == ["1d"]
+
+
+def test_terminal_task_retention_is_bounded(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "MAX_TERMINAL_TASKS", 2)
+    for index in range(3):
+        core.DATA_TASKS[f"task-terminal-{index}"] = {
+            "status": "failed",
+            "updated_at": f"2026-01-01T00:00:0{index}",
+        }
+    core._prune_terminal_tasks_locked()
+
+    assert set(core.DATA_TASKS) == {"task-terminal-1", "task-terminal-2"}
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_expired_reservation_does_not_block_new_work(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 0.01)
+    stale = {
+        "id": "task-stale",
+        "status": "running",
+        "download_request_key": "same-request",
+        "singleflight_lease_until": time.monotonic() - 1,
+    }
+    core.DATA_TASKS["task-stale"] = stale
+    reservation = {"id": "task-new", "status": "starting"}
+
+    existing = core._register_download_task(reservation, "same-request")
+
+    assert existing is None
+    assert stale["status"] == "failed"
+    assert core.DATA_TASKS["task-new"]["download_request_key"] == "same-request"
+    core.DATA_TASKS.clear()
+
+
+def test_task_log_read_is_bounded_and_redacted(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "task-log.log"
+    log_path.write_text(
+        ("x" * 200) + "\nAuthorization: Bearer super-secret\n",
+        encoding="utf-8",
+    )
+
+    content = core._read_task_log(log_path, max_bytes=64)
+
+    assert len(content.encode("utf-8")) <= 64
+    assert "super-secret" not in content
+    assert "Bearer [Filtered]" in content
+
+
+def test_general_log_collection_caps_lines_and_redacts_json(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            json.dumps({"level": "INFO", "message": f"line-{index}", "api_key": "secret"})
+            for index in range(2500)
+        ),
+        encoding="utf-8",
+    )
+
+    entries = core._collect_log_entries([log_path], max_bytes=1024 * 1024, max_lines=3)
+
+    assert len(entries) == 3
+    assert all("secret" not in entry["line"] for entry in entries)
+
+
+def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
+    import importlib.util
+
+    script_path = Path(__file__).parents[1] / "scripts" / "verify_ctrader_order.py"
+    spec = importlib.util.spec_from_file_location("verify_ctrader_order_test", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "REPORTS_DIR", tmp_path / "reports")
+
+    output_path = module._write_report_for_run({"verified": True})
+
+    assert output_path.exists()
+    assert output_path.stat().st_mode & 0o777 == 0o600
+    assert output_path.parent.stat().st_mode & 0o777 == 0o700
+    assert json.loads(output_path.read_text(encoding="utf-8"))["verified"] is True

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,37 +12,14 @@ from typing import Any, Mapping, Sequence
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 
-# shared.constants loads .env exactly once (see its module docstring); importing it
-# here makes that ordering dependency explicit instead of relying on import order.
 import shared.constants  # noqa: F401
+from shared.logging import _SENSITIVE_MARKERS, redact_text, redact_value
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _INITIALIZED = False
 _INITIALIZED_SERVICE: str | None = None
 _REDACTED = "[Filtered]"
-_SENSITIVE_MARKERS = (
-    "api_key",
-    "apikey",
-    "app_secret",
-    "authorization",
-    "cookie",
-    "dsn",
-    "github_token",
-    "password",
-    "refresh_token",
-    "secret",
-    "token",
-)
-_SENSITIVE_QUERY_RE = re.compile(
-    r"(?i)([?&](?:access_token|api_key|apikey|dsn|key|password|refresh_token|secret|token)=)"
-    r"([^&#\s]+)"
-)
-_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(access_token|api_key|apikey|dsn|password|refresh_token|secret|token)"
-    r"(\s*[:=]\s*)([^,\s;&]+)"
-)
-_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
 
 
 class SentryConfigError(ValueError):
@@ -198,30 +174,17 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] 
     return _redact_value(event)
 
 
-def _redact_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _REDACTED if _is_sensitive_key(key) else _redact_value(child)
-            for key, child in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value(child) for child in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_value(child) for child in value)
-    if isinstance(value, str):
-        return _redact_string(value)
-    return value
-
-
 def _is_sensitive_key(key: object) -> bool:
     normalized = str(key).strip().lower().replace("-", "_")
     return any(marker in normalized for marker in _SENSITIVE_MARKERS)
 
 
+def _redact_value(value: Any) -> Any:
+    return redact_value(value)
+
+
 def _redact_string(value: str) -> str:
-    redacted = _BEARER_TOKEN_RE.sub("Bearer [Filtered]", value)
-    redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
-    return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1\2[Filtered]", redacted)
+    return redact_text(value)
 
 
 def _parse_bool(value: str | None, *, name: str, default: bool | None = None) -> bool:

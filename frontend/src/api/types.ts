@@ -151,6 +151,9 @@ export interface Trade {
   risk_percent?: number | null;
   exit_reason?: string | null;
   pnl: number;
+  gross_pnl?: number | null;
+  net_pnl?: number | null;
+  fees?: number | null;
   pnl_pct: number;
   duration: string;
   bars_held?: number;
@@ -309,6 +312,11 @@ export interface OptimizationTrial {
 
 export type OptimizationStatValue = number | string | boolean | null;
 export type OptimizationStatMap = Record<string, OptimizationStatValue>;
+export type OptimizationOosStatus =
+  | "available"
+  | "insufficient_overlap"
+  | "no_oos_requested"
+  | "unavailable";
 
 export interface OptimizationSummary {
   id: string;
@@ -329,6 +337,7 @@ export interface OptimizationSummary {
   test_period: OptimizationPeriod;
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
+  oos_status?: OptimizationOosStatus | null;
 }
 
 export interface OptimizationDetail {
@@ -359,6 +368,7 @@ export interface OptimizationDetail {
   test_period: OptimizationPeriod;
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
+  oos_status?: OptimizationOosStatus | null;
   top_trials: OptimizationTrial[];
 }
 

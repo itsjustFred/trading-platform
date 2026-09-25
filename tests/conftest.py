@@ -140,6 +140,8 @@ def viewer_client(monkeypatch, tmp_path):
     )
     viewer_app_module.DATA_TASKS.clear()
     viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
+    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
     return _TestClient(viewer_app_module.app)
 
 

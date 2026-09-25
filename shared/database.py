@@ -3809,14 +3809,26 @@ def _apply_backtest_trade_risk_fallbacks(
         return position_size, risk_amount, risk_percent
     if position_size is None:
         position_size = risk_math.get("position_size")
+    realized_amount = risk_math.get("realized_risk_amount")
+    realized_percent = risk_math.get("realized_risk_percent")
+    if realized_amount is None:
+        realized_amount = row.meta.get("realized_risk_amount")
+    if realized_percent is None:
+        realized_percent = row.meta.get("realized_risk_percent")
     if risk_amount is None:
-        risk_amount = risk_math.get("risk_target_usd")
+        risk_amount = realized_amount
     if risk_percent is None:
-        risk_percent = risk_math.get("risk_target_pct")
-        if risk_percent is None:
-            max_position_pct = risk_math.get("max_position_pct")
-            if max_position_pct is not None:
-                risk_percent = max_position_pct
+        risk_percent = realized_percent
+        if risk_percent is None and realized_amount is not None:
+            equity_at_entry = risk_math.get("equity_at_entry")
+            try:
+                equity_value = float(equity_at_entry)
+                amount_value = float(realized_amount)
+            except (TypeError, ValueError):
+                equity_value = 0.0
+                amount_value = 0.0
+            if equity_value > 0 and amount_value >= 0:
+                risk_percent = amount_value / equity_value
     return position_size, risk_amount, risk_percent
 
 

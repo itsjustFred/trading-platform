@@ -1,4 +1,5 @@
 export type OptimizationOosEvidenceState = "available" | "decayed" | "degraded" | "unavailable";
+export type OptimizationOosStatus = "available" | "insufficient_overlap" | "no_oos_requested" | "unavailable";
 
 export interface OptimizationOosEvidence {
   state: OptimizationOosEvidenceState;
@@ -28,6 +29,19 @@ const TARGET_METRIC_ALIASES: Record<string, string> = {
   total_return: "total_return",
 };
 
+function unavailableEvidence(metricKey: string, message: string): OptimizationOosEvidence {
+  return {
+    state: "unavailable",
+    metricKey,
+    oosValue: null,
+    label: "OOS evidence unavailable",
+    message,
+    tone: "#fbbf24",
+    background: "rgba(120, 53, 15, 0.18)",
+    border: "rgba(251, 191, 36, 0.28)",
+  };
+}
+
 export function resolveOptimizationMetricKey(targetMetric: string): string {
   const normalized = String(targetMetric || "").trim().toLowerCase();
   return Object.hasOwn(TARGET_METRIC_ALIASES, normalized)
@@ -39,33 +53,49 @@ export function classifyOptimizationOosEvidence(
   targetMetric: string,
   inSampleValue: unknown,
   testStats: Record<string, unknown> | null | undefined,
+  oosStatus: OptimizationOosStatus | string = "available",
 ): OptimizationOosEvidence {
   const metricKey = resolveOptimizationMetricKey(targetMetric);
+  const normalizedStatus = String(oosStatus || "unavailable").trim().toLowerCase();
+  if (normalizedStatus !== "available") {
+    const reason = normalizedStatus === "no_oos_requested"
+      ? "No out-of-sample window was requested for this optimization."
+      : "The out-of-sample evaluation was not available or did not have sufficient overlap.";
+    return unavailableEvidence(metricKey, reason);
+  }
+
   const rawOosValue = testStats?.[metricKey];
   const oosValue = typeof rawOosValue === "number" && Number.isFinite(rawOosValue) ? rawOosValue : null;
-
   if (oosValue === null) {
-    return {
-      state: "unavailable",
+    return unavailableEvidence(
       metricKey,
-      oosValue: null,
-      label: "OOS evidence unavailable",
-      message: `No finite out-of-sample value is available for ${metricKey}. This run is only identified as an in-sample selected candidate.`,
-      tone: "#fbbf24",
-      background: "rgba(120, 53, 15, 0.18)",
-      border: "rgba(251, 191, 36, 0.28)",
-    };
+      `No finite out-of-sample value is available for ${metricKey}. This run is only identified as an in-sample selected candidate.`,
+    );
   }
 
   const finiteInSampleValue =
     typeof inSampleValue === "number" && Number.isFinite(inSampleValue) ? inSampleValue : null;
+  if (finiteInSampleValue === null) {
+    return unavailableEvidence(
+      metricKey,
+      `The in-sample selected score for ${metricKey} is not finite, so OOS evidence cannot be validated.`,
+    );
+  }
+
   const lowerIsFavorable = metricKey === "p_value";
-  // #87: OOS decay rule — respects each metric's favorable direction.
-  // Higher-is-better: OOS <= 0 (from positive IS) is degraded (red);
-  // 0 < OOS < 50% of IS is decayed (amber) — e.g. Sharpe 2.0 -> 0.01 no
-  // longer shows green. p_value (lower-is-better): losing significance
-  // (IS < 0.05, OOS >= 0.05) is degraded; OOS > 2x IS is decayed.
-  if (lowerIsFavorable && finiteInSampleValue !== null && finiteInSampleValue >= 0) {
+  if (lowerIsFavorable) {
+    if (finiteInSampleValue < 0 || oosValue < 0 || oosValue > 1) {
+      return {
+        state: "degraded",
+        metricKey,
+        oosValue,
+        label: "OOS significance invalid",
+        message: `The p_value values must remain in the probability interval 0..1; received ${finiteInSampleValue} in-sample and ${oosValue} OOS.`,
+        tone: "#fda4af",
+        background: "rgba(127, 29, 29, 0.2)",
+        border: "rgba(251, 113, 133, 0.3)",
+      };
+    }
     if (finiteInSampleValue < 0.05 && oosValue >= 0.05) {
       return {
         state: "degraded",
@@ -78,42 +108,52 @@ export function classifyOptimizationOosEvidence(
         border: "rgba(251, 113, 133, 0.3)",
       };
     }
-    if (finiteInSampleValue > 0 && oosValue > 2 * finiteInSampleValue) {
+    if (finiteInSampleValue === 0 ? oosValue > 0 : oosValue > 2 * finiteInSampleValue) {
       return {
         state: "decayed",
         metricKey,
         oosValue,
         label: "OOS significance decay",
-        message: `The p_value more than doubles OOS (${finiteInSampleValue} -> ${oosValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`,
+        message: `The p_value moved from ${finiteInSampleValue} in-sample to ${oosValue} OOS for ${metricKey}. Treat this candidate as decayed, not OOS validated.`,
         tone: "#fcd34d",
         background: "rgba(120, 53, 15, 0.2)",
         border: "rgba(251, 191, 36, 0.3)",
       };
     }
-  }
-  if (!lowerIsFavorable && finiteInSampleValue !== null && finiteInSampleValue > 0 && oosValue <= 0) {
-    return {
-      state: "degraded",
-      metricKey,
-      oosValue,
-      label: "OOS sign degradation",
-      message: `The positive in-sample selected score becomes non-positive OOS for ${metricKey}. Treat this candidate as degraded, not OOS validated.`,
-      tone: "#fda4af",
-      background: "rgba(127, 29, 29, 0.2)",
-      border: "rgba(251, 113, 133, 0.3)",
-    };
-  }
-  if (!lowerIsFavorable && finiteInSampleValue !== null && finiteInSampleValue > 0 && oosValue < 0.5 * finiteInSampleValue) {
-    return {
-      state: "decayed",
-      metricKey,
-      oosValue,
-      label: "OOS decay",
-      message: `The out-of-sample value (${oosValue}) is less than 50% of the in-sample selected score (${finiteInSampleValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`,
-      tone: "#fcd34d",
-      background: "rgba(120, 53, 15, 0.2)",
-      border: "rgba(251, 191, 36, 0.3)",
-    };
+  } else {
+    if (finiteInSampleValue === 0) {
+      return unavailableEvidence(
+        metricKey,
+        `The in-sample selected score for ${metricKey} is zero, so a relative OOS comparison is not meaningful.`,
+      );
+    }
+    if ((finiteInSampleValue > 0 && oosValue <= 0) || (finiteInSampleValue < 0 && oosValue >= 0)) {
+      const signMessage = finiteInSampleValue > 0
+        ? `The positive in-sample selected score (${finiteInSampleValue}) becomes non-positive OOS (${oosValue}) for ${metricKey}. Treat this candidate as degraded, not OOS validated.`
+        : `The negative in-sample selected score (${finiteInSampleValue}) becomes non-negative OOS (${oosValue}) for ${metricKey}. Treat this candidate as degraded, not OOS validated.`;
+      return {
+        state: "degraded",
+        metricKey,
+        oosValue,
+        label: "OOS sign degradation",
+        message: signMessage,
+        tone: "#fda4af",
+        background: "rgba(127, 29, 29, 0.2)",
+        border: "rgba(251, 113, 133, 0.3)",
+      };
+    }
+    if (oosValue < 0.5 * finiteInSampleValue) {
+      return {
+        state: "decayed",
+        metricKey,
+        oosValue,
+        label: "OOS decay",
+        message: `The out-of-sample value (${oosValue}) is less than 50% of the in-sample selected score (${finiteInSampleValue}) for ${metricKey}. Treat this candidate as decayed, not OOS validated.`,
+        tone: "#fcd34d",
+        background: "rgba(120, 53, 15, 0.2)",
+        border: "rgba(251, 191, 36, 0.3)",
+      };
+    }
   }
 
   return {

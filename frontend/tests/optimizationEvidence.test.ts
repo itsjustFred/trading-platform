@@ -14,6 +14,8 @@ test("optimization pages identify scores and parameters as in-sample selected", 
   assert.doesNotMatch(listPage, />\s*Best score\s*</);
   assert.match(detailPage, /In-sample selected score/);
   assert.match(detailPage, /In-sample selected parameters/);
+  assert.match(listPage, /oos_status \?\? "unavailable"/);
+  assert.match(detailPage, /oos_status \?\? "unavailable"/);
   assert.doesNotMatch(detailPage, /Winning envelope|Best parameters card/);
 });
 
@@ -109,8 +111,35 @@ test("#87: p_value losing significance is degraded, doubling is decayed", async 
     classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 0.5 }).state,
     "degraded",
   );
+
   assert.equal(
     classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 0.03 }).state,
     "decayed",
+  );
+});
+
+test("negative baseline worsening is direction-aware decay", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  assert.equal(
+    classifyOptimizationOosEvidence("sharpe", -2, { sharpe_ratio: -3 }).state,
+    "decayed",
+  );
+  assert.equal(
+    classifyOptimizationOosEvidence("sharpe", -2, { sharpe_ratio: 0 }).state,
+    "degraded",
+  );
+});
+
+test("non-available OOS lifecycle status is unavailable", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  assert.equal(
+    classifyOptimizationOosEvidence("sharpe", 2, { sharpe_ratio: 2 }, "insufficient_overlap").state,
+    "unavailable",
+  );
+  assert.equal(
+    classifyOptimizationOosEvidence("sharpe", 2, { sharpe_ratio: 2 }, "no_oos_requested").state,
+    "unavailable",
   );
 });

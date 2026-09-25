@@ -461,6 +461,7 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert payload["effective_best_parameters"] == {"fixed": 3, "window": 3}
     assert payload["train_stats"]["sharpe_ratio"] == 2.5
     assert payload["test_stats"]["sharpe_ratio"] == 1.7
+    assert payload["oos_status"] == "available"
     assert len(payload["top_trials"]) == 4
     assert payload["top_trials"][0]["params"] == {"window": 3}
     assert any(trial["penalty_applied"] for trial in payload["top_trials"])
@@ -547,6 +548,7 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
 
     assert payload["optimization_mode"] == "risk_parity_covariance"
     assert payload["target_metric"] == "risk_parity_score"
+    assert payload["oos_status"] == "available"
     assert set(payload["best_symbols"]) <= {"SPY", "TLT", "GLD"}
     assert payload["effective_best_parameters"]["risk_parity_weights"]
     weights = payload["effective_best_parameters"]["risk_parity_weights"].values()

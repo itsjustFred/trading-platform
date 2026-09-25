@@ -626,6 +626,7 @@ def run_optimization(
         "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
         "test_stats": _json_safe(test_stats),
+        "oos_status": "available",
         "top_trials": _top_trials_payload(
             study.trials,
             limit=10,
@@ -936,6 +937,7 @@ def _run_risk_parity_covariance_optimization(
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
         "test_stats": _json_safe(test_stats),
+        "oos_status": "available",
         "risk_parity": _json_safe(selection),
         "top_trials": [],
     }

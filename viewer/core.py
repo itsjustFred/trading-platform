@@ -32,6 +32,7 @@ from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_aut
 from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
 from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
+from shared.logging import get_logger, redact_text, redact_value
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -47,10 +48,13 @@ from shared.strategy_registry import (
 )
 from viewer.comparison import compare_backtests, compute_drawdown_pct
 
-from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR
-from shared.logging import get_logger
-
+from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 logger = get_logger("viewer")
+
+
+def _log_safe(value: object) -> str:
+    return "".join(character if character.isprintable() else "?" for character in str(value))
+
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 REACT_DIST = Path(__file__).parent.parent / "frontend" / "dist"
@@ -70,6 +74,28 @@ TASK_NOT_FOUND_ERROR = "Task not found"
 JFOREX_SDK_UNAVAILABLE_ERROR = "JForex SDK classes unavailable"
 JAVA_RUNTIME_UNAVAILABLE_ERROR = "Java/JVM runtime unavailable"
 ALL_LOGS_NAME = "ALL_LOGS"
+
+
+def _environment_float(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    return max(value, minimum)
+
+
+SINGLEFLIGHT_LEASE_SECONDS = _environment_float(
+    "VIEWER_SINGLEFLIGHT_LEASE_SECONDS", 900.0, 1.0
+)
+SINGLEFLIGHT_HEARTBEAT_SECONDS = _environment_float(
+    "VIEWER_SINGLEFLIGHT_HEARTBEAT_SECONDS", 30.0, 0.1
+)
+TASK_LOG_MAX_BYTES = 64 * 1024
+GENERAL_LOG_MAX_BYTES = 2 * 1024 * 1024
+GENERAL_LOG_MAX_LINES = 2000
+MAX_TERMINAL_TASKS = 1024
 _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 _JOBS_LOCK = threading.RLock()
 _JOBS_TIMESTAMP: dict[str, float] = {}  # job_id -> last lifecycle transition (monotonic)
@@ -157,6 +183,18 @@ def evict_jobs(*, max_age_seconds: float = 3600.0) -> int:
 BARS_BEFORE = 60
 BARS_AFTER = 25
 _OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_OHLCV_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
+_OHLCV_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+_OHLCV_MAX_MATCHES = 32
+_OHLCV_MAX_BYTES = 256 * 1024 * 1024
+_OHLCV_MAX_ROWS = 2_000_000
+_OHLCV_SOURCE_PRIORITY = {
+    "dukascopy": 0,
+    "yfinance": 1,
+    "huggingface": 2,
+    "alpaca": 3,
+    "dolthub": 4,
+}
 _OHLCV_DF_CACHE_LOCK = threading.RLock()
 _OHLCV_DF_CACHE: dict[
     tuple[str, str],
@@ -189,7 +227,7 @@ def _load_optimization_payload(optimization_id: str) -> dict[str, Any] | None:
 
 
 def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[str, Any]:
-    return {
+    summary = {
         "id": payload.get("id", path.stem),
         "filename": path.name,
         "created_at": payload.get("created_at"),
@@ -209,6 +247,9 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "train_stats": payload.get("train_stats", {}),
         "test_stats": payload.get("test_stats", {}),
     }
+    if "oos_status" in payload:
+        summary["oos_status"] = payload.get("oos_status")
+    return summary
 
 
 def _strategy_entries() -> list[StrategyEntry]:
@@ -354,6 +395,50 @@ def _normalize_equity_points(points: list[dict]) -> list[dict]:
     return collapsed
 
 
+def _trade_net_pnl(trade: Trade) -> float:
+    value = getattr(trade, "net_pnl", None)
+    if value is not None:
+        numeric = _safe_float(value, float("nan"))
+        if math.isfinite(numeric):
+            return numeric
+    gross = _safe_float(getattr(trade, "pnl", 0.0), 0.0)
+    fees = _safe_float(getattr(trade, "fees", 0.0), 0.0)
+    return gross - fees
+
+
+def _trade_realized_risk(trade: Trade) -> tuple[float | None, float | None]:
+    metadata = trade.meta if isinstance(getattr(trade, "meta", None), dict) else {}
+    risk_math = metadata.get("risk_math") if isinstance(metadata.get("risk_math"), dict) else {}
+    realized_amount = risk_math.get("realized_risk_amount")
+    realized_percent = risk_math.get("realized_risk_percent")
+    if realized_amount is None:
+        realized_amount = metadata.get("realized_risk_amount")
+    if realized_percent is None:
+        realized_percent = metadata.get("realized_risk_percent")
+    if realized_amount is not None:
+        amount = _safe_float(realized_amount, float("nan"))
+        if math.isfinite(amount) and amount >= 0:
+            percent = realized_percent
+            if percent is None:
+                equity = _safe_float(risk_math.get("equity_at_entry"), 0.0)
+                percent = amount / equity if equity > 0 else None
+            else:
+                percent = _safe_float(percent, float("nan"))
+                if not math.isfinite(percent):
+                    percent = None
+            return amount, percent
+    if realized_percent is not None:
+        percent = _safe_float(realized_percent, float("nan"))
+        if math.isfinite(percent):
+            return None, percent
+    if not risk_math:
+        amount = _safe_float(getattr(trade, "risk_amount", None), float("nan"))
+        if math.isfinite(amount) and amount >= 0:
+            percent = _safe_float(getattr(trade, "risk_percent", None), float("nan"))
+            return amount, (percent if math.isfinite(percent) else None)
+    return None, None
+
+
 def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
     if not result.trades:
         return []
@@ -368,7 +453,9 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
         ),
     )
 
-    first_trade_time = _iso_to_unix(ordered_trades[0].entry_time or ordered_trades[0].last_exit_time)
+    first_trade_time = _iso_to_unix(
+        ordered_trades[0].entry_time or ordered_trades[0].last_exit_time
+    )
     points: list[dict] = []
     if first_trade_time > 0:
         points.append({"time": first_trade_time, "equity": round(initial_capital, 2)})
@@ -378,7 +465,7 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
         event_time = _iso_to_unix(trade.last_exit_time or trade.entry_time)
         if event_time <= 0:
             continue
-        running_equity += _safe_float(trade.pnl, 0.0)
+        running_equity += _trade_net_pnl(trade)
         points.append({"time": event_time, "equity": round(running_equity, 2)})
 
     return _normalize_equity_points(points)
@@ -394,25 +481,13 @@ def _trade_to_viewer(trade) -> dict:
     if position_size is None:
         position_size = risk_math.get("position_size")
 
-    risk_amount = trade.risk_amount
-    if risk_amount is None:
-        risk_amount = risk_math.get("risk_target_usd")
-
-    risk_percent = trade.risk_percent
-    if risk_percent is None:
-        direct_percent = risk_math.get("risk_target_pct")
-        if direct_percent is not None:
-            risk_percent = direct_percent
-        else:
-            equity_at_entry = _safe_float(risk_math.get("equity_at_entry"), 0.0)
-            target_risk_usd = _safe_float(risk_math.get("risk_target_usd"), 0.0)
-            if equity_at_entry > 0 and target_risk_usd > 0:
-                risk_percent = target_risk_usd / equity_at_entry
+    risk_amount, risk_percent = _trade_realized_risk(trade)
 
     exit_reason = trade.exit_reason or (last_exit.reason if last_exit else None)
     if exit_reason is None and isinstance(trade_meta.get("exit_reason"), str):
         exit_reason = str(trade_meta.get("exit_reason"))
 
+    net_pnl = _trade_net_pnl(trade)
     payload = {
         "nr": trade.id,
         "symbol": trade.symbol,
@@ -428,7 +503,9 @@ def _trade_to_viewer(trade) -> dict:
         "risk_amount": risk_amount,
         "risk_percent": risk_percent,
         "exit_reason": exit_reason,
-        "pnl": trade.pnl,
+        "pnl": net_pnl,
+        "gross_pnl": trade.pnl,
+        "net_pnl": net_pnl,
         "pnl_pct": trade.pnl_pct,
         "r_multiple": trade.r_multiple,
         "holding_bars": trade.holding_bars,
@@ -451,23 +528,71 @@ def _trade_to_viewer(trade) -> dict:
     return payload
 
 
+def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
+    normalized_symbol = symbol.casefold()
+    normalized_timeframe = normalize_timeframe(timeframe).casefold()
+    candidates: list[tuple[int, str, Path]] = []
+    for path in root.rglob("*.parquet"):
+        try:
+            relative = path.relative_to(root)
+            parts = relative.parts
+            if len(parts) < 2 or path.is_symlink() or not path.is_file():
+                continue
+            if parts[-2].casefold() != normalized_symbol:
+                continue
+            file_timeframe = path.stem
+            if normalize_timeframe(file_timeframe).casefold() != normalized_timeframe:
+                continue
+            source = parts[0].casefold()
+            priority = _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY))
+            candidates.append((priority, source, path))
+            if len(candidates) > _OHLCV_MAX_MATCHES:
+                return []
+        except (OSError, ValueError):
+            continue
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
+    selected_source = candidates[0][1]
+    return [item[2] for item in candidates if item[1] == selected_source]
+
+
 def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
-    """Find and load OHLCV parquet for a symbol+timeframe."""
-    ohlcv_root = DATA_DIR / "ohlcv"
-    normalized_symbol = str(symbol or "").strip()
-    normalized_timeframe = str(timeframe or "").strip()
-    cache_key = (normalized_symbol.upper(), normalized_timeframe.lower())
-    matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
-    if not matches:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    cache_key = (normalized_symbol, normalized_timeframe)
+    if (
+        _OHLCV_SYMBOL_RE.fullmatch(normalized_symbol) is None
+        or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
+    ):
         with _OHLCV_DF_CACHE_LOCK:
             _OHLCV_DF_CACHE.pop(cache_key, None)
         return None
+
+    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
+    if not matches or len(matches) > _OHLCV_MAX_MATCHES:
+        with _OHLCV_DF_CACHE_LOCK:
+            _OHLCV_DF_CACHE.pop(cache_key, None)
+        return None
+
     signature_parts: list[tuple[str, int, int]] = []
+    total_bytes = 0
     for path in matches:
         try:
             stat = path.stat()
         except OSError:
             continue
+        total_bytes += int(stat.st_size)
+        if total_bytes > _OHLCV_MAX_BYTES:
+            with _OHLCV_DF_CACHE_LOCK:
+                _OHLCV_DF_CACHE.pop(cache_key, None)
+            logger.warning(
+                "OHLCV byte budget exceeded for %s %s",
+                normalized_symbol,
+                normalized_timeframe,
+            )
+            return None
         signature_parts.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
     signature: tuple[tuple[str, int, int], ...] = tuple(signature_parts)
     with _OHLCV_DF_CACHE_LOCK:
@@ -478,29 +603,40 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
                 return cached_df.copy(deep=False)
 
     frames: list[pd.DataFrame] = []
+    total_rows = 0
     for path in matches:
         try:
             try:
-                df = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
+                frame = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
             except (ValueError, KeyError):
-                df = pd.read_parquet(path)
+                frame = pd.read_parquet(path)
         except (ValueError, KeyError, OSError) as exc:
             logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
-        df.columns = [str(column).lower() for column in df.columns]
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            df = df.dropna(subset=["timestamp"])
-        if not df.empty:
-            frames.append(df)
+        total_rows += len(frame)
+        if total_rows > _OHLCV_MAX_ROWS:
+            with _OHLCV_DF_CACHE_LOCK:
+                _OHLCV_DF_CACHE.pop(cache_key, None)
+            logger.warning(
+                "OHLCV row budget exceeded for %s %s",
+                normalized_symbol,
+                normalized_timeframe,
+            )
+            return None
+        frame.columns = [str(column).lower() for column in frame.columns]
+        if "timestamp" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["timestamp"])
+        if not frame.empty:
+            frames.append(frame)
 
     if not frames:
         return None
-    if len(frames) == 1:
-        merged = frames[0].copy()
-    else:
-        merged = pd.concat(frames, ignore_index=True, sort=False)
-
+    merged = (
+        frames[0].copy()
+        if len(frames) == 1
+        else pd.concat(frames, ignore_index=True, sort=False)
+    )
     if "timestamp" in merged.columns:
         merged = (
             merged.dropna(subset=["timestamp"])
@@ -992,7 +1128,13 @@ def _quick_stats_and_equity(
         equity = [initial_capital]
         running = initial_capital
         for trade in trades:
-            pnl = _safe_float(trade.get("pnl", 0))
+            if isinstance(trade, Trade):
+                pnl = _trade_net_pnl(trade)
+            else:
+                pnl = _safe_float(trade.get("net_pnl"), float("nan"))
+                if not math.isfinite(pnl):
+                    pnl = _safe_float(trade.get("pnl"), 0.0)
+                    pnl -= _safe_float(trade.get("fees"), 0.0)
             running += pnl
             equity.append(round(running, 2))
         total_pnl = running - initial_capital
@@ -1083,31 +1225,49 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     """
     raw = _canonical_stats_from_result(result)
 
-    pnls = [
-        _safe_float(trade.pnl, 0.0)
-        for trade in (result.trades or [])
-        if _safe_float(trade.pnl, 0.0) != 0.0
-    ]
+    net_pnls = [_trade_net_pnl(trade) for trade in (result.trades or [])]
+    pnls = [pnl for pnl in net_pnls if pnl != 0.0]
     best_trade = max(pnls) if pnls else 0
     worst_trade = min(pnls) if pnls else 0
+    net_total = sum(net_pnls)
+    winners = sum(1 for pnl in net_pnls if pnl > 0)
+    losers = sum(1 for pnl in net_pnls if pnl < 0)
+    avg_winner = sum(pnl for pnl in net_pnls if pnl > 0) / winners if winners else 0
+    avg_loser = sum(pnl for pnl in net_pnls if pnl < 0) / losers if losers else 0
+    win_rate = winners / len(net_pnls) if net_pnls else 0.0
+    profit_factor = (
+        sum(pnl for pnl in net_pnls if pnl > 0) / abs(sum(pnl for pnl in net_pnls if pnl < 0))
+        if any(pnl < 0 for pnl in net_pnls)
+        else None
+    )
 
     stats = {
-        "net_profit": raw.get("total_pnl", 0),
+        "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
         "net_profit_pct": round(
-            raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100, 2
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / (result.meta.initial_capital or 100000)
+            * 100,
+            2,
         ),
         "sharpe": raw.get("sharpe_ratio", 0),
         "sortino": raw.get("sortino_ratio", 0),
         "calmar": raw.get("calmar_ratio", 0),
         "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
-        "win_rate": round(raw.get("win_rate", 0) * 100, 1),
-        "profit_factor": raw.get("profit_factor", 0),
-        "total_trades": raw.get("total_trades", 0),
-        "winners": raw.get("winners", 0),
-        "losers": raw.get("losers", 0),
-        "avg_winner": raw.get("avg_winner", 0),
-        "avg_loser": raw.get("avg_loser", 0),
-        "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
+        "win_rate": round(
+            (win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)) * 100,
+            1,
+        ),
+        "profit_factor": profit_factor if net_pnls else raw.get("profit_factor", 0),
+        "total_trades": len(net_pnls) if net_pnls else raw.get("total_trades", 0),
+        "winners": winners if net_pnls else raw.get("winners", 0),
+        "losers": losers if net_pnls else raw.get("losers", 0),
+        "avg_winner": round(avg_winner, 2) if net_pnls else raw.get("avg_winner", 0),
+        "avg_loser": round(avg_loser, 2) if net_pnls else raw.get("avg_loser", 0),
+        "avg_trade_pnl": round(
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / max(len(net_pnls) if net_pnls else raw.get("total_trades", 1), 1),
+            2,
+        ),
         "avg_bars_held": raw.get("avg_holding_bars", 0),
         "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
         "best_trade": best_trade,
@@ -1116,9 +1276,11 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "expectancy": 0,  # computed below
     }
     # Expectancy
-    wr = raw.get("win_rate", 0)
+    wr = win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)
+    winner_average = avg_winner if net_pnls else _safe_float(raw.get("avg_winner"), 0.0)
+    loser_average = avg_loser if net_pnls else _safe_float(raw.get("avg_loser"), 0.0)
     stats["expectancy"] = round(
-        wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
+        wr * winner_average + (1 - wr) * loser_average, 2
     )
     # PSR / p-value
     stats["psr"] = raw.get("psr")
@@ -1585,13 +1747,14 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
 
 def _dolthub_pull():
     """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
-    if not _DOLTHUB_REPOS.is_dir():
+    dolthub_repos = DATA_DIR / "dolthub"
+    if not dolthub_repos.is_dir():
         return
     if shutil.which("dolt") is None:
         logger.info("Skipping dolthub pull: optional 'dolt' binary not installed")
         return
     for repo in ("stocks", "earnings", "options", "rates"):
-        repo_path = _DOLTHUB_REPOS / repo
+        repo_path = dolthub_repos / repo
         if not (repo_path / ".dolt").is_dir():
             continue
         try:
@@ -1661,28 +1824,52 @@ def _extract_log_level(line: str, payload: dict | None = None) -> str | None:
     return None
 
 
-def _collect_log_entries(paths: list[Path]) -> list[dict]:
+def _read_log_tail(path: Path, max_bytes: int) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _collect_log_entries(
+    paths: list[Path],
+    *,
+    max_bytes: int = GENERAL_LOG_MAX_BYTES,
+    max_lines: int = GENERAL_LOG_MAX_LINES,
+) -> list[dict]:
     entries: list[dict] = []
+    remaining = max(0, int(max_bytes))
+    line_limit = max(0, int(max_lines))
     for path in paths:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        if remaining <= 0 or len(entries) >= line_limit:
+            break
+        per_file_limit = min(256 * 1024, remaining)
+        text = _read_log_tail(path, per_file_limit)
+        if not text:
             continue
-        for line_number, line in enumerate(lines):
+        remaining -= len(text.encode("utf-8", errors="ignore"))
+        for line_number, line in enumerate(text.splitlines()):
+            if len(entries) >= line_limit:
+                break
+            safe_line = redact_text(line)
             payload: dict | None = None
             timestamp: datetime | None = None
             try:
                 parsed = json.loads(line)
                 if isinstance(parsed, dict):
-                    payload = parsed
+                    payload = redact_value(parsed)
                     timestamp = _parse_log_timestamp(parsed.get("timestamp"))
             except json.JSONDecodeError:
                 payload = None
             entries.append(
                 {
-                    "line": line,
+                    "line": safe_line,
                     "timestamp": timestamp,
-                    "level": _extract_log_level(line, payload),
+                    "level": _extract_log_level(safe_line, payload),
                     "path": path.name,
                     "line_number": line_number,
                 }
@@ -1807,6 +1994,19 @@ ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
 FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
+def _prune_terminal_tasks_locked() -> None:
+    terminal = [
+        (str(task.get("updated_at") or ""), task_id)
+        for task_id, task in DATA_TASKS.items()
+        if task.get("status") in FINAL_TASK_STATUSES
+    ]
+    terminal.sort()
+    excess = len(terminal) - MAX_TERMINAL_TASKS
+    if excess > 0:
+        for _, task_id in terminal[:excess]:
+            DATA_TASKS.pop(task_id, None)
+
+
 def _download_request_key(identity: dict[str, Any]) -> str:
     payload = {
         "source": str(identity.get("source") or "").strip().lower(),
@@ -1838,18 +2038,49 @@ def _download_request_key(identity: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _singleflight_lease_expired(task: dict[str, Any], now: float) -> bool:
+    if task.get("status") not in ACTIVE_TASK_STATUSES:
+        return False
+    lease_until = task.get("singleflight_lease_until")
+    if lease_until is None:
+        return True
+    try:
+        return now >= float(lease_until)
+    except (TypeError, ValueError):
+        return True
+
+
+def _touch_singleflight_lease(task: dict[str, Any], now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    task["singleflight_heartbeat_at"] = current
+    task["singleflight_lease_until"] = current + SINGLEFLIGHT_LEASE_SECONDS
+
+
 def _register_download_task(
     record: dict[str, Any], request_key: str | None
 ) -> dict[str, Any] | None:
+    now = time.monotonic()
     with DATA_TASKS_LOCK:
         if request_key:
             for task in DATA_TASKS.values():
                 if task.get("download_request_key") != request_key:
                     continue
                 if task.get("status") in ACTIVE_TASK_STATUSES:
-                    return dict(task)
+                    if not _singleflight_lease_expired(task, now):
+                        _touch_singleflight_lease(task, now)
+                        return dict(task)
+                    task["status"] = "failed"
+                    task["error"] = "singleflight reservation lease expired"
+                    task["finished_at"] = _task_now_iso()
+                    task.pop("download_request_key", None)
+                else:
+                    task.pop("download_request_key", None)
             record["download_request_key"] = request_key
+        record.setdefault("owner_pid", os.getpid())
+        record.setdefault("owner_thread_id", threading.get_ident())
+        _touch_singleflight_lease(record, now)
         DATA_TASKS[record["id"]] = record
+        _prune_terminal_tasks_locked()
         return None
 
 
@@ -1864,6 +2095,8 @@ def _start_singleflight_download(
         "id": task_id,
         "status": "starting",
         "download_request_key": request_key,
+        "owner_pid": os.getpid(),
+        "owner_thread_id": threading.get_ident(),
     }
     existing = _register_download_task(reservation, request_key)
     if existing is not None:
@@ -1892,22 +2125,28 @@ def _task_timestamp() -> str:
 
 
 def _task_log_path(task_id: str) -> Path:
-    return TASK_LOGS_DIR / f"task_{task_id}.log"
+    normalized = _normalized_task_id(task_id)
+    if not normalized:
+        raise ValueError("Invalid task id")
+    return TASK_LOGS_DIR / f"task_{normalized}.log"
 
 
 def _read_task_log(log_file: str | Path, *, max_bytes: int | None = None) -> str:
     path = Path(log_file)
-    if not path.exists():
+    if not path.exists() or path.is_symlink() or not path.is_file():
         return ""
 
-    if max_bytes is None:
-        return path.read_text(encoding="utf-8", errors="replace")
-
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size > max_bytes:
-            handle.seek(size - max_bytes)
-        return handle.read().decode("utf-8", errors="replace")
+    limit = TASK_LOG_MAX_BYTES if max_bytes is None else max(0, int(max_bytes))
+    if limit <= 0:
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > limit:
+                handle.seek(size - limit)
+            return redact_text(handle.read(limit).decode("utf-8", errors="replace"))
+    except OSError:
+        return ""
 
 
 def _append_task_log(log_file: Path, message: str) -> None:
@@ -2043,9 +2282,18 @@ def _create_task_record(
         "updated_at": now,
     }
     with DATA_TASKS_LOCK:
+        _prune_terminal_tasks_locked()
         reservation = DATA_TASKS.get(task_id)
         if reservation is not None and reservation.get("download_request_key"):
-            record["download_request_key"] = reservation["download_request_key"]
+            for key in (
+                "download_request_key",
+                "owner_pid",
+                "owner_thread_id",
+                "singleflight_heartbeat_at",
+                "singleflight_lease_until",
+            ):
+                if key in reservation:
+                    record[key] = reservation[key]
     return record
 
 
@@ -2056,14 +2304,10 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _normalized_task_id(task_id: str) -> str:
-    """Normalize a task-id path parameter to a bounded charset (python:S5131).
-
-    Task ids are uuid4-derived hex/uuid strings; anything else is mapped to an
-    empty string, which cannot match a task.
-    """
-    return task_id[:64] if task_id and not any(
-        not ch.isprintable() or ch in {"/", chr(92)} for ch in task_id
-    ) else ""
+    value = str(task_id or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9-]{8,64}", value) is None:
+        return ""
+    return value
 
 
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
@@ -2081,6 +2325,8 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
         task.update(updates)
         if task.get("status") in FINAL_TASK_STATUSES:
             task.pop("download_request_key", None)
+        elif task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
         return dict(task)
 
@@ -2108,7 +2354,7 @@ def _update_task_progress(
             detail["total"] = max(int(task.get("total_items", 0) or 0), 0)
 
         if current is not None:
-            detail["current"] = current
+            detail["current"] = redact_text(str(current))
 
         next_percent = float(task.get("progress", 0.0) or 0.0)
         if percent is not None:
@@ -2117,6 +2363,8 @@ def _update_task_progress(
         detail["percent"] = next_percent
         task["progress"] = next_percent
         task["progress_detail"] = detail
+        if task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
         return dict(task)
 
@@ -2129,7 +2377,7 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
 
         detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
         detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
-        detail["current"] = text
+        detail["current"] = redact_text(text)
 
         if text.startswith(("✅", "❌")):
             if text.startswith("✅"):
@@ -2146,17 +2394,21 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
             detail["percent"] = float(task.get("progress", detail.get("percent", 0.0)) or 0.0)
 
         task["progress_detail"] = detail
+        if task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
 
 
 def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[str, Any]:
     detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
     detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
+    if detail.get("current"):
+        detail["current"] = redact_text(str(detail["current"]))
 
     if not detail.get("current") and log_content:
         lines = [line.strip() for line in log_content.splitlines() if line.strip()]
         if lines:
-            detail["current"] = lines[-1]
+            detail["current"] = redact_text(lines[-1])
 
     if detail["total"] > 0 and detail.get("completed", 0) == 0 and detail.get("failed", 0) == 0 and log_content:
         detail["completed"] = log_content.count("✅")
@@ -2224,7 +2476,7 @@ def _mark_task_finished(
     if returncode is not None:
         updates["returncode"] = returncode
     if error is not None:
-        updates["error"] = error
+        updates["error"] = redact_text(str(error))
     task = _update_task_fields(task_id, **updates)
     if status == "completed":
         _update_task_progress(task_id, percent=100.0)

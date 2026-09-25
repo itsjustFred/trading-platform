@@ -66,7 +66,7 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
-from shared.logging import get_logger
+from shared.logging import get_logger, redact_text, redact_value
 from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
@@ -218,6 +218,10 @@ REPLAY_MIN_BARS_PER_EVENT = 4
 REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_TASK_LOG_WS_CHUNK_BYTES = 64 * 1024
+_TASK_LOG_WS_MAX_BYTES = 2 * 1024 * 1024
+_TASK_LOG_RESPONSE_MAX_LINES = 2000
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -501,6 +505,209 @@ def _run_backtest_sync(runner: Callable[[Any], Any], payload: Any) -> Any:
     return _run_coroutine_sync(lambda: _invoke())
 
 
+_RECOVERY_SPEC_VERSION = 1
+_RECOVERY_BACKTEST_ENGINES = {"native", "vectorbt", "lean", "pynecore"}
+_RECOVERY_DOWNLOAD_SOURCES = {"yfinance", "huggingface", "alpaca", "dolthub", "dukascopy", "jforex"}
+_RECOVERY_OPERATIONS = {"download", "resample", "harvest", "validate", "calibrate"}
+_RECOVERY_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
+_RECOVERY_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+
+
+def _recovery_spec(raw_config: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    if not isinstance(raw_config, dict):
+        return None
+    candidate = raw_config.get("task_spec")
+    if not isinstance(candidate, dict):
+        return None
+    if candidate.get("version") != _RECOVERY_SPEC_VERSION:
+        return None
+    if str(candidate.get("kind") or "").strip().lower() != kind:
+        return None
+    operation = str(candidate.get("operation") or "").strip().lower()
+    if kind == "data" and operation not in _RECOVERY_OPERATIONS:
+        return None
+    if kind == "backtest" and operation != "run":
+        return None
+    return dict(candidate)
+
+
+def _recovery_backtest_spec(raw_config: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(raw_config, dict):
+        return None
+    explicit = _recovery_spec(raw_config, "backtest")
+    if explicit is not None:
+        return explicit
+    legacy = raw_config.get("restart_config")
+    if not isinstance(legacy, dict):
+        return None
+    return {
+        "version": _RECOVERY_SPEC_VERSION,
+        "kind": "backtest",
+        "operation": "run",
+        "parameters": dict(legacy),
+    }
+
+
+def _recovery_list(payload: dict[str, Any], key: str, *, required: bool) -> list[str]:
+    raw = payload.get(key)
+    if raw is None and not required:
+        return []
+    if isinstance(raw, str):
+        raw = [item for item in raw.split(",") if item.strip()]
+    if not isinstance(raw, list):
+        raise ValueError(f"{key} must be a list")
+    values: list[str] = []
+    for item in raw:
+        value = str(item or "").strip()
+        if not value or value in values:
+            continue
+        values.append(value)
+    if required and not values:
+        raise ValueError(f"{key} is required")
+    if len(values) > 256:
+        raise ValueError(f"{key} has too many values")
+    return values
+
+
+def _recovery_symbols(payload: dict[str, Any], *, required: bool) -> list[str]:
+    values = _recovery_list(payload, "symbols", required=required)
+    for value in values:
+        if _RECOVERY_SYMBOL_RE.fullmatch(value) is None:
+            raise ValueError("invalid recovery symbol")
+    return [value.upper() for value in values]
+
+
+def _recovery_timeframes(payload: dict[str, Any], *, required: bool) -> list[str]:
+    values = _recovery_list(payload, "timeframes", required=required)
+    for value in values:
+        if _RECOVERY_TIMEFRAME_RE.fullmatch(value) is None:
+            raise ValueError("invalid recovery timeframe")
+    return [value.lower() for value in values]
+
+
+def _recovery_date(payload: dict[str, Any], key: str) -> str | None:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        return None
+    if len(value) > 64 or pd.isna(pd.to_datetime(value, utc=True, errors="coerce")):
+        raise ValueError(f"invalid recovery {key}")
+    return value
+
+
+def _recovery_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"invalid recovery {key}")
+    return value
+
+
+def _recovery_int(payload: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = payload.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"invalid recovery {key}")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid recovery {key}") from exc
+    if normalized < low or normalized > high:
+        raise ValueError(f"recovery {key} is out of range")
+    return normalized
+
+
+def _backtest_request_from_recovery_spec(spec: dict[str, Any]) -> BacktestRunRequest:
+    nested_parameters = spec.get("parameters")
+    if isinstance(nested_parameters, dict) and "strategy" in nested_parameters:
+        payload = nested_parameters
+    else:
+        payload = spec
+    strategy = str(payload.get("strategy") or "").strip()
+    engine = str(payload.get("engine") or "native").strip().lower()
+    symbols = _recovery_symbols(payload, required=True)
+    timeframe = str(payload.get("timeframe") or "1d").strip().lower()
+    if not strategy or engine not in _RECOVERY_BACKTEST_ENGINES:
+        raise ValueError("invalid recovery backtest configuration")
+    if _RECOVERY_TIMEFRAME_RE.fullmatch(timeframe) is None:
+        raise ValueError("invalid recovery timeframe")
+    capital = _safe_float(payload.get("capital"), 100000.0)
+    if not math.isfinite(capital) or capital <= 0:
+        raise ValueError("invalid recovery capital")
+    parameters = payload.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError("invalid recovery parameters")
+    return BacktestRunRequest(
+        strategy=strategy,
+        engine=engine,
+        symbols=symbols,
+        timeframe=timeframe,
+        start=str(payload.get("start") or ""),
+        end=str(payload.get("end") or ""),
+        capital=capital,
+        risk_per_trade_pct=payload.get("risk_per_trade_pct"),
+        max_position_pct=payload.get("max_position_pct"),
+        max_leverage=payload.get("max_leverage"),
+        modeling_resolution=(
+            str(payload["modeling_resolution"])
+            if payload.get("modeling_resolution") is not None
+            else None
+        ),
+        intrabar_resolution=(
+            str(payload["intrabar_resolution"])
+            if payload.get("intrabar_resolution") is not None
+            else None
+        ),
+        parameters=dict(parameters or {}),
+    )
+
+
+def _download_request_from_recovery_spec(spec: dict[str, Any]) -> _PreparedDownloadRequest:
+    source = str(spec.get("source") or "").strip().lower()
+    if source not in _RECOVERY_DOWNLOAD_SOURCES:
+        raise ValueError("unsupported recovery download source")
+    symbols = _recovery_symbols(spec, required=source != "dolthub")
+    timeframes = _recovery_timeframes(spec, required=source != "dolthub")
+    offer_side = str(spec.get("offer_side") or spec.get("price_type") or "bid").strip().lower()
+    if offer_side not in {"bid", "ask", "both"}:
+        raise ValueError("invalid recovery offer side")
+    request = _PreparedDownloadRequest(
+        source=source,
+        symbols=",".join(symbols),
+        timeframes=",".join(timeframes),
+        start=_recovery_date(spec, "start") or "",
+        end=_recovery_date(spec, "end") or "",
+        offer_side=offer_side,
+        merge_tick=_recovery_bool(spec, "merge_tick"),
+        merge_s1=_recovery_bool(spec, "merge_s1"),
+        batch_size=_recovery_int(spec, "batch_size", 10, 1, 50),
+        pause_ms=_recovery_int(spec, "pause_ms", 1000, 0, 60000),
+        query_timeout_seconds=_recovery_int(spec, "query_timeout_seconds", 900, 30, 7200),
+        symbol_list=symbols,
+        timeframe_list=timeframes,
+    )
+    _validate_download_limits(request)
+    return request
+
+
+def _queue_unrecoverable_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any], reason: str
+) -> None:
+    config = dict(raw_config)
+    config.pop("command", None)
+    config.pop("cmd", None)
+    config["recovery_rejected"] = reason
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=str(record.get("type") or "data"),
+        status="queued",
+        config_json=config,
+        progress_message="Recovery pending manual restart; typed recovery metadata is required",
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
 def _resume_interrupted_tasks() -> None:
     if not _LEGACY_HOOKS_INSTALLED:
         raise RuntimeError(
@@ -512,73 +719,13 @@ def _resume_interrupted_tasks() -> None:
     for record in records:
         try:
             task_id = str(record.get("id") or "").strip()
-            if not task_id:
+            if not task_id or _TASK_ID_RE.fullmatch(task_id) is None:
                 continue
-
-            task_type = str(record.get("type") or "")
+            task_type = str(record.get("type") or "").strip().lower()
             raw_config = dict(record.get("config_json") or {})
-
             if task_type == "backtest":
-                strategy = str(backtest_config.get("strategy") or "").strip()
-                symbols = backtest_config.get("symbols")
-                if not strategy or not isinstance(symbols, list) or not symbols:
-                    logger.warning(
-                        "Skipping auto-recovery for task %s: incomplete backtest restart config",
-                        task_id,
-                    )
-                    continue
-
-                logger.info(
-                    "Auto-restarting backtest task %s (%s %s %s)",
-                    task_id,
-                    strategy,
-                    ",".join(str(symbol) for symbol in symbols),
-                    str(backtest_config.get("timeframe") or "1d"),
-                )
-                request_payload = BacktestRunRequest(
-                    strategy=strategy,
-                    engine=str(backtest_config.get("engine") or "native"),
-                    symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-                    timeframe=str(backtest_config.get("timeframe") or "1d"),
-                    start=str(backtest_config.get("start") or ""),
-                    end=str(backtest_config.get("end") or ""),
-                    capital=float(backtest_config.get("capital") or 100000.0),
-                    risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
-                    max_position_pct=backtest_config.get("max_position_pct"),
-                    max_leverage=backtest_config.get("max_leverage"),
-                    modeling_resolution=(
-                        str(backtest_config.get("modeling_resolution"))
-                        if backtest_config.get("modeling_resolution") is not None
-                        else None
-                    ),
-                    intrabar_resolution=(
-                        str(backtest_config.get("intrabar_resolution"))
-                        if backtest_config.get("intrabar_resolution") is not None
-                        else None
-                    ),
-                    parameters=dict(backtest_config.get("parameters") or {}),
-                )
-                restarted = _run_backtest_sync(run_backtest, request_payload)
-                restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
-                upsert_background_task_record(
-                    task_id=task_id,
-                    task_type=task_type,
-                    status="completed",
-                    config_json=raw_config,
-                    progress_message=(
-                        f"Auto-restarted as task {restarted_task_id}"
-                        if restarted_task_id
-                        else "Auto-restarted as new task"
-                    ),
-                    name=str(record.get("name") or ""),
-                    description=str(record.get("description") or ""),
-                    source=str(record.get("source") or ""),
-                    created_at=str(record.get("created_at") or ""),
-                    updated_at=_now_iso(),
-                )
-                continue
-
-            if task_type == "data":
+                _resume_interrupted_backtest_task(record, task_id, raw_config)
+            elif task_type == "data":
                 _resume_interrupted_data_task(record, task_id, raw_config)
         except Exception as exc:
             logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
@@ -587,52 +734,27 @@ def _resume_interrupted_tasks() -> None:
 def _resume_interrupted_backtest_task(
     record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
 ) -> None:
-    restart_config = raw_config.get("restart_config")
-    backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
-    strategy = str(backtest_config.get("strategy") or "").strip()
-    symbols = backtest_config.get("symbols")
-    if not strategy or not isinstance(symbols, list) or not symbols:
-        logger.warning(
-            "Skipping auto-recovery for task %s: incomplete backtest restart config",
-            task_id,
-        )
+    spec = _recovery_backtest_spec(raw_config)
+    if spec is None:
+        _queue_unrecoverable_task(record, task_id, raw_config, "missing typed backtest spec")
         return
-
+    try:
+        request_payload = _backtest_request_from_recovery_spec(spec)
+    except (TypeError, ValueError) as exc:
+        _queue_unrecoverable_task(record, task_id, raw_config, str(exc))
+        return
     logger.info(
         "Auto-restarting backtest task %s (%s %s %s)",
         task_id,
-        strategy,
-        ",".join(str(symbol) for symbol in symbols),
-        str(backtest_config.get("timeframe") or "1d"),
-    )
-    request_payload = BacktestRunRequest(
-        strategy=strategy,
-        engine=str(backtest_config.get("engine") or "native"),
-        symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-        timeframe=str(backtest_config.get("timeframe") or "1d"),
-        start=str(backtest_config.get("start") or ""),
-        end=str(backtest_config.get("end") or ""),
-        capital=float(backtest_config.get("capital") or 100000.0),
-        risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
-        max_position_pct=backtest_config.get("max_position_pct"),
-        max_leverage=backtest_config.get("max_leverage"),
-        modeling_resolution=(
-            str(backtest_config.get("modeling_resolution"))
-            if backtest_config.get("modeling_resolution") is not None
-            else None
-        ),
-        intrabar_resolution=(
-            str(backtest_config.get("intrabar_resolution"))
-            if backtest_config.get("intrabar_resolution") is not None
-            else None
-        ),
-        parameters=dict(backtest_config.get("parameters") or {}),
+        request_payload.strategy,
+        ",".join(request_payload.symbols),
+        request_payload.timeframe,
     )
     restarted = _run_backtest_sync(run_backtest, request_payload)
     restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
     upsert_background_task_record(
         task_id=task_id,
-        task_type=str(record.get("type") or ""),
+        task_type=str(record.get("type") or "backtest"),
         status="completed",
         config_json=raw_config,
         progress_message=(
@@ -651,99 +773,59 @@ def _resume_interrupted_backtest_task(
 def _resume_interrupted_data_task(
     record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
 ) -> None:
-    task_type = str(record.get("type") or "")
-    source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
-    downloader = str(raw_config.get("downloader") or source or "").strip().lower()
-    symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
-    timeframes = [
-        str(item).strip().lower()
-        for item in raw_config.get("timeframes", [])
-        if str(item).strip()
-    ]
-    total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
-    name = str(record.get("name") or "Recovered data task")
-    description = str(record.get("description") or "")
-    start = str(raw_config.get("start") or "").strip() or None
-    end = str(raw_config.get("end") or "").strip() or None
-
-    if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
-        _resume_interrupted_downloader_task(
-            record=record,
-            task_id=task_id,
-            raw_config=raw_config,
-            downloader=downloader,
-            symbols=symbols,
-            timeframes=timeframes,
-            total_items=total_items,
-            name=name,
-            description=description,
-            start=start,
-            end=end,
-        )
+    spec = _recovery_spec(raw_config, "data")
+    if spec is None:
+        _queue_unrecoverable_task(record, task_id, raw_config, "missing typed data spec")
         return
-
-    command = raw_config.get("command")
-    if isinstance(command, list) and command:
-        logger.info("Auto-restarting data task %s via persisted command", task_id)
-        _start_data_task(
-            task_id,
-            [str(part) for part in command],
-            total_items=total_items,
-            name=name,
-            description=description,
-            kind="data",
-            source=source or downloader or "data",
-        )
-        _apply_recovery_data_metadata(
-            task_id,
-            command=[str(part) for part in command],
-            downloader=downloader or None,
-            symbols=symbols or None,
-            timeframes=timeframes or None,
-            start=start,
-            end=end,
-            offer_side=str(raw_config.get("offer_side") or "") or None,
-            price_type=str(raw_config.get("price_type") or "") or None,
-            merge_tick=(
-                bool(raw_config.get("merge_tick"))
-                if raw_config.get("merge_tick") is not None
-                else None
-            ),
-            merge_s1=(
-                bool(raw_config.get("merge_s1"))
-                if raw_config.get("merge_s1") is not None
-                else None
-            ),
-            batch_size=(
-                _safe_int(raw_config.get("batch_size"))
-                if raw_config.get("batch_size") is not None
-                else None
-            ),
-            pause_ms=(
-                _safe_int(raw_config.get("pause_ms"))
-                if raw_config.get("pause_ms") is not None
-                else None
-            ),
-            query_timeout_seconds=(
-                _safe_int(raw_config.get("query_timeout_seconds"))
-                if raw_config.get("query_timeout_seconds") is not None
-                else None
-            ),
-        )
+    operation = str(spec.get("operation") or "").strip().lower()
+    try:
+        if operation == "download":
+            request = _download_request_from_recovery_spec(spec)
+            name = str(record.get("name") or "Recovered data task")
+            description = str(record.get("description") or "")
+            if request.source in {"dukascopy", "jforex"}:
+                _start_jforex_download(task_id, request, name=name, description=description)
+            else:
+                _start_generic_download(task_id, request, name=name, description=description)
+            return
+        if operation == "resample":
+            source_path = _contained_client_data_file(
+                str(spec.get("source_path") or ""), allowed_suffix=OHLCV_PARQUET_SUFFIX
+            )
+            target_timeframes = _recovery_timeframes(
+                {"timeframes": spec.get("target_timeframes")}, required=True
+            )
+            if source_path is None or not target_timeframes:
+                raise ValueError("invalid recovery resample input")
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "data_tools.resample",
+                "--source",
+                str(source_path),
+                "--timeframes",
+                ",".join(target_timeframes),
+            ]
+            _start_data_task(
+                task_id,
+                command,
+                total_items=1,
+                name=str(record.get("name") or "Recovered resample task"),
+                description=str(record.get("description") or ""),
+                source="resample",
+            )
+            _apply_recovery_data_metadata(
+                task_id,
+                command=command,
+                downloader="resample",
+                task_spec=spec,
+            )
+            return
+    except (HTTPException, TypeError, ValueError) as exc:
+        _queue_unrecoverable_task(record, task_id, raw_config, str(exc))
         return
-
-    upsert_background_task_record(
-        task_id=task_id,
-        task_type=task_type,
-        status="queued",
-        config_json=raw_config,
-        progress_message="Recovery pending manual restart; missing restart metadata",
-        name=str(record.get("name") or ""),
-        description=str(record.get("description") or ""),
-        source=str(record.get("source") or ""),
-        created_at=str(record.get("created_at") or ""),
-        updated_at=_now_iso(),
-    )
+    _queue_unrecoverable_task(record, task_id, raw_config, "unsupported typed data operation")
 
 
 def _resume_interrupted_downloader_task(
@@ -760,66 +842,28 @@ def _resume_interrupted_downloader_task(
     start: str | None,
     end: str | None,
 ) -> None:
-    task_type = str(record.get("type") or "")
-    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
-    cmd = raw_config.get("command")
-    if not isinstance(cmd, list) or not cmd:
-        logger.warning(
-            "Skipping auto-recovery for data task %s: missing command for %s",
+    spec = _recovery_spec(raw_config, "data")
+    if spec is None or str(spec.get("operation") or "").lower() != "download":
+        _queue_unrecoverable_task(record, task_id, raw_config, "missing typed downloader spec")
+        return
+    try:
+        request = _download_request_from_recovery_spec(spec)
+    except (TypeError, ValueError) as exc:
+        _queue_unrecoverable_task(record, task_id, raw_config, str(exc))
+        return
+    requested_source = str(spec.get("source") or "").strip().lower()
+    if requested_source not in {"dukascopy", "jforex"}:
+        _queue_unrecoverable_task(
+            record,
             task_id,
-            downloader,
-        )
-        upsert_background_task_record(
-            task_id=task_id,
-            task_type=task_type,
-            status="queued",
-            config_json=raw_config,
-            progress_message="Recovery pending manual restart; missing restart command",
-            name=str(record.get("name") or ""),
-            description=str(record.get("description") or ""),
-            source=str(record.get("source") or ""),
-            created_at=str(record.get("created_at") or ""),
-            updated_at=_now_iso(),
+            raw_config,
+            "downloader source is not allowlisted",
         )
         return
-
-    logger.info("Auto-restarting %s data task %s", downloader, task_id)
-    cmd_list = [str(part) for part in cmd]
-    _start_jforex_task(
-        task_id,
-        cmd_list,
-        source_label=downloader,
-        allow_native_fallback=(downloader == "dukascopy"),
-        symbols=symbols,
-        timeframes=timeframes,
-        start=start,
-        end=end,
-        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
-        merge_tick=bool(raw_config.get("merge_tick", False)),
-        merge_s1=bool(raw_config.get("merge_s1", False)),
-        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-        total_items=total_items or max(len(symbols) * len(timeframes), 1),
-        name=name,
-        description=description,
-    )
-    _apply_recovery_data_metadata(
-        task_id,
-        command=cmd_list,
-        downloader=downloader,
-        symbols=symbols,
-        timeframes=timeframes,
-        start=start,
-        end=end,
-        offer_side=str(raw_config.get("offer_side") or "bid"),
-        price_type=str(raw_config.get("price_type") or "bid"),
-        merge_tick=bool(raw_config.get("merge_tick", False)),
-        merge_s1=bool(raw_config.get("merge_s1", False)),
-        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-    )
+    if requested_source != downloader:
+        _queue_unrecoverable_task(record, task_id, raw_config, "downloader source mismatch")
+        return
+    _start_jforex_download(task_id, request, name=name, description=description)
 
 
 @asynccontextmanager
@@ -1394,18 +1438,23 @@ async def api_request_logging_middleware(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    error_id = uuid.uuid4().hex
     logger.exception(
         "Unhandled server exception",
         extra={
             "data": {
                 "method": request.method,
                 "path": request.url.path,
+                "error_id": error_id,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
         },
     )
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error (error_id={error_id})"},
+    )
 
 
 def _load_result(backtest_id: str) -> BacktestResult | None:
@@ -1426,9 +1475,33 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
         return None
 
 
+def _validated_task_id(task_id: str) -> str:
+    normalized = str(task_id or "").strip()
+    if _TASK_ID_RE.fullmatch(normalized) is None:
+        raise HTTPException(status_code=400, detail="Invalid task id")
+    return normalized
+
+
+def _validated_task_log_path(task_id: str) -> Path:
+    normalized = _validated_task_id(task_id)
+    if TASK_LOGS_DIR.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    root = TASK_LOGS_DIR.resolve()
+    raw_candidate = root / f"task_{normalized}.log"
+    if raw_candidate.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    candidate = raw_candidate.resolve()
+    if candidate.parent != root or candidate.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    return candidate
+
+
 def _task_status(task_id: str) -> str | None:
+    normalized = str(task_id or "").strip()
+    if _TASK_ID_RE.fullmatch(normalized) is None:
+        return None
     with DATA_TASKS_LOCK:
-        task = DATA_TASKS.get(task_id)
+        task = DATA_TASKS.get(normalized)
         return task.get("status") if task else None
 
 
@@ -2090,7 +2163,11 @@ def _portfolio_stats_from_trades(
     max_drawdown = 0.0
 
     for trade in ordered_trades:
-        pnl = _safe_float(trade.get("pnl"), 0.0)
+        pnl_value = trade.get("net_pnl")
+        if pnl_value is None:
+            pnl_value = _safe_float(trade.get("pnl"), 0.0)
+            pnl_value -= _safe_float(trade.get("fees"), 0.0)
+        pnl = _safe_float(pnl_value, 0.0)
         total_pnl += pnl
         equity += pnl
         peak = max(peak, equity)
@@ -2947,6 +3024,7 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
         "error": _json_safe(task.get("error")),
         "result": _json_safe(task.get("result")),
         "restart_config": _json_safe(task.get("restart_config")),
+        "task_spec": _json_safe(task.get("task_spec")),
     }
     if task.get("pid") is not None:
         payload["pid"] = task.get("pid")
@@ -3039,7 +3117,12 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
         "percent",
         float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(str(task.get("status")), 0.0))),
     )
-    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    progress_detail.setdefault(
+        "current",
+        redact_text(str(record.get("progress_message") or "")),
+    )
+    if progress_detail.get("current"):
+        progress_detail["current"] = redact_text(str(progress_detail["current"]))
     task["progress"] = float(progress_detail.get("percent", 0.0) or 0.0)
     task["progress_detail"] = progress_detail
 
@@ -3049,6 +3132,8 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     task.setdefault("pause_event", threading.Event())
     task.setdefault("stop_event", threading.Event())
     task.setdefault("log_file", str(_task_log_path(task_id)))
+    if config_payload.get("task_spec") is not None:
+        task["task_spec"] = config_payload.get("task_spec")
     record_history = _sanitize_progress_history(config_payload.get("progress_history"))
     if record_history:
         task["progress_history"] = record_history
@@ -3068,7 +3153,11 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "percent",
         float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(status, 0.0))),
     )
-    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    progress_detail.setdefault(
+        "current",
+        redact_text(str(record.get("progress_message") or "")),
+    )
+    raw_error = config_payload.get("error")
     task = {
         "id": task_id,
         "name": str(record.get("name") or ""),
@@ -3094,7 +3183,7 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "progress_history": _sanitize_progress_history(config_payload.get("progress_history")),
         "pause_event": threading.Event(),
         "stop_event": threading.Event(),
-        "error": config_payload.get("error"),
+        "error": redact_text(str(raw_error)) if raw_error is not None else None,
         "result": config_payload.get("result"),
     }
     if config_payload.get("pid") is not None:
@@ -3103,6 +3192,8 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         task["command"] = config_payload.get("command")
     if config_payload.get("downloader") is not None:
         task["downloader"] = config_payload.get("downloader")
+    if config_payload.get("task_spec") is not None:
+        task["task_spec"] = config_payload.get("task_spec")
     for key in (
         "symbols",
         "timeframes",
@@ -3127,6 +3218,7 @@ def _apply_recovery_data_metadata(
     *,
     command: list[str],
     downloader: str | None = None,
+    task_spec: dict[str, Any] | None = None,
     symbols: list[str] | None = None,
     timeframes: list[str] | None = None,
     start: str | None = None,
@@ -3145,6 +3237,8 @@ def _apply_recovery_data_metadata(
         return
     payload_updates: dict[str, Any] = {}
     payload_updates["command"] = list(command)
+    if task_spec is not None:
+        payload_updates["task_spec"] = _json_safe(task_spec)
     if downloader is not None:
         payload_updates["downloader"] = downloader
     if symbols is not None:
@@ -3187,6 +3281,31 @@ def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
 
 
 _COALESCED_CLEANUP_PENDING: set[str] = set()
+_COALESCED_CLEANUP_ORDER: list[str] = []
+_COALESCED_CLEANUP_ATTEMPTS: dict[str, int] = {}
+_COALESCED_CLEANUP_MAX_ENTRIES = 1024
+_COALESCED_CLEANUP_MAX_ATTEMPTS = 5
+
+
+def _remember_coalesced_cleanup(task_id: str) -> None:
+    if task_id not in _COALESCED_CLEANUP_PENDING:
+        _COALESCED_CLEANUP_PENDING.add(task_id)
+        while task_id in _COALESCED_CLEANUP_ORDER:
+            _COALESCED_CLEANUP_ORDER.remove(task_id)
+        _COALESCED_CLEANUP_ORDER.append(task_id)
+    while len(_COALESCED_CLEANUP_ORDER) > _COALESCED_CLEANUP_MAX_ENTRIES:
+        oldest = _COALESCED_CLEANUP_ORDER.pop(0)
+        _COALESCED_CLEANUP_PENDING.discard(oldest)
+        _COALESCED_CLEANUP_ATTEMPTS.pop(oldest, None)
+
+
+def _forget_coalesced_cleanup(task_id: str) -> None:
+    _COALESCED_CLEANUP_PENDING.discard(task_id)
+    _COALESCED_CLEANUP_ATTEMPTS.pop(task_id, None)
+    try:
+        _COALESCED_CLEANUP_ORDER.remove(task_id)
+    except ValueError:
+        pass
 
 
 def _retry_coalesced_cleanup(task_id: str) -> bool:
@@ -3194,7 +3313,12 @@ def _retry_coalesced_cleanup(task_id: str) -> bool:
         delete_background_task_record(task_id)
     except Exception as exc:
         with DATA_TASKS_LOCK:
-            _COALESCED_CLEANUP_PENDING.add(task_id)
+            attempts = _COALESCED_CLEANUP_ATTEMPTS.get(task_id, 0) + 1
+            _COALESCED_CLEANUP_ATTEMPTS[task_id] = attempts
+            if attempts > _COALESCED_CLEANUP_MAX_ATTEMPTS:
+                _forget_coalesced_cleanup(task_id)
+            else:
+                _remember_coalesced_cleanup(task_id)
         logger.warning(
             "Could not retry provisional coalesced task cleanup %s: %s",
             task_id,
@@ -3202,11 +3326,13 @@ def _retry_coalesced_cleanup(task_id: str) -> bool:
         )
         return False
     with DATA_TASKS_LOCK:
-        _COALESCED_CLEANUP_PENDING.discard(task_id)
+        _forget_coalesced_cleanup(task_id)
     return True
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    if _TASK_ID_RE.fullmatch(str(task_id or "").strip()) is None:
+        return None
     with DATA_TASKS_LOCK:
         cleanup_pending = task_id in _COALESCED_CLEANUP_PENDING
         if cleanup_pending:
@@ -3264,15 +3390,29 @@ def _hydrate_background_task_records(
             DATA_TASKS.pop(task_id, None)
         for record in records:
             task_id = str(record.get("id") or "").strip()
-            if not task_id:
+            if not task_id or _TASK_ID_RE.fullmatch(task_id) is None:
                 continue
             if _is_coalesced_cleanup_marker(record):
                 DATA_TASKS.pop(task_id, None)
+                _remember_coalesced_cleanup(task_id)
                 cleanup_ids.add(task_id)
                 continue
             if task_id in cleanup_ids or task_id in DATA_TASKS:
                 continue
             DATA_TASKS[task_id] = _build_task_from_record(record)
+        terminal = sorted(
+            (
+                str(task.get("updated_at") or ""),
+                task_id,
+            )
+            for task_id, task in DATA_TASKS.items()
+            if task.get("status") in FINAL_TASK_STATUSES
+        )
+        max_terminal_tasks = int(getattr(legacy_viewer, "MAX_TERMINAL_TASKS", 1024))
+        excess = len(terminal) - max_terminal_tasks
+        if excess > 0:
+            for _, task_id in terminal[:excess]:
+                DATA_TASKS.pop(task_id, None)
         return cleanup_ids, len(DATA_TASKS)
 
 
@@ -3364,7 +3504,7 @@ def _discard_coalesced_download_registration(task_id: str) -> None:
         delete_background_task_record(task_id)
     except Exception as exc:
         with DATA_TASKS_LOCK:
-            _COALESCED_CLEANUP_PENDING.add(task_id)
+            _remember_coalesced_cleanup(task_id)
         try:
             upsert_background_task_record(
                 task_id=task_id,
@@ -3557,6 +3697,8 @@ def _serialize_task(
         error_message = None
     elif not isinstance(error_message, str):
         error_message = str(error_message)
+    if error_message is not None:
+        error_message = redact_text(error_message)
     payload["can_restart"] = status in {"interrupted", "failed"}
     payload["category"] = _normalize_task_category(
         task.get("category"),
@@ -3636,12 +3778,14 @@ def _live_ws_error_detail(exc: Exception) -> str:
     if isinstance(exc, HTTPException):
         detail = exc.detail
         if isinstance(detail, str):
-            return detail
+            return redact_text(detail)
         try:
-            return json.dumps(detail, ensure_ascii=False, default=str)
+            return redact_text(
+                json.dumps(redact_value(detail), ensure_ascii=False, default=str)
+            )
         except Exception:
-            return str(detail)
-    return str(exc)
+            return "Live stream unavailable"
+    return "Live stream unavailable"
 
 
 async def _consume_live_ws_messages(
@@ -4770,9 +4914,18 @@ def _normalize_portfolio_trade_fields(raw_trade: dict[str, Any]) -> dict[str, An
     )
     trade["size"] = _safe_float(size, _safe_float(quantity, 0.0))
 
-    pnl = _trade_numeric_value(trade, "pnl", "realized_pnl", "profit", "net_profit")
-    if pnl is not None:
-        trade["pnl"] = pnl
+    gross_pnl = _trade_numeric_value(trade, "gross_pnl", "pnl", "realized_pnl", "profit")
+    net_pnl = _trade_numeric_value(trade, "net_pnl", "net_profit")
+    fees = _trade_numeric_value(trade, "fees", "commission")
+    if net_pnl is None and gross_pnl is not None:
+        net_pnl = gross_pnl - (fees or 0.0)
+    if net_pnl is not None:
+        trade["net_pnl"] = net_pnl
+        trade["pnl"] = net_pnl
+    if gross_pnl is not None:
+        trade["gross_pnl"] = gross_pnl
+    if fees is not None:
+        trade["fees"] = fees
     pnl_pct = _trade_numeric_value(trade, "pnl_pct", "profit_pct", "return_pct")
     if pnl_pct is not None:
         trade["pnl_pct"] = pnl_pct
@@ -5274,7 +5427,11 @@ def _accumulate_trade_pnls(
             if component_id not in component_ids:
                 continue
             bucket = grouped[key]
-            pnl_value = _safe_float(trade.get("pnl"), 0.0)
+            pnl_value = trade.get("net_pnl")
+            if pnl_value is None:
+                pnl_value = _safe_float(trade.get("pnl"), 0.0)
+                pnl_value -= _safe_float(trade.get("fees"), 0.0)
+            pnl_value = _safe_float(pnl_value, 0.0)
             bucket["trade_count"] = int(bucket.get("trade_count") or 0) + 1
             if pnl_value > 0:
                 bucket["wins"] = int(bucket.get("wins") or 0) + 1
@@ -7242,7 +7399,7 @@ async def get_strategy(name: str) -> dict[str, Any]:
         return legacy_viewer._strategy_payload(entry)
     except Exception as exc:
         logger.exception("Failed to build strategy payload for %s: %s", name, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy payload")) from exc
 
 
 @app.patch("/api/strategies/{name:path}")
@@ -7267,7 +7424,7 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise
     except Exception as exc:
         logger.exception("Failed to rename strategy %s: %s", _log_safe(name), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
 def _matrix_result_path(filename: str) -> Path:
@@ -7284,7 +7441,7 @@ def _matrix_summary_payload() -> dict[str, Any]:
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid matrix summary: {exc}") from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -7312,7 +7469,7 @@ def _load_matrix_grid_overview_payload() -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid matrix grid overview: {exc}") from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix grid overview")) from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="Invalid matrix grid overview payload")
     payload["api_source"] = str(path)
@@ -7650,7 +7807,7 @@ async def get_backtest(
         return payload
     except Exception as exc:
         logger.exception("Failed to serialize backtest '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest serialization")) from exc
 
 
 @app.delete("/api/backtests/{backtest_id}")
@@ -7685,7 +7842,7 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
         }
     except Exception as exc:
         logger.exception("Failed to rename backtest '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest rename")) from exc
 
 
 @app.put("/api/backtests/{backtest_id}/name")
@@ -7713,7 +7870,7 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(legacy_viewer._stats_payload_from_result, result)
     except Exception as exc:
         logger.exception("Failed to compute stats for '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest stats")) from exc
 
 
 @app.get("/api/backtest/{backtest_id}/equity")
@@ -7900,7 +8057,7 @@ async def get_backtest_capm(
     try:
         strategy_returns = _returns_from_equity_curve(equity_curve)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     benchmark_returns = _benchmark_daily_returns(
         benchmark_symbol,
@@ -7912,7 +8069,7 @@ async def get_backtest_capm(
         capm = calculate_capm(strategy_returns, benchmark_returns)
         aligned = align_return_series(strategy_returns, benchmark_returns)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     scatter = [
         CapmScatterPoint(
@@ -8475,8 +8632,12 @@ def _compare_backtests_payload(ids: str) -> dict[str, Any]:
                     "stats": stats,
                     "trades": {
                         "total_trades": len(result.trades),
-                        "winning_trades": sum(1 for trade in result.trades if trade.pnl > 0),
-                        "losing_trades": sum(1 for trade in result.trades if trade.pnl <= 0),
+                        "winning_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+                        ),
+                        "losing_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) <= 0
+                        ),
                     },
                 }
             )
@@ -8511,7 +8672,9 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         )
     )
     win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
-    winning_trades = sum(1 for trade in result.trades if _safe_float(trade.pnl, 0.0) > 0)
+    winning_trades = sum(
+        1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+    )
     losing_trades = max(len(result.trades) - winning_trades, 0)
 
     return {
@@ -8861,22 +9024,29 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             "job_id": task_id,
         },
     )
+    restart_config = {
+        "strategy": strategy,
+        "engine": engine,
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "start": start,
+        "end": end,
+        "capital": capital,
+        "risk_per_trade_pct": risk_pct,
+        "max_position_pct": max_position_pct,
+        "max_leverage": max_leverage,
+        "modeling_resolution": payload.modeling_resolution,
+        "intrabar_resolution": payload.intrabar_resolution,
+        "parameters": dict(params),
+    }
     _update_task_fields(
         task_id,
-        restart_config={
-            "strategy": strategy,
-            "engine": engine,
-            "symbols": symbols,
-            "timeframe": timeframe,
-            "start": start,
-            "end": end,
-            "capital": capital,
-            "risk_per_trade_pct": risk_pct,
-            "max_position_pct": max_position_pct,
-            "max_leverage": max_leverage,
-            "modeling_resolution": payload.modeling_resolution,
-            "intrabar_resolution": payload.intrabar_resolution,
-            "parameters": dict(params),
+        restart_config=restart_config,
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "backtest",
+            "operation": "run",
+            "parameters": restart_config,
         },
     )
 
@@ -9121,7 +9291,7 @@ def _validate_signal_processor_name(signal_processor: Any) -> str:
         try:
             get_signal_processor(signal_processor_name, {})
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return signal_processor_name
 
 
@@ -9197,6 +9367,20 @@ def _log_safe(value: object) -> str:
     """Sanitize user-controlled values before writing them to logs (S5145)."""
     text = str(value)
     return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
+def _internal_error_detail(exc: Exception, operation: str) -> str:
+    error_id = uuid.uuid4().hex
+    logger.exception(
+        "%s failed",
+        operation,
+        extra={"data": {"operation": operation, "error_id": error_id, "error": str(exc)}},
+    )
+    return f"Internal server error (error_id={error_id})"
+
+
+def _public_value_error_detail(exc: Exception) -> str:
+    return redact_text(str(exc))[:300]
 
 
 def _validated_signal_replay_request(
@@ -9629,9 +9813,9 @@ async def _load_and_filter_csv_signals(
     try:
         loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Signal CSV not found") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     if not loaded_signals:
         raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
@@ -9902,7 +10086,7 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
         payload = _load_optimization_payload(optimization_id)
     except (OSError, TypeError, ValueError) as exc:
         logger.exception("Failed to load optimization '%s': %s", _log_safe(optimization_id), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "optimization load")) from exc
 
     if payload is None:
         raise HTTPException(status_code=404, detail=f"Optimization '{optimization_id}' not found")
@@ -10331,7 +10515,7 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
         logger.exception("Failed to rename portfolio '%s': %s", _log_safe(portfolio_id), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "portfolio rename")) from exc
 
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
@@ -10582,7 +10766,7 @@ async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, An
         )
         created = await asyncio.to_thread(create_service, service)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return _serialize_service_payload(created)
 
 
@@ -10602,7 +10786,7 @@ async def update_service_status_endpoint(
     try:
         updated = await asyncio.to_thread(update_service_status, service_id, payload.status)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(updated)
@@ -10690,7 +10874,8 @@ async def get_service_logs_endpoint(
             query_lower = search.lower()
             entries = [entry for entry in entries if query_lower in entry["line"].lower()]
         total_lines = len(entries)
-        recent_entries = entries[-lines:] if len(entries) > lines else entries
+        response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
+        recent_entries = entries[-response_limit:] if len(entries) > response_limit else entries
         return LogContentModel(
             name=f"service:{service.name}",
             lines=[entry["line"] for entry in recent_entries],
@@ -10698,7 +10883,7 @@ async def get_service_logs_endpoint(
         )
     except Exception as exc:
         logger.exception("Failed to load service logs for %s: %s", service_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "service logs")) from exc
 
 
 @app.get("/api/verification/evidence")
@@ -10717,7 +10902,7 @@ async def get_verification_evidence(
             limit=limit,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 @app.get("/api/verification/evidence/summary")
@@ -10734,7 +10919,7 @@ async def get_verification_evidence_summary(
             limit=limit,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 @app.post(
@@ -10766,7 +10951,7 @@ async def create_verification_evidence(
             run_id=payload.run_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 async def _resolve_live_deployment_signal_source(
@@ -10949,7 +11134,7 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         try:
             created_deployment = await asyncio.to_thread(create_live_deployment, deployment)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
         created.append(_serialize_live_deployment_payload(created_deployment))
     return {
         "status": "created",
@@ -11001,7 +11186,7 @@ async def create_live_deployment_endpoint(
         try:
             get_signal_processor(signal_processor_name, {})
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
         signal_config_payload["signal_processor"] = signal_processor_name
 
     (
@@ -11035,11 +11220,11 @@ async def create_live_deployment_endpoint(
     try:
         validate_stockkit_deployment_route(deployment)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return _serialize_live_deployment_payload(created)
 
 
@@ -11057,7 +11242,7 @@ async def update_live_deployment_status_endpoint(
             update_live_deployment_status, deployment_id, payload.status
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
     return _serialize_live_deployment_payload(updated)
@@ -11367,6 +11552,27 @@ def _prepare_download_request(payload: DataDownloadRequest) -> _PreparedDownload
     return request
 
 
+def _download_task_spec(
+    request: _PreparedDownloadRequest, *, source: str | None = None
+) -> dict[str, Any]:
+    return {
+        "version": _RECOVERY_SPEC_VERSION,
+        "kind": "data",
+        "operation": "download",
+        "source": str(source or request.source).strip().lower(),
+        "symbols": list(request.symbol_list),
+        "timeframes": list(request.timeframe_list),
+        "start": request.start or None,
+        "end": request.end or None,
+        "offer_side": request.offer_side,
+        "merge_tick": request.merge_tick,
+        "merge_s1": request.merge_s1,
+        "batch_size": request.batch_size,
+        "pause_ms": request.pause_ms,
+        "query_timeout_seconds": request.query_timeout_seconds,
+    }
+
+
 def _jforex_download_command(request: _PreparedDownloadRequest) -> list[str]:
     cmd = [
         sys.executable,
@@ -11422,6 +11628,7 @@ def _start_jforex_download(
             task_id,
             command=[str(part) for part in cmd],
             downloader=source_label,
+            task_spec=_download_task_spec(request, source=source_label),
             symbols=request.symbol_list,
             timeframes=request.timeframe_list,
             start=request.start or None,
@@ -11486,6 +11693,7 @@ def _start_generic_download(
             task_id,
             command=[str(part) for part in cmd],
             downloader=request.source,
+            task_spec=_download_task_spec(request),
             symbols=request.symbol_list,
             timeframes=request.timeframe_list,
             start=request.start or None,
@@ -11659,6 +11867,17 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="resample",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "resample",
+            "source_path": str(source_path),
+            "target_timeframes": [
+                item.strip().lower()
+                for item in str(target_timeframes).split(",")
+                if item.strip()
+            ],
+        },
     )
     return result
 
@@ -11702,6 +11921,15 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="harvest",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "harvest",
+            "source": "dukascopy",
+            "symbols": [symbol],
+            "asset_class": asset_class or None,
+            "start": start or None,
+        },
         symbols=[symbol],
         start=start or None,
     )
@@ -11728,6 +11956,13 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="validate",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "validate",
+            "symbol": str(payload.symbol).strip().upper() if payload.symbol else None,
+            "report": str(payload.report).strip() if payload.report else None,
+        },
         symbols=[str(payload.symbol).strip().upper()] if payload.symbol else None,
     )
     return result
@@ -11773,6 +12008,23 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="calibrate",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "calibrate",
+            "source": "dukascopy",
+            "symbols": [s.strip().upper() for s in symbols.split(",") if s.strip()],
+            "timeframes": (
+                [tf.strip().lower() for tf in str(payload.timeframes).split(",") if tf.strip()]
+                if payload.timeframes
+                else []
+            ),
+            "price_type": str(payload.price_type or "bid").strip().lower(),
+            "start_year": int(payload.start_year),
+            "min_year": int(payload.min_year),
+            "force": bool(payload.force),
+            "verbose": bool(payload.verbose),
+        },
         symbols=[s.strip().upper() for s in symbols.split(",") if s.strip()],
         timeframes=(
             [tf.strip().lower() for tf in str(payload.timeframes).split(",") if tf.strip()]
@@ -11812,6 +12064,7 @@ async def list_tasks() -> dict[str, Any]:
 
 @app.get("/api/data/tasks/{task_id}")
 async def get_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _snapshot_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
@@ -11820,11 +12073,13 @@ async def get_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/restart")
 async def restart_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     return await asyncio.to_thread(_restart_interrupted_task, task_id)
 
 
 @app.post("/api/data/tasks/{task_id}/pause")
 async def pause_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
@@ -11845,6 +12100,7 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/resume")
 async def resume_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
@@ -11865,6 +12121,7 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/cancel")
 async def cancel_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
@@ -11886,18 +12143,30 @@ async def cancel_data_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/data/tasks/{task_id}/logs")
 async def get_data_task_logs(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _snapshot_task(task_id)
-    log_file = _task_log_path(task_id)
+    log_file = _validated_task_log_path(task_id)
     if task is None and not log_file.exists():
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
+    configured_log = task.get("log_file") if task else None
+    if configured_log:
+        try:
+            candidate = Path(str(configured_log)).resolve()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid task log path") from exc
+        root = TASK_LOGS_DIR.resolve()
+        if candidate.parent != root or candidate.is_symlink():
+            raise HTTPException(status_code=400, detail="Invalid task log path")
+        log_file = candidate
     return {
-        "logs": _read_task_log(task.get("log_file", log_file) if task else log_file),
+        "logs": _read_task_log(log_file, max_bytes=64 * 1024),
         "status": task.get("status", "unknown") if task else "unknown",
     }
 
 
 @app.delete("/api/data/tasks/{task_id}")
 async def delete_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
@@ -11940,7 +12209,7 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         _refresh_catalog()
         return {"status": "deleted"}
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "data deletion")) from exc
 
 
 @app.get("/api/logs")
@@ -12009,7 +12278,8 @@ async def get_log(
             entries = [entry for entry in entries if query_lower in entry["line"].lower()]
 
         total_lines = len(entries)
-        recent_entries = entries[-lines:] if len(entries) > lines else entries
+        response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
+        recent_entries = entries[-response_limit:] if len(entries) > response_limit else entries
         return LogContentModel(
             name=log_name,
             lines=[entry["line"] for entry in recent_entries],
@@ -12017,7 +12287,7 @@ async def get_log(
         )
     except Exception as exc:
         logger.exception("Failed to read log '%s': %s", log_name, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "log read")) from exc
 
 
 def _symbols_payload() -> dict[str, Any]:
@@ -12169,39 +12439,66 @@ async def live_executions_socket(websocket: WebSocket, account_id: str) -> None:
 @app.websocket("/ws/tasks/{job_id}")
 async def task_log_socket(websocket: WebSocket, job_id: str) -> None:
     await websocket.accept()
+    try:
+        task_id = _validated_task_id(job_id)
+        log_path = _validated_task_log_path(task_id)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
 
-    log_path = TASK_LOGS_DIR / f"task_{job_id}.log"
     position = 0
+    total_sent = 0
+    pending = ""
     idle_cycles = 0
 
     try:
         while True:
-            if log_path.exists():
-                with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                    handle.seek(position)
-                    chunk = handle.read()
-                    position = handle.tell()
-
+            if log_path.is_file() and not log_path.is_symlink():
+                try:
+                    size = log_path.stat().st_size
+                    if size < position:
+                        position = 0
+                    with log_path.open("rb") as handle:
+                        handle.seek(position)
+                        remaining = min(_TASK_LOG_WS_CHUNK_BYTES, _TASK_LOG_WS_MAX_BYTES - total_sent)
+                        chunk = handle.read(max(0, remaining))
+                        position = handle.tell()
+                except OSError:
+                    chunk = b""
                 if chunk:
-                    for line in chunk.splitlines():
-                        await websocket.send_text(line)
+                    total_sent += len(chunk)
+                    pending += chunk.decode("utf-8", errors="replace")
+                    complete_lines = pending.splitlines(keepends=True)
+                    if complete_lines and not complete_lines[-1].endswith(("\n", "\r")):
+                        pending = complete_lines.pop()
+                    else:
+                        pending = ""
+                    for raw_line in complete_lines:
+                        await websocket.send_text(redact_text(raw_line.rstrip("\r\n")))
                 idle_cycles = 0
             else:
                 idle_cycles += 1
 
-            status = _task_status(job_id)
+            status = _task_status(task_id)
             if status in FINAL_TASK_STATUSES:
-                await websocket.send_text(f"[task:{job_id}] status={status}")
+                if pending:
+                    await websocket.send_text(redact_text(pending))
+                await websocket.send_text(f"[task:{task_id}] status={status}")
                 await websocket.close()
                 return
 
+            if total_sent >= _TASK_LOG_WS_MAX_BYTES:
+                await websocket.send_text("[task:log] output limit reached")
+                await websocket.close(code=1009)
+                return
+
             if idle_cycles > 120 and status is None:
-                await websocket.send_text(f"[task:{job_id}] no log stream available")
+                await websocket.send_text(f"[task:{task_id}] no log stream available")
                 await websocket.close(code=1000)
                 return
 
             await asyncio.sleep(0.5)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, OSError, ValueError):
         return
 
 

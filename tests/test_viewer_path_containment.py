@@ -595,3 +595,54 @@ def test_contained_client_data_file_accepts_signals_dir_and_widened_trees(
         is None
     )
     assert outside.exists()
+
+
+def test_viewer_ohlcv_loader_rejects_wildcard_identity_and_match_budget(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    core._OHLCV_DF_CACHE.clear()
+    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+
+    assert core._load_ohlcv_df("*", "1h") is None
+    assert core._load_ohlcv_df("EURUSD", "*") is None
+
+    _make_parquet(tmp_path / "ohlcv" / "yfinance" / "EURUSD" / "1h.parquet")
+    candidates = core._ohlcv_candidates(
+        (tmp_path / "ohlcv").resolve(),
+        "EURUSD",
+        "1h",
+    )
+    assert candidates
+    assert all("dukascopy" in str(path) for path in candidates)
+
+    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "archive" / "EURUSD" / "1h.parquet")
+    monkeypatch.setattr(core, "_OHLCV_MAX_MATCHES", 1)
+
+    assert core._load_ohlcv_df("EURUSD", "1h") is None
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_viewer_ohlcv_loader_enforces_byte_budget(monkeypatch, tmp_path):
+    from viewer import core
+
+    monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(core, "_OHLCV_MAX_BYTES", 1)
+    core._OHLCV_DF_CACHE.clear()
+    _make_parquet(tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet")
+
+    assert core._load_ohlcv_df("EURUSD", "1h") is None
+    core._OHLCV_DF_CACHE.clear()
+
+
+def test_task_routes_reject_invalid_task_ids(viewer_client):
+    import viewer.main as viewer_app_module
+
+    for task_id in ("short", "bad_id", "a" * 65):
+        response = viewer_client.get(f"/api/data/tasks/{task_id}")
+        assert response.status_code == 400
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        viewer_app_module._validated_task_id("../escape")
+    assert exc_info.value.status_code == 400

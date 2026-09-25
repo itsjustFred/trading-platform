@@ -50,3 +50,19 @@ def test_json_formatter_includes_required_fields_and_defaults():
     assert payload["module"] == "trading.viewer"
     assert payload["function"] == "<unknown>"
     assert payload["line"] == 0
+
+
+def test_redact_value_handles_nested_sensitive_data_and_exception_text():
+    from shared.logging import redact_value
+
+    value = {
+        "Authorization": "Bearer super-secret",
+        "items": [{"api_key": "key-secret", "value": "ordinary"}],
+    }
+    error = RuntimeError("token=exception-secret")
+
+    redacted = redact_value({"value": value, "error": error})
+
+    assert redacted["value"]["Authorization"] == "[Filtered]"
+    assert redacted["value"]["items"][0]["api_key"] == "[Filtered]"
+    assert "exception-secret" not in redacted["error"]

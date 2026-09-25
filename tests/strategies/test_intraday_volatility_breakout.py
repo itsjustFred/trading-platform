@@ -2,6 +2,7 @@
 Unit + Integration tests for Intraday Volatility Breakout strategy.
 """
 
+from datetime import timedelta
 import sys
 from pathlib import Path
 
@@ -700,3 +701,31 @@ def test_native_daily_ohlcv_overrides_intraday_resampled_atr():
     jan3 = df["timestamp"] == pd.Timestamp("2024-01-03 12:00", tz="UTC")
     assert resampled_indicators["daily_atr"].loc[jan3].iloc[0] == pytest.approx(2.0)
     assert native_indicators["daily_atr"].loc[jan3].iloc[0] == pytest.approx(20.0)
+
+
+def test_invalid_session_timezone_fails_closed():
+    mod = _load_module()
+    params = mod.STRATEGY_META["parameters"].copy()
+    params["session_timezone"] = "Not/A_Real_Zone"
+
+    with pytest.raises(ValueError, match="Invalid session_timezone"):
+        mod.generate_signals(_make_df(20), params)
+
+
+def test_missing_timestamp_and_non_datetime_index_fails_closed():
+    mod = _load_module()
+    params = mod.STRATEGY_META["parameters"].copy()
+    frame = _make_df(20).drop(columns=["timestamp"]).reset_index(drop=True)
+
+    with pytest.raises(ValueError, match="timestamp column or datetime index"):
+        mod.generate_signals(frame, params)
+
+
+def test_fixed_utc_offset_is_supported_when_timezone_is_blank():
+    mod = _load_module()
+
+    zone = mod._resolve_session_zone("", 2)
+
+    assert zone.utcoffset(None) == timedelta(hours=2)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        mod._resolve_session_zone("Europe/Athens", 2)

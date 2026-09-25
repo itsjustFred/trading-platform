@@ -18,19 +18,103 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 from shared.constants import LOG_DIR
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_BYTES = 10 * 1024 * 1024
 BACKUP_COUNT = 5
+_REDACTED = "[Filtered]"
+_SENSITIVE_MARKERS = (
+    "api_key",
+    "apikey",
+    "app_secret",
+    "authorization",
+    "broker_login",
+    "cookie",
+    "credential",
+    "dsn",
+    "github_token",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "session",
+    "token",
+    "webhook",
+)
+_SENSITIVE_QUERY_RE = re.compile(
+    r"(?i)([?&](?:access_token|api_key|apikey|broker_login|credential|dsn|key|password|refresh_token|secret|session|token)=)([^&#\s]+)"
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)([\"']?(?:access_token|api_key|apikey|app_secret|broker_login|cookie|credential|dsn|github_token|password|private_key|refresh_token|secret|session|token|webhook)[\"']?\s*[:=]\s*[\"']?)([^\"',;&\s}]+)"
+)
+_SENSITIVE_QUOTED_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:access_token|api_key|apikey|app_secret|broker_login|cookie|credential|dsn|github_token|password|private_key|refresh_token|secret|session|token|webhook)[\"']?\s*[:=]\s*)(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+)
+_AUTHORIZATION_RE = re.compile(
+    r"(?i)(authorization\s*[:=]\s*)(bearer|basic)\s+[^\s,;]+"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+")
+_PRIVATE_KEY_RE = re.compile(r"(?is)-----BEGIN [^-]+-----.*?-----END [^-]+-----")
+_TOKEN_VALUE_RES = (
+    re.compile(r"(?i)\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+)
 
 _loggers: dict[str, logging.Logger] = {}
+
+
+def _is_sensitive_key(key: object) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return any(marker in normalized for marker in _SENSITIVE_MARKERS)
+
+
+def redact_text(value: str) -> str:
+    redacted = _AUTHORIZATION_RE.sub(r"\1\2 [Filtered]", str(value))
+    redacted = _BEARER_TOKEN_RE.sub("Bearer [Filtered]", redacted)
+    redacted = _SENSITIVE_QUERY_RE.sub(r"\1[Filtered]", redacted)
+    redacted = _SENSITIVE_QUOTED_ASSIGNMENT_RE.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}"
+            f"{_REDACTED}{match.group('quote')}"
+        ),
+        redacted,
+    )
+    redacted = _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[Filtered]", redacted)
+    redacted = _PRIVATE_KEY_RE.sub("[Filtered private key]", redacted)
+    for pattern in _TOKEN_VALUE_RES:
+        redacted = pattern.sub("[Filtered]", redacted)
+    return redacted
+
+
+def redact_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _REDACTED if _is_sensitive_key(key) else redact_value(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_value(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(child) for child in value)
+    if isinstance(value, set):
+        return {redact_value(child) for child in value}
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, (bytes, bytearray)):
+        return redact_text(bytes(value).decode("utf-8", errors="replace"))
+    if isinstance(value, BaseException):
+        return redact_text(str(value))
+    return value
 
 
 class JsonFormatter(logging.Formatter):
@@ -53,13 +137,13 @@ class JsonFormatter(logging.Formatter):
             "module": module_name,
             "function": function_name,
             "line": line_number,
-            "message": record.getMessage(),
+            "message": redact_text(record.getMessage()),
         }
         data = getattr(record, "data", None)
         if data is not None:
-            entry["data"] = data
+            entry["data"] = redact_value(data)
         if record.exc_info and record.exc_info[0] is not None:
-            entry["exception"] = self.formatException(record.exc_info)
+            entry["exception"] = redact_text(self.formatException(record.exc_info))
         return json.dumps(entry, default=str)
 
 

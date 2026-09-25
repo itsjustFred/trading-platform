@@ -178,6 +178,7 @@ export function OptimizationResultsPage() {
     optimization.target_metric,
     optimization.best_value,
     optimization.test_stats,
+    optimization.oos_status ?? "unavailable",
   );
 
   return (
