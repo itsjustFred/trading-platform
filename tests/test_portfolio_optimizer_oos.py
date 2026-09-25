@@ -9,9 +9,12 @@ from runner.portfolio_optimizer import (
     _compute_correlation_matrix,
     _compute_oos_metrics,
     _parse_time_to_ts,
+    _period_percentage_returns,
     _persist_optimization_result,
     _portfolio_sharpe_from_weights,
+    _split_equity_curves_by_boundaries,
     _split_equity_curves_by_time,
+    _weighted_correlation_penalty,
     optimize_portfolio_allocation,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
@@ -74,6 +77,55 @@ def test_split_equity_curves_basic() -> None:
     #   test gets months 14-17 = 4 points (ts >= month 14)
     assert len(test_curves[0]) == 4  # Last 4 points (month 14-17)
     assert len(train_curves[0]) == 12  # First 12 points (month 0-11)
+
+
+def test_split_equity_curves_explicit_boundaries_preserve_purged_windows() -> None:
+    curves = [
+        [
+            StrategyEquityPoint(time=1704067200, equity=100.0),
+            StrategyEquityPoint(time=1704153600, equity=101.0),
+            StrategyEquityPoint(time=1704240000, equity=102.0),
+            StrategyEquityPoint(time=1704326400, equity=103.0),
+        ],
+        [
+            StrategyEquityPoint(time=1704067200, equity=200.0),
+            StrategyEquityPoint(time=1704153600, equity=201.0),
+            StrategyEquityPoint(time=1704240000, equity=202.0),
+            StrategyEquityPoint(time=1704326400, equity=203.0),
+        ],
+    ]
+
+    train, test = _split_equity_curves_by_boundaries(
+        curves,
+        train_start="2024-01-01",
+        train_end="2024-01-02",
+        test_start="2024-01-03",
+        test_end="2024-01-04",
+    )
+
+    assert [point.time for point in train[0]] == [1704067200, 1704153600]
+    assert [point.time for point in test[0]] == [1704240000, 1704326400]
+    assert [point.time for point in train[1]] == [1704067200, 1704153600]
+    assert [point.time for point in test[1]] == [1704240000, 1704326400]
+
+
+def test_split_equity_curves_rejects_unordered_explicit_boundaries() -> None:
+    with pytest.raises(ValueError, match="ordered"):
+        _split_equity_curves_by_boundaries(
+            [[StrategyEquityPoint(time=1704067200, equity=100.0)]],
+            train_start="2024-01-03",
+            train_end="2024-01-01",
+            test_start="2024-01-02",
+            test_end="2024-01-04",
+        )
+
+
+def test_period_percentage_returns_uses_equity_ratios() -> None:
+    returns = _period_percentage_returns(
+        np.array([[100.0, 50.0], [110.0, 55.0], [121.0, 60.5]])
+    )
+
+    assert np.allclose(returns, [[0.1, 0.1], [0.1, 0.1]])
 
 
 def test_split_equity_curves_empty() -> None:
@@ -339,9 +391,8 @@ def test_normalize_weights_normal_case() -> None:
 def test_objective_penalizes_positive_correlation() -> None:
     """Highly correlated strategies must score worse than diversified ones.
 
-    Regression guard for the sign flip: the objective subtracts the average
-    off-diagonal correlation, so positive correlation can no longer inflate the
-    score.
+    Regression guard for the production objective: positive correlation is
+    penalized through the weight-dependent diversification term.
     """
 
     seconds_per_day = 24 * 60 * 60
@@ -366,12 +417,12 @@ def test_objective_penalizes_positive_correlation() -> None:
 
     def score(c1, c2):
         matrix = _align_equity_curves([c1, c2])
-        returns = np.diff(matrix, axis=0)
+        returns = _period_percentage_returns(matrix)
         sharpe, max_dd = _portfolio_sharpe_from_weights(weights, matrix)
         corr = _compute_correlation_matrix(returns)
-        nn = corr.shape[0]
-        off = (corr.sum() - np.trace(corr)) / (nn * nn - nn)
-        return sharpe - (5.0 * off) - (3.0 * max(0.0, max_dd - 0.3))
+        return sharpe - (5.0 * _weighted_correlation_penalty(weights, corr)) - (
+            3.0 * max(0.0, max_dd - 0.3)
+        )
 
     assert score(neg_a, neg_b) > score(pos_a, pos_b)
 

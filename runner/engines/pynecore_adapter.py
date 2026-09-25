@@ -265,6 +265,7 @@ class PyneCoreAdapter(EngineAdapter):
         all_trades: list[Trade] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
+        asset_classes: dict[str, str] = {}
         trade_counter = 0
         total_bars = 0
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
@@ -292,6 +293,12 @@ class PyneCoreAdapter(EngineAdapter):
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
             )
+            asset_class = _infer_asset_class(
+                Path(config.data_dir) if config.data_dir else DATA_DIR,
+                symbol,
+                config.timeframe,
+            )
+            asset_classes[str(symbol).upper()] = asset_class
             trade_counter += len(trades)
             all_trades.extend(trades)
             # Merge, never overwrite (F11): `all_stats =` here would silently
@@ -308,7 +315,12 @@ class PyneCoreAdapter(EngineAdapter):
                 )
             )
 
-        _apply_fee_model(all_trades, fee_model)
+        _apply_risk_sizing(
+            all_trades,
+            config,
+            asset_class_by_symbol=asset_classes,
+            fee_model=fee_model,
+        )
         result = BacktestResult(
             meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
@@ -337,11 +349,6 @@ class PyneCoreAdapter(EngineAdapter):
         """Run the pyne CLI for one symbol and parse its trade/stats output."""
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         trade_context = _build_trade_context(context_builder, df, resolved_parameters)
-        asset_class = _infer_asset_class(
-            Path(config.data_dir) if config.data_dir else DATA_DIR,
-            symbol,
-            config.timeframe,
-        )
         trades: list[Trade] = []
         stats: dict[str, Any] = {}
 
@@ -382,7 +389,7 @@ class PyneCoreAdapter(EngineAdapter):
                 # resized quantities/pnl build on parity prices.
                 trades = _gate_warmup_trades(trades, config)
                 _apply_fill_parity(trades, df, config, resolved_parameters)
-                _apply_risk_sizing(trades, config, asset_class)
+
 
             if stats_csv.exists():
                 stats.update(_parse_stats_csv(stats_csv))
@@ -1109,7 +1116,14 @@ def _materialize_exit_price_levels(meta: dict[str, Any], trade: Trade) -> None:
             meta.setdefault("tp_price_at_exit", round(tp_exit, 6))
 
 
-def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class: str) -> None:
+def _apply_risk_sizing(
+    trades: list[Trade],
+    config: BacktestConfig,
+    asset_class: str = "unknown",
+    *,
+    asset_class_by_symbol: dict[str, str] | None = None,
+    fee_model: Any | None = None,
+) -> None:
     if not trades:
         return
     if config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
@@ -1117,16 +1131,68 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
             "Risk sizing is not configured (risk_per_trade_pct unset); "
             "refusing unsized PyneCore trades"
         )
-
+    risk_pct = float(config.risk_per_trade_pct)
+    if not math.isfinite(risk_pct) or not 0 < risk_pct <= 1:
+        raise ValueError("PyneCore risk_per_trade_pct must be finite and between 0 and 1")
     equity = float(config.initial_capital)
-    max_position_exposure_pct = _resolve_max_position_exposure_pct(
-        config.max_position_exposure_pct, asset_class
-    )
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("PyneCore initial capital must be finite and > 0")
     max_leverage = _resolve_max_leverage(config.max_leverage)
+    if not math.isfinite(max_leverage) or max_leverage <= 0:
+        raise ValueError("PyneCore max_leverage must be finite and > 0")
 
+    class_by_symbol = {
+        str(symbol).upper(): str(value).lower()
+        for symbol, value in (asset_class_by_symbol or {}).items()
+    }
+
+    def _time(value: object, field_name: str) -> pd.Timestamp:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(f"PyneCore {field_name} must be a valid timestamp")
+        return pd.Timestamp(parsed)
+
+    ordered: list[tuple[Trade, pd.Timestamp, pd.Timestamp]] = []
+    for trade in trades:
+        entry_time = _time(trade.entry_time, "entry_time")
+        exit_time = entry_time
+        if trade.exits:
+            exit_time = max(
+                _time(leg.time, "exit_time") for leg in trade.exits
+            )
+        ordered.append((trade, entry_time, exit_time))
+    ordered.sort(key=lambda item: (item[1], str(item[0].entry_time), int(item[0].id or 0)))
+    by_exit = sorted(
+        ordered,
+        key=lambda item: (item[2], str(item[0].entry_time), int(item[0].id or 0)),
+    )
+
+    open_ledger: dict[int, tuple[pd.Timestamp, float, float, float]] = {}
+    released = 0
     rejected_trade_ids: set[int] = set()
-    for trade in sorted(trades, key=lambda item: item.entry_time):
-        meta = trade.meta or {}
+
+    def _release_through(cutoff: pd.Timestamp) -> None:
+        nonlocal released, equity
+        while released < len(by_exit):
+            trade, _entry_time, exit_time = by_exit[released]
+            if exit_time > cutoff:
+                break
+            key = int(trade.id)
+            booked = open_ledger.pop(key, None)
+            if booked is not None:
+                equity += booked[3]
+            released += 1
+
+    for trade, entry_time, _exit_time in ordered:
+        _release_through(entry_time)
+        symbol_class = class_by_symbol.get(str(trade.symbol).upper(), asset_class)
+        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+            config.max_position_exposure_pct, symbol_class
+        )
+        if not 0 < max_position_exposure_pct <= 1:
+            raise ValueError("PyneCore position exposure must be between 0 and 1")
+
+        meta = dict(trade.meta or {})
         sl_price = meta.get("sl_price")
         if sl_price is None:
             if config.reject_missing_stop or not config.allow_fallback_stop:
@@ -1141,44 +1207,63 @@ def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class:
             sl_price = float(trade.entry_price) - direction_sign * stop_distance
             meta["sl_price"] = sl_price
             meta["stop_source"] = "fallback_percent"
-            trade.meta = meta
-        stop_distance = abs(float(trade.entry_price) - float(sl_price))
+        entry_price = float(trade.entry_price)
+        stop_distance = abs(entry_price - float(sl_price))
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError("PyneCore entry price must be finite and > 0")
         if not math.isfinite(stop_distance) or stop_distance <= 0:
             raise ValueError("PyneCore stop distance must be finite and > 0")
 
-        risk_amount = equity * config.risk_per_trade_pct
-        entry_price = float(trade.entry_price)
-        if not math.isfinite(entry_price) or entry_price <= 0:
-            raise ValueError("PyneCore entry price must be finite and > 0")
-        base_qty = risk_amount / stop_distance
-        required_notional = base_qty * entry_price
-        cap_notional = equity * max_position_exposure_pct
-        leverage_notional_limit = equity * max_leverage
-        binding_notional = min(cap_notional, leverage_notional_limit)
-        final_notional = min(required_notional, binding_notional)
-        new_qty = round(final_notional / entry_price, 4)
         old_qty = float(trade.quantity or 0.0)
         if not math.isfinite(old_qty) or old_qty <= 0:
             raise ValueError("PyneCore trade quantity must be finite and > 0")
+        risk_amount = equity * risk_pct
+        required_notional = risk_amount / stop_distance * entry_price
+        position_notional = equity * max_position_exposure_pct
+        open_notional = sum(item[1] for item in open_ledger.values())
+        aggregate_notional = max(0.0, equity * max_leverage - open_notional)
+        final_notional = min(required_notional, position_notional, aggregate_notional)
+        new_qty = round(final_notional / entry_price, 4)
         scale = new_qty / old_qty
+
         for leg in trade.exits:
             leg.quantity = round(float(leg.quantity or 0.0) * scale, 4)
             if str(trade.direction).upper() == "LONG":
-                leg.pnl = round(
-                    (float(leg.price) - float(trade.entry_price)) * leg.quantity,
-                    2,
-                )
+                leg.pnl = round((float(leg.price) - entry_price) * leg.quantity, 2)
             else:
-                leg.pnl = round(
-                    (float(trade.entry_price) - float(leg.price)) * leg.quantity,
-                    2,
-                )
+                leg.pnl = round((entry_price - float(leg.price)) * leg.quantity, 2)
         trade.quantity = new_qty
         trade.pnl = round(sum(float(leg.pnl or 0.0) for leg in trade.exits), 2)
-        if trade.fees is not None:
+        if fee_model is not None:
+            exit_price = float(trade.exits[-1].price) if trade.exits else entry_price
+            trade.fees = round(
+                float(fee_model.fee_for_trade(entry_price, exit_price, new_qty)),
+                2,
+            )
+        elif trade.fees is not None:
             trade.fees = round(float(trade.fees) * scale, 2)
         trade.net_pnl = round(float(trade.pnl) - float(trade.fees or 0.0), 2)
-        equity += float(trade.net_pnl)
+        trade.meta = meta
+
+        open_notional += new_qty * entry_price
+        open_risk = sum(item[2] for item in open_ledger.values()) + new_qty * stop_distance
+        if new_qty > 0:
+            open_ledger[int(trade.id)] = (
+                _exit_time,
+                new_qty * entry_price,
+                new_qty * stop_distance,
+                float(trade.net_pnl),
+            )
+        meta["risk_math"] = {
+            "equity_at_entry": round(equity, 2),
+            "position_size": round(new_qty, 4),
+            "open_positions": len(open_ledger),
+            "open_notional": round(open_notional, 2),
+            "open_notional_pct": round(open_notional / equity, 6) if equity > 0 else None,
+            "open_risk": round(open_risk, 2),
+            "open_risk_pct": round(open_risk / equity, 6) if equity > 0 else None,
+        }
+        trade.meta = meta
 
     if rejected_trade_ids:
         trades[:] = [trade for trade in trades if int(trade.id) not in rejected_trade_ids]

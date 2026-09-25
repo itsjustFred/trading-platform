@@ -1,6 +1,9 @@
 import logging
 from pathlib import Path
 
+import pytest
+
+import data_tools.dolthub_manager as dolthub_manager
 from data_tools.dolthub_manager import _stock_export_path
 
 
@@ -51,3 +54,48 @@ def test_export_stocks_skips_symbols_that_fail_symbol_validation(tmp_path, monke
     warnings = [record.getMessage() for record in caplog.records]
     assert any("../escape" in message for message in warnings)
     assert any("BAD SYMBOL" in message for message in warnings)
+
+
+def test_export_table_csv_keeps_previous_file_when_dolt_fails(tmp_path, monkeypatch):
+    output = tmp_path / "ohlcv.csv"
+    output.write_text("previous", encoding="utf-8")
+
+    def fail_run(*_args, **_kwargs):
+        raise RuntimeError("dolt failed")
+
+    monkeypatch.setattr(dolthub_manager, "run_dolt", fail_run)
+
+    with pytest.raises(RuntimeError, match="dolt failed"):
+        dolthub_manager._export_table_csv(tmp_path, "ohlcv", output)
+
+    assert output.read_text(encoding="utf-8") == "previous"
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+def test_repo_parquet_export_keeps_previous_file_when_write_fails(tmp_path, monkeypatch):
+    repo = tmp_path / "earnings"
+    (repo / dolthub_manager.DOLT_METADATA_DIR).mkdir(parents=True)
+    output_dir = tmp_path / "exports"
+    output_path = output_dir / "earnings.parquet"
+    output_dir.mkdir()
+    output_path.write_text("previous parquet", encoding="utf-8")
+
+    monkeypatch.setattr(dolthub_manager, "DOLT_DIR", tmp_path)
+    monkeypatch.setattr(dolthub_manager, "_list_tables", lambda _repo: ["earnings"])
+    monkeypatch.setattr(
+        dolthub_manager,
+        "_export_table_csv",
+        lambda _repo, _table, path: path.write_text(
+            "value\n1\n", encoding="utf-8"
+        ),
+    )
+    monkeypatch.setattr(
+        dolthub_manager,
+        "write_parquet_atomically",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+
+    dolthub_manager._export_repo_tables("earnings", output_dir)
+
+    assert output_path.read_text(encoding="utf-8") == "previous parquet"
+    assert not (output_dir / "earnings.csv").exists()

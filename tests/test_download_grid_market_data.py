@@ -32,7 +32,7 @@ def test_normalize_timeframe_value():
 
 def test_normalize_symbol():
     """Test symbol normalization with oil aliases."""
-    from data_tools.download_grid_market_data import normalize_symbol, CANONICAL_SYMBOLS
+    from data_tools.download_grid_market_data import normalize_symbol
 
     # Standard symbols
     assert normalize_symbol("XAUUSD") == "XAUUSD"
@@ -114,8 +114,9 @@ def test_download_symbol_invalid_timeframes(monkeypatch):
 
 def test_download_symbol_skip_balance_rows():
     """Test that balance rows are skipped in normalization."""
-    from data_tools.download_grid_market_data import normalize_ohlcv_columns
     import pandas as pd
+
+    from data_tools.download_grid_market_data import normalize_ohlcv_columns
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "test.parquet"
@@ -197,8 +198,9 @@ if __name__ == "__main__":
 
 def test_ensure_alias_copy_refreshes_when_canonical_is_newer(tmp_path):
     """Regression DV-B30: equal file size is not freshness."""
-    from data_tools.download_grid_market_data import ensure_alias_copy
     import os
+
+    from data_tools.download_grid_market_data import ensure_alias_copy
 
     canonical = tmp_path / "canonical" / "1m.parquet"
     canonical.parent.mkdir(parents=True)
@@ -237,6 +239,31 @@ def test_ensure_alias_copy_skips_copy_when_alias_up_to_date(tmp_path):
 
     assert second == first
     assert second.stat().st_mtime_ns == before
+
+
+def test_normalize_preserves_provenance_quality_and_missing_volume(tmp_path):
+    from data_tools.download_grid_market_data import normalize_ohlcv_columns
+
+    path = tmp_path / "test.parquet"
+    pd.DataFrame(
+        {
+            "timestamp": [1, 2],
+            "open": [1.0, 2.0],
+            "high": [1.0, 2.0],
+            "low": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "volume": [None, None],
+            "source_bucket_timeframe": ["60m", "60m"],
+            "quality_score": [0.9, 0.8],
+        }
+    ).to_parquet(path, index=False)
+
+    normalize_ohlcv_columns(path)
+
+    result = pd.read_parquet(path)
+    assert result["volume"].isna().all()
+    assert result["source_bucket_timeframe"].tolist() == ["60m", "60m"]
+    assert result["quality_score"].tolist() == [0.9, 0.8]
 
 
 def test_normalize_bid_priority_with_provenance():

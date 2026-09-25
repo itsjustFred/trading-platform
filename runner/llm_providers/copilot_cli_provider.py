@@ -6,6 +6,8 @@ import subprocess
 import time
 from typing import Any
 
+from runner.agent_process import build_backtest_child_env
+
 # The full prompt is piped via stdin (`-p -`) instead of being passed as a
 # single argv element: prompts here routinely exceed platform argv limits
 # (Windows ~32k chars) and would otherwise be readable process-wide via `ps`.
@@ -182,6 +184,7 @@ class CopilotCLIProvider:
                 text=True,
                 check=False,
                 timeout=self._timeout_seconds,
+                env=build_backtest_child_env(),
             )
         except FileNotFoundError as exc:
             raise CliInvocationError(

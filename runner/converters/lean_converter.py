@@ -63,21 +63,48 @@ def _order_fee(order: dict) -> float:
     return 0.0
 
 
+def _lean_orders(data: dict) -> list[tuple[object, dict]]:
+    raw_orders = data.get("orders", [])
+    if isinstance(raw_orders, dict):
+        items = raw_orders.items()
+    elif isinstance(raw_orders, list):
+        items = enumerate(raw_orders)
+    else:
+        raise ValueError("LEAN orders must be a list or object")
+    normalized: list[tuple[object, dict]] = []
+    for fallback_id, order in items:
+        if not isinstance(order, dict):
+            raise ValueError("Each LEAN order must be an object")
+        normalized.append((fallback_id, order))
+    return normalized
+
+
+def _order_sort_key(order: dict) -> tuple[str, tuple[int, float | str], str]:
+    raw_id = order.get("id", 0)
+    try:
+        id_key = (0, float(raw_id))
+    except (TypeError, ValueError, OverflowError):
+        id_key = (1, str(raw_id))
+    return (str(order.get("time", "")), id_key, str(raw_id))
+
+
 def _build_trades(data: dict) -> list[Trade]:
     """Pair LEAN orders into entry/exit trades."""
-    orders_dict = data.get("orders", {})
     profit_loss = data.get("profitLoss", {})
 
     # Flatten and sort
     all_orders = []
-    for oid, order in orders_dict.items():
+    for fallback_id, order in _lean_orders(data):
         sym_info = order.get("symbol", {})
-        sym_value = sym_info.get("value", "UNKNOWN")
-        ticker = _extract_ticker(sym_value)
+        if isinstance(sym_info, dict):
+            sym_value = sym_info.get("value", "UNKNOWN")
+        else:
+            sym_value = sym_info or "UNKNOWN"
+        ticker = _extract_ticker(str(sym_value))
 
         all_orders.append(
             {
-                "id": order.get("id"),
+                "id": order.get("id", fallback_id),
                 "time": order.get("time", ""),
                 "quantity": order.get("quantity", 0),
                 "price": order.get("price", 0),
@@ -89,7 +116,7 @@ def _build_trades(data: dict) -> list[Trade]:
             }
         )
 
-    all_orders.sort(key=lambda x: (x["time"], x["id"] or 0))
+    all_orders.sort(key=_order_sort_key)
 
     # Group by ticker
     by_ticker: dict[str, list] = defaultdict(list)
@@ -249,11 +276,9 @@ def _build_trades(data: dict) -> list[Trade]:
 def _order_times(data: dict) -> list[str]:
     """All order timestamps in the payload (for real meta bounds)."""
     times: list[str] = []
-    orders = data.get("orders", {})
-    if isinstance(orders, dict):
-        for order in orders.values():
-            if isinstance(order, dict) and order.get("time"):
-                times.append(str(order["time"]))
+    for _fallback_id, order in _lean_orders(data):
+        if order.get("time"):
+            times.append(str(order["time"]))
     return sorted(times)
 
 

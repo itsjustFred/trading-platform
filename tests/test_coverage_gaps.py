@@ -293,6 +293,36 @@ class TestSegmentCoverageWeekends:
             start="2024-01-05", end="2024-01-08T10:00", data_dir=tmp_path,
         )
 
+    def test_sunday_to_monday_hourly_fx_weekend_gap_is_expected(self):
+        from data_tools.validate import _gap_is_expected_nontrading
+
+        assert _gap_is_expected_nontrading(
+            pd.Timestamp("2024-01-07T00:00:00Z"),
+            pd.Timestamp("2024-01-08T00:00:00Z"),
+            "forex",
+            "1h",
+        )
+
+    def test_session_window_overrides_generic_weekday_grid(self, tmp_path):
+        stamps = []
+        for day in ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"):
+            stamps.extend(
+                pd.date_range(f"{day}T14:30", periods=5, freq="1h", tz="UTC")
+            )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1h",
+            start="2024-01-02T00:00:00Z",
+            end="2024-01-05T23:59:59Z",
+            data_dir=tmp_path,
+            session={"start": "14:30", "end": "19:30"},
+        )
+
     def test_midweek_hole_still_fails(self, tmp_path):
         # 12h hole Tue->Wed (no weekend involved) exceeds 3x 1h.
         stamps = list(pd.date_range("2024-01-09T00:00", "2024-01-09T05:00", freq="1h", tz="UTC"))
@@ -339,6 +369,29 @@ class TestValidateHolidayCalendar:
         result = validate_module.validate_parquet(target)
         assert result.gaps == []
 
+    def test_long_outage_spanning_holiday_remains_an_error(self, tmp_path, monkeypatch) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = self._write_equity_bars(
+            tmp_path, ["2024-07-03T00:00:00Z", "2024-07-08T00:00:00Z"]
+        )
+
+        result = validate_module.validate_parquet(target)
+
+        assert len(result.gaps) == 1
+
+    def test_holiday_does_not_hide_an_additional_weekday_outage(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-09T09:30:00Z"),
+            "forex",
+            "1h",
+            holidays=["2024-07-04"],
+        ) == "data"
+
     def test_same_gap_flagged_for_forex(self, tmp_path, monkeypatch) -> None:
         import pandas as pd
 
@@ -363,6 +416,133 @@ class TestValidateHolidayCalendar:
         ).to_parquet(target, index=False)
         result = validate_module.validate_parquet(target)
         assert len(result.gaps) == 1
+
+    def test_validate_parquet_accepts_explicit_session_boundaries(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
+        target.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-09T16:00:00Z", "2024-01-10T09:30:00Z"], utc=True
+                ),
+                "open": [100.0, 100.0],
+                "high": [100.5, 100.5],
+                "low": [99.5, 99.5],
+                "close": [100.0, 100.0],
+                "volume": [10, 10],
+            }
+        ).to_parquet(target, index=False)
+
+        result = validate_module.validate_parquet(
+            target,
+            session_start="09:30",
+            session_end="16:00",
+        )
+
+        assert result.gaps == []
+
+    def test_session_gap_during_trading_window_remains_a_data_gap(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
+        target.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-09T10:00:00Z", "2024-01-09T14:00:00Z"], utc=True
+                ),
+                "open": [100.0, 100.0],
+                "high": [100.5, 100.5],
+                "low": [99.5, 99.5],
+                "close": [100.0, 100.0],
+                "volume": [10, 10],
+            }
+        ).to_parquet(target, index=False)
+
+        result = validate_module.validate_parquet(
+            target,
+            session={"start": "09:30", "end": "16:00"},
+        )
+
+        assert len(result.gaps) == 1
+        assert result.gaps[0]["classification"] == "session"
+
+    def test_session_metadata_classifies_weekday_overnight_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T19:30:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "overnight"
+
+    def test_overnight_session_metadata_classifies_weekday_close_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T17:00:00Z"),
+            pd.Timestamp("2024-01-09T18:00:00Z"),
+            "futures",
+            "1h",
+            session={"start": "18:00", "end": "17:00"},
+        ) == "overnight"
+
+    def test_session_metadata_keeps_intraday_gap_as_data_loss(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T10:00:00Z"),
+            pd.Timestamp("2024-01-09T14:00:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "session"
+
+    def test_holiday_metadata_classifies_only_holiday_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-05T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+            holidays=["2024-07-04"],
+        ) == "holiday"
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-08T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+            holidays=["2024-07-04"],
+        ) == "session"
+
+    def test_weekend_and_missing_session_are_distinct(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-05T22:00:00Z"),
+            pd.Timestamp("2024-01-08T00:00:00Z"),
+            "forex",
+            "1h",
+        ) == "weekend"
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T16:00:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "forex",
+            "1h",
+        ) == "data"
 
 
 class TestEnsureBacktestDataGapGate:

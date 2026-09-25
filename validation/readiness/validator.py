@@ -61,6 +61,7 @@ class ReadinessValidator:
         risk_report: RiskComparisonReport | None = None,
         stats: tuple[TradeStatistics, TradeStatistics] | None = None,
         config: ReadinessConfig | None = None,
+        equity_evidence_status: str | None = None,
     ) -> ReadinessReport:
         """Run all readiness checks and return a structured report.
 
@@ -78,6 +79,8 @@ class ReadinessValidator:
         config:
             Optional :class:`ReadinessConfig` with thresholds.  Defaults are
             used when not provided.
+        equity_evidence_status:
+            Optional combined equity evidence status. ``missing`` fails closed.
 
         Returns
         -------
@@ -98,6 +101,9 @@ class ReadinessValidator:
         checks.extend(cls._check_regression(regression, cfg, recommendations))
         checks.extend(cls._check_risk(risk_report, cfg, recommendations))
         checks.extend(cls._check_stats(stats, cfg, recommendations))
+        checks.extend(
+            cls._check_equity_evidence(equity_evidence_status, recommendations)
+        )
 
         # Check for required artifacts - missing required = NOT_READY
         missing_required = []
@@ -163,6 +169,35 @@ class ReadinessValidator:
             warnings=warnings,
             recommendations=recommendations,
         )
+
+    @classmethod
+    def _check_equity_evidence(
+        cls,
+        equity_evidence_status: str | None,
+        recommendations: list[str],
+    ) -> list[ReadinessCheck]:
+        if equity_evidence_status is None:
+            return []
+        available = equity_evidence_status == "available"
+        if not available:
+            recommendations.append(
+                "Provide complete equity evidence for both reference and platform "
+                "before certifying readiness."
+            )
+        return [
+            ReadinessCheck(
+                name="equity_evidence",
+                description="Reference and platform equity evidence is complete",
+                passed=available,
+                severity="info" if available else "error",
+                message=(
+                    "Equity evidence is available"
+                    if available
+                    else "Equity evidence is missing or incomplete; readiness cannot be certified."
+                ),
+                details={"status": equity_evidence_status},
+            )
+        ]
 
     @classmethod
     def _check_required_artifacts(
@@ -390,7 +425,6 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if regression is None:
-            # #83: fail closed — a missing regression result is not a pass.
             checks.append(
                 ReadinessCheck(
                     name="regression_status",

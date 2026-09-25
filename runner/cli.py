@@ -5,8 +5,8 @@ Usage:
     python -m runner.cli run --engine vectorbt --strategy strategies/example_sma/example_sma.py \\
         --symbols AAPL MSFT --timeframe 1h --start 2023-01-01 --end 2025-01-01
 
-    python -m runner.cli run --engine lean --strategy path/to/lean_result.json \\
-        --symbols XAUUSD --name my_strategy
+    python -m runner.converters.cli lean path/to/lean_result.json \\
+        --name my_strategy
 
     python -m runner.cli engines    # list available engines
 """
@@ -541,13 +541,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
     run_p.add_argument("--output", "-o", help="Output file path")
     run_p.add_argument("--result-id", help="Persisted BacktestMeta.id override")
-    run_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist this run to SQLite")
+    run_p.add_argument(
+        "--skip-sqlite", action="store_true", help="Do not persist this run to SQLite"
+    )
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help=HELP_OVERRIDE_DATA_DIR)
     run_p.add_argument(
         "--keep-indicators",
         action="store_true",
-        help="Keep indicator arrays in the output JSON (grids pass this when --keep-indicators is set)",
+        help=(
+            "Keep indicator arrays in the output JSON (grids pass this when "
+            "--keep-indicators is set)"
+        ),
     )
     run_p.add_argument(
         "--progress-stdout",
@@ -570,7 +575,9 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument("--end", required=True, help="Walk-forward end date")
     wf_p.add_argument("--capital", type=float, default=100000, help=HELP_INITIAL_CAPITAL)
     wf_p.add_argument("--train-months", type=int, default=12, help="Training window in months")
-    wf_p.add_argument("--test-months", type=int, default=3, help="Out-of-sample test window in months")
+    wf_p.add_argument(
+        "--test-months", type=int, default=3, help="Out-of-sample test window in months"
+    )
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
     wf_p.add_argument(
         "--purge-days", type=int, default=0, help="Days purged before each test fold"
@@ -589,8 +596,16 @@ def build_parser() -> argparse.ArgumentParser:
     # Backtest grid command
     grid_p = subparsers.add_parser("grid", help="Run one strategy across a symbol/timeframe grid")
     grid_p.add_argument("--strategy", "-s", required=True, help="Path to strategy file")
-    grid_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help=HELP_COMMA_SEPARATED_SYMBOLS)
-    grid_p.add_argument("--timeframes", default="1m,5m,15m,1h,4h,1d", help="Comma-separated timeframes")
+    grid_p.add_argument(
+        "--symbols",
+        default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL",
+        help=HELP_COMMA_SEPARATED_SYMBOLS,
+    )
+    grid_p.add_argument(
+        "--timeframes",
+        default="1m,5m,15m,1h,4h,1d",
+        help="Comma-separated timeframes",
+    )
     grid_p.add_argument("--start", default="2020-01-01", help="Start date")
     grid_p.add_argument("--end", default="", help="End date, empty = auto-detect")
     grid_p.add_argument("--engine", default="vectorbt", help="Backtest engine")
@@ -603,21 +618,53 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
     grid_p.add_argument("--max-workers", type=int, default=1, help="Parallel grid cells")
     grid_p.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per grid cell")
-    grid_p.add_argument("--resume", action="store_true", help="Skip cells with existing output JSON")
-    grid_p.add_argument("--subprocess", action="store_true", help="Run each grid cell via runner.cli subprocess")
-    grid_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite")
-    grid_p.add_argument("--keep-indicators", action="store_true", help="Keep indicator arrays in grid output JSONs")
+    grid_p.add_argument(
+        "--resume", action="store_true", help="Skip cells with existing output JSON"
+    )
+    grid_p.add_argument(
+        "--subprocess",
+        action="store_true",
+        help="Run each grid cell via runner.cli subprocess",
+    )
+    grid_p.add_argument(
+        "--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite"
+    )
+    grid_p.add_argument(
+        "--keep-indicators",
+        action="store_true",
+        help="Keep indicator arrays in grid output JSONs",
+    )
     grid_p.set_defaults(func=cmd_grid)
 
     # Backtest matrix command
-    matrix_p = subparsers.add_parser("matrix", help="Run all strategies across a symbol/timeframe grid")
-    matrix_p.add_argument("--strategy", "-s", action="append", default=[], help="Strategy slug/name/path to include; repeatable. Default: all.")
+    matrix_p = subparsers.add_parser(
+        "matrix", help="Run all strategies across a symbol/timeframe grid"
+    )
+    matrix_p.add_argument(
+        "--strategy",
+        "-s",
+        action="append",
+        default=[],
+        help="Strategy slug/name/path to include; repeatable. Default: all.",
+    )
     matrix_p.add_argument("--strategies-dir", type=Path, default=Path("strategies"))
-    matrix_p.add_argument("--symbols", default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL", help=HELP_COMMA_SEPARATED_SYMBOLS)
-    matrix_p.add_argument("--timeframes", default="1m,5m,15m,1h,4h,1d", help="Comma-separated timeframes")
+    matrix_p.add_argument(
+        "--symbols",
+        default="XAUUSD,SP500,NAS100,EURUSD,USDJPY,OIL",
+        help=HELP_COMMA_SEPARATED_SYMBOLS,
+    )
+    matrix_p.add_argument(
+        "--timeframes",
+        default="1m,5m,15m,1h,4h,1d",
+        help="Comma-separated timeframes",
+    )
     matrix_p.add_argument("--start", default="2020-01-01", help="Start date")
     matrix_p.add_argument("--end", default="", help="End date, empty = auto-detect")
-    matrix_p.add_argument("--engine", default="", help="Override engine. Empty uses each strategy's detected engine.")
+    matrix_p.add_argument(
+        "--engine",
+        default="",
+        help="Override engine. Empty uses each strategy's detected engine.",
+    )
     matrix_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(matrix_p, risk_default=0.01)
     _add_fee_flags(matrix_p)
@@ -625,12 +672,30 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
     matrix_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
-    matrix_p.add_argument("--max-workers", type=int, default=1, help="Parallel grid cells per strategy")
-    matrix_p.add_argument("--timeout-seconds", type=int, default=1800, help="Timeout per grid cell")
-    matrix_p.add_argument("--resume", action="store_true", help="Skip/rehydrate cells with existing output JSON")
-    matrix_p.add_argument("--subprocess", action="store_true", help="Run each grid cell via runner.cli subprocess")
-    matrix_p.add_argument("--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite")
-    matrix_p.add_argument("--keep-indicators", action="store_true", help="Keep indicator arrays in grid output JSONs")
+    matrix_p.add_argument(
+        "--max-workers", type=int, default=1, help="Parallel grid cells per strategy"
+    )
+    matrix_p.add_argument(
+        "--timeout-seconds", type=int, default=1800, help="Timeout per grid cell"
+    )
+    matrix_p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip/rehydrate cells with existing output JSON",
+    )
+    matrix_p.add_argument(
+        "--subprocess",
+        action="store_true",
+        help="Run each grid cell via runner.cli subprocess",
+    )
+    matrix_p.add_argument(
+        "--skip-sqlite", action="store_true", help="Do not persist grid cells to SQLite"
+    )
+    matrix_p.add_argument(
+        "--keep-indicators",
+        action="store_true",
+        help="Keep indicator arrays in grid output JSONs",
+    )
     matrix_p.set_defaults(func=cmd_matrix)
 
     return parser

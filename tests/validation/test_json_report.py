@@ -142,6 +142,21 @@ class TestRiskEvidenceGate:
             for delta in data["stat_deltas"]
         )
 
+    def test_missing_equity_evidence_fails_certification(self) -> None:
+        reference = make_reference([make_trade()])
+        reference.equity_curve = []
+        reference.equity_evidence_status = "missing"
+        data = json.loads(
+            json_report.generate_json_report(
+                reference,
+                reference,
+                risk_delta_report=make_passing_risk_evidence(),
+            )
+        )
+        assert data["passed"] is False
+        assert data["equity_passed"] is False
+        assert data["equity_evidence_status"] == "missing"
+
     def test_missing_risk_evidence_fails_report(self) -> None:
         reference = make_reference([make_trade()])
         data = json.loads(json_report.generate_json_report(reference, reference))

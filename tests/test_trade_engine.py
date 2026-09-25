@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 
-import pyarrow.parquet as pq
-import pyarrow.compute as pc
 import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 
 from runner.engine import TradeEngine
@@ -27,6 +27,19 @@ def _to_utc_datetime(value: object) -> datetime | None:
     if isinstance(value, date):
         return datetime.combine(value, time.min, tzinfo=timezone.utc)
     return None
+
+
+@pytest.mark.parametrize("exposure", [0.0, -0.01, 1.01])
+def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposure: float):
+    with pytest.raises(ValueError):
+        BacktestConfig(
+            strategy_name="bounds",
+            symbols=["TEST"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            max_position_exposure_pct=exposure,
+        )
 
 
 def _time_bounds(path: Path) -> tuple[datetime | None, datetime | None]:
@@ -394,7 +407,7 @@ class TestIssueC2ExposureMath:
             symbol="X",
         )
 
-    def test_stopless_legs_contribute_no_invented_distance(self) -> None:
+    def test_stopless_open_leg_fails_closed(self) -> None:
         from runner.engine_pkg.orders import Position
 
         engine = self._engine()
@@ -412,8 +425,27 @@ class TestIssueC2ExposureMath:
                 stop_loss=None,
             )
         )
-        # No entry*0.98 fantasy math: stopless legs contribute nothing.
-        assert engine._current_risk_exposure(100.0) == 0.0
+        with pytest.raises(ValueError, match="stopless open position"):
+            engine._current_risk_exposure(100.0)
+
+    def test_stopless_pending_order_fails_closed(self) -> None:
+        from runner.engine_pkg.orders import Order, OrderType
+
+        engine = self._engine()
+        engine.equity = 100_000.0
+        engine.pending_orders.append(
+            Order(
+                symbol="X",
+                direction="LONG",
+                order_type=OrderType.MARKET,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=500.0,
+                stop_loss=None,
+            )
+        )
+        with pytest.raises(ValueError, match="stopless pending order"):
+            engine._current_risk_exposure(100.0)
 
     def test_stopped_legs_contribute_stop_distance(self) -> None:
         from runner.engine_pkg.orders import Position

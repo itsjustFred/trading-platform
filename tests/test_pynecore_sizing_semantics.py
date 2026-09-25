@@ -13,7 +13,6 @@ PyneCore branch was test-blind) plus the P2 fixes:
 """
 
 from __future__ import annotations
-from tests.helpers import with_zero_fees
 
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import (
     _apply_fill_parity,
@@ -30,12 +30,13 @@ from runner.engines.pynecore_adapter import (
     _pyne_cli_end_bound,
     _pyne_cli_start_bound,
 )
-from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from shared.models import Trade, TradeExit
+from tests.helpers import with_zero_fees
 
 
 def _trade(
     *,
+    trade_id: int = 1,
     entry_price: float = 100.0,
     sl_price: float | None = 99.0,
     exit_price: float = 101.0,
@@ -49,7 +50,7 @@ def _trade(
     if sl_price is not None:
         meta["sl_price"] = sl_price
     return Trade(
-        id=1,
+        id=trade_id,
         symbol="T",
         direction=direction,
         entry_time=entry_time,
@@ -67,6 +68,61 @@ def _trade(
         pnl=0.0,
         meta=meta,
     )
+
+
+def test_shared_equity_sizes_later_trades_after_realized_pnl(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.5,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-03T00:00:00+00:00",
+        entry_price=100.0,
+        sl_price=99.0,
+        exit_price=110.0,
+    )
+    second = _trade(
+        trade_id=2,
+        entry_time="2024-01-04T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+        entry_price=100.0,
+        sl_price=99.0,
+        exit_price=101.0,
+    )
+
+    _apply_risk_sizing([first, second], config, "equities")
+
+    assert first.quantity == pytest.approx(500.0)
+    assert first.meta["risk_math"]["equity_at_entry"] == pytest.approx(100_000.0)
+    assert second.meta["risk_math"]["equity_at_entry"] == pytest.approx(105_000.0)
+    assert second.quantity == pytest.approx(525.0)
+
+
+def test_overlapping_pyne_trades_share_aggregate_leverage_cap(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    second = _trade(
+        trade_id=2,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+
+    _apply_risk_sizing([first, second], config, "equities")
+
+    assert first.quantity == pytest.approx(750.0)
+    assert second.quantity == pytest.approx(250.0)
+    assert second.meta["risk_math"]["open_notional_pct"] == pytest.approx(1.0)
 
 
 def test_enrich_trades_with_context_materializes_canonical_levels() -> None:

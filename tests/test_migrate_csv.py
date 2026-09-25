@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from data_tools.migrate_csv import _convert_ohlcv, _source_fingerprint
 
@@ -24,13 +25,23 @@ def test_force_backs_up_previous_artifact(tmp_path: Path) -> None:
     assert _convert_ohlcv(src, dest, False) == 1
 
     _csv(tmp_path / "a.csv", rows=5)
-    assert _convert_ohlcv(src, dest, False) == 0  # skip without force
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        _convert_ohlcv(src, dest, False)
     assert _convert_ohlcv(src, dest, False, force=True) == 1
 
     backups = list(tmp_path.glob("a.bak.*.parquet"))
     assert len(backups) == 1
     assert len(pd.read_parquet(backups[0])) == 3
     assert len(pd.read_parquet(dest)) == 5
+
+
+def test_unverifiable_existing_migration_requires_force(tmp_path: Path) -> None:
+    src = _csv(tmp_path / "a.csv")
+    dest = tmp_path / "a.parquet"
+    dest.write_bytes(b"legacy artifact")
+
+    with pytest.raises(RuntimeError, match="no source fingerprint"):
+        _convert_ohlcv(src, dest, False)
 
 
 def test_source_fingerprint_reports_hash_and_rows(tmp_path: Path) -> None:

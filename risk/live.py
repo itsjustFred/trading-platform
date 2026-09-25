@@ -62,7 +62,10 @@ _LIVE_TP_KEYS = ("take_profit", "tp_price")
 
 def _first_metadata_float(metadata: dict[str, Any], keys: tuple[str, ...]) -> float | None:
     for key in keys:
-        value = _to_optional_float(metadata.get(key))
+        try:
+            value = _to_optional_float(metadata.get(key))
+        except ValueError as exc:
+            raise ValueError(f"{key}: {exc}") from exc
         if value is not None:
             return value
     return None
@@ -86,6 +89,10 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
         raise ValueError("entry_price must be > 0")
     stop = _first_metadata_float(metadata, _LIVE_SL_KEYS)
     take = _first_metadata_float(metadata, _LIVE_TP_KEYS)
+    if stop is not None and stop <= 0:
+        raise ValueError("stop_loss must be > 0")
+    if take is not None and take <= 0:
+        raise ValueError("take_profit must be > 0")
     return entry, stop, take
 
 

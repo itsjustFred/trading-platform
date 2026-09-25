@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +59,7 @@ GAP_THRESHOLD_MINUTES = {
 #: FX/metals trade through most US holidays, so blanket skipping would hide
 #: real data holes there).
 _EQUITY_LIKE_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf", "index"})
+_EXPECTED_GAP_CLASSIFICATIONS = frozenset({"overnight", "weekend", "holiday"})
 
 
 def _easter_sunday(year: int) -> tuple[int, int]:
@@ -117,19 +120,310 @@ def _nyse_holidays(year: int) -> set[str]:
     return {day.isoformat() for day in holidays if day is not None and day.year == year}
 
 
-def _gap_touches_holiday(gap_start: pd.Timestamp, gap_end: pd.Timestamp) -> bool:
-    """Whether a gap interval covers a NYSE holiday (B3, equity-like only)."""
-    years = range(gap_start.year, gap_end.year + 1)
-    holidays: set[str] = set()
-    for year in years:
-        holidays |= _nyse_holidays(year)
-    cursor = gap_start.normalize()
-    end = gap_end.normalize()
-    while cursor <= end:
-        if cursor.date().isoformat() in holidays:
-            return True
+def _utc_timestamp(value: object) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def _parse_session_clock(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in {"24:00", "24:00:00"}:
+        return 1440
+    parsed = pd.to_datetime(f"2000-01-01 {text}", errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return int(parsed.hour * 60 + parsed.minute)
+
+
+def _session_window(value: object) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        start = value.get("start", value.get("open", value.get("session_start")))
+        end = value.get("end", value.get("close", value.get("session_end")))
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        start, end = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        separator = "-" if "-" in text else (" to " if " to " in text else None)
+        if separator is None:
+            return None
+        start, end = text.split(separator, 1)
+    start_minutes = _parse_session_clock(start)
+    end_minutes = _parse_session_clock(end)
+    if start_minutes is None or end_minutes is None:
+        return None
+    if end_minutes <= start_minutes:
+        end_minutes += 1440
+    return start_minutes, end_minutes
+
+
+def _holiday_dates(
+    value: object,
+    start_year: int,
+    end_year: int,
+    *,
+    include_nyse: bool = False,
+) -> set[str]:
+    dates: set[str] = set()
+    if isinstance(value, Mapping):
+        value = value.get("holidays", value.get("holiday_dates", value.get("calendar")))
+    if isinstance(value, str):
+        value = [item for item in re.split(r"[,;\s]+", value) if item]
+    elif value is not None and not isinstance(value, (list, tuple, set, frozenset)):
+        value = [value]
+    if value is not None:
+        for item in value:
+            parsed = pd.to_datetime(item, errors="coerce")
+            if not pd.isna(parsed):
+                dates.add(pd.Timestamp(parsed).date().isoformat())
+    if include_nyse:
+        for year in range(start_year, end_year + 1):
+            dates |= _nyse_holidays(year)
+    return dates
+
+
+def _observed_session_window(
+    timestamps: list[pd.Timestamp], timeframe: str
+) -> tuple[int, int] | None:
+    normalized = str(timeframe).lower()
+    step_minutes = {
+        "1m": 1.0,
+        "5m": 5.0,
+        "15m": 15.0,
+        "30m": 30.0,
+        "1h": 60.0,
+        "4h": 240.0,
+    }.get(normalized)
+    if step_minutes is None or len(timestamps) < 2:
+        return None
+    by_day: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+    for timestamp in timestamps:
+        by_day.setdefault(timestamp.normalize(), []).append(timestamp)
+    starts = [
+        min(int(point.hour * 60 + point.minute) for point in points)
+        for points in by_day.values()
+    ]
+    ends = [
+        max(int(point.hour * 60 + point.minute) for point in points)
+        + int(step_minutes)
+        for points in by_day.values()
+    ]
+    start_minutes = int(round(float(sorted(starts)[len(starts) // 2])))
+    end_minutes = int(round(float(sorted(ends)[len(ends) // 2])))
+    if end_minutes <= start_minutes or end_minutes - start_minutes < step_minutes * 2:
+        return None
+    return start_minutes, end_minutes
+
+
+def _session_overlap(
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    session: tuple[int, int],
+    holidays: set[str],
+) -> bool:
+    cursor = start.normalize() - pd.Timedelta(days=1)
+    while cursor <= end.normalize():
+        if cursor.weekday() < 5 and cursor.date().isoformat() not in holidays:
+            session_start = cursor + pd.Timedelta(minutes=session[0])
+            session_end = cursor + pd.Timedelta(minutes=session[1])
+            if min(end, session_end) > max(start, session_start):
+                return True
         cursor += pd.Timedelta(days=1)
     return False
+
+
+def _interval_has_weekend(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    cursor = start.normalize() + pd.Timedelta(days=1)
+    saw_day = False
+    while cursor < end.normalize():
+        saw_day = True
+        if cursor.weekday() < 5:
+            return False
+        cursor += pd.Timedelta(days=1)
+    return saw_day
+
+
+def _weekend_boundary(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    start_day = start.normalize()
+    end_day = end.normalize()
+    if start_day.weekday() == 4 and start.time() >= pd.Timestamp("20:00").time():
+        return end_day.weekday() in {5, 6, 0} and end.time() <= pd.Timestamp("02:00").time()
+    if start_day.weekday() == 5:
+        return end_day.weekday() in {6, 0} and end.time() <= pd.Timestamp("02:00").time()
+    if start_day.weekday() == 6:
+        return end_day.weekday() == 0 and end.time() <= pd.Timestamp("02:00").time()
+    return False
+
+
+def _is_intraday_timeframe(timeframe: str) -> bool:
+    return str(timeframe).strip().lower() not in {
+        "",
+        "1d",
+        "1w",
+        "d",
+        "day",
+        "daily",
+        "1day",
+    }
+
+
+def _gap_classification(
+    gap_start: pd.Timestamp,
+    gap_end: pd.Timestamp,
+    asset_class: str,
+    timeframe: str = "",
+    *,
+    session: object = None,
+    holidays: object = None,
+    calendar: object = None,
+    observed_session: tuple[int, int] | None = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
+) -> str:
+    if session is None and (session_start is not None or session_end is not None):
+        if session_start is None or session_end is None:
+            raise ValueError("session_start and session_end must be supplied together")
+        session = {"start": session_start, "end": session_end}
+    if gap_end <= gap_start:
+        return "data"
+    start = _utc_timestamp(gap_start)
+    end = _utc_timestamp(gap_end)
+    intraday = _is_intraday_timeframe(timeframe)
+    normalized_asset_class = str(asset_class).strip().lower()
+    session_value = session
+    if session_value is None and isinstance(calendar, Mapping):
+        session_value = calendar.get("session", calendar.get("trading_session"))
+    resolved_session = _session_window(session_value)
+    if resolved_session is None and normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
+        resolved_session = observed_session
+    holiday_value = holidays
+    if holiday_value is None and isinstance(calendar, Mapping):
+        holiday_value = calendar.get("holidays", calendar.get("holiday_dates"))
+    holiday_set = _holiday_dates(
+        holiday_value,
+        start.year,
+        end.year,
+        include_nyse=normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES,
+    )
+
+    if intraday and resolved_session is not None:
+        if _session_overlap(start, end, resolved_session, holiday_set):
+            return "session"
+        if any(
+            start.normalize() + pd.Timedelta(days=offset) < end.normalize()
+            and (start.normalize() + pd.Timedelta(days=offset)).date().isoformat() in holiday_set
+            for offset in range((end.normalize() - start.normalize()).days + 1)
+        ):
+            return "holiday"
+        if _interval_has_weekend(start, end) or _weekend_boundary(start, end):
+            return "weekend"
+        return "overnight"
+
+    if not intraday:
+        if _interval_has_weekend(start, end):
+            return "weekend"
+        cursor = start.normalize() + pd.Timedelta(days=1)
+        saw_missing_day = False
+        while cursor < end.normalize():
+            saw_missing_day = True
+            if cursor.weekday() < 5 and cursor.date().isoformat() not in holiday_set:
+                return "data"
+            cursor += pd.Timedelta(days=1)
+        if saw_missing_day:
+            return "holiday"
+        return "data"
+
+    if _weekend_boundary(start, end):
+        return "weekend"
+    if _interval_has_weekend(start, end):
+        return "weekend"
+    cursor = start.normalize() + pd.Timedelta(days=1)
+    saw_missing_day = False
+    while cursor < end.normalize():
+        saw_missing_day = True
+        if cursor.weekday() < 5 and cursor.date().isoformat() not in holiday_set:
+            return "data"
+        cursor += pd.Timedelta(days=1)
+    return "holiday" if saw_missing_day else "data"
+
+
+def _gap_is_expected_nontrading(
+    gap_start: pd.Timestamp,
+    gap_end: pd.Timestamp,
+    asset_class: str,
+    timeframe: str = "",
+    *,
+    session: object = None,
+    holidays: object = None,
+    calendar: object = None,
+    observed_session: tuple[int, int] | None = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
+) -> bool:
+    return _gap_classification(
+        gap_start,
+        gap_end,
+        asset_class,
+        timeframe,
+        session=session,
+        holidays=holidays,
+        calendar=calendar,
+        observed_session=observed_session,
+        session_start=session_start,
+        session_end=session_end,
+    ) in _EXPECTED_GAP_CLASSIFICATIONS
+
+
+def _asset_class_from_parts(parts: tuple[str, ...]) -> str:
+    for index, part in enumerate(parts):
+        if part.lower() == "ohlcv" and index + 1 < len(parts):
+            return parts[index + 1].lower()
+    if len(parts) >= 2:
+        return parts[1].lower()
+    return ""
+
+
+def _first_column_value(frame: pd.DataFrame, names: tuple[str, ...]) -> object:
+    for name in names:
+        if name not in frame.columns:
+            continue
+        values = frame[name].dropna()
+        if not values.empty:
+            return values.iloc[0]
+    return None
+
+
+def _dataset_metadata(path: Path) -> dict:
+    candidates = [DATA_DIR / "source_meta.json", path.parent / "source_meta.json"]
+    for metadata_path in candidates:
+        if not metadata_path.exists():
+            continue
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        keys = [str(path), path.as_posix()]
+        try:
+            keys.append(str(path.resolve().relative_to(DATA_DIR.resolve())))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, Mapping):
+                return dict(value)
+        continue
+    return {}
 
 
 @dataclass
@@ -167,15 +461,35 @@ class ValidationResult:
         }
 
 
-def validate_parquet(path: Path) -> ValidationResult:
+def validate_parquet(
+    path: Path,
+    *,
+    session: object = None,
+    holidays: object = None,
+    calendar: object = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
+    holiday_dates: object = None,
+) -> ValidationResult:
     """Validate a single OHLCV Parquet file."""
-    rel = path.relative_to(DATA_DIR / "ohlcv") if str(path).startswith(str(DATA_DIR)) else path
+    if session is None and (session_start is not None or session_end is not None):
+        if session_start is None or session_end is None:
+            raise ValueError("session_start and session_end must be supplied together")
+        session = {"start": session_start, "end": session_end}
+    if holidays is None and holiday_dates is not None:
+        holidays = holiday_dates
+    candidate = Path(path).expanduser()
+    try:
+        configured_root = (DATA_DIR / "ohlcv").resolve()
+        rel = candidate.resolve().relative_to(configured_root)
+    except (OSError, RuntimeError, ValueError):
+        rel = candidate
     parts = rel.parts
 
     # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet
     source = parts[0] if len(parts) >= 4 else "unknown"
-    symbol = path.parent.name
-    timeframe = path.stem
+    symbol = candidate.parent.name
+    timeframe = candidate.stem
 
     result = ValidationResult(
         path=str(rel),
@@ -185,13 +499,44 @@ def validate_parquet(path: Path) -> ValidationResult:
     )
 
     try:
-        df = pd.read_parquet(path)
+        df = pd.read_parquet(candidate)
     except Exception as e:
         result.status = "error"
         result.errors.append(f"Could not read parquet: {e}")
         return result
 
     df.columns = [c.lower() for c in df.columns]
+    dataset_metadata = dict(df.attrs) if isinstance(df.attrs, Mapping) else {}
+    dataset_metadata.update(_dataset_metadata(candidate))
+    frame_session = _first_column_value(
+        df, ("session", "trading_session", "trading_hours", "market_hours")
+    )
+    if frame_session is None and {"session_start", "session_end"}.issubset(df.columns):
+        frame_session = {
+            "start": _first_column_value(df, ("session_start", "market_open")),
+            "end": _first_column_value(df, ("session_end", "market_close")),
+        }
+    frame_calendar = _first_column_value(df, ("calendar", "holiday_calendar"))
+    frame_holidays = _first_column_value(df, ("holiday", "holidays", "holiday_dates"))
+    resolved_session = session if session is not None else frame_session
+    if resolved_session is None:
+        resolved_session = dataset_metadata.get("session", dataset_metadata.get("trading_session"))
+    if resolved_session is None:
+        metadata_start = dataset_metadata.get("session_start", dataset_metadata.get("market_open"))
+        metadata_end = dataset_metadata.get("session_end", dataset_metadata.get("market_close"))
+        if metadata_start is not None or metadata_end is not None:
+            resolved_session = {"start": metadata_start, "end": metadata_end}
+    resolved_calendar = calendar if calendar is not None else frame_calendar
+    if resolved_calendar is None:
+        resolved_calendar = dataset_metadata.get("calendar")
+    resolved_holidays = holidays if holidays is not None else frame_holidays
+    if resolved_holidays is None:
+        resolved_holidays = dataset_metadata.get(
+            "holidays",
+            dataset_metadata.get(
+                "holiday_dates", dataset_metadata.get("holiday_calendar")
+            ),
+        )
     result.total_rows = len(df)
 
     if len(df) == 0:
@@ -213,6 +558,9 @@ def validate_parquet(path: Path) -> ValidationResult:
         result.warnings.append(f"{null_ts} unparseable timestamps")
 
     ts = ts.dropna()
+    observed_session = _observed_session_window(
+        [_utc_timestamp(value) for value in ts.tolist()], timeframe
+    )
     if len(ts) > 0:
         result.date_range_start = str(ts.iloc[0])
         result.date_range_end = str(ts.iloc[-1])
@@ -252,20 +600,18 @@ def validate_parquet(path: Path) -> ValidationResult:
             gap_end = ts.loc[idx]
             gap_minutes = large_gaps.iloc[pos].total_seconds() / 60
 
-            # Skip weekends for non-forex
-            if gap_start.weekday() == 4 and gap_end.weekday() == 0:
-                continue  # Friday→Monday is expected
-            if gap_start.weekday() == 4 and gap_end.weekday() == 6:
-                continue  # Friday→Sunday
-            if gap_start.weekday() == 6 and gap_end.weekday() == 0:
-                continue  # Sunday→Monday
-
-            # B3: NYSE holidays are not data holes — but only for
-            # equity-like paths (FX/metals print through US holidays).
-            asset_class = str(parts[1]).strip().lower() if len(parts) >= 4 else ""
-            if asset_class in _EQUITY_LIKE_ASSET_CLASSES and _gap_touches_holiday(
-                gap_start, gap_end
-            ):
+            asset_class = _asset_class_from_parts(parts)
+            classification = _gap_classification(
+                gap_start,
+                gap_end,
+                asset_class,
+                timeframe,
+                session=resolved_session,
+                holidays=resolved_holidays,
+                calendar=resolved_calendar,
+                observed_session=observed_session,
+            )
+            if classification in _EXPECTED_GAP_CLASSIFICATIONS:
                 continue
 
             result.gaps.append(
@@ -273,6 +619,7 @@ def validate_parquet(path: Path) -> ValidationResult:
                     "start": str(gap_start),
                     "end": str(gap_end),
                     "gap_minutes": round(gap_minutes, 1),
+                    "classification": classification,
                 }
             )
 
@@ -339,7 +686,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
     results = []
     for parquet in sorted(ohlcv_root.rglob("*.parquet")):
         try:
-            ensure_dataset_path_within(ohlcv_root, parquet)
+            validated_path = ensure_dataset_path_within(ohlcv_root, parquet)
         except ValueError as exc:
             result = ValidationResult(
                 path=str(parquet),
@@ -354,8 +701,8 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         if symbol_filter and parquet.parent.name.upper() != symbol_filter.upper():
             continue
 
-        logger.info("Validating %s ...", parquet.relative_to(ohlcv_root))
-        r = validate_parquet(parquet)
+        logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root.resolve()))
+        r = validate_parquet(validated_path)
 
         status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
         logger.info(

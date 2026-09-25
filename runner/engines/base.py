@@ -90,7 +90,7 @@ class BacktestConfig(BaseModel):
     # exposure of a single position as a fraction of equity (0.05 = 5%).
     # Not an aggregate-portfolio limit and not a loss budget — those are
     # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
-    max_position_exposure_pct: float | None = Field(None, gt=0.0)
+    max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
     # Fill convention for signal-driven

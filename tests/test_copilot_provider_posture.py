@@ -60,6 +60,26 @@ def test_cli_provider_passes_prompt_via_stdin(monkeypatch):
     assert "long prompt" not in joined
 
 
+def test_cli_provider_sanitizes_child_environment(monkeypatch):
+    monkeypatch.setenv("CTRADER_APP_SECRET", "do-not-leak")
+    monkeypatch.setenv("ALPACA_API_SECRET", "do-not-leak")
+    captured: dict[str, object] = {}
+    provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
+
+    def fake_run(command, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _completed()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    provider.generate(prompt="hello")
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert "CTRADER_APP_SECRET" not in child_env
+    assert "ALPACA_API_SECRET" not in child_env
+    assert "PATH" in child_env
+
+
 def test_cli_provider_still_parses_json_output(monkeypatch):
     provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
 

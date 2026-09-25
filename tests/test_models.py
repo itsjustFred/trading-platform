@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from shared.models import (
     BacktestMeta,
     BacktestResult,
@@ -22,7 +24,13 @@ def _make_simple_trade() -> Trade:
         entry_price=121.50,
         quantity=82,
         exits=[
-            TradeExit(time="2021-03-18T15:45:00Z", price=124.80, quantity=82, reason="rsi_target", fees=1.64)
+            TradeExit(
+                time="2021-03-18T15:45:00Z",
+                price=124.80,
+                quantity=82,
+                reason="rsi_target",
+                fees=1.64,
+            )
         ],
         pnl=270.60,
         pnl_pct=2.72,
@@ -40,8 +48,23 @@ def _make_partial_exit_trade() -> Trade:
         entry_price=376.37,
         quantity=138,
         exits=[
-            TradeExit(time="2026-02-23T15:20:00Z", price=387.22, quantity=69, reason="tp1", fees=0.82, tags=["tp1"]),
-            TradeExit(time="2026-02-23T16:45:00Z", price=382.10, quantity=69, reason="supertrend_flip", fees=0.82, tags=["runner"]),
+                TradeExit(
+                    time="2026-02-23T15:20:00Z",
+                    price=387.22,
+                    quantity=69,
+                    reason="tp1",
+                    fees=0.82,
+                    tags=["tp1"],
+                ),
+                TradeExit(
+                    time="2026-02-23T16:45:00Z",
+                    price=382.10,
+                    quantity=69,
+                    reason="supertrend_flip",
+                    fees=0.82,
+                    tags=["runner"],
+                ),
+
         ],
         pnl=1143.67,
         pnl_pct=2.20,
@@ -99,7 +122,13 @@ def _make_result() -> BacktestResult:
 
 class TestTradeExit:
     def test_roundtrip(self):
-        e = TradeExit(time="2021-03-18T15:45:00Z", price=124.80, quantity=82, reason="tp1", fees=1.0)
+        e = TradeExit(
+            time="2021-03-18T15:45:00Z",
+            price=124.80,
+            quantity=82,
+            reason="tp1",
+            fees=1.0,
+        )
         d = e.to_dict()
         e2 = TradeExit.from_dict(d)
         assert e2.time == e.time
@@ -210,6 +239,20 @@ class TestBacktestResult:
             r2 = BacktestResult.load(path)
             assert r2.meta.id == r.meta.id
             assert len(r2.trades) == 2
+
+    def test_save_preserves_existing_file_when_serialization_fails(self, tmp_path, monkeypatch):
+        result = _make_result()
+        path = tmp_path / "result.json"
+        path.write_text("previous", encoding="utf-8")
+
+        def fail_serialization():
+            raise ValueError("serialization failed")
+
+        monkeypatch.setattr(result, "to_json", fail_serialization)
+        with pytest.raises(ValueError, match="serialization failed"):
+            result.save(path)
+
+        assert path.read_text(encoding="utf-8") == "previous"
 
     def test_filename_generation(self):
         r = _make_result()

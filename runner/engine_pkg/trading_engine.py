@@ -95,9 +95,7 @@ class TradeEngine:
                 max_total_exposure=max_total_exposure,
                 max_positions=TRADE_ENGINE_MAX_POSITIONS,
                 default_sl_atr_multiplier=2.0,
-                # Keep the backtest's notional bound equal to the engine's own
-                # max_leverage cap so sizing and the post-cap do not fight.
-                max_notional_per_trade=max_leverage if max_leverage > 0 else 0.20,
+                max_notional_per_trade=min(max_leverage, 1.0),
                 allow_fallback_stop=bool(self.config.allow_fallback_stop),
                 reject_missing_stop=bool(self.config.reject_missing_stop),
             )
@@ -203,28 +201,46 @@ class TradeEngine:
         return "SHORT" if direction == "SHORT" else "LONG"
 
     def _current_risk_exposure(self, reference_price: float) -> float:
-        # C2: no invented stops. Only stop-protected legs contribute their
-        # stop distance — a leg WITHOUT a stop contributes nothing here
-        # instead of entry*0.98 fantasy math. (Sizing still bounds every
-        # leg through the fallback-stop path with a warning; exposure
-        # intentionally measures stop-defined risk only. Stopless legs are
-        # therefore invisible to the exposure cap by design, not by
-        # accident — see max_positions, which counts every leg.)
         if self.equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
 
         for position in self.positions:
-            if position.stop_loss is None:
-                continue
-            risk_distance = abs(float(position.entry_price) - float(position.stop_loss))
+            stop_loss = position.stop_loss
+            if stop_loss is None:
+                stop_loss = position.meta.get("sizing_stop_loss")
+            if stop_loss is None:
+                raise ValueError(
+                    "Cannot compute exposure for a stopless open position"
+                )
+            risk_distance = abs(float(position.entry_price) - float(stop_loss))
             risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
 
         for order in self.pending_orders:
-            if order.stop_loss is None:
-                continue
-            risk_distance = abs(float(reference_price) - float(order.stop_loss))
+            stop_loss = order.stop_loss
+            if stop_loss is None:
+                stop_loss = getattr(order, "_sizing_stop_loss", None)
+            if stop_loss is None:
+                trigger_price = (
+                    order.limit_price
+                    if order.order_type == OrderType.LIMIT
+                    else order.stop_price
+                )
+                if trigger_price is not None:
+                    direction_sign = 1.0 if order.direction == "LONG" else -1.0
+                    risk_distance = abs(float(reference_price) - float(trigger_price))
+                    if risk_distance <= 0:
+                        risk_distance = (
+                            float(reference_price)
+                            * self._risk_engine.config.fallback_stop_pct
+                        )
+                    stop_loss = float(reference_price) - direction_sign * risk_distance
+            if stop_loss is None:
+                raise ValueError(
+                    "Cannot compute exposure for a stopless pending order"
+                )
+            risk_distance = abs(float(reference_price) - float(stop_loss))
             risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
 
         return max(0.0, risk_exposure)
@@ -347,6 +363,15 @@ class TradeEngine:
         stop_distance = float(stop_distance_raw) if pd.notna(stop_distance_raw) else None
         take_profit = float(tp_levels[0]["price"]) if tp_levels else None
         size_from_stop = stop_loss if stop_loss is not None else sizing_only_stop
+        exposure_stop = size_from_stop
+        if exposure_stop is None and self._risk_enabled and self.config.allow_fallback_stop:
+            direction_sign = 1.0 if direction == "LONG" else -1.0
+            fallback_distance = (
+                float(stop_distance)
+                if stop_distance is not None and stop_distance > 0
+                else entry_price * self._risk_engine.config.fallback_stop_pct
+            )
+            exposure_stop = entry_price - direction_sign * fallback_distance
         qty = self._calculate_position_size(
             entry_price=entry_price,
             stop_loss_price=size_from_stop,
@@ -369,6 +394,7 @@ class TradeEngine:
             stop_distance=stop_distance,
             take_profit_levels=tp_levels,
         )
+        order._sizing_stop_loss = exposure_stop
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
         # order's quantity — it still tracks exposure and credits PnL.
@@ -388,6 +414,9 @@ class TradeEngine:
         # per-unit coefficient quantity/equity_at_entry replays exactly).
         position_meta = dict(getattr(order, "meta", None) or {})
         position_meta["equity_at_entry"] = round(float(self.equity), 2)
+        sizing_stop = getattr(order, "_sizing_stop_loss", None)
+        if sizing_stop is not None:
+            position_meta["sizing_stop_loss"] = float(sizing_stop)
         # A-M4 (D5): transient proportionality flag from _create_order
         # (fixed-amount sizing must not be re-scaled by the shared replay).
         position_meta["equity_proportional_sizing"] = bool(
@@ -461,6 +490,16 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
+                if order.stop_loss is None:
+                    direction_sign = 1.0 if order.direction == "LONG" else -1.0
+                    fallback_distance = (
+                        float(order.stop_distance)
+                        if order.stop_distance is not None and order.stop_distance > 0
+                        else float(fill_price) * self._risk_engine.config.fallback_stop_pct
+                    )
+                    order._sizing_stop_loss = (
+                        float(fill_price) - direction_sign * fallback_distance
+                    )
                 if (
                     order.order_type == OrderType.MARKET
                     and order.stop_distance is not None

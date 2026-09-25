@@ -7,7 +7,7 @@ per-file copies.
 
 from __future__ import annotations
 
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from validation.reference import ValidationReference
 
 
@@ -58,6 +58,10 @@ def make_reference(
         trades=trades,
         stats={},
         raw_metadata={},
+        equity_curve=[
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=100_000.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=100_050.0),
+        ],
         allow_empty=True,
     )
 
@@ -84,4 +88,12 @@ def make_platform_result(trades: list[Trade]) -> BacktestResult:
         engine="test",
         strategies=["test"],
     )
-    return BacktestResult(meta=meta, trades=trades, stats={})
+    return BacktestResult(
+        meta=meta,
+        trades=trades,
+        equity_curve=[
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=100_000.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=100_050.0),
+        ],
+        stats={},
+    )

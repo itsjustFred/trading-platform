@@ -76,6 +76,7 @@ def _write_base_backtest(
     *,
     symbols: list[str] | None = None,
     data_dir: Path | None = None,
+    session: dict[str, str] | None = None,
 ) -> None:
     data = {
         "symbols": symbols or ["AAPL"],
@@ -84,6 +85,8 @@ def _write_base_backtest(
     }
     if data_dir is not None:
         data["data_dir"] = str(data_dir)
+    if session is not None:
+        data["session"] = session
     result = BacktestResult(
         meta=BacktestMeta(
             id="base-demo",
@@ -93,6 +96,7 @@ def _write_base_backtest(
             backtest_start="2024-01-01",
             backtest_end="2024-01-10",
             initial_capital=100000.0,
+            risk_per_trade_pct=0.01,
             data=data,
             parameters={"fixed": 3},
         ),
@@ -212,6 +216,7 @@ def _write_risk_parity_base_backtest(backtests_dir: Path, *, data_dir: Path | No
             backtest_start="2024-01-01",
             backtest_end="2024-01-10",
             initial_capital=100000.0,
+            risk_per_trade_pct=0.01,
             data={
                 "symbols": ["SPY", "TLT", "GLD"],
                 "timeframes": ["1d"],
@@ -478,6 +483,103 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert saved_payload["test_stats"]["sharpe_ratio"] == 1.7
 
 
+def test_run_optimization_rejects_legacy_base_before_study(monkeypatch, tmp_path: Path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir()
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="legacy-demo",
+            created_at="2024-01-01T00:00:00+00:00",
+            engine="vectorbt",
+            strategies=["example_sma"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-10",
+            initial_capital=100_000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+        ),
+        trades=[],
+    )
+    result.save(backtests_dir / "legacy-demo.trades.json")
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(
+        optimizer_module.optuna,
+        "create_study",
+        _forbid_call("study must not be created for a legacy artifact"),
+    )
+
+    with pytest.raises(ValueError, match="legacy artifact.*risk_per_trade_pct"):
+        optimizer_module.run_optimization(
+            optimizer_module.OptimizationConfig(
+                base_backtest_id="legacy-demo",
+                target_metric="sharpe",
+                n_trials=1,
+                parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
+            )
+        )
+
+
+def test_run_optimization_propagates_explicit_base_risk_to_real_config(
+    monkeypatch, tmp_path: Path
+):
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[2], pass_through_stats=True)
+    propagated: list[float | None] = []
+
+    def fake_run_backtest(config, strategy_path):
+        propagated.append(config.risk_per_trade_pct)
+        return _trial_result(config, metric=1.0, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=1,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
+        )
+    )
+
+    assert propagated and all(value == pytest.approx(0.01) for value in propagated)
+
+
+def test_run_optimization_passes_explicit_session_to_coverage_gate(
+    monkeypatch, tmp_path: Path
+):
+    session = {"start": "14:30", "end": "19:30"}
+    _patch_optimizer_env(
+        monkeypatch,
+        tmp_path,
+        grid_choices=[2],
+        pass_through_stats=True,
+        session=session,
+    )
+    coverage_calls: list[dict[str, object]] = []
+
+    def fake_coverage(**kwargs):
+        coverage_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", fake_coverage)
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.0, trade_count=1),
+    )
+
+    optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=1,
+            parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
+        )
+    )
+
+    assert coverage_calls
+    assert all(call["session"] == session for call in coverage_calls)
+
+
 def test_run_optimization_propagates_backtest_errors(monkeypatch, tmp_path: Path):
     _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[2])
     monkeypatch.setattr(
@@ -584,7 +686,10 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
 
     assert payload["best_params"] == {"window": 2}
     assert payload["best_value"] == -0.5
-    penalties = {trial["params"]["window"]: trial["penalty_applied"] for trial in payload["top_trials"]}
+    penalties = {
+        trial["params"]["window"]: trial["penalty_applied"]
+        for trial in payload["top_trials"]
+    }
     assert penalties == {1: True, 2: False}
     no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
@@ -609,13 +714,14 @@ def _patch_optimizer_env(
     *,
     grid_choices: list[int],
     pass_through_stats: bool = False,
+    session: dict[str, str] | None = None,
 ) -> None:
     """Shared optimizer test environment: base backtest on disk, redirected
     output dirs, bar-coverage preflight allowed, strategy entry resolved to
     the tmp strategy, and a deterministic GridSampler."""
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
-    _write_base_backtest(backtests_dir)
+    _write_base_backtest(backtests_dir, session=session)
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
     monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations")
     _allow_bar_coverage_preflight(monkeypatch)
@@ -656,7 +762,9 @@ def test_metric_reaching_no_trade_penalty_floor_fails_loudly(monkeypatch, tmp_pa
         train_split_pct=0.7,
         parameter_ranges={"window": {"type": "int", "min": 2, "max": 2, "step": 1}},
     )
-    with pytest.raises(RuntimeError, match="No optimization trial completed successfully") as exc_info:
+    with pytest.raises(
+        RuntimeError, match="No optimization trial completed successfully"
+    ) as exc_info:
         optimizer_module.run_optimization(config)
     # The floor violation is preserved as the trial's failure reason through
     # the all-failed guard, instead of silently steering the study.
@@ -724,6 +832,25 @@ class TestRiskAdjustedObjective:
             direction="maximize",
         )
         assert robust > lucky
+
+    def test_sparsity_credit_is_clamped_to_unit_interval(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        _value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": -10, "max_drawdown_pct": 0.0},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["sparsity_factor"] == 0.0
+
+        _value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 300, "max_drawdown_pct": 0.0},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["sparsity_factor"] == 1.0
 
     def test_full_credit_leaves_value_untouched(self) -> None:
         from runner.optimizer import _risk_adjusted_metric_value

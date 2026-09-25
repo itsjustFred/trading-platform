@@ -27,7 +27,7 @@ nachfolgenden Prüfungen nicht aufheben.
 | c | `extra_trades` | Zusätzliche Trades innerhalb des konfigurierten Schwellenwerts |
 | d | `critical_mismatches` | Kritische Richtungs-/PnL-Abweichungen |
 | e | `trade_warnings` | Warning-Level-Abweichungen; ein Fehlschlag ist `READY_WITH_WARNINGS` |
-| f | `regression_status` | Regression bestanden, wenn `require_all_goldens_pass=True` |
+| f | `regression_status` | Regression bestanden, wenn `require_all_goldens_pass=True`; fehlende Evidenz ist ein Fehler |
 | g | `risk_evidence` | Risk-Report enthält vergleichbare Feldwerte |
 | h | `risk_failed_results` | Keine strukturell fehlgeschlagenen Risk-Ergebnisse |
 | i | `risk_report_verdict` | Risk-Report insgesamt bestanden |
@@ -38,6 +38,7 @@ nachfolgenden Prüfungen nicht aufheben.
 | n | `stats_net_profit` | Net-Profit-Differenz innerhalb Toleranz |
 | o | `stats_sharpe` | Sharpe-Differenz innerhalb der/absoluten Sharpe-Toleranz |
 | p | `stats_max_drawdown` | Absolute Max-Drawdown-Differenz höchstens `0.02` (2 Prozentpunkte) |
+| q | `equity_evidence` | Equity-Evidenz für Referenz und Plattform vorhanden |
 
 Jede Prüfung erzeugt ein :class:`~validation.readiness.models.ReadinessCheck` mit:
 - `name` — maschinenlesbarer Name
@@ -93,6 +94,10 @@ null ist `1.0` und damit ein Fehlschlag. Die Sharpe-Prüfung verwendet
 stats_sharpe_tolerance_abs)`. Die Drawdown-Prüfung verwendet die direkte
 absolute Differenz, nicht den Nenner der relativen Statistikprüfungen.
 
+
+Die Validation-CLI führt Readiness immer aus. Ohne Golden-Datei fehlt die
+Regression-Evidenz; ohne Equity-Kurve auf beiden Seiten fehlt die
+Kalender-Evidenz. Beide Fälle blockieren die Zertifizierung.
 
 ## Was würde Paper Trading bedeuten?
 

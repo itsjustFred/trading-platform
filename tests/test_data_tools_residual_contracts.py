@@ -19,6 +19,7 @@ from data_tools.path_safety import build_dataset_path, validate_dataset_componen
 @pytest.mark.parametrize(
     "component",
     [
+        ".",
         "..",
         "../escape",
         "folder/file",
@@ -40,6 +41,11 @@ def test_dataset_component_rejects_unsafe_values(component: str) -> None:
 def test_dataset_component_rejects_explicit_parent_component() -> None:
     with pytest.raises(ValueError, match="traversal component"):
         validate_dataset_component("..")
+
+
+def test_dataset_component_rejects_current_directory_component() -> None:
+    with pytest.raises(ValueError, match="traversal component"):
+        validate_dataset_component(".")
 
 
 def test_dataset_path_rejects_parent_traversal_in_root(tmp_path: Path) -> None:
@@ -173,6 +179,29 @@ def test_csv_migration_keeps_previous_artifact_when_atomic_write_fails(
     monkeypatch.setattr(migrate_csv, "write_parquet_atomically", fail_write)
     assert migrate_csv._convert_ohlcv(source, destination, False, force=True) == 0
     assert destination.read_bytes() == before
+
+
+def test_validation_rejects_symlinked_file_outside_data_root(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    outside = tmp_path / "outside.parquet"
+    target = root / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True),
+            "open": [1.0],
+            "high": [2.0],
+            "low": [0.0],
+            "close": [1.5],
+        }
+    ).to_parquet(outside, index=False)
+    target.symlink_to(outside)
+
+    results = validation.validate_all(root)
+
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert "escapes" in results[0].errors[0]
 
 
 def test_validation_cli_returns_nonzero_for_errors(

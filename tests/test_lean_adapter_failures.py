@@ -10,7 +10,7 @@ from runner.engines.lean_adapter import LeanAdapter
 
 
 def _config(tmp_path: Path) -> BacktestConfig:
-    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         strategy_name="lean_demo",
         symbols=["SPY"],
         timeframe="1d",
@@ -49,14 +49,58 @@ def test_lean_adapter_imports_cleanly():
     assert hasattr(module, "LeanAdapter")
 
 
-def test_lean_adapter_runs_end_to_end_from_result_fixture(tmp_path):
+def test_lean_adapter_imports_result_through_explicit_path(tmp_path):
     fixture = tmp_path / "lean_result.json"
     fixture.write_text(json.dumps(LEAN_FIXTURE), encoding="utf-8")
 
-    result = LeanAdapter(lean_project_dir=tmp_path).run(_config(tmp_path), str(fixture))
+    result = LeanAdapter(lean_project_dir=tmp_path).import_result(
+        fixture, config=_config(tmp_path)
+    )
 
     assert result.meta.engine == "lean"
     assert len(result.trades) == 1
+
+
+def test_lean_adapter_rejects_result_json_as_strategy_path(tmp_path):
+    fixture = tmp_path / "lean_result.json"
+    fixture.write_text(json.dumps(LEAN_FIXTURE), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="import_result"):
+        LeanAdapter(lean_project_dir=tmp_path).run(_config(tmp_path), str(fixture))
+
+
+def test_lean_adapter_converts_list_shaped_orders_end_to_end(tmp_path):
+    fixture = tmp_path / "lean_result.json"
+    payload = {
+        "orders": list(LEAN_FIXTURE["orders"].values()),
+        "profitLoss": LEAN_FIXTURE["profitLoss"],
+    }
+    fixture.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = LeanAdapter(lean_project_dir=tmp_path).import_result(fixture)
+
+    assert result.meta.engine == "lean"
+    assert len(result.trades) == 1
+    assert result.meta.backtest_start.startswith("2024-01-05")
+
+
+def test_lean_config_write_preserves_previous_file_on_failure(tmp_path, monkeypatch):
+    import runner.engines.lean_adapter as module
+
+    project_dir = tmp_path / "lean_project"
+    project_dir.mkdir()
+    config_path = project_dir / "backtest_config.json"
+    config_path.write_text("previous", encoding="utf-8")
+    adapter = module.LeanAdapter(lean_project_dir=project_dir)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("simulated config write failure")
+
+    monkeypatch.setattr(module, "write_text_atomically", fail_write)
+    with pytest.raises(OSError, match="simulated"):
+        adapter._write_config(_config(tmp_path), "strategy.py")
+
+    assert config_path.read_text(encoding="utf-8") == "previous"
 
 
 def test_lean_adapter_fails_loudly_when_lean_cli_missing(tmp_path, monkeypatch):

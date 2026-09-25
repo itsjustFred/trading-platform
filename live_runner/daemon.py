@@ -22,6 +22,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    coerce_positive_live_qty,
     is_unbounded_tp,
 )
 from live_runner.credential_env import (
@@ -335,7 +336,9 @@ def _clear_ctrader_blocked_state(account_id: str) -> None:
 
 
 def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
-    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(exc):
+    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(
+        exc
+    ):
         return
     reason = str(exc).strip() or "cTrader authorization failed"
     _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
@@ -639,48 +642,49 @@ def _resolve_exit_only_target_qty(
     positions: Iterable[Mapping[str, object]],
     symbol: str,
 ) -> float:
-    """Return the total quantity to flatten for ``symbol``.
-
-    Hedging accounts (cTrader default) can hold several lots of the same
-    symbol as separate positions; netting accounts fold them into one row.
-    Both shapes must flatten the whole exposure, so the magnitudes of all
-    matching rows are summed — shorts count too (a negative qty is an open
-    short that an exit-only close must buy back, not a residual to ignore).
-    The live submission path validates every matching broker row before
-    calling this helper.
-    """
-    target_qty = 0.0
+    quantities: list[float] = []
     for position in positions:
         position_symbol = str(position.get("symbol") or "").strip().upper()
         if position_symbol != symbol.upper():
             continue
-        try:
-            resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
-        except ValueError:
-            continue
-        target_qty += abs(resolved_qty)
-    return target_qty
+        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
+        if not math.isfinite(quantity) or quantity == 0:
+            raise ValueError(
+                f"Exit-only signal for {symbol} received a non-positive broker position."
+            )
+        quantities.append(quantity)
+    if not quantities:
+        return 0.0
+    if len(quantities) > 1:
+        raise ValueError(
+            f"Exit-only signal for {symbol} has multiple broker positions; "
+            "refusing an unaddressed aggregate close."
+        )
+    if quantities[0] < 0:
+        return abs(quantities[0])
+    return quantities[0]
 
 
 def _exit_only_close_action(positions: Iterable[Mapping[str, object]], symbol: str) -> str:
-    """Return the order side that flattens ``symbol``'s net exposure.
-
-    A net-long book closes with ``sell``; a net-short book closes with
-    ``buy`` (the short must be bought back). A flat book (or rows that all
-    fail to parse) returns ``sell`` — the caller rejects the order on a
-    zero target quantity anyway, and ``sell`` keeps the historical default
-    for the rows that do parse.
-    """
-    net_qty = 0.0
+    quantities: list[float] = []
     for position in positions:
         position_symbol = str(position.get("symbol") or "").strip().upper()
         if position_symbol != symbol.upper():
             continue
-        try:
-            net_qty += _coerce_live_float(position.get("qty"), field_name="qty")
-        except ValueError:
-            continue
-    return "buy" if net_qty < 0 else "sell"
+        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
+        if not math.isfinite(quantity) or quantity == 0:
+            raise ValueError(
+                f"Exit-only signal for {symbol} received a non-positive broker position."
+            )
+        quantities.append(quantity)
+    if not quantities:
+        return "sell"
+    if len(quantities) > 1:
+        raise ValueError(
+            f"Exit-only signal for {symbol} has multiple broker positions; "
+            "refusing an ambiguous aggregate close."
+        )
+    return "buy" if quantities[0] < 0 else "sell"
 
 
 async def _metadata_for_exit_only_order(
@@ -722,7 +726,12 @@ async def _metadata_for_exit_only_order(
             f"Exit-only signal for {signal.symbol} has mixed long and short broker positions; "
             "refusing an ambiguous close."
         )
-    target_qty = sum(abs(quantity) for quantity in quantities)
+    if len(quantities) > 1:
+        raise ValueError(
+            f"Exit-only signal for {signal.symbol} has multiple broker positions; "
+            "refusing an unaddressed aggregate close."
+        )
+    target_qty = abs(quantities[0])
     for key in (
         "qty",
         "explicit_qty",
@@ -733,6 +742,7 @@ async def _metadata_for_exit_only_order(
         "position_count",
     ):
         metadata.pop(key, None)
+    metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)
     metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     metadata["position_count"] = len(matching_positions)
@@ -848,6 +858,23 @@ async def submit_order_with_risk(
         current_exposure=max(float(current_exposure), broker_exposure),
         pip_value=pip_value,
         current_positions=open_positions_count,
+    )
+    try:
+        sized_qty = coerce_positive_live_qty(
+            (sized_signal.metadata or {}).get("qty"), field_name="live entry qty"
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Live entry quantity must be finite and positive; refusing to submit a zero-size order."
+        ) from exc
+    sized_signal = sized_signal.model_copy(
+        update={
+            "metadata": {
+                **(sized_signal.metadata or {}),
+                "qty": sized_qty,
+                "explicit_qty": sized_qty,
+            }
+        }
     )
     # Sizing may have resolved a fallback stop (ATR/percent). Persist that
     # resolution so the broker order carries the stop sizing actually assumed.

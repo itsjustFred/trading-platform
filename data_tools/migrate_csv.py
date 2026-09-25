@@ -205,11 +205,17 @@ def _convert_ohlcv(
         metadata = _read_migration_metadata(dest)
         current_fingerprint = _source_fingerprint(csv_path)
         recorded_fingerprint = str(metadata.get("source_fingerprint") or "")
-        if recorded_fingerprint and recorded_fingerprint != current_fingerprint:
-            logger.warning(
-                "[STALE] %s was migrated from a different CSV fingerprint; "
-                "use --force to replace it",
-                dest,
+        if not recorded_fingerprint:
+            raise RuntimeError(
+                f"Migration artifact {dest} has no source fingerprint; refusing "
+                "to skip an unverifiable legacy artifact. Re-run with --force "
+                "to replace it after reviewing the source."
+            )
+        if recorded_fingerprint != current_fingerprint:
+            raise RuntimeError(
+                f"Migration artifact {dest} was created from a different source "
+                "fingerprint; refusing to skip stale data. Re-run with --force "
+                "to replace it after reviewing the source change."
             )
         logger.info("[SKIP] %s (already exists)", dest)
         return 0
