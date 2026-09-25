@@ -1090,6 +1090,49 @@ def test_ctrader_volume_rejects_non_finite_qty():
             adapter._resolve_order_volume(bad_signal)
 
 
+def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "volume": 999_999,
+            "ctrader_volume": 888_888,
+            "note": "keep",
+        },
+    )
+    persisted: list[LiveSignal] = []
+
+    class _PersistenceCaptured(Exception):
+        pass
+
+    def _capture(persisted_signal):
+        persisted.append(persisted_signal)
+        raise _PersistenceCaptured
+
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(module, "save_live_signal", _capture)
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 5_000)
+
+    with pytest.raises(_PersistenceCaptured):
+        asyncio.run(adapter.submit_order(signal, qty=3.0))
+
+    assert len(persisted) == 1
+    metadata = persisted[0].metadata
+    assert metadata["qty"] == pytest.approx(3.0)
+    assert metadata["explicit_qty"] == pytest.approx(3.0)
+    assert metadata["note"] == "keep"
+    assert "volume" not in metadata
+    assert "ctrader_volume" not in metadata
+
+
 def test_ctrader_fill_quantities_are_persisted_in_qty_units(monkeypatch):
     """Live fill events and reconcile backfills must persist filled_qty in the
     same unit as signal metadata qty (broker volume / 1000), so the viewer's

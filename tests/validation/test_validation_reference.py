@@ -124,6 +124,20 @@ class TestToBacktestResult:
 
         assert result.meta.initial_capital == pytest.approx(67_890.0)
 
+    @pytest.mark.parametrize(
+        "invalid_capital",
+        [0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+    )
+    def test_invalid_initial_capital_uses_default_fallback(self, invalid_capital):
+        from validation.reference import resolve_initial_capital
+
+        ref = _make_minimal_valid_reference(
+            settings={"initial_capital": invalid_capital},
+            raw_metadata={},
+        )
+
+        assert resolve_initial_capital(ref) == pytest.approx(100_000.0)
+
     def test_trades_preserved(self):
         ref = _make_minimal_valid_reference()
         result = ref.to_backtest_result()

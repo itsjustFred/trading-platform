@@ -237,6 +237,66 @@ def test_colliding_trade_ids_do_not_reject_each_other(tmp_path: Path) -> None:
     assert trades == [accepted]
 
 
+def test_colliding_trade_ids_release_realized_pnl_before_later_entry(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-03T00:00:00+00:00",
+        exit_price=110.0,
+    )
+    second = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-04T00:00:00+00:00",
+        exit_price=111.0,
+    )
+    observer = _trade(
+        trade_id=2,
+        entry_time="2024-01-03T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    trades = [second, first, observer]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert observer.meta["risk_math"]["equity_at_entry"] == pytest.approx(107_500.0)
+
+
+def test_release_order_follows_exit_order_when_entry_order_differs(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    long_open = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+        exit_price=110.0,
+    )
+    early_close = _trade(
+        trade_id=2,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-02T02:00:00+00:00",
+        exit_price=111.0,
+    )
+    observer = _trade(
+        trade_id=3,
+        entry_time="2024-01-02T03:00:00+00:00",
+        exit_time="2024-01-04T00:00:00+00:00",
+    )
+    trades = [long_open, early_close, observer]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert observer.meta["risk_math"]["equity_at_entry"] == pytest.approx(102_750.0)
+
+
 def _frame() -> pd.DataFrame:
     return pd.DataFrame(
         {

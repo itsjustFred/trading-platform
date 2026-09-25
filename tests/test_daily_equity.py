@@ -262,6 +262,32 @@ class TestAttachDailyEquity:
         assert len(result.equity_curve) > 2
         assert result.meta.data["equity_frequency"] == "daily"
 
+    @pytest.mark.parametrize(
+        "preserved_curve",
+        [
+            [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0)],
+            [
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=100500.0),
+            ],
+        ],
+    )
+    def test_daily_equity_rejects_single_point_and_stale_preservation(
+        self, preserved_curve
+    ):
+        from runner.daily_equity import _preserves_engine_curve
+
+        daily_timestamps = pd.date_range("2024-01-01", periods=32, freq="D", tz="UTC")
+        daily_curve = [
+            EquityPoint(
+                time=timestamp.isoformat(),
+                equity=100500.0 if timestamp == daily_timestamps[-1] else 100000.0,
+            )
+            for timestamp in daily_timestamps
+        ]
+
+        assert not _preserves_engine_curve(preserved_curve, daily_curve)
+
     def test_rejects_sparse_existing_equity_curve(self):
         result = make_result(
             trades=[make_trade(pnl=500.0)],

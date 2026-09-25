@@ -807,3 +807,18 @@ def test_observed_session_allows_a_final_day_cut_at_the_requested_end() -> None:
         start_ts=pd.Timestamp("2024-01-02T00:00:00Z"),
         end_ts=pd.Timestamp("2024-01-03T13:00:00Z"),
     ) is None
+
+
+def test_observed_session_uses_an_interior_window_at_boundary_cuts() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T10:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=6, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-04T09:00", periods=4, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T10:30:00Z"),
+        end_ts=pd.Timestamp("2024-01-04T13:00:00Z"),
+    ) == (540, 900)

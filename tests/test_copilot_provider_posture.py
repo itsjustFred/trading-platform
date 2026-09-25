@@ -144,6 +144,24 @@ def test_cli_provider_skips_unknown_json_event_types(monkeypatch):
     assert provider.generate(prompt="hello") == "generated"
 
 
+def test_cli_provider_keeps_processing_after_observable_unknown_event(monkeypatch):
+    provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
+    stdout = "\n".join(
+        [
+            _assistant_event("before"),
+            json.dumps({"type": "future.event", "data": {"content": "ignored"}}),
+            _assistant_event("after"),
+            json.dumps({"type": "result", "exitCode": 0}),
+        ]
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: _completed(stdout=stdout),
+    )
+
+    assert provider.generate(prompt="hello") == "after"
+
+
 @pytest.mark.parametrize("exit_code", [1, "0"])
 def test_cli_provider_rejects_failed_result_events(monkeypatch, exit_code):
     provider = CopilotCLIProvider(executable="copilot", timeout_seconds=5)
