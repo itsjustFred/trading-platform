@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,8 @@ class TestWalkforwardSignature:
 class TestWalkforwardOutputStructure:
     """Tests for output JSON structure validation."""
 
-    def test_walkforward_output_structure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_output_structure(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test the expected output structure of walkforward with mocked optimizer."""
         # Mock the optimizer to return predictable results
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -90,7 +92,9 @@ class TestWalkforwardOutputStructure:
         assert "oos_sharpe" in result["folds"][0]
         assert "oos_max_drawdown" in result["folds"][0]
 
-    def test_walkforward_output_has_all_required_fields(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_output_has_all_required_fields(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test that output has all required fields for summary calculation."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -117,7 +121,8 @@ class TestWalkforwardOutputStructure:
 class TestWalkforwardSummaryMetrics:
     """Tests for summary metrics calculation."""
 
-    def test_summary_metrics_profitable_fold(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_summary_metrics_profitable_fold(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test summary metrics with a profitable fold (positive OOS Sharpe)."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -139,7 +144,8 @@ class TestWalkforwardSummaryMetrics:
         assert result["summary"]["n_profitable_folds"] == 1
         assert result["summary"]["profitable_fold_pct"] == 100.0
 
-    def test_summary_metrics_unprofitable_fold(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_summary_metrics_unprofitable_fold(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test summary metrics with an unprofitable fold (negative OOS Sharpe)."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -161,7 +167,8 @@ class TestWalkforwardSummaryMetrics:
         assert result["summary"]["n_profitable_folds"] == 0
         assert result["summary"]["profitable_fold_pct"] == 0.0
 
-    def test_summary_metrics_zero_oos_sharpe(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_summary_metrics_zero_oos_sharpe(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test summary metrics with zero OOS Sharpe (boundary case)."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -183,7 +190,8 @@ class TestWalkforwardSummaryMetrics:
         assert result["summary"]["n_profitable_folds"] == 0
         assert result["summary"]["profitable_fold_pct"] == 0.0
 
-    def test_summary_metrics_null_oos_sharpe(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_summary_metrics_null_oos_sharpe(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test summary metrics when OOS Sharpe is None."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -208,7 +216,8 @@ class TestWalkforwardSummaryMetrics:
 class TestWalkforwardFileOutput:
     """Tests for file output verification."""
 
-    def test_walkforward_creates_output_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_creates_output_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test that walkforward creates a JSON output file."""
         # Create a mock output directory
         output_dir = tmp_path / "walkforward_results"
@@ -243,7 +252,8 @@ class TestWalkforwardFileOutput:
         assert saved_content["folds"] == result["folds"]
         assert saved_content["summary"] == result["summary"]
 
-    def test_walkforward_file_naming_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_file_naming_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test that output file uses correct naming format with timestamp."""
         output_dir = tmp_path / "walkforward_results"
 
@@ -272,7 +282,8 @@ class TestWalkforwardFileOutput:
 class TestWalkforwardEdgeCases:
     """Tests for edge cases and error handling."""
 
-    def test_walkforward_multiple_backtests(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_multiple_backtests(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test walkforward with multiple backtest IDs."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -295,7 +306,8 @@ class TestWalkforwardEdgeCases:
         assert result["backtest_ids"] == backtest_ids
         assert len(result["folds"]) == 1  # Current implementation has single fold
 
-    def test_walkforward_custom_parameters(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_custom_parameters(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test walkforward with custom parameters."""
         captured_kwargs: dict[str, Any] = {}
 
@@ -350,7 +362,8 @@ class TestWalkforwardEdgeCases:
             assert call["train_start"] < call["train_end"] < call["test_start"] <= call["test_end"]
             assert call["train_end"] < call["test_start"]
 
-    def test_walkforward_created_at_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_walkforward_created_at_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Test that created_at uses ISO format with timezone."""
         def mock_optimize(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {"sharpe": 1.0, "oos_sharpe": 0.7}
@@ -405,7 +418,9 @@ class _FakeEngine:
     def validate_config(self, config: BacktestConfig) -> list[str]:
         return []
 
-    def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
+    def run(
+        self, config: BacktestConfig, strategy_path: str, progress_callback=None
+    ) -> BacktestResult:
         self.configs.append(config)
         is_oos = len(self.configs) % 2 == 0
         sharpe = 0.5 if is_oos else 1.5
@@ -435,6 +450,27 @@ class _FakeEngine:
                 "total_trades": 2,
             },
         )
+
+
+def test_aggregate_oos_metrics_uses_daily_closes_and_epoch_seconds() -> None:
+    curve = [
+        {"time": 1_703_980_800, "equity": 100.0},
+        {"time": 1_704_067_200, "equity": 100.0},
+        {"time": 1_704_067_260, "equity": 110.0},
+        {"time": 1_704_153_600, "equity": 120.0},
+        {"time": 1_704_240_000, "equity": 121.0},
+    ]
+    returns = [110.0 / 100.0 - 1.0, 120.0 / 110.0 - 1.0, 121.0 / 120.0 - 1.0]
+    mean = sum(returns) / len(returns)
+    std = math.sqrt(sum((value - mean) ** 2 for value in returns) / len(returns))
+    expected = mean / std * math.sqrt(252.0)
+
+    sharpe, drawdown = wf_module._aggregate_oos_metrics(
+        [{"oos_equity_curve": curve}]
+    )
+
+    assert sharpe == pytest.approx(expected)
+    assert drawdown == pytest.approx(0.0)
 
 
 def test_strategy_walkforward_builds_rolling_folds_and_summary(tmp_path: Path) -> None:
@@ -476,7 +512,9 @@ class _FoldRecordingEngine(_FakeEngine):
         super().__init__()
         self.stats = dict(stats or {})
 
-    def run(self, config: BacktestConfig, strategy_path: str, progress_callback=None) -> BacktestResult:
+    def run(
+        self, config: BacktestConfig, strategy_path: str, progress_callback=None
+    ) -> BacktestResult:
         self.configs.append(config)
         return _fake_result(config, strategy_path, len(self.configs), [], dict(self.stats))
 

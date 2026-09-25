@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from shared.models import Trade, TradeExit
+from validation import cli as validation_cli
 from validation.reference import ValidationReference
 
 
@@ -89,6 +90,56 @@ class TestCliHelp:
         assert "quantconnect" in result.stdout
 
 
+class TestCliAutoImporterFallback:
+    def test_auto_fallback_forwards_timeframe(self, tmp_path: Path, monkeypatch) -> None:
+        source = tmp_path / "result.json"
+        source.write_text("{}", encoding="utf-8")
+        seen: dict[str, Any] = {}
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                seen["path"] = path
+                seen.update(kwargs)
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "QuantConnectResultImporter", _Importer)
+
+        result = validation_cli._load_validation_reference(source, "auto", timeframe="5m")
+
+        assert result.timeframe == "1h"
+        assert seen["path"] == source
+        assert seen["timeframe"] == "5m"
+
+    def test_auto_fallback_reports_both_parse_errors(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        source = tmp_path / "result.json"
+        source.write_text("{}", encoding="utf-8")
+        fallback_error = ValueError("fallback exploded")
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                raise fallback_error
+
+        monkeypatch.setattr(validation_cli, "QuantConnectResultImporter", _Importer)
+
+        with pytest.raises(ValueError) as exc_info:
+            validation_cli._load_validation_reference(source, "auto", timeframe="5m")
+
+        message = str(exc_info.value)
+        assert "canonical ValidationReference" in message
+        assert "fallback exploded" in message
+        assert exc_info.value.__cause__ is fallback_error
+
+    def test_cli_capital_resolver_uses_settings_before_metadata(self) -> None:
+        reference = _make_reference(
+            settings={"initial_capital": 12_345},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        assert validation_cli._initial_capital(reference) == pytest.approx(12_345.0)
+
+
 class TestCliJsonOutput:
     def test_cli_json_output(self, tmp_reference_json: Path, tmp_platform_json: Path):
         result = _invoke_cli([
@@ -115,7 +166,10 @@ class TestCliMarkdownOutput:
         ])
         assert result.returncode == 0
         assert "# Validation Report: test_strategy" in result.stdout
-        assert "Overall Passed**:** Yes" in result.stdout or "Overall Passed**: Yes" in result.stdout
+        assert (
+            "Overall Passed**:** Yes" in result.stdout
+            or "Overall Passed**: Yes" in result.stdout
+        )
 
 
 class TestCliMissingTradeExitCode1:
@@ -136,7 +190,9 @@ class TestCliMissingTradeExitCode1:
 
 
 class TestCliOutputToFile:
-    def test_cli_output_to_file(self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path):
+    def test_cli_output_to_file(
+        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+    ):
         out_path = tmp_path / "report.json"
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
@@ -203,7 +259,9 @@ class TestCliAutoImporterXLSX:
 
 
 class TestCliExitCode0OnPerfectMatch:
-    def test_cli_exit_code_0_on_perfect_match(self, tmp_reference_json: Path, tmp_platform_json: Path):
+    def test_cli_exit_code_0_on_perfect_match(
+        self, tmp_reference_json: Path, tmp_platform_json: Path
+    ):
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
@@ -292,7 +350,11 @@ class TestCliInvalidReferencePathExitCode2:
             "--format", "json",
         ])
         assert result.returncode == 2
-        assert "not found" in result.stderr.lower() or "failed to load reference" in result.stderr.lower() or "no such file or directory" in result.stderr.lower()
+        assert (
+            "not found" in result.stderr.lower()
+            or "failed to load reference" in result.stderr.lower()
+            or "no such file or directory" in result.stderr.lower()
+        )
 
 
 class TestCliStatsToleranceArgument:

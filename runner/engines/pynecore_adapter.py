@@ -1169,7 +1169,7 @@ def _apply_risk_sizing(
 
     open_ledger: dict[int, tuple[pd.Timestamp, float, float, float]] = {}
     released = 0
-    rejected_trade_ids: set[int] = set()
+    rejected_trade_keys: set[int] = set()
 
     def _release_through(cutoff: pd.Timestamp) -> None:
         nonlocal released, equity
@@ -1177,7 +1177,7 @@ def _apply_risk_sizing(
             trade, _entry_time, exit_time = by_exit[released]
             if exit_time > cutoff:
                 break
-            key = int(trade.id)
+            key = id(trade)
             booked = open_ledger.pop(key, None)
             if booked is not None:
                 equity += booked[3]
@@ -1196,7 +1196,7 @@ def _apply_risk_sizing(
         sl_price = meta.get("sl_price")
         if sl_price is None:
             if config.reject_missing_stop or not config.allow_fallback_stop:
-                rejected_trade_ids.add(int(trade.id))
+                rejected_trade_keys.add(id(trade))
                 logger.warning(
                     "Rejecting PyneCore trade %s: no stop_loss and fallback sizing is disabled",
                     trade.id,
@@ -1248,7 +1248,7 @@ def _apply_risk_sizing(
         open_notional += new_qty * entry_price
         open_risk = sum(item[2] for item in open_ledger.values()) + new_qty * stop_distance
         if new_qty > 0:
-            open_ledger[int(trade.id)] = (
+            open_ledger[id(trade)] = (
                 _exit_time,
                 new_qty * entry_price,
                 new_qty * stop_distance,
@@ -1265,8 +1265,8 @@ def _apply_risk_sizing(
         }
         trade.meta = meta
 
-    if rejected_trade_ids:
-        trades[:] = [trade for trade in trades if int(trade.id) not in rejected_trade_ids]
+    if rejected_trade_keys:
+        trades[:] = [trade for trade in trades if id(trade) not in rejected_trade_keys]
 
 
 def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str | None:

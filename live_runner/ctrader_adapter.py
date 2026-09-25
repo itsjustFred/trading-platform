@@ -1862,6 +1862,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             == EXIT_ONLY_RISK_SIZING_MODE
         )
         self._resolve_order_volume(signal)
+        signal = signal.model_copy(
+            update={
+                "metadata": {
+                    key: value
+                    for key, value in (signal.metadata or {}).items()
+                    if key not in {"ctrader_volume", "volume"}
+                }
+            }
+        )
         persisted_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, signal_id
         )

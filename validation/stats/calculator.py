@@ -299,7 +299,7 @@ def compute_trade_statistics(
         if not math.isfinite(capital) or capital <= 0:
             raise ValueError("initial_capital must be finite and > 0")
     if not trades:
-        return TradeStatistics()
+        return TradeStatistics(risk_free_rate=float(risk_free_rate))
 
     realized_pnls = [_net_realized_pnl(t) for t in trades]
     # Gross figures stay gross (fees excluded) so they remain comparable with
@@ -364,6 +364,7 @@ def compute_trade_statistics(
 
     return TradeStatistics(
         total_trades=total_trades,
+        risk_free_rate=float(risk_free_rate),
         winning_trades=winning_trades,
         losing_trades=losing_trades,
         win_rate=win_rate,

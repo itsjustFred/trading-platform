@@ -27,8 +27,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_tools.auto_download import TIMEFRAME_MINUTES
 from data_tools.path_safety import ensure_dataset_path_within
-from shared.constants import DATA_DIR
+from shared.constants import DATA_DIR, normalize_timeframe
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -194,16 +195,9 @@ def _holiday_dates(
 def _observed_session_window(
     timestamps: list[pd.Timestamp], timeframe: str
 ) -> tuple[int, int] | None:
-    normalized = str(timeframe).lower()
-    step_minutes = {
-        "1m": 1.0,
-        "5m": 5.0,
-        "15m": 15.0,
-        "30m": 30.0,
-        "1h": 60.0,
-        "4h": 240.0,
-    }.get(normalized)
-    if step_minutes is None or len(timestamps) < 2:
+    normalized = normalize_timeframe(str(timeframe).strip())
+    step_minutes = TIMEFRAME_MINUTES.get(normalized)
+    if step_minutes is None or step_minutes >= 1440.0 or len(timestamps) < 2:
         return None
     by_day: dict[pd.Timestamp, list[pd.Timestamp]] = {}
     for timestamp in timestamps:
@@ -229,7 +223,9 @@ def _session_overlap(
     end: pd.Timestamp,
     session: tuple[int, int],
     holidays: set[str],
+    step_minutes: float = 0.0,
 ) -> bool:
+    start = start + pd.Timedelta(minutes=step_minutes)
     cursor = start.normalize() - pd.Timedelta(days=1)
     while cursor <= end.normalize():
         if cursor.weekday() < 5 and cursor.date().isoformat() not in holidays:
@@ -298,6 +294,8 @@ def _gap_classification(
     start = _utc_timestamp(gap_start)
     end = _utc_timestamp(gap_end)
     intraday = _is_intraday_timeframe(timeframe)
+    normalized_timeframe = normalize_timeframe(str(timeframe).strip())
+    step_minutes = TIMEFRAME_MINUTES.get(normalized_timeframe)
     normalized_asset_class = str(asset_class).strip().lower()
     session_value = session
     if session_value is None and isinstance(calendar, Mapping):
@@ -316,7 +314,13 @@ def _gap_classification(
     )
 
     if intraday and resolved_session is not None:
-        if _session_overlap(start, end, resolved_session, holiday_set):
+        if _session_overlap(
+            start,
+            end,
+            resolved_session,
+            holiday_set,
+            step_minutes=step_minutes or 0.0,
+        ):
             return "session"
         if any(
             start.normalize() + pd.Timedelta(days=offset) < end.normalize()

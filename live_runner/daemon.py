@@ -943,7 +943,11 @@ async def submit_order_with_risk(
     preserved_metadata = {
         key: value for key, value in metadata.items() if key not in sizing_keys
     }
-    final_metadata = {**sized_metadata, **preserved_metadata}
+    final_metadata = {
+        key: value
+        for key, value in {**sized_metadata, **preserved_metadata}.items()
+        if key not in {"volume", "ctrader_volume"}
+    }
     sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     # C1/B2: the risk-sized qty is binding — pass it explicitly so the
     # adapter sizes exactly zero times (never with default config).

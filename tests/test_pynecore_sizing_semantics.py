@@ -150,6 +150,50 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
     return BacktestConfig(**with_zero_fees(payload))
 
 
+def test_colliding_trade_ids_keep_independent_open_ledger_entries(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    second = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    trades = [first, second]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert len(trades) == 2
+    assert first.quantity == pytest.approx(750.0)
+    assert second.quantity == pytest.approx(250.0)
+
+
+def test_colliding_trade_ids_do_not_reject_each_other(tmp_path: Path) -> None:
+    config = _config(tmp_path, reject_missing_stop=True)
+    accepted = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        sl_price=99.0,
+    )
+    rejected = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        sl_price=None,
+    )
+    trades = [accepted, rejected]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert trades == [accepted]
+
+
 def _frame() -> pd.DataFrame:
     return pd.DataFrame(
         {

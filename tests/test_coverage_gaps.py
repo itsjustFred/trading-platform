@@ -358,6 +358,22 @@ class TestValidateHolidayCalendar:
         frame.to_parquet(target, index=False)
         return target
 
+    def test_session_overlap_starts_after_prior_bar_close(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T15:00:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "overnight"
+
+    def test_validate_uses_shared_timeframe_step_mapping(self) -> None:
+        import data_tools.validate as validate_module
+
+        assert validate_module.TIMEFRAME_MINUTES is auto_download.TIMEFRAME_MINUTES
+
     def test_july4_gap_skipped_for_equity(self, tmp_path, monkeypatch) -> None:
         import data_tools.validate as validate_module
 

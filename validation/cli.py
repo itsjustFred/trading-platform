@@ -22,7 +22,7 @@ from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.importers.quantconnect_result import QuantConnectResultImporter
 from validation.readiness.models import ReadinessConfig, ReadinessReport
 from validation.readiness.validator import ReadinessValidator
-from validation.reference import ValidationReference
+from validation.reference import ValidationReference, resolve_initial_capital
 from validation.regression.runner import RegressionConfig, run_regression
 from validation.reporting.json_report import (
     ValidationReport,
@@ -70,10 +70,19 @@ def _load_validation_reference(
         text = path.read_text(encoding="utf-8")
         try:
             return ValidationReference.model_validate_json(text)
-        except ValueError:
+        except ValueError as canonical_error:
             if importer_name != "auto":
                 raise
-            return QuantConnectResultImporter().load(path)
+            try:
+                importer = QuantConnectResultImporter()
+                if timeframe:
+                    return importer.load(path, timeframe=timeframe)
+                return importer.load(path)
+            except Exception as fallback_error:
+                raise ValueError(
+                    f"Failed to load '{path}' as canonical ValidationReference "
+                    f"({canonical_error}) or QuantConnect result ({fallback_error})"
+                ) from fallback_error
 
     if importer_name == "auto":
         if suffix == ".xlsx":
@@ -191,13 +200,7 @@ def _write_atomic(path: Path, output: str) -> None:
 
 
 def _initial_capital(reference: ValidationReference) -> float:
-    metadata = reference.raw_metadata.get("parsed_meta", {})
-    value = metadata.get("initial_capital") if isinstance(metadata, dict) else None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 100_000.0
-    return number if math.isfinite(number) and number > 0.0 else 100_000.0
+    return resolve_initial_capital(reference)
 
 
 def _risk_report(

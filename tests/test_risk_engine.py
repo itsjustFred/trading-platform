@@ -408,6 +408,7 @@ def test_legacy_signal_ids_are_unique_and_stable_per_signal():
     assert fallback_id == fallback_id_again
 
 
+def test_calculate_position_size_uses_explicit_signal_id() -> None:
     engine = RiskEngine()
     signal = TradeSignal(
         action="sell",
