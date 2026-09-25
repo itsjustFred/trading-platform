@@ -7,14 +7,15 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_tools.path_safety import build_dataset_path
+from shared.constants import DATA_DIR
+from shared.sql import quote_identifier, quote_literal
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("dolthub_manager")
-
-from shared.constants import DATA_DIR
-from shared.sql import quote_identifier, quote_literal
 
 DOLT_DIR = DATA_DIR / "dolthub"
 EXPORT_DIR = DATA_DIR / "ohlcv" / "dolthub"
@@ -161,8 +162,8 @@ def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
     """Return the canonical OHLCV output path and migrate legacy flat exports."""
-    legacy_path = target_dir / f"{symbol}.parquet"
-    canonical_path = target_dir / symbol / "1d.parquet"
+    legacy_path = build_dataset_path(target_dir, f"{symbol}.parquet")
+    canonical_path = build_dataset_path(target_dir, symbol, "1d.parquet")
 
     if legacy_path.exists() and not canonical_path.exists():
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,7 +222,7 @@ def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
         text=True,
     )
     lines = result.stdout.strip().split("\n")[1:]  # skip header
-    return [l.strip() for l in lines if l.strip()]
+    return [line.strip() for line in lines if line.strip()]
 
 
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
@@ -235,7 +236,7 @@ def _export_symbol_csv(
         return
     try:
         out_parquet.parent.mkdir(parents=True, exist_ok=True)
-        sym_csv = target_dir / f"{symbol}.csv"
+        sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
         with open(sym_csv, "w") as f:
             subprocess.check_call(
                 [
@@ -257,7 +258,7 @@ def _export_symbol_csv(
     except Exception as e:
         logger.warning(f"Failed to export {symbol}: {e}")
     finally:
-        csv_path = target_dir / f"{symbol}.csv"
+        csv_path = build_dataset_path(target_dir, f"{symbol}.csv")
         if csv_path.exists():
             csv_path.unlink()
 
@@ -272,11 +273,11 @@ def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for table in _list_tables(repo_path):
-        out_parquet = output_dir / f"{table}.parquet"
+        out_parquet = build_dataset_path(output_dir, f"{table}.parquet")
         if out_parquet.exists():
             continue
         try:
-            csv_path = output_dir / f"{table}.csv"
+            csv_path = build_dataset_path(output_dir, f"{table}.csv")
             _export_table_csv(repo_path, table, csv_path)
             df = pd.read_csv(csv_path)
             if not df.empty:
@@ -309,12 +310,19 @@ def export_data():
 
             # Get symbols
             result = run_dolt(
-                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}", "-r", "csv"],
+                [
+                    "dolt",
+                    "sql",
+                    "-q",
+                    f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}",
+                    "-r",
+                    "csv",
+                ],
                 cwd=stocks_repo,
                 capture=True,
             )
             lines = result.stdout.strip().split("\n")[1:]  # skip header
-            symbols = [l.strip() for l in lines if l.strip()]
+            symbols = [line.strip() for line in lines if line.strip()]
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):
@@ -327,7 +335,7 @@ def export_data():
 
                 try:
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
-                    sym_csv = target_dir / f"{symbol}.csv"
+                    sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
                     with open(sym_csv, "w") as f:
                         run_dolt(
                             [
@@ -349,7 +357,7 @@ def export_data():
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:
-                    csv_path = target_dir / f"{symbol}.csv"
+                    csv_path = build_dataset_path(target_dir, f"{symbol}.csv")
                     if csv_path.exists():
                         csv_path.unlink()
 

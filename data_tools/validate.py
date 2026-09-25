@@ -19,17 +19,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+from data_tools.path_safety import ensure_dataset_path_within
+from shared.constants import DATA_DIR
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
-
-from shared.constants import DATA_DIR
 
 # Expected bars per timeframe per trading day (forex ~24h, equities ~7h)
 EXPECTED_BARS_PER_DAY = {
@@ -287,12 +287,12 @@ def validate_parquet(path: Path) -> ValidationResult:
             result.errors.append(f"Missing column: {col}")
             return result
 
-    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+    o, h, low, c = df["open"], df["high"], df["low"], df["close"]
 
     # high should be >= max(open, close) and low should be <= min(open, close)
     high_violations = (h < o) | (h < c)
-    low_violations = (l > o) | (l > c)
-    hl_violations = h < l
+    low_violations = (low > o) | (low > c)
+    hl_violations = h < low
 
     result.ohlc_violations = int(high_violations.sum() + low_violations.sum() + hl_violations.sum())
     if result.ohlc_violations > 0:
@@ -338,6 +338,19 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
 
     results = []
     for parquet in sorted(ohlcv_root.rglob("*.parquet")):
+        try:
+            ensure_dataset_path_within(ohlcv_root, parquet)
+        except ValueError as exc:
+            result = ValidationResult(
+                path=str(parquet),
+                symbol=parquet.parent.name,
+                timeframe=parquet.stem,
+                source="unknown",
+                status="error",
+            )
+            result.errors.append(str(exc))
+            results.append(result)
+            continue
         if symbol_filter and parquet.parent.name.upper() != symbol_filter.upper():
             continue
 
@@ -369,7 +382,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 
-def main():
+def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Validate OHLCV data quality")
@@ -380,6 +393,7 @@ def main():
 
     data_dir = Path(args.data_dir)
     results = validate_all(data_dir, symbol_filter=args.symbol)
+    missing_root = not (data_dir / "ohlcv").is_dir()
 
     # Summary
     ok = sum(1 for r in results if r.status == "ok")
@@ -404,6 +418,8 @@ def main():
             json.dump(report, f, indent=2)
         print(f"  Report saved to: {args.report}")
 
+    return 1 if err or missing_root else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

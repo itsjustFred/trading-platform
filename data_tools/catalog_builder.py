@@ -23,11 +23,13 @@ from typing import Any
 import pandas as pd
 import pyarrow.parquet as pq
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-logger = logging.getLogger(__name__)
-
+from data_tools.file_fingerprint import file_fingerprint, fingerprint_to_json
+from data_tools.path_safety import ensure_dataset_path_within
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+logger = logging.getLogger(__name__)
 
 CATALOG_FILE = "catalog.json"
 _COULD_NOT_READ_MESSAGE = "Could not read %s: %s"
@@ -76,6 +78,16 @@ def _load_source_meta(data_dir: Path) -> dict[str, dict]:
     return {}
 
 
+def _catalog_path_key(value: object, data_dir: Path | None = None) -> str:
+    try:
+        path = Path(str(value)).expanduser()
+        if data_dir is not None and not path.is_absolute():
+            path = Path(data_dir) / path
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return str(value)
+
+
 def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
     """Load the previous catalog to reuse unchanged file metadata."""
     cache_path = data_dir / CATALOG_FILE
@@ -95,7 +107,7 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
             continue
         path = entry.get("path")
         if path:
-            cache[str(path)] = entry
+            cache[_catalog_path_key(path, data_dir)] = entry
         segments = entry.get("segments")
         if isinstance(segments, list):
             for segment in segments:
@@ -106,7 +118,7 @@ def _load_catalog_cache(data_dir: Path) -> dict[str, dict]:
                     continue
                 merged_segment_entry = dict(entry)
                 merged_segment_entry.update(segment)
-                cache[str(segment_path)] = merged_segment_entry
+                cache[_catalog_path_key(segment_path, data_dir)] = merged_segment_entry
     return cache
 
 
@@ -232,12 +244,7 @@ def _mtime_to_iso(value: float) -> str:
 
 
 def _file_fingerprint(path: Path) -> tuple[int, int] | None:
-    """Exact (mtime_ns, size_bytes) fingerprint, or None when unreadable."""
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    return (int(stat.st_mtime_ns), int(stat.st_size))
+    return file_fingerprint(path)
 
 
 def _should_reuse_cached_summary(
@@ -520,6 +527,7 @@ def _new_group_aggregate(symbol: str, timeframe: str) -> dict:
         "errors": set(),
         "segments": [],
         "segment_paths": set(),
+        "file_fingerprints": {},
     }
 
 
@@ -578,6 +586,23 @@ def _latest_scalar(aggregate: dict, key: str, value: Any, *, numeric: bool) -> N
 
 
 def _accumulate_metadata(aggregate: dict, candidate: dict) -> None:
+    raw_fingerprints = candidate.get("file_fingerprints")
+    if isinstance(raw_fingerprints, dict):
+        for raw_path, raw_fingerprint in raw_fingerprints.items():
+            if isinstance(raw_fingerprint, dict):
+                aggregate["file_fingerprints"][str(raw_path)] = dict(raw_fingerprint)
+
+    path_value = str(candidate.get("path") or "").strip()
+    candidate_mtime = candidate.get("mtime_ns")
+    candidate_size = candidate.get("size_bytes")
+    if path_value and candidate_mtime is not None and candidate_size is not None:
+        try:
+            aggregate["file_fingerprints"][path_value] = fingerprint_to_json(
+                (int(candidate_mtime), int(candidate_size))
+            )
+        except (TypeError, ValueError):
+            pass
+
     mtime_ns = candidate.get("mtime_ns")
     if mtime_ns is not None:
         try:
@@ -782,6 +807,8 @@ def _build_grouped_entry(aggregate: dict) -> dict:
             grouped_entry["region"] = region_values[0]
     if aggregate["mtime_ns"] is not None:
         grouped_entry["mtime_ns"] = aggregate["mtime_ns"]
+    if aggregate["file_fingerprints"]:
+        grouped_entry["file_fingerprints"] = dict(sorted(aggregate["file_fingerprints"].items()))
     if aggregate["last_updated"] is not None:
         grouped_entry["last_updated"] = aggregate["last_updated"]
     if aggregate["columns"]:
@@ -836,6 +863,11 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
     catalog_cache = _load_catalog_cache(data_dir)
 
     for parquet_file in sorted(ohlcv_root.rglob("*.parquet")):
+        try:
+            ensure_dataset_path_within(ohlcv_root, parquet_file)
+        except ValueError as exc:
+            logger.warning("Skipping parquet outside OHLCV root: %s (%s)", parquet_file, exc)
+            continue
         entry = parse_ohlcv_path(parquet_file, ohlcv_root)
         if entry is None:
             continue
@@ -849,7 +881,7 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
 
         try:
             fingerprint = _file_fingerprint(parquet_file)
-            cached_entry = catalog_cache.get(str(parquet_file))
+            cached_entry = catalog_cache.get(_catalog_path_key(parquet_file, data_dir))
             if _should_reuse_cached_summary(cached_entry, fingerprint):
                 for key in (
                     "rows",
@@ -958,7 +990,9 @@ def build_catalog(data_dir: Path | None = None, include_validation: bool = False
     fundamentals = scan_fundamentals(root)
 
     # Build summary
-    symbols = sorted({str(e.get("symbol") or "") for e in ohlcv if str(e.get("symbol") or "").strip()})
+    symbols = sorted(
+        {str(e.get("symbol") or "") for e in ohlcv if str(e.get("symbol") or "").strip()}
+    )
     sources: set[str] = set()
     for entry in ohlcv:
         entry_sources = entry.get("sources")

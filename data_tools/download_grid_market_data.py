@@ -26,7 +26,10 @@ from typing import Any
 import pandas as pd
 
 from data_tools.downloaders.dukascopy_native import DukascopyNativeDownloader
+from data_tools.file_fingerprint import file_fingerprint, files_have_same_content
+from data_tools.path_safety import build_dataset_path
 from data_tools.resample import resample_file
+from shared.atomic_io import atomic_replace, write_parquet_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
 
 DEFAULT_SYMBOLS = ["XAUUSD", "SP500", "NAS100", "EURUSD", "USDJPY", "OIL"]
@@ -120,7 +123,7 @@ def normalize_ohlcv_columns(path: Path) -> None:
     df[OHLCV_SOURCE_COLUMN] = sides
     keep = ["timestamp", "open", "high", "low", "close", "volume", OHLCV_SOURCE_COLUMN]
     df = df[[col for col in keep if col in df.columns]]
-    df.to_parquet(path, index=False)
+    write_parquet_atomically(path, df)
 
 
 def _resolve_bid_ask_side(df: pd.DataFrame, sides: pd.Series, target: str) -> pd.Series:
@@ -174,7 +177,12 @@ def symbol_asset_class(canonical_symbol: str) -> str:
     return "forex"
 
 
-def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: str, output_dir: Path) -> Path:
+def ensure_alias_copy(
+    canonical_path: Path,
+    requested_symbol: str,
+    asset_class: str,
+    output_dir: Path,
+) -> Path:
     """Copy the canonical parquet under the requested symbol name.
 
     Equal file size is not freshness: a re-download that merges or replaces rows
@@ -185,18 +193,22 @@ def ensure_alias_copy(canonical_path: Path, requested_symbol: str, asset_class: 
     external restores (rsync -a, tar, git checkout) can reorder mtimes without
     changing content, which would make a stale alias look fresh.
     """
-    alias_path = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol / canonical_path.name
-    if alias_path.exists():
-        try:
-            canonical_is_newer = (
-                canonical_path.stat().st_mtime_ns > alias_path.stat().st_mtime_ns
-            )
-        except OSError:
-            canonical_is_newer = True
-        if not canonical_is_newer:
+    alias_path = build_dataset_path(
+        output_dir,
+        "ohlcv",
+        "dukascopy",
+        asset_class,
+        requested_symbol,
+        canonical_path.name,
+    )
+    canonical_fingerprint = file_fingerprint(canonical_path)
+    if alias_path.exists() and canonical_fingerprint is not None:
+        if file_fingerprint(alias_path) == canonical_fingerprint:
+            return alias_path
+        if files_have_same_content(canonical_path, alias_path):
             return alias_path
     alias_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(canonical_path, alias_path)
+    atomic_replace(alias_path, lambda target: shutil.copy2(canonical_path, target))
     return alias_path
 
 
@@ -218,9 +230,13 @@ def download_symbol(
 ) -> dict[str, Any]:
     downloader = DukascopyNativeDownloader()
     asset_class = symbol_asset_class(canonical_symbol)
-    canonical_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / canonical_symbol
-    requested_dir = output_dir / "ohlcv" / "dukascopy" / asset_class / requested_symbol
-    source_path = canonical_dir / "1m.parquet"
+    canonical_dir = build_dataset_path(
+        output_dir, "ohlcv", "dukascopy", asset_class, canonical_symbol
+    )
+    requested_dir = build_dataset_path(
+        output_dir, "ohlcv", "dukascopy", asset_class, requested_symbol
+    )
+    source_path = build_dataset_path(canonical_dir, "1m.parquet")
     requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
     known_timeframes = [tf for tf in requested_timeframes if tf in VALID_TIMEFRAMES]
     higher_timeframes = [tf for tf in known_timeframes if tf != "1m"]
@@ -259,7 +275,13 @@ def download_symbol(
                 result["download"] = dl_result.to_dict() | {"path": str(dl_result.path)}
             else:
                 rows = parquet_rows(source_path)
-                result["download"] = {"symbol": canonical_symbol, "timeframe": "1m", "rows": rows, "path": str(source_path), "status": "cached"}
+                result["download"] = {
+                    "symbol": canonical_symbol,
+                    "timeframe": "1m",
+                    "rows": rows,
+                    "path": str(source_path),
+                    "status": "cached",
+                }
 
             normalize_ohlcv_columns(source_path)
             requested_1m = ensure_alias_copy(source_path, requested_symbol, asset_class, output_dir)
@@ -267,8 +289,12 @@ def download_symbol(
             result["paths"]["rows_1m"] = parquet_rows(requested_1m)
 
         for tf in higher_timeframes:
-            target_path = requested_dir / f"{tf}.parquet"
-            if target_path.exists() and not force and parquet_non_null_ohlcv(target_path) == parquet_rows(target_path):
+            target_path = build_dataset_path(requested_dir, f"{tf}.parquet")
+            if (
+                target_path.exists()
+                and not force
+                and parquet_non_null_ohlcv(target_path) == parquet_rows(target_path)
+            ):
                 result["paths"][tf] = str(target_path)
                 result["paths"][f"rows_{tf}"] = parquet_rows(target_path)
                 continue
@@ -294,19 +320,37 @@ def download_symbol(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download Dukascopy data for the backtest grid")
-    parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS), help="Comma-separated requested symbols")
-    parser.add_argument("--timeframes", default=",".join(DEFAULT_TIMEFRAMES), help="Comma-separated timeframes")
+    parser.add_argument(
+        "--symbols", default=",".join(DEFAULT_SYMBOLS), help="Comma-separated requested symbols"
+    )
+    parser.add_argument(
+        "--timeframes",
+        default=",".join(DEFAULT_TIMEFRAMES),
+        help="Comma-separated timeframes",
+    )
     parser.add_argument("--start", default=DEFAULT_START, help="Start date, default 2020-01-01")
     parser.add_argument("--end", default="", help="End date, empty = today")
     parser.add_argument("--output", type=Path, default=DATA_DIR, help="Data root directory")
     parser.add_argument("--workers", type=int, default=6, help="Parallel symbols")
-    parser.add_argument("--batch-size", type=int, default=20, help="Dukascopy URL batch size per symbol")
-    parser.add_argument("--pipeline-batches", type=int, default=2, help="Dukascopy batches kept in flight per symbol")
-    parser.add_argument("--pause-ms", type=int, default=500, help="Pause between Dukascopy batches")
+    parser.add_argument(
+        "--batch-size", type=int, default=20, help="Dukascopy URL batch size per symbol"
+    )
+    parser.add_argument(
+        "--pipeline-batches",
+        type=int,
+        default=2,
+        help="Dukascopy batches kept in flight per symbol",
+    )
+    parser.add_argument(
+        "--pause-ms", type=int, default=500, help="Pause between Dukascopy batches"
+    )
     parser.add_argument("--price-type", choices=["bid", "ask", "both"], default="bid")
     parser.add_argument("--oil-type", choices=sorted(OIL_ALIASES), default="USOIL")
     parser.add_argument("--force", action="store_true", help="Redownload 1m even if cached")
-    parser.add_argument("--dry-run", action="store_true", help="Print planned downloads without fetching")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print planned downloads without fetching"
+    )
+
     args = parser.parse_args()
 
     output_dir = args.output.expanduser().resolve()
@@ -325,7 +369,17 @@ def main() -> None:
         for requested in requested_symbols
     ]
     if args.dry_run:
-        print(json.dumps({"planned": planned, "output_dir": str(output_dir), "start": args.start, "end": end}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "planned": planned,
+                    "output_dir": str(output_dir),
+                    "start": args.start,
+                    "end": end,
+                },
+                indent=2,
+            )
+        )
         return
 
     rows: list[dict[str, Any]] = []

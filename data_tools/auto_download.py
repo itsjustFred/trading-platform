@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -11,6 +12,7 @@ from typing import Any, Callable
 import pandas as pd
 import pyarrow.parquet as pq
 
+from data_tools.path_safety import ensure_dataset_path_within, validate_dataset_component
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -505,6 +507,15 @@ def find_internal_gaps(
     return []
 
 
+def _contained_rglob(root: Path, pattern: str) -> Iterator[Path]:
+    for path in root.rglob(pattern):
+        try:
+            ensure_dataset_path_within(root, path)
+        except ValueError:
+            continue
+        yield path
+
+
 def has_ohlcv_bars_in_range(
     *,
     symbol: str,
@@ -530,10 +541,16 @@ def has_ohlcv_bars_in_range(
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
 
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return False
+
     ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
     matches = sorted(
         path
-        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
     return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
@@ -549,10 +566,16 @@ def _segment_timestamps_in_range(
     """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return []
+
     ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
     matches = sorted(
         path
-        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
     stamps: set[pd.Timestamp] = set()
@@ -640,7 +663,9 @@ def _build_requirements(
         symbol = str(raw_symbol or "").strip().upper()
         if not symbol:
             continue
+        validate_dataset_component(symbol, name="symbol")
         for required_timeframe in timeframes:
+            validate_dataset_component(required_timeframe, name="timeframe")
             requirements.append(
                 DataRequirement(
                     symbol=symbol,
@@ -704,8 +729,13 @@ def _has_required_coverage(data_root: Path, requirement: DataRequirement) -> boo
 
 
 def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, str] | None:
+    try:
+        validate_dataset_component(symbol, name="symbol")
+        validate_dataset_component(timeframe, name="timeframe")
+    except ValueError:
+        return None
     ohlcv_root = data_root / "ohlcv"
-    matches = sorted(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(_contained_rglob(ohlcv_root, f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
         return None
 
@@ -751,10 +781,25 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     missing data and significant internal holes both report "failed" (Decision
     Record 2026-08-31), small holes warn.
     """
-    symbol_dir_candidates = sorted((data_root / "ohlcv").rglob(f"**/{requirement.symbol}"))
+    symbol = str(requirement.symbol or "").strip().upper()
     timeframe = normalize_timeframe(str(requirement.timeframe or "").strip())
+    try:
+        validate_dataset_component(symbol, name="symbol")
+        validate_dataset_component(timeframe, name="timeframe")
+    except ValueError as exc:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "status": "failed",
+            "gaps": [],
+            "failed_downloads": [],
+            "error": str(exc),
+        }
+    symbol_dir_candidates = sorted(
+        _contained_rglob(data_root / "ohlcv", f"**/{symbol}")
+    )
     gaps: list[dict[str, object]] = []
-    bounds = _coverage_for(data_root, requirement.symbol, timeframe)
+    bounds = _coverage_for(data_root, symbol, timeframe)
 
     for candidate in symbol_dir_candidates:
         gaps.extend(find_internal_gaps(candidate, timeframe))
@@ -764,7 +809,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     required_end: str | None = None
     if bounds is None:
         error = (
-            f"No {requirement.symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
+            f"No {symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
         )
     else:
         required_start = _normalize_coverage_date(requirement.start)
@@ -791,7 +836,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         status = "ok"
 
     report: dict[str, Any] = {
-        "symbol": requirement.symbol,
+        "symbol": symbol,
         "timeframe": timeframe,
         "status": status,
         "gaps": gaps,

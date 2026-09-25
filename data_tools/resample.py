@@ -5,9 +5,12 @@ Given M1 (or any source timeframe) data, generate M5, M15, M30, H1, H4, D1.
 OHLCV rules: Open=first, High=max, Low=min, Close=last, Volume=sum.
 
 Usage:
-    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1h.parquet --timeframes 4h,1d
-    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1m.parquet --timeframes 5m,15m,30m,1h,4h,1d
-    python -m data_tools.resample --source-dir ~/data/ohlcv/dukascopy/forex/ --from 1h --timeframes 4h,1d
+    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1h.parquet \
+        --timeframes 4h,1d
+    python -m data_tools.resample --source ~/data/ohlcv/dukascopy/forex/EURUSD/1m.parquet \
+        --timeframes 5m,15m,30m,1h,4h,1d
+    python -m data_tools.resample --source-dir ~/data/ohlcv/dukascopy/forex/ \
+        --from 1h --timeframes 4h,1d
 """
 
 from __future__ import annotations
@@ -18,6 +21,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_tools.path_safety import (
+    build_dataset_path,
+    ensure_dataset_path_within,
+    validate_dataset_component,
+)
 from shared.atomic_io import write_parquet_atomically
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -39,7 +47,12 @@ TIMEFRAME_MAP = {
 TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
 
-def _aggregation_for(columns: list[str]) -> dict[str, str]:
+def _sum_preserving_missing(values: pd.Series) -> float:
+    total = values.sum(min_count=1)
+    return float(total) if pd.notna(total) else float("nan")
+
+
+def _aggregation_for(columns: list[str]) -> dict[str, str | object]:
     """OHLCV aggregation with retention for extra columns (C5).
 
     Spread / bid_* / ask_* OHLCV siblings aggregate like their plain
@@ -50,12 +63,12 @@ def _aggregation_for(columns: list[str]) -> dict[str, str]:
     merged volume after resampling (a merged bucket is zero-volume only
     when every sub-bucket was).
     """
-    agg: dict[str, str] = {
+    agg: dict[str, str | object] = {
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
-        "volume": "sum",
+        "volume": _sum_preserving_missing,
     }
     for column in columns:
         if column in agg or column == "timestamp" or column == "zero_volume_bar":
@@ -198,7 +211,7 @@ def resample_file(
     results = []
 
     for tf in timeframes:
-        out_path = out_dir / f"{tf}.parquet"
+        out_path = build_dataset_path(out_dir, f"{tf}.parquet")
         resampled = resample_ohlcv(df, tf)
         if out_path.exists():
             resampled = merge_resampled_history(out_path, resampled)
@@ -209,12 +222,27 @@ def resample_file(
     return results
 
 
+def _path_is_contained(root: Path, path: Path) -> bool:
+    try:
+        ensure_dataset_path_within(root, path)
+    except ValueError:
+        return False
+    return True
+
+
 def resample_directory(source_dir: Path, from_tf: str, timeframes: list[str]) -> list[Path]:
     """Resample all parquet files in a directory tree.
 
     Finds all {from_tf}.parquet files under source_dir and resamples each.
     """
-    source_files = sorted(source_dir.rglob(f"{from_tf}.parquet"))
+    validate_dataset_component(from_tf, name="source timeframe")
+    for timeframe in timeframes:
+        validate_dataset_component(timeframe, name="target timeframe")
+    source_files = sorted(
+        path
+        for path in source_dir.rglob(f"{from_tf}.parquet")
+        if _path_is_contained(source_dir, path)
+    )
 
     if not source_files:
         logger.warning("No %s.parquet files found under %s", from_tf, source_dir)

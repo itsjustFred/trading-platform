@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import json
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
@@ -80,7 +82,9 @@ class ServiceScheduler:
                 service_type=ServiceType.SCHEDULED_JOB,
             )
 
-        scheduled_services = [service for service in services if service.type == ServiceType.SCHEDULED_JOB]
+        scheduled_services = [
+            service for service in services if service.type == ServiceType.SCHEDULED_JOB
+        ]
         desired_job_ids = {str(service.id) for service in scheduled_services}
 
         for service in scheduled_services:
@@ -116,7 +120,11 @@ class ServiceScheduler:
                 )
                 continue
 
-            signature = f"{cron_expr}|{job_type}"
+            job_config = dict(config)
+            signature = (
+                f"{cron_expr}|{job_type}|"
+                f"{json.dumps(job_config, sort_keys=True, default=str)}"
+            )
             if (
                 self._scheduler.get_job(service_id) is not None
                 and self._job_signatures.get(service_id) == signature
@@ -149,6 +157,7 @@ class ServiceScheduler:
                     "service_id": service_id,
                     "service_name": service.name,
                     "job_type": job_type,
+                    "config": job_config,
                 },
                 # B2: a 5-minute grace silently swallows outages (a missed
                 # run just vanishes into coalescing). One minute, and misses
@@ -179,6 +188,7 @@ class ServiceScheduler:
         service_id: str,
         service_name: str,
         job_type: str,
+        config: dict[str, Any] | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         # B2: microsecond suffix — two runs in the same second must not
@@ -188,6 +198,7 @@ class ServiceScheduler:
             "service_id": service_id,
             "service_name": service_name,
             "job_type": job_type,
+            "job_config": dict(config or {}),
             "started_at": now.isoformat(),
             "total_items": 1,
             "progress_percent": 5.0,
@@ -224,9 +235,27 @@ class ServiceScheduler:
 
         try:
             handler = _SCHEDULED_JOB_HANDLERS[job_type]
-            result = await handler(
-                task_id=task_id, service_id=service_id, service_name=service_name
-            )
+            handler_kwargs: dict[str, Any] = {
+                "task_id": task_id,
+                "service_id": service_id,
+                "service_name": service_name,
+            }
+            try:
+                parameters = inspect.signature(handler).parameters.values()
+                accepts_config = any(
+                    (
+                        parameter.name == "config"
+                        and parameter.kind
+                        in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+                    )
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+            except (TypeError, ValueError):
+                accepts_config = True
+            if accepts_config:
+                handler_kwargs["config"] = dict(config or {})
+            result = await handler(**handler_kwargs)
             finished = datetime.now(timezone.utc)
             # A handler may report a truthful non-success outcome (e.g.
             # "partial"/"skipped"/"failed" plus a result payload) by returning a

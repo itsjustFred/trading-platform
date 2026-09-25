@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
 from shared.database import upsert_background_task_record
 from shared.logging import get_logger
@@ -15,10 +16,19 @@ _HEALTH_CHECK_DESCRIPTION = (
 )
 
 
-HEALTH_CHECK_DESCRIPTION = "Validates signal processor registry and config files for ramjet, rocketfuel, and nitro bots."
+HEALTH_CHECK_DESCRIPTION = (
+    "Validates signal processor registry and config files for ramjet, "
+    "rocketfuel, and nitro bots."
+)
 
 
-async def run(*, task_id: str, service_id: str, service_name: str) -> None:
+async def run(
+    *,
+    task_id: str,
+    service_id: str,
+    service_name: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run signal bot health check and report status."""
     logger.info(
         "Signal bot health check started",
@@ -67,6 +77,12 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
                 extra={"data": {"service_id": service_id, "errors": errors}},
             )
 
+        result = {
+            "status": status,
+            "bots_checked": len(bot_results),
+            "overall_status": overall_status,
+            "errors": errors,
+        }
         await asyncio.to_thread(
             upsert_background_task_record,
             task_id=task_id,
@@ -78,6 +94,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
                 "bots_checked": len(bot_results),
                 "overall_status": overall_status,
                 "errors": errors,
+                "result": result,
             },
             progress_message=f"Signal bot health check: {overall_status}",
             name=f"{service_name} · Signal Bot Health Check",
@@ -85,6 +102,7 @@ async def run(*, task_id: str, service_id: str, service_name: str) -> None:
             source="scheduler",
             updated_at=datetime.now(timezone.utc).isoformat(),
         )
+        return result
 
     except Exception as exc:
         logger.exception(

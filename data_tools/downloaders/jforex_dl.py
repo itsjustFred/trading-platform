@@ -19,13 +19,13 @@ native base timeframe and resampling via data_tools.resample.resample_ohlcv.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import re
 import sys
 import time
 import xml.etree.ElementTree as ET
-import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +39,7 @@ import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG, _resolve_symbol_and_instrument
+from data_tools.path_safety import build_dataset_path
 from data_tools.resample import resample_ohlcv
 from shared.constants import DATA_DIR, normalize_timeframe
 
@@ -162,6 +163,17 @@ JFOREX_PERIOD_ATTR: dict[str, str] = {
     "1m": "ONE_MIN",
     "1h": "ONE_HOUR",
     "1d": "DAILY",
+}
+
+FILE_SUFFIX_ALIASES: dict[str, str] = {
+    "1m": "m1",
+    "5m": "m5",
+    "15m": "m15",
+    "30m": "m30",
+    "1h": "h1",
+    "4h": "h4",
+    "1d": "d1",
+    "1w": "w1",
 }
 
 
@@ -456,7 +468,7 @@ def _download_jforex_jars_from_jnlp(
         file_name = Path(urlparse(jar_url).path).name
         if not file_name.endswith(".jar"):
             continue
-        output_path = target_dir / file_name
+        output_path = build_dataset_path(target_dir, file_name)
         _fetch_jar_file(jar_url, output_path)
         # DV-B6b: the digest check runs on the artifact that actually ends up
         # on the classpath — also when the file was already cached on disk
@@ -485,7 +497,9 @@ def _resolve_jforex_classpath() -> list[str]:
 def _resolve_jforex_classpath_details() -> tuple[list[str], str]:
     explicit = os.getenv("JFOREX_CLASSPATH") or os.getenv("JFOREX_JARS")
     if explicit:
-        return [entry.strip() for entry in explicit.split(os.pathsep) if entry.strip()], "explicit env"
+        return [
+            entry.strip() for entry in explicit.split(os.pathsep) if entry.strip()
+        ], "explicit env"
 
     repo_root = Path(__file__).resolve().parents[2]
     home_env = os.getenv("JFOREX_HOME")
@@ -801,9 +815,13 @@ def _resolve_java_instrument(symbol: str) -> tuple[str, str, Any]:
     try:
         from com.dukascopy.api import Instrument
     except _java_exception_types() as exc:
-        _raise_jforex_runtime_error("JForex SDK import failed for com.dukascopy.api.Instrument", exc)
+        _raise_jforex_runtime_error(
+            "JForex SDK import failed for com.dukascopy.api.Instrument", exc
+        )
     except Exception as exc:  # noqa: BLE001
-        _raise_jforex_runtime_error("JForex SDK import failed for com.dukascopy.api.Instrument", exc)
+        _raise_jforex_runtime_error(
+            "JForex SDK import failed for com.dukascopy.api.Instrument", exc
+        )
 
     normalized_symbol, instrument_key, asset_class = _resolve_symbol_and_instrument(symbol)
     candidates = [
@@ -945,7 +963,9 @@ def _collect_jforex_rows(
     return rows
 
 
-def _await_jforex_connection(client: Any, state: QueryState, *, deadline_seconds: float = 30) -> None:
+def _await_jforex_connection(
+    client: Any, state: QueryState, *, deadline_seconds: float = 30
+) -> None:
     connect_deadline = time.monotonic() + deadline_seconds
     while time.monotonic() < connect_deadline:
         if state.connected.is_set() or bool(client.isConnected()):
@@ -1038,7 +1058,10 @@ def _run_jforex_query_session(
                 try:
                     context.stop()
                 except _java_exception_types():
-                    logger.debug("JForex strategy context.stop() raised Java exception", exc_info=True)
+                    logger.debug(
+                        "JForex strategy context.stop() raised Java exception",
+                        exc_info=True,
+                    )
                 except Exception:  # noqa: BLE001
                     logger.debug("JForex strategy context.stop() raised exception", exc_info=True)
 
@@ -1201,9 +1224,8 @@ def _normalize_offer_side(value: str | None) -> str:
 
 
 def _normalize_timeframe_for_file_suffix(timeframe: str) -> str:
-    return timeframe.replace("1m", "m1").replace("5m", "m5").replace("15m", "m15").replace(
-        "30m", "m30"
-    ).replace("1h", "h1").replace("4h", "h4").replace("1d", "d1").replace("1w", "w1")
+    normalized = str(timeframe or "").strip().lower()
+    return FILE_SUFFIX_ALIASES.get(normalized, normalized)
 
 
 def _bars_with_offer_prefix(df: pd.DataFrame, offer_side: str) -> pd.DataFrame:
@@ -1320,7 +1342,9 @@ class JForexDownloader(Downloader):
         target_tf = _normalize_timeframe(timeframe)
         base_tf = BASE_TIMEFRAME_MAP[target_tf]
 
-        offer_side = _normalize_offer_side(kwargs.get("offer_side", kwargs.get("price_type", "bid")))
+        offer_side = _normalize_offer_side(
+            kwargs.get("offer_side", kwargs.get("price_type", "bid"))
+        )
         if offer_side == "both" and target_tf == "tick":
             raise ValueError("offer_side='both' is not supported for timeframe 'tick' with JForex")
 

@@ -18,7 +18,8 @@ from typing import Any
 
 import pandas as pd
 
-from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from data_tools.path_safety import build_dataset_path
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,15 @@ class HuggingFaceDownloader(Downloader):
         ]
 
     def _make_us_equity_output_path(self, output_dir: Path, symbol: str, timeframe: str) -> Path:
-        path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
+        path = build_dataset_path(
+            output_dir,
+            "ohlcv",
+            self.source_name,
+            "equity",
+            "US",
+            symbol,
+            f"{timeframe}.parquet",
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -179,7 +188,7 @@ class HuggingFaceDownloader(Downloader):
             return pd.DataFrame()
 
         if "volume" not in working.columns:
-            working["volume"] = 0
+            working["volume"] = float("nan")
 
         working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
         for column in ("open", "high", "low", "close", "volume"):
@@ -245,7 +254,8 @@ class HuggingFaceDownloader(Downloader):
 
         if parsed_start > parsed_end:
             raise ValueError(
-                f"Requested range is outside HuggingFace coverage ({DEFAULT_START_DATE} → {HF_COVERAGE_END})."
+                "Requested range is outside HuggingFace coverage "
+                f"({DEFAULT_START_DATE} → {HF_COVERAGE_END})."
             )
 
         months = _month_sequence(parsed_start, parsed_end)
@@ -285,7 +295,8 @@ class HuggingFaceDownloader(Downloader):
 
         if not monthly_frames:
             raise RuntimeError(
-                f"No {normalized_symbol} rows found in {DATASET_ID} for {parsed_start.date()} → {parsed_end.date()}."
+                f"No {normalized_symbol} rows found in {DATASET_ID} for "
+                f"{parsed_start.date()} → {parsed_end.date()}."
             )
 
         combined_months = (
@@ -329,7 +340,9 @@ class HuggingFaceDownloader(Downloader):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download OHLCV data from HuggingFace monthly parquet files")
+    parser = argparse.ArgumentParser(
+        description="Download OHLCV data from HuggingFace monthly parquet files"
+    )
     parser.add_argument("--symbols", required=True, help="Comma-separated symbols (e.g. AAPL,MSFT)")
     parser.add_argument(
         "--timeframes",
@@ -348,7 +361,8 @@ def main() -> None:
     if args.list:
         for item in downloader.list_available():
             print(
-                f"{item['dataset']} | {item['description']} | tf={','.join(item['timeframes'])} | end={item['coverage_end']}"
+                f"{item['dataset']} | {item['description']} | "
+                f"tf={','.join(item['timeframes'])} | end={item['coverage_end']}"
             )
         return
 
@@ -372,7 +386,10 @@ def main() -> None:
                     end=args.end or None,
                 )
                 warning_suffix = f" warnings={len(result.warnings)}" if result.warnings else ""
-                print(f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → {result.path}{warning_suffix}")
+                print(
+                    f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → "
+                    f"{result.path}{warning_suffix}"
+                )
                 for warning in result.warnings:
                     print(f"⚠️  {warning}")
             except Exception as exc:

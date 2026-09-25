@@ -1,8 +1,6 @@
 """Tests for signal bot health check scheduler job."""
 import asyncio
-from unittest.mock import patch, MagicMock
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from scheduler.jobs.signal_bot_health_check import run
 
@@ -31,8 +29,13 @@ def test_signal_bot_health_check_job_runs_successfully() -> None:
             ) as mock_upsert:
                 mock_upsert.return_value = MagicMock()
 
-                await run(task_id="test-task-1", service_id="svc-1", service_name="test-service")
+                result = await run(
+                    task_id="test-task-1",
+                    service_id="svc-1",
+                    service_name="test-service",
+                )
 
+                assert result["status"] == "completed"
                 assert mock_check.called
                 assert mock_upsert.call_count >= 2
 
@@ -57,8 +60,13 @@ def test_signal_bot_health_check_job_detects_errors() -> None:
             ) as mock_upsert:
                 mock_upsert.return_value = MagicMock()
 
-                await run(task_id="test-task-2", service_id="svc-2", service_name="test-service")
+                result = await run(
+                    task_id="test-task-2",
+                    service_id="svc-2",
+                    service_name="test-service",
+                )
 
+                assert result["status"] == "failed"
                 assert mock_check.called
                 assert mock_upsert.call_count >= 2
 

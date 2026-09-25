@@ -30,7 +30,6 @@ def _hourly_payload(start: str, hours: int) -> pd.DataFrame:
 
 def _normalized_hourly(start: str, hours: int) -> pd.DataFrame:
     """Payload as it looks after the downloader's normalization step."""
-    from data_tools.downloaders import yfinance_dl
 
     payload = _hourly_payload(start, hours).reset_index()
     payload.columns = [str(col).strip().lower() for col in payload.columns]
@@ -160,6 +159,17 @@ def test_download_non_4h_timeframes_keep_native_buckets(monkeypatch, tmp_path: P
     stored = pd.read_parquet(result.path)
     assert list(stored["timestamp"].dt.hour) == [1, 2, 3]
     assert "source_bucket_timeframe" not in stored.columns
+
+
+def test_resample_4h_preserves_unavailable_volume_as_missing():
+    from data_tools.downloaders import yfinance_dl
+
+    payload = _normalized_hourly("2024-03-04T01:00:00Z", 7)
+    payload["volume"] = float("nan")
+
+    resampled, _ = yfinance_dl._resample_4h_utc_grid(payload)
+
+    assert resampled["volume"].isna().all()
 
 
 def test_resample_4h_utc_grid_rejects_naive_timestamps():

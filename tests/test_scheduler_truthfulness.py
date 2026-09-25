@@ -156,6 +156,63 @@ def test_weekly_refresh_writes_skipped_task_record(tmp_path: Path) -> None:
     assert any("offline" in message.lower() for message in messages)
 
 
+def test_weekly_refresh_rejects_unsafe_config_before_download(tmp_path: Path) -> None:
+    from scheduler.jobs import weekly_data_refresh
+
+    with patch.object(weekly_data_refresh, "upsert_background_task_record"), patch.object(
+        weekly_data_refresh,
+        "ensure_backtest_data",
+        side_effect=AssertionError("unsafe config must not download"),
+    ) as download:
+        result = asyncio.run(
+            weekly_data_refresh.run(
+                task_id="task-config",
+                service_id="svc-config",
+                service_name="Weekly Data Refresh",
+                config={"symbols": ["../escape"], "timeframes": ["1h"]},
+            )
+        )
+
+    assert result["status"] == "failed"
+    assert not download.called
+
+
+def test_weekly_refresh_continues_after_unexpected_symbol_error(tmp_path: Path) -> None:
+    from scheduler.jobs import weekly_data_refresh
+
+    calls: list[str] = []
+    fresh = {"AAPL": False, "MSFT": False}
+
+    def fake_download(*, symbols, **_kwargs):
+        calls.append(symbols[0])
+        if symbols[0] == "AAPL":
+            raise KeyError("unexpected unit failure")
+        fresh["MSFT"] = True
+        return []
+
+    with patch.object(weekly_data_refresh, "upsert_background_task_record"), patch.object(
+        weekly_data_refresh,
+        "has_ohlcv_bars_in_range",
+        side_effect=lambda *, symbol, **_kwargs: fresh[symbol],
+    ), patch.object(
+        weekly_data_refresh,
+        "ensure_backtest_data",
+        side_effect=fake_download,
+    ):
+        result = asyncio.run(
+            weekly_data_refresh.run(
+                task_id="task-continue",
+                service_id="svc-continue",
+                service_name="Weekly Data Refresh",
+                config={"symbols": ["AAPL", "MSFT"], "timeframes": ["1h"]},
+            )
+        )
+
+    assert calls == ["AAPL", "MSFT"]
+    assert result["refreshed"] == ["MSFT"]
+    assert any("KeyError" in error for error in result["errors"])
+
+
 def test_signal_bot_health_check_handler_is_registered() -> None:
     """The signal-bot health-check job must be registered with the scheduler."""
     from scheduler.scheduler import _SCHEDULED_JOB_HANDLERS

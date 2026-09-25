@@ -30,6 +30,7 @@ from data_tools.downloaders.dukascopy_native import (
     generate_minute_urls,
     generate_tick_urls,
 )
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -335,8 +336,10 @@ def _find_start_day(
             ):
                 return day
         raise RuntimeError(
-            f"Could not determine a Dukascopy start day for {symbol} in {year}-{month:02d} ({timeframe})"
+            f"Could not determine a Dukascopy start day for {symbol} in "
+            f"{year}-{month:02d} ({timeframe})"
         )
+
 
     earliest = candidate
     for day in range(candidate - 1, 0, -1):
@@ -477,7 +480,7 @@ def save_genesis_index(results: dict[str, dict[str, str]], output_path: Path) ->
         str(symbol).upper(): dict(sorted((data or {}).items()))
         for symbol, data in sorted(results.items())
     }
-    output_path.write_text(json.dumps(normalized, indent=2, sort_keys=True))
+    write_text_atomically(output_path, json.dumps(normalized, indent=2, sort_keys=True))
 
 
 def main() -> None:
@@ -571,7 +574,8 @@ def main() -> None:
                 ref = REFERENCE_GENESIS.get(normalized_symbol, {}).get(timeframe)
                 if ref and genesis != ref:
                     print(
-                        f"⚠️  {normalized_symbol} {timeframe}: discovered {genesis}, reference expects {ref}"
+                        f"⚠️  {normalized_symbol} {timeframe}: discovered {genesis}, "
+                        f"reference expects {ref}"
                     )
                 print(f"✅ {normalized_symbol} {timeframe}: {genesis}")
             except Exception as exc:

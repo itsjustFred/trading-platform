@@ -23,7 +23,8 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
-from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from data_tools.path_safety import build_dataset_path
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,11 @@ def _to_utc_timestamp(value: str | None) -> pd.Timestamp | None:
     return pd.Timestamp(ts)
 
 
+def _sum_preserving_missing(values: pd.Series) -> float:
+    total = values.sum(min_count=1)
+    return float(total) if pd.notna(total) else float("nan")
+
+
 def _resample_4h_utc_grid(
     df: pd.DataFrame, source_bucket: str = "60m"
 ) -> tuple[pd.DataFrame, str]:
@@ -125,7 +131,7 @@ def _resample_4h_utc_grid(
                 "high": "max",
                 "low": "min",
                 "close": "last",
-                "volume": "sum",
+                "volume": _sum_preserving_missing,
             }
         )
         .dropna(subset=["open", "high", "low", "close"])
@@ -193,7 +199,15 @@ class YFinanceDownloader(Downloader):
         symbol: str,
         timeframe: str,
     ) -> Path:
-        path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
+        path = build_dataset_path(
+            output_dir,
+            "ohlcv",
+            self.source_name,
+            "equity",
+            "US",
+            symbol,
+            f"{timeframe}.parquet",
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -225,6 +239,12 @@ class YFinanceDownloader(Downloader):
             start=parsed_start,
             end=parsed_end,
         )
+        if parsed_start is not None and bounded_start is not None and bounded_start > parsed_start:
+            raise RuntimeError(
+                f"yfinance cannot return the requested {canonical_tf} window from "
+                f"{parsed_start.date()} to {bounded_end.date()}; refusing to publish "
+                "a clipped intraday dataset"
+            )
         resolved_start = (
             bounded_start.strftime("%Y-%m-%d")
             if bounded_start is not None
@@ -238,7 +258,20 @@ class YFinanceDownloader(Downloader):
                 end=bounded_end,
             )
             warnings.extend(resume_warnings)
-            resolved_start = adjusted_resume.strftime("%Y-%m-%d") if adjusted_resume is not None else ""
+            if (
+                resume_start is not None
+                and adjusted_resume is not None
+                and adjusted_resume > resume_start
+            ):
+                raise RuntimeError(
+                    f"yfinance cannot resume the requested {canonical_tf} window from "
+                    f"{resume_start.date()}; refusing to publish a clipped intraday dataset"
+                )
+            resolved_start = (
+                adjusted_resume.strftime("%Y-%m-%d")
+                if adjusted_resume is not None
+                else ""
+            )
         resolved_end = bounded_end.strftime("%Y-%m-%d")
 
         logger.info(
@@ -266,7 +299,8 @@ class YFinanceDownloader(Downloader):
         )
         if df is None or df.empty:
             raise RuntimeError(
-                f"No yfinance data returned for {normalized_symbol} ({canonical_tf}) in requested range."
+                f"No yfinance data returned for {normalized_symbol} ({canonical_tf}) "
+                "in requested range."
             )
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -294,8 +328,10 @@ class YFinanceDownloader(Downloader):
                 rename_map[key.capitalize()] = key
         df = df.rename(columns=rename_map)
 
-        keep = [column for column in ("timestamp", "open", "high", "low", "close", "volume") if column in df.columns]
-        if "timestamp" not in keep or "open" not in keep:
+        if "volume" not in df.columns:
+            df["volume"] = float("nan")
+        keep = ["timestamp", "open", "high", "low", "close", "volume"]
+        if "timestamp" not in df.columns or "open" not in df.columns:
             raise RuntimeError("yfinance payload missing required OHLCV columns")
         df = df[keep]
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -307,7 +343,10 @@ class YFinanceDownloader(Downloader):
         df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
         df = df.sort_values("timestamp").reset_index(drop=True)
         if df.empty:
-            raise RuntimeError(f"yfinance returned only empty/NaN rows for {normalized_symbol} ({canonical_tf})")
+            raise RuntimeError(
+                f"yfinance returned only empty/NaN rows for {normalized_symbol} "
+                f"({canonical_tf})"
+            )
 
         if canonical_tf == "4h":
             df, bucket_origin = _resample_4h_utc_grid(df, source_bucket=yf_interval)
@@ -322,11 +361,7 @@ class YFinanceDownloader(Downloader):
         combined = self._merge_and_store_single_file(out_path, df)
         # C5: a clipped intraday window is an explicit artifact, not just a
         # warning — downstream coverage sees the truncation.
-        truncated = bool(
-            parsed_start is not None
-            and bounded_start is not None
-            and bounded_start > parsed_start
-        )
+        truncated = False
         return DownloadResult(
             symbol=normalized_symbol,
             timeframe=canonical_tf,
@@ -393,7 +428,8 @@ def main() -> None:
                 )
                 warning_suffix = f" warnings={len(result.warnings)}" if result.warnings else ""
                 print(
-                    f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → {result.path}{warning_suffix}"
+                    f"✅ {result.symbol} {result.timeframe}: {result.rows} rows → "
+                    f"{result.path}{warning_suffix}"
                 )
                 for warning in result.warnings:
                     print(f"⚠️  {warning}")
