@@ -15,6 +15,7 @@ from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
     closed_positions,
+    entry_side_scope,
     group_position_fills,
     position_fill_summary,
 )
@@ -564,6 +565,12 @@ class MT5HTMLImporter(BaseImporter):
                 MT5HTMLImporter._get_str(row, col_typ, "").lower() != "balance"
             ),
             quantity_of=_row_quantity,
+            scope_of=lambda row: entry_side_scope(
+                row,
+                lambda item: MT5HTMLImporter._get_str(item, col_symbol, ""),
+                lambda item: MT5HTMLImporter._get_str(item, col_typ, ""),
+                _row_direction,
+            ),
         )
 
         trades: list[Trade] = []

@@ -257,6 +257,15 @@ def _base_result(tmp_path: Path):
     return BacktestResult(meta=meta, trades=[])
 
 
+def test_runtime_config_accepts_zero_risk_sizing(tmp_path: Path):
+    result = _base_result(tmp_path)
+    result.meta.risk_per_trade_pct = 0.0
+
+    runtime = optimizer_module._runtime_config_from_base_result(result)
+
+    assert runtime["risk_per_trade_pct"] == 0.0
+
+
 # ─── Mutation hardening: penalty margin + empty-study guard ─────────────────
 
 

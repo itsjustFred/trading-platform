@@ -11,6 +11,10 @@ import pandas as pd
 
 from shared.models import BacktestResult, EquityPoint, Trade
 
+MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
+MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
+MIN_PRESERVED_DAY_COVERAGE = 0.5
+
 
 def _parse_ts(value: str | None) -> datetime | None:
     """Parse an ISO-ish timestamp; None when it cannot be understood."""
@@ -120,15 +124,62 @@ def _preserves_engine_curve(
     if len(preserved_curve or ()) < 2 or not daily_points:
         return False
     try:
-        preserved_end = pd.to_datetime(
-            preserved_curve[-1].time, utc=True, errors="coerce"
+        preserved_index = pd.DatetimeIndex(
+            pd.to_datetime(
+                [point.time for point in preserved_curve],
+                utc=True,
+                errors="coerce",
+                format="mixed",
+            )
         )
-        daily_end = pd.to_datetime(daily_points[-1].time, utc=True, errors="coerce")
+        daily_index = pd.DatetimeIndex(
+            pd.to_datetime(
+                [point.time for point in daily_points],
+                utc=True,
+                errors="coerce",
+                format="mixed",
+            )
+        )
+        preserved_values = pd.Series(
+            pd.to_numeric(
+                [point.equity for point in preserved_curve], errors="coerce"
+            ),
+            dtype=float,
+        )
+        daily_final = float(daily_points[-1].equity)
+        preserved_final = float(preserved_values.iloc[-1])
     except (TypeError, ValueError, OverflowError):
         return False
-    if pd.isna(preserved_end) or pd.isna(daily_end):
+    if (
+        preserved_index.hasnans
+        or daily_index.hasnans
+        or preserved_values.isna().any()
+        or not all(math.isfinite(float(value)) for value in preserved_values)
+        or not math.isfinite(preserved_final)
+        or not math.isfinite(daily_final)
+    ):
         return False
-    return preserved_end.date() >= daily_end.date()
+    if not preserved_index.is_monotonic_increasing or preserved_index.has_duplicates:
+        return False
+    preserved_start = preserved_index[0].normalize()
+    daily_start = daily_index[0].normalize()
+    preserved_end = preserved_index[-1].normalize()
+    daily_end = daily_index[-1].normalize()
+    if preserved_start < daily_start or preserved_end > daily_end:
+        return False
+    if preserved_start - daily_start > MAX_PRESERVED_BOUNDARY_GAP:
+        return False
+    if daily_end - preserved_end > MAX_PRESERVED_BOUNDARY_GAP:
+        return False
+    preserved_days = preserved_index.normalize().nunique()
+    daily_days = daily_index.normalize().nunique()
+    if preserved_days / max(daily_days, 1) < MIN_PRESERVED_DAY_COVERAGE:
+        return False
+    gaps = preserved_index.to_series().diff().dropna()
+    if gaps.empty or gaps.max() > MAX_PRESERVED_CURVE_GAP:
+        return False
+    tolerance = max(0.01, abs(daily_final) * 1e-9)
+    return abs(preserved_final - daily_final) <= tolerance
 
 
 def _curve_frequency(points: list[EquityPoint]) -> str:

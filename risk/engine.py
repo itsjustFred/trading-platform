@@ -311,7 +311,9 @@ class RiskEngine:
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
-            risk_distance = abs(signal.entry_price - stop_loss)
+            risk_distance: float | None = abs(signal.entry_price - stop_loss)
+            if risk_distance <= 0 or not math.isfinite(risk_distance):
+                risk_distance = None
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,

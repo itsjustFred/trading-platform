@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 from shared.models import VALID_DIRECTIONS
+from validation.importers._pairing import group_position_fills
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
 
@@ -447,6 +448,18 @@ class TestOrphanOutDeal:
 
 
 class TestPositionFillClassification:
+    def test_unhashable_pairing_scope_is_rejected(self):
+        rows = [{"id": 1, "direction": "in", "quantity": 1.0}]
+
+        with pytest.raises(TypeError, match="scope must be hashable"):
+            group_position_fills(
+                rows,
+                position_id_of=lambda row: str(row["id"]),
+                direction_of=lambda row: row["direction"],
+                is_trade_row=lambda _row: True,
+                scope_of=lambda _row: {"symbol": "AAPL"},
+            )
+
     def test_partial_open_and_orphan_fills_are_evidence_only(self):
         deals = pd.DataFrame(
             [
@@ -465,6 +478,74 @@ class TestPositionFillClassification:
         assert evidence["orphan_exit_count"] == 1
         assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
         assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)
+
+    def test_interleaved_symbols_and_entry_sides_preserve_partial_pairing(self):
+        columns = [
+            "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
+            "Auftrag", "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar",
+        ]
+        deals = pd.DataFrame(
+            [
+                ["2024.01.01 08:00:00", 1, "AAPL", "buy", "in", "0.10", 100.0,
+                 901, 0, 0, 0, 100000, "Entry"],
+                ["2024.01.01 09:00:00", 2, "MSFT", "sell", "in", "0.20", 200.0,
+                 902, 0, 0, 0, 100000, "Entry"],
+                ["2024.01.02 08:00:00", 3, "MSFT", "buy", "out", "0.04", 190.0,
+                 903, 0, 0, -40, 99960, "Partial"],
+                ["2024.01.02 09:00:00", 4, "MSFT", "buy", "out", "0.16", 190.0,
+                 904, 0, 0, -160, 99800, "Close"],
+                ["2024.01.03 08:00:00", 5, "AAPL", "sell", "out", "0.04", 110.0,
+                 905, 0, 0, 40, 99840, "Partial"],
+                ["2024.01.03 09:00:00", 6, "AAPL", "sell", "out", "0.06", 110.0,
+                 906, 0, 0, 60, 99900, "Close"],
+            ],
+            columns=columns,
+        )
+
+        trades, evidence = MT5XLSXImporter._build_trades(deals, {})
+
+        assert [(trade.symbol, trade.direction) for trade in trades] == [
+            ("AAPL", "LONG"),
+            ("MSFT", "SHORT"),
+        ]
+        assert [leg.time for leg in trades[0].exits] == [
+            "2024-01-03T08:00:00Z",
+            "2024-01-03T09:00:00Z",
+        ]
+        assert [leg.time for leg in trades[1].exits] == [
+            "2024-01-02T08:00:00Z",
+            "2024-01-02T09:00:00Z",
+        ]
+        assert evidence["closed_position_count"] == 2
+        assert evidence["residual_position_count"] == 0
+
+    def test_shared_position_ids_are_scoped_by_symbol(self):
+        columns = [
+            "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
+            "Auftrag", "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar",
+        ]
+        deals = pd.DataFrame(
+            [
+                ["2024.01.01 08:00:00", 7, "AAPL", "buy", "in", "0.10", 100.0,
+                 901, 0, 0, 0, 100000, "Entry"],
+                ["2024.01.01 09:00:00", 7, "MSFT", "sell", "in", "0.20", 200.0,
+                 902, 0, 0, 0, 100000, "Entry"],
+                ["2024.01.01 10:00:00", 7, "AAPL", "sell", "out", "0.10", 110.0,
+                 903, 0, 0, 10, 100010, "Close"],
+                ["2024.01.01 11:00:00", 7, "MSFT", "buy", "out", "0.20", 190.0,
+                 904, 0, 0, -20, 99990, "Close"],
+            ],
+            columns=columns,
+        )
+
+        trades, evidence = MT5XLSXImporter._build_trades(deals, {})
+
+        assert [(trade.symbol, trade.quantity) for trade in trades] == [
+            ("AAPL", pytest.approx(0.10)),
+            ("MSFT", pytest.approx(0.20)),
+        ]
+        assert evidence["closed_position_count"] == 2
+        assert evidence["orphan_exit_count"] == 0
 
 
 class TestTotalReturnFraction:

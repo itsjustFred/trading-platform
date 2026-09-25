@@ -309,6 +309,31 @@ def test_calculate_position_size_blocks_stop_on_wrong_side():
     assert sized.decision.stop_price_used == pytest.approx(102.0)
 
 
+def test_calculate_position_size_zero_distance_wrong_side_returns_rejection():
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=100.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = RiskEngine().calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.risk_distance is None
+
+
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
     engine = RiskEngine(
         RiskConfig(

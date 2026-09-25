@@ -60,7 +60,7 @@ def compute_stats(
     if not math.isfinite(float(risk_free_rate)):
         raise ValueError("risk_free_rate must be finite")
     if not trades and not equity_curve:
-        return _empty_stats()
+        return _empty_stats(risk_free_rate)
 
     if trades:
         # #84: net-based stats — gross t.pnl ignores fees and flatters every
@@ -256,6 +256,7 @@ def compute_stats(
         psr=round(float(psr), 4) if psr is not None else None,
         p_value=round(float(p_value), 6),
         extras={
+            "risk_free_rate": float(risk_free_rate),
             "undefined_metrics": sorted(undefined_metrics),
             "equity_return_frequency": return_frequency,
             "duplicate_equity_timestamps": duplicate_timestamp_count,
@@ -543,9 +544,10 @@ def _duplicate_timestamp_count(equity_curve: list[EquityPoint]) -> int:
     return int(valid.duplicated(keep="first").sum())
 
 
-def _empty_stats() -> dict[str, Any]:
+def _empty_stats(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, Any]:
     return BacktestStats(
         extras={
+            "risk_free_rate": float(risk_free_rate),
             "undefined_metrics": [
                 "max_drawdown_pct",
                 "max_drawdown_duration",

@@ -7,6 +7,8 @@ import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,8 +39,6 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 # Thresholds deliberately count calendar days, not business days (the parent
 # record states the fail threshold in calendar days): a regular FX weekend
 # (~2 days) therefore warns, and only holes beyond 3 calendar days fail.
-# Per-source overrides (crypto, holidays) are an explicit open item of the
-# parent issue and are intentionally not implemented here.
 INTERNAL_GAP_FAIL_DAYS = 3
 INTERNAL_GAP_WARN_DAYS = 1
 
@@ -47,8 +47,7 @@ INTERNAL_GAP_WARN_DAYS = 1
 # Sundays excluded — no venue in this repo prints Sat bars, so wall-clock
 # counting would reject every multi-week segment); >=95% of expected bars
 # must be present and no single bar-to-bar gap may exceed 3x the timeframe
-# in trading minutes, regardless of density. Exchange holidays are NOT
-# skipped (no calendar wired) — the gate stays fail-closed there by design.
+# in trading minutes, regardless of density.
 TIMEFRAME_MINUTES: dict[str, float] = {
     "1m": 1.0,
     "5m": 5.0,
@@ -61,6 +60,76 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 }
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
+US_EQUITY_ASSET_CLASSES = frozenset(
+    {"equity", "stock", "stocks", "etf", "index"}
+)
+US_EQUITY_CALENDAR_SOURCES = frozenset(
+    {"alpaca", "dolthub", "huggingface", "test", "yfinance"}
+)
+
+
+@lru_cache(maxsize=None)
+def _nyse_holidays(year: int) -> frozenset[str]:
+    def observed(month: int, day: int) -> date:
+        day_date = date(year, month, day)
+        if day_date.weekday() == 5 and (month, day) != (1, 1):
+            return day_date - timedelta(days=1)
+        if day_date.weekday() == 6:
+            return day_date + timedelta(days=1)
+        return day_date
+
+    def nth_weekday(month: int, weekday: int, occurrence: int) -> date:
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+    def last_weekday(month: int, weekday: int) -> date:
+        probe = (
+            date(year + 1, 1, 1) - timedelta(days=1)
+            if month == 12
+            else date(year, month + 1, 1) - timedelta(days=1)
+        )
+        offset = (probe.weekday() - weekday) % 7
+        return probe - timedelta(days=offset)
+
+    easter = _easter_sunday(year)
+    holidays = {
+        observed(1, 1),
+        nth_weekday(1, 0, 3),
+        nth_weekday(2, 0, 3),
+        last_weekday(5, 0),
+        observed(7, 4),
+        nth_weekday(9, 0, 1),
+        nth_weekday(11, 3, 4),
+        observed(12, 25),
+        date(year, *easter) - timedelta(days=2),
+    }
+    if year >= 2022:
+        holidays.add(observed(6, 19))
+    return frozenset(day.isoformat() for day in holidays)
+
+
+def _easter_sunday(year: int) -> tuple[int, int]:
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    weekday_correction = (32 + 2 * e + 2 * i - h - k) % 7
+    month_adjustment = (a + 11 * h + 22 * weekday_correction) // 451
+    month = (h + weekday_correction - 7 * month_adjustment + 114) // 31
+    day = ((h + weekday_correction - 7 * month_adjustment + 114) % 31) + 1
+    return month, day
+
+
+def is_us_equity_holiday(value: object) -> bool:
+    day = pd.Timestamp(value).date()
+    return any(
+        day.isoformat() in _nyse_holidays(adjacent_year)
+        for adjacent_year in (day.year - 1, day.year, day.year + 1)
+    )
 
 
 def _weekend_overlap_minutes(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
@@ -79,17 +148,46 @@ def _weekend_overlap_minutes(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> fl
     return total
 
 
-def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
+def _holiday_overlap_minutes(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    holidays: frozenset[date],
+) -> float:
+    if end_ts <= start_ts:
+        return 0.0
+    total = 0.0
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5 and cursor.date() in holidays:
+            day_start = max(start_ts, cursor)
+            day_end = min(end_ts, cursor + pd.Timedelta(days=1))
+            if day_end > day_start:
+                total += (day_end - day_start).total_seconds() / 60.0
+        cursor += pd.Timedelta(days=1)
+    return total
+
+
+def _trading_minutes_between(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    holidays: frozenset[date] = frozenset(),
+) -> float:
     """Wall-clock minutes minus full-weekend overlap (CodeRabbit round)."""
     total = max((end_ts - start_ts).total_seconds() / 60.0, 0.0)
-    return max(total - _weekend_overlap_minutes(start_ts, end_ts), 0.0)
+    weekend = _weekend_overlap_minutes(start_ts, end_ts)
+    holiday = _holiday_overlap_minutes(start_ts, end_ts, holidays)
+    return max(total - weekend - holiday, 0.0)
 
 
-def _is_trading_instant(ts: pd.Timestamp, step_minutes: float) -> bool:
+def _is_trading_instant(
+    ts: pd.Timestamp,
+    step_minutes: float,
+    holidays: frozenset[date] = frozenset(),
+) -> bool:
     """Whether a bar grid instant falls in trading time."""
     if step_minutes >= 10080.0:
         return True
-    return ts.weekday() < 5
+    return ts.weekday() < 5 and ts.date() not in holidays
 
 
 def _parse_session_clock(value: object) -> int:
@@ -199,6 +297,7 @@ def _session_trading_minutes_between(
     start_ts: pd.Timestamp,
     end_ts: pd.Timestamp,
     session_window: tuple[int, int],
+    holidays: frozenset[date] = frozenset(),
 ) -> float:
     if end_ts <= start_ts:
         return 0.0
@@ -206,7 +305,7 @@ def _session_trading_minutes_between(
     total = 0.0
     cursor = start_ts.normalize()
     while cursor <= end_ts.normalize():
-        if cursor.weekday() < 5:
+        if cursor.weekday() < 5 and cursor.date() not in holidays:
             session_start = cursor + pd.Timedelta(minutes=start_minutes)
             session_end = cursor + pd.Timedelta(minutes=end_minutes)
             overlap_start = max(start_ts, session_start)
@@ -222,6 +321,7 @@ def _expected_trading_bars(
     end_ts: pd.Timestamp,
     step_minutes: float,
     session_window: tuple[int, int] | None = None,
+    holidays: frozenset[date] = frozenset(),
 ) -> int:
     """Count expected bars on the venue/session grid when it is known."""
     if step_minutes <= 0:
@@ -232,13 +332,17 @@ def _expected_trading_bars(
         return sum(
             1
             for k in range(steps + 1)
-            if _is_trading_instant(start_ts + pd.Timedelta(minutes=k * step_minutes), step_minutes)
+            if _is_trading_instant(
+                start_ts + pd.Timedelta(minutes=k * step_minutes),
+                step_minutes,
+                holidays,
+            )
         )
     start_minutes, end_minutes = session_window
     count = 0
     cursor = start_ts.normalize()
     while cursor <= end_ts.normalize():
-        if cursor.weekday() < 5:
+        if cursor.weekday() < 5 and cursor.date() not in holidays:
             day_start = cursor + pd.Timedelta(minutes=start_minutes)
             day_end = cursor + pd.Timedelta(minutes=end_minutes)
             first = max(start_ts, day_start)
@@ -733,6 +837,71 @@ def _segment_timestamps_in_range(
     return sorted(stamps)
 
 
+def _segment_venue_metadata(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+) -> tuple[set[str], set[str]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    matches = _contained_rglob(
+        ohlcv_root,
+        f"**/{normalized_timeframe}.parquet",
+    )
+    asset_classes: set[str] = set()
+    sources: set[str] = set()
+    for path in matches:
+        if path.parent.name.upper() != normalized_symbol:
+            continue
+        parts = path.relative_to(ohlcv_root).parts
+        if len(parts) >= 4:
+            sources.add(parts[0].lower())
+            asset_classes.add(parts[1].lower())
+    return asset_classes, sources
+
+
+def _uses_us_equity_calendar(
+    symbol: str,
+    timeframe: str = "",
+    data_dir: str | Path = "",
+) -> bool:
+    asset_classes, sources = _segment_venue_metadata(symbol, timeframe, data_dir)
+    if asset_classes and sources:
+        return asset_classes.issubset(US_EQUITY_ASSET_CLASSES) and sources.issubset(
+            US_EQUITY_CALENDAR_SOURCES
+        )
+    if asset_classes:
+        return False
+    normalized = str(symbol or "").strip().upper()
+    if _is_forex_symbol(normalized) or _is_dukascopy_symbol(normalized):
+        return False
+    crypto_bases = {"BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "AVAX"}
+    base = normalized.split("-", 1)[0].removesuffix("USD")
+    if base in crypto_bases:
+        return False
+    return _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized) is not None
+
+
+def _expected_us_equity_holidays(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> frozenset[date]:
+    if not _uses_us_equity_calendar(symbol, timeframe, data_dir):
+        return frozenset()
+    values: set[date] = set()
+    for year in range(start_ts.year - 1, end_ts.year + 2):
+        values.update(
+            pd.Timestamp(value).date()
+            for value in _nyse_holidays(year)
+            if start_ts.date() <= pd.Timestamp(value).date() <= end_ts.date()
+        )
+    return frozenset(values)
+
+
 def has_sufficient_segment_coverage(
     *,
     symbol: str,
@@ -778,8 +947,21 @@ def has_sufficient_segment_coverage(
             start_ts=start_ts,
             end_ts=end_ts,
         )
+    holidays = _expected_us_equity_holidays(
+        symbol,
+        normalized_timeframe,
+        data_dir,
+        start_ts,
+        end_ts,
+    )
     expected = max(
-        _expected_trading_bars(start_ts, end_ts, step_minutes, session_window),
+        _expected_trading_bars(
+            start_ts,
+            end_ts,
+            step_minutes,
+            session_window,
+            holidays,
+        ),
         1,
     )
     if len(stamps) / expected < min_density:
@@ -787,10 +969,13 @@ def has_sufficient_segment_coverage(
     limit_minutes = step_minutes * max_gap_multiplier
     for prev, cur in zip(stamps, stamps[1:]):
         if session_window is None:
-            gap_trading_minutes = _trading_minutes_between(prev, cur)
+            gap_trading_minutes = _trading_minutes_between(prev, cur, holidays)
         else:
             gap_trading_minutes = _session_trading_minutes_between(
-                prev, cur, session_window
+                prev,
+                cur,
+                session_window,
+                holidays,
             )
         if gap_trading_minutes > limit_minutes:
             return False

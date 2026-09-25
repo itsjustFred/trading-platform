@@ -973,6 +973,19 @@ def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_pr
     meta.pop(short_key, None)
 
 
+def _validate_trade_exit_order(trade: Trade) -> None:
+    entry_time = _normalize_trade_timestamp(trade.entry_time)
+    if entry_time is None:
+        return
+    for exit_leg in trade.exits:
+        exit_time = _normalize_trade_timestamp(exit_leg.time)
+        if exit_time is not None and exit_time < entry_time:
+            raise ValueError(
+                f"PyneCore exit time {exit_leg.time!r} is before entry time "
+                f"{trade.entry_time!r}"
+            )
+
+
 def _enrich_trades_with_context(
     trades: list[Trade], trade_context: IndicatorMap, df: pd.DataFrame
 ) -> None:
@@ -981,6 +994,7 @@ def _enrich_trades_with_context(
 
     timestamp_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     for trade in trades:
+        _validate_trade_exit_order(trade)
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
         exit_idx = _locate_trade_bar(timestamp_series, trade.last_exit_time)
         meta = dict(trade.meta or {})
@@ -1000,11 +1014,11 @@ def _enrich_trades_with_context(
         _materialize_exit_price_levels(meta, trade)
         trade.stop_loss = _finite_meta_value(
             meta,
-            ("sl_price_at_exit", "sl_price"),
+            ("sl_price_at_exit", "sl_price", "initial_sl"),
         )
         trade.take_profit = _finite_meta_value(
             meta,
-            ("tp_price_at_exit", "tp_price"),
+            ("tp_price_at_exit", "tp_price", "initial_tp"),
         )
         trade.meta = meta or None
         if trade.exits:
@@ -1064,27 +1078,33 @@ def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
 
 def _normalize_trade_exits(trades: list[Trade]) -> None:
     for trade in trades:
+        _validate_trade_exit_order(trade)
         if not trade.exits or not trade.meta:
             continue
 
-        sl_price = trade.meta.get("sl_price_at_exit", trade.meta.get("sl_price"))
-        tp_price = trade.meta.get("tp_price_at_exit", trade.meta.get("tp_price"))
-
-        for exit_leg in trade.exits:
-            if trade.direction == "LONG":
-                if sl_price is not None and exit_leg.price < float(sl_price):
-                    exit_leg.price = round(float(sl_price), 6)
-                    exit_leg.reason = "stop_loss"
-                elif tp_price is not None and exit_leg.price > float(tp_price):
-                    exit_leg.price = round(float(tp_price), 6)
-                    exit_leg.reason = "take_profit"
-            else:
-                if sl_price is not None and exit_leg.price > float(sl_price):
-                    exit_leg.price = round(float(sl_price), 6)
-                    exit_leg.reason = "stop_loss"
-                elif tp_price is not None and exit_leg.price < float(tp_price):
-                    exit_leg.price = round(float(tp_price), 6)
-                    exit_leg.reason = "take_profit"
+        sl_price = trade.meta.get(
+            "sl_price_at_exit",
+            trade.meta.get("sl_price", trade.meta.get("initial_sl")),
+        )
+        tp_price = trade.meta.get(
+            "tp_price_at_exit",
+            trade.meta.get("tp_price", trade.meta.get("initial_tp")),
+        )
+        exit_leg = trade.exits[-1]
+        if trade.direction == "LONG":
+            if sl_price is not None and exit_leg.price < float(sl_price):
+                exit_leg.price = round(float(sl_price), 6)
+                exit_leg.reason = "stop_loss"
+            elif tp_price is not None and exit_leg.price > float(tp_price):
+                exit_leg.price = round(float(tp_price), 6)
+                exit_leg.reason = "take_profit"
+        else:
+            if sl_price is not None and exit_leg.price > float(sl_price):
+                exit_leg.price = round(float(sl_price), 6)
+                exit_leg.reason = "stop_loss"
+            elif tp_price is not None and exit_leg.price < float(tp_price):
+                exit_leg.price = round(float(tp_price), 6)
+                exit_leg.reason = "take_profit"
 
 
 def _materialize_exit_price_levels(meta: dict[str, Any], trade: Trade) -> None:
@@ -1126,6 +1146,8 @@ def _apply_risk_sizing(
 ) -> None:
     if not trades:
         return
+    for trade in trades:
+        _validate_trade_exit_order(trade)
     if config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
         raise ValueError(
             "Risk sizing is not configured (risk_per_trade_pct unset); "
@@ -1276,6 +1298,8 @@ def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str
         ("tp_price_at_exit", "take_profit"),
         ("sl_price", "stop_loss"),
         ("tp_price", "take_profit"),
+        ("initial_sl", "stop_loss"),
+        ("initial_tp", "take_profit"),
     ]
     for key, reason in checks:
         value = meta.get(key)

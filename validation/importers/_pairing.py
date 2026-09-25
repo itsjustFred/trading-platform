@@ -86,34 +86,76 @@ def classify_position_fills(
 
 
 def _add_to_group(
-    groups: dict[str, PositionFills],
-    order: list[str],
+    groups: dict[object, PositionFills],
+    order: list[object],
+    group_key: object,
     position_id: str,
     row: dict[str, Any],
     direction: str,
 ) -> None:
-    if position_id not in groups:
-        groups[position_id] = PositionFills(position_id=position_id)
-        order.append(position_id)
+    if group_key not in groups:
+        groups[group_key] = PositionFills(position_id=position_id)
+        order.append(group_key)
     if direction == "in":
-        groups[position_id].entries.append(row)
+        groups[group_key].entries.append(row)
     else:
-        groups[position_id].exits.append(row)
+        groups[group_key].exits.append(row)
+
+
+def _pairing_scope(
+    row: dict[str, Any],
+    scope_of: Callable[[dict[str, Any]], object] | None,
+) -> object:
+    if scope_of is None:
+        return None
+    scope = scope_of(row)
+    try:
+        hash(scope)
+    except TypeError as exc:
+        raise TypeError("pairing scope must be hashable") from exc
+    return scope
 
 
 def _shared_ids(
     rows: Sequence[dict[str, Any]],
     position_id_of: Callable[[dict[str, Any]], str],
     is_trade_row: Callable[[dict[str, Any]], bool],
+    scope_of: Callable[[dict[str, Any]], object] | None,
 ) -> bool:
-    counts: dict[str, int] = {}
+    counts: dict[tuple[object, str], int] = {}
     for row in rows:
         if not is_trade_row(row):
             continue
         position_id = position_id_of(row)
         if position_id:
-            counts[position_id] = counts.get(position_id, 0) + 1
+            key = (_pairing_scope(row, scope_of), position_id)
+            counts[key] = counts.get(key, 0) + 1
     return any(count > 1 for count in counts.values())
+
+
+def entry_side_scope(
+    row: dict[str, Any],
+    symbol_of: Callable[[dict[str, Any]], object],
+    deal_type_of: Callable[[dict[str, Any]], object],
+    direction_of: Callable[[dict[str, Any]], object],
+) -> tuple[str, str]:
+    direction = str(direction_of(row) or "").strip().lower()
+    deal_type = str(deal_type_of(row) or "").strip().lower()
+    if deal_type.startswith("buy"):
+        deal_side = "buy"
+    elif deal_type.startswith("sell"):
+        deal_side = "sell"
+    else:
+        deal_side = ""
+    if direction == "in":
+        entry_side = deal_side
+    elif deal_side == "sell":
+        entry_side = "buy"
+    elif deal_side == "buy":
+        entry_side = "sell"
+    else:
+        entry_side = ""
+    return str(symbol_of(row) or "").strip().upper(), entry_side
 
 
 def group_position_fills(
@@ -122,6 +164,7 @@ def group_position_fills(
     direction_of: Callable[[dict[str, Any]], str],
     is_trade_row: Callable[[dict[str, Any]], bool],
     quantity_of: Callable[[dict[str, Any]], Any] | None = None,
+    scope_of: Callable[[dict[str, Any]], object] | None = None,
 ) -> list[PositionFills]:
     """Group fills by stable position id or by the report deal sequence."""
     relevant = [
@@ -129,30 +172,39 @@ def group_position_fills(
         for row in rows
         if is_trade_row(row) and direction_of(row) in ("in", "out")
     ]
-    use_shared_ids = _shared_ids(relevant, position_id_of, lambda _row: True)
-    groups: dict[str, PositionFills] = {}
-    order: list[str] = []
-    remaining: list[float] = []
-    next_id = [0]
+    use_shared_ids = _shared_ids(relevant, position_id_of, lambda _row: True, scope_of)
+    groups: dict[object, PositionFills] = {}
+    order: list[object] = []
+    remaining_by_scope: dict[object, list[float]] = {}
+    position_ids_by_scope: dict[object, list[str]] = {}
+    next_generated_id = 0
+    next_position_id = 0
+    next_orphan_id = 0
 
     for row in relevant:
         direction = direction_of(row)
         position_id = position_id_of(row)
+        scope = _pairing_scope(row, scope_of)
         if use_shared_ids:
             if not position_id:
-                next_id[0] += 1
+                next_generated_id += 1
                 position_id = (
-                    f"orphan-{next_id[0]}"
+                    f"orphan-{next_generated_id}"
                     if direction == "out"
-                    else f"unresolved-{next_id[0]}"
+                    else f"unresolved-{next_generated_id}"
                 )
-            _add_to_group(groups, order, position_id, row, direction)
+                group_key: object = ("generated", next_generated_id)
+            else:
+                group_key = (scope, position_id)
+            _add_to_group(groups, order, group_key, position_id, row, direction)
             continue
 
         if quantity_of is not None:
             quantity = _quantity(quantity_of(row))
         else:
             quantity = _row_quantity(row, None)
+        remaining = remaining_by_scope.setdefault(scope, [])
+        position_ids = position_ids_by_scope.setdefault(scope, [])
         if direction == "in":
             for index, open_quantity in enumerate(remaining):
                 if open_quantity <= _quantity_tolerance(open_quantity):
@@ -160,23 +212,25 @@ def group_position_fills(
                 break
             else:
                 index = len(remaining)
+                next_position_id += 1
+                position_id = f"position-{next_position_id}"
                 remaining.append(0.0)
-                next_id[0] += 1
+                position_ids.append(position_id)
+            position_id = position_ids[index]
             remaining[index] += quantity
-            position_id = f"position-{index + 1}"
         else:
             position_id = ""
             for index, open_quantity in enumerate(remaining):
                 if open_quantity > _quantity_tolerance(open_quantity):
                     remaining[index] = max(0.0, open_quantity - quantity)
-                    position_id = f"position-{index + 1}"
+                    position_id = position_ids[index]
                     break
             if not position_id:
-                next_id[0] += 1
-                position_id = f"orphan-{next_id[0]}"
-        _add_to_group(groups, order, position_id, row, direction)
+                next_orphan_id += 1
+                position_id = f"orphan-{next_orphan_id}"
+        _add_to_group(groups, order, position_id, position_id, row, direction)
 
-    result = [groups[position_id] for position_id in order]
+    result = [groups[group_key] for group_key in order]
     return classify_position_fills(result, quantity_of)
 
 
