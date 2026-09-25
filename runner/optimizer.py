@@ -385,6 +385,7 @@ def run_optimization(
         backtest_end,
         config.train_split_pct,
         embargo_days=config.embargo_days,
+        embargo_pct=float(config.embargo_pct or 0.0),
     )
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
@@ -871,7 +872,20 @@ def _split_backtest_period(
     end_value: str,
     train_split_pct: float,
     embargo_days: int = 1,
+    embargo_pct: float = 0.0,
 ) -> tuple[dict[str, str], dict[str, str]]:
+    """Split into train / embargo-gap / test windows.
+
+    ``embargo_pct`` drops a gap between the two windows, on top of the fixed
+    ``embargo_days``. A trade opened just before the split can still be open
+    during the test window, so its label contains test information; without the
+    gap that leaks backwards into training. The gap is applied here, to the
+    windows that actually run, rather than only being reported by the
+    diagnostics.
+    """
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
     start_ts = _parse_period_boundary(start_value, is_end=False)
     end_ts = _parse_period_boundary(end_value, is_end=True)
     if end_ts <= start_ts:
@@ -889,16 +903,20 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
-    # C3: embargo gap — the test window starts `embargo_days` after the
-    # split so no bar (and no indicator warmup overlap) is shared. The old
-    # split+1µs boundary leaked the split bar into both segments.
-    embargo = pd.Timedelta(days=max(int(embargo_days), 0))
+    # C3: embargo gap — the test window starts after the split so no bar
+    # (and no indicator warmup overlap) is shared. The old split+1µs
+    # boundary leaked the split bar into both segments. `embargo_pct` scales
+    # the gap with the length of the backtest; `embargo_days` is the fixed
+    # component. Both are applied to the windows that run, not just reported.
+    embargo = pd.Timedelta(days=max(int(embargo_days), 0)) + (
+        (end_ts - start_ts) * float(embargo_pct)
+    )
     test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
     if test_start_ts >= end_ts:
         raise ValueError(
-            "train_split_pct + embargo_days leave an empty test period for "
-            "the base backtest range"
+            "train_split_pct/embargo_days/embargo_pct leave an empty train or "
+            "test period for the base backtest range"
         )
     test_period = {
         "start": test_start_ts.isoformat(),
