@@ -852,6 +852,42 @@ async def submit_order_with_risk(
     )
 
 
+def _mint_signal_idempotency_key(
+    signal: TradeSignal, deployment: LiveDeploymentConfig, metadata: dict[str, object]
+) -> None:
+    """Mint a producer-stable idempotency key for non-Discord signals (C1).
+
+    A redelivery returns the canonical row instead of a second broker
+    order. Content-stable (same logical signal → same key); distinct
+    signals differ by price/levels/time. Discord redeliveries keep using
+    their discord_message_id. CodeRabbit round: only mint from real
+    producer identity — an empty timestamp slot would make distinct
+    timestamp-less signals share one key and wrongly dedupe, so leave it
+    unset instead (the execution layer derives a fill-content key
+    downstream).
+    """
+    if metadata.get("discord_message_id") or metadata.get("idempotency_key"):
+        return
+    producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
+    if not producer_stamp:
+        return
+    key_material = "|".join(
+        [
+            str(deployment.id),
+            str(signal.symbol).upper(),
+            str(signal.action).lower(),
+            repr(float(signal.entry_price)),
+            repr(signal.stop_loss),
+            repr(signal.take_profit),
+            str(signal.timeframe),
+            str(producer_stamp),
+        ]
+    )
+    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
+        :32
+    ]
+
+
 def _trade_signal_to_live_signal(
     signal: TradeSignal,
     deployment: LiveDeploymentConfig,
@@ -863,33 +899,7 @@ def _trade_signal_to_live_signal(
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
-    # C1: producer-stable idempotency key for non-Discord signals so a
-    # redelivery returns the canonical row instead of a second broker order.
-    # Content-stable (same logical signal → same key); distinct signals
-    # differ by price/levels/time. Discord redeliveries keep using their
-    # discord_message_id.
-    if not metadata.get("discord_message_id") and not metadata.get("idempotency_key"):
-        # CodeRabbit round: only mint a key from real producer identity. An
-        # empty timestamp slot would make distinct timestamp-less signals
-        # share one key and wrongly dedupe — leave it unset instead (the
-        # execution layer derives a fill-content key downstream).
-        producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
-        if producer_stamp:
-            key_material = "|".join(
-                [
-                    str(deployment.id),
-                    str(signal.symbol).upper(),
-                    str(signal.action).lower(),
-                    repr(float(signal.entry_price)),
-                    repr(signal.stop_loss),
-                    repr(signal.take_profit),
-                    str(signal.timeframe),
-                    str(producer_stamp),
-                ]
-            )
-            metadata["idempotency_key"] = hashlib.sha256(
-                key_material.encode("utf-8")
-            ).hexdigest()[:32]
+    _mint_signal_idempotency_key(signal, deployment, metadata)
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE

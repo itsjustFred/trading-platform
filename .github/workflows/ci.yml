@@ -16,7 +16,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: pip install uv
+        # Pinned (Sonar: no unlocked installs); uv ships wheels only.
+        run: pip install "uv==0.10.4"
       - name: Sync dependencies
         # All extras: the suite imports optional engines (vectorbt, lean,
         # ctrader, …) unconditionally; a subset install fails collection.

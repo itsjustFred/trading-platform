@@ -725,6 +725,24 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
     return min(starts), max(ends)
 
 
+def _gaps_overlapping_window(
+    gaps: list[dict[str, object]], start: str | None, end: str | None
+) -> list[dict[str, object]]:
+    """Keep only holes strictly overlapping [start, end] (CodeRabbit round).
+
+    Ancient history outside the required window must not fail a requirement
+    that never touches it; boundary-touching holes carry no interior
+    missing bars and are excluded too.
+    """
+    if start is None or end is None:
+        return list(gaps)
+    return [
+        gap
+        for gap in gaps
+        if str(gap.get("end", "")) > start and str(gap.get("start", "")) < end
+    ]
+
+
 def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dict[str, Any]:
     """Report coverage for one requirement, including internal holes.
 
@@ -761,16 +779,9 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     significant_gaps = [
         gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
     ]
-    if required_start is not None and required_end is not None:
-        # CodeRabbit round: only holes overlapping the required window can
-        # fail the requirement — ancient history outside [start, end] must
-        # not fail a backtest that never touches it.
-        significant_gaps = [
-            gap
-            for gap in significant_gaps
-            if str(gap.get("end", "")) > required_start
-            and str(gap.get("start", "")) < required_end
-        ]
+    significant_gaps = _gaps_overlapping_window(
+        significant_gaps, required_start, required_end
+    )
 
     if error or significant_gaps:
         status = "failed"

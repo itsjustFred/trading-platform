@@ -43,7 +43,6 @@ class DiscordChannelForbiddenError(RuntimeError):
     """
 
     def __init__(self, channel_id: str, message: str = "") -> None:
-        self.channel_id = channel_id
         super().__init__(message or f"Discord channel forbidden (403): {channel_id}")
         self.channel_id = channel_id
 
@@ -666,6 +665,9 @@ class DiscordSignalSource(BaseSignalSource):
             return
         parsed.metadata["source"] = self.source_name
         parsed.metadata["discord_bot_name"] = self.bot_name
+        # Sonar round: the polled channel is the source of truth — backfill
+        # it when the message object carries no channel id of its own.
+        parsed.metadata.setdefault("discord_channel_id", channel_id)
         if self.service_id:
             parsed.metadata["service_id"] = self.service_id
         await self._set_service_status(

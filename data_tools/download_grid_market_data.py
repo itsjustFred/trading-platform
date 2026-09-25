@@ -113,25 +113,7 @@ def normalize_ohlcv_columns(path: Path) -> None:
         return
     sides = pd.Series("unresolved", index=df.index)
     for target in ("open", "high", "low", "close", "volume"):
-        bid_col, ask_col = f"bid_{target}", f"ask_{target}"
-        has_bid = bid_col in df.columns
-        has_ask = ask_col in df.columns
-        if target not in df.columns:
-            if has_bid:
-                df[target] = df[bid_col]
-            elif has_ask:
-                df[target] = df[ask_col]
-            else:
-                df[target] = pd.NA
-                continue
-        if has_bid:
-            df[target] = df[target].fillna(df[bid_col])
-        if has_ask:
-            df[target] = df[target].fillna(df[ask_col])
-        if has_bid:
-            sides = sides.mask(df[bid_col].notna(), "bid")
-        if has_ask:
-            sides = sides.mask(sides.eq("unresolved") & df[ask_col].notna(), "ask")
+        sides = _resolve_bid_ask_side(df, sides, target)
     for col in ["open", "high", "low", "close", "volume"]:
         if col not in df.columns:
             df[col] = pd.NA
@@ -139,6 +121,31 @@ def normalize_ohlcv_columns(path: Path) -> None:
     keep = ["timestamp", "open", "high", "low", "close", "volume", OHLCV_SOURCE_COLUMN]
     df = df[[col for col in keep if col in df.columns]]
     df.to_parquet(path, index=False)
+
+
+def _resolve_bid_ask_side(df: pd.DataFrame, sides: pd.Series, target: str) -> pd.Series:
+    """Fill one canonical column with bid priority; return updated sides."""
+
+    bid_col, ask_col = f"bid_{target}", f"ask_{target}"
+    has_bid = bid_col in df.columns
+    has_ask = ask_col in df.columns
+    if target not in df.columns:
+        if has_bid:
+            df[target] = df[bid_col]
+        elif has_ask:
+            df[target] = df[ask_col]
+        else:
+            df[target] = pd.NA
+            return sides
+    if has_bid:
+        df[target] = df[target].fillna(df[bid_col])
+    if has_ask:
+        df[target] = df[target].fillna(df[ask_col])
+    if has_bid:
+        sides = sides.mask(df[bid_col].notna(), "bid")
+    if has_ask:
+        sides = sides.mask(sides.eq("unresolved") & df[ask_col].notna(), "ask")
+    return sides
 
 
 def parquet_rows(path: Path) -> int:
