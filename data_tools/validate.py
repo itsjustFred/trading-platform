@@ -117,19 +117,58 @@ def _nyse_holidays(year: int) -> set[str]:
     return {day.isoformat() for day in holidays if day is not None and day.year == year}
 
 
-def _gap_touches_holiday(gap_start: pd.Timestamp, gap_end: pd.Timestamp) -> bool:
-    """Whether a gap interval covers a NYSE holiday (B3, equity-like only)."""
-    years = range(gap_start.year, gap_end.year + 1)
+def _gap_is_expected_nontrading(
+    gap_start: pd.Timestamp,
+    gap_end: pd.Timestamp,
+    asset_class: str,
+    timeframe: str = "",
+) -> bool:
+    if gap_end <= gap_start:
+        return False
+    start = pd.Timestamp(gap_start).tz_convert("UTC")
+    end = pd.Timestamp(gap_end).tz_convert("UTC")
+    start_day = start.normalize()
+    end_day = end.normalize()
+    intraday = str(timeframe).lower() not in {"", "1d", "1w"}
+    normalized_asset_class = str(asset_class).strip().lower()
+    if intraday:
+        if normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
+            return False
+        weekend_boundary = (
+            start_day.weekday() == 4
+            and end_day.weekday() in {6, 0}
+            and start.time() >= pd.Timestamp("21:00").time()
+            and end.time() <= pd.Timestamp("01:00").time()
+        ) or (
+            start_day.weekday() == 6
+            and end_day.weekday() == 0
+            and start.time() <= pd.Timestamp("01:00").time()
+            and end.time() <= pd.Timestamp("01:00").time()
+        )
+        if not weekend_boundary:
+            return False
+        return True
     holidays: set[str] = set()
-    for year in years:
-        holidays |= _nyse_holidays(year)
-    cursor = gap_start.normalize()
-    end = gap_end.normalize()
-    while cursor <= end:
-        if cursor.date().isoformat() in holidays:
-            return True
+    if normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
+        for year in range(start_day.year, end_day.year + 1):
+            holidays |= _nyse_holidays(year)
+    cursor = start_day + pd.Timedelta(days=1)
+    saw_missing_day = False
+    while cursor < end_day:
+        saw_missing_day = True
+        if cursor.weekday() < 5 and cursor.date().isoformat() not in holidays:
+            return False
         cursor += pd.Timedelta(days=1)
-    return False
+    return saw_missing_day
+
+
+def _asset_class_from_parts(parts: tuple[str, ...]) -> str:
+    for index, part in enumerate(parts):
+        if part.lower() == "ohlcv" and index + 1 < len(parts):
+            return parts[index + 1].lower()
+    if len(parts) >= 2:
+        return parts[1].lower()
+    return ""
 
 
 @dataclass
@@ -169,7 +208,12 @@ class ValidationResult:
 
 def validate_parquet(path: Path) -> ValidationResult:
     """Validate a single OHLCV Parquet file."""
-    rel = path.relative_to(DATA_DIR / "ohlcv") if str(path).startswith(str(DATA_DIR)) else path
+    candidate = Path(path).expanduser()
+    try:
+        configured_root = (DATA_DIR / "ohlcv").resolve()
+        rel = candidate.resolve().relative_to(configured_root)
+    except (OSError, RuntimeError, ValueError):
+        rel = candidate
     parts = rel.parts
 
     # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet
@@ -252,20 +296,8 @@ def validate_parquet(path: Path) -> ValidationResult:
             gap_end = ts.loc[idx]
             gap_minutes = large_gaps.iloc[pos].total_seconds() / 60
 
-            # Skip weekends for non-forex
-            if gap_start.weekday() == 4 and gap_end.weekday() == 0:
-                continue  # Friday→Monday is expected
-            if gap_start.weekday() == 4 and gap_end.weekday() == 6:
-                continue  # Friday→Sunday
-            if gap_start.weekday() == 6 and gap_end.weekday() == 0:
-                continue  # Sunday→Monday
-
-            # B3: NYSE holidays are not data holes — but only for
-            # equity-like paths (FX/metals print through US holidays).
-            asset_class = str(parts[1]).strip().lower() if len(parts) >= 4 else ""
-            if asset_class in _EQUITY_LIKE_ASSET_CLASSES and _gap_touches_holiday(
-                gap_start, gap_end
-            ):
+            asset_class = _asset_class_from_parts(parts)
+            if _gap_is_expected_nontrading(gap_start, gap_end, asset_class, timeframe):
                 continue
 
             result.gaps.append(
@@ -339,7 +371,7 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
     results = []
     for parquet in sorted(ohlcv_root.rglob("*.parquet")):
         try:
-            ensure_dataset_path_within(ohlcv_root, parquet)
+            validated_path = ensure_dataset_path_within(ohlcv_root, parquet)
         except ValueError as exc:
             result = ValidationResult(
                 path=str(parquet),
@@ -354,8 +386,8 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
         if symbol_filter and parquet.parent.name.upper() != symbol_filter.upper():
             continue
 
-        logger.info("Validating %s ...", parquet.relative_to(ohlcv_root))
-        r = validate_parquet(parquet)
+        logger.info("Validating %s ...", validated_path.relative_to(ohlcv_root.resolve()))
+        r = validate_parquet(validated_path)
 
         status_icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(r.status, "?")
         logger.info(

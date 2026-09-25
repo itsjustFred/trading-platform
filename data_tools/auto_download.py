@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -85,36 +86,125 @@ def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> fl
 
 
 def _is_trading_instant(ts: pd.Timestamp, step_minutes: float) -> bool:
-    """Whether a bar grid instant falls in trading time (pre-mortem R1).
-
-    Weekends print no bars on any venue in this repo; weekly+ grids are
-    sparse by nature and count every grid point.
-    """
+    """Whether a bar grid instant falls in trading time."""
     if step_minutes >= 10080.0:
         return True
     return ts.weekday() < 5
 
 
-def _expected_trading_bars(
-    start_ts: pd.Timestamp, end_ts: pd.Timestamp, step_minutes: float
-) -> int:
-    """Count step-grid points in [start, end] that fall in trading time.
+def _parse_session_clock(value: object) -> int:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("session clock must not be empty")
+    if text in {"24:00", "24:00:00"}:
+        return 1440
+    parsed = pd.to_datetime(f"2000-01-01 {text}", errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"invalid session clock: {value!r}")
+    return int(parsed.hour * 60 + parsed.minute)
 
-    The old `span // step + 1` overcounted whenever the span end landed on
-    excluded time (e.g. a Mon–Sat daily segment expected 6 bars for 5
-    perfect weekday bars and failed a healthy feed).
-    """
+
+def _explicit_session_window(
+    session: Mapping[str, object] | tuple[str, str] | None,
+    session_start: str | None,
+    session_end: str | None,
+) -> tuple[int, int] | None:
+    start_value: object = session_start
+    end_value: object = session_end
+    if isinstance(session, Mapping):
+        start_value = session.get("start", session.get("session_start", session.get("open")))
+        end_value = session.get("end", session.get("session_end", session.get("close")))
+    elif isinstance(session, (tuple, list)) and len(session) == 2:
+        start_value, end_value = session
+    if start_value is None and end_value is None:
+        return None
+    if start_value is None or end_value is None:
+        raise ValueError("session requires both start and end")
+    start_minutes = _parse_session_clock(start_value)
+    end_minutes = _parse_session_clock(end_value)
+    if end_minutes <= start_minutes:
+        raise ValueError("session end must be after session start")
+    return start_minutes, end_minutes
+
+
+def _observed_session_window(
+    stamps: list[pd.Timestamp], step_minutes: float
+) -> tuple[int, int] | None:
+    if step_minutes >= 1440.0 or len(stamps) < 4:
+        return None
+    by_day: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+    for stamp in stamps:
+        by_day.setdefault(stamp.normalize(), []).append(stamp)
+    if len(by_day) < 2 or max(len(rows) for rows in by_day.values()) < 2:
+        return None
+    start_minutes = min(
+        int(stamp.hour * 60 + stamp.minute) for stamp in stamps
+    )
+    end_minutes = max(
+        int(stamp.hour * 60 + stamp.minute) for stamp in stamps
+    ) + int(step_minutes)
+    if end_minutes - start_minutes < step_minutes * 3:
+        return None
+    return start_minutes, end_minutes
+
+
+def _session_trading_minutes_between(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    session_window: tuple[int, int],
+) -> float:
+    if end_ts <= start_ts:
+        return 0.0
+    start_minutes, end_minutes = session_window
+    total = 0.0
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5:
+            session_start = cursor + pd.Timedelta(minutes=start_minutes)
+            session_end = cursor + pd.Timedelta(minutes=end_minutes)
+            overlap_start = max(start_ts, session_start)
+            overlap_end = min(end_ts, session_end)
+            if overlap_end > overlap_start:
+                total += (overlap_end - overlap_start).total_seconds() / 60.0
+        cursor += pd.Timedelta(days=1)
+    return total
+
+
+def _expected_trading_bars(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    step_minutes: float,
+    session_window: tuple[int, int] | None = None,
+) -> int:
+    """Count expected bars on the venue/session grid when it is known."""
     if step_minutes <= 0:
         return 0
-    span_minutes = (end_ts - start_ts).total_seconds() / 60.0
-    steps = int(span_minutes // step_minutes)
+    if session_window is None:
+        span_minutes = (end_ts - start_ts).total_seconds() / 60.0
+        steps = int(span_minutes // step_minutes)
+        return sum(
+            1
+            for k in range(steps + 1)
+            if _is_trading_instant(start_ts + pd.Timedelta(minutes=k * step_minutes), step_minutes)
+        )
+    start_minutes, end_minutes = session_window
     count = 0
-    for k in range(steps + 1):
-        instant = start_ts + pd.Timedelta(minutes=k * step_minutes)
-        if instant > end_ts:
-            break
-        if _is_trading_instant(instant, step_minutes):
-            count += 1
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5:
+            day_start = cursor + pd.Timedelta(minutes=start_minutes)
+            day_end = cursor + pd.Timedelta(minutes=end_minutes)
+            first = max(start_ts, day_start)
+            last = min(end_ts, day_end)
+            if last >= first:
+                offset = math.ceil(
+                    (first - day_start).total_seconds() / (step_minutes * 60)
+                )
+                instant = day_start + pd.Timedelta(minutes=offset * step_minutes)
+                while instant <= last and instant < day_end:
+                    count += 1
+                    instant += pd.Timedelta(minutes=step_minutes)
+        cursor += pd.Timedelta(days=1)
     return count
 
 
@@ -605,6 +695,9 @@ def has_sufficient_segment_coverage(
     data_dir: str | Path = "",
     min_density: float = SEGMENT_MIN_DENSITY,
     max_gap_multiplier: float = SEGMENT_MAX_GAP_MULTIPLIER,
+    session: Mapping[str, object] | tuple[str, str] | None = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
 ) -> bool:
     """Return whether ``[start, end]`` has dense, gap-free coverage (#86).
 
@@ -622,20 +715,31 @@ def has_sufficient_segment_coverage(
     end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
-    expected = max(
-        _expected_trading_bars(start_ts, end_ts, step_minutes),
-        1,
-    )
+    try:
+        explicit_session = _explicit_session_window(session, session_start, session_end)
+    except ValueError:
+        return False
     stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
     if not stamps:
         return False
+    if step_minutes >= 1440.0:
+        session_window = None
+    else:
+        session_window = explicit_session or _observed_session_window(stamps, step_minutes)
+    expected = max(
+        _expected_trading_bars(start_ts, end_ts, step_minutes, session_window),
+        1,
+    )
     if len(stamps) / expected < min_density:
         return False
     limit_minutes = step_minutes * max_gap_multiplier
     for prev, cur in zip(stamps, stamps[1:]):
-        gap_trading_minutes = (cur - prev).total_seconds() / 60.0 - _weekend_overlap_minutes(
-            prev, cur
-        )
+        if session_window is None:
+            gap_trading_minutes = _trading_minutes_between(prev, cur)
+        else:
+            gap_trading_minutes = _session_trading_minutes_between(
+                prev, cur, session_window
+            )
         if gap_trading_minutes > limit_minutes:
             return False
     return True

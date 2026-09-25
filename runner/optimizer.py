@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
@@ -327,6 +328,19 @@ class OptimizationConfig(BaseModel):
         return self
 
 
+def _coverage_session_from_result(result: BacktestResult) -> Mapping[str, object] | None:
+    data = result.meta.data if isinstance(result.meta.data, dict) else {}
+    for key in ("session", "trading_session"):
+        value = data.get(key)
+        if isinstance(value, Mapping):
+            return value
+    start = data.get("session_start")
+    end = data.get("session_end")
+    if start is not None and end is not None:
+        return {"start": start, "end": end}
+    return None
+
+
 def run_optimization(
     config: OptimizationConfig,
     progress_callback: ProgressCallback | None = None,
@@ -337,6 +351,8 @@ def run_optimization(
             "Optimization currently supports vectorbt base backtests only, "
             f"got {base_result.meta.engine!r}"
         )
+    base_runtime = _runtime_config_from_base_result(base_result)
+    coverage_session = _coverage_session_from_result(base_result)
 
     symbols = list(base_result.meta.data.get("symbols") or [])
     if not symbols:
@@ -360,7 +376,6 @@ def run_optimization(
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
-    base_runtime = _runtime_config_from_base_result(base_result)
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -404,14 +419,16 @@ def run_optimization(
     )
     for segment_name, period in (("train", train_period), ("test", test_period)):
         for symbol in required_symbols:
-            # #86: density + max-gap gate — a 1-bar month must not pass.
-            if not has_sufficient_segment_coverage(
-                symbol=symbol,
-                timeframe=timeframe,
-                start=period["start"],
-                end=period["end"],
-                data_dir=data_dir,
-            ):
+            coverage_kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "start": period["start"],
+                "end": period["end"],
+                "data_dir": data_dir,
+            }
+            if coverage_session is not None:
+                coverage_kwargs["session"] = coverage_session
+            if not has_sufficient_segment_coverage(**coverage_kwargs):
                 raise ValueError(
                     f"Optimization {segment_name} segment has insufficient OHLCV "
                     f"coverage for {symbol} {timeframe} ({period['start']} -> "
@@ -559,7 +576,11 @@ def run_optimization(
     if not completed_trials:
         failure_summary = "; ".join(
             f"trial {trial.number}: {trial.state.name}"
-            + (f" ({trial.user_attrs.get('failure_reason')})" if trial.user_attrs.get("failure_reason") else "")
+            + (
+                f" ({trial.user_attrs.get('failure_reason')})"
+                if trial.user_attrs.get("failure_reason")
+                else ""
+            )
             for trial in study.get_trials(deepcopy=False)[-5:]
         )
         raise RuntimeError(
@@ -748,14 +769,40 @@ def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
         meta_value = getattr(result.meta, name, None)
         if meta_value is not None:
             return meta_value
-        if name in data:
+        if name in data and data[name] is not None:
             return data[name]
-        if name in stored_runtime:
+        if name in stored_runtime and stored_runtime[name] is not None:
             return stored_runtime[name]
         return parameters.get(name, default)
 
+    risk_per_trade_pct = getattr(result.meta, "risk_per_trade_pct", None)
+    if risk_per_trade_pct is None:
+        risk_per_trade_pct = data.get("risk_per_trade_pct")
+    if risk_per_trade_pct is None:
+        risk_per_trade_pct = stored_runtime.get("risk_per_trade_pct")
+    if risk_per_trade_pct is None:
+        raise ValueError(
+            "Base backtest is a legacy artifact without an explicit "
+            "risk_per_trade_pct runtime snapshot. Optimization cannot safely "
+            "reuse it; rerun the base backtest with risk_per_trade_pct configured "
+            "or provide a complete explicit runtime snapshot. No default risk "
+            "was applied."
+        )
+    try:
+        numeric_risk = float(risk_per_trade_pct)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "Base backtest risk_per_trade_pct must be a finite fraction between "
+            f"0 and 1, got {risk_per_trade_pct!r}."
+        ) from exc
+    if not math.isfinite(numeric_risk) or not 0.0 <= numeric_risk <= 1.0:
+        raise ValueError(
+            "Base backtest risk_per_trade_pct must be a finite fraction between "
+            f"0 and 1, got {risk_per_trade_pct!r}."
+        )
+
     return {
-        "risk_per_trade_pct": value("risk_per_trade_pct"),
+        "risk_per_trade_pct": numeric_risk,
         "max_position_exposure_pct": value("max_position_exposure_pct"),
         "max_leverage": value("max_leverage"),
         "modeling_resolution": value("modeling_resolution", "open_close"),

@@ -335,7 +335,9 @@ def _clear_ctrader_blocked_state(account_id: str) -> None:
 
 
 def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
-    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(exc):
+    if not isinstance(exc, CTraderAuthTerminalError) and not _is_terminal_ctrader_runtime_error(
+        exc
+    ):
         return
     reason = str(exc).strip() or "cTrader authorization failed"
     _CTRADER_AUTH_BLOCKED_ACCOUNTS.add(account_id)
@@ -733,6 +735,7 @@ async def _metadata_for_exit_only_order(
         "position_count",
     ):
         metadata.pop(key, None)
+    metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)
     metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     metadata["position_count"] = len(matching_positions)

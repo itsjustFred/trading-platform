@@ -121,7 +121,20 @@ def normalize_ohlcv_columns(path: Path) -> None:
         if col not in df.columns:
             df[col] = pd.NA
     df[OHLCV_SOURCE_COLUMN] = sides
-    keep = ["timestamp", "open", "high", "low", "close", "volume", OHLCV_SOURCE_COLUMN]
+    canonical = ["timestamp", "open", "high", "low", "close", "volume"]
+    raw_quote_columns = {
+        f"{side}_{field}"
+        for side in ("bid", "ask")
+        for field in ("open", "high", "low", "close", "volume")
+    }
+    metadata_columns = [
+        column
+        for column in df.columns
+        if column not in canonical
+        and column not in raw_quote_columns
+        and column != OHLCV_SOURCE_COLUMN
+    ]
+    keep = [*canonical, *metadata_columns, OHLCV_SOURCE_COLUMN]
     df = df[[col for col in keep if col in df.columns]]
     write_parquet_atomically(path, df)
 

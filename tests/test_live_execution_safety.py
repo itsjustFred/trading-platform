@@ -450,7 +450,13 @@ def test_alpaca_extended_hours_entries_fail_closed():
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 1.0, "extended_hours": True, "limit_price": 101.5, "stop_loss": 95.0, "take_profit": 110.0},
+        metadata={
+            "qty": 1.0,
+            "extended_hours": True,
+            "limit_price": 101.5,
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     builder = adapter._build_order_request
@@ -538,7 +544,12 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-123", "stop_loss": 95.0, "take_profit": 110.0},
+        metadata={
+            "qty": 1.0,
+            "discord_message_id": "discord-123",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
     redelivery = LiveSignal(
         id=uuid4(),
@@ -684,7 +695,12 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-456", "stop_loss": 95.0, "take_profit": 110.0},
+        metadata={
+            "qty": 1.0,
+            "discord_message_id": "discord-456",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
@@ -968,10 +984,9 @@ def test_submit_order_with_risk_zeroes_size_when_budget_exhausted_by_positions()
 
 def test_ctrader_volume_contract_uses_qty_units_only():
     """The one contract: signal metadata 'qty' is in broker volume / 1000
-    (account-currency lots for FX). 'ctrader_volume' and 'volume' are raw
-    broker-unit overrides — honored ONLY for exit-only flatten orders; on
-    entries they are rejected so an untrusted payload can never trade an
-    arbitrary size with zero risk checks (#79)."""
+    (account-currency lots for FX). Raw 'ctrader_volume' and 'volume' keys are
+    rejected for entries and exit-only closes; the daemon-bound 'qty' is the
+    only traded-size authority."""
     _module, adapter = _make_ctrader_adapter()
 
     def _signal(metadata: dict[str, Any]) -> LiveSignal:
@@ -986,25 +1001,24 @@ def test_ctrader_volume_contract_uses_qty_units_only():
 
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
     # Entry + explicit volume: rejected, never honored.
-    with pytest.raises(ValueError, match="exit-only"):
+    with pytest.raises(ValueError, match="ambiguous"):
         adapter._resolve_order_volume(_signal({"ctrader_volume": 100000}))
-    with pytest.raises(ValueError, match="exit-only"):
+    with pytest.raises(ValueError, match="ambiguous"):
         adapter._resolve_order_volume(_signal({"volume": 100000}))
-    # Trusted adapter callers may provide a broker-unit override when no qty is present.
-    assert (
-        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000, "risk_sizing_mode": "exit_only"}))
-        == 100000
-    )
-    assert (
-        adapter._resolve_order_volume(_signal({"volume": 100000, "risk_sizing_mode": "exit_only"}))
-        == 100000
-    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        adapter._resolve_order_volume(
+            _signal({"ctrader_volume": 100000, "risk_sizing_mode": "exit_only"})
+        )
+    with pytest.raises(ValueError, match="ambiguous"):
+        adapter._resolve_order_volume(
+            _signal({"volume": 100000, "risk_sizing_mode": "exit_only"})
+        )
     empty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
         adapter._resolve_order_volume(empty)
 
 
-def test_ctrader_exit_only_qty_overrides_raw_metadata_volume() -> None:
+def test_ctrader_exit_only_rejects_ambiguous_raw_metadata_volume() -> None:
     _module, adapter = _make_ctrader_adapter()
     signal = _ctrader_signal(
         "EURUSD",
@@ -1016,7 +1030,37 @@ def test_ctrader_exit_only_qty_overrides_raw_metadata_volume() -> None:
         },
     )
 
-    assert adapter._resolve_order_volume(signal) == 3000
+    with pytest.raises(ValueError, match="ambiguous"):
+        adapter._resolve_order_volume(signal)
+
+
+def test_ctrader_rejects_raw_volume_before_signal_persistence(monkeypatch):
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={
+            "qty": 3.0,
+            "volume": 999_999,
+            "stop_loss": 1.05,
+            "take_profit": 1.2,
+        },
+    )
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(
+        module,
+        "save_live_signal",
+        lambda _signal: pytest.fail("raw volume must be rejected before persistence"),
+    )
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        asyncio.run(adapter.submit_order(signal, qty=3.0))
 
 
 def test_ctrader_volume_rejects_non_finite_qty():
@@ -1087,6 +1131,44 @@ def test_ctrader_fill_quantities_are_persisted_in_qty_units(monkeypatch):
     assert saved[0].dedupe_key == "ctrader:deal:777"
 
 
+def test_ctrader_sparse_deal_uses_order_executed_volume(monkeypatch):
+    module, adapter = _make_ctrader_adapter()
+    adapter._order_id_to_symbol[45678] = "EURUSD"
+    adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
+    saved: list[LiveExecution] = []
+    monkeypatch.setattr(
+        module,
+        "save_live_execution",
+        lambda execution: saved.append(execution) or True,
+    )
+
+    event = SimpleNamespace(
+        executionType=1,
+        order=SimpleNamespace(
+            orderId=45678,
+            clientOrderId=str(uuid4()),
+            executedVolume=5_000_000,
+            utcLastUpdateTimestamp=1700000000000,
+        ),
+        deal=SimpleNamespace(
+            dealId=778,
+            orderId=45678,
+            filledVolume=0,
+            volume=0,
+            executionPrice=1.2345,
+            executionTimestamp=1700000000000,
+            commission=0.0,
+        ),
+        HasField=lambda field: field == "order",
+    )
+
+    asyncio.run(adapter._persist_execution_event(event))
+
+    assert len(saved) == 1
+    assert saved[0].filled_qty == pytest.approx(5000.0)
+    assert saved[0].dedupe_key == "ctrader:deal:778"
+
+
 def test_ctrader_reconciled_deals_are_persisted_in_qty_units(monkeypatch):
     """The reconcile backfill path uses the same unit contract."""
     module, adapter = _make_ctrader_adapter()
@@ -1127,6 +1209,32 @@ def test_ctrader_reconciled_deals_are_persisted_in_qty_units(monkeypatch):
 
     assert recovered == 1
     assert saved[0].filled_qty == pytest.approx(2500.0)  # 2_500_000 / 1000
+
+
+def test_ctrader_reconcile_sparse_deal_uses_order_executed_volume():
+    _module, adapter = _make_ctrader_adapter()
+    adapter._order_id_to_symbol[45678] = "EURUSD"
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=1, PARTIALLY_FILLED=2)
+    deal = SimpleNamespace(
+        dealId=779,
+        dealStatus=1,
+        filledVolume=0,
+        volume=0,
+        executionPrice=1.2345,
+        executionTimestamp=1700000000000,
+        commission=0.0,
+    )
+    order = SimpleNamespace(executedVolume=5_000_000)
+
+    execution = adapter._build_reconciled_execution(
+        deal,
+        signal_uuid=UUID("00000000-0000-0000-0000-000000000001"),
+        broker_order_id="45678",
+        order=order,
+    )
+
+    assert execution is not None
+    assert execution.filled_qty == pytest.approx(5000.0)
 
 
 def test_ctrader_get_positions_qty_matches_volume_contract():
@@ -1389,7 +1497,8 @@ def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> N
                 "CREATE TABLE live_signals ("
                 "id TEXT PRIMARY KEY, deployment_id TEXT NOT NULL, symbol TEXT NOT NULL, "
                 "action TEXT NOT NULL, theoretical_price FLOAT NOT NULL, timestamp TEXT NOT NULL, "
-                "source TEXT NOT NULL DEFAULT 'internal', broker_order_id TEXT NOT NULL DEFAULT '', "
+                "source TEXT NOT NULL DEFAULT 'internal', "
+                "broker_order_id TEXT NOT NULL DEFAULT '', "
                 f"discord_message_id TEXT, metadata TEXT NOT NULL{unique_clause})"
             )
         )
@@ -1544,7 +1653,9 @@ def test_migration_fails_closed_for_duplicate_composite_claim(isolated_db):
         foreign_keys_enabled = int(
             connection.execute(database.text("PRAGMA foreign_keys")).scalar_one()
         )
-        row_count = connection.execute(database.text("SELECT COUNT(*) FROM live_signals")).scalar_one()
+        row_count = connection.execute(
+            database.text("SELECT COUNT(*) FROM live_signals")
+        ).scalar_one()
         rolled_back_claim = connection.execute(
             database.text(
                 "SELECT discord_message_id FROM live_signals WHERE id = 'duplicate-b'"
@@ -2993,7 +3104,9 @@ def test_ctrader_reconcile_skips_non_numeric_broker_order_ids(monkeypatch):
     )
     # Alpaca UUID format - not numeric, should be skipped
     monkeypatch.setattr(
-        module, "get_live_signal_broker_order_id", lambda _sid: "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        module,
+        "get_live_signal_broker_order_id",
+        lambda _sid: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
     )
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
@@ -3938,13 +4051,12 @@ def test_exit_only_metadata_flows_through_adapter_volume_gate() -> None:
     )
     metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
     assert metadata["risk_sizing_mode"] == EXIT_ONLY_RISK_SIZING_MODE
+    assert metadata["qty"] == pytest.approx(2.0)
+    assert metadata["explicit_qty"] == pytest.approx(2.0)
 
     _module, adapter = _make_ctrader_adapter()
-    explicit_volume = int(2.0 * 1000)
-    gated = signal.model_copy(
-        update={"metadata": {**metadata, "ctrader_volume": explicit_volume}}
-    )
-    assert adapter._resolve_order_volume(gated) == explicit_volume
+    gated = signal.model_copy(update={"metadata": metadata})
+    assert adapter._resolve_order_volume(gated) == 2000
 
 
 def test_unbounded_tp_policy_passes_daemon_guard_with_warning(caplog) -> None:

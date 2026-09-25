@@ -293,6 +293,36 @@ class TestSegmentCoverageWeekends:
             start="2024-01-05", end="2024-01-08T10:00", data_dir=tmp_path,
         )
 
+    def test_sunday_to_monday_hourly_fx_weekend_gap_is_expected(self):
+        from data_tools.validate import _gap_is_expected_nontrading
+
+        assert _gap_is_expected_nontrading(
+            pd.Timestamp("2024-01-07T00:00:00Z"),
+            pd.Timestamp("2024-01-08T00:00:00Z"),
+            "forex",
+            "1h",
+        )
+
+    def test_session_window_overrides_generic_weekday_grid(self, tmp_path):
+        stamps = []
+        for day in ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"):
+            stamps.extend(
+                pd.date_range(f"{day}T14:30", periods=5, freq="1h", tz="UTC")
+            )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1h",
+            start="2024-01-02T00:00:00Z",
+            end="2024-01-05T23:59:59Z",
+            data_dir=tmp_path,
+            session={"start": "14:30", "end": "19:30"},
+        )
+
     def test_midweek_hole_still_fails(self, tmp_path):
         # 12h hole Tue->Wed (no weekend involved) exceeds 3x 1h.
         stamps = list(pd.date_range("2024-01-09T00:00", "2024-01-09T05:00", freq="1h", tz="UTC"))
@@ -338,6 +368,18 @@ class TestValidateHolidayCalendar:
         )
         result = validate_module.validate_parquet(target)
         assert result.gaps == []
+
+    def test_long_outage_spanning_holiday_remains_an_error(self, tmp_path, monkeypatch) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = self._write_equity_bars(
+            tmp_path, ["2024-07-03T00:00:00Z", "2024-07-08T00:00:00Z"]
+        )
+
+        result = validate_module.validate_parquet(target)
+
+        assert len(result.gaps) == 1
 
     def test_same_gap_flagged_for_forex(self, tmp_path, monkeypatch) -> None:
         import pandas as pd

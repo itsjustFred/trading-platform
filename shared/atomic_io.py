@@ -81,7 +81,7 @@ def write_text_atomically(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` atomically (temp file + os.replace)."""
 
     def _write(target: Path) -> None:
-        target.write_text(text)
+        target.write_text(text, encoding="utf-8")
 
     atomic_replace(path, _write)
 

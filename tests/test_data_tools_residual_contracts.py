@@ -175,6 +175,29 @@ def test_csv_migration_keeps_previous_artifact_when_atomic_write_fails(
     assert destination.read_bytes() == before
 
 
+def test_validation_rejects_symlinked_file_outside_data_root(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    outside = tmp_path / "outside.parquet"
+    target = root / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True),
+            "open": [1.0],
+            "high": [2.0],
+            "low": [0.0],
+            "close": [1.5],
+        }
+    ).to_parquet(outside, index=False)
+    target.symlink_to(outside)
+
+    results = validation.validate_all(root)
+
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert "escapes" in results[0].errors[0]
+
+
 def test_validation_cli_returns_nonzero_for_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
