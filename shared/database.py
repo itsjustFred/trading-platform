@@ -199,6 +199,9 @@ _FINAL_TASK_STATUSES = {
     "interrupted",
     "partial",
     "skipped",
+    "manual_required",
+    "cleanup_pending",
+    "cleanup_exhausted",
 }
 
 
@@ -217,6 +220,9 @@ _TASK_STATUS_TO_EVIDENCE_STATUS = {
     "cancelled": VerificationEvidenceStatus.SKIPPED.value,
     "partial": VerificationEvidenceStatus.PARTIAL.value,
     "skipped": VerificationEvidenceStatus.SKIPPED.value,
+    "manual_required": VerificationEvidenceStatus.FAILED.value,
+    "cleanup_pending": VerificationEvidenceStatus.PARTIAL.value,
+    "cleanup_exhausted": VerificationEvidenceStatus.FAILED.value,
 }
 _MANUAL_VALIDATION_CATEGORIES = {
     "discord",

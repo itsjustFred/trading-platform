@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.websockets import WebSocketDisconnect
+
 from shared.models import (
     BacktestMeta,
     BacktestResult,
@@ -1840,7 +1843,10 @@ def test_coalesced_cleanup_failure_persists_retryable_marker(
             "task_id": "task-provisional",
             "task_type": "data",
             "status": "cleanup_pending",
-            "config_json": {"coalesced_cleanup_pending": True},
+            "config_json": {
+                "coalesced_cleanup_pending": True,
+                "coalesced_cleanup_attempts": 1,
+            },
             "progress_message": "Pending cleanup of coalesced provisional task",
             "source": "yfinance",
         }
@@ -1932,12 +1938,82 @@ def test_coalesced_cleanup_marker_failure_retries_from_memory(
         "delete_background_task_record",
         lambda value: delete_attempts.append(value) or True,
     )
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
+    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
 
     viewer_app_module._hydrate_task_cache_once(force=True)
 
     assert delete_attempts == [task_id, task_id]
     assert task_id not in viewer_app_module.DATA_TASKS
     assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+
+def test_coalesced_cleanup_exhaustion_is_terminal_across_restart(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-exhausted-cleanup"
+    delete_attempts: list[str] = []
+    persisted: list[dict] = []
+
+    def fail_delete(value: str) -> bool:
+        delete_attempts.append(value)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **record: persisted.append(record),
+    )
+
+    viewer_app_module._discard_coalesced_download_registration(task_id)
+    for _ in range(viewer_app_module._COALESCED_CLEANUP_MAX_ATTEMPTS - 1):
+        viewer_app_module._retry_coalesced_cleanup(task_id)
+
+    terminal = [record for record in persisted if record.get("status") == "cleanup_exhausted"]
+    assert terminal
+    assert terminal[-1]["config_json"]["coalesced_cleanup_exhausted"] is True
+    assert task_id in viewer_app_module._COALESCED_CLEANUP_EXHAUSTED
+
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS.clear()
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
+    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
+    delete_attempts.clear()
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda: [
+            {
+                "id": task_id,
+                "type": "data",
+                "status": "cleanup_pending",
+                "config_json": {"coalesced_cleanup_pending": True},
+            }
+        ],
+    )
+
+    viewer_app_module._hydrate_task_cache_once(force=True)
+
+    assert delete_attempts == []
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
+def test_coalesced_cleanup_exhausted_memory_is_bounded(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "_COALESCED_CLEANUP_MAX_ENTRIES", 2)
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
+    for index in range(3):
+        viewer_app_module._remember_coalesced_cleanup_exhausted(f"exhausted-{index}")
+
+    assert len(viewer_app_module._COALESCED_CLEANUP_EXHAUSTED) == 2
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
 
 
 def test_hydrated_cache_retries_pending_coalesced_cleanup(viewer_client, monkeypatch):
@@ -2634,7 +2710,7 @@ def test_failed_task_can_restart(viewer_client, tmp_path):
     restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
     assert restart_resp.status_code == 200
     restarted = restart_resp.json()
-    assert restarted["status"] == "queued"
+    assert restarted["status"] == "manual_required"
     assert restarted["can_restart"] is False
 
 
@@ -2656,13 +2732,15 @@ def test_failed_jforex_task_restart_marks_interrupted(viewer_client, tmp_path):
         supports_control=True,
     )
     viewer_app_module._update_task_fields(task_id, downloader="jforex")
-    viewer_app_module._mark_task_finished(task_id, status="failed", returncode=1, error="jforex error")
+    viewer_app_module._mark_task_finished(
+        task_id, status="failed", returncode=1, error="jforex error"
+    )
 
     restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
     assert restart_resp.status_code == 200
     payload = restart_resp.json()
-    assert payload["status"] == "interrupted"
-    assert payload["can_restart"] is True
+    assert payload["status"] == "manual_required"
+    assert payload["can_restart"] is False
     assert payload["progress"]["failed"] >= 1
 
 
@@ -2720,7 +2798,9 @@ def test_data_task_delete_rejects_active_task(viewer_client, tmp_path):
     assert task_id in viewer_app_module.DATA_TASKS
 
 
-def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_client, tmp_path):
+def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(
+    viewer_client, tmp_path, monkeypatch
+):
     import viewer.main as viewer_app_module
 
     task_id = "missing-log"
@@ -2728,6 +2808,11 @@ def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_cli
         "status": "running",
         "log_file": str(tmp_path / "logs" / "tasks" / f"task_{task_id}.log"),
     }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "running", "config_json": {}},
+    )
 
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
@@ -2735,7 +2820,7 @@ def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_cli
     assert resp.json() == {"logs": "", "status": "running"}
 
 
-def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
+def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path, monkeypatch):
     import viewer.main as viewer_app_module
 
     task_id = "completed-log"
@@ -2746,6 +2831,11 @@ def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
         "status": "completed",
         "log_file": str(log_file),
     }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "completed", "config_json": {}},
+    )
 
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
@@ -2756,7 +2846,65 @@ def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
     }
 
 
-def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, monkeypatch, tmp_path):
+def test_data_task_logs_endpoint_bounds_and_redacts_output(
+    viewer_client, tmp_path, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "bounded-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        ("x" * 70000) + "Authorization: Bearer endpoint-secret\n",
+        encoding="utf-8",
+    )
+    viewer_app_module.DATA_TASKS[task_id] = {
+        "status": "running",
+        "log_file": str(log_file),
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "running", "config_json": {}},
+    )
+
+    response = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
+
+    assert response.status_code == 200
+    logs = response.json()["logs"]
+    assert len(logs.encode("utf-8")) <= 64 * 1024
+    assert "endpoint-secret" not in logs
+    assert "Bearer [Filtered]" in logs
+
+
+def test_data_task_logs_rejects_syntactically_valid_unknown_task(viewer_client, tmp_path):
+    task_id = "unknown-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("secret\n")
+
+    response = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
+
+    assert response.status_code == 404
+    assert "secret" not in response.text
+
+
+def test_task_log_websocket_rejects_unknown_task_identity(viewer_client, tmp_path):
+    task_id = "unknown-ws-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("secret\n")
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with viewer_client.websocket_connect(f"/ws/tasks/{task_id}") as websocket:
+            websocket.receive_text()
+
+    assert exc_info.value.code == 1008
+
+
+def test_start_data_task_writes_task_logs_and_refreshes_catalog(
+    viewer_client, monkeypatch, tmp_path
+):
     import viewer.main as viewer_app_module
 
     refresh_calls: list[str] = []
@@ -4104,6 +4252,108 @@ def test_backtests_bulk_delete_and_single_delete(viewer_client, tmp_path):
     assert not (backtests_dir / "delete-c.trades.json").exists()
 
 
+def test_backtest_delete_database_failure_restores_json_and_reports_failed(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    artifact = backtests_dir / "delete-failure.trades.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    def fail_delete(_backtest_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_backtest", fail_delete)
+    response = viewer_client.post(
+        "/api/backtests/delete-bulk", json={"ids": ["delete-failure"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "failed"
+    assert payload["items"][0]["database"] == "failed"
+    assert payload["items"][0]["artifact"] == "restored"
+    assert artifact.exists()
+    assert not (backtests_dir / ".delete-failure.trades.json.delete-staged").exists()
+
+
+def test_backtest_delete_cleanup_failure_is_recoverable_and_truthful(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    artifact = backtests_dir / "delete-pending.trades.json"
+    artifact.write_text("{}", encoding="utf-8")
+    database_deletes: list[str] = []
+    original_unlink = Path.unlink
+
+    def delete_from_db(backtest_id: str) -> bool:
+        database_deletes.append(backtest_id)
+        return True
+
+    def fail_staged_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name.endswith(".delete-staged"):
+            raise OSError("artifact cleanup failed")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(viewer_app_module, "delete_backtest", delete_from_db)
+    monkeypatch.setattr(Path, "unlink", fail_staged_unlink)
+    response = viewer_client.post(
+        "/api/backtests/delete-bulk", json={"ids": ["delete-pending"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "cleanup_pending"
+    assert payload["items"][0]["database"] == "deleted"
+    assert payload["items"][0]["artifact"] == "staged"
+    assert not artifact.exists()
+    staged = backtests_dir / ".delete-pending.trades.json.delete-staged"
+    journal = backtests_dir / ".delete-pending.trades.json.delete-journal.json"
+    assert staged.exists()
+    assert journal.exists()
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    viewer_app_module._recover_maintenance_deletes()
+
+    assert database_deletes == ["delete-pending"]
+    assert not staged.exists()
+    assert not journal.exists()
+
+
+def test_portfolio_delete_database_failure_restores_json_and_reports_failed(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    artifact = portfolios_dir / "delete-failure.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    def fail_delete(_portfolio_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", fail_delete)
+    response = viewer_client.post(
+        "/api/portfolios/delete-bulk", json={"ids": ["delete-failure"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "failed"
+    assert payload["items"][0]["database"] == "failed"
+    assert payload["items"][0]["artifact"] == "restored"
+    assert artifact.exists()
+
+
 def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
@@ -5004,9 +5254,101 @@ def test_data_recovery_rejects_persisted_command_without_typed_spec(monkeypatch)
     viewer_app_module._resume_interrupted_data_task(record, "task-recovery", record["config_json"])
 
     assert started == []
-    assert updates[0]["status"] == "queued"
+    assert updates[0]["status"] == "manual_required"
     assert updates[0]["config_json"]["recovery_rejected"] == "missing typed data spec"
+    assert updates[0]["config_json"]["recovery_mode"] == "manual"
     assert "command" not in updates[0]["config_json"]
+
+
+def test_typed_only_unsupported_recovery_is_manual_and_not_executable(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    updates: list[dict] = []
+    started: list[tuple] = []
+    record = {
+        "id": "task-typed-only",
+        "type": "data",
+        "status": "interrupted",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "harvest",
+                "source": "dukascopy",
+                "symbols": ["EURUSD"],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(
+        record, "task-typed-only", record["config_json"]
+    )
+
+    assert started == []
+    assert updates[0]["status"] == "manual_required"
+    assert updates[0]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in updates[0]["config_json"]
+
+
+def test_manual_recovery_typed_only_unsupported_is_not_executable(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "manual-typed-only"
+    viewer_app_module.DATA_TASKS[task_id] = {
+        "id": task_id,
+        "kind": "data",
+        "status": "failed",
+    }
+    record = {
+        "id": task_id,
+        "type": "data",
+        "status": "failed",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "validate",
+                "symbol": "EURUSD",
+            },
+        },
+    }
+    started: list[tuple] = []
+    updates: list[dict] = []
+    monkeypatch.setattr(
+        viewer_app_module, "get_background_task_record", lambda _task_id: record
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+
+    response = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "manual_required"
+    assert started == []
+    assert updates[-1]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in updates[-1]["config_json"]
 
 
 def test_typed_data_recovery_rebuilds_request_and_ignores_command(monkeypatch):
@@ -5129,6 +5471,7 @@ def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
     output_path = module._write_report_for_run({"verified": True})
 
     assert output_path.exists()
-    assert output_path.stat().st_mode & 0o777 == 0o600
-    assert output_path.parent.stat().st_mode & 0o777 == 0o700
+    if os.name == "posix":
+        assert output_path.stat().st_mode & 0o777 == 0o600
+        assert output_path.parent.stat().st_mode & 0o777 == 0o700
     assert json.loads(output_path.read_text(encoding="utf-8"))["verified"] is True

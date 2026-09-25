@@ -6,7 +6,7 @@ and entire backtest references using the existing RiskEngine.
 
 from __future__ import annotations
 
-from validation.risk.adapter import RiskAdapter, _trade_to_signal
+from validation.risk.adapter import RiskAdapter
 from validation.risk.models import RiskSizingResult, TradeRiskProfile
 from validation.risk.percent_risk import PercentRiskConfig, PercentRiskModel
 
@@ -14,7 +14,6 @@ __all__ = [
     "RiskAdapter",
     "RiskSizingResult",
     "TradeRiskProfile",
-    "_trade_to_signal",
     "PercentRiskConfig",
     "PercentRiskModel",
 ]

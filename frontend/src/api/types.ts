@@ -949,16 +949,28 @@ export interface MatrixGridOverview {
   rows: MatrixGridRow[];
 }
 
+export interface MaintenanceDeleteItem {
+  id: string;
+  status: "deleted" | "not_found" | "failed" | "cleanup_pending";
+  database: string;
+  artifact: string;
+  error?: string;
+  journal_pending?: boolean;
+}
+
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface BacktestsRemoveEmptyResponse {
   removed: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfoliosBulkDeleteResponse {
   deleted: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface BacktestDuplicateGroup {
@@ -985,6 +997,7 @@ export interface BacktestsDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfolioDuplicateGroup {
@@ -1009,12 +1022,14 @@ export interface PortfoliosDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfoliosRemoveEmptyResponse {
   removed: number;
   remaining: number;
   removed_ids: string[];
+  items: MaintenanceDeleteItem[];
 }
 
 export interface TradeDetail extends Trade {

@@ -251,7 +251,9 @@ def test_backtest_bulk_delete_ignores_path_traversal_ids(security_client, tmp_pa
     )
 
     assert response.status_code == 200
-    assert response.json() == {"deleted": 0}
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "not_found"
     assert secret.exists()
 
 
@@ -267,7 +269,9 @@ def test_portfolio_bulk_delete_ignores_path_traversal_ids(security_client, tmp_p
     )
 
     assert response.status_code == 200
-    assert response.json() == {"deleted": 0}
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "not_found"
     assert secret.exists()
 
 

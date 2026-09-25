@@ -1991,7 +1991,14 @@ def _refresh_catalog() -> None:
 DATA_TASKS: dict[str, dict[str, Any]] = {}
 DATA_TASKS_LOCK = threading.Lock()
 ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
-FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+FINAL_TASK_STATUSES = {
+    "completed",
+    "failed",
+    "cancelled",
+    "manual_required",
+    "cleanup_pending",
+    "cleanup_exhausted",
+}
 
 
 def _prune_terminal_tasks_locked() -> None:

@@ -10,20 +10,34 @@ Orders an einen Broker weiterzureichen (Paper Trading).
 
 ## Readiness-Checks
 
-Der :class:`~validation.readiness.validator.ReadinessValidator` führt folgende
-Prüfungen durch:
+Der :class:`~validation.readiness.validator.ReadinessValidator` führt
+Transaktions-, Risiko-, Regressions- und Statistikprüfungen aus. Die
+folgenden Artefakte sind für eine belastbare Entscheidung **verpflichtend**:
+Trade-Delta-Report, Regression-Result, Risk-Comparison-Report und das
+Paar `(expected_stats, actual_stats)`. Fehlt eines dieser Artefakte, ist das
+Ergebnis `NOT_READY`; ein fehlendes Artefakt wird nicht durch leere, bestandene
+Checks ersetzt. Die `require_*`-Optionen steuern die expliziten
+`required_artifact_*`-Checks, können aber die fail-closed-Abhängigkeit der
+nachfolgenden Prüfungen nicht aufheben.
 
 | Check | Name | Bedeutung |
 |-------|------|-----------|
-| a | `trade_errors` | Keine Error-Level-Abweichungen in gematchten Trades |
-| b | `missing_trades` | Anzahl fehlender Trades unter Schwellenwert |
-| c | `extra_trades` | Anzahl zusätzlicher Trades unter Schwellenwert |
-| d | `critical_mismatches` | Keine Mismatches in Richtung oder PnL |
-| e | `stats_win_rate` | Win-Rate-Differenz innerhalb Toleranz |
-| f | `stats_net_profit` | Net-Profit-Differenz innerhalb Toleranz |
-| g | `risk_position_size` | Position-Size-Differenz innerhalb Toleranz |
-| h | `risk_stop_distance` | Stop-Distance-Differenz innerhalb Toleranz |
-| i | `regression_status` | Regression bestanden (sofern vorhanden) |
+| a | `trade_errors` | Error-Level-Abweichungen in Trades |
+| b | `missing_trades` | Fehlende Trades innerhalb des konfigurierten Schwellenwerts |
+| c | `extra_trades` | Zusätzliche Trades innerhalb des konfigurierten Schwellenwerts |
+| d | `critical_mismatches` | Kritische Richtungs-/PnL-Abweichungen |
+| e | `trade_warnings` | Warning-Level-Abweichungen; ein Fehlschlag ist `READY_WITH_WARNINGS` |
+| f | `regression_status` | Regression bestanden, wenn `require_all_goldens_pass=True` |
+| g | `risk_evidence` | Risk-Report enthält vergleichbare Feldwerte |
+| h | `risk_failed_results` | Keine strukturell fehlgeschlagenen Risk-Ergebnisse |
+| i | `risk_report_verdict` | Risk-Report insgesamt bestanden |
+| j | `risk_position_size` | Position-Size-Differenz innerhalb Toleranz |
+| k | `risk_stop_distance` | Stop-Distance-Differenz innerhalb Toleranz |
+| l | `stats_risk_free_rate` | Beide Statistikseiten verwenden kanonisch `risk_free_rate=0` |
+| m | `stats_win_rate` | Win-Rate-Differenz innerhalb Toleranz |
+| n | `stats_net_profit` | Net-Profit-Differenz innerhalb Toleranz |
+| o | `stats_sharpe` | Sharpe-Differenz innerhalb der/absoluten Sharpe-Toleranz |
+| p | `stats_max_drawdown` | Absolute Max-Drawdown-Differenz höchstens `0.02` (2 Prozentpunkte) |
 
 Jede Prüfung erzeugt ein :class:`~validation.readiness.models.ReadinessCheck` mit:
 - `name` — maschinenlesbarer Name
@@ -33,9 +47,10 @@ Jede Prüfung erzeugt ein :class:`~validation.readiness.models.ReadinessCheck` m
 - `message` — erklärender Text
 - `details` — strukturierte Zusatzdaten (z. B. Differenzen, Schwellen)
 
-## Readiness-Levels
+## Readiness-Level und fehlgeschlagene Warnungen
 
-Aus den Checks wird ein aggregiertes :class:`~validation.readiness.models.PaperReadinessLevel` abgeleitet:
+Aus den Checks wird ein aggregiertes
+:class:`~validation.readiness.models.PaperReadinessLevel` abgeleitet:
 
 | Level | Bedingung |
 |-------|-----------|
@@ -43,22 +58,41 @@ Aus den Checks wird ein aggregiertes :class:`~validation.readiness.models.PaperR
 | `READY_WITH_WARNINGS` | Keine Errors, aber mindestens ein Warning mit `passed=False` |
 | `READY` | Alle Checks bestanden |
 
-## Schwellenwerte (`ReadinessConfig`)
+Ein fehlgeschlagener Check mit `severity=warning` führt zu
+`READY_WITH_WARNINGS`; der aggregierte `ReadinessReport.passed` bleibt in
+diesem Fall `True`. Zähler-Checks können dagegen bei einer Abweichung innerhalb
+ihres Schwellenwerts `severity=warning` bei `passed=True` sein; nur
+`passed=False` zählt als fehlgeschlagene Warnung. Ein fehlgeschlagener
+Error-Check, ein fehlendes Pflichtartefakt oder ein fehlgeschlagener
+Risk-Report-Gesamtstatus führt immer zu `NOT_READY` und `passed=False`.
 
-Die :class:`~validation.readiness.models.ReadinessConfig` enthält die
-konfigurierbaren Schwellen:
+## Schwellenwerte (`ReadinessConfig`)
 
 | Feld | Standard | Beschreibung |
 |------|----------|--------------|
 | `max_missing_trades` | `0` | Maximal akzeptable Anzahl fehlender Trades |
 | `max_extra_trades` | `0` | Maximal akzeptable Anzahl zusätzlicher Trades |
-| `max_mismatched_trades` | `0` | Maximal akzeptable Anzahl Mismatched-Trades |
+| `max_mismatched_trades` | `0` | Maximal akzeptable Anzahl kritischer Mismatches |
 | `max_error_count` | `0` | Maximal akzeptable Anzahl Error-Level-Abweichungen |
 | `require_all_goldens_pass` | `True` | Regression muss bestehen, wenn vorhanden |
 | `max_position_size_diff_pct` | `0.01` (1 %) | Maximale relative Position-Size-Abweichung |
 | `max_stop_distance_diff_pct` | `0.01` (1 %) | Maximale relative Stop-Distance-Abweichung |
 | `stats_win_rate_tolerance_pct` | `0.01` (1 %) | Maximale relative Win-Rate-Abweichung |
 | `stats_net_profit_tolerance_pct` | `0.01` (1 %) | Maximale relative Net-Profit-Abweichung |
+| `stats_sharpe_tolerance_pct` | `0.10` (10 %) | Relativer Sharpe-Anteil |
+| `stats_sharpe_tolerance_abs` | `0.1` | Mindestabsolute Sharpe-Toleranz |
+| `stats_max_drawdown_tolerance_pp` | `0.02` (2 Prozentpunkte) | Absolute Drawdown-Toleranz |
+
+### Nenner und Spezialfälle
+
+Relative Abweichungen werden gegen den **erwarteten** Wert berechnet:
+`abs(expected - actual) / abs(expected)`. Bei `expected == 0` gilt die
+Abweichung nur dann als null, wenn auch `actual == 0`; jede Abweichung von
+null ist `1.0` und damit ein Fehlschlag. Die Sharpe-Prüfung verwendet
+`max(stats_sharpe_tolerance_pct * abs(expected_sharpe),
+stats_sharpe_tolerance_abs)`. Die Drawdown-Prüfung verwendet die direkte
+absolute Differenz, nicht den Nenner der relativen Statistikprüfungen.
+
 
 ## Was würde Paper Trading bedeuten?
 
