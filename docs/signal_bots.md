@@ -128,3 +128,25 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
 - Vor jeder Submission werden Deployment-Status, Demo-Modus und die
   PAUSE-Concurrency nochmals geprüft. Exit-only-Metadaten sind nur für SELL
   erlaubt und werden bei Entries entfernt.
+
+## Credential-Typ: Bot-Token vs. Account-Token
+
+Discord akzeptiert zwei **nicht** austauschbare Credentials:
+
+| Typ | Authorization-Header | Bezug |
+| --- | --- | --- |
+| Bot-/Application-Token | `Bot <token>` | Discord Developer Portal |
+| Account-(User)-Token | `<token>` (ohne Präfix) | Browser-Session |
+
+Ein Account-Token mit `Bot `-Präfix wird mit **HTTP 401** abgelehnt. Der
+Quelltyp muss deshalb explizit konfiguriert werden und wird **nicht geraten**:
+
+- `DISCORD_BOT_<NAME>_AUTH_SCHEME=bot|account` (je Bot)
+- sonst global `DISCORD_AUTH_SCHEME=bot|account`
+- Vorgabe: `bot`
+
+Ein Token, das bereits ein Schema-Präfix trägt, wird nicht doppelt präfigiert.
+Ein unbekanntes Schema wird abgelehnt. Im `account`-Modus loggt der Daemon
+ausdrücklich, dass ein Self-Bot betrieben wird: das verletzt die Discord-ToS
+und kann zur Sperrung des Kontos führen. Für unbeaufsichtigten Handel ist ein
+Bot-Token die dauerhafte Lösung.

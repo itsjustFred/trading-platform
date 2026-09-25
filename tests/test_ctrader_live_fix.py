@@ -685,3 +685,175 @@ def test_dedupe_executions_idempotent_on_clean_table(isolated_db):
     with database.get_session() as session:
         rows = session.exec(database.select(database.LiveExecutionModel)).all()
     assert len(rows) == 2
+
+
+# ─── cTrader cancel / flatten (STOPPED semantics) ───────────────────────────
+
+
+class _FakeCTraderAdapter:
+    """Exercises the cTrader cancel/flatten logic without a broker connection."""
+
+    def __init__(self, orders, positions):
+        self._orders = orders
+        self._positions = positions
+        self.sent = []
+        self.ctid_trader_account_id = 10105151
+        self._connected = True
+        self._authenticated = True
+
+    def _raise_if_terminal_auth_failed(self):
+        return None
+
+    def _raise_terminal_auth_from_api_error(self, exc):
+        return None
+
+    # Minimal protobuf stand-ins.
+    class _Req:
+        def __init__(self):
+            self.ctidTraderAccountId = 0
+            self.orderId = ""
+            self.positionId = ""
+            self.fromTimestamp = 0
+            self.toTimestamp = 0
+
+    class _OrderListRes:
+        def __init__(self, orders):
+            self.orders = orders
+
+    class _OrderType:
+        MARKET = 1
+        LIMIT = 2
+        STOP = 3
+        STOP_LOSS_TAKE_PROFIT = 4
+        MARKET_RANGE = 5
+        STOP_LIMIT = 6
+
+    _ProtoOAOrderListReq = _Req
+    _ProtoOACancelOrderReq = _Req
+    _ProtoOAClosePositionReq = _Req
+    _ProtoOAOrderListRes = _OrderListRes
+    _ProtoOAOrderType = _OrderType
+
+    async def connect(self):
+        return None
+
+    async def _send_request_with_refresh_retry(self, request, timeout_seconds=None):
+        self.sent.append(request)
+        if hasattr(request, "fromTimestamp") and hasattr(request, "toTimestamp"):
+            return self._OrderListRes(self._orders)
+        return object()
+
+    async def cancel_open_orders(self):
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+        source = CTraderLiveAdapter.cancel_open_orders
+        return await source(self)
+
+
+def _order(order_id, order_type):
+    return type("O", (), {"orderId": order_id, "orderType": order_type})()
+
+
+async def _cancel(orders):
+    adapter = _FakeCTraderAdapter(orders, [])
+    cancelled = await adapter.cancel_open_orders()
+    return adapter, cancelled
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_cancel_skips_market_orders_and_cancels_resting_ones():
+    adapter, cancelled = _run(
+        _cancel(
+            [
+                _order("mkt-1", 1),
+                _order("lim-1", 2),
+                _order("sltp-1", 4),
+                _order("stoplim-1", 6),
+            ]
+        )
+    )
+    assert cancelled == 3, "market orders fill immediately and cannot be cancelled"
+    ids = [getattr(r, "orderId", "") for r in adapter.sent]
+    assert "mkt-1" not in ids
+    assert {"lim-1", "sltp-1", "stoplim-1"} <= set(ids)
+
+
+def test_cancel_with_no_orders_is_a_no_op():
+    adapter, cancelled = _run(_cancel([]))
+    assert cancelled == 0
+    # The order-list request is still sent; only the cancel requests are absent.
+    assert all(not getattr(r, "orderId", "") for r in adapter.sent)
+
+
+def test_cancel_rejects_an_unexpected_response_type():
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _bad(request, timeout_seconds=None):
+        return "not-an-order-list-response"
+
+    adapter._send_request_with_refresh_retry = _bad
+    with pytest.raises(RuntimeError, match="Unexpected order-list response"):
+        _run(adapter.cancel_open_orders())
+
+
+def test_flatten_closes_every_open_position():
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [
+        type("P", (), {"positionId": "pos-1", "tradeData": None})(),
+        type("P", (), {"positionId": "pos-2", "tradeData": None})(),
+    ]
+    adapter = _FakeCTraderAdapter([], positions)
+
+    class _ReconcileRes:
+        pass
+
+    async def _reconcile(request, timeout_seconds=None):
+        return _ReconcileRes()
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+    closed = _run(CTraderLiveAdapter.close_all_positions(adapter))
+    assert closed == 2
+    closed_ids = [r.positionId for r in adapter.sent]
+    assert closed_ids == ["pos-1", "pos-2"]
+
+
+def test_flatten_skips_positions_without_an_id():
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [type("P", (), {"positionId": "", "tradeData": None})()]
+    adapter = _FakeCTraderAdapter([], positions)
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert adapter.sent == []
+
+
+def test_both_brokers_now_advertise_the_controls():
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+    from live_runner.base_adapter import BaseLiveAdapter
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    for adapter_cls in (AlpacaLiveAdapter, CTraderLiveAdapter):
+        assert adapter_cls.supports_cancel_orders.fget(object()) is True
+        assert adapter_cls.supports_flatten.fget(object()) is True
+
+    # A base adapter that implements neither must not claim support.
+    class _Bare(BaseLiveAdapter):
+        async def connect(self): ...
+        async def submit_order(self, signal, *, qty=None): return ""
+        async def listen_executions(self): ...
+        async def get_balance(self): return (0.0, 0.0)
+
+    bare = _Bare()
+    assert bare.supports_cancel_orders is False
+    assert bare.supports_flatten is False

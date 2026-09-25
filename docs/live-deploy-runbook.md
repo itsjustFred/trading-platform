@@ -85,7 +85,13 @@ Keep the daemon running long enough to verify Discord connection, paper order su
   Deployment wird also nie als "gestoppt/flat" gemeldet, wenn der Broker nicht
   tatsächlich flach gestellt wurde.
 
-Achtung: Derzeit unterstützt **kein** cTrader-Adapter `cancel_open_orders` oder
-`close_all_positions`. Eine cTrader-Deployment auf `STOPPED` bleibt daher
-faktisch auf `PAUSED`-Niveau und loggt einen Fehler pro Sync, bis die
-Adapter-Unterstützung nachgerüstet ist. Vorher `PAUSED` verwenden.
+Beide Broker implementieren die Kontrollen inzwischen:
+
+- **Alpaca:** `cancel_orders()` (Bulk) und `close_all_positions()`.
+- **cTrader:** `ProtoOAOrderListReq` + `ProtoOACancelOrderReq` für offene Orders
+  (Market-/Market-Range-Orders sind nicht stornierbar, da sofort ausgeführt) und
+  `ProtoOAClosePositionReq` je offener Position.
+
+Ein Adapter, der eine Aktion nicht kann, meldet das über
+`supports_cancel_orders` / `supports_flatten`; der Daemon verweigert dann die
+Erfolgsmeldung und versucht es im nächsten Sync erneut.

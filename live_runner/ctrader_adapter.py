@@ -366,6 +366,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
+                ProtoOACancelOrderReq,
+                ProtoOAClosePositionReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
                 ProtoOAErrorRes,
@@ -410,6 +412,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq = ProtoOASymbolsListReq
         self._ProtoOASymbolsListRes = ProtoOASymbolsListRes
         self._ProtoOANewOrderReq = ProtoOANewOrderReq
+        self._ProtoOACancelOrderReq = ProtoOACancelOrderReq
+        self._ProtoOAClosePositionReq = ProtoOAClosePositionReq
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
         self._ProtoOAErrorRes = ProtoOAErrorRes
@@ -1658,25 +1662,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             equity = _to_float(getattr(trader, "equity", balance)) / scale
         return balance, equity
 
-    async def get_positions(self) -> list[dict[str, Any]]:
-        """Return open positions with signed qty for exposure limits and exit-only sizing.
+    @property
+    def supports_cancel_orders(self) -> bool:
+        return True
 
-        qty uses the same unit convention as signal metadata 'qty'
-        (inverse of _resolve_order_volume: qty == broker volume / 1000).
-        current_price/unrealized_pnl are not available without a spot
-        subscription and are reported as 0.0.
-        """
+    @property
+    def supports_flatten(self) -> bool:
+        return True
+
+    async def _fetch_open_positions(self) -> list[Any]:
+        """Return raw open-position protos, shared by get_positions and flatten."""
         self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
-
         self._raise_if_terminal_auth_failed()
+
         reconcile_req = self._ProtoOAReconcileReq()
         reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
         try:
             reconcile_res = await self._send_request_with_refresh_retry(
-                reconcile_req,
-                timeout_seconds=15,
+                reconcile_req, timeout_seconds=15
             )
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
@@ -1686,14 +1691,108 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Unexpected reconcile response: {type(reconcile_res).__name__}"
             )
 
-        symbol_id_to_name = {
-            symbol_id: name for name, symbol_id in self._symbol_name_to_id.items()
-        }
-        payload: list[dict[str, Any]] = []
+        open_positions: list[Any] = []
         for position in getattr(reconcile_res, "position", []):
             status = int(getattr(position, "positionStatus", 0) or 0)
             if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
                 continue
+            if getattr(position, "tradeData", None) is None:
+                continue
+            open_positions.append(position)
+        return open_positions
+
+    async def cancel_open_orders(self) -> int:
+        """Cancel every working order for this cTrader account.
+
+        Used by the STOPPED path so a resting entry cannot fire after an
+        operator asked to stop. Orders that are already filled or cancelled are
+        skipped; only cancellable ones are counted.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+
+        order_list_req = self._ProtoOAOrderListReq()
+        order_list_req.ctidTraderAccountId = self.ctid_trader_account_id
+        order_list_req.fromTimestamp = 0
+        order_list_req.toTimestamp = 0
+        try:
+            order_list_res = await self._send_request_with_refresh_retry(
+                order_list_req, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(order_list_res, self._ProtoOAOrderListRes):
+            raise RuntimeError(
+                f"Unexpected order-list response: {type(order_list_res).__name__}"
+            )
+
+        # Market and market-range orders fill immediately and cannot be
+        # cancelled; everything else can still be resting.
+        cancellable = {
+            self._ProtoOAOrderType.LIMIT,
+            self._ProtoOAOrderType.STOP,
+            self._ProtoOAOrderType.STOP_LIMIT,
+            self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        }
+        cancelled = 0
+        for order in getattr(order_list_res, "orders", []) or []:
+            order_type = int(getattr(order, "orderType", 0) or 0)
+            order_id = str(getattr(order, "orderId", "") or "").strip()
+            if not order_id or order_type not in cancellable:
+                continue
+            cancel_req = self._ProtoOACancelOrderReq()
+            cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
+            cancel_req.orderId = order_id
+            try:
+                await self._send_request_with_refresh_retry(
+                    cancel_req, timeout_seconds=10
+                )
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                raise
+            cancelled += 1
+        return cancelled
+
+    async def close_all_positions(self) -> int:
+        """Close every open position for this cTrader account."""
+        positions = await self._fetch_open_positions()
+        closed = 0
+        for position in positions:
+            position_id = str(getattr(position, "positionId", "") or "").strip()
+            if not position_id:
+                continue
+            close_req = self._ProtoOAClosePositionReq()
+            close_req.ctidTraderAccountId = self.ctid_trader_account_id
+            close_req.positionId = position_id
+            # volume omitted => close the full position at market.
+            try:
+                await self._send_request_with_refresh_retry(
+                    close_req, timeout_seconds=15
+                )
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                raise
+            closed += 1
+        return closed
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        """Return open positions with signed qty for exposure limits and exit-only sizing.
+
+        qty uses the same unit convention as signal metadata 'qty'
+        (inverse of _resolve_order_volume: qty == broker volume / 1000).
+        current_price/unrealized_pnl are not available without a spot
+        subscription and are reported as 0.0.
+        """
+        open_positions = await self._fetch_open_positions()
+
+        symbol_id_to_name = {
+            symbol_id: name for name, symbol_id in self._symbol_name_to_id.items()
+        }
+        payload: list[dict[str, Any]] = []
+        for position in open_positions:
             trade_data = getattr(position, "tradeData", None)
             if trade_data is None:
                 continue
