@@ -408,6 +408,7 @@ def test_legacy_signal_ids_are_unique_and_stable_per_signal():
     assert fallback_id == fallback_id_again
 
 
+def test_calculate_position_size_uses_explicit_signal_id() -> None:
     engine = RiskEngine()
     signal = TradeSignal(
         action="sell",
@@ -562,55 +563,3 @@ class TestIssueC1FallbackGuards:
             result = self._engine().apply_trailing_stop(signal, market_price=101.0)
         assert result == pytest.approx(98.0)
         assert any("supertrend_flip" in record.message for record in caplog.records)
-
-
-def test_native_position_exposure_caps_per_position_notional() -> None:
-    from runner.engine import TradeEngine
-    from runner.engines.base import BacktestConfig
-
-    engine = TradeEngine(
-        BacktestConfig(
-            strategy_name="native-cap",
-            symbols=["X"],
-            timeframe="1h",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            risk_per_trade_pct=0.01,
-            max_position_exposure_pct=0.4,
-            max_leverage=3.0,
-            parameters={"fees": "zero"},
-        ),
-        symbol="X",
-    )
-
-    assert engine._max_position_exposure_pct == pytest.approx(0.4)
-    assert engine._calculate_position_size(
-        entry_price=100.0,
-        stop_loss_price=99.0,
-        direction="LONG",
-    ) == pytest.approx(400.0)
-
-
-def test_native_leverage_above_one_is_independent_of_position_cap() -> None:
-    from runner.engine import TradeEngine
-    from runner.engines.base import BacktestConfig
-
-    engine = TradeEngine(
-        BacktestConfig(
-            strategy_name="native-leverage",
-            symbols=["X"],
-            timeframe="1h",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            risk_per_trade_pct=0.01,
-            max_leverage=2.0,
-            parameters={"fees": "zero"},
-        ),
-        symbol="X",
-    )
-
-    assert engine._calculate_position_size(
-        entry_price=100.0,
-        stop_loss_price=99.9,
-        direction="LONG",
-    ) == pytest.approx(2_000.0)

@@ -117,7 +117,18 @@ def _windowed_curve(
 def _preserves_engine_curve(
     preserved_curve: list[EquityPoint] | None, daily_points: list[EquityPoint]
 ) -> bool:
-    return bool(preserved_curve)
+    if len(preserved_curve or ()) < 2 or not daily_points:
+        return False
+    try:
+        preserved_end = pd.to_datetime(
+            preserved_curve[-1].time, utc=True, errors="coerce"
+        )
+        daily_end = pd.to_datetime(daily_points[-1].time, utc=True, errors="coerce")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pd.isna(preserved_end) or pd.isna(daily_end):
+        return False
+    return preserved_end.date() >= daily_end.date()
 
 
 def _curve_frequency(points: list[EquityPoint]) -> str:

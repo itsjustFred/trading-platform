@@ -3608,6 +3608,31 @@ def test_exit_only_metadata_discards_untrusted_close_volume() -> None:
     assert "volume" not in adapter.submitted_signal.metadata
 
 
+def test_entry_metadata_discards_raw_broker_volume_but_keeps_risk_qty() -> None:
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[])
+    signal = _live_signal(deployment)
+    signal = signal.model_copy(
+        update={
+            "metadata": {
+                **signal.metadata,
+                "volume": 999_999,
+                "ctrader_volume": 888_888,
+            }
+        }
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_qty == pytest.approx(200.0)
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.metadata["qty"] == pytest.approx(200.0)
+    assert "volume" not in adapter.submitted_signal.metadata
+    assert "ctrader_volume" not in adapter.submitted_signal.metadata
+
+
 def test_exit_only_orders_close_short_positions_with_a_buy():
     """#76: an exit-only signal on a net-short book must submit a BUY that
     flattens the short magnitude instead of raising 'no long position'."""

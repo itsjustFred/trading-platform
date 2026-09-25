@@ -100,6 +100,26 @@ class TestToBacktestResult:
         assert result.meta.data["timeframes"] == ["1h"]
         assert result.meta.parameters == {"period": 14}
 
+    def test_settings_initial_capital_precedes_parsed_metadata(self):
+        ref = _make_minimal_valid_reference(
+            settings={"initial_capital": 12_345},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        result = ref.to_backtest_result()
+
+        assert result.meta.initial_capital == pytest.approx(12_345.0)
+
+    def test_parsed_metadata_supplies_missing_initial_capital(self):
+        ref = _make_minimal_valid_reference(
+            settings={},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        result = ref.to_backtest_result()
+
+        assert result.meta.initial_capital == pytest.approx(67_890.0)
+
     def test_trades_preserved(self):
         ref = _make_minimal_valid_reference()
         result = ref.to_backtest_result()

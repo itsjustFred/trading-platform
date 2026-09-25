@@ -172,6 +172,7 @@ def test_stats_reports_duplicate_equity_timestamps() -> None:
     assert stats["duplicate_equity_timestamps"] == 1
 
 
+def test_walkforward_purge_and_embargo_boundaries() -> None:
     windows = _build_windows(
         start="2024-01-01",
         end="2024-06-30",

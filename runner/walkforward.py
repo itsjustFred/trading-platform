@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 from datetime import datetime, timezone
+from numbers import Real
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -200,18 +201,53 @@ def _summary_from_folds(folds: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _parse_equity_timestamp(value: Any) -> pd.Timestamp | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, Real):
+            parsed = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+        else:
+            parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(parsed):
+        return None
+    return pd.Timestamp(parsed)
+
+
+def _daily_close_series(curve: list[dict[str, Any]]) -> pd.Series:
+    observations: list[tuple[pd.Timestamp, float]] = []
+    for point in curve or []:
+        try:
+            timestamp = _parse_equity_timestamp(point["time"])
+            equity = float(point["equity"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if timestamp is not None and math.isfinite(equity):
+            observations.append((timestamp, equity))
+    if not observations:
+        return pd.Series(dtype=float)
+    series = pd.Series(
+        [equity for _, equity in observations],
+        index=pd.DatetimeIndex([timestamp for timestamp, _ in observations]),
+        dtype=float,
+    ).sort_index(kind="stable")
+    series = series[~series.index.duplicated(keep="last")]
+    return series.resample("D").last().ffill().dropna()
+
+
 def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, float | None]:
     return_values: list[float] = []
     for fold in folds:
         curve = fold.get("oos_equity_curve")
         if not curve:
             continue
-        points = sorted(curve, key=lambda point: pd.Timestamp(point["time"]))
-        for previous, current in zip(points, points[1:], strict=False):
-            start = float(previous["equity"])
-            end = float(current["equity"])
+        daily_equity = _daily_close_series(curve)
+        values = daily_equity.to_numpy(dtype=float)
+        for start, end in zip(values, values[1:], strict=False):
             if start > 0 and math.isfinite(start) and math.isfinite(end):
-                return_values.append(end / start - 1.0)
+                return_values.append(float(end / start - 1.0))
     if len(return_values) < 2:
         return None, None
     mean = sum(return_values) / len(return_values)

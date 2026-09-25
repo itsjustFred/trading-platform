@@ -234,6 +234,33 @@ class TestAttachDailyEquity:
         assert result.equity_curve[0].equity == 100000.0
         assert result.equity_curve[-1].equity == 100500.0
 
+    def test_does_not_preserve_single_point_engine_curve(self):
+        result = make_result(
+            trades=[make_trade(pnl=500.0)],
+            equity_curve=[EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0)],
+        )
+
+        attach_daily_equity(result)
+
+        assert len(result.equity_curve) > 1
+        assert result.equity_curve[-1].equity == pytest.approx(100500.0)
+        assert result.meta.data["equity_frequency"] == "daily"
+
+    def test_does_not_preserve_stale_engine_curve(self):
+        result = make_result(
+            trades=[make_trade(pnl=500.0)],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=100500.0),
+            ],
+        )
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve[-1].equity == pytest.approx(100500.0)
+        assert len(result.equity_curve) > 2
+        assert result.meta.data["equity_frequency"] == "daily"
+
     def test_preserves_existing_equity_curve_when_longer(self):
         """Test that existing equity curve is preserved when it has more points."""
         result = make_result(

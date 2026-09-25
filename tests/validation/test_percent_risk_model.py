@@ -184,11 +184,21 @@ def test_risk_percent_zero_raises() -> None:
 
 
 def test_risk_percent_negative_raises() -> None:
-    config = PercentRiskConfig(risk_percent=-0.01)
+    with pytest.raises(ValueError, match="risk_percent must be between 0 and 1"):
+        PercentRiskConfig(risk_percent=-0.01)
+
+
+def test_risk_percent_upper_boundary_is_accepted() -> None:
+    config = PercentRiskConfig(risk_percent=1.0)
     model = PercentRiskModel(config)
     inp = _make_input(entry_price=100.0, stop_loss=99.0, account_balance=10_000.0)
-    with pytest.raises(ValueError, match="risk_percent must be > 0"):
-        model.size(inp)
+    result = model.size(inp)
+    assert result.profiles[0].risk_percent == pytest.approx(1.0)
+
+
+def test_risk_percent_above_one_raises() -> None:
+    with pytest.raises(ValueError, match="risk_percent must be between 0 and 1"):
+        PercentRiskConfig(risk_percent=1.01)
 
 
 # ─── Stop-loss equals entry ─────────────────────────────────────────────────

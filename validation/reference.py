@@ -96,13 +96,7 @@ class ValidationReference(BaseModel):
         curve and its evidence status are preserved; absent curve evidence
         remains explicit rather than being converted into numeric zeroes.
         """
-        raw_initial_capital = self.settings.get("initial_capital")
-        try:
-            initial_capital = float(raw_initial_capital)
-        except (TypeError, ValueError, OverflowError):
-            initial_capital = 100_000.0
-        if not math.isfinite(initial_capital) or initial_capital <= 0:
-            initial_capital = 100_000.0
+        initial_capital = resolve_initial_capital(self)
 
         meta = BacktestMeta(
             id=f"{self.strategy_name}_{self.source_framework}_{self.imported_at.strftime('%Y%m%d-%H%M%S')}",
@@ -130,3 +124,16 @@ class ValidationReference(BaseModel):
             drawings=[],
             equity_evidence_status=self.equity_evidence_status,
         )
+
+
+def resolve_initial_capital(reference: ValidationReference) -> float:
+    for source in (reference.settings, reference.raw_metadata.get("parsed_meta")):
+        if not isinstance(source, dict):
+            continue
+        try:
+            value = float(source.get("initial_capital"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return 100_000.0

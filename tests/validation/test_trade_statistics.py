@@ -46,6 +46,20 @@ def test_initial_capital_is_validated_even_without_trades() -> None:
         compute_trade_statistics([], initial_capital=0.0)
 
 
+def test_empty_result_persists_risk_free_rate() -> None:
+    stats = compute_trade_statistics([], risk_free_rate=0.0375)
+
+    assert stats.risk_free_rate == pytest.approx(0.0375)
+    assert isinstance(stats.risk_free_rate, float)
+
+
+def test_nonempty_result_persists_risk_free_rate() -> None:
+    stats = compute_trade_statistics([_make_trade(1, [10.0])], risk_free_rate=0.0375)
+
+    assert stats.risk_free_rate == pytest.approx(0.0375)
+    assert isinstance(stats.risk_free_rate, float)
+
+
 # ── 2. Single trade scenarios ──────────────────────────────────────────────
 
 
@@ -428,7 +442,9 @@ def test_break_even_trade_not_counted_as_winner_or_loser() -> None:
 # ── 17. Fees / net PnL (DV-B46) ────────────────────────────────────────────
 
 
-def _make_fee_trade(trade_id: int, exit_pnl: float, fees: float | None, net_pnl: float | None = None) -> Trade:
+def _make_fee_trade(
+    trade_id: int, exit_pnl: float, fees: float | None, net_pnl: float | None = None
+) -> Trade:
     exits = [TradeExit(time="2024-01-01T00:00:00Z", price=100.0, quantity=1.0, pnl=exit_pnl)]
     total = exit_pnl
     return Trade(
