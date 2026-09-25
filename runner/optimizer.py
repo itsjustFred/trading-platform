@@ -7,6 +7,7 @@ import math
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, NoReturn
 
 import optuna
@@ -19,7 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
-from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
+from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 from shared.database import load_backtest_result
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
@@ -127,6 +128,11 @@ class OptimizationConfig(BaseModel):
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
+    # Fraction of the window dropped between train and test so a trade open
+    # across the split cannot leak test information into training.
+    embargo_pct: float = Field(default=0.0, ge=0.0, le=0.4)
+    # Number of sequential walk-forward folds reported as a robustness check.
+    walk_forward_splits: int = Field(default=3, ge=1, le=20)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -561,11 +567,164 @@ def run_optimization(
         "train_stats": _json_safe(best_train_stats),
         "test_stats": _json_safe(test_stats),
         "top_trials": _top_trials_payload(study.trials, limit=10),
+        "diagnostics": _json_safe(
+            _build_diagnostics_payload(
+                trials=study.trials,
+                config=config,
+                train_period=train_period,
+                test_period=test_period,
+                target_metric=config.target_metric,
+                timeframe=str(execution_context.get("timeframe") or "") or None,
+            )
+        ),
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
     _emit_progress(progress_callback, 100.0, f"Optimization finished: {output_path.name}")
+    return payload
+
+
+# Canonical platform timeframe labels (as returned by normalize_timeframe) ->
+# bar duration in seconds. Expressed directly rather than via pandas offsets
+# because pd.Timedelta rejects non-fixed frequencies such as "D" and "W".
+#
+# normalize_timeframe passes through both the "5m" and the "m5" spellings, so
+# both families are listed.
+_TIMEFRAME_BAR_SECONDS: dict[str, float] = {
+    "1s": 1.0,
+    "5s": 5.0,
+    "10s": 10.0,
+    "15s": 15.0,
+    "30s": 30.0,
+    "1m": 60.0,
+    "3m": 180.0,
+    "5m": 300.0,
+    "15m": 900.0,
+    "30m": 1800.0,
+    "1h": 3600.0,
+    "2h": 7200.0,
+    "3h": 10800.0,
+    "4h": 14400.0,
+    "6h": 21600.0,
+    "8h": 28800.0,
+    "12h": 43200.0,
+    "1d": 86400.0,
+    "1w": 604800.0,
+    # "<unit><n>" spellings that normalize_timeframe leaves untouched.
+    "s1": 1.0,
+    "s5": 5.0,
+    "s10": 10.0,
+    "s15": 15.0,
+    "s30": 30.0,
+    "m1": 60.0,
+    "m3": 180.0,
+    "m5": 300.0,
+    "m15": 900.0,
+    "m30": 1800.0,
+    "h1": 3600.0,
+    "h2": 7200.0,
+    "h3": 10800.0,
+    "h4": 14400.0,
+    "h6": 21600.0,
+    "h8": 28800.0,
+    "h12": 43200.0,
+    "d1": 86400.0,
+    "w1": 604800.0,
+}
+
+
+def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
+    """Bar duration for a timeframe label, used to express the embargo in bars."""
+    seconds = _TIMEFRAME_BAR_SECONDS.get(normalize_timeframe(timeframe))
+    if seconds is None:
+        return None
+    return pd.Timedelta(seconds=seconds)
+
+
+def _build_diagnostics_payload(
+    *,
+    trials: Sequence[Any],
+    config: OptimizationConfig,
+    train_period: Mapping[str, str],
+    test_period: Mapping[str, str],
+    target_metric: str,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    """Attach honesty checks to the optimization result.
+
+    Reports how much the selected parameter should be trusted: whether the
+    optimum sits on a stable plateau, how much of the score is explained by
+    picking the best of many trials, and what the split/embargo actually was.
+    Never changes the selection; only annotates it.
+    """
+    from runner.optimization_diagnostics import (
+        embargo_split,
+        multiple_testing_correction,
+        plateau_analysis,
+        walk_forward_splits,
+    )
+
+    payload: dict[str, Any] = {}
+    bar_duration = _timeframe_bar_duration(timeframe)
+
+    # 1. Split geometry, including the gap between train and test.
+    try:
+        split = embargo_split(
+            train_period["start"],
+            test_period["end"],
+            train_split_pct=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+        payload["split"] = split.as_dict()
+    except (ValueError, KeyError) as exc:
+        payload["split"] = {"error": str(exc)}
+
+    # 2. Walk-forward folds, so the result is not a single lucky split.
+    try:
+        payload["walk_forward"] = walk_forward_splits(
+            train_period["start"],
+            test_period["end"],
+            n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
+            train_fraction=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+    except (ValueError, KeyError) as exc:
+        payload["walk_forward"] = {"error": str(exc)}
+
+    # 3. Plateau stability and selection bias over the evaluated trials.
+    trial_rows: list[dict[str, Any]] = []
+    for trial in trials or []:
+        params = getattr(trial, "params", None)
+        value = getattr(trial, "value", None)
+        if isinstance(params, dict) and isinstance(value, (int, float)):
+            trial_rows.append({**params, "metric": value})
+
+    # A plateau is only meaningful along a parameter that actually varied.
+    varied: dict[str, set[Any]] = {}
+    for row in trial_rows:
+        for key, value in row.items():
+            if key == "metric":
+                continue
+            varied.setdefault(key, set()).add(value)
+    candidates = [name for name, values in varied.items() if len(values) > 1]
+    if candidates:
+        # Pick the parameter explored most broadly: that is where a plateau (or
+        # its absence) says the most about robustness.
+        parameter = max(candidates, key=lambda name: len(varied[name]))
+        plateau = plateau_analysis(trial_rows, parameter=parameter, metric="metric")
+        payload["plateau"] = (
+            {"parameter": parameter, **plateau.as_dict()} if plateau else None
+        )
+    else:
+        payload["plateau"] = None
+
+    payload["multiple_testing"] = multiple_testing_correction(
+        [float(row["metric"]) for row in trial_rows]
+    )
+    payload["target_metric"] = target_metric
     return payload
 
 
