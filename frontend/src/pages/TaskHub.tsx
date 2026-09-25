@@ -19,8 +19,19 @@ const FINAL_STATUSES = new Set([
   "cancelled",
   "interrupted",
 ]);
+/**
+ * Statuses that are neither active nor a recognised terminal state are shown
+ * as "Needs Attention" rather than dropped.
+ *
+ * The database still holds rows written by older builds (e.g. 430 tasks in
+ * `manual_required`). Any status the current UI does not model used to be
+ * dropped from both lists, so those jobs became completely invisible: an
+ * operator had no way to know they existed. Anything unrecognised is now
+ * surfaced explicitly instead of silently disappearing.
+ */
 const TASK_POLL_MS = 3000;
 const COMPLETED_TASK_LIMIT = 100;
+const ATTENTION_TASK_LIMIT = 100;
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -164,8 +175,24 @@ export function TaskHubPage() {
     [tasks],
   );
 
+  const attentionTasks = useMemo(
+    () =>
+      tasks
+        .filter((task) => {
+          const status = String(task.status || "").toLowerCase();
+          if (!status) return true;
+          if (ACTIVE_STATUSES.has(status) || FINAL_STATUSES.has(status)) {
+            return false;
+          }
+          return true;
+        })
+        .sort(byNewest)
+        .slice(0, ATTENTION_TASK_LIMIT),
+    [tasks],
+  );
+
   const summary = useMemo(() => {
-    const counts = { running: 0, queued: 0, completed: 0, failed: 0 };
+    const counts = { running: 0, queued: 0, completed: 0, failed: 0, attention: 0 };
     for (const task of tasks) {
       const status = String(task.status || "").toLowerCase();
       if (status === "running" || status === "starting" || status === "paused")
@@ -173,6 +200,9 @@ export function TaskHubPage() {
       if (status === "queued") counts.queued += 1;
       if (status === "completed") counts.completed += 1;
       if (status === "failed" || status === "interrupted") counts.failed += 1;
+      const recognised =
+        ACTIVE_STATUSES.has(status) || FINAL_STATUSES.has(status);
+      if (!recognised) counts.attention += 1;
     }
     return counts;
   }, [tasks]);
@@ -241,7 +271,7 @@ export function TaskHubPage() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
           gap: "10px",
         }}
       >
@@ -249,6 +279,7 @@ export function TaskHubPage() {
         <SummaryCard label="Queued" value={summary.queued} />
         <SummaryCard label="Completed" value={summary.completed} />
         <SummaryCard label="Failed" value={summary.failed} failed />
+        <SummaryCard label="Needs attention" value={summary.attention} failed />
       </div>
 
       <section style={{ display: "grid", gap: "10px" }}>
@@ -395,6 +426,55 @@ export function TaskHubPage() {
               </div>
             );
           })}
+      </section>
+
+      <section style={{ display: "grid", gap: "10px" }}>
+        <div style={{ fontWeight: 700, fontSize: "1.03rem" }}>
+          Needs Attention
+          <span
+            style={{
+              marginLeft: "8px",
+              fontSize: "0.78rem",
+              fontWeight: 400,
+              color: "var(--color-text-muted)",
+            }}
+          >
+            jobs whose status this build does not recognise
+          </span>
+        </div>
+        {!loading && attentionTasks.length === 0 && (
+          <div style={cardStyle()}>No unrecognised jobs.</div>
+        )}
+        {!loading &&
+          attentionTasks.map((task) => (
+            <div
+              key={task.id || `${task.name}-${task.created_at}`}
+              style={cardStyle()}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  alignItems: "baseline",
+                }}
+              >
+                <strong>{task.name || task.id || "Task"}</strong>
+                <span
+                  style={{
+                    fontSize: "0.75rem",
+                    color: "var(--color-text-muted)",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {String(task.status || "unknown")}
+                </span>
+              </div>
+              <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
+                {taskMessage(task) || task.description || "No message recorded."}
+              </div>
+            </div>
+          ))}
       </section>
 
       <section style={{ display: "grid", gap: "10px" }}>
