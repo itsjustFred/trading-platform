@@ -7,9 +7,9 @@ BacktestResult objects.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -92,11 +92,20 @@ class ValidationReference(BaseModel):
         Callers needing a curve must build it explicitly instead of
         assuming this one is populated.
         """
+        raw_initial_capital = self.settings.get("initial_capital")
+        try:
+            initial_capital = float(raw_initial_capital)
+        except (TypeError, ValueError, OverflowError):
+            initial_capital = 100_000.0
+        if not math.isfinite(initial_capital) or initial_capital <= 0:
+            initial_capital = 100_000.0
+
         meta = BacktestMeta(
             id=f"{self.strategy_name}_{self.source_framework}_{self.imported_at.strftime('%Y%m%d-%H%M%S')}",
             created_at=self.imported_at.isoformat(),
             engine=self.source_framework,
             strategies=[self.strategy_name],
+            initial_capital=initial_capital,
             data={
                 "symbols": [self.symbol],
                 "timeframes": [self.timeframe],

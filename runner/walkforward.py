@@ -24,7 +24,6 @@ from runner.portfolio_optimizer import optimize_portfolio_allocation
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 
-
 WALKFORWARD_OUTPUT_DIR = DATA_DIR / "walkforward_results"
 
 
@@ -70,19 +69,32 @@ def _build_windows(
     train_months: int,
     test_months: int,
     step_months: int,
+    purge_days: int = 0,
+    embargo_days: int = 0,
 ) -> list[dict[str, str]]:
     if train_months <= 0 or test_months <= 0 or step_months <= 0:
         raise ValueError("train_months, test_months and step_months must all be > 0.")
+    if purge_days < 0 or embargo_days < 0:
+        raise ValueError("purge_days and embargo_days must be >= 0.")
 
     cursor = _parse_boundary(start)
     final_end = _parse_boundary(end, is_end=True)
     windows: list[dict[str, str]] = []
     while True:
         train_start = cursor
-        train_end = train_start + pd.DateOffset(months=train_months) - pd.Timedelta(microseconds=1)
-        test_start = train_end + pd.Timedelta(microseconds=1)
+        train_end = (
+            train_start
+            + pd.DateOffset(months=train_months)
+            - pd.Timedelta(microseconds=1)
+            - pd.Timedelta(days=purge_days)
+        )
+        test_start = (
+            train_end
+            + pd.Timedelta(microseconds=1)
+            + pd.Timedelta(days=embargo_days)
+        )
         test_end = test_start + pd.DateOffset(months=test_months) - pd.Timedelta(microseconds=1)
-        if test_end > final_end:
+        if test_end > final_end or train_end <= train_start:
             break
         windows.append(
             {
@@ -137,7 +149,9 @@ def _run_fold_backtest(
         attach_daily_equity(result, start=start, end=end)
     # Freshly computed canonical stats win over stale engine-provided stats.
     merge_canonical_stats(result)
-    return dict(result.stats)
+    stats = dict(result.stats)
+    stats["_equity_curve"] = [point.to_dict() for point in result.equity_curve]
+    return stats
 
 
 def _summary_from_folds(folds: list[dict[str, Any]]) -> dict[str, Any]:
@@ -152,13 +166,60 @@ def _summary_from_folds(folds: list[dict[str, Any]]) -> dict[str, Any]:
         if value is not None
     ]
     profitable = [value for value in oos_sharpes if value > 0]
+    aggregate_sharpe, aggregate_drawdown = _aggregate_oos_metrics(folds)
+    canonical_sharpe = (
+        aggregate_sharpe
+        if aggregate_sharpe is not None
+        else (sum(oos_sharpes) / len(oos_sharpes) if oos_sharpes else None)
+    )
     return {
         "fold_count": len(folds),
-        "avg_oos_sharpe": round(sum(oos_sharpes) / len(oos_sharpes), 6) if oos_sharpes else None,
+        "avg_oos_sharpe": (
+            round(canonical_sharpe, 6) if canonical_sharpe is not None else None
+        ),
+        "mean_fold_oos_sharpe": (
+            round(sum(oos_sharpes) / len(oos_sharpes), 6) if oos_sharpes else None
+        ),
+        "aggregate_oos_sharpe": (
+            round(aggregate_sharpe, 6) if aggregate_sharpe is not None else None
+        ),
+        "aggregate_oos_max_drawdown": (
+            round(aggregate_drawdown, 6) if aggregate_drawdown is not None else None
+        ),
         "worst_oos_drawdown": round(max(drawdowns), 6) if drawdowns else None,
         "n_profitable_folds": len(profitable),
-        "profitable_fold_pct": round((len(profitable) / len(oos_sharpes)) * 100, 4) if oos_sharpes else 0.0,
+        "profitable_fold_pct": (
+            round((len(profitable) / len(oos_sharpes)) * 100, 4) if oos_sharpes else 0.0
+        ),
     }
+
+
+def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, float | None]:
+    return_values: list[float] = []
+    for fold in folds:
+        curve = fold.get("oos_equity_curve")
+        if not curve:
+            continue
+        points = sorted(curve, key=lambda point: pd.Timestamp(point["time"]))
+        for previous, current in zip(points, points[1:], strict=False):
+            start = float(previous["equity"])
+            end = float(current["equity"])
+            if start > 0 and math.isfinite(start) and math.isfinite(end):
+                return_values.append(end / start - 1.0)
+    if len(return_values) < 2:
+        return None, None
+    mean = sum(return_values) / len(return_values)
+    variance = sum((value - mean) ** 2 for value in return_values) / len(return_values)
+    std = math.sqrt(variance)
+    sharpe = mean / std * math.sqrt(252.0) if std > 0 else 0.0
+    running = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    for value in return_values:
+        running *= 1.0 + value
+        peak = max(peak, running)
+        max_drawdown = max(max_drawdown, (peak - running) / peak)
+    return sharpe, max_drawdown
 
 
 def _write_payload(payload: dict[str, Any], output_dir: str | Path | None = None) -> Path:
@@ -179,30 +240,61 @@ def _run_portfolio_walkforward(
     step_months: int,
     n_trials: int,
     output_dir: str | Path | None,
+    start: str = "",
+    end: str = "",
+    purge_days: int = 0,
+    embargo_days: int = 0,
 ) -> dict[str, Any]:
-    result = optimize_portfolio_allocation(
-        backtest_ids=backtest_ids,
-        n_trials=n_trials,
-        train_months=train_months,
-        test_months=test_months,
-    )
-    fold = {
-        "fold": 1,
-        "is_sharpe": _metric(result, "sharpe", "sharpe_ratio"),
-        "oos_sharpe": result.get("oos_sharpe"),
-        "oos_max_drawdown": result.get("oos_max_drawdown"),
-    }
+    windows = None
+    if start and end:
+        windows = _build_windows(
+            start=start,
+            end=end,
+            train_months=train_months,
+            test_months=test_months,
+            step_months=step_months,
+            purge_days=purge_days,
+            embargo_days=embargo_days,
+        )
+    if windows is None:
+        windows = [None]
+
+    folds: list[dict[str, Any]] = []
+    for index, window in enumerate(windows, start=1):
+        result = optimize_portfolio_allocation(
+            backtest_ids=backtest_ids,
+            n_trials=n_trials,
+            train_months=train_months,
+            test_months=test_months,
+            start_date=window["train_start"] if window else None,
+            end_date=window["test_end"] if window else None,
+        )
+        folds.append(
+            {
+                "fold": index,
+                **(window or {}),
+                "is_sharpe": _metric(result, "sharpe", "sharpe_ratio"),
+                "oos_sharpe": result.get("oos_sharpe"),
+                "oos_max_drawdown": result.get("oos_max_drawdown"),
+                "oos_equity_curve": result.get("oos_equity_curve", []),
+            }
+        )
+
     payload = {
         "mode": "portfolio",
         "backtest_ids": backtest_ids,
         "config": {
+            "start": start,
+            "end": end,
             "train_months": train_months,
             "test_months": test_months,
             "step_months": step_months,
+            "purge_days": purge_days,
+            "embargo_days": embargo_days,
             "n_trials": n_trials,
         },
-        "folds": [fold],
-        "summary": _summary_from_folds([fold]),
+        "folds": folds,
+        "summary": _summary_from_folds(folds),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_payload(payload, output_dir)
@@ -232,6 +324,8 @@ def run_walkforward(
     backtest_ids: list[str] | None = None,
     n_trials: int = 100,
     max_position_pct: float | None = None,
+    purge_days: int = 0,
+    embargo_days: int = 0,
 ) -> dict[str, Any]:
     """Run generic strategy walk-forward validation.
 
@@ -251,6 +345,10 @@ def run_walkforward(
             step_months=step_months,
             n_trials=n_trials,
             output_dir=output_dir,
+            start=start,
+            end=end,
+            purge_days=purge_days,
+            embargo_days=embargo_days,
         )
 
     if not strategy:
@@ -278,6 +376,8 @@ def run_walkforward(
         train_months=train_months,
         test_months=test_months,
         step_months=step_months,
+        purge_days=purge_days,
+        embargo_days=embargo_days,
     )
 
     folds: list[dict[str, Any]] = []
@@ -306,6 +406,8 @@ def run_walkforward(
         test_stats = _run_fold_backtest(
             start=window["test_start"], end=window["test_end"], **fold_kwargs
         )
+        oos_curve = test_stats.pop("_equity_curve", [])
+        train_stats.pop("_equity_curve", None)
         folds.append(
             {
                 "fold": index,
@@ -315,6 +417,7 @@ def run_walkforward(
                 "oos_max_drawdown": _metric(test_stats, "max_drawdown_pct"),
                 "is_stats": train_stats,
                 "oos_stats": test_stats,
+                "oos_equity_curve": oos_curve,
             }
         )
 
@@ -331,6 +434,8 @@ def run_walkforward(
             "train_months": train_months,
             "test_months": test_months,
             "step_months": step_months,
+            "purge_days": purge_days,
+            "embargo_days": embargo_days,
             "risk_pct": risk_pct,
             "max_position_exposure_pct": max_position_exposure_pct,
             "max_leverage": max_leverage,

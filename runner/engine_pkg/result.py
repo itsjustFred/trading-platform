@@ -67,6 +67,14 @@ def build_result(
             "source": "ohlcv",
         },
         initial_capital=config.initial_capital,
+        risk_per_trade_pct=config.risk_per_trade_pct,
+        max_position_exposure_pct=config.max_position_exposure_pct,
+        max_leverage=config.max_leverage,
+        modeling_resolution=config.modeling_resolution,
+        signal_exit_fill=config.signal_exit_fill,
+        allow_fallback_stop=config.allow_fallback_stop,
+        reject_missing_stop=config.reject_missing_stop,
+        require_explicit_column_roles=config.require_explicit_column_roles,
         parameters=config.parameters,
     )
     return BacktestResult(

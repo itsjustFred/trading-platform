@@ -13,7 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +21,8 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
-from tests.helpers import sma_crossover_strategy_text, with_zero_fees
-
-
-from tests.helpers import deterministic_ohlcv_frame, write_ohlcv as _write_shared_ohlcv
+from tests.helpers import deterministic_ohlcv_frame, sma_crossover_strategy_text, with_zero_fees
+from tests.helpers import write_ohlcv as _write_shared_ohlcv
 
 STRATEGY = sma_crossover_strategy_text("vbt_sizing_sma", with_stop_loss=True)
 
@@ -138,9 +135,11 @@ class TestPortfolioEquityCurveSemantics:
         equity_by_time = {point.time: point.equity for point in result.equity_curve}
         initial = config.initial_capital
         exit_times = {str(trade.last_exit_time) for trade in result.trades}
-        assert set(equity_by_time) <= exit_times, (
-            "curve points must be stamped only at exit times"
+        initial_time = f"{config.start_date}T00:00:00+00:00"
+        assert set(equity_by_time) <= exit_times | {initial_time}, (
+            "curve points must be stamped at the initial boundary or exits"
         )
+        assert equity_by_time[initial_time] == pytest.approx(initial)
         for trade in result.trades:
             entry_time = str(trade.entry_time)
             # Entry timestamps that carry a curve point must still be at
@@ -292,7 +291,8 @@ def _sizing_env_from(frame: pd.DataFrame, *, stop: bool):
     text = STRATEGY
     if not stop:
         text = text.replace(
-            '        "stop_loss": pd.Series([df["close"].iloc[0] * 0.95] * len(df), index=df.index),\n',
+            '        "stop_loss": pd.Series('
+            '[df["close"].iloc[0] * 0.95] * len(df), index=df.index),\n',
             "",
         )
     strategy_path.write_text(text)

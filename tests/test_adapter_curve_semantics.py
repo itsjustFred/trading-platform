@@ -11,7 +11,6 @@ builders:
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -74,14 +73,14 @@ class TestNativeCurveSemantics:
 
         exit_times = {str(t.last_exit_time) for t in result.trades}
         entry_times = {str(t.entry_time) for t in result.trades}
-        assert set(point.time for point in result.equity_curve) <= exit_times | entry_times
-        # At least the first point must sit on an exit stamp (not an entry).
-        first_exit = min(
-            pd.Timestamp(t.last_exit_time) for t in result.trades
+        initial_time = f"{config.start_date}T00:00:00+00:00"
+        assert (
+            set(point.time for point in result.equity_curve)
+            <= exit_times | entry_times | {initial_time}
         )
-        assert pd.Timestamp(result.equity_curve[0].time) >= first_exit - pd.Timedelta(0), (
-            "curve points must be stamped at exits, not entries"
-        )
+        assert result.equity_curve[0].time == initial_time
+        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
+        assert pd.Timestamp(result.equity_curve[1].time) >= first_exit
 
     def test_meta_total_bars_is_bar_count(self, curve_env):
         config, strategy_path = curve_env
@@ -157,9 +156,10 @@ class TestNativeCurveExitOrder:
         )
         result = NativeAdapter().run(config, str(strategy_path))
         assert len(result.trades) == 2
-        assert len(result.equity_curve) == 2
+        assert len(result.equity_curve) == 3
         first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
-        assert pd.Timestamp(result.equity_curve[0].time) == first_exit
+        assert result.equity_curve[0].time == f"{config.start_date}T00:00:00+00:00"
+        assert pd.Timestamp(result.equity_curve[1].time) == first_exit
         stamps = [pd.Timestamp(p.time) for p in result.equity_curve]
         assert stamps == sorted(stamps)
         expected = config.initial_capital + sum(t.pnl for t in result.trades)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-
 
 # All exposure values are FRACTIONS OF ACCOUNT EQUITY in [0, 1]:
 #   - max_risk_per_trade: maximum loss on a single trade (as a fraction of
@@ -24,14 +24,28 @@ class RiskConfig:
     default_sl_atr_multiplier: float = 2.0
     fallback_stop_pct: float = 0.02
     max_notional_per_trade: float = 0.20
+    allow_fallback_stop: bool = True
+    reject_missing_stop: bool = False
 
     def __post_init__(self) -> None:
-        self.max_risk_per_trade = float(self.max_risk_per_trade)
-        self.max_total_exposure = float(self.max_total_exposure)
-        self.max_positions = int(self.max_positions)
-        self.default_sl_atr_multiplier = float(self.default_sl_atr_multiplier)
-        self.fallback_stop_pct = float(self.fallback_stop_pct)
-        self.max_notional_per_trade = float(self.max_notional_per_trade)
+        self.max_risk_per_trade = self._finite_float(
+            self.max_risk_per_trade, "max_risk_per_trade"
+        )
+        self.max_total_exposure = self._finite_float(
+            self.max_total_exposure, "max_total_exposure"
+        )
+        self.max_positions = self._positive_int(self.max_positions, "max_positions")
+        self.default_sl_atr_multiplier = self._finite_float(
+            self.default_sl_atr_multiplier, "default_sl_atr_multiplier"
+        )
+        self.fallback_stop_pct = self._finite_float(
+            self.fallback_stop_pct, "fallback_stop_pct"
+        )
+        self.max_notional_per_trade = self._finite_float(
+            self.max_notional_per_trade, "max_notional_per_trade"
+        )
+        self.allow_fallback_stop = self._bool(self.allow_fallback_stop, "allow_fallback_stop")
+        self.reject_missing_stop = self._bool(self.reject_missing_stop, "reject_missing_stop")
 
         if self.max_risk_per_trade <= 0:
             raise ValueError("max_risk_per_trade must be > 0")
@@ -45,3 +59,37 @@ class RiskConfig:
             raise ValueError("fallback_stop_pct must be between 0 and 1")
         if self.max_notional_per_trade <= 0:
             raise ValueError("max_notional_per_trade must be > 0")
+
+    @staticmethod
+    def _finite_float(value: object, field_name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field_name} must be numeric") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{field_name} must be finite")
+        return parsed
+
+    @staticmethod
+    def _positive_int(value: object, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be an integer")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError(f"{field_name} must be an integer")
+        return int(numeric)
+
+    @staticmethod
+    def _bool(value: object, field_name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        raise ValueError(f"{field_name} must be boolean")

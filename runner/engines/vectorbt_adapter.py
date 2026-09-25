@@ -15,6 +15,8 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+import math
+import traceback
 from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -31,8 +33,14 @@ from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
     resolve_ask_high_low,
     resolve_bar_spread,
+)
+from runner.engines._shared import (
     resolve_max_leverage as _resolve_max_leverage,
+)
+from runner.engines._shared import (
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+)
+from runner.engines._shared import (
     serialize_meta_value as _shared_serialize_meta_value,
 )
 from runner.engines.base import (
@@ -44,7 +52,14 @@ from runner.engines.base import (
 from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
 from shared.constants import DATA_DIR
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
+from shared.models import (
+    BacktestMeta,
+    BacktestResult,
+    EquityPoint,
+    IndicatorSeries,
+    Trade,
+    TradeExit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +88,20 @@ class _SizeRecord(TypedDict):
     capped_by_max_position: bool
     capped_by_max_leverage: bool
     qty: float
+    rejected: bool
+    rejection_reason: str | None
 
 
-def _warn_once(key: tuple[str, str, str], message: str, *args: Any) -> None:
-    if key in _RISK_WARNING_KEYS:
+def _warn_once(
+    key: tuple[str, str, str],
+    message: str,
+    *args: Any,
+    warning_keys: set[tuple[str, str, str]] | None = None,
+) -> None:
+    keys = _RISK_WARNING_KEYS if warning_keys is None else warning_keys
+    if key in keys:
         return
-    _RISK_WARNING_KEYS.add(key)
+    keys.add(key)
     logger.warning(message, *args)
 
 
@@ -140,6 +163,7 @@ def _size_trade(
     entry_idx: int,
     symbol: str,
     trade_counter: int,
+    warning_keys: set[tuple[str, str, str]] | None = None,
 ) -> _SizeRecord:
     """Size one trade and return the full risk-math record.
 
@@ -147,6 +171,10 @@ def _size_trade(
     configured, otherwise full-equity sizing. Warnings are emitted once per
     (symbol, timeframe, reason).
     """
+    if not math.isfinite(float(equity)) or equity <= 0:
+        raise ValueError("equity must be finite and > 0")
+    if not math.isfinite(float(entry_price)) or entry_price <= 0:
+        raise ValueError("entry_price must be finite and > 0")
     risk_target_usd: float | None = None
     stop_distance: float | None = None
     max_position_exposure_pct: float | None = None
@@ -158,6 +186,8 @@ def _size_trade(
     capped_by_max_position = False
     capped_by_max_leverage = False
     sizing_mode = "full_equity"
+    rejected = False
+    rejection_reason: str | None = None
 
     if config.risk_per_trade_pct is not None and config.risk_per_trade_pct > 0:
         sizing_mode = "risk_pct"
@@ -179,13 +209,43 @@ def _size_trade(
         )
 
         if not stop_distance or stop_distance <= 0:
-            stop_distance = entry_price * 0.02
-            _warn_once(
-                (symbol, config.timeframe, "fallback_stop"),
-                "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
-                symbol,
-                config.timeframe,
-                2.0,
+            if config.reject_missing_stop or not config.allow_fallback_stop:
+                rejected = True
+                rejection_reason = "missing_stop"
+                _warn_once(
+                    (symbol, config.timeframe, "missing_stop"),
+                    "Rejecting %s/%s: no stop_loss/ATR and fallback sizing is disabled",
+                    symbol,
+                    config.timeframe,
+                    warning_keys=warning_keys,
+                )
+            else:
+                stop_distance = entry_price * 0.02
+                _warn_once(
+                    (symbol, config.timeframe, "fallback_stop"),
+                    "Risk sizing fallback for %s/%s: no stop_loss/ATR, using %.2f%% default stop",
+                    symbol,
+                    config.timeframe,
+                    2.0,
+                    warning_keys=warning_keys,
+                )
+
+        if rejected:
+            return _SizeRecord(
+                sizing_mode="rejected",
+                risk_target_usd=risk_target_usd,
+                stop_distance=None,
+                max_position_exposure_pct=max_position_exposure_pct,
+                max_leverage=max_leverage,
+                required_notional=None,
+                cap_notional=None,
+                leverage_notional_limit=None,
+                final_notional=None,
+                capped_by_max_position=False,
+                capped_by_max_leverage=False,
+                qty=0.0,
+                rejected=True,
+                rejection_reason=rejection_reason,
             )
 
         base_qty = risk_target_usd / stop_distance
@@ -203,7 +263,9 @@ def _size_trade(
             final_notional = binding_notional
             if capped_by_max_leverage and not capped_by_max_position:
                 logger.info(
-                    "Leverage bound notional for %s trade %s: required_notional=%.2f exceeds leverage limit=%.2f (max_leverage=%.2fx)",
+                    "Leverage bound notional for %s trade %s: "
+                    "required_notional=%.2f exceeds leverage limit=%.2f "
+                    "(max_leverage=%.2fx)",
                     symbol,
                     trade_counter,
                     required_notional,
@@ -217,6 +279,7 @@ def _size_trade(
                 config.timeframe,
                 cap_notional,
                 max_leverage,
+                warning_keys=warning_keys,
             )
 
         qty = final_notional / entry_price
@@ -241,6 +304,8 @@ def _size_trade(
         capped_by_max_position=capped_by_max_position,
         capped_by_max_leverage=capped_by_max_leverage,
         qty=qty,
+        rejected=rejected,
+        rejection_reason=rejection_reason,
     )
 
 
@@ -250,6 +315,7 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
+    warning_keys: set[tuple[str, str, str]] | None = None,
 ) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries], int]:
     """Process a single symbol: load data, generate signals, extract trades.
 
@@ -296,13 +362,19 @@ def _process_symbol(
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
 
     signal_output = _call_generate_signals(strategy_mod, df, resolved_parameters)
-    signals, indicators, drawings = _normalize_signal_output(signal_output, df.index, symbol=symbol)
-    indicator_series = _build_indicator_series(df, indicators)
     column_roles = resolved_parameters.get("column_roles")
+    signals, indicators, drawings = _normalize_signal_output(
+        signal_output,
+        df.index,
+        symbol=symbol,
+        column_roles=column_roles if isinstance(column_roles, dict) else None,
+    )
+    indicator_series = _build_indicator_series(df, indicators)
     execution_signals, execution_indicators = _prepare_next_open_execution_data(
         signals,
         indicators,
         column_roles if isinstance(column_roles, dict) else None,
+        require_explicit_roles=bool(config.require_explicit_column_roles),
     )
     entries = execution_signals["entries"]
     exits = execution_signals["exits"]
@@ -342,7 +414,8 @@ def _process_symbol(
             # Entry leg executes next-open (shifted index = execution bar).
             in_trade = True
             entry_idx = i
-        if in_trade and bool(exits.iloc[i]):
+        is_terminal_bar = i == len(df) - 1
+        if in_trade and (bool(exits.iloc[i]) or is_terminal_bar):
             # D4 (A-M1): the exit leg stays on the trigger bar, so an exit
             # may fire on the entry execution bar itself (same-bar open
             # fill -> close exit), exactly like the native engine which
@@ -376,6 +449,8 @@ def _process_symbol(
                 direction=direction,
             )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
+            if is_terminal_bar and not bool(exits.iloc[i]):
+                exit_reason = "end_of_data"
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
@@ -418,7 +493,9 @@ def _process_symbol(
                 entry_idx=entry_idx,
                 symbol=symbol,
                 trade_counter=trade_counter,
+                warning_keys=warning_keys,
             )
+
             qty = sizing["qty"]
             sizing_mode = sizing["sizing_mode"]
             risk_target_usd = sizing["risk_target_usd"]
@@ -431,8 +508,11 @@ def _process_symbol(
             final_notional = sizing["final_notional"]
             capped_by_max_position = sizing["capped_by_max_position"]
             capped_by_max_leverage = sizing["capped_by_max_leverage"]
+            if sizing["rejected"]:
+                continue
 
             if stop_price is None and stop_distance is not None and stop_distance > 0:
+
                 stop_price = (
                     entry_price - stop_distance
                     if direction == "LONG"
@@ -469,7 +549,10 @@ def _process_symbol(
                         direction,
                         stop_price,
                         entry_price,
+                        warning_keys=warning_keys,
                     )
+
+
                     continue
 
             if stop_distance is None and stop_price is not None:
@@ -478,7 +561,9 @@ def _process_symbol(
             trade_meta["risk_math"] = {
                 "sizing_mode": sizing_mode,
                 "equity_at_entry": round(equity, 2),
-                "risk_target_usd": round(risk_target_usd, 2) if risk_target_usd is not None else None,
+                "risk_target_usd": (
+                    round(risk_target_usd, 2) if risk_target_usd is not None else None
+                ),
                 "entry_price": round(entry_price, 6),
                 "sl_price": round(stop_price, 6) if stop_price is not None else None,
                 "stop_distance": round(stop_distance, 6) if stop_distance is not None else None,
@@ -513,6 +598,8 @@ def _process_symbol(
                 "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
                 "capped_by_max_position": capped_by_max_position,
                 "capped_by_max_leverage": capped_by_max_leverage,
+                "rejected": sizing["rejected"],
+                "rejection_reason": sizing["rejection_reason"],
             }
 
             if direction == "LONG":
@@ -584,20 +671,55 @@ class VectorbtAdapter(EngineAdapter):
         used_timeframes = [config.timeframe]
         total_loaded_bars = 0
         total_inverted_drops = 0
+        run_warning_keys: set[tuple[str, str, str]] = set()
+        _RISK_WARNING_KEYS.clear()
 
         num_symbols = len(config.symbols)
         use_parallel = num_symbols > 1
+        symbol_errors: list[tuple[str, Exception]] = []
+        try:
+            process_parameters = inspect.signature(_process_symbol).parameters.values()
+            accepts_warning_keys = any(
+                parameter.name == "warning_keys"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in process_parameters
+            )
+        except (TypeError, ValueError):
+            accepts_warning_keys = True
+        process_kwargs = {"warning_keys": run_warning_keys} if accepts_warning_keys else {}
+
+        def _raise_symbol_errors() -> None:
+            if not symbol_errors:
+                return
+            details = "; ".join(
+                f"{symbol}: {type(exc).__name__}: {exc}"
+                for symbol, exc in symbol_errors
+            )
+            error = RuntimeError(
+                f"Vectorbt backtest failed for symbol(s): {details}"
+            )
+            error.worker_errors = tuple(symbol_errors)
+            for symbol, exc in symbol_errors[1:]:
+                error.add_note(
+                    f"{symbol}: {''.join(traceback.format_exception(exc))}"
+                )
+            raise error from symbol_errors[0][1]
 
         if use_parallel:
             max_workers = min(num_symbols, MAX_PARALLEL_WORKERS)
-            symbol_errors: list[tuple[str, Exception]] = []
             logger.info(
                 "Parallel backtest: %d symbols across %d workers", num_symbols, max_workers
             )
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(
-                        _process_symbol, sym, config, strategy_path, resolved_parameters, data_root
+                        _process_symbol,
+                        sym,
+                        config,
+                        strategy_path,
+                        resolved_parameters,
+                        data_root,
+                        **process_kwargs,
                     ): sym
                     for sym in config.symbols
                 }
@@ -623,23 +745,30 @@ class VectorbtAdapter(EngineAdapter):
                     except Exception as exc:
                         logger.exception("Failed processing symbol %s", sym)
                         symbol_errors.append((sym, exc))
-            if symbol_errors:
-                failed_symbols = ", ".join(symbol for symbol, _ in symbol_errors)
-                raise RuntimeError(
-                    f"Vectorbt backtest failed for symbol(s): {failed_symbols}"
-                ) from symbol_errors[0][1]
+            _raise_symbol_errors()
+
         else:
             for symbol in config.symbols:
-                (
-                    trades,
-                    extra_tfs,
-                    drawings,
-                    indicator_series,
-                    loaded_bars,
-                    inverted_drops,
-                ) = _process_symbol(
-                    symbol, config, strategy_path, resolved_parameters, data_root
-                )
+                try:
+                    (
+                        trades,
+                        extra_tfs,
+                        drawings,
+                        indicator_series,
+                        loaded_bars,
+                        inverted_drops,
+                    ) = _process_symbol(
+                        symbol,
+                        config,
+                        strategy_path,
+                        resolved_parameters,
+                        data_root,
+                        **process_kwargs,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed processing symbol %s", symbol)
+                    symbol_errors.append((symbol, exc))
+                    continue
                 total_loaded_bars += loaded_bars
                 total_inverted_drops += inverted_drops
                 all_trades.extend(trades)
@@ -648,6 +777,7 @@ class VectorbtAdapter(EngineAdapter):
                 for tf in extra_tfs:
                     if tf not in used_timeframes:
                         used_timeframes.append(tf)
+            _raise_symbol_errors()
 
         # Renumber trade IDs sequentially after merge
         all_trades.sort(key=lambda t: t.entry_time)
@@ -675,7 +805,13 @@ class VectorbtAdapter(EngineAdapter):
             from runner.engines._shared import replay_shared_equity
 
             all_trades, shared_equity_curve, shared_summary = replay_shared_equity(
-                all_trades, config.initial_capital
+                all_trades,
+                config.initial_capital,
+                start_time=(
+                    f"{config.start_date}T00:00:00+00:00"
+                    if len(config.start_date) == 10
+                    else config.start_date
+                ),
             )
             # Renumber again: the replay re-sorts chronologically by entry.
             all_trades.sort(key=lambda t: t.entry_time)
@@ -694,7 +830,16 @@ class VectorbtAdapter(EngineAdapter):
             # same). Drawdown/Sharpe computed on this curve describe the realized
             # portfolio, not an intraday mark-to-market path — the limitation is
             # documented in the cross-engine contract.
-            all_equity: list[EquityPoint] = []
+            all_equity: list[EquityPoint] = [
+                EquityPoint(
+                    time=(
+                        f"{config.start_date}T00:00:00+00:00"
+                        if len(config.start_date) == 10
+                        else config.start_date
+                    ),
+                    equity=round(config.initial_capital, 2),
+                )
+            ]
             equity = config.initial_capital
             for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
                 # #84: portfolio replay accumulates NET pnl.
@@ -703,12 +848,14 @@ class VectorbtAdapter(EngineAdapter):
                     if trade.net_pnl is not None
                     else float(trade.pnl) - float(trade.fees or 0.0)
                 )
-                all_equity.append(
-                    EquityPoint(
-                        time=trade.last_exit_time or trade.entry_time,
-                        equity=round(equity, 2),
-                    )
+                point = EquityPoint(
+                    time=trade.last_exit_time or trade.entry_time,
+                    equity=round(equity, 2),
                 )
+                if all_equity[-1].time == point.time:
+                    all_equity[-1] = point
+                else:
+                    all_equity.append(point)
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
@@ -754,6 +901,14 @@ class VectorbtAdapter(EngineAdapter):
                 "shared_equity": shared_summary,
             },
             initial_capital=config.initial_capital,
+            risk_per_trade_pct=config.risk_per_trade_pct,
+            max_position_exposure_pct=config.max_position_exposure_pct,
+            max_leverage=config.max_leverage,
+            modeling_resolution=config.modeling_resolution,
+            signal_exit_fill=config.signal_exit_fill,
+            allow_fallback_stop=config.allow_fallback_stop,
+            reject_missing_stop=config.reject_missing_stop,
+            require_explicit_column_roles=config.require_explicit_column_roles,
             parameters=resolved_parameters,
         )
 
@@ -780,12 +935,41 @@ def _normalize_signal_output(
     index: pd.Index,
     *,
     symbol: str,
+    column_roles: Mapping[str, str] | None = None,
 ) -> tuple[pd.DataFrame, IndicatorMap, DrawingList]:
     if isinstance(output, pd.DataFrame):
-        if "entries" not in output.columns or "exits" not in output.columns:
-            raise ValueError("Strategy DataFrame output must include 'entries' and 'exits' columns")
         signals = output.copy()
         signals.index = index
+        if "entries" not in signals.columns or "exits" not in signals.columns:
+            roles = {
+                str(name): str(role).strip().lower()
+                for name, role in (column_roles or {}).items()
+            }
+            entry_columns = [
+                name for name in signals.columns
+                if str(name).lower() == "entries" or roles.get(str(name)) == "entry"
+            ]
+            exit_columns = [
+                name for name in signals.columns
+                if str(name).lower() == "exits" or roles.get(str(name)) == "exit"
+            ]
+            if not entry_columns or not exit_columns:
+                raise ValueError(
+                    "Strategy DataFrame output must include entry and exit columns "
+                    "or explicit column_roles"
+                )
+            signals["entries"] = _coerce_boolean_series(
+                signals[entry_columns[0]], index
+            )
+            for name in entry_columns[1:]:
+                signals["entries"] = signals["entries"] | _coerce_boolean_series(
+                    signals[name], index
+                )
+            signals["exits"] = _coerce_boolean_series(signals[exit_columns[0]], index)
+            for name in exit_columns[1:]:
+                signals["exits"] = signals["exits"] | _coerce_boolean_series(
+                    signals[name], index
+                )
         signals["entries"] = _coerce_boolean_series(signals["entries"], index)
         signals["exits"] = _coerce_boolean_series(signals["exits"], index)
         return signals, {}, []
@@ -870,6 +1054,8 @@ def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
     explicit_roles: Mapping[str, str] | None = None,
+    *,
+    require_explicit_roles: bool = False,
 ) -> tuple[pd.DataFrame, IndicatorMap]:
     """Split strategy output into execution timing (D4, A-M1).
 
@@ -881,6 +1067,37 @@ def _prepare_next_open_execution_data(
       exit-when series: exit_price, exit_reason, exit_*, exit_meta_*) stays
       UNSHIFTED, so both engines price the same bar's close.
     """
+    roles = dict(explicit_roles or {})
+    if require_explicit_roles:
+        canonical = {
+            "entries",
+            "exits",
+            "stop_loss",
+            "sl_price",
+            "take_profit",
+            "tp_price",
+            "atr",
+            "direction",
+            "entry_stop",
+            "exit_price",
+            "exit_reason",
+        }
+        for column in signals.columns:
+            if str(column).lower() not in canonical and str(column) not in roles:
+                raise ValueError(
+                    f"Signal column {column!r} has no explicit entry/exit role"
+                )
+        for name in indicators:
+            if str(name) not in roles and not str(name).lower().startswith("meta_"):
+                raise ValueError(
+                    f"Indicator {name!r} has no explicit entry/exit role"
+                )
+    for column, role in roles.items():
+        if str(role).strip().lower() not in {"entry", "exit"}:
+            raise ValueError(
+                f"Invalid column role for {column!r}: expected 'entry' or 'exit'"
+            )
+
     execution_signals = pd.DataFrame(index=signals.index)
     for column in signals.columns:
         raw = signals[column]
@@ -897,7 +1114,10 @@ def _prepare_next_open_execution_data(
 
     execution_indicators: IndicatorMap = {}
     for name, (series, explicit_when) in indicators.items():
-        when = _infer_indicator_when(name, explicit_when)
+        when = _infer_indicator_when(
+            name,
+            str(roles.get(name, "")).strip().lower() or explicit_when,
+        )
         if when == "exit":
             shifted_series = series.copy()
         else:
@@ -1208,8 +1428,14 @@ def _resolve_stop_distance(
 
     if atr_series is not None:
         atr = atr_series.iloc[entry_idx]
-        if pd.notna(atr) and float(atr) > 0:
-            return float(atr)
+        if not pd.isna(atr):
+            try:
+                atr_value = float(atr)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("ATR value must be numeric") from exc
+            if not math.isfinite(atr_value) or atr_value <= 0:
+                raise ValueError("ATR value must be finite and > 0")
+            return atr_value
 
     return None
 
@@ -1223,7 +1449,10 @@ def _load_ohlcv(
 ) -> tuple[pd.DataFrame | None, Path | None]:
     """Find and load OHLCV parquet for a symbol."""
     ohlcv_root = data_root / "ohlcv"
-    matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return None, None
 

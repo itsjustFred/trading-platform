@@ -17,8 +17,8 @@ from shared.models import BacktestMeta, BacktestResult, Trade
 from validation.comparison.anomalies import AnomalyDetector
 from validation.comparison.comparison import (
     MatchedTrade,
-    TradeComparisonConfig,
     TradeComparator,
+    TradeComparisonConfig,
 )
 from validation.comparison.delta_report import (
     DeltaReportBuilder,
@@ -416,8 +416,16 @@ def generate_json_report(
         # C4: single canonical computation path — always recompute from
         # trades on both sides, never prefer stored/curated numbers
         # (comparing recomputed vs stored stats is apples vs oranges).
-        ref_stats = compute_trade_statistics(reference.trades)
-        act_stats = compute_trade_statistics(platform_bt.trades)
+        reference_initial_capital = reference.to_backtest_result().meta.initial_capital
+        platform_initial_capital = platform_bt.meta.initial_capital
+        ref_stats = compute_trade_statistics(
+            reference.trades,
+            initial_capital=reference_initial_capital,
+        )
+        act_stats = compute_trade_statistics(
+            platform_bt.trades,
+            initial_capital=platform_initial_capital,
+        )
         stat_deltas: list[StatDelta] = _compare_stats(
             ref_stats, act_stats, abs_tol=stats_abs_tol, rel_tol=stats_rel_tol
         )

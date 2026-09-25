@@ -348,10 +348,14 @@ def _coerce_live_float(
     field_name: str,
     minimum: float | None = None,
 ) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field_name}: {value!r}")
     try:
         parsed = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite")
     if minimum is not None and parsed < minimum:
         raise ValueError(f"{field_name} must be >= {minimum}")
     return parsed
@@ -363,10 +367,15 @@ def _coerce_live_int(
     field_name: str,
     minimum: int | None = None,
 ) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid {field_name}: {value!r}")
     try:
-        parsed = int(float(value))
-    except (TypeError, ValueError) as exc:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"Invalid {field_name}: {value!r}") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{field_name} must be an integer")
+    parsed = int(numeric)
     if minimum is not None and parsed < minimum:
         raise ValueError(f"{field_name} must be >= {minimum}")
     return parsed
@@ -392,6 +401,10 @@ def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
     max_total_exposure_raw = settings.get("max_total_exposure", 0.05)
     max_positions_raw = settings.get("max_positions", 5)
     sl_multiplier_raw = settings.get("default_sl_atr_multiplier", 2.0)
+    fallback_stop_pct_raw = settings.get("fallback_stop_pct", 0.02)
+    max_notional_raw = settings.get("max_notional_per_trade", 0.20)
+    allow_fallback_raw = settings.get("allow_fallback_stop", True)
+    reject_missing_raw = settings.get("reject_missing_stop", False)
 
     return RiskConfig(
         max_risk_per_trade=_coerce_live_float(
@@ -410,6 +423,18 @@ def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
             field_name="default_sl_atr_multiplier",
             minimum=0.0,
         ),
+        fallback_stop_pct=_coerce_live_float(
+            fallback_stop_pct_raw,
+            field_name="fallback_stop_pct",
+            minimum=0.0,
+        ),
+        max_notional_per_trade=_coerce_live_float(
+            max_notional_raw,
+            field_name="max_notional_per_trade",
+            minimum=0.0,
+        ),
+        allow_fallback_stop=allow_fallback_raw,
+        reject_missing_stop=reject_missing_raw,
     )
 
 

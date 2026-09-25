@@ -22,7 +22,6 @@ from shared.models import Trade, TradeExit
 from validation.risk.fixed_risk import FixedRiskConfig, FixedRiskModel
 from validation.risk.models import RiskSizingInput
 
-
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 
@@ -120,10 +119,8 @@ def test_negative_stop_loss() -> None:
     config = FixedRiskConfig(risk_amount=100.0)
     model = FixedRiskModel(config)
     inp = _make_input(entry_price=50.0, stop_loss=-50.0)
-    result = model.size(inp)
-    # distance = abs(50 - (-50)) = 100
-    assert result.profiles[0].position_size == pytest.approx(1.0)
-    assert result.profiles[0].risk_amount == pytest.approx(100.0)
+    with pytest.raises(ValueError, match="stop_loss must be finite and > 0"):
+        model.size(inp)
 
 
 def test_stop_equals_entry_raises() -> None:
@@ -138,9 +135,8 @@ def test_zero_stop_loss_with_nonzero_entry() -> None:
     config = FixedRiskConfig(risk_amount=100.0)
     model = FixedRiskModel(config)
     inp = _make_input(entry_price=100.0, stop_loss=0.0)
-    result = model.size(inp)
-    # distance = 100
-    assert result.profiles[0].position_size == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="stop_loss must be finite and > 0"):
+        model.size(inp)
 
 
 # ─── Lot rounding ───────────────────────────────────────────────────────────

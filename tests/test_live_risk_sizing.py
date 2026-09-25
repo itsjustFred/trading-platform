@@ -272,8 +272,7 @@ def test_risk_config_rejects_non_positive_notional_cap():
         RiskConfig(max_notional_per_trade=-0.1)
 
 
-def test_size_live_signal_never_raises_on_out_of_domain_metadata():
-    """Out-of-domain metadata (crash vector from finding r3) is inert."""
+def test_size_live_signal_rejects_malformed_present_metadata():
     signal = _signal(
         {
             "entry_price": "not-a-number",
@@ -284,9 +283,5 @@ def test_size_live_signal_never_raises_on_out_of_domain_metadata():
         }
     )
 
-    sized = size_live_signal(signal, account_balance=10000.0)
-
-    # entry_price falls back to theoretical_price; sizing proceeds normally.
-    assert sized.decision is not None
-    assert sized.decision.accepted is True
-    assert sized.position_size > 0
+    with pytest.raises(ValueError, match="entry_price"):
+        size_live_signal(signal, account_balance=10000.0)

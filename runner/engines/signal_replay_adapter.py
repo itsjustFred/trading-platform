@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from signal_bots.registry import get_signal_processor
 
@@ -46,8 +47,8 @@ def _to_optional_float(value: Any) -> float | None:
         return None
     try:
         numeric = float(value)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric value: {value!r}") from exc
     if pd.isna(numeric):
         return None
     return numeric
@@ -92,11 +93,15 @@ class ReplaySignal:
         timestamp = _to_timestamp(payload.get("timestamp"))
         action = _coerce_action(payload.get("action"))
         entry_price = float(payload.get("entry_price"))
-        if entry_price <= 0:
-            raise ValueError("entry_price must be > 0")
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError("entry_price must be finite and > 0")
 
         stop_loss = _to_optional_float(payload.get("stop_loss"))
         take_profit = _to_optional_float(payload.get("take_profit"))
+        if stop_loss is not None and (not math.isfinite(stop_loss) or stop_loss <= 0):
+            raise ValueError("stop_loss must be finite and > 0")
+        if take_profit is not None and (not math.isfinite(take_profit) or take_profit <= 0):
+            raise ValueError("take_profit must be finite and > 0")
 
         return cls(
             timestamp=timestamp,
@@ -707,13 +712,27 @@ class SignalReplayAdapter:
             trade.id = idx
 
         running_equity = float(self.initial_capital)
-        equity_curve: list[EquityPoint] = []
+        curve_start = pd.to_datetime(
+            backtest_start or (closed_trades[0].entry_time if closed_trades else ""),
+            utc=True,
+            errors="coerce",
+        )
+        if pd.isna(curve_start):
+            curve_start = pd.Timestamp.now(tz="UTC")
+        equity_curve: list[EquityPoint] = [
+            EquityPoint(time=pd.Timestamp(curve_start).isoformat(), equity=round(running_equity, 2))
+        ]
         for trade in closed_trades:
             # #84: the equity path accumulates NET pnl.
             running_equity += _net_pnl_of(trade)
-            equity_curve.append(
-                EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2))
+            point = EquityPoint(
+                time=trade.last_exit_time,
+                equity=round(running_equity, 2),
             )
+            if equity_curve[-1].time == point.time:
+                equity_curve[-1] = point
+            else:
+                equity_curve.append(point)
 
         signal_sources = self._collect_signal_sources(replay_signals)
         tags = ["signal-replay", "signal_replay", *[f"source:{source}" for source in signal_sources]]
@@ -733,6 +752,14 @@ class SignalReplayAdapter:
                 "source": ",".join(signal_sources) if signal_sources else "internal",
             },
             initial_capital=float(self.initial_capital),
+            risk_per_trade_pct=float(self.risk_config.max_risk_per_trade),
+            max_position_exposure_pct=float(self.risk_config.max_notional_per_trade),
+            max_leverage=None,
+            modeling_resolution=normalized_timeframe,
+            signal_exit_fill="close",
+            allow_fallback_stop=self.risk_config.allow_fallback_stop,
+            reject_missing_stop=self.risk_config.reject_missing_stop,
+            require_explicit_column_roles=False,
             parameters={
                 "max_risk_per_trade": float(self.risk_config.max_risk_per_trade),
                 "max_total_exposure": float(self.risk_config.max_total_exposure),
@@ -833,19 +860,29 @@ class SignalReplayEngine:
         signals: list[ReplaySignal],
         fallback: str,
     ) -> str:
-        has_intraday = False
-        for signal in signals:
-            signal_timeframe = normalize_timeframe(signal.timeframe)
-            if signal_timeframe in {"1m", "5m", "15m", "30m", "1h", "4h"}:
-                return "1m"
-            if any(
-                (
-                    signal.timestamp.hour,
-                    signal.timestamp.minute,
-                    signal.timestamp.second,
-                )
-            ):
-                has_intraday = True
+        declared = [
+            normalized
+            for signal in signals
+            if (normalized := normalize_timeframe(signal.timeframe)) in VALID_TIMEFRAMES
+        ]
+        if declared:
+            order = {
+                "tick": 0,
+                "s1": 1,
+                "1m": 2,
+                "5m": 3,
+                "15m": 4,
+                "30m": 5,
+                "1h": 6,
+                "4h": 7,
+                "1d": 8,
+                "1w": 9,
+            }
+            return min(declared, key=lambda value: order.get(value, len(order)))
+        has_intraday = any(
+            any((signal.timestamp.hour, signal.timestamp.minute, signal.timestamp.second))
+            for signal in signals
+        )
         if has_intraday:
             return "1m"
         if signals:

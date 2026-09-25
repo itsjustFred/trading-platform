@@ -28,8 +28,8 @@ from runner.engine_pkg._time import to_iso_utc
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
-from runner.engines.base import BacktestConfig
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
+from runner.engines.base import BacktestConfig
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from runner.fees import resolve_fee_model
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
@@ -98,6 +98,8 @@ class TradeEngine:
                 # Keep the backtest's notional bound equal to the engine's own
                 # max_leverage cap so sizing and the post-cap do not fight.
                 max_notional_per_trade=max_leverage if max_leverage > 0 else 0.20,
+                allow_fallback_stop=bool(self.config.allow_fallback_stop),
+                reject_missing_stop=bool(self.config.reject_missing_stop),
             )
         )
 

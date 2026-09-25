@@ -36,7 +36,7 @@ from typing import List
 
 from pydantic import BaseModel
 
-from shared.models import Trade, TradeExit
+from shared.models import Trade
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,9 @@ def _trade_span_years(trades: List[Trade]) -> float | None:
     return span_days / 365.25
 
 
-def _daily_net_series(trades: List[Trade]) -> List[float] | None:
+def _daily_net_series(
+    trades: List[Trade], initial_capital: float | None = None
+) -> List[float] | None:
     """Daily-resampled net PnL series for ratio annualization (#84).
 
     Trades are summed per exit calendar day over the full calendar span
@@ -204,8 +206,18 @@ def _daily_net_series(trades: List[Trade]) -> List[float] | None:
     days = int((end - start).total_seconds() // 86400) + 1
     series: List[float] = []
     cursor = start
+    balance = float(initial_capital) if initial_capital is not None else None
+    if balance is not None and (not math.isfinite(balance) or balance <= 0):
+        raise ValueError("initial_capital must be finite and > 0")
     for _ in range(days):
-        series.append(day_totals.get(cursor.date().isoformat(), 0.0))
+        pnl = day_totals.get(cursor.date().isoformat(), 0.0)
+        if balance is None:
+            series.append(pnl)
+        elif balance > 0:
+            series.append(pnl / balance)
+            balance += pnl
+        else:
+            break
         cursor += pd.Timedelta(days=1)
     return series
 
@@ -221,13 +233,19 @@ def _annualize_factor(trades: List[Trade]) -> float:
     return math.sqrt(252)
 
 
-def _sharpe(returns: List[float], annualize_factor: float | None = None) -> float:
+def _sharpe(
+    returns: List[float],
+    annualize_factor: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> float:
     """Annualized Sharpe ratio (population std, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
         return 0.0
-    mean_return = sum(returns) / n
-    variance = sum((r - mean_return) ** 2 for r in returns) / n
+    daily_rf = float(risk_free_rate) / 252.0
+    excess = [float(value) - daily_rf for value in returns]
+    mean_return = sum(excess) / n
+    variance = sum((r - mean_return) ** 2 for r in excess) / n
     std = math.sqrt(variance) if variance > 0 else 0.0
     if math.isclose(std, 0.0, abs_tol=_ZERO_TOL):
         return 0.0
@@ -235,13 +253,19 @@ def _sharpe(returns: List[float], annualize_factor: float | None = None) -> floa
     return (mean_return / std) * factor
 
 
-def _sortino(returns: List[float], annualize_factor: float | None = None) -> float:
+def _sortino(
+    returns: List[float],
+    annualize_factor: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> float:
     """Annualized Sortino ratio (downside deviation, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
         return 0.0
-    mean_return = sum(returns) / n
-    downside = [r for r in returns if r < 0]
+    daily_rf = float(risk_free_rate) / 252.0
+    excess = [float(value) - daily_rf for value in returns]
+    mean_return = sum(excess) / n
+    downside = [r for r in excess if r < 0]
     if not downside:
         return 0.0
     downside_var = sum(r**2 for r in downside) / len(downside)
@@ -252,7 +276,12 @@ def _sortino(returns: List[float], annualize_factor: float | None = None) -> flo
     return (mean_return / downside_std) * factor
 
 
-def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
+def compute_trade_statistics(
+    trades: List[Trade],
+    *,
+    initial_capital: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> TradeStatistics:
     """Compute all trade-based statistics from a list of Trade objects."""
     if not trades:
         return TradeStatistics()
@@ -280,11 +309,27 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
 
     # #84: ratio metrics run on the daily-resampled net series with the
     # shared sqrt(252) annualization (same contract as runner/stats.py).
-    daily_series = _daily_net_series(trades)
+    daily_series = _daily_net_series(trades, initial_capital=initial_capital)
     annualize = _annualize_factor(trades)
-    ratio_observations = daily_series if daily_series is not None else realized_pnls
-    sharpe_ratio = _sharpe(ratio_observations, annualize)
-    sortino_ratio = _sortino(ratio_observations, annualize)
+    ratio_observations = (
+        daily_series
+        if daily_series is not None and len(daily_series) >= 2
+        else (
+            [pnl / float(initial_capital) for pnl in realized_pnls]
+            if initial_capital is not None
+            else realized_pnls
+        )
+    )
+    sharpe_ratio = _sharpe(
+        ratio_observations,
+        annualize,
+        risk_free_rate=risk_free_rate,
+    )
+    sortino_ratio = _sortino(
+        ratio_observations,
+        annualize,
+        risk_free_rate=risk_free_rate,
+    )
 
     if not math.isclose(max_drawdown, 0.0, abs_tol=_ZERO_TOL):
         recovery_factor = net_profit / max_drawdown

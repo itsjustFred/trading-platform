@@ -10,10 +10,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from shared.models import BacktestResult, Trade
 from validation.comparison.anomalies import AnomalyDetector
-from validation.comparison.comparison import MatchedTrade, TradeComparisonConfig, TradeComparator
-from validation.comparison.delta_report import DeltaReportBuilder, FieldDelta, TradeDelta, TradeDeltaReport
+from validation.comparison.comparison import (
+    MatchedTrade,
+    TradeComparator,
+    TradeComparisonConfig,
+)
+from validation.comparison.delta_report import (
+    DeltaReportBuilder,
+    FieldDelta,
+    TradeDeltaReport,
+)
 from validation.comparison.matcher import TradeMatcher
 from validation.reference import ValidationReference
 from validation.stats.calculator import TradeStatistics, compute_trade_statistics
@@ -359,8 +366,14 @@ def run_regression(
     )
 
     # --- statistics comparison ------------------------------------------
-    golden_stats = compute_trade_statistics(golden_ref.trades)
-    current_stats = compute_trade_statistics(current_ref.trades)
+    golden_stats = compute_trade_statistics(
+        golden_ref.trades,
+        initial_capital=golden_ref.to_backtest_result().meta.initial_capital,
+    )
+    current_stats = compute_trade_statistics(
+        current_ref.trades,
+        initial_capital=current_ref.to_backtest_result().meta.initial_capital,
+    )
     stats_deltas = _compare_stats(golden_stats, current_stats, cfg)
 
     has_trade_mismatch = any(

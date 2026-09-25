@@ -162,7 +162,9 @@ def _trade_stop_distance(trade: Trade) -> float | None:
 
 
 def replay_shared_equity(
-    trades: list[Trade], initial_capital: float
+    trades: list[Trade],
+    initial_capital: float,
+    start_time: str | None = None,
 ) -> tuple[list[Trade], list[EquityPoint], dict[str, Any]]:
     """Replay multi-symbol trades onto one running portfolio equity (D5, A-M4).
 
@@ -265,7 +267,9 @@ def replay_shared_equity(
         open_notional += trade_notional
         open_risk += trade_risk
         pending_pnl[trade.id] = (
-            (new_pnl - float(trade.fees or 0.0)) if trade.net_pnl is not None else new_pnl
+            float(trade.net_pnl)
+            if trade.net_pnl is not None
+            else new_pnl - float(trade.fees or 0.0)
         )
         if shared > 0:
             peak_notional = max(peak_notional, open_notional)
@@ -275,17 +279,33 @@ def replay_shared_equity(
     # them) so the returned shared state is exact.
     _release_through("~")
 
-    equity_curve: list[EquityPoint] = []
+    if not ordered:
+        return ordered, [], {
+            "shared_equity": True,
+            "symbols_traded": [],
+            "peak_open_notional_usd": 0.0,
+            "peak_exposure_pct": 0.0,
+        }
+    first_time = start_time or str(ordered[0].entry_time)
+    equity_curve: list[EquityPoint] = [
+        EquityPoint(time=first_time, equity=round(float(initial_capital), 2))
+    ]
     running = float(initial_capital)
     for trade in sorted(ordered, key=lambda t: str(t.last_exit_time or t.entry_time)):
-        net = float(trade.net_pnl) if trade.net_pnl is not None else float(trade.pnl or 0.0)
-        running += net
-        equity_curve.append(
-            EquityPoint(
-                time=str(trade.last_exit_time or trade.entry_time),
-                equity=round(running, 2),
-            )
+        net = (
+            float(trade.net_pnl)
+            if trade.net_pnl is not None
+            else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
         )
+        running += net
+        point = EquityPoint(
+            time=str(trade.last_exit_time or trade.entry_time),
+            equity=round(running, 2),
+        )
+        if equity_curve[-1].time == point.time:
+            equity_curve[-1] = point
+        else:
+            equity_curve.append(point)
 
     summary = {
         "shared_equity": True,

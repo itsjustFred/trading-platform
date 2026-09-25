@@ -360,6 +360,7 @@ def run_optimization(
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
+    base_runtime = _runtime_config_from_base_result(base_result)
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -382,6 +383,7 @@ def run_optimization(
             train_period=train_period,
             test_period=test_period,
             base_parameters=base_parameters,
+            base_runtime=base_runtime,
             progress_callback=progress_callback,
         )
 
@@ -453,6 +455,7 @@ def run_optimization(
                     end_date=train_period["end"],
                     initial_capital=initial_capital,
                     parameters=combined_params,
+                    **base_runtime,
                 ),
                 strategy_path,
             )
@@ -586,6 +589,7 @@ def run_optimization(
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            **base_runtime,
         ),
         strategy_path,
     )
@@ -735,6 +739,33 @@ def _suggest_parameter(trial: optuna.Trial, name: str, spec: dict[str, Any]) -> 
     raise ValueError(f"Unsupported parameter type for {name!r}: {spec.get('type')!r}")
 
 
+def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
+    data = result.meta.data if isinstance(result.meta.data, dict) else {}
+    parameters = result.meta.parameters if isinstance(result.meta.parameters, dict) else {}
+    stored_runtime = data.get("_backtest_config", {}) if isinstance(data, dict) else {}
+
+    def value(name: str, default: Any = None) -> Any:
+        meta_value = getattr(result.meta, name, None)
+        if meta_value is not None:
+            return meta_value
+        if name in data:
+            return data[name]
+        if name in stored_runtime:
+            return stored_runtime[name]
+        return parameters.get(name, default)
+
+    return {
+        "risk_per_trade_pct": value("risk_per_trade_pct"),
+        "max_position_exposure_pct": value("max_position_exposure_pct"),
+        "max_leverage": value("max_leverage"),
+        "modeling_resolution": value("modeling_resolution", "open_close"),
+        "signal_exit_fill": value("signal_exit_fill", "close"),
+        "allow_fallback_stop": value("allow_fallback_stop", True),
+        "reject_missing_stop": value("reject_missing_stop", False),
+        "require_explicit_column_roles": value("require_explicit_column_roles", False),
+    }
+
+
 def _run_vectorbt_backtest(config: BacktestConfig, strategy_path: Path) -> BacktestResult:
     ensure_backtest_data(
         symbols=config.symbols,
@@ -815,8 +846,10 @@ def _run_risk_parity_covariance_optimization(
     train_period: dict[str, str],
     test_period: dict[str, str],
     base_parameters: dict[str, Any],
-    progress_callback: ProgressCallback | None,
+    base_runtime: dict[str, Any] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    base_runtime = base_runtime or _runtime_config_from_base_result(base_result)
     _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
     # Covariance input precedence (Cleanup 16-D1, F30): risk-parity weights
     # express ASSET co-movement, so the returns frame must come from market
@@ -860,6 +893,7 @@ def _run_risk_parity_covariance_optimization(
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            **base_runtime,
         ),
         strategy_path,
     )
@@ -962,7 +996,11 @@ def _asset_returns_frame_from_market_data(
     start_ts = pd.to_datetime(start, utc=True, errors="coerce")
     end_ts = pd.to_datetime(end, utc=True, errors="coerce")
     for symbol in symbols:
-        path = next(root.rglob(f"**/{symbol}/{timeframe}.parquet"), None)
+        matches = sorted(
+            root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+            key=lambda item: item.as_posix(),
+        )
+        path = matches[0] if matches else None
         if path is None:
             continue
         frame = pd.read_parquet(path)

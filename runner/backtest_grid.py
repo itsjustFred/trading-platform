@@ -255,9 +255,15 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
     contract (F19): no fabricated range may ever flow into a backtest.
     """
     root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
-    matches = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
-        matches = list(root.rglob(f"**/{symbol}/*.parquet"))
+        matches = sorted(
+            root.rglob(f"**/{symbol}/*.parquet"),
+            key=lambda path: path.as_posix(),
+        )
     if not matches:
         raise ValueError(
             f"No OHLCV data found for {symbol}/{timeframe} under {root}; "

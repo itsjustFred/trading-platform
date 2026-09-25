@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ from typing import Any, Callable
 import numpy as np
 import optuna
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -142,7 +145,11 @@ def _split_equity_curves_by_time(
     return train_curves, test_curves
 
 
-def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
+def _load_strategy_equity(
+    backtest_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[StrategyEquityPoint]:
     """Load an equity curve for a strategy backtest from SQLite (C3).
 
     Load errors surface with the backtest id attached instead of decaying
@@ -162,9 +169,17 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
     if not result.equity_curve:
         return []
     points = []
+    start_ts = _parse_time_to_ts(start_date) if start_date else None
+    end_ts = _parse_time_to_ts(end_date) if end_date else None
+    if end_ts is not None and "T" not in str(end_date) and ":" not in str(end_date):
+        end_ts += 86_400.0 - 1e-6
     for point in result.equity_curve:
         time_ts = _parse_time_to_ts(point.time)
-        if time_ts and point.equity:
+        if start_ts is not None and time_ts < start_ts:
+            continue
+        if end_ts is not None and time_ts > end_ts:
+            continue
+        if math.isfinite(time_ts) and math.isfinite(float(point.equity)):
             points.append(
                 StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
             )
@@ -292,15 +307,12 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
     if equity_matrix.shape[0] < 3 or len(_LAST_PORTFOLIO_TIMESTAMPS) < 3:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    timestamps = pd.DatetimeIndex(_LAST_PORTFOLIO_TIMESTAMPS)
+    timestamps = pd.to_datetime(pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True)
     if len(timestamps) != equity_matrix.shape[0]:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    # Resolution-agnostic: ``asi8`` returns the native unit of the index
-    # (seconds for datetime64[s] stamps, nanoseconds for the pandas default).
-    # Normalize via Timedelta arithmetic instead of a hardcoded 1e9 divisor.
-    spacings = np.diff(timestamps) / np.timedelta64(1, "s")
-    spacing = float(np.median(spacings))
+    spacings = timestamps.diff().dt.total_seconds().dropna()
+    spacing = float(spacings.median()) if not spacings.empty else 0.0
     if not math.isfinite(spacing) or spacing <= 0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
@@ -342,19 +354,24 @@ def _portfolio_sharpe_from_weights(
     if equity_matrix.size == 0 or equity_matrix.shape[0] < 2 or len(weights) == 0:
         return 0.0, 1.0
 
-    # Weighted combination
     portfolio_eq = equity_matrix @ weights
-    returns = np.diff(portfolio_eq) / (portfolio_eq[:-1] + 1e-10)
+    if not np.all(np.isfinite(portfolio_eq)) or np.any(portfolio_eq <= 0):
+        raise ValueError("portfolio equity must be finite and positive")
+    returns = np.diff(portfolio_eq) / portfolio_eq[:-1]
 
     mean_ret = np.mean(returns)
-    std_ret = np.std(returns) + 1e-10
+    std_ret = np.std(returns)
 
     periods_per_year = _infer_portfolio_periods_per_year(equity_matrix)
-    sharpe = float(mean_ret / std_ret) * math.sqrt(periods_per_year)
+    sharpe = (
+        float(mean_ret / std_ret) * math.sqrt(periods_per_year)
+        if std_ret > 0
+        else 0.0
+    )
 
     # Max drawdown
     peak = np.maximum.accumulate(portfolio_eq)
-    drawdown = (peak - portfolio_eq) / (peak + 1e-10)
+    drawdown = (peak - portfolio_eq) / peak
     max_dd = float(np.max(drawdown))
 
     return sharpe, max_dd
@@ -379,6 +396,7 @@ def _build_objective(
     backtest_ids: list[str],
     equity_matrix: np.ndarray,
     returns: np.ndarray,
+    target_sharpe: float = 0.0,
 ) -> Callable[[optuna.Trial], float]:
     """Build the Optuna objective for the prepared in-sample data."""
     correlation_matrix = _compute_correlation_matrix(returns)
@@ -396,6 +414,7 @@ def _build_objective(
         score = sharpe - (5.0 * penalty) - (
             3.0 * max(0, max_drawdown - 0.3)
         )
+        score -= max(0.0, float(target_sharpe) - sharpe)
 
         trial.report(sharpe, trial.number)
         return -score
@@ -409,9 +428,18 @@ def _run_optimization(
     progress_callback: Callable[[float, str], None] | None,
 ) -> optuna.Study:
     """Run the requested trials and report progress in ten-trial increments."""
+    if n_trials <= 0:
+        raise ValueError("n_trials must be > 0")
     study = optuna.create_study(direction="minimize")
     for trial_index in range(n_trials):
-        study.optimize(objective, n_trials=1, catch=(ValueError,))
+        try:
+            study.optimize(objective, n_trials=1, catch=())
+        except ValueError as exc:
+            logger.warning(
+                "Portfolio optimization trial %d failed: %s",
+                trial_index + 1,
+                exc,
+            )
         completed_trials = trial_index + 1
         if progress_callback and completed_trials % 10 == 0:
             progress_callback(
@@ -419,6 +447,24 @@ def _run_optimization(
                 f"Trial {completed_trials}/{n_trials}",
             )
     return study
+
+
+def _build_oos_equity_curve(
+    test_curves: list[list[StrategyEquityPoint]],
+    best_weights: np.ndarray,
+) -> list[dict[str, float | int]]:
+    if not test_curves or len(test_curves) < 2:
+        return []
+    timestamps = _common_timestamps(test_curves, require_overlap=True)
+    matrix = _align_equity_curves(test_curves, require_overlap=True)
+    if matrix.size == 0 or matrix.shape[0] < 2 or matrix.shape[1] != len(best_weights):
+        return []
+    portfolio = matrix @ best_weights
+    return [
+        {"time": int(timestamp), "equity": float(equity)}
+        for timestamp, equity in zip(timestamps, portfolio, strict=False)
+        if math.isfinite(float(equity))
+    ]
 
 
 def _compute_oos_metrics(
@@ -457,6 +503,8 @@ def _build_optimization_result(
     train_months: int | None,
     test_months: int | None,
     oos_metrics: tuple[float | None, float | None],
+    target_sharpe: float = 0.0,
+    oos_equity_curve: list[dict[str, float | int]] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Build the persisted result and its output path."""
     now = datetime.now(timezone.utc)
@@ -483,6 +531,9 @@ def _build_optimization_result(
             for row in range(len(backtest_ids))
         },
         "n_trials": n_trials,
+        "target_sharpe": float(target_sharpe),
+        "target_met": bool(sharpe >= target_sharpe),
+        "target_shortfall": max(0.0, float(target_sharpe) - float(sharpe)),
     }
 
     oos_sharpe, oos_max_drawdown = oos_metrics
@@ -502,6 +553,8 @@ def _build_optimization_result(
             "train_months": train_months,
             "test_months": test_months,
         }
+        if oos_equity_curve:
+            result["oos_equity_curve"] = oos_equity_curve
     return result, output_path
 
 
@@ -528,6 +581,8 @@ def optimize_portfolio_allocation(
     progress_callback: Callable[[float, str], None] | None = None,
     train_months: int | None = None,
     test_months: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """Optimize portfolio weights for maximum Sharpe with negative correlation.
 
@@ -545,8 +600,23 @@ def optimize_portfolio_allocation(
         Optimization result with best weights and stats. Includes both IS (in-sample)
         and OOS (out-of-sample) Sharpe when test_months is provided.
     """
+    if isinstance(target_sharpe, bool):
+        raise ValueError("target_sharpe must be numeric")
+    try:
+        target = float(target_sharpe)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_sharpe must be numeric") from exc
+    if not math.isfinite(target) or target < 0:
+        raise ValueError("target_sharpe must be finite and >= 0")
+
     # Load equity curves
-    curves = [_load_strategy_equity(bt_id) for bt_id in backtest_ids]
+    if start_date or end_date:
+        curves = [
+            _load_strategy_equity(bt_id, start_date=start_date, end_date=end_date)
+            for bt_id in backtest_ids
+        ]
+    else:
+        curves = [_load_strategy_equity(bt_id) for bt_id in backtest_ids]
 
     # Split curves by time for OOS validation
     train_curves, test_curves = _split_equity_curves_by_time(curves, train_months, test_months)
@@ -582,7 +652,12 @@ def optimize_portfolio_allocation(
         }
 
     returns = np.diff(equity_matrix, axis=0)
-    objective = _build_objective(backtest_ids, equity_matrix, returns)
+    objective = _build_objective(
+        backtest_ids,
+        equity_matrix,
+        returns,
+        target_sharpe=target,
+    )
     study = _run_optimization(objective, n_trials, progress_callback)
     completed_trials = study.get_trials(
         deepcopy=False,
@@ -606,6 +681,7 @@ def optimize_portfolio_allocation(
     )
     correlation_matrix = _compute_correlation_matrix(returns)
     oos_metrics = _compute_oos_metrics(test_curves, best_weights)
+    oos_equity_curve = _build_oos_equity_curve(test_curves, best_weights)
     result, output_path = _build_optimization_result(
         backtest_ids,
         best_weights,
@@ -616,6 +692,8 @@ def optimize_portfolio_allocation(
         train_months,
         test_months,
         oos_metrics,
+        target_sharpe=target,
+        oos_equity_curve=oos_equity_curve,
     )
 
     _persist_optimization_result(result, output_path)

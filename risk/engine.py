@@ -69,15 +69,20 @@ class RiskEngine:
         explicit = signal.metadata.get("signal_id") or signal.metadata.get("source_signal_id")
         if explicit:
             return str(explicit)
+        cached = signal.metadata.get("_risk_legacy_signal_id")
+        if cached:
+            return str(cached)
         stop = "none" if signal.stop_loss is None else f"{float(signal.stop_loss):.12g}"
         take_profit = (
             "none" if signal.take_profit is None else f"{float(signal.take_profit):.12g}"
         )
-        return (
+        signal_id = (
             "legacy:"
             f"{signal.symbol}:{signal.timeframe}:{signal.action}:"
-            f"{signal.entry_price:.12g}:{stop}:{take_profit}"
+            f"{signal.entry_price:.12g}:{stop}:{take_profit}:{signal.identity}"
         )
+        signal.metadata["_risk_legacy_signal_id"] = signal_id
+        return signal_id
 
     def _decision(
         self,
@@ -130,12 +135,27 @@ class RiskEngine:
             decision=decision,
         )
 
+    @staticmethod
+    def _finite_number(value: object, field_name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field_name} must be numeric") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{field_name} must be finite")
+        return parsed
+
     def calculate_position_size(
         self,
         signal: TradeSignal,
         account_balance: float,
         pip_value: float,
         current_exposure: float,
+        *,
+        allow_fallback_stop: bool | None = None,
+        reject_missing_stop: bool | None = None,
     ) -> SizedOrder:
         """Size one signal against the configured risk limits.
 
@@ -152,15 +172,37 @@ class RiskEngine:
         ``current_exposure``) must come from the portfolio/broker source of
         truth, never from untrusted signal payloads.
         """
-        balance = float(account_balance)
+        balance = self._finite_number(account_balance, "account_balance")
         if balance <= 0:
             raise ValueError("account_balance must be > 0")
-        pip = float(pip_value)
+        pip = self._finite_number(pip_value, "pip_value")
         if pip <= 0:
             raise ValueError("pip_value must be > 0")
-        exposure = max(0.0, float(current_exposure))
-        current_positions = int(float(signal.metadata.get("current_positions", 0) or 0))
+        exposure = self._finite_number(current_exposure, "current_exposure")
+        if exposure < 0:
+            raise ValueError("current_exposure must be >= 0")
+        raw_positions = signal.metadata.get("current_positions", 0) or 0
+        if isinstance(raw_positions, bool):
+            raise ValueError("current_positions must be an integer")
+        try:
+            numeric_positions = float(raw_positions)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("current_positions must be an integer") from exc
+        if not math.isfinite(numeric_positions) or not numeric_positions.is_integer():
+            raise ValueError("current_positions must be an integer")
+        current_positions = int(numeric_positions)
+        if current_positions < 0:
+            raise ValueError("current_positions must be >= 0")
         decision_signal_id = self._signal_id(signal)
+        fallback_allowed = (
+            self.config.allow_fallback_stop
+            if allow_fallback_stop is None
+            else RiskConfig._bool(allow_fallback_stop, "allow_fallback_stop")
+        )
+        if reject_missing_stop is None:
+            reject_missing_stop = self.config.reject_missing_stop
+        else:
+            reject_missing_stop = RiskConfig._bool(reject_missing_stop, "reject_missing_stop")
 
         if current_positions >= self.config.max_positions:
             return self._sized_order(
@@ -207,7 +249,40 @@ class RiskEngine:
             )
 
         stop_loss = signal.stop_loss
+        if stop_loss is not None and (
+            not math.isfinite(float(stop_loss)) or float(stop_loss) <= 0
+        ):
+            raise ValueError("stop_loss must be finite and > 0")
         stop_source = "signal"
+        if stop_loss is None and (reject_missing_stop or not fallback_allowed):
+            logger.warning(
+                "Rejecting %s/%s: no signal stop_loss and fallback stops are disabled",
+                signal.symbol,
+                signal.timeframe,
+            )
+            return self._sized_order(
+                signal=signal,
+                position_size=0.0,
+                risk_amount=0.0,
+                risk_percent=0.0,
+                risk_reward_ratio=None,
+                decision=self._decision(
+                    signal,
+                    signal_id=decision_signal_id,
+                    accepted=False,
+                    quantity=0.0,
+                    risk_amount=0.0,
+                    risk_percent=0.0,
+                    risk_distance=None,
+                    stop_price_used=None,
+                    rejection_reason="missing_stop",
+                    metadata={
+                        "current_exposure": exposure,
+                        "stop_source": "missing",
+                        "fallback_stop_allowed": False,
+                    },
+                ),
+            )
         if stop_loss is None:
             stop_source = (
                 "fallback_atr"
@@ -294,6 +369,8 @@ class RiskEngine:
                     "current_exposure": exposure,
                     "pip_value": pip,
                     "stop_source": stop_source,
+                    "fallback_stop_allowed": fallback_allowed and not reject_missing_stop,
+                    "stop_price_provenance": stop_source,
                     "max_notional_per_trade": self.config.max_notional_per_trade,
                     "capped_by_notional": capped_by_notional,
                     **(

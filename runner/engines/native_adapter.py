@@ -40,7 +40,10 @@ def _load_strategy_module(path: str):
 
 
 def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
-    matches = list((data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return None
 
@@ -185,13 +188,22 @@ class NativeAdapter(EngineAdapter):
         # multiply capital by the symbol count). The aggregate curve replays
         # closed PnL once per portfolio, credited at exit — documented in the
         # cross-engine contract.
-        equity_curve: list[EquityPoint] = []
+        equity_curve: list[EquityPoint] = [
+            EquityPoint(
+                time=f"{config.start_date}T00:00:00+00:00"
+                if len(config.start_date) == 10
+                else config.start_date,
+                equity=round(config.initial_capital, 2),
+            )
+        ]
         shared_summary: dict[str, Any] = {}
         if len(config.symbols) > 1 and all_trades:
             from runner.engines._shared import replay_shared_equity
 
             all_trades, replayed_curve, shared_summary = replay_shared_equity(
-                all_trades, config.initial_capital
+                all_trades,
+                config.initial_capital,
+                start_time=equity_curve[0].time,
             )
             all_trades.sort(key=lambda trade: (trade.entry_time, trade.id))
             for index, trade in enumerate(all_trades, start=1):
@@ -200,8 +212,16 @@ class NativeAdapter(EngineAdapter):
         else:
             running = config.initial_capital
             for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                running += trade.pnl
-                equity_curve.append(EquityPoint(time=trade.last_exit_time, equity=round(running, 2)))
+                running += (
+                    float(trade.net_pnl)
+                    if trade.net_pnl is not None
+                    else float(trade.pnl) - float(trade.fees or 0.0)
+                )
+                point = EquityPoint(time=trade.last_exit_time, equity=round(running, 2))
+                if equity_curve[-1].time == point.time:
+                    equity_curve[-1] = point
+                else:
+                    equity_curve.append(point)
         emit_progress(90.0, "Calculating statistics...")
 
         now = datetime.now(timezone.utc)
@@ -234,6 +254,14 @@ class NativeAdapter(EngineAdapter):
                 "shared_equity": shared_summary,
             },
             initial_capital=config.initial_capital,
+            risk_per_trade_pct=config.risk_per_trade_pct,
+            max_position_exposure_pct=config.max_position_exposure_pct,
+            max_leverage=config.max_leverage,
+            modeling_resolution=config.modeling_resolution,
+            signal_exit_fill=config.signal_exit_fill,
+            allow_fallback_stop=config.allow_fallback_stop,
+            reject_missing_stop=config.reject_missing_stop,
+            require_explicit_column_roles=config.require_explicit_column_roles,
             parameters=resolved_parameters,
         )
 

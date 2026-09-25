@@ -477,6 +477,14 @@ class BacktestMeta:
     # Capital
     initial_capital: float = 100_000.0
     currency: str = "USD"
+    risk_per_trade_pct: float | None = None
+    max_position_exposure_pct: float | None = None
+    max_leverage: float | None = None
+    modeling_resolution: str = "main_timeframe"
+    signal_exit_fill: str = "close"
+    allow_fallback_stop: bool = True
+    reject_missing_stop: bool = False
+    require_explicit_column_roles: bool = False
 
     # Parameter (strategie-spezifisch)
     parameters: dict = field(default_factory=dict)
@@ -506,6 +514,24 @@ class BacktestMeta:
             d["data"] = self.data
         if self.currency != "USD":
             d["currency"] = self.currency
+        for name in (
+            "risk_per_trade_pct",
+            "max_position_exposure_pct",
+            "max_leverage",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                d[name] = value
+        if self.modeling_resolution != "main_timeframe":
+            d["modeling_resolution"] = self.modeling_resolution
+        if self.signal_exit_fill != "close":
+            d["signal_exit_fill"] = self.signal_exit_fill
+        if not self.allow_fallback_stop:
+            d["allow_fallback_stop"] = False
+        if self.reject_missing_stop:
+            d["reject_missing_stop"] = True
+        if self.require_explicit_column_roles:
+            d["require_explicit_column_roles"] = True
         if self.parameters:
             d["parameters"] = self.parameters
         if self.tags:
@@ -528,6 +554,14 @@ class BacktestMeta:
             data=d.get("data", {}),
             initial_capital=d.get("initial_capital", 100_000.0),
             currency=d.get("currency", "USD"),
+            risk_per_trade_pct=d.get("risk_per_trade_pct"),
+            max_position_exposure_pct=d.get("max_position_exposure_pct"),
+            max_leverage=d.get("max_leverage"),
+            modeling_resolution=d.get("modeling_resolution", "main_timeframe"),
+            signal_exit_fill=d.get("signal_exit_fill", "close"),
+            allow_fallback_stop=d.get("allow_fallback_stop", True),
+            reject_missing_stop=d.get("reject_missing_stop", False),
+            require_explicit_column_roles=d.get("require_explicit_column_roles", False),
             parameters=d.get("parameters", {}),
             tags=d.get("tags", []),
             notes=d.get("notes", ""),

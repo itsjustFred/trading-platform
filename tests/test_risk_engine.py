@@ -253,7 +253,68 @@ def test_calculate_position_size_missing_stop_loss_uses_fallback():
     assert ":none:" in sized.decision.signal_id
 
 
-def test_calculate_position_size_uses_explicit_signal_id_in_decision():
+def test_calculate_position_size_rejects_missing_stop_when_fallback_disabled():
+    engine = RiskEngine(RiskConfig(reject_missing_stop=True))
+    signal = TradeSignal(
+        action="buy",
+        symbol="BTCUSD",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=105.0,
+        timeframe="1h",
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "missing_stop"
+    assert sized.decision.metadata["fallback_stop_allowed"] is False
+
+
+def test_legacy_signal_ids_are_unique_and_stable_per_signal():
+    engine = RiskEngine()
+    first = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h",
+    )
+    second = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h",
+    )
+
+    first_id = engine.calculate_position_size(
+        signal=first, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    first_id_again = engine.calculate_position_size(
+        signal=first, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    second_id = engine.calculate_position_size(
+        signal=second, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+
+    assert first_id == first_id_again
+    assert first_id != second_id
+
+    fallback = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe="1h",
+    )
+    fallback_id = engine.calculate_position_size(
+        signal=fallback, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    fallback_id_again = engine.calculate_position_size(
+        signal=fallback, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    assert fallback_id == fallback_id_again
+
+
     engine = RiskEngine()
     signal = TradeSignal(
         action="sell",

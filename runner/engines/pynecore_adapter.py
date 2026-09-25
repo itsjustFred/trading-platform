@@ -12,11 +12,13 @@ import ast
 import csv
 import inspect
 import logging
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone, date as _date
+from datetime import date as _date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +31,14 @@ from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
     resolve_bar_spread,
+)
+from runner.engines._shared import (
     resolve_max_leverage as _resolve_max_leverage,
+)
+from runner.engines._shared import (
     resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+)
+from runner.engines._shared import (
     serialize_meta_value as _serialize_meta_value,
 )
 from runner.engines.base import (
@@ -487,16 +495,39 @@ def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
 
 
 def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
-    """Build the equity curve from the merged, time-ordered trades (#84: net)."""
-    equity = config.initial_capital
-    curve: list[EquityPoint] = []
-    for trade in sorted(all_trades, key=lambda item: item.entry_time):
-        equity += (
+    """Build a net, exit-timed equity curve from merged trades."""
+    equity = float(config.initial_capital)
+    events: list[tuple[str, float]] = []
+    for trade in all_trades:
+        exits = sorted(trade.exits or [], key=lambda item: str(item.time))
+        if not exits:
+            events.append((str(trade.entry_time), float(trade.net_pnl or 0.0)))
+            continue
+        gross_total = sum(float(leg.pnl or 0.0) for leg in exits)
+        net_total = (
             float(trade.net_pnl)
             if trade.net_pnl is not None
             else float(trade.pnl) - float(trade.fees or 0.0)
         )
-        curve.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+        fee_delta = net_total - gross_total
+        for leg in exits:
+            gross_leg = float(leg.pnl or 0.0)
+            share = gross_leg / gross_total if gross_total else 1.0 / len(exits)
+            events.append((str(leg.time), gross_leg + fee_delta * share))
+
+    if not events:
+        return []
+    start = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+    if pd.isna(start):
+        start = pd.to_datetime(events[0][0], utc=True)
+    curve = [EquityPoint(time=pd.Timestamp(start).isoformat(), equity=round(equity, 2))]
+    for timestamp, pnl in sorted(events, key=lambda item: (pd.Timestamp(item[0]), item[0])):
+        equity += pnl
+        point = EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=round(equity, 2))
+        if curve[-1].time == point.time:
+            curve[-1] = point
+        else:
+            curve.append(point)
     return curve
 
 
@@ -532,6 +563,14 @@ def _pyne_meta(
             "source": "yfinance",
         },
         initial_capital=config.initial_capital,
+        risk_per_trade_pct=config.risk_per_trade_pct,
+        max_position_exposure_pct=config.max_position_exposure_pct,
+        max_leverage=config.max_leverage,
+        modeling_resolution=config.modeling_resolution,
+        signal_exit_fill=config.signal_exit_fill,
+        allow_fallback_stop=config.allow_fallback_stop,
+        reject_missing_stop=config.reject_missing_stop,
+        require_explicit_column_roles=config.require_explicit_column_roles,
         parameters=resolved_parameters,
     )
 
@@ -951,7 +990,10 @@ def _load_ohlcv(
 ) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol."""
     ohlcv_root = data_root / "ohlcv"
-    matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return None
 
@@ -969,7 +1011,10 @@ def _load_ohlcv(
 
 
 def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
-    matches = list((data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return "unknown"
     parts = matches[0].parts
@@ -985,24 +1030,24 @@ def _normalize_trade_exits(trades: list[Trade]) -> None:
         if not trade.exits or not trade.meta:
             continue
 
-        exit_leg = trade.exits[-1]
         sl_price = trade.meta.get("sl_price_at_exit", trade.meta.get("sl_price"))
         tp_price = trade.meta.get("tp_price_at_exit", trade.meta.get("tp_price"))
 
-        if trade.direction == "LONG":
-            if sl_price is not None and exit_leg.price < float(sl_price):
-                exit_leg.price = round(float(sl_price), 6)
-                exit_leg.reason = "stop_loss"
-            elif tp_price is not None and exit_leg.price > float(tp_price):
-                exit_leg.price = round(float(tp_price), 6)
-                exit_leg.reason = "take_profit"
-        else:
-            if sl_price is not None and exit_leg.price > float(sl_price):
-                exit_leg.price = round(float(sl_price), 6)
-                exit_leg.reason = "stop_loss"
-            elif tp_price is not None and exit_leg.price < float(tp_price):
-                exit_leg.price = round(float(tp_price), 6)
-                exit_leg.reason = "take_profit"
+        for exit_leg in trade.exits:
+            if trade.direction == "LONG":
+                if sl_price is not None and exit_leg.price < float(sl_price):
+                    exit_leg.price = round(float(sl_price), 6)
+                    exit_leg.reason = "stop_loss"
+                elif tp_price is not None and exit_leg.price > float(tp_price):
+                    exit_leg.price = round(float(tp_price), 6)
+                    exit_leg.reason = "take_profit"
+            else:
+                if sl_price is not None and exit_leg.price > float(sl_price):
+                    exit_leg.price = round(float(sl_price), 6)
+                    exit_leg.reason = "stop_loss"
+                elif tp_price is not None and exit_leg.price < float(tp_price):
+                    exit_leg.price = round(float(tp_price), 6)
+                    exit_leg.reason = "take_profit"
 
 
 def _materialize_exit_price_levels(meta: dict[str, Any], trade: Trade) -> None:
@@ -1035,57 +1080,78 @@ def _materialize_exit_price_levels(meta: dict[str, Any], trade: Trade) -> None:
 
 
 def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class: str) -> None:
-    if not trades or config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
+    if not trades:
         return
+    if config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
+        raise ValueError(
+            "Risk sizing is not configured (risk_per_trade_pct unset); "
+            "refusing unsized PyneCore trades"
+        )
 
-    equity = config.initial_capital
+    equity = float(config.initial_capital)
     max_position_exposure_pct = _resolve_max_position_exposure_pct(
         config.max_position_exposure_pct, asset_class
     )
-    # A-C3: mirror vectorbt _size_trade min() semantics. max_leverage is an
-    # INDEPENDENT cap, not a floor above the position cap — max() here
-    # silently disabled the position cap whenever leverage allowed more.
     max_leverage = _resolve_max_leverage(config.max_leverage)
 
+    rejected_trade_ids: set[int] = set()
     for trade in sorted(trades, key=lambda item: item.entry_time):
         meta = trade.meta or {}
         sl_price = meta.get("sl_price")
         if sl_price is None:
-            equity += trade.pnl
-            continue
-
-        stop_distance = abs(trade.entry_price - float(sl_price))
-        if stop_distance <= 0:
-            equity += trade.pnl
-            continue
+            if config.reject_missing_stop or not config.allow_fallback_stop:
+                rejected_trade_ids.add(int(trade.id))
+                logger.warning(
+                    "Rejecting PyneCore trade %s: no stop_loss and fallback sizing is disabled",
+                    trade.id,
+                )
+                continue
+            direction_sign = 1.0 if str(trade.direction).upper() == "LONG" else -1.0
+            stop_distance = float(trade.entry_price) * 0.02
+            sl_price = float(trade.entry_price) - direction_sign * stop_distance
+            meta["sl_price"] = sl_price
+            meta["stop_source"] = "fallback_percent"
+            trade.meta = meta
+        stop_distance = abs(float(trade.entry_price) - float(sl_price))
+        if not math.isfinite(stop_distance) or stop_distance <= 0:
+            raise ValueError("PyneCore stop distance must be finite and > 0")
 
         risk_amount = equity * config.risk_per_trade_pct
+        entry_price = float(trade.entry_price)
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError("PyneCore entry price must be finite and > 0")
         base_qty = risk_amount / stop_distance
-        required_notional = base_qty * trade.entry_price
+        required_notional = base_qty * entry_price
         cap_notional = equity * max_position_exposure_pct
         leverage_notional_limit = equity * max_leverage
-
-        # A-C3: the binding notional is min(position cap, leverage limit),
-        # mirroring vectorbt _size_trade — a conservative position cap binds
-        # even when leverage would allow more (no over-cap fill).
         binding_notional = min(cap_notional, leverage_notional_limit)
-        if required_notional <= binding_notional:
-            final_notional = required_notional
-        else:
-            final_notional = binding_notional
+        final_notional = min(required_notional, binding_notional)
+        new_qty = round(final_notional / entry_price, 4)
+        old_qty = float(trade.quantity or 0.0)
+        if not math.isfinite(old_qty) or old_qty <= 0:
+            raise ValueError("PyneCore trade quantity must be finite and > 0")
+        scale = new_qty / old_qty
+        for leg in trade.exits:
+            leg.quantity = round(float(leg.quantity or 0.0) * scale, 4)
+            if str(trade.direction).upper() == "LONG":
+                leg.pnl = round(
+                    (float(leg.price) - float(trade.entry_price)) * leg.quantity,
+                    2,
+                )
+            else:
+                leg.pnl = round(
+                    (float(trade.entry_price) - float(leg.price)) * leg.quantity,
+                    2,
+                )
+        trade.quantity = new_qty
+        trade.pnl = round(sum(float(leg.pnl or 0.0) for leg in trade.exits), 2)
+        if trade.fees is not None:
+            trade.fees = round(float(trade.fees) * scale, 2)
+        trade.net_pnl = round(float(trade.pnl) - float(trade.fees or 0.0), 2)
+        equity += float(trade.net_pnl)
 
-        qty = round(final_notional / trade.entry_price, 4)
-        exit_price = trade.exits[-1].price
-        if trade.direction == "LONG":
-            pnl = round((exit_price - trade.entry_price) * qty, 2)
-        else:
-            pnl = round((trade.entry_price - exit_price) * qty, 2)
-
-        trade.quantity = qty
-        trade.pnl = pnl
-        trade.exits[-1].quantity = qty
-        trade.exits[-1].pnl = pnl
-        equity += pnl
+    if rejected_trade_ids:
+        trades[:] = [trade for trade in trades if int(trade.id) not in rejected_trade_ids]
 
 
 def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str | None:
@@ -1130,47 +1196,63 @@ def _initial_exit_reason(raw_signal: str) -> str | None:
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
     trades: list[Trade] = []
     entries: dict[int, dict[str, Any]] = {}
+    exits: dict[int, list[TradeExit]] = {}
 
-    with open(csv_path, "r") as handle:
+    with open(csv_path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             trade_num = int(row["Trade #"])
             trade_type = row["Type"].strip().lower()
 
             if "entry" in trade_type:
-                entries[trade_num] = {
-                    "time": row["Date/Time"],
-                    "price": float(row["Price USD"]),
-                    "contracts": float(row["Contracts"]),
-                    "direction": "LONG" if "long" in trade_type else "SHORT",
-                }
-            elif "exit" in trade_type and trade_num in entries:
-                entry = entries[trade_num]
-                exit_price = float(row["Price USD"])
-                exit_time = row["Date/Time"]
-                profit = float(row["Profit USD"])
-                qty = float(row["Contracts"])
-
-                trade = Trade(
-                    id=id_offset + trade_num,
-                    symbol=symbol,
-                    direction=entry["direction"],
-                    entry_time=entry["time"],
-                    entry_price=round(entry["price"], 6),
-                    quantity=round(qty, 4),
-                    exits=[
-                        TradeExit(
-                            time=exit_time,
-                            price=round(exit_price, 6),
-                            quantity=round(qty, 4),
-                            pnl=round(profit, 2),
-                            reason=_initial_exit_reason(row.get("Signal", "")),
-                        )
-                    ],
-                    pnl=round(profit, 2),
-                    tags=["pynecore"],
+                entry = entries.setdefault(
+                    trade_num,
+                    {
+                        "time": row["Date/Time"],
+                        "price": 0.0,
+                        "contracts": 0.0,
+                        "direction": "LONG" if "long" in trade_type else "SHORT",
+                    },
                 )
-                trades.append(trade)
+                quantity = float(row["Contracts"])
+                entry["contracts"] += quantity
+                entry["price"] = (
+                    (
+                        entry["price"] * (entry["contracts"] - quantity)
+                        + float(row["Price USD"]) * quantity
+                    )
+                    / entry["contracts"]
+                    if entry["contracts"]
+                    else float(row["Price USD"])
+                )
+            elif "exit" in trade_type and trade_num in entries:
+                exits.setdefault(trade_num, []).append(
+                    TradeExit(
+                        time=row["Date/Time"],
+                        price=round(float(row["Price USD"]), 6),
+                        quantity=round(float(row["Contracts"]), 4),
+                        pnl=round(float(row["Profit USD"]), 2),
+                        reason=_initial_exit_reason(row.get("Signal", "")),
+                    )
+                )
+
+    for trade_num, entry in entries.items():
+        trade_exits = sorted(exits.get(trade_num, []), key=lambda item: str(item.time))
+        if not trade_exits:
+            continue
+        trades.append(
+            Trade(
+                id=id_offset + trade_num,
+                symbol=symbol,
+                direction=str(entry["direction"]),
+                entry_time=str(entry["time"]),
+                entry_price=round(float(entry["price"]), 6),
+                quantity=round(float(entry["contracts"]), 4),
+                exits=trade_exits,
+                pnl=round(sum(float(leg.pnl or 0.0) for leg in trade_exits), 2),
+                tags=["pynecore"],
+            )
+        )
 
     return trades
 

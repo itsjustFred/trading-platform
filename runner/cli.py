@@ -113,10 +113,16 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
         )
 
     for symbol in symbols:
-        matches = list(ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"))
+        matches = sorted(
+            ohlcv_root.rglob(f"**/{symbol}/{normalized_timeframe}.parquet"),
+            key=lambda path: path.as_posix(),
+        )
         if not matches:
             # Try without exact timeframe match — find any parquet for symbol
-            matches = list(ohlcv_root.rglob(f"**/{symbol}/*.parquet"))
+            matches = sorted(
+                ohlcv_root.rglob(f"**/{symbol}/*.parquet"),
+                key=lambda path: path.as_posix(),
+            )
         if not matches:
             raise ValueError(
                 f"No OHLCV data found for {symbol}/{normalized_timeframe} under "
@@ -327,6 +333,8 @@ def cmd_walkforward(args):
         params=params,
         data_dir=args.data_dir or "",
         output_dir=args.output_dir,
+        purge_days=getattr(args, "purge_days", 0),
+        embargo_days=getattr(args, "embargo_days", 0),
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
@@ -564,6 +572,12 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument("--train-months", type=int, default=12, help="Training window in months")
     wf_p.add_argument("--test-months", type=int, default=3, help="Out-of-sample test window in months")
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
+    wf_p.add_argument(
+        "--purge-days", type=int, default=0, help="Days purged before each test fold"
+    )
+    wf_p.add_argument(
+        "--embargo-days", type=int, default=0, help="Days embargoed between train and test"
+    )
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
     _add_sizing_flags(wf_p, risk_default=None)
     _add_fee_flags(wf_p)
