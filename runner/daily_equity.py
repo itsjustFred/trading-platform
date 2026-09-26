@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -20,6 +20,27 @@ MIN_PRESERVED_DAY_COVERAGE = 0.5
 #: same total return the calendar fill already describes, and adopting them
 #: would publish a 2-point "daily" curve that hides every intermediate day.
 MIN_RECONCILING_ENGINE_CURVE_POINTS = 3
+
+#: Half of the last representable place of the persisted equity series. Every
+#: engine rounds an equity observation to cents (``round(running, 2)`` — see
+#: ``runner/engines/vectorbt_adapter.py`` and ``runner/engines/_shared.py``),
+#: so a persisted value can sit up to half a cent away from the exact one.
+EQUITY_HALF_CENT = 0.005
+#: One whole cent: the tolerance's absolute floor and its per-trade term. Two
+#: half-cent roundings (see :func:`_reconciliation_tolerance`) reach it.
+EQUITY_CENT = 2 * EQUITY_HALF_CENT
+#: Machine epsilon for float64. Summing ``n`` doubles of magnitude ``m`` is
+#: only accurate to about ``n * 2**-52 * m``; the reconciliation tolerance
+#: scales with it so an account large enough to make that term visible (a
+#: $1e12 account, or a six-figure trade count) is not held to a standard the
+#: arithmetic cannot meet.
+FLOAT64_EPSILON = 2.0**-52
+#: Safety factor on the float64 accumulation term. Kahan-free ``sum()`` in
+#: CPython is naive, and the per-term error bound is pessimistic; 8x leaves
+#: headroom without ever letting a real disagreement hide behind it (a genuine
+#: contradiction between an engine curve and the trade list is orders of
+#: magnitude larger than any of these terms).
+FLOAT64_ACCUMULATION_SAFETY = 8.0
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -217,18 +238,107 @@ def _trade_net_value(trade: Trade) -> float:
     return value if math.isfinite(value) else 0.0
 
 
+def _reconciliation_tolerance(*, expected_final: float, trade_count: int) -> float:
+    """How far the engine's final equity may sit from the trade-derived total.
+
+    The comparison is between two *cent-quantised sums of the same trades*, so
+    the bound is derived from the arithmetic both sides actually perform instead
+    of from a round-number dollar amount:
+
+    1. **Cent floor.** ``runner/engines/vectorbt_adapter.py`` stores each trade
+       as ``pnl=round(pnl, 2)``, ``fees=round(fees, 2)`` and
+       ``net_pnl=round(pnl - fees, 2)``, and the curve as
+       ``equity=round(running, 2)``. The final observation is therefore up to
+       half a cent from the exact running total and the last trade's own
+       ``net_pnl`` rounding adds at most another half cent: one whole cent.
+    2. **Per-trade drift.** An engine that accumulates its curve from the
+       *unrounded* ``pnl - fees`` while this module sums the *stored*
+       ``net_pnl`` disagrees by up to half a cent on gross PnL plus half a cent
+       on fees — one whole cent per trade — and those differences accumulate
+       linearly in the trade count instead of cancelling.
+    3. **Float64 accumulation.** Naive summation of ``n`` doubles of magnitude
+       ``m`` carries an error of about ``n * 2**-52 * m``, scaled by 8 for the
+       per-term error bound. This is the relative epsilon: it is the only term
+       that grows with the account, because cent quantisation does not.
+
+    A genuine contradiction — an engine curve ending somewhere the trades cannot
+    reach, e.g. 105000.0 against 100500.0 — sits four orders of magnitude above
+    the resulting bound for any realistic trade count, so widening the gate
+    from a flat $0.05 to this does not weaken it. A flat $0.05 was simply
+    wrong in the other direction too: it *rejected* curves that were off by six
+    cents across twenty trades, discarding the mark-to-market path this function
+    exists to preserve.
+    """
+    trades = max(int(trade_count), 1)
+    float64_drift = (
+        FLOAT64_ACCUMULATION_SAFETY * trades * FLOAT64_EPSILON * abs(expected_final)
+    )
+    return max(EQUITY_CENT, float64_drift) + (trades * EQUITY_CENT)
+
+
+def _fill_engine_curve_gaps(
+    anchor_date: date,
+    anchor_equity: float,
+    last_by_day: dict[str, tuple[datetime, float]],
+) -> list[tuple[datetime, float]]:
+    """Order the observed engine-curve days and insert flat points for gaps.
+
+    ``build_daily_equity_curve`` emits a point for *every* calendar day of the
+    window, zero-return days included. An engine curve only carries a point for
+    the days it happened to observe, and deriving returns from consecutive
+    *observed* days books a multi-day move as a single day: a four-calendar-day
+    span of two observations produced two returns that were then annualised as
+    if the whole move had happened in one day, roughly doubling the reported
+    figure — and the size of the error depended on how many days the engine
+    curve happened to skip.
+
+    Every calendar day from ``anchor_date`` through the last observed day is
+    therefore emitted: an observed day at its own equity, a skipped day flat at
+    the previous equity (an explicit ``0.0`` return). A day with no observation
+    genuinely has no measurable return, which is exactly what the calendar fill
+    already reports for a day with no closed trade. ``anchor_date`` and
+    ``anchor_equity`` are the opening point of the curve, so the flat period
+    before the engine's first observation is filled too.
+    """
+    ordered: list[tuple[datetime, float]] = []
+    cursor_date = anchor_date
+    cursor_equity = anchor_equity
+    for day in sorted(last_by_day):
+        timestamp, equity = last_by_day[day]
+        observed_date = timestamp.date()
+        # Fill only the days strictly BEFORE this observation: the observation
+        # itself is appended below, so including its own day would emit two
+        # points for one calendar day.
+        while cursor_date + timedelta(days=1) < observed_date:
+            cursor_date += timedelta(days=1)
+            ordered.append(
+                (
+                    datetime.combine(
+                        cursor_date, datetime.min.time(), tzinfo=timezone.utc
+                    ),
+                    cursor_equity,
+                )
+            )
+        ordered.append((timestamp, equity))
+        cursor_date = observed_date
+        cursor_equity = equity
+    return ordered
+
+
 def _daily_points_from_engine_curve(
     result: BacktestResult,
     *,
     start: datetime | None = None,
 ) -> tuple[list[EquityPoint], list[dict[str, Any]]] | None:
-    """Compact a reconciling engine curve to one point per observed day.
+    """Compact a reconciling engine curve to one point per calendar day.
 
     The calendar fill can only see CLOSED trades, so an open position's
     mark-to-market drawdown is invisible to it. When the engine's own curve
     reconciles with the realized trades (final equity ==
     initial_capital + net PnL) it is the more faithful daily series and is
-    preferred. Returns None when the curve does not reconcile, is not
+    preferred. Days the engine curve skipped are emitted as explicit flat
+    points (see :func:`_fill_engine_curve_gaps`) so no multi-day move is booked
+    as a single day. Returns None when the curve does not reconcile, is not
     parseable, or is endpoint-only (fewer than
     ``MIN_RECONCILING_ENGINE_CURVE_POINTS`` points carry no path).
     """
@@ -250,9 +360,11 @@ def _daily_points_from_engine_curve(
     curve.sort(key=lambda item: item[0])
 
     initial_capital = float(result.meta.initial_capital)
-    tolerance = max(0.05, abs(initial_capital) * 1e-9)
     expected_final = initial_capital + sum(
         _trade_net_value(trade) for trade in result.trades
+    )
+    tolerance = _reconciliation_tolerance(
+        expected_final=expected_final, trade_count=len(result.trades)
     )
     if abs(curve[-1][1] - expected_final) > tolerance:
         return None
@@ -274,15 +386,26 @@ def _daily_points_from_engine_curve(
 
     last_by_day: dict[str, tuple[datetime, float]] = {}
     for timestamp, equity in curve[start_index:]:
+        # Anything on or before the baseline day is already represented by the
+        # opening point; keeping it would make the published curve go backwards.
+        if timestamp.date() <= baseline.date():
+            continue
         last_by_day[timestamp.date().isoformat()] = (timestamp, equity)
 
-    for day in sorted(last_by_day):
-        timestamp, equity = last_by_day[day]
+    ordered = _fill_engine_curve_gaps(baseline.date(), initial_capital, last_by_day)
+
+    for timestamp, equity in ordered:
         points.append(EquityPoint(time=timestamp.isoformat(), equity=round(equity, 2)))
         daily_return = (
             (equity - previous_equity) / previous_equity if previous_equity > 0 else 0.0
         )
-        daily_returns.append({"date": day, "return": daily_return, "equity": equity})
+        daily_returns.append(
+            {
+                "date": timestamp.date().isoformat(),
+                "return": daily_return,
+                "equity": equity,
+            }
+        )
         previous_equity = equity
 
     if len(points) < 2:

@@ -473,18 +473,128 @@ class TestCalmarAndQsFallback:
         )
 
     def test_qs_installed_but_unparseable_times_still_yields_sharpe(self):
-        """With QS installed but timestamps unresolvable, Sharpe must not be 0.
+        """Unparseable timestamps must not change the Sharpe that is published.
 
-        Kills the mutant that disables the manual fall-through: the fallback
-        computes Sharpe/Sortino on raw period returns instead of silently
-        leaving 0.0.
+        **Why this test was rewritten.** The original asserted only
+        ``stats["sharpe_ratio"] != 0.0``. That cannot distinguish an annualized
+        Sharpe from a per-observation ratio — the defect published a per-period
+        ratio of 0.20 for a daily Sharpe of 3.2, which is very much "not
+        0.0" — so the assertion locked the defect in. The premise behind it,
+        that the fall-through exists to keep the number non-zero, was wrong:
+        under ADR D5 the two code paths must publish the SAME Sharpe for the
+        same returns, so the contract to pin is parity with the `"daily"`
+        branch, not the absence of a zero.
+
+        The fixture below builds two curves with identical equity values: one
+        with daily timestamps (the `daily` branch, quantstats) and one with
+        timestamps nothing can parse (the fall-through). Same returns in, same
+        Sharpe out.
         """
-        equity = [
-            EquityPoint(time=f"not-a-timestamp-{i}", equity=100_000.0 * (1.001**i))
-            for i in range(40)
+        returns = [
+            0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
+            -0.003, 0.009, 0.001, -0.002, 0.005, -0.001,
         ]
-        stats = compute_stats([], equity_curve=equity)
-        assert stats["sharpe_ratio"] != 0.0, (
-            "unparseable equity timestamps must fall back to the manual Sharpe "
-            "path (raw period returns), not silently publish 0.0"
+
+        def _equities():
+            values = [100_000.0]
+            for value in returns:
+                values.append(values[-1] * (1 + value))
+            return values
+
+        start = datetime(2021, 1, 1, tzinfo=timezone.utc)
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=equity)
+            for index, equity in enumerate(_equities())
+        ]
+        daily = [
+            EquityPoint(
+                time=(start + timedelta(days=index)).isoformat(), equity=equity
+            )
+            for index, equity in enumerate(_equities())
+        ]
+
+        unknown = compute_stats([], equity_curve=unparseable, risk_free_rate=0.04)
+        daily_stats = compute_stats([], equity_curve=daily, risk_free_rate=0.04)
+
+        assert daily_stats["equity_return_frequency"] == "daily"
+        assert unknown["equity_return_frequency"].startswith("unknown")
+        assert daily_stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual(returns, 0.04), abs=1e-4
         )
+        assert unknown["sharpe_ratio"] == pytest.approx(
+            daily_stats["sharpe_ratio"], abs=1e-4
+        ), (
+            "a per-observation ratio was published as a Sharpe: "
+            f"{unknown['sharpe_ratio']} instead of {daily_stats['sharpe_ratio']}"
+        )
+        assert unknown["sortino_ratio"] == pytest.approx(
+            daily_stats["sortino_ratio"], abs=1e-4
+        )
+        # Not merely "non-zero": the annualized value, ~13.75x the per-period
+        # ratio the defect produced for these returns.
+        assert unknown["sharpe_ratio"] > 1.0
+        assert "sharpe_ratio" not in unknown["undefined_metrics"]
+
+    def test_unknown_frequency_states_why_the_period_assumption_is_unverified(self):
+        """`equity_return_frequency` must name the reason, not just "unknown"."""
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=100_000.0 * (1.001**index))
+            for index in range(40)
+        ]
+
+        stats = compute_stats([], equity_curve=unparseable, risk_free_rate=0.04)
+
+        assert stats["equity_return_frequency"] == (
+            "unknown:unparseable_equity_timestamps"
+        ), (
+            "the payload must say the equity curve had no readable clock, so a "
+            "consumer can see the annualisation was a stated assumption rather "
+            "than a fact read off the data"
+        )
+        # A known frequency stays a bare token, so existing consumers keep
+        # matching on it.
+        assert stats["undefined_metrics"] is not None
+        known = _equity_curve_from_returns([0.01, -0.005, 0.004] * 4)
+        assert compute_stats([], equity_curve=known)["equity_return_frequency"] == "daily"
+
+    def test_describe_return_frequency_is_a_no_op_without_a_reason(self):
+        from runner.stats import (
+            UNKNOWN_RETURN_FREQUENCY,
+            _describe_return_frequency,
+        )
+
+        assert _describe_return_frequency("daily", None) == "daily"
+        assert _describe_return_frequency("none", None) == "none"
+        assert _describe_return_frequency(UNKNOWN_RETURN_FREQUENCY, "why") == "unknown:why"
+
+    def test_sharpe_manual_has_no_annualization_knob(self):
+        """The per-period variant is unreachable, not merely unused.
+
+        ``annualization_factor=1.0`` is what published a per-observation ratio
+        under the name "Sharpe". Leaving the parameter in place (unused, with a
+        default) invites the same call back, so its absence is the fix.
+        """
+        import inspect
+
+        from runner.stats import _sortino_manual
+
+        for helper in (_sharpe_manual, _sortino_manual):
+            assert "annualization_factor" not in inspect.signature(helper).parameters
+
+        # And the only ratio these helpers can produce is the annualized one:
+        # the per-period variant is off by exactly sqrt(252).
+        returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002]
+        annualized = _sharpe_manual(returns, 0.0)
+        assert annualized == pytest.approx(
+            (sum(returns) / len(returns))
+            / (
+                sum(
+                    (value - sum(returns) / len(returns)) ** 2 for value in returns
+                )
+                / (len(returns) - 1)
+            )
+            ** 0.5
+            * math.sqrt(252)
+        )
+        assert annualized != pytest.approx(annualized / math.sqrt(252))
+

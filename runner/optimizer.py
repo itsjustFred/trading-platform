@@ -36,6 +36,13 @@ ProgressCallback = Callable[[float, str], None]
 # parameter that happens to be called "symbol_universe".
 _INTERNAL_SYMBOL_UNIVERSE_PARAM = "__internal_symbol_universe"
 
+#: Prefix that marks an Optuna param as optimizer bookkeeping rather than a
+#: strategy parameter. Params under it are stripped before the trial rows reach
+#: the plateau / multiple-testing statistics, so an internal param can never be
+#: picked as the axis a "plateau" is reported along, nor counted as a distinct
+#: strategy configuration.
+_INTERNAL_PARAM_PREFIX = "__internal_"
+
 # Upper bound on the number of symbol-subset universes we enumerate. Without a
 # cap the candidate set grows as 2**n and both memory and the Optuna categorical
 # search space explode for large symbol lists.
@@ -967,12 +974,39 @@ def _build_diagnostics_payload(
         payload["walk_forward"] = {"error": str(exc)}
 
     # 3. Plateau stability and selection bias over the evaluated trials.
+    # Two classes of row are NOT strategy performances and must not reach
+    # either statistic:
+    #  - no-trade ("penalty") trials, which carry a sentinel value. The
+    #    sentinel is *dynamic* (`_no_trade_penalty_value`), so the value-level
+    #    `penalty_floor` filter below catches only the very first trial's
+    #    -1e9 and lets every later `min(values) - 1.0` through — which put a
+    #    sentinel in the sample mean/spread and in the plateau's neighbour
+    #    list, where it made `sensitivity` a ratio against a penalty rather
+    #    than against the nearest real parameter value. The `penalty_applied`
+    #    user attr is the definitive marker, so filter on that.
+    #  - internal bookkeeping params (`__internal_symbol_universe`), which are
+    #    optimizer plumbing, not strategy parameters: they must not be chosen
+    #    as the plateau axis, and a row carrying nothing but internal params is
+    #    not a trial at all.
     trial_rows: list[dict[str, Any]] = []
+    excluded_no_trade_trials = 0
     for trial in trials or []:
+        if bool(getattr(trial, "user_attrs", {}).get("penalty_applied", False)):
+            excluded_no_trade_trials += 1
+            continue
         params = getattr(trial, "params", None)
         value = getattr(trial, "value", None)
-        if isinstance(params, dict) and isinstance(value, (int, float)):
-            trial_rows.append({**params, "metric": value})
+        if not isinstance(params, dict) or not isinstance(value, (int, float)):
+            continue
+        row = {
+            key: item
+            for key, item in params.items()
+            if not str(key).startswith(_INTERNAL_PARAM_PREFIX)
+        }
+        if not row:
+            continue
+        row["metric"] = value
+        trial_rows.append(row)
 
     # A plateau is only meaningful along a parameter that actually varied.
     varied: dict[str, set[Any]] = {}
@@ -993,13 +1027,21 @@ def _build_diagnostics_payload(
     else:
         payload["plateau"] = None
 
-    # penalty_floor keeps the no-trade sentinel out of the trial distribution:
-    # it is a penalty, not a strategy performance, and would otherwise describe
-    # the mean/spread of the sample (and every comparison below it).
-    payload["multiple_testing"] = multiple_testing_correction(
+    # penalty_floor is the second line of defence for a sentinel that reached
+    # the metrics list without the marker (a caller that synthesised trials).
+    multiple_testing = multiple_testing_correction(
         [float(row["metric"]) for row in trial_rows],
         penalty_floor=_NO_TRADE_PENALTY,
     )
+    # The rows were already filtered above, so the function's own count is zero
+    # here; the honest number is how many were kept out.
+    multiple_testing["n_penalty_trials_excluded"] = int(
+        multiple_testing.get("n_penalty_trials_excluded") or 0
+    ) + excluded_no_trade_trials
+    payload["multiple_testing"] = multiple_testing
+    # Never let the sample shrink silently: a reader has to be able to see that
+    # the reported statistics describe fewer rows than the study ran.
+    payload["n_no_trade_trials_excluded"] = excluded_no_trade_trials
     payload["target_metric"] = target_metric
     return payload
 

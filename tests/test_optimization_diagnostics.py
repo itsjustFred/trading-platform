@@ -354,3 +354,144 @@ def test_expected_max_is_scaled_onto_the_metrics_own_distribution():
     assert tight["significance_threshold"] > 1.0
     assert wide["significance_threshold"] > 30.0
     assert wide["expected_max_under_null"] != tight["expected_max_under_null"]
+
+
+# ─── diagnostics payload: what is a trial row ─────────────────────────────────
+
+
+def _payload_for(trials, **config_kwargs):
+    import runner.optimizer as opt
+
+    config = opt.OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=len(trials),
+        train_split_pct=0.7,
+        walk_forward_splits=2,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 9}},
+        **config_kwargs,
+    )
+    return opt._build_diagnostics_payload(
+        trials=trials,
+        config=config,
+        train_period={
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-04-01T00:00:00+00:00",
+        },
+        test_period={
+            "start": "2024-04-01T00:00:00+00:00",
+            "end": "2024-07-01T00:00:00+00:00",
+        },
+        target_metric="sharpe_ratio",
+        timeframe="1h",
+    )
+
+
+def _trial(params, value, *, penalty=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        params=params, value=value, user_attrs={"penalty_applied": penalty}
+    )
+
+
+def test_no_trade_trials_are_excluded_from_the_plateau():
+    """A no-trade trial is a sentinel, not a strategy performance.
+
+    The `penalty_floor` threaded into `multiple_testing_correction` does NOT
+    keep these rows out: the sentinel is *dynamic*
+    (`_no_trade_penalty_value` returns `min(values) - 1.0` once any trading
+    trial has completed), so the value-level filter only ever caught the very
+    first trial's -1e9. Every later sentinel reached the plateau, where it
+    inflated `total_evaluated` and — because `neighbours` is ordered by
+    distance from the best parameter value — a sentinel at the *same*
+    parameter value became the nearest other neighbour, so `sensitivity`
+    reported a ratio against a penalty.
+    """
+    trials = [
+        _trial({"window": 2}, 0.10),
+        _trial({"window": 3}, 0.40),
+        _trial({"window": 4}, 0.39),
+        _trial({"window": 5}, 0.05),
+        # Dynamic sentinel: min(observed trading values) - 1.0 == -0.95.
+        _trial({"window": 3}, -0.95, penalty=True),
+        _trial({"window": 4}, -0.95, penalty=True),
+    ]
+
+    payload = _payload_for(trials)
+
+    plateau = payload["plateau"]
+    assert plateau["total_evaluated"] == 4, "a sentinel is not an evaluated trial"
+    assert all(
+        neighbour["metric"] > -1.0 for neighbour in plateau["neighbours"]
+    ), "no penalty value may appear in the plateau's neighbour list"
+    # `sensitivity` is the ratio of the nearest OTHER parameter value's delta to
+    # the best. Against the -0.95 sentinel at window=3 the ratio was ~0.95/0.4;
+    # against the real window=2 neighbour it is 0.3/0.4.
+    assert plateau["sensitivity"] == pytest.approx(0.3 / 0.4, rel=1e-6)
+    assert plateau["parameter"] == "window"
+    assert payload["n_no_trade_trials_excluded"] == 2
+    # The same rows must not reach the selection-bias statistics either.
+    multiple_testing = payload["multiple_testing"]
+    assert multiple_testing["n_trials"] == 4
+    assert multiple_testing["n_penalty_trials_excluded"] == 2
+    assert multiple_testing["trial_metric_mean"] == pytest.approx(0.235, abs=1e-6)
+    assert multiple_testing["survives_selection_bias"] is not None
+
+
+def test_internal_params_are_never_the_plateau_axis():
+    """`__internal_symbol_universe` is plumbing, not a strategy parameter.
+
+    `varied` counted every key of every trial row, and the plateau axis is the
+    parameter with the most distinct values. A study that enumerated six symbol
+    universes across only two window values therefore reported its "plateau"
+    along `__internal_symbol_universe` and published `best_value: 5` — an
+    internal index, meaningless to whoever reads the optimization report.
+
+    The two domains are deliberately disjoint here (windows 20/30, universe
+    indices 0..5) so the reported `best_value` cannot accidentally look like a
+    window.
+    """
+    trials = [
+        _trial(
+            {"window": 20 + 10 * (index % 2), "__internal_symbol_universe": index},
+            0.1 * (index + 1),
+        )
+        for index in range(6)
+    ]
+
+    payload = _payload_for(trials)
+
+    assert payload["plateau"]["parameter"] == "window"
+    assert payload["plateau"]["best_value"] in {20, 30}
+    assert payload["plateau"]["total_evaluated"] == 6
+    assert {neighbour["value"] for neighbour in payload["plateau"]["neighbours"]} <= {
+        20,
+        30,
+    }
+
+
+def test_a_row_of_only_internal_params_is_not_a_trial():
+    """Nothing but bookkeeping params means nothing to analyse."""
+    trials = [
+        _trial({"window": 2}, 0.10),
+        _trial({"window": 3}, 0.40),
+        _trial({"__internal_symbol_universe": 0}, 0.30),
+    ]
+
+    payload = _payload_for(trials)
+
+    assert payload["plateau"]["total_evaluated"] == 2
+    assert payload["multiple_testing"]["n_trials"] == 2
+
+
+def test_all_no_trade_trials_leave_the_statistics_empty_not_wrong():
+    """An all-sentinel study reports nothing rather than describing sentinels."""
+    trials = [_trial({"window": 2 + index}, -0.95, penalty=True) for index in range(3)]
+
+    payload = _payload_for(trials)
+
+    assert payload["plateau"] is None
+    assert payload["multiple_testing"]["n_trials"] == 0
+    assert payload["multiple_testing"]["survives_selection_bias"] is None
+    assert payload["n_no_trade_trials_excluded"] == 3
