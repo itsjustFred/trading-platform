@@ -9,6 +9,19 @@ from shared.models import LiveSignal
 #: (adapters) must never compare divergent spellings again.
 EXIT_ONLY_RISK_SIZING_MODE = "exit_only"
 
+#: Explicit unbounded-take-profit policy (C1 owner decision). Set ONLY by
+#: the originating processor (RocketFuel exits on the opposite signal) —
+#: never inferred. Matched via :func:`is_unbounded_tp`, not string
+#: comparison scattered across daemon + adapters (pre-mortem PM2).
+UNBOUNDED_TP_POLICY = "unbounded_exit_on_opposite_signal"
+
+
+def is_unbounded_tp(metadata: object) -> bool:
+    """Whether metadata declares the explicit unbounded-TP policy."""
+    if not isinstance(metadata, dict):
+        return False
+    return str(metadata.get("take_profit_policy") or "") == UNBOUNDED_TP_POLICY
+
 
 class BaseLiveAdapter(ABC):
     """Abstract broker adapter for live order routing and fill streaming."""

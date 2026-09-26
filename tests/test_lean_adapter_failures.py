@@ -10,7 +10,7 @@ from runner.engines.lean_adapter import LeanAdapter
 
 
 def _config(tmp_path: Path) -> BacktestConfig:
-    return BacktestConfig(parameters={"fees": "zero"}, 
+    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
         strategy_name="lean_demo",
         symbols=["SPY"],
         timeframe="1d",
@@ -72,3 +72,48 @@ def test_lean_adapter_fails_loudly_when_lean_cli_missing(tmp_path, monkeypatch):
     config = _config(tmp_path)
     with pytest.raises(RuntimeError, match="LEAN"):
         adapter.run(config, str(strategy))
+
+
+def test_find_result_rejects_non_result_json(tmp_path: Path) -> None:
+    """C2: config echoes and log-shaped JSON are never mistaken for results."""
+    import json
+
+    from runner.engines.lean_adapter import LeanAdapter
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "b_config.json").write_text(json.dumps({"config": True}))
+    (out / "a_log.json").write_text(json.dumps(["not", "a", "dict"]))
+    (out / "c_result.json").write_text(
+        json.dumps({"orders": [], "trades": [{"id": 1}]})
+    )
+    adapter = LeanAdapter.__new__(LeanAdapter)
+    found = adapter._find_result(out)
+    assert found is not None and found.name == "c_result.json"
+
+
+def test_find_result_returns_none_when_nothing_validates(tmp_path: Path) -> None:
+    import json
+
+    from runner.engines.lean_adapter import LeanAdapter
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps({"config": True}))
+    adapter = LeanAdapter.__new__(LeanAdapter)
+    assert adapter._find_result(out) is None
+
+
+def test_find_result_accepts_dict_shaped_orders(tmp_path: Path) -> None:
+    """CodeRabbit round (critical): LEAN writes orders dict-shaped keyed
+    by order id — the finder must accept what the converter consumes."""
+    import json
+
+    from runner.engines.lean_adapter import LeanAdapter
+
+    out = tmp_path / "output"
+    out.mkdir()
+    (out / "result.json").write_text(json.dumps(LEAN_FIXTURE))
+    adapter = LeanAdapter.__new__(LeanAdapter)
+    found = adapter._find_result(out)
+    assert found is not None and found.name == "result.json"

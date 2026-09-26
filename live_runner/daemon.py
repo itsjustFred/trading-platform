@@ -18,11 +18,23 @@ from live_runner.account_routing import (
     validate_live_account_routes,
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
-from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
+from live_runner.base_adapter import (
+    EXIT_ONLY_RISK_SIZING_MODE,
+    BaseLiveAdapter,
+    is_unbounded_tp,
+)
+from live_runner.credential_env import (
+    accounts_env_mtime,
+    load_accounts_env_values,
+    resolve_env_value,
+)
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
-from live_runner.signal_sources import DiscordSignalSource, wait_for_candle_close
+from live_runner.signal_sources import (
+    DiscordSignalSource,
+    signal_is_fresh,
+    wait_for_candle_close,
+)
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
 from live_runner.stockkit_routing import (
     infer_stockkit_route,
@@ -226,13 +238,20 @@ def _recover_failed_services() -> list[Service]:
     """Retry FAILED services on startup; never resurrect PAUSED/STOPPED ones.
 
     PAUSED/STOPPED encode operator intent and must survive a daemon restart.
-    FAILED is system state (e.g. transient auth/network) and is safe to retry.
+    FAILED is system state (e.g. transient auth/network) and is safe to retry —
+    but bounded (B2): each resuscitated service starts with its reconnect
+    floor armed, so a still-broken credential backs off instead of hot-looping
+    from the first tick. Terminal auth failures re-block immediately.
     """
     services = list_services()
     for service in services:
         if service.status != ServiceStatus.FAILED:
             continue
         update_service_status(str(service.id), ServiceStatus.RUNNING)
+        _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE[str(service.id)] = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=DISCORD_RECONNECT_RETRY_FLOOR_SECONDS)
+        )
     return list_services()
 
 
@@ -737,7 +756,12 @@ async def submit_order_with_risk(
         close_action = metadata.get("action")
         if close_action in {"buy", "sell"} and close_action != signal.action:
             update["action"] = close_action
-        return await adapter.submit_order(signal.model_copy(update=update))
+        # C1/B2: the broker-resolved flatten qty is binding — pass it
+        # explicitly so the adapter never re-sizes.
+        return await adapter.submit_order(
+            signal.model_copy(update=update),
+            qty=float(metadata["explicit_qty"]),
+        )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -753,9 +777,9 @@ async def submit_order_with_risk(
         current_positions=open_positions_count,
     )
     # Sizing may have resolved a fallback stop (ATR/percent). Persist that
-    # resolution so the broker order carries the stop sizing actually assumed,
-    # and derive the take profit from the same geometry (1:1 risk-reward) so a
-    # signal without an explicit TP still opens a bounded bracket at the broker.
+    # resolution so the broker order carries the stop sizing actually assumed.
+    # C1 (owner decision): a missing take profit FAILS — no invented 1.0-RR
+    # bracket from theoretical_price. The guard below rejects it.
     sized_metadata = dict(sized_signal.metadata or {})
     if "resolved_stop_loss" in sized_metadata:
         metadata["stop_loss"] = float(sized_metadata["resolved_stop_loss"])
@@ -763,23 +787,17 @@ async def submit_order_with_risk(
         metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
     )
     take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-    if take_profit is None and stop_loss is not None:
-        risk_distance = abs(float(signal.theoretical_price) - float(stop_loss))
-        reward_distance = risk_distance * (
-            float(sized_metadata.get("risk_reward_ratio") or 1.0)
-        )
-        take_profit = (
-            float(signal.theoretical_price) + reward_distance
-            if signal.action == "buy"
-            else float(signal.theoretical_price) - reward_distance
-        )
     # Fail closed: sizing divides the risk budget by the stop distance, so an
     # order without SL/TP would be sized on an invented distance and open an
-    # unbounded position. Both broker adapters enforce the same guard.
+    # unbounded position. Both broker adapters enforce the same guard. The
+    # ONLY exception is an explicit unbounded-take-profit policy flag set by
+    # the originating processor (C1 owner decision: bounded TP or explicit
+    # unbounded flag — RocketFuel exits on the opposite signal).
+    unbounded_tp = is_unbounded_tp(metadata)
     missing: list[str] = []
     if stop_loss is None:
         missing.append("stop loss")
-    if take_profit is None:
+    if take_profit is None and not unbounded_tp:
         missing.append("take profit")
     if missing:
         raise ValueError(
@@ -788,8 +806,23 @@ async def submit_order_with_risk(
             f"symbol={signal.symbol}); opening an unbounded position is "
             "not allowed."
         )
+    if take_profit is None and unbounded_tp:
+        logger.warning(
+            "Submitting live order with explicitly unbounded take profit "
+            "(exit on opposite signal)",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "symbol": signal.symbol,
+                    "take_profit_policy": metadata.get("take_profit_policy"),
+                }
+            },
+        )
     metadata["stop_loss"] = float(stop_loss)
-    metadata["take_profit"] = float(take_profit)
+    if take_profit is not None:
+        metadata["take_profit"] = float(take_profit)
+    else:
+        metadata.pop("take_profit", None)
     # Overlay the resolved SL/TP onto the SIZED metadata. The sized values for
     # qty/explicit_qty/risk_* must win: letting incoming metadata re-override
     # them would let a signal's self-declared qty bypass the risk sizing
@@ -812,7 +845,47 @@ async def submit_order_with_risk(
     }
     final_metadata = {**sized_metadata, **preserved_metadata}
     sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
-    return await adapter.submit_order(sized_signal)
+    # C1/B2: the risk-sized qty is binding — pass it explicitly so the
+    # adapter sizes exactly zero times (never with default config).
+    return await adapter.submit_order(
+        sized_signal, qty=float(sized_signal.metadata["qty"])
+    )
+
+
+def _mint_signal_idempotency_key(
+    signal: TradeSignal, deployment: LiveDeploymentConfig, metadata: dict[str, object]
+) -> None:
+    """Mint a producer-stable idempotency key for non-Discord signals (C1).
+
+    A redelivery returns the canonical row instead of a second broker
+    order. Content-stable (same logical signal → same key); distinct
+    signals differ by price/levels/time. Discord redeliveries keep using
+    their discord_message_id. CodeRabbit round: only mint from real
+    producer identity — an empty timestamp slot would make distinct
+    timestamp-less signals share one key and wrongly dedupe, so leave it
+    unset instead (the execution layer derives a fill-content key
+    downstream).
+    """
+    if metadata.get("discord_message_id") or metadata.get("idempotency_key"):
+        return
+    producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
+    if not producer_stamp:
+        return
+    key_material = "|".join(
+        [
+            str(deployment.id),
+            str(signal.symbol).upper(),
+            str(signal.action).lower(),
+            repr(float(signal.entry_price)),
+            repr(signal.stop_loss),
+            repr(signal.take_profit),
+            str(signal.timeframe),
+            str(producer_stamp),
+        ]
+    )
+    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
+        :32
+    ]
 
 
 def _trade_signal_to_live_signal(
@@ -826,6 +899,7 @@ def _trade_signal_to_live_signal(
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
+    _mint_signal_idempotency_key(signal, deployment, metadata)
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
@@ -977,13 +1051,11 @@ def _resolve_account_discord_token(
         token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
     discord_token = ""
     if token_env_key:
-        _resolved = str(accounts_env_values.get(token_env_key) or "").strip()
-        if not _resolved:
-            _resolved = str(os.environ.get(token_env_key, "")).strip()
+        _resolved = resolve_env_value(accounts_env_values, token_env_key)
         if _resolved:
             discord_token = _resolved
     if not discord_token:
-        discord_token = str(os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
+        discord_token = resolve_env_value(accounts_env_values, "DISCORD_BOT_TOKEN")
     return discord_token
 
 
@@ -1011,9 +1083,7 @@ def _resolve_discord_service_trusted_author_ids(
     env_key = _service_config_string(config, "trusted_author_ids_env_key") or (
         "DISCORD_TRUSTED_AUTHOR_IDS"
     )
-    raw_env = str(
-        accounts_env_values.get(env_key) or os.environ.get(env_key, "")
-    ).strip()
+    raw_env = resolve_env_value(accounts_env_values, env_key)
     if not raw_env:
         return set()
     return _trusted_author_ids_from_config(
@@ -1030,6 +1100,22 @@ async def _submit_normalized_discord_signal(
     signal_timeframe: str,
     wait_enabled: bool,
 ) -> None:
+    # B2 (owner decision): stale signals trade immediately on outdated
+    # information — discard anything older than one deployment-timeframe
+    # candle instead.
+    if not signal_is_fresh(trade_signal, signal_timeframe):
+        logger.info(
+            "Skipping stale discord signal: older than one timeframe candle",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                    "signal_timeframe": signal_timeframe,
+                }
+            },
+        )
+        return
     normalized_signal = TradeSignal(
         action=trade_signal.action,
         symbol=trade_signal.symbol,
@@ -1062,7 +1148,8 @@ async def _submit_normalized_discord_signal(
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
-    # wait window must not trade at the candle-close price.
+    # wait window must not trade at the candle-close price — and neither must
+    # a signal that AGED OUT during the wait (B2 price/age revalidation).
     if not _deployment_is_currently_active(deployment):
         logger.info(
             "Skipping discord signal: deployment left ACTIVE during candle-close wait",
@@ -1072,6 +1159,18 @@ async def _submit_normalized_discord_signal(
                     "deployment_id": str(deployment.id),
                     "symbol": trade_signal.symbol,
                     "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return
+    if not signal_is_fresh(normalized_signal, signal_timeframe):
+        logger.info(
+            "Skipping discord signal: aged out during candle-close wait",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
                 }
             },
         )
@@ -1397,7 +1496,9 @@ def _create_adapter_for_account(
     accounts_env_values: Mapping[str, str] | None = None,
     accounts_env_path: Path | str | None = None,
 ) -> BaseLiveAdapter | None:
-    env_values = accounts_env_values or os.environ
+    # C1: an explicitly passed (even empty) mapping wins over os.environ —
+    # a falsy-but-present mapping must not fall through to process env.
+    env_values = accounts_env_values if accounts_env_values is not None else os.environ
     if account.broker == "alpaca":
         credentials = resolve_alpaca_credentials(
             account_id=account.id,
@@ -1585,7 +1686,7 @@ def _resolve_discord_bot_runtime(
     if not token_env_key:
         canonical_name = re.sub(r"[^A-Z0-9_]+", "_", str(service.name or "").upper())
         token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
-    token = str(accounts_env_values.get(token_env_key) or os.environ.get(token_env_key, "")).strip()
+    token = resolve_env_value(accounts_env_values, token_env_key)
     channel_id = _service_config_string(config, "channel_id")
     return token_env_key, token, channel_id
 
@@ -2106,6 +2207,10 @@ async def _poll_adapter_balance(
         )
 
 
+#: Per-account balance timeout (B2): one hung broker must not stall the tick.
+BALANCE_POLL_TIMEOUT_SECONDS = 30.0
+
+
 async def _poll_balances(
     adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
 ) -> None:
@@ -2115,10 +2220,37 @@ async def _poll_balances(
             "Polling balances for adapters",
             extra={"data": {"adapter_count": len(adapters)}},
         )
-        for account_id, adapter in list(adapters.items()):
-            if not _adapter_is_ready(adapter):
-                continue
-            await _poll_adapter_balance(adapters, account_id, adapter, snapshot_time)
+        # B2: fan out with gather (per-account timestamp preserved) instead
+        # of sequential awaits — one slow broker no longer blocks all
+        # accounts. return_exceptions keeps one failure from killing the tick.
+        ready = [
+            (account_id, adapter)
+            for account_id, adapter in list(adapters.items())
+            if _adapter_is_ready(adapter)
+        ]
+
+        async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
+            try:
+                await asyncio.wait_for(
+                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    timeout=BALANCE_POLL_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Live balance polling timed out",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "adapter": type(adapter).__name__,
+                            "timeout_seconds": BALANCE_POLL_TIMEOUT_SECONDS,
+                        }
+                    },
+                )
+
+        await asyncio.gather(
+            *(_poll_one(account_id, adapter) for account_id, adapter in ready),
+            return_exceptions=True,
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -2439,7 +2571,9 @@ async def _connect_active_accounts(
     accounts_env_values: Mapping[str, str],
     accounts_env_path: Path | str | None = None,
 ) -> None:
-    await asyncio.gather(
+    # B2: per-account isolation — one failing connect must not fail the
+    # whole tick (bare gather propagated the first exception).
+    results = await asyncio.gather(
         *(
             _ensure_adapter_for_active_account(
                 account_id,
@@ -2449,8 +2583,19 @@ async def _connect_active_accounts(
                 accounts_env_path=accounts_env_path,
             )
             for account_id in sorted(account_ids)
-        )
+        ),
+        return_exceptions=True,
     )
+    for account_id, result in zip(sorted(account_ids), results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Adapter connect failed; will retry",
+                extra={
+                    "data": {"account_id": account_id, "error": str(result)}
+                },
+            )
 
 
 async def _rotate_changed_ctrader_adapters(
@@ -2593,7 +2738,10 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            await _disconnect_inactive_adapters(active_adapters, active_account_ids)
+            # B2: disconnect against runnable (blocked-excluded) ids — a
+            # blocked account must never keep a live adapter via the
+            # active-id set.
+            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
 
             active_discord_account_ids = _discord_active_account_ids(deployments)
 
@@ -2678,16 +2826,32 @@ async def run_daemon(
             )
         raise
     finally:
-        if not service_sync_task.done():
-            service_sync_task.cancel()
+        # B2: cancel EVERYTHING (sync + balance loops leaked before) and
+        # await the cancels — fire-and-forget cancel() leaves pending tasks
+        # and "Task was destroyed" warnings behind.
+        for task in (sync_task, service_sync_task, balance_task):
+            if not task.done():
+                task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await service_sync_task
+            await asyncio.gather(
+                sync_task, service_sync_task, balance_task, return_exceptions=True
+            )
+        for task in list(active_listener_tasks.values()):
+            if not task.done():
+                task.cancel()
         for task in list(active_discord_tasks.values()):
             if not task.done():
                 task.cancel()
         for task in list(active_discord_bot_tasks.values()):
             if not task.done():
                 task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(
+                *list(active_listener_tasks.values()),
+                *list(active_discord_tasks.values()),
+                *list(active_discord_bot_tasks.values()),
+                return_exceptions=True,
+            )
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)

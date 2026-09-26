@@ -24,12 +24,24 @@ def validate_live_account_routes(accounts: Sequence[LiveAccountConfig]) -> None:
         if account.broker != "ctrader":
             continue
 
+        # B3: cTrader routing needs a numeric cTID — a missing/non-numeric
+        # identifier must fail here at validation, not surface at preflight
+        # or, worse, route to the wrong account.
         identifier = ctrader_account_identifier(account)
         try:
             numeric_identifier = int(identifier)
-            routing_key = str(numeric_identifier) if numeric_identifier > 0 else identifier
-        except ValueError:
-            routing_key = identifier
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"cTrader account '{account_id}' has no numeric broker "
+                f"identifier (ctid/broker_login resolved to {identifier!r}); "
+                "set a numeric ctid."
+            )
+        if numeric_identifier <= 0:
+            raise ValueError(
+                f"cTrader account '{account_id}' has a non-positive broker "
+                f"identifier ({identifier!r}); set a numeric ctid."
+            )
+        routing_key = str(numeric_identifier)
         existing_account_id = ctrader_targets.get(routing_key)
         if existing_account_id is not None:
             raise ValueError(

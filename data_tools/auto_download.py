@@ -82,6 +82,40 @@ def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> fl
     return max(total - _weekend_overlap_minutes(start_ts, end_ts), 0.0)
 
 
+def _is_trading_instant(ts: pd.Timestamp, step_minutes: float) -> bool:
+    """Whether a bar grid instant falls in trading time (pre-mortem R1).
+
+    Weekends print no bars on any venue in this repo; weekly+ grids are
+    sparse by nature and count every grid point.
+    """
+    if step_minutes >= 10080.0:
+        return True
+    return ts.weekday() < 5
+
+
+def _expected_trading_bars(
+    start_ts: pd.Timestamp, end_ts: pd.Timestamp, step_minutes: float
+) -> int:
+    """Count step-grid points in [start, end] that fall in trading time.
+
+    The old `span // step + 1` overcounted whenever the span end landed on
+    excluded time (e.g. a Mon–Sat daily segment expected 6 bars for 5
+    perfect weekday bars and failed a healthy feed).
+    """
+    if step_minutes <= 0:
+        return 0
+    span_minutes = (end_ts - start_ts).total_seconds() / 60.0
+    steps = int(span_minutes // step_minutes)
+    count = 0
+    for k in range(steps + 1):
+        instant = start_ts + pd.Timedelta(minutes=k * step_minutes)
+        if instant > end_ts:
+            break
+        if _is_trading_instant(instant, step_minutes):
+            count += 1
+    return count
+
+
 @dataclass
 class InternalGap:
     """A hole between two consecutive bars inside the stored range."""
@@ -167,6 +201,7 @@ def ensure_backtest_data(
         if not _has_required_coverage(data_root, requirement)
     ]
     if not missing:
+        _fail_on_internal_gaps(data_root, requirements)
         return []
 
     downloaded: list[dict[str, Any]] = []
@@ -215,7 +250,6 @@ def ensure_backtest_data(
                 f"{requirement.symbol} {requirement.timeframe} "
                 f"({requirement.start or 'auto'} -> {requirement.end or 'latest'})"
             )
-
         payload = {
             "symbol": requirement.symbol,
             "timeframe": requirement.timeframe,
@@ -231,8 +265,25 @@ def ensure_backtest_data(
                 f"Downloaded data for {requirement.symbol} {requirement.timeframe}",
             )
 
+    # C5: global min/max bounds are not coverage — fail on internal gaps
+    # the bounds check cannot see (DV-B15). Verified for every requirement,
+    # not just freshly downloaded ones.
+    _fail_on_internal_gaps(data_root, requirements)
+
     _invalidate_catalog_cache(data_root)
     return downloaded
+
+
+def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    """Raise when any requirement's stored range hides an internal hole."""
+    for requirement in requirements:
+        coverage_report = analyze_ohlcv_coverage(data_root, requirement)
+        if coverage_report.get("status") == "failed":
+            raise RuntimeError(
+                "OHLCV coverage has internal gaps for "
+                f"{requirement.symbol} {requirement.timeframe}: "
+                f"{coverage_report.get('gaps') or coverage_report.get('error')}"
+            )
 
 
 def _resolve_data_root(data_dir: str | Path) -> Path:
@@ -548,8 +599,10 @@ def has_sufficient_segment_coverage(
     end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
-    span_minutes = _trading_minutes_between(start_ts, end_ts)
-    expected = max(int(span_minutes // step_minutes) + 1, 1)
+    expected = max(
+        _expected_trading_bars(start_ts, end_ts, step_minutes),
+        1,
+    )
     stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
     if not stamps:
         return False
@@ -672,6 +725,24 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
     return min(starts), max(ends)
 
 
+def _gaps_overlapping_window(
+    gaps: list[dict[str, object]], start: str | None, end: str | None
+) -> list[dict[str, object]]:
+    """Keep only holes strictly overlapping [start, end] (CodeRabbit round).
+
+    Ancient history outside the required window must not fail a requirement
+    that never touches it; boundary-touching holes carry no interior
+    missing bars and are excluded too.
+    """
+    if start is None or end is None:
+        return list(gaps)
+    return [
+        gap
+        for gap in gaps
+        if str(gap.get("end", "")) > start and str(gap.get("start", "")) < end
+    ]
+
+
 def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dict[str, Any]:
     """Report coverage for one requirement, including internal holes.
 
@@ -689,6 +760,8 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         gaps.extend(find_internal_gaps(candidate, timeframe))
 
     error: str | None = None
+    required_start: str | None = None
+    required_end: str | None = None
     if bounds is None:
         error = (
             f"No {requirement.symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
@@ -706,6 +779,9 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     significant_gaps = [
         gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
     ]
+    significant_gaps = _gaps_overlapping_window(
+        significant_gaps, required_start, required_end
+    )
 
     if error or significant_gaps:
         status = "failed"

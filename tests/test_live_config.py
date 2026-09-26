@@ -44,6 +44,7 @@ def test_parse_live_deployments_warns_for_missing_account(tmp_path: Path):
 accounts:
   - id: ctrader-live
     broker: ctrader
+    ctid: "12345"
 
 deployments:
   - strategy_name: orphan_strategy

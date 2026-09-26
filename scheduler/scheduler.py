@@ -41,6 +41,21 @@ class ServiceScheduler:
     async def start(self) -> None:
         if self._started:
             return
+        from apscheduler.events import EVENT_JOB_MISSED
+
+        # B2: misfire alarm — a missed run logs loudly instead of vanishing
+        # into coalescing.
+        def _alarm_missed(event: Any) -> None:
+            logger.error(
+                "Scheduled service job missed its window",
+                extra={
+                    "data": {
+                        "job_id": str(getattr(event, "job_id", "")),
+                    }
+                },
+            )
+
+        self._scheduler.add_listener(_alarm_missed, EVENT_JOB_MISSED)
         self._scheduler.start()
         self._started = True
         services = await asyncio.to_thread(
@@ -135,7 +150,10 @@ class ServiceScheduler:
                     "service_name": service.name,
                     "job_type": job_type,
                 },
-                misfire_grace_time=300,
+                # B2: a 5-minute grace silently swallows outages (a missed
+                # run just vanishes into coalescing). One minute, and misses
+                # are alarmed via the EVENT_JOB_MISSED listener below.
+                misfire_grace_time=60,
             )
             self._job_signatures[service_id] = signature
             logger.info(
@@ -163,7 +181,9 @@ class ServiceScheduler:
         job_type: str,
     ) -> None:
         now = datetime.now(timezone.utc)
-        task_id = f"service-{service_id}-{now.strftime('%Y%m%d%H%M%S')}"
+        # B2: microsecond suffix — two runs in the same second must not
+        # share a task id (second-resolution collided and overwrote).
+        task_id = f"service-{service_id}-{now.strftime('%Y%m%d%H%M%S%f')}"
         base_config = {
             "service_id": service_id,
             "service_name": service_name,

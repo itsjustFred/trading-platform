@@ -143,24 +143,32 @@ def _split_equity_curves_by_time(
 
 
 def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
-    """Load an equity curve for a strategy backtest from SQLite."""
+    """Load an equity curve for a strategy backtest from SQLite (C3).
+
+    Load errors surface with the backtest id attached instead of decaying
+    into an empty curve and a late, misleading "need 2 curves" error.
+    An id with genuinely no usable points still returns [] (caller decides).
+    """
     try:
         from shared.database import load_backtest_result
 
         result = load_backtest_result(backtest_id)
-        if result and result.equity_curve:
-            points = []
-            for point in result.equity_curve:
-                time_ts = _parse_time_to_ts(point.time)
-                if time_ts and point.equity:
-                    points.append(
-                        StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
-                    )
-            if points:
-                return points
-    except Exception:
+    except Exception as exc:
+        raise ValueError(
+            f"Could not load equity curve for backtest {backtest_id!r}: {exc}"
+        ) from exc
+    if result is None:
+        raise ValueError(f"Unknown backtest id {backtest_id!r}: no stored result")
+    if not result.equity_curve:
         return []
-    return []
+    points = []
+    for point in result.equity_curve:
+        time_ts = _parse_time_to_ts(point.time)
+        if time_ts and point.equity:
+            points.append(
+                StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
+            )
+    return points
 
 
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:

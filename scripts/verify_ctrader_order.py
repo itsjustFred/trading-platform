@@ -14,38 +14,64 @@ Usage:
     CTRADER_VERIFY_ORDER_ID=27678592 CTRADER_VERIFY_ACCOUNT_ID=47644617 \
         python scripts/verify_ctrader_order.py
 """
+import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
 from datetime import datetime, timezone
 
 # Install the asyncio reactor BEFORE importing the Twisted-backed adapter.
-from twisted.internet import asyncioreactor
+# B3: guarded (only when no reactor is installed yet) instead of unconditional.
+from twisted.internet import error as _twisted_error
 
-asyncioreactor.install()
+try:
+    from twisted.internet import asyncioreactor
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    asyncioreactor.install()
+except _twisted_error.ReactorAlreadyInstalledError:
+    pass
+
+# B3: no sys.path hack — resolve the repo root and require it on sys.path
+# only when missing (e.g. direct script invocation outside `uv run`).
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from dotenv import dotenv_values  # noqa: E402
 from live_runner.ctrader_adapter import CTraderLiveAdapter  # noqa: E402
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ACCOUNTS_ENV = os.path.join(_ROOT, ".accounts.env")
-ORDER_ID = int(os.environ.get("CTRADER_VERIFY_ORDER_ID", "27678592"))
-ACCOUNT_ID = int(os.environ.get("CTRADER_VERIFY_ACCOUNT_ID", "47644617"))
 MAX_ATTEMPTS = 4
 ATTEMPT_GAP_S = 30
 
 
-async def verify_once(adapter: CTraderLiveAdapter) -> dict:
+def _resolve_ids(args: argparse.Namespace) -> tuple[int, int]:
+    """Mandatory order/account ids from flags or env — no hardcoded defaults (B3)."""
+    order_raw = args.order_id or os.environ.get("CTRADER_VERIFY_ORDER_ID", "")
+    account_raw = str(args.account_id or os.environ.get("CTRADER_VERIFY_ACCOUNT_ID", ""))
+    try:
+        order_id = int(str(order_raw).strip())
+        account_id = int(account_raw.strip())
+    except (TypeError, ValueError):
+        order_id, account_id = 0, 0
+    if order_id <= 0 or account_id <= 0:
+        raise SystemExit(
+            "error: --order-id and --account-id (or CTRADER_VERIFY_ORDER_ID / "
+            "CTRADER_VERIFY_ACCOUNT_ID) are required; refusing defaults."
+        )
+    return order_id, account_id
+
+
+async def verify_once(adapter: CTraderLiveAdapter, order_id: int) -> dict:
     await adapter.connect()
     req = adapter._ProtoOAOrderDetailsReq()
     req.ctidTraderAccountId = adapter.ctid_trader_account_id
-    req.orderId = ORDER_ID
+    req.orderId = order_id
     res = await adapter._send_request_with_refresh_retry(req, timeout_seconds=20)
     deals = getattr(res, "deal", [])
-    out: dict = {"order_id": ORDER_ID, "deals": []}
+    out: dict = {"order_id": order_id, "deals": []}
     for d in deals:
         out["deals"].append(
             {
@@ -65,7 +91,7 @@ async def verify_once(adapter: CTraderLiveAdapter) -> dict:
     return out
 
 
-async def main() -> dict:
+async def main(order_id: int, account_id: int) -> dict:
     env = {str(k): str(v).strip() for k, v in dotenv_values(ACCOUNTS_ENV).items() if k}
     last_err: str | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -74,12 +100,12 @@ async def main() -> dict:
             app_secret=env["CTRADER_APP_SECRET"],
             access_token=env["CTRADER_ACCESS_TOKEN"],
             refresh_token=env["CTRADER_REFRESH_TOKEN"],
-            account_id=ACCOUNT_ID,
+            account_id=account_id,
             demo=True,
         )
         try:
             print(f"[attempt {attempt}/{MAX_ATTEMPTS}] connecting cTrader DEMO...")
-            result = await verify_once(adapter)
+            result = await verify_once(adapter, order_id)
             result["verified"] = True
             result["attempt"] = attempt
             result["verified_at"] = datetime.now(timezone.utc).isoformat()
@@ -97,19 +123,36 @@ async def main() -> dict:
                 await asyncio.sleep(ATTEMPT_GAP_S)
     return {
         "verified": False,
-        "order_id": ORDER_ID,
+        "order_id": order_id,
         "error": last_err,
         "attempts": MAX_ATTEMPTS,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
+def _write_report_atomic(payload: dict, out_path: str) -> None:
+    """Write the verification report with owner-only permissions (B3: 0o600)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(out_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        raise
+
+
 if __name__ == "__main__":
-    res = asyncio.run(main())
+    cli = argparse.ArgumentParser(description="Verify a cTrader order against broker truth.")
+    cli.add_argument("--order-id", type=int, default=0)
+    cli.add_argument("--account-id", type=int, default=0)
+    cli_args = cli.parse_args()
+    _order_id, _account_id = _resolve_ids(cli_args)
+    res = asyncio.run(main(_order_id, _account_id))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     reports_dir = os.path.join(_ROOT, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     out_path = os.path.join(reports_dir, f"ctrader_order_verification_{stamp}.json")
-    with open(out_path, "w") as fh:
-        json.dump(res, fh, indent=2)
+    _write_report_atomic(res, out_path)
     print("report:", out_path)

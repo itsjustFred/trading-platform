@@ -27,6 +27,21 @@ DATASET_ID = "mito0o852/OHLCV-1m"
 MONTHLY_URL_TEMPLATE = (
     "https://huggingface.co/datasets/mito0o852/OHLCV-1m/resolve/main/data/ohlcv_{year:04d}-{month:02d}.parquet"
 )
+#: Host allowlist for monthly parquet URLs (B3: unpinned remote reads must
+#: stay on the known dataset host).
+HF_ALLOWED_HOSTS = frozenset({"huggingface.co"})
+#: Fail-closed past N gaps (B3): more failed months than this aborts the
+#: download instead of selling a holey dataset as covered.
+HF_MAX_FAILED_MONTHS = 3
+
+
+def _check_month_url(url: str) -> None:
+    """Reject monthly URLs outside the allowlisted dataset host (B3)."""
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or ""
+    if host.lower() not in HF_ALLOWED_HOSTS:
+        raise ValueError(f"HuggingFace monthly URL host not allowlisted: {host!r}")
 DEFAULT_START_DATE = "1994-10-01"
 HF_COVERAGE_END = "2025-07-31"
 
@@ -193,23 +208,9 @@ class HuggingFaceDownloader(Downloader):
             return frame
         if timeframe == "1m":
             return frame
-        rule = RESAMPLE_RULES[timeframe]
-        resampled = (
-            frame.set_index("timestamp")
-            .resample(rule)
-            .agg(
-                {
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                }
-            )
-            .dropna(subset=["open", "high", "low", "close"])
-            .reset_index()
-        )
-        return resampled
+        from data_tools.resample import resample_with_origin
+
+        return resample_with_origin(frame, RESAMPLE_RULES[timeframe])
 
     def download(
         self,
@@ -255,6 +256,7 @@ class HuggingFaceDownloader(Downloader):
             month_label = f"{year:04d}-{month:02d}"
             logger.info("HuggingFace download progress %s/%s: %s", index, len(months), month_label)
             url = MONTHLY_URL_TEMPLATE.format(year=year, month=month)
+            _check_month_url(url)
             try:
                 month_frame = pd.read_parquet(url)
             except Exception as exc:
@@ -272,6 +274,14 @@ class HuggingFaceDownloader(Downloader):
             )
             if not normalized.empty:
                 monthly_frames.append(normalized)
+
+        # B3: fail closed past N gaps — a holey dataset must not sell as
+        # covered (warnings alone hid multi-month holes).
+        if len(failed_months) > HF_MAX_FAILED_MONTHS:
+            raise RuntimeError(
+                f"HuggingFace download for {normalized_symbol}: {len(failed_months)} "
+                f"months failed ({', '.join(failed_months)}); refusing a holey dataset."
+            )
 
         if not monthly_frames:
             raise RuntimeError(

@@ -31,6 +31,7 @@ from uuid import uuid4
 from runner.backtest_grid import (
     GRID_SYMBOLS,
     GRID_TIMEFRAMES,
+    _derive_net_profit_pct,
     build_run_id,
     get_engine,
     normalize_symbol,
@@ -117,27 +118,31 @@ def run_strategy_grid(
                 # Collect stats
                 stats = result.stats if result.stats else {}
 
-                # Explicit None metric values (engine produced no number) fall
-                # back to 0 instead of crashing float() and flipping a valid
-                # cell to "error" (CodeRabbit round on 16-D2). The sharpe key is
-                # read under both spellings ('sharpe' and the canonical
-                # 'sharpe_ratio' emitted by runner.stats.compute_stats_for_result)
-                # so a populated engine result is never reported as 0.
-                def _num(*keys: str, default: float = 0.0) -> float:
+                # C3: None-preserving reads — a missing metric stays None
+                # (missing data), never a fabricated 0.0 that outranks real
+                # losers. The sharpe key is read under both spellings
+                # ('sharpe' and the canonical 'sharpe_ratio'); net_profit_pct
+                # is DERIVED from total_return (F40, same as backtest_grid),
+                # never read raw.
+                def _num_or_none(*keys: str) -> float | None:
                     for key in keys:
                         value = stats.get(key)
-                        if value is not None:
+                        if value is None:
+                            continue
+                        try:
                             return float(value)
-                    return default
+                        except (TypeError, ValueError):
+                            continue
+                    return None
 
                 results_matrix[symbol][timeframe] = {
                     "status": "success",
-                    "sharpe": _num("sharpe", "sharpe_ratio"),
-                    "cagr": _num("cagr"),
-                    "max_drawdown_pct": _num("max_drawdown_pct"),
-                    "win_rate": _num("win_rate"),
-                    "total_trades": int(_num("total_trades")),
-                    "net_profit_pct": _num("net_profit_pct"),
+                    "sharpe": _num_or_none("sharpe", "sharpe_ratio"),
+                    "cagr": _num_or_none("cagr"),
+                    "max_drawdown_pct": _num_or_none("max_drawdown_pct"),
+                    "win_rate": _num_or_none("win_rate"),
+                    "total_trades": _num_or_none("total_trades"),
+                    "net_profit_pct": _derive_net_profit_pct(stats.get("total_return")),
                 }
             except Exception as e:
                 results_matrix[symbol][timeframe] = {
@@ -372,13 +377,16 @@ def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ok_rows = [row for row in strategy_rows if row.get("status") == "ok"]
         sharpe_values = [_safe_float(row.get("sharpe_ratio")) for row in ok_rows]
         sharpe_values = [value for value in sharpe_values if value is not None]
-        pnl_values = [_safe_float(row.get("total_pnl")) for row in ok_rows]
-        pnl_values = [value for value in pnl_values if value is not None]
         trade_values = [_safe_float(row.get("total_trades")) for row in ok_rows]
         trade_values = [int(value) for value in trade_values if value is not None]
         return_values = [_safe_float(row.get("net_profit_pct")) for row in ok_rows]
         return_values = [value for value in return_values if value is not None]
         best_row = max(ok_rows, key=lambda row: _safe_float(row.get("sharpe_ratio")) or float("-inf"), default=None)
+        # C3: no cross-capital aggregation — total_pnl summed across
+        # different capitals and arithmetic avg_sharpe over incomparable
+        # cells ranked overfit noise as signal. The overview reports
+        # per-cell bests (Sharpe is scale-free, hence comparable) plus
+        # counts; any cross-cell aggregation must normalize capital first.
         overview.append(
             {
                 "strategy": strategy,
@@ -391,8 +399,6 @@ def build_strategy_overview(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     1 for row in strategy_rows if row.get("status") == "skipped_existing"
                 ),
                 "total_trades": sum(trade_values),
-                "total_pnl": sum(pnl_values),
-                "avg_sharpe": sum(sharpe_values) / len(sharpe_values) if sharpe_values else None,
                 "best_sharpe": max(sharpe_values) if sharpe_values else None,
                 "best_net_profit_pct": max(return_values) if return_values else None,
                 "best_symbol": best_row.get("symbol") if best_row else None,

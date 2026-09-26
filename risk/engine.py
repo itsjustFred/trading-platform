@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 from risk.config import RiskConfig
 from risk.models import RiskDecision, SizedOrder, TradeSignal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -15,15 +18,32 @@ class RiskEngine:
         self.config = config or RiskConfig()
 
     def _fallback_stop_loss(self, signal: TradeSignal) -> float:
+        # C1: finite-guard ATR — NaN/negative/garbage values are rejected,
+        # never silently healed (abs() + 0.02 fallback hid bad inputs).
         atr = signal.metadata.get("atr")
         if atr is not None:
-            distance = abs(float(atr)) * self.config.default_sl_atr_multiplier
+            try:
+                atr_value = float(atr)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"ATR value {atr!r} is not a number; refusing to size "
+                    "on an uninterpretable stop distance."
+                )
+            if not math.isfinite(atr_value) or atr_value <= 0:
+                raise ValueError(
+                    f"ATR value {atr!r} is not finite and positive; refusing "
+                    "to size on an uninterpretable stop distance."
+                )
+            distance = atr_value * self.config.default_sl_atr_multiplier
         else:
             # Percent-of-price fallback. An absolute (pip-based) distance under-scales
             # on high-priced assets and produces drastically oversized positions.
             distance = signal.entry_price * self.config.fallback_stop_pct
         if distance <= 0 or not math.isfinite(distance):
-            distance = signal.entry_price * 0.02
+            raise ValueError(
+                "Fallback stop distance is not finite and positive "
+                f"(got {distance!r}); refusing to size on it."
+            )
         if signal.action in {"buy", "long"}:
             return signal.entry_price - distance
         return signal.entry_price + distance
@@ -194,6 +214,13 @@ class RiskEngine:
                 if signal.metadata.get("atr") is not None
                 else "fallback_percent"
             )
+            # C1: a fallback stop is an explicit, logged event — sizing on
+            # an invented distance must never be silent.
+            logger.warning(
+                "Sizing on %s fallback stop (no signal stop provided)",
+                stop_source,
+                extra={"data": {"symbol": signal.symbol, "stop_source": stop_source}},
+            )
             stop_loss = self._fallback_stop_loss(signal)
             signal.stop_loss = stop_loss
             signal.metadata["resolved_stop_loss"] = stop_loss
@@ -294,6 +321,13 @@ class RiskEngine:
 
         mode = str(trailing_cfg.get("mode") or "").strip().lower()
         if mode != "percent":
+            # C1: unsupported trailing modes (e.g. supertrend_flip) are an
+            # explicit warned no-op — never a silent one.
+            logger.warning(
+                "Unsupported trailing stop mode %r; leaving stop unchanged",
+                mode,
+                extra={"data": {"symbol": signal.symbol, "mode": mode}},
+            )
             return signal.stop_loss
 
         percent = float(trailing_cfg.get("percent") or 0.0)

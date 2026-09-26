@@ -71,6 +71,61 @@ METRIC_DIRECTIONS: dict[str, str] = {
     for metric in set(TARGET_METRIC_ALIASES.values())
 }
 
+#: Raw (non-risk-adjusted) maximize metrics (C3). Targeting these without
+#: trade-count/drawdown penalties systematically selects overfit lucky runs,
+#: so the objective haircuts them by default (opt-out via config).
+RAW_MAXIMIZE_METRICS = frozenset(
+    {"total_pnl", "total_return", "profit_factor", "win_rate"}
+)
+
+
+def _risk_adjusted_metric_value(
+    value: float,
+    stats: dict[str, Any],
+    *,
+    metric_key: str,
+    direction: str,
+    min_trades_for_full_credit: int = 30,
+    drawdown_penalty_weight: float = 1.0,
+) -> tuple[float, dict[str, float]]:
+    """Apply mandatory risk penalties to raw maximize targets (C3).
+
+    Returns (adjusted_value, terms) with terms for transparency. Sparsity
+    haircut scales credit by trades/``min_trades`` below the threshold; the
+    drawdown haircut scales by ``1 - |max_drawdown_pct| * weight`` (floored
+    at 0). Both haircuts multiply non-negative values, so the score keeps
+    the metric's unit; LOSING values pass through raw (a multiplicative
+    haircut would compress them toward zero and let losers outrank small
+    winners). Non-raw metrics (sharpe/sortino/calmar/psr/cagr) and minimize
+    studies pass through untouched.
+    """
+    terms = {"sparsity_factor": 1.0, "drawdown_factor": 1.0}
+    if direction != "maximize" or metric_key not in RAW_MAXIMIZE_METRICS:
+        return value, terms
+    if value < 0:
+        return value, terms
+    try:
+        trade_count = int(stats.get("total_trades", 0) or 0)
+    except (TypeError, ValueError):
+        trade_count = 0
+    try:
+        max_dd = abs(float(stats.get("max_drawdown_pct", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        max_dd = 0.0
+    if not math.isfinite(max_dd):
+        max_dd = 0.0
+    # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
+    # 5.0). Percent-scale input would silently zero every trial via the
+    # min(max_dd, 1.0) clamp — fail loud instead.
+    if max_dd > 1.0:
+        raise ValueError(
+            f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
+        )
+    sparsity = min(1.0, trade_count / max(int(min_trades_for_full_credit), 1))
+    drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
+    return value * sparsity * drawdown_factor, terms
+
 #: Marker value recorded on no-trade trials. Purely informational (the trial
 #: objective returns the dynamic penalty from :func:`_no_trade_penalty_value`);
 #: kept for the ``metric_value`` user attr so downstream consumers see an
@@ -175,6 +230,12 @@ class OptimizationConfig(BaseModel):
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
+    # C3: risk-adjusted objective for raw targets (default on) + embargo
+    # gap between train and test (default 1 day, no shared-boundary bars).
+    risk_adjust_objective: bool = True
+    min_trades_for_full_credit: int = Field(default=30, ge=1)
+    drawdown_penalty_weight: float = Field(default=1.0, ge=0.0)
+    embargo_days: int = Field(default=1, ge=0)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -294,6 +355,7 @@ def run_optimization(
         backtest_start,
         backtest_end,
         config.train_split_pct,
+        embargo_days=config.embargo_days,
     )
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
@@ -420,6 +482,21 @@ def run_optimization(
             return penalty
 
         metric_value = _metric_value(train_stats, config.target_metric)
+        # C3: raw maximize targets (total_pnl/profit_factor/win_rate/...)
+        # carry mandatory trade-count/drawdown haircuts so lucky sparse
+        # runs cannot beat robust ones. Terms are recorded for transparency.
+        metric_direction = _study_direction(config.target_metric)
+        metric_key = _metric_key(config.target_metric, train_stats)
+        if config.risk_adjust_objective:
+            metric_value, penalty_terms = _risk_adjusted_metric_value(
+                metric_value,
+                train_stats,
+                metric_key=metric_key,
+                direction=metric_direction,
+                min_trades_for_full_credit=config.min_trades_for_full_credit,
+                drawdown_penalty_weight=config.drawdown_penalty_weight,
+            )
+            trial.set_user_attr("penalty_terms", penalty_terms)
         # The NO_TRADE_PENALTY floor only steers Optuna correctly while every
         # honest metric value ranks above it. A metric that reaches the floor
         # (e.g. a raw-PnL target on a large account) would silently invert the
@@ -582,6 +659,7 @@ def _split_backtest_period(
     start_value: str,
     end_value: str,
     train_split_pct: float,
+    embargo_days: int = 1,
 ) -> tuple[dict[str, str], dict[str, str]]:
     start_ts = _parse_period_boundary(start_value, is_end=False)
     end_ts = _parse_period_boundary(end_value, is_end=True)
@@ -600,13 +678,17 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
-    test_start_ts = split_ts + pd.Timedelta(microseconds=1)
-    if split_ts <= start_ts or test_start_ts >= end_ts:
-        raise ValueError(
-            "train_split_pct produces an empty train or test period for the base backtest range"
-        )
-
+    # C3: embargo gap — the test window starts `embargo_days` after the
+    # split so no bar (and no indicator warmup overlap) is shared. The old
+    # split+1µs boundary leaked the split bar into both segments.
+    embargo = pd.Timedelta(days=max(int(embargo_days), 0))
+    test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
+    if test_start_ts >= end_ts:
+        raise ValueError(
+            "train_split_pct + embargo_days leave an empty test period for "
+            "the base backtest range"
+        )
     test_period = {
         "start": test_start_ts.isoformat(),
         "end": end_ts.isoformat(),
@@ -852,6 +934,9 @@ def _asset_returns_frame_from_base_result(result: BacktestResult) -> pd.DataFram
         series[symbol] = pd.Series(returns.to_numpy(), index=frame["time"])
     if len(series) < 2:
         return pd.DataFrame()
+    # NOTE (C3): the 0.0 here fills STRATEGY-equity days (a day without a
+    # trade leaves equity flat, so 0% is exact — not fabricated market data).
+    # Market-data bars use intersection instead (see above).
     return pd.DataFrame(series).sort_index().fillna(0.0)
 
 
@@ -893,10 +978,14 @@ def _asset_returns_frame_from_market_data(
         if len(asset) < 3:
             continue
         asset = asset.sort_values("time").drop_duplicates("time", keep="last")
-        series[str(symbol).upper()] = asset.set_index("time")["close"].pct_change().fillna(0.0)
+        series[str(symbol).upper()] = asset.set_index("time")["close"].pct_change()
     if len(series) < 2:
         return pd.DataFrame()
-    return pd.DataFrame(series).sort_index().fillna(0.0)
+    # C3: no zero-fill across symbols — a missing bar is missing data, not a
+    # 0% return. Rows without full overlap are dropped (intersection); the
+    # caller falls back to the trade-PnL frame when nothing overlaps.
+    # (The leading NaN of each pct_change row is dropped with them.)
+    return pd.DataFrame(series).sort_index().dropna()
 
 
 def _canonical_stats(result: BacktestResult) -> dict[str, Any]:

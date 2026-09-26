@@ -74,6 +74,7 @@ def _native_result(frame: pd.DataFrame, strategy_fn, **config_kwargs):
         "start_date": "2024-01-01",
         "end_date": "2024-01-02",
         "initial_capital": 100_000.0,
+        "risk_per_trade_pct": 0.01,
     }
     payload.update(config_kwargs)
     config = BacktestConfig(**with_zero_fees(payload))
@@ -91,6 +92,7 @@ def _vectorbt_result(tmp_path: Path, frame: pd.DataFrame, strategy_text: str, **
         "start_date": "2024-01-01",
         "end_date": "2024-01-02",
         "initial_capital": 100_000.0,
+        "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
         "parameters": {},
@@ -195,7 +197,7 @@ def generate_signals(df, params):
         """D4: the fill-convention switch is load-bearing — a typo must fail
         loudly instead of silently falling through to close-fill."""
         with pytest.raises(ValueError, match="signal_exit_fill"):
-            BacktestConfig(parameters={"fees": "zero"}, 
+            BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
                 strategy_name="contract",
                 symbols=["CEC"],
                 timeframe="1h",
@@ -206,7 +208,7 @@ def generate_signals(df, params):
             )
 
     def test_signal_exit_fill_normalizes_case(self, tmp_path: Path):
-        config = BacktestConfig(parameters={"fees": "zero"}, 
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -224,7 +226,7 @@ class TestNativeWarmupLoad:
     def test_warmup_start_extends_loaded_window(self, tmp_path: Path):
         _write_ohlcv(tmp_path, "CEC", _frame())
         strategy_path = _write_strategy(tmp_path, "contract_warmup_load", _strategy_text())
-        config = BacktestConfig(parameters={"fees": "zero"}, 
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -283,7 +285,7 @@ class TestSharedEquity:
 
     def test_vectorbt_multi_symbol_replays_shared_equity(self, tmp_path: Path):
         strategy_path = self._two_symbol_env(tmp_path)
-        config = BacktestConfig(
+        config = BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="contract",
             symbols=["SH1", "SH2"],
             timeframe="1h",
@@ -316,7 +318,7 @@ class TestSharedEquity:
 
     def test_native_multi_symbol_replays_shared_equity(self, tmp_path: Path):
         strategy_path = self._two_symbol_env(tmp_path)
-        config = BacktestConfig(
+        config = BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="contract",
             symbols=["SH1", "SH2"],
             timeframe="1h",

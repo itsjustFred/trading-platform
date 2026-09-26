@@ -85,3 +85,17 @@ def group_position_fills(
 def closed_positions(fills: list[PositionFills]) -> list[PositionFills]:
     """Keep only positions that have at least one entry and one exit fill."""
     return [f for f in fills if f.entries and f.exits]
+
+
+def open_position_summary(fills: list[PositionFills]) -> dict[str, Any]:
+    """Explicit open-position accounting (C4: no silent survivorship bias).
+
+    Positions with entries but no exits are still open at report end — they
+    must be counted and identified in the import metadata, never silently
+    dropped alongside genuinely closed trades.
+    """
+    open_fills = [f for f in fills if f.entries and not f.exits]
+    return {
+        "open_position_count": len(open_fills),
+        "open_position_ids": [f.position_id for f in open_fills],
+    }

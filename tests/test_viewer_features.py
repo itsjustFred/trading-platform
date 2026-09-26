@@ -3152,9 +3152,9 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
     csv_path.write_text(
         "\n".join(
             [
-                "Symbol;Signal Price;Datum;Zeit (NY);Signal Type",
-                "AAPL;173,79;2026-02-23;09:32;BUY",
-                "TSLA;250,10;2026-02-23;10:07;SELL",
+                "Symbol;Signal Price;Datum;Zeit;Signal Type",
+                "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY",
+                "TSLA;250,10;2026-02-23;10:07:00-05:00;SELL",
             ]
         ),
         encoding="utf-8",
@@ -3199,8 +3199,8 @@ def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client,
     csv_path.write_text(
         "\n".join(
             [
-                "Symbol;Signal Price;Datum;Zeit (NY);Signal Type",
-                "AAPL;173,79;2026-02-23;09:32;BUY",
+                "Symbol;Signal Price;Datum;Zeit;Signal Type",
+                "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY",
             ]
         ),
         encoding="utf-8",

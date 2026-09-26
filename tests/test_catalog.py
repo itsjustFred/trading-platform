@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -288,3 +289,23 @@ def test_empty_catalog(tmp_path):
     assert catalog["summary"]["total_datasets"] == 0
     assert catalog["ohlcv"] == []
     assert catalog["universes"] == []
+
+
+def test_build_catalog_recomputes_on_content_change_same_second(
+    sample_data_dir, monkeypatch
+) -> None:
+    """B3: same-mtime rewrite with different bytes must not reuse the cache."""
+    first_catalog = build_catalog(sample_data_dir)
+    (sample_data_dir / "catalog.json").write_text(json.dumps(first_catalog))
+
+    # Rewrite one parquet with different content but coerce the mtime back
+    # so only the size fingerprint distinguishes it.
+    target = next((sample_data_dir / "ohlcv").rglob("*.parquet"))
+    before = target.stat()
+    frame = pd.read_parquet(target)
+    frame = pd.concat([frame, frame.iloc[:5]], ignore_index=True)
+    frame.to_parquet(target, index=False)
+    os.utime(target, ns=(before.st_mtime_ns, before.st_mtime_ns))
+
+    recomputed = build_catalog(sample_data_dir)
+    assert recomputed["ohlcv"][0]["rows"] != first_catalog["ohlcv"][0]["rows"]

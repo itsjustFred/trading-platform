@@ -13,7 +13,11 @@ import pandas as pd
 
 from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
-from validation.importers._pairing import closed_positions, group_position_fills
+from validation.importers._pairing import (
+    closed_positions,
+    group_position_fills,
+    open_position_summary,
+)
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -140,7 +144,16 @@ class MT5XLSXImporter(BaseImporter):
 
         # Parse Trades / Deals table
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades = self._build_trades(trades_df, sltp_map, resolved_timezone)
+        trades, open_summary = self._build_trades(trades_df, sltp_map, resolved_timezone)
+        # C4: open positions are accounted explicitly (counts + ids), never
+        # silently dropped into survivorship bias.
+        raw_metadata["open_positions"] = open_summary
+        if open_summary.get("open_position_count"):
+            logger.warning(
+                "MT5 XLSX report ends with %d open position(s): %s",
+                open_summary["open_position_count"],
+                open_summary["open_position_ids"],
+            )
 
         return ValidationReference(
             strategy_name=meta.get("strategy_name", "unknown"),
@@ -291,6 +304,7 @@ class MT5XLSXImporter(BaseImporter):
     @staticmethod
     def _parse_stats(rows: list[list[Any]], orders_header_idx: int) -> dict[str, Any]:
         stats: dict[str, Any] = {}
+        recognized = 0
         for row in rows[:orders_header_idx]:
             for label_str, val in MT5XLSXImporter._stat_label_value_groups(row):
                 key = _STAT_LABEL_MAP.get(label_str.rstrip(":"))
@@ -299,7 +313,21 @@ class MT5XLSXImporter(BaseImporter):
                 if key is None:
                     continue
 
+                recognized += 1
                 MT5XLSXImporter._apply_stat_key(key, val, stats)
+        # C4 layout validation: zero recognized labels is only fatal when
+        # the meta section is unrecognisable too — a minimal but valid
+        # report may simply carry no stats block, while a fully foreign
+        # header area means the layout drifted (rigid col+3 reads would
+        # then silently harvest nothing).
+        if rows[:orders_header_idx] and recognized == 0:
+            meta_probe = MT5XLSXImporter._parse_meta(rows, orders_header_idx)
+            if meta_probe.get("strategy_name", "unknown") == "unknown":
+                raise ValueError(
+                    "No recognized MT5 stat labels or strategy name in the "
+                    "header area; the sheet layout likely drifted (expected "
+                    "label/value groups)."
+                )
 
         # Derive total_return as a FRACTION (#84: the runner reports
         # total_return as equity_end/equity_start - 1, e.g. 0.21 — the old
@@ -446,18 +474,15 @@ class MT5XLSXImporter(BaseImporter):
         if col_order_id is None:
             return mapping
 
-        # DV-B44: the xlsx SL/TP cells go through the same locale-aware
-        # parser as the HTML importer; "2.500" is 2500, not 2.5.
-        #
-        # Only the SL/TP cells feed the locale detector: a grouped value in
-        # another orders column (volume "0.10", comment "10.000 runs") has no
-        # bearing on how the SL/TP columns are formatted, and a stray ASCII
-        # grouping there would flip the convention for the whole report.
+        # DV-B44 + C4: locale detection scans the whole orders table —
+        # the same convention as the HTML importer. A per-column detector
+        # let the two importers disagree on one report (unified detector,
+        # single convention per report).
         cell_values: list[str | None] = []
         for _, row in orders_df.iterrows():
-            for col in (col_sl, col_tp):
-                if col is not None and col in row and pd.notna(row[col]):
-                    cell_values.append(str(row[col]))
+            for value in row:
+                if pd.notna(value):
+                    cell_values.append(str(value))
         decimal_comma = detect_decimal_comma(cell_values)
 
         def _parse(cell: Any, order_id: Any) -> float | None:
@@ -489,9 +514,9 @@ class MT5XLSXImporter(BaseImporter):
         trades_df: pd.DataFrame,
         sltp_map: dict[Any, dict[str, float | None]],
         source_timezone: str | tzinfo | None = None,
-    ) -> list[Trade]:
+    ) -> tuple[list[Trade], dict[str, Any]]:
         if trades_df.empty:
-            return []
+            return [], open_position_summary([])
 
         col_time = MT5XLSXImporter._find_col(trades_df, ["Zeit"])
         col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
@@ -712,7 +737,7 @@ class MT5XLSXImporter(BaseImporter):
             trades.append(trade)
             trade_id_counter += 1
 
-        return trades
+        return trades, open_position_summary(position_fills)
 
     @staticmethod
     def _find_exit_row(

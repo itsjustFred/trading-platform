@@ -243,23 +243,10 @@ class CTraderDownloader(Downloader):
         return df[keep].dropna(subset=["open"]).sort_values("timestamp").reset_index(drop=True)
 
     def _resample(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-        rule = RESAMPLE_MAP[timeframe]
-        df = df.set_index("timestamp")
-        resampled = (
-            df.resample(rule)
-            .agg(
-                {
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                }
-            )
-            .dropna(subset=["open"])
-            .reset_index()
-        )
-        return resampled
+        """Resample via the shared origin-aware helper (C5)."""
+        from data_tools.resample import resample_with_origin
+
+        return resample_with_origin(df, RESAMPLE_MAP[timeframe])
 
     def get_source_meta(self) -> SourceMeta:
         return SourceMeta(

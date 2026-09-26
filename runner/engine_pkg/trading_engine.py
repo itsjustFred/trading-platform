@@ -72,7 +72,17 @@ class TradeEngine:
         self._progress_end = float(progress_end)
         configured_risk_pct = float(self.config.risk_per_trade_pct or 0.0)
         self._risk_enabled = configured_risk_pct > 0
-        max_total_exposure = float(self.config.max_position_pct or 0.05)
+        # B4 (16-E remainder): BacktestConfig folds the deprecated alias
+        # into max_position_exposure_pct at construction (with warning), so
+        # only the canonical field is read here. The silent `or 0.05`
+        # fallback is gone — unset means the RiskConfig default, named
+        # explicitly.
+        _position_cap = self.config.max_position_exposure_pct
+        max_total_exposure = (
+            float(_position_cap)
+            if _position_cap is not None
+            else RiskConfig().max_total_exposure
+        )
         max_leverage = float(self.config.max_leverage or 1.0)
         # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
         # policy is engine configuration only. It is intentionally NOT read
@@ -191,27 +201,28 @@ class TradeEngine:
         return "SHORT" if direction == "SHORT" else "LONG"
 
     def _current_risk_exposure(self, reference_price: float) -> float:
+        # C2: no invented stops. Only stop-protected legs contribute their
+        # stop distance — a leg WITHOUT a stop contributes nothing here
+        # instead of entry*0.98 fantasy math. (Sizing still bounds every
+        # leg through the fallback-stop path with a warning; exposure
+        # intentionally measures stop-defined risk only. Stopless legs are
+        # therefore invisible to the exposure cap by design, not by
+        # accident — see max_positions, which counts every leg.)
         if self.equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
 
         for position in self.positions:
-            stop_price = (
-                float(position.stop_loss)
-                if position.stop_loss is not None
-                else float(position.entry_price) * 0.98
-            )
-            risk_distance = abs(float(position.entry_price) - stop_price)
+            if position.stop_loss is None:
+                continue
+            risk_distance = abs(float(position.entry_price) - float(position.stop_loss))
             risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
 
         for order in self.pending_orders:
-            stop_price = (
-                float(order.stop_loss)
-                if order.stop_loss is not None
-                else float(reference_price) * 0.98
-            )
-            risk_distance = abs(float(reference_price) - stop_price)
+            if order.stop_loss is None:
+                continue
+            risk_distance = abs(float(reference_price) - float(order.stop_loss))
             risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
 
         return max(0.0, risk_exposure)
@@ -269,7 +280,9 @@ class TradeEngine:
                 take_profit=take_profit_price,
                 timeframe=self.config.timeframe,
                 metadata={
-                    "current_positions": len(self.positions),
+                    # C2: pending orders count toward max_positions — a
+                    # pending order is committed intent, not free capacity.
+                    "current_positions": len(self.positions) + len(self.pending_orders),
                     "pending_positions": len(self.pending_orders),
                 },
             )
@@ -281,7 +294,13 @@ class TradeEngine:
             )
             shares = float(sized_order.position_size)
         else:
-            shares = self.equity / entry_price
+            # C1 (owner decision): HARD ERROR without explicit sizing —
+            # no silent full-equity default. Without config there is no trade.
+            raise ValueError(
+                "Risk sizing is not configured (risk_per_trade_pct unset and "
+                "no fixed_risk_amount); refusing the full-equity default. "
+                "Set risk_per_trade_pct or fixed_risk_amount explicitly."
+            )
 
         max_value = self.equity * max_leverage
         shares = min(shares, max_value / entry_price)

@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import (
@@ -88,7 +89,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     adapter = VectorbtAdapter()
     result = adapter.run(
-        BacktestConfig(parameters={"fees": "zero"}, 
+        BacktestConfig(parameters={"fees": "zero"},
             strategy_name="tuple_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -154,7 +155,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="supertrend_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -240,7 +241,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(
+        BacktestConfig(risk_per_trade_pct=0.01,
             strategy_name="meta_params_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -312,7 +313,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(symbol_dir / "1m.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="intrabar_strategy",
             symbols=["AAPL"],
             timeframe="1h",
@@ -332,7 +333,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.exits[0].price == 105.0
     assert trade.exits[0].time == "2024-01-01T01:30:00+00:00"
     assert trade.meta["modeling_resolution"] == "1m"
-    assert trade.pnl == 39.6
+    # C1: explicit risk sizing (1% of 1000 = 10 risk on the 6.0 stop
+    # distance → qty 1.6667; exit x qty = 4.0 x 1.6667 ≈ 6.67).
+    assert trade.pnl == pytest.approx(6.67, rel=1e-3)
 
 
 def test_vectorbt_adapter_persists_custom_drawings(tmp_path: Path):
@@ -384,7 +387,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(parameters={"fees": "zero"}, 
+        BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="drawing_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -403,7 +406,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert result.drawings[1]["type"] == "line"
     assert result.drawings[1]["start_time"] == "2024-01-02T00:00:00+00:00"
     assert result.drawings[1]["end_time"] == "2024-01-04T00:00:00+00:00"
-    assert result.trades[0].meta["risk_math"]["sizing_mode"] == "full_equity"
+    # C1: the full-equity mode is removed; fixtures declare risk.
+    assert result.trades[0].meta["risk_math"]["sizing_mode"] == "risk_pct"
     assert result.trades[0].meta["risk_math"]["position_size"] == result.trades[0].quantity
 
 

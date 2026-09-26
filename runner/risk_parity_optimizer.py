@@ -219,7 +219,8 @@ def select_best_risk_parity_universe(
         columns = [symbol for symbol in universe if symbol in returns_frame.columns]
         if len(columns) < 2:
             continue
-        subset = returns_frame[columns].dropna(how="all").fillna(0.0)
+        # C3: intersection, not zero-fill — missing bars are not 0% returns.
+        subset = returns_frame[columns].dropna()
         if len(subset) < 2:
             continue
         selections.append(

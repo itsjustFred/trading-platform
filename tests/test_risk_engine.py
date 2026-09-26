@@ -361,3 +361,50 @@ def test_submit_order_with_risk_applies_qty_before_submit():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["qty"] == 200.0
     assert adapter.submitted_signal.metadata["explicit_qty"] == 200.0
+
+
+class TestIssueC1FallbackGuards:
+    """C1: no silent healing of bad ATR; unsupported trailing warns."""
+
+    def _engine(self) -> RiskEngine:
+        return RiskEngine(
+            RiskConfig(
+                max_risk_per_trade=0.01,
+                max_total_exposure=0.05,
+                max_positions=5,
+                default_sl_atr_multiplier=2.0,
+            )
+        )
+
+    def _signal(self, **metadata) -> TradeSignal:
+        return TradeSignal(
+            action="buy",
+            symbol="EURUSD",
+            entry_price=100.0,
+            stop_loss=None,
+            take_profit=105.0,
+            timeframe="1h",
+            metadata={"current_positions": 1, **metadata},
+        )
+
+    @pytest.mark.parametrize("bad_atr", [float("nan"), float("inf"), -1.5, 0.0, "nonsense"])
+    def test_non_finite_atr_rejected(self, bad_atr) -> None:
+        with pytest.raises(ValueError, match="[Aa][Tt][Rr]"):
+            self._engine().calculate_position_size(
+                signal=self._signal(atr=bad_atr),
+                account_balance=10000.0,
+                pip_value=1.0,
+                current_exposure=0.0,
+            )
+
+    def test_unsupported_trailing_mode_warns_and_leaves_stop(self, caplog) -> None:
+        import logging
+
+        signal = self._signal(
+            trailing_sl_config={"mode": "supertrend_flip"},
+        )
+        signal.stop_loss = 98.0
+        with caplog.at_level(logging.WARNING, logger="risk.engine"):
+            result = self._engine().apply_trailing_stop(signal, market_price=101.0)
+        assert result == pytest.approx(98.0)
+        assert any("supertrend_flip" in record.message for record in caplog.records)

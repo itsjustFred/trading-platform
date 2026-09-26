@@ -177,6 +177,9 @@ class RegressionConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     trade_config: TradeComparisonConfig = Field(default_factory=TradeComparisonConfig)
+    # C4: matching tolerance, plumbed into TradeMatcher.match (previously
+    # the default 0s demanded exact seconds while nothing forwarded it).
+    match_time_tolerance_seconds: int = 0
     stats_absolute_tolerance: dict[str, float] = Field(default_factory=dict)
     stats_relative_tolerance: dict[str, float] = Field(default_factory=dict)
     # Tolerance semantics (DV-B35): every *configured* band must hold (AND).
@@ -329,7 +332,11 @@ def run_regression(
     platform_result = current_ref.to_backtest_result()
 
     # --- trade matching & comparison -----------------------------------
-    match_result = TradeMatcher.match(golden_ref.trades, current_ref.trades)
+    match_result = TradeMatcher.match(
+        golden_ref.trades,
+        current_ref.trades,
+        time_tolerance_seconds=cfg.match_time_tolerance_seconds,
+    )
 
     comparison_results = []
     for ref_trade, act_trade, key in match_result.matched:
@@ -338,7 +345,13 @@ def run_regression(
         comparison_results.append(comparator.compare(matched))
 
     anomalies = AnomalyDetector.detect(
-        golden_ref, current_ref.trades, comparison_results
+        golden_ref,
+        current_ref.trades,
+        comparison_results,
+        # CodeRabbit round: reuse the configured-tolerance match — the
+        # default re-match inside detect() would use tolerance 0 and
+        # contradict the matcher's own verdict.
+        match_result=match_result,
     )
 
     trade_delta_report = DeltaReportBuilder.build(

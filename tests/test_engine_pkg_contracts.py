@@ -104,7 +104,9 @@ def test_size_trade_returns_typed_record():
         start_date="2024-01-01",
         end_date="2024-02-01",
         initial_capital=10_000.0,
-        risk_per_trade_pct=0.0,
+        # C1: risk-off (0.0) is a hard error — the record type is pinned
+        # on an explicitly sized config instead.
+        risk_per_trade_pct=0.01,
     )
     record = _size_trade(
         config=config,
@@ -118,5 +120,8 @@ def test_size_trade_returns_typed_record():
         trade_counter=1,
     )
     assert set(record) == set(_SizeRecord.__annotations__)
-    assert record["sizing_mode"] == "full_equity"
-    assert record["qty"] == 100.0
+    # C1: the full-equity mode is removed — the record is pinned on the
+    # risk_pct path (budget 100 on a 2.0 fallback stop → 50, capped by the
+    # 0.2 position cap to 2000/100 = 20).
+    assert record["sizing_mode"] == "risk_pct"
+    assert record["qty"] == 20.0

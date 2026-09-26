@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -832,7 +833,7 @@ class _SignalSubmittingAdapter:
     async def connect(self) -> None:
         return None
 
-    async def submit_order(self, signal) -> str:
+    async def submit_order(self, signal, *, qty: float | None = None) -> str:
         self.submitted.append(signal)
         return "order-1"
 
@@ -879,7 +880,12 @@ def _trade_signal() -> object:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
 
@@ -1063,3 +1069,46 @@ def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -
     )
 
     assert adapter.submitted == []
+
+
+def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
+    """B2: one slow broker must not serialize all balance snapshots."""
+    import contextlib
+
+    import live_runner.daemon as daemon_module
+
+    completions: list[str] = []
+
+    class _SlowAdapter:
+        _connected = True
+
+        async def get_balance(self):
+            await asyncio.sleep(0.5)
+            completions.append("slow")
+            return 100_000.0, 100_000.0
+
+    class _FastAdapter:
+        _connected = True
+
+        async def get_balance(self):
+            completions.append("fast")
+            return 100_000.0, 100_000.0
+
+    monkeypatch.setattr(daemon_module, "save_live_balance", lambda _record: True)
+
+    async def _one_tick() -> None:
+        task = asyncio.create_task(
+            daemon_module._poll_balances(
+                {"slow-acc": _SlowAdapter(), "fast-acc": _FastAdapter()},
+                interval_seconds=60.0,
+            )
+        )
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_one_tick())
+    # Gathered: fast completes while slow is still sleeping. Sequential
+    # would order slow first (dict order) — or never reach fast at all.
+    assert completions and completions[0] == "fast"

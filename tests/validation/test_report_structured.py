@@ -212,7 +212,8 @@ class TestJsonReportBasics:
         data = json.loads(json_str)
         assert data["passed"] is False
         assert data["trade_summary"]["missing"] == 1
-        assert data["anomalies"][0]["severity"] == "warning"
+        # C4: missing flips the readiness missing-trades gate — error.
+        assert data["anomalies"][0]["severity"] == "error"
 
     def test_platform_result_as_validation_reference(self):
         ref_trade = _make_trade(trade_id=1)

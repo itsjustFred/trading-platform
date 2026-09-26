@@ -53,6 +53,84 @@ GAP_THRESHOLD_MINUTES = {
     "1d": 4320,  # 3 days (weekend)
 }
 
+#: Asset classes with exchange holidays (B3: gap skips apply to these only —
+#: FX/metals trade through most US holidays, so blanket skipping would hide
+#: real data holes there).
+_EQUITY_LIKE_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf", "index"})
+
+
+def _easter_sunday(year: int) -> tuple[int, int]:
+    """Month/day of Easter Sunday (Anonymous Gregorian algorithm)."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    weekday_corr = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * weekday_corr) // 451
+    month = (h + weekday_corr - 7 * m + 114) // 31
+    day = ((h + weekday_corr - 7 * m + 114) % 31) + 1
+    return month, day
+
+
+def _nyse_holidays(year: int) -> set[str]:
+    """NYSE holiday dates (ISO) for one year, incl. observed shifts (B3)."""
+    from datetime import date, timedelta
+
+    def observed(month: int, day: int) -> date:
+        day_date = date(year, month, day)
+        if day_date.weekday() == 5:  # Saturday -> preceding Friday
+            return day_date - timedelta(days=1)
+        if day_date.weekday() == 6:  # Sunday -> following Monday
+            return day_date + timedelta(days=1)
+        return day_date
+
+    def nth_weekday(month: int, weekday: int, n: int) -> date:
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + timedelta(days=offset + 7 * (n - 1))
+
+    def last_weekday(month: int, weekday: int) -> date:
+        if month == 12:
+            probe = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            probe = date(year, month + 1, 1) - timedelta(days=1)
+        offset = (probe.weekday() - weekday) % 7
+        return probe - timedelta(days=offset)
+
+    holidays = {
+        observed(1, 1),  # New Year's Day
+        nth_weekday(1, 0, 3),  # MLK Day
+        nth_weekday(2, 0, 3),  # Presidents Day
+        last_weekday(5, 0),  # Memorial Day
+        observed(6, 19) if year >= 2021 else None,  # Juneteenth (from 2021)
+        observed(7, 4),  # Independence Day
+        nth_weekday(9, 0, 1),  # Labor Day
+        nth_weekday(11, 3, 4),  # Thanksgiving
+        observed(12, 25),  # Christmas
+    }
+    easter_month, easter_day = _easter_sunday(year)
+    good_friday = date(year, easter_month, easter_day) - timedelta(days=2)
+    holidays.add(good_friday)
+    return {day.isoformat() for day in holidays if day is not None and day.year == year}
+
+
+def _gap_touches_holiday(gap_start: pd.Timestamp, gap_end: pd.Timestamp) -> bool:
+    """Whether a gap interval covers a NYSE holiday (B3, equity-like only)."""
+    years = range(gap_start.year, gap_end.year + 1)
+    holidays: set[str] = set()
+    for year in years:
+        holidays |= _nyse_holidays(year)
+    cursor = gap_start.normalize()
+    end = gap_end.normalize()
+    while cursor <= end:
+        if cursor.date().isoformat() in holidays:
+            return True
+        cursor += pd.Timedelta(days=1)
+    return False
+
 
 @dataclass
 class ValidationResult:
@@ -181,6 +259,14 @@ def validate_parquet(path: Path) -> ValidationResult:
                 continue  # Friday→Sunday
             if gap_start.weekday() == 6 and gap_end.weekday() == 0:
                 continue  # Sunday→Monday
+
+            # B3: NYSE holidays are not data holes — but only for
+            # equity-like paths (FX/metals print through US holidays).
+            asset_class = str(parts[1]).strip().lower() if len(parts) >= 4 else ""
+            if asset_class in _EQUITY_LIKE_ASSET_CLASSES and _gap_touches_holiday(
+                gap_start, gap_end
+            ):
+                continue
 
             result.gaps.append(
                 {

@@ -112,7 +112,8 @@ class TestStopDistanceMismatch:
         assert result.field_results["stop_distance"].passed is False
         assert result.field_results["risk_per_trade"].passed is True
         assert result.field_results["position_size"].passed is True
-        assert result.severity == "warning"
+        # C4: failed pairs flip the risk gate — error.
+        assert result.severity == "error"
 
 
 class TestPositionSizeMismatch:
@@ -134,7 +135,8 @@ class TestPositionSizeMismatch:
         assert result.field_results["stop_distance"].passed is True
         assert result.field_results["risk_per_trade"].passed is True
         assert result.field_results["position_size"].passed is False
-        assert result.severity == "warning"
+        # C4: failed pairs flip the risk gate — error.
+        assert result.severity == "error"
 
 
 class TestRiskPerTradeMismatch:
@@ -156,11 +158,12 @@ class TestRiskPerTradeMismatch:
         assert result.field_results["stop_distance"].passed is True
         assert result.field_results["risk_per_trade"].passed is False
         assert result.field_results["position_size"].passed is True
-        assert result.severity == "warning"
+        # C4: failed pairs flip the risk gate — error.
+        assert result.severity == "error"
 
 
 class TestMissingTrade:
-    def test_missing_trade_is_warning(self) -> None:
+    def test_missing_trade_is_error(self) -> None:
         t1 = _make_trade(trade_id=1, entry_price=100.0, stop_loss=90.0)
         ref1 = _make_reference([t1])
         ref2 = _make_reference([])
@@ -171,7 +174,8 @@ class TestMissingTrade:
         assert report.passed is False
         assert len(report.trade_results) == 1
         result = report.trade_results[0]
-        assert result.severity == "warning"
+        # C4: missing flips the risk gate — error.
+        assert result.severity == "error"
         assert result.passed is False
         assert result.expected_trade is not None
         assert result.actual_trade is None
@@ -256,8 +260,9 @@ class TestReportSummary:
         assert summary["passed"] == 1
         assert summary["failed"] == 2
         assert summary["severity_counts"]["info"] == 1
-        assert summary["severity_counts"]["warning"] == 1
-        assert summary["severity_counts"]["error"] == 1
+        # C4: missing + phantom both flip the gate — error, not warning.
+        assert summary["severity_counts"].get("warning", 0) == 0
+        assert summary["severity_counts"]["error"] == 2
         assert report.passed is False
 
 
@@ -287,7 +292,8 @@ class TestRiskReportBuilderDelta:
         assert delta.passed is False
 
         matched = delta.matched_trades[0]
-        assert matched.severity == "warning"
+        # C4: failed pairs flip the risk gate — error.
+        assert matched.severity == "error"
         assert matched.anomaly_type == "mismatch"
         assert len(matched.field_deltas) == 3
         assert matched.field_deltas[0].field == "stop_distance"
@@ -306,7 +312,8 @@ class TestRiskReportBuilderDelta:
 
         assert len(delta.missing_trades) == 1
         assert delta.missing_trades[0].anomaly_type == "missing"
-        assert delta.missing_trades[0].severity == "warning"
+        # C4: missing flips the risk gate — error.
+        assert delta.missing_trades[0].severity == "error"
         assert len(delta.extra_trades) == 1
         assert delta.extra_trades[0].anomaly_type == "extra"
         # #85: phantom trades are errors, not informational.

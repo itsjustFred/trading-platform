@@ -320,6 +320,13 @@ class YFinanceDownloader(Downloader):
             )
 
         combined = self._merge_and_store_single_file(out_path, df)
+        # C5: a clipped intraday window is an explicit artifact, not just a
+        # warning — downstream coverage sees the truncation.
+        truncated = bool(
+            parsed_start is not None
+            and bounded_start is not None
+            and bounded_start > parsed_start
+        )
         return DownloadResult(
             symbol=normalized_symbol,
             timeframe=canonical_tf,
@@ -331,6 +338,9 @@ class YFinanceDownloader(Downloader):
             end=str(combined["timestamp"].iloc[-1]),
             size_bytes=out_path.stat().st_size,
             warnings=warnings,
+            requested_start=start or "",
+            requested_end=end or "",
+            truncated_window=truncated,
         )
 
     def get_source_meta(self) -> SourceMeta:

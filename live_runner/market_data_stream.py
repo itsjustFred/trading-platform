@@ -183,21 +183,33 @@ class _StreamWorker:
 
 
 class LiveMarketDataStreamService:
-    def __init__(self, *, max_bars_per_symbol: int = 500) -> None:
+    def __init__(
+        self,
+        *,
+        max_bars_per_symbol: int = 500,
+        env_values: dict[str, str] | None = None,
+    ) -> None:
         self._max_bars_per_symbol = max(10, int(max_bars_per_symbol))
         self._bars: dict[str, deque[dict[str, Any]]] = defaultdict(
             lambda: deque(maxlen=self._max_bars_per_symbol)
         )
         self._workers: dict[tuple[_CredentialKey, str], _StreamWorker] = {}
         self._lock = threading.Lock()
+        # C1: file-first credential source so quotes resolve the same
+        # credentials as execution (never process-env while trading on file).
+        self._env_values = env_values
 
     async def refresh_from_deployments(
         self,
         deployments: list[LiveDeploymentConfig],
         account_lookup: dict[str, LiveAccountConfig],
+        *,
+        env_values: dict[str, str] | None = None,
     ) -> None:
         try:
-            await asyncio.to_thread(self._refresh_sync, deployments, account_lookup)
+            await asyncio.to_thread(
+                self._refresh_sync, deployments, account_lookup, env_values
+            )
         except ModuleNotFoundError:
             logger.info("alpaca-py market data stream unavailable; install alpaca-py to enable live quotes")
 
@@ -205,6 +217,7 @@ class LiveMarketDataStreamService:
         self,
         deployments: list[LiveDeploymentConfig],
         account_lookup: dict[str, LiveAccountConfig],
+        env_values: dict[str, str] | None = None,
     ) -> None:
         target_symbols: dict[tuple[_CredentialKey, str], set[str]] = defaultdict(set)
         for deployment in deployments:
@@ -216,6 +229,7 @@ class LiveMarketDataStreamService:
             credentials = resolve_alpaca_credentials(
                 account_id=account.id,
                 broker_login=account.broker_login,
+                env=env_values if env_values is not None else self._env_values,
             )
             if credentials is None:
                 continue
@@ -228,29 +242,48 @@ class LiveMarketDataStreamService:
                 stream_kind = "crypto" if _is_crypto_symbol(symbol) else "stock"
                 target_symbols[(key, stream_kind)].add(symbol)
 
+        # B2: decide under the lock, do network I/O outside it — stop/start/
+        # set_symbols perform websocket I/O and must never hold the lock
+        # (same pattern as _stop_sync below).
         with self._lock:
             worker_keys = set(self._workers.keys())
             target_keys = set(target_symbols.keys())
-
-            for worker_key in worker_keys - target_keys:
-                worker = self._workers.pop(worker_key, None)
-                if worker is not None:
-                    worker.stop()
-
+            stopped = [
+                self._workers.pop(worker_key, None)
+                for worker_key in worker_keys - target_keys
+            ]
+            to_start: list[tuple[tuple[_CredentialKey, str], set[str]]] = []
+            to_update: list[tuple[_StreamWorker, set[str]]] = []
             for worker_key, symbols in target_symbols.items():
                 worker = self._workers.get(worker_key)
                 if worker is None:
-                    credentials_key, stream_kind = worker_key
-                    worker = _StreamWorker(
-                        kind=stream_kind,
-                        api_key=credentials_key.api_key,
-                        secret_key=credentials_key.secret_key,
-                        paper=credentials_key.paper,
-                        bar_handler=self._on_bar,
-                    )
-                    worker.start()
+                    to_start.append((worker_key, symbols))
+                else:
+                    to_update.append((worker, symbols))
+        for worker in stopped:
+            if worker is not None:
+                worker.stop()
+        for worker_key, symbols in to_start:
+            credentials_key, stream_kind = worker_key
+            worker = _StreamWorker(
+                kind=stream_kind,
+                api_key=credentials_key.api_key,
+                secret_key=credentials_key.secret_key,
+                paper=credentials_key.paper,
+                bar_handler=self._on_bar,
+            )
+            worker.start()
+            with self._lock:
+                keep_new = worker_key not in self._workers
+                if keep_new:
                     self._workers[worker_key] = worker
-                worker.set_symbols(symbols)
+            if not keep_new:
+                # Lost a concurrent refresh race — stop the spare worker.
+                worker.stop()
+                continue
+            worker.set_symbols(symbols)
+        for worker, symbols in to_update:
+            worker.set_symbols(symbols)
 
     async def stop(self) -> None:
         await asyncio.to_thread(self._stop_sync)

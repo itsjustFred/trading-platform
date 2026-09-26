@@ -304,6 +304,8 @@ class StrategyIR(BaseModel):
     parameters: list[ParameterSpec] = Field(default_factory=list)
     state_machine: StateMachine | None = None
     raw_expressions: list[RawExpression] = Field(default_factory=list)
+    # C6: presence heuristic (0.25 per populated part), NOT a calibrated
+    # probability — 0.0 with empty parts is the explicit-unknown state.
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     fallback_code: str = ""
     engine_hint: EngineHint = EngineHint.UNKNOWN

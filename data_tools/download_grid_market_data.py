@@ -93,37 +93,59 @@ def _timeframe_sort_key(timeframe: str) -> tuple[int, str]:
         return (len(TIMEFRAME_ORDER), timeframe)
 
 
+#: Provenance column recording which quote side fed each canonical bar (C5).
+OHLCV_SOURCE_COLUMN = "ohlcv_source_side"
+
+
 def normalize_ohlcv_columns(path: Path) -> None:
-    """Fill canonical OHLCV columns from bid/ask columns when needed."""
+    """Fill canonical OHLCV columns from bid/ask columns with bid priority (C5).
+
+    Bid wins wherever present (trades lift the bid side convention used
+    downstream); ask only fills bid gaps. The winning side per bar is
+    recorded in ``OHLCV_SOURCE_COLUMN`` instead of being dropped with the
+    source columns.
+    """
     if not path.exists() or path.stat().st_size == 0:
         return
     df = pd.read_parquet(path)
     df.columns = [c.lower() for c in df.columns]
     if "timestamp" not in df.columns:
         return
-    for source_prefix in ("bid", "ask"):
-        mapping = {
-            "open": f"{source_prefix}_open",
-            "high": f"{source_prefix}_high",
-            "low": f"{source_prefix}_low",
-            "close": f"{source_prefix}_close",
-            "volume": f"{source_prefix}_volume",
-        }
-        if not {"open", "high", "low", "close"}.issubset(df.columns):
-            for target, source in mapping.items():
-                if source in df.columns:
-                    df[target] = df[source]
-        for target, source in mapping.items():
-            if source in df.columns:
-                if target not in df.columns:
-                    df[target] = df[source]
-                else:
-                    df[target] = df[target].fillna(df[source])
+    sides = pd.Series("unresolved", index=df.index)
+    for target in ("open", "high", "low", "close", "volume"):
+        sides = _resolve_bid_ask_side(df, sides, target)
     for col in ["open", "high", "low", "close", "volume"]:
         if col not in df.columns:
             df[col] = pd.NA
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df[OHLCV_SOURCE_COLUMN] = sides
+    keep = ["timestamp", "open", "high", "low", "close", "volume", OHLCV_SOURCE_COLUMN]
+    df = df[[col for col in keep if col in df.columns]]
     df.to_parquet(path, index=False)
+
+
+def _resolve_bid_ask_side(df: pd.DataFrame, sides: pd.Series, target: str) -> pd.Series:
+    """Fill one canonical column with bid priority; return updated sides."""
+
+    bid_col, ask_col = f"bid_{target}", f"ask_{target}"
+    has_bid = bid_col in df.columns
+    has_ask = ask_col in df.columns
+    if target not in df.columns:
+        if has_bid:
+            df[target] = df[bid_col]
+        elif has_ask:
+            df[target] = df[ask_col]
+        else:
+            df[target] = pd.NA
+            return sides
+    if has_bid:
+        df[target] = df[target].fillna(df[bid_col])
+    if has_ask:
+        df[target] = df[target].fillna(df[ask_col])
+    if has_bid:
+        sides = sides.mask(df[bid_col].notna(), "bid")
+    if has_ask:
+        sides = sides.mask(sides.eq("unresolved") & df[ask_col].notna(), "ask")
+    return sides
 
 
 def parquet_rows(path: Path) -> int:

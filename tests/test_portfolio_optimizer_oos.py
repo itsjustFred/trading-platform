@@ -613,3 +613,20 @@ class TestIssue87Guards:
         result = module.optimize_portfolio_allocation(["a", "b"], n_trials=2)
         assert result["oos_status"] == "no_oos_requested"
         assert "oos_sharpe" not in result
+
+
+def test_load_strategy_equity_surfaces_load_errors(monkeypatch) -> None:
+    """C3: load errors surface with the id instead of decaying to []."""
+    import runner.portfolio_optimizer as po_module
+    import shared.database as database_module
+
+    def _boom(_backtest_id: str):
+        raise RuntimeError("db gone")
+
+    monkeypatch.setattr(database_module, "load_backtest_result", _boom)
+    with pytest.raises(ValueError, match="no-such-id"):
+        po_module._load_strategy_equity("no-such-id")
+
+    monkeypatch.setattr(database_module, "load_backtest_result", lambda _bid: None)
+    with pytest.raises(ValueError, match="no-such-id"):
+        po_module._load_strategy_equity("no-such-id")

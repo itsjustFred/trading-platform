@@ -455,3 +455,55 @@ def test_unrecognized_expression_fails_loudly():
 
     with pytest.raises(ValueError, match="Cannot deterministically translate"):
         generate_vectorbt_strategy_code(strategy_ir)
+
+
+def test_ambiguous_window_param_fails_loudly() -> None:
+    """C6: two window-like params raise instead of alphabetical guess."""
+    import pytest
+
+    from runner.strategy_ir.codegen_vectorbt import _indicator_defaults
+    from runner.strategy_ir.models import IndicatorRef
+
+    with pytest.raises(ValueError, match="Ambiguous window"):
+        _indicator_defaults(IndicatorRef(name="X", params={"window": 10, "smooth": 5}))
+
+
+def test_declared_roles_drive_signal_selection() -> None:
+    """C6: explicit primary/secondary roles beat alphabetical order."""
+    from runner.strategy_ir.codegen_vectorbt import _select_signal_roles
+    from runner.strategy_ir.models import IndicatorRef
+
+    zebra = IndicatorRef(name="Zebra", params={}, role="primary")
+    alpha = IndicatorRef(name="Alpha", params={}, role="secondary")
+    primary, secondary = _select_signal_roles([zebra, alpha])
+    assert primary is zebra
+    assert secondary is alpha
+
+    with pytest.raises(ValueError, match="Multiple indicators declare role 'primary'"):
+        _select_signal_roles(
+            [
+                IndicatorRef(name="One", params={}, role="primary"),
+                IndicatorRef(name="Two", params={}, role="primary"),
+            ]
+        )
+
+
+def test_primary_fallback_avoids_declared_secondary() -> None:
+    """CodeRabbit round: single-indicator IR with a declared secondary
+    must not wire primary to the same indicator line (which compiled to
+    the always-false `indicator_only > indicator_only`)."""
+    ir = StrategyIR(
+        name="Single Secondary",
+        parameters=[],
+        indicators=[IndicatorRef(name="Only", params={}, role="secondary")],
+        entry_conditions=[
+            Condition(expression="Only greater than 50", when=ConditionWhen.ENTRY)
+        ],
+        exit_signals=[],
+        confidence=1.0,
+        engine_hint=EngineHint.VECTORBT,
+        metadata={"version": "1.0.0"},
+    )
+    code = generate_vectorbt_strategy_code(ir)
+    assert "(close > indicator_only)" in code
+    assert "(indicator_only > indicator_only)" not in code

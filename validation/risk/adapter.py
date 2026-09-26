@@ -53,6 +53,9 @@ def _trade_to_signal(
     metadata: dict[str, Any] = dict(trade.meta) if trade.meta else {}
     if account_balance is not None:
         metadata["account_balance"] = float(account_balance)
+    # C4: mirror the live daemon path — wrong-side stops size to zero on
+    # both sides of the comparison instead of sizing through silently.
+    metadata.setdefault("enforce_stop_direction", True)
 
     return TradeSignal(
         action=action,
@@ -66,7 +69,16 @@ def _trade_to_signal(
 
 
 class RiskAdapter:
-    """Adapter that surfaces RiskEngine calculations for validation use-cases."""
+    """Adapter that surfaces RiskEngine calculations for validation use-cases.
+
+    Parity assumptions vs the live path (C4 quantified delta): both sides
+    of every comparison share these, so reference-vs-platform stays fair —
+    but validation-vs-live differs in exactly three documented ways:
+    ``pip_value`` defaults to 1.0 (pass the symbol's pip explicitly),
+    ``current_positions`` defaults to 0 (no broker book), and position
+    counts come from the comparison batch, not a portfolio. Stop-direction
+    enforcement matches live (``enforce_stop_direction=True``).
+    """
 
     def __init__(
         self,

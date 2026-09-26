@@ -410,6 +410,8 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
                 "psr": 0.8,
                 "max_drawdown": -5,
                 "trade_count": 11,
+                # C5: deployment shortlist requires OOS evidence.
+                "oos_sharpe": 0.9,
             }
         ],
     )

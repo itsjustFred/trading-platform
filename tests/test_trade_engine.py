@@ -90,7 +90,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         exits.iloc[20] = True
         return entries, exits, {}, []
 
-    cfg = BacktestConfig(
+    cfg = BacktestConfig(risk_per_trade_pct=0.01,
         strategy_name="unit-test",
         symbols=["TEST"],
         timeframe="1h",
@@ -347,7 +347,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         pytest.skip("No local 1h OHLCV parquet data covering 2024-01-01..2025-12-31")
 
     symbol = selected.parent.name
-    cfg = BacktestConfig(
+    cfg = BacktestConfig(risk_per_trade_pct=0.01,
         strategy_name="example_sma",
         symbols=[symbol],
         timeframe="1h",
@@ -372,3 +372,65 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         f"Trade-count divergence on real data must be at most one trade: "
         f"native={native_count}, vectorbt={vectorbt_count} on {symbol}/1h"
     )
+
+
+class TestIssueC2ExposureMath:
+    """C2: exposure counts stop-defined risk only; pending counts for limits."""
+
+    def _engine(self):
+        from runner.engine import TradeEngine
+
+        return TradeEngine(
+            BacktestConfig(
+                strategy_name="t",
+                symbols=["X"],
+                timeframe="1h",
+                start_date="2024-01-01",
+                end_date="2024-01-02",
+                initial_capital=100_000.0,
+                risk_per_trade_pct=0.01,
+                parameters={"fees": "zero"},
+            ),
+            symbol="X",
+        )
+
+    def test_stopless_legs_contribute_no_invented_distance(self) -> None:
+        from runner.engine_pkg.orders import Position
+
+        engine = self._engine()
+        engine.equity = 100_000.0
+        engine.positions.append(
+            Position(
+                symbol="X",
+                direction="LONG",
+                entry_index=0,
+                entry_time="2024-01-01T00:00:00+00:00",
+                entry_price=100.0,
+                order_type="market",
+                quantity=500.0,
+                remaining_qty=500.0,
+                stop_loss=None,
+            )
+        )
+        # No entry*0.98 fantasy math: stopless legs contribute nothing.
+        assert engine._current_risk_exposure(100.0) == 0.0
+
+    def test_stopped_legs_contribute_stop_distance(self) -> None:
+        from runner.engine_pkg.orders import Position
+
+        engine = self._engine()
+        engine.equity = 100_000.0
+        engine.positions.append(
+            Position(
+                symbol="X",
+                direction="LONG",
+                entry_index=0,
+                entry_time="2024-01-01T00:00:00+00:00",
+                entry_price=100.0,
+                order_type="market",
+                quantity=500.0,
+                remaining_qty=500.0,
+                stop_loss=98.0,
+            )
+        )
+        assert engine._current_risk_exposure(100.0) == pytest.approx(0.01)

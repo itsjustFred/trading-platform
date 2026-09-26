@@ -6,6 +6,10 @@ from typing import Any
 
 import pandas as pd
 
+from shared.logging import get_logger
+
+logger = get_logger("data-tools")
+
 _SYMBOL_KEYS = ("symbol", "ticker", "instrument")
 _ACTION_KEYS = ("action", "side", "signal_type", "signal")
 _PRICE_KEYS = ("entry_price", "signal_price", "price")
@@ -64,7 +68,11 @@ def _parse_decimal(value: Any) -> float | None:
     return numeric
 
 
-def _parse_action(value: Any) -> str:
+def _parse_action(value: Any) -> str | None:
+    """Parse a CSV action cell; None means "unusable, drop the row" (B3).
+
+    Unknown values must never default to "buy" — that invents longs.
+    """
     action = str(value or "").strip().lower()
     if action in {"buy", "long", "entry"}:
         return "buy"
@@ -74,7 +82,7 @@ def _parse_action(value: Any) -> str:
         return "sell"
     if "sell" in action:
         return "sell"
-    return "buy"
+    return None
 
 
 def _is_intraday_timestamp(value: pd.Timestamp) -> bool:
@@ -88,27 +96,36 @@ def _parse_timestamp(
     date_column: str | None,
     time_column: str | None,
 ) -> tuple[datetime | None, str]:
-    has_ny_time = bool(time_column and "ny" in _normalize_header(time_column))
-    source_timezone = "America/New_York" if has_ny_time else "UTC"
-
+    # B3: explicit timezones only — the NY-by-header heuristic silently
+    # mis-stamped every naive non-NY feed as America/New_York. Naive values
+    # are unusable (caller drops the row with a warning).
     timestamp_value = str(row.get(timestamp_column, "")).strip() if timestamp_column else ""
     date_value = str(row.get(date_column, "")).strip() if date_column else ""
     time_value = str(row.get(time_column, "")).strip() if time_column else ""
 
     parsed: pd.Timestamp | pd.NaT = pd.NaT
+    date_only = False
     if timestamp_value:
-        parsed = pd.to_datetime(timestamp_value, errors="coerce")
+        parsed = pd.to_datetime(timestamp_value, errors="coerce", utc=False)
     elif date_value and time_value:
-        parsed = pd.to_datetime(f"{date_value} {time_value}", errors="coerce")
+        parsed = pd.to_datetime(f"{date_value} {time_value}", errors="coerce", utc=False)
     elif date_value:
-        parsed = pd.to_datetime(date_value, errors="coerce")
+        parsed = pd.to_datetime(date_value, errors="coerce", utc=False)
+        date_only = True
 
     if pd.isna(parsed):
         return None, "1d"
 
     ts = pd.Timestamp(parsed)
     if ts.tzinfo is None:
-        ts = ts.tz_localize(source_timezone)
+        if date_only:
+            # A bare date carries no intraday time to mis-stamp: UTC
+            # midnight, documented. Intraday naives stay unusable.
+            ts = ts.tz_localize("UTC")
+        else:
+            # No explicit timezone carried by the value: unusable rather
+            # than guessed (the old NY-header heuristic mis-stamped feeds).
+            return None, "1d"
     ts_utc = ts.tz_convert("UTC")
     timeframe = "1m" if _is_intraday_timestamp(ts_utc) else "1d"
     return ts_utc.to_pydatetime(), timeframe
@@ -164,9 +181,27 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
             time_column=time_column,
         )
         if timestamp is None:
+            logger.warning(
+                "Skipping CSV row without explicit-timezone timestamp",
+                extra={"data": {"csv_row": int(index) + 2}},
+            )
             continue
 
-        action = _parse_action(row.get(action_column)) if action_column else "buy"
+        if action_column:
+            action = _parse_action(row.get(action_column))
+            if action is None:
+                logger.warning(
+                    "Skipping CSV row with unknown action (never default buy)",
+                    extra={
+                        "data": {
+                            "csv_row": int(index) + 2,
+                            "action": str(row.get(action_column)),
+                        }
+                    },
+                )
+                continue
+        else:
+            action = "buy"
         metadata: dict[str, Any] = {
             "csv_file": str(path),
             "csv_row": int(index) + 2,

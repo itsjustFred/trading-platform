@@ -1,0 +1,34 @@
+# B3: minimal CI — pytest + ruff on every push/PR.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        # Pinned (Sonar: no unlocked installs); uv ships wheels only.
+        run: pip install "uv==0.10.4"
+      - name: Sync dependencies
+        # All extras: the suite imports optional engines (vectorbt, lean,
+        # ctrader, …) unconditionally; a subset install fails collection.
+        run: uv sync --frozen --all-extras
+      # Advisory until the legacy debt is cleared (1144 pre-existing
+      # findings on main): new code is held to ruff-parity with main in
+      # review instead of a repo-wide gate that can never pass.
+      - name: Lint (advisory)
+        continue-on-error: true
+        run: uv run ruff check .
+      - name: Tests
+        run: uv run pytest -q -p no:cacheprovider -m "not slow" --ignore=tests/strategies
+      - name: Strategy tests
+        run: uv run pytest -q -p no:cacheprovider tests/strategies

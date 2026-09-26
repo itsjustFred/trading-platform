@@ -54,10 +54,54 @@ def _timeframe_seconds(timeframe: str) -> int | None:
     return None
 
 
-def _next_candle_close(reference: datetime, timeframe_seconds: int) -> datetime:
+def _next_candle_close(
+    reference: datetime, timeframe_seconds: int, *, timeframe: str = ""
+) -> datetime:
+    # B2: weekly candles anchor on Monday 00:00 UTC, not the Unix epoch
+    # (which anchors weeks on Thursday). All other granularities divide
+    # days evenly from midnight UTC already.
+    if timeframe.strip().lower().endswith("w"):
+        weeks = max(timeframe_seconds // (7 * 86400), 1)
+        monday = (reference - timedelta(days=reference.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        candidate = monday
+        while candidate <= reference:
+            candidate += timedelta(days=7 * weeks)
+        return candidate
     epoch_seconds = int(reference.timestamp())
     next_epoch = ((epoch_seconds // timeframe_seconds) + 1) * timeframe_seconds
     return datetime.fromtimestamp(next_epoch, tz=timezone.utc)
+
+
+def max_signal_age_seconds(timeframe: str) -> int | None:
+    """Maximum live-signal age: one candle of the deployment timeframe (B2).
+
+    A 1h signal older than 60 minutes is discarded instead of trading
+    immediately on stale information.
+    """
+    return _timeframe_seconds(timeframe)
+
+
+def signal_is_fresh(
+    signal: TradeSignal, timeframe: str, *, now: datetime | None = None
+) -> bool:
+    """Whether a live signal is young enough to trade (B2).
+
+    Fail-closed: signals without a parseable `received_at` are treated as
+    STALE. Age cannot be judged, and an unstamped signal must never trade
+    on possibly ancient information. The Discord dispatch path always
+    stamps `received_at` at receipt, so this only rejects signals that
+    bypassed stamping.
+    """
+    max_age = max_signal_age_seconds(timeframe)
+    if max_age is None:
+        return True
+    received_at = _parse_signal_timestamp(signal.metadata.get("received_at"))
+    if received_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return (current - received_at).total_seconds() <= max_age
 
 
 async def wait_for_candle_close(signal: TradeSignal, timeframe: str) -> None:
@@ -68,7 +112,7 @@ async def wait_for_candle_close(signal: TradeSignal, timeframe: str) -> None:
 
     received_at = _parse_signal_timestamp(signal.metadata.get("received_at"))
     reference = received_at or datetime.now(timezone.utc)
-    close_at = _next_candle_close(reference, timeframe_seconds)
+    close_at = _next_candle_close(reference, timeframe_seconds, timeframe=timeframe)
     now = datetime.now(timezone.utc)
     delay = (close_at - now).total_seconds()
     if delay <= 0:

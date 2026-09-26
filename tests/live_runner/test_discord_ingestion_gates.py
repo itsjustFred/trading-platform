@@ -504,7 +504,7 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 
@@ -526,7 +526,12 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -563,7 +568,7 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 
@@ -585,7 +590,13 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1", "discord_author_id": "bot-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "bot-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -620,7 +631,7 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
     submitted: list[str] = []
 
     class _Adapter:
-        async def submit_order(self, signal):
+        async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
 
@@ -640,7 +651,12 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
         stop_loss=195.0,
         take_profit=210.0,
         timeframe="1h",
-        metadata={"discord_channel_id": "channel-1"},
+        metadata={
+            "discord_channel_id": "channel-1",
+            # Fail-closed freshness (B2): real ingestion always stamps
+            # received_at; fixtures must carry a fresh stamp to dispatch.
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -1096,3 +1112,159 @@ class TestIssue81EnvAllowlist:
             accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "env-1"},
         )
         assert resolved == {"cfg-1"}
+
+
+# ── B2: backfill, poison ids, 403, prime-all, connect status ──────────────────
+
+def _burst_message(i: int) -> dict:
+    return {
+        "id": str(1000 + i),
+        "channel_id": "channel-1",
+        "timestamp": "2026-09-01T12:00:00Z",
+        "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+        "author": {"id": "bot-1", "bot": True},
+    }
+
+
+class TestIssueB2Backfill:
+    def test_burst_beyond_poll_limit_backfills(self) -> None:
+        """Bursts > POLL_LIMIT paginate backwards instead of losing exits."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        newest = [_burst_message(i) for i in range(20, 0, -1)]  # ids 1020..1001
+        older = [_burst_message(i) for i in range(0, -5, -1)]  # ids 1000..996
+        calls: list[dict] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            if not kwargs.get("before"):
+                return newest
+            assert kwargs["before"] == "1001"
+            return older
+
+        source._fetch_messages = _fetch
+        source._last_seen_message_ids["channel-1"] = "990"
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert any(call.get("before") == "1001" for call in calls)
+        assert source._queue.qsize() == 25
+
+    def test_short_page_does_not_backfill(self) -> None:
+        """A short page proves completeness — no extra REST traffic."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        calls: list[dict] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            return [_burst_message(5), _burst_message(4)]
+
+        source._fetch_messages = _fetch
+        source._last_seen_message_ids["channel-1"] = "1000"
+        asyncio.run(source._poll_once("channel-1"))
+        assert calls == [{}]
+
+    def test_poison_message_id_does_not_crash_cursor(self) -> None:
+        """A non-numeric newest id must not raise out of the cursor update."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+
+        async def _fetch(_channel_id, **kwargs):
+            return [{**_burst_message(1), "id": "not-a-snowflake"}]
+
+        source._fetch_messages = _fetch
+        source._last_seen_message_ids["channel-1"] = "1000"
+        asyncio.run(source._poll_once("channel-1"))  # must not raise
+        # Cursor keeps the last orderable value; the poison message still
+        # flowed through the seen-set exactly once.
+        assert source._last_seen_message_ids["channel-1"] == "1000"
+
+    def test_channel_forbidden_skips_channel_not_source(self) -> None:
+        """403 skips one channel; other channels still poll."""
+        import asyncio
+
+        from live_runner.signal_sources.discord_source import (
+            DiscordChannelForbiddenError,
+        )
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source.channel_ids = {"bad-channel", "channel-1"}
+
+        async def _fetch(channel_id, **kwargs):
+            if channel_id == "bad-channel":
+                raise DiscordChannelForbiddenError(channel_id)
+            return [_burst_message(1)]
+
+        source._fetch_messages = _fetch
+
+        async def _run():
+            for channel_id in sorted(source.channel_ids):
+                try:
+                    await source._poll_once(channel_id)
+                except DiscordChannelForbiddenError:
+                    continue
+
+        asyncio.run(_run())
+        assert source._queue.qsize() == 1
+
+
+def test_dispatch_discards_stale_signals() -> None:
+    """B2: a signal older than one deployment-timeframe candle never trades."""
+    import asyncio
+    from datetime import timedelta
+
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    submitted: list[str] = []
+
+    class _Adapter:
+        async def submit_order(self, signal, *, qty: float | None = None):
+            submitted.append(str(signal.deployment_id))
+            return "order-1"
+
+        async def get_balance(self):
+            return 100_000.0, 100_000.0
+
+        async def get_positions(self):
+            return []
+
+    deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
+    deployment.signal_config["trusted_author_ids"] = ["bot-1"]
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "bot-1",
+            "received_at": stale_at,
+        },
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    original = daemon.wait_for_candle_close
+    daemon.wait_for_candle_close = _no_wait
+    try:
+        asyncio.run(
+            daemon._dispatch_discord_trade_signal(
+                "acc-1",
+                _Adapter(),
+                [deployment],
+                signal,
+                accounts_env_values={},
+            )
+        )
+    finally:
+        daemon.wait_for_candle_close = original
+
+    assert submitted == []

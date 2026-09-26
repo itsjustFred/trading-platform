@@ -137,13 +137,30 @@ class LeanAdapter(EngineAdapter):
         return output_dir
 
     def _find_result(self, output_dir: Path) -> Path | None:
-        """Find the LEAN result JSON in output directory."""
+        """Find the LEAN result JSON in output directory (C2).
+
+        First JSON shaped like a result wins — deterministically (sorted),
+        requiring a dict with `orders`/`trades` when present. LEAN writes
+        orders dict-shaped (keyed by order id); lists are accepted too —
+        matching what :mod:`runner.converters.lean_converter` consumes.
+        Returns None (caller fails loudly) when nothing validates.
+        """
         for pattern in ["*.json", "**/*.json"]:
-            for f in output_dir.glob(pattern):
+            for f in sorted(output_dir.glob(pattern)):
                 try:
                     data = json.loads(f.read_text())
-                    if "orders" in data or "trades" in data:
-                        return f
-                except (json.JSONDecodeError, KeyError):
+                except (json.JSONDecodeError, KeyError, OSError):
                     continue
+                if not isinstance(data, dict):
+                    continue
+                if "orders" not in data and "trades" not in data:
+                    continue
+                orders = data.get("orders", [])
+                trades = data.get("trades", [])
+                if not isinstance(orders, (list, dict)) or not isinstance(
+                    trades, (list, dict)
+                ):
+                    continue
+                logger.info("Using LEAN result file: %s", f)
+                return f
         return None

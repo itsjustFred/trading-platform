@@ -144,9 +144,12 @@ def test_live_preflight_rejects_non_numeric_ctrader_account_id(tmp_path: Path) -
         },
     )
 
+    # B3: unroutable accounts fail the preflight as a reported config
+    # error, not an unhandled crash.
     assert result.ok is False
-    assert "must be numeric" in result.accounts[0].errors[0]
-    assert any("CTRADER_REFRESH_TOKEN" in warning for warning in result.accounts[0].warnings)
+    assert any(
+        "no numeric broker identifier" in error for error in result.deployment_errors
+    )
 
 
 def test_live_preflight_reports_unknown_deployment_account(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from live_runner.base_adapter import UNBOUNDED_TP_POLICY
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
 
@@ -146,8 +147,18 @@ class RocketFuelSignalProcessor:
         )
         if "timestamp" in raw_signal and raw_signal.get("timestamp") is not None:
             metadata["signal_timestamp"] = str(raw_signal.get("timestamp"))
-        if "signal_price" in raw_signal and raw_signal.get("signal_price") is not None:
-            metadata["signal_price"] = float(raw_signal.get("signal_price"))
+        # C1: signal-vs-fill attribution, same contract as RamJet.
+        incoming_price = raw_signal.get("signal_price")
+        try:
+            signal_price = float(incoming_price) if incoming_price is not None else entry_price
+        except (TypeError, ValueError):
+            signal_price = entry_price
+        metadata["signal_price"] = signal_price
+        metadata["slippage_vs_signal"] = entry_price - signal_price
+        # C1 (owner decision): RocketFuel exits on the opposite signal, so it
+        # carries no bounded take profit. That is an EXPLICIT unbounded flag,
+        # never a silent None the daemon would invent a bracket for.
+        metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
 
         return TradeSignal(
             action=action,

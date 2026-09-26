@@ -141,7 +141,8 @@ class RiskComparator:
                     actual_risk_profile=None,
                     field_results={},
                     passed=False,
-                    severity="warning",
+                    # C4: missing flips the risk gate — error, not warning.
+                    severity="error",
                     explanation=(
                         f"Expected trade {ref_trade.id} has no matching actual trade"
                     ),
@@ -234,6 +235,8 @@ class RiskComparator:
         field_results: dict[str, FieldComparisonResult] = {}
 
         if exp_profile is None or act_profile is None:
+            # C4: sizing failures are error, not warning (global fail-closed
+            # rule — an uncomputable profile fails the risk gate).
             return RiskComparisonResult(
                 expected_trade=ref_trade,
                 actual_trade=act_trade,
@@ -241,7 +244,7 @@ class RiskComparator:
                 actual_risk_profile=act_profile,
                 field_results=field_results,
                 passed=False,
-                severity="warning",
+                severity="error",
                 explanation="Could not compute risk profile for one or both trades",
             )
 
@@ -271,7 +274,8 @@ class RiskComparator:
             name for name, res in field_results.items() if not res.passed
         ]
         passed = len(mismatches) == 0
-        severity = "info" if passed else "warning"
+        # C4: a failed pair flips the risk gate — error, not warning.
+        severity = "info" if passed else "error"
 
         if passed:
             explanation = (

@@ -44,6 +44,35 @@ def _to_int(value: Any, *, default: int) -> int:
         return default
 
 
+#: Single source precedence for live trade levels (C1: mixed sources sized
+#: wrong distances). Entry falls back to theoretical_price; SL/TP accept the
+#: same alias keys the daemon resolves (stop_loss/sl_price/stop_price/
+#: resolved_stop_loss, take_profit/tp_price) — never bare theoretical math.
+_LIVE_SL_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+_LIVE_TP_KEYS = ("take_profit", "tp_price")
+
+
+def _first_metadata_float(metadata: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _to_optional_float(metadata.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float | None]:
+    """Resolve (entry, stop, take) for a live signal under one precedence.
+
+    Entry: metadata entry_price, else theoretical_price. SL/TP: metadata
+    aliases only. One function so every sizing path geometry-matches.
+    """
+    metadata = signal.metadata or {}
+    entry = _to_float(metadata.get("entry_price"), default=float(signal.theoretical_price))
+    stop = _first_metadata_float(metadata, _LIVE_SL_KEYS)
+    take = _first_metadata_float(metadata, _LIVE_TP_KEYS)
+    return entry, stop, take
+
+
 def size_live_signal(
     signal: LiveSignal,
     *,
@@ -87,20 +116,19 @@ def size_live_signal(
         # Trusted flatten: honor the caller's exact position size, but still
         # apply the notional ceiling so even internal paths cannot overshoot.
         max_notional = float(account_balance) * risk_config.max_notional_per_trade
-        entry = _to_float(
-            metadata.get("entry_price"), default=float(signal.theoretical_price)
-        )
+        entry, _, _ = resolve_live_levels(signal)
         if entry > 0 and reduce_qty * entry > max_notional:
             reduce_qty = max_notional / entry
         for untrusted_key in ("explicit_qty", "risk_sizing_mode"):
             metadata.pop(untrusted_key, None)
+        _, reduce_stop, reduce_take = resolve_live_levels(signal)
         signal.metadata = {
             **metadata,
             "qty": float(reduce_qty),
             "risk_amount": 0.0,
             "risk_percent": 0.0,
             "risk_reward_ratio": None,
-            "resolved_stop_loss": _to_optional_float(metadata.get("stop_loss")),
+            "resolved_stop_loss": reduce_stop,
             "risk_rejected": reduce_qty <= 0,
             "risk_rejection_reason": None if reduce_qty > 0 else "reduce_only_zero_qty",
             "risk_config_source": "deployment_runtime",
@@ -111,8 +139,8 @@ def size_live_signal(
                 action=str(signal.action),
                 symbol=str(signal.symbol),
                 entry_price=entry if entry > 0 else float(signal.theoretical_price),
-                stop_loss=_to_optional_float(metadata.get("stop_loss")),
-                take_profit=_to_optional_float(metadata.get("take_profit")),
+                stop_loss=reduce_stop,
+                take_profit=reduce_take,
                 timeframe=str(metadata.get("timeframe") or "1m"),
             ),
             position_size=float(reduce_qty),
@@ -121,15 +149,13 @@ def size_live_signal(
             risk_reward_ratio=None,
         )
 
+    entry_price, level_stop, level_take = resolve_live_levels(signal)
     trade_signal = TradeSignal(
         action=str(signal.action),
         symbol=str(signal.symbol),
-        entry_price=_to_float(
-            metadata.get("entry_price"),
-            default=float(signal.theoretical_price),
-        ),
-        stop_loss=_to_optional_float(metadata.get("stop_loss")),
-        take_profit=_to_optional_float(metadata.get("take_profit")),
+        entry_price=entry_price,
+        stop_loss=level_stop,
+        take_profit=level_take,
         timeframe=str(metadata.get("timeframe") or "1m"),
         metadata={
             "atr": metadata.get("atr"),

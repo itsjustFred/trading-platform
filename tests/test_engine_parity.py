@@ -73,13 +73,18 @@ def parity_data_dir(tmp_path_factory) -> Path:
 
 
 def _parity_config(data_dir: Path) -> BacktestConfig:
-    return BacktestConfig(
+    return BacktestConfig(risk_per_trade_pct=0.01,
         strategy_name="example_sma",
         symbols=["PARITY"],
         timeframe="1h",
         start_date=PARITY_START,
         end_date=PARITY_END,
         initial_capital=100_000,
+        # Parity needs identical caps on both engines: vectorbt's position
+        # cap would otherwise bind (0.2 default) while native caps at 1.0x.
+        # Non-binding on both sides keeps the comparison about fills/PnL.
+        max_position_exposure_pct=1.0,
+        max_leverage=10.0,
         modeling_resolution="main_timeframe",
         data_dir=str(data_dir),
         parameters={"fees": "zero", "fast_length": 5, "slow_length": 20},

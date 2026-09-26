@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
@@ -208,12 +208,92 @@ def _canonical_time(value: Any) -> str:
             except ValueError:
                 continue
     if parsed is None:
-        return text
+        # B3: unparsable times fail closed — passing raw strings through
+        # silently poisoned every downstream comparison with unorderable text.
+        raise ValueError(f"unparsable timestamp: {text!r}")
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     parsed = parsed.astimezone(timezone.utc)
     rendered = parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds")
     return rendered.replace(_UTC_OFFSET, "Z")
+
+
+_TIMEFRAME_SNAP_MINUTES = {
+    "1m": 1.0,
+    "5m": 5.0,
+    "15m": 15.0,
+    "30m": 30.0,
+    "1h": 60.0,
+    "4h": 240.0,
+    "1d": 1440.0,
+}
+
+
+def _resolve_reference_timeframe(normalized_trades: list, explicit: Any = None) -> str:
+    """Infer the reference timeframe or fail closed (B3).
+
+    An explicit `timeframe` kwarg always wins. Otherwise the median
+    inter-entry spacing snaps to the nearest standard frame within 10% —
+    anything sparser is not inferable and raises instead of shipping the
+    dishonest `"unknown"` downstream into comparison bucketing.
+    """
+    if explicit is not None:
+        label = str(explicit).strip()
+        if not label:
+            raise ValueError("timeframe kwarg must not be empty")
+        return label
+    stamps: list[datetime] = []
+    for trade in normalized_trades:
+        parsed = _parse_trade_timestamp(getattr(trade, "entry_time", ""))
+        if parsed is not None:
+            stamps.append(parsed)
+    if len(stamps) < 3:
+        raise ValueError(
+            "cannot infer reference timeframe from fewer than 3 dated entries; "
+            "pass timeframe= explicitly"
+        )
+    stamps.sort()
+    gaps = [
+        (later - earlier).total_seconds() / 60.0
+        for earlier, later in zip(stamps, stamps[1:])
+        if (later - earlier).total_seconds() > 0
+    ]
+    if not gaps:
+        raise ValueError(
+            "cannot infer reference timeframe from identical timestamps; "
+            "pass timeframe= explicitly"
+        )
+    median_gap = sorted(gaps)[len(gaps) // 2]
+    best: str | None = None
+    best_rel = float("inf")
+    for label, minutes in _TIMEFRAME_SNAP_MINUTES.items():
+        rel = abs(median_gap - minutes) / minutes
+        if rel < best_rel:
+            best_rel = rel
+            best = label
+    if best is None or best_rel > 0.10:
+        raise ValueError(
+            f"cannot infer reference timeframe (median inter-entry gap "
+            f"{median_gap:.1f}m snaps to nothing within 10%); "
+            "pass timeframe= explicitly"
+        )
+    return best
+
+
+def _parse_trade_timestamp(value: Any) -> datetime | None:
+    try:
+        text = str(value or "").strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _header_key(value: str) -> str:
@@ -249,10 +329,12 @@ def _decimal_export_matches(json_value: Any, csv_value: Any) -> bool:
         return False
     exponent = exported.as_tuple().exponent
     quantum = Decimal(1).scaleb(exponent)
-    return exported in {
-        expected.quantize(quantum, rounding=ROUND_HALF_UP),
-        expected.quantize(quantum, rounding=ROUND_DOWN),
-    }
+    if exported == expected.quantize(quantum, rounding=ROUND_HALF_UP):
+        return True
+    # B3: no ROUND_DOWN acceptance (systematic truncation). Drift within half
+    # a quantum of the exported precision is indistinguishable from honest
+    # rounding (≈ a cent at money precision); anything larger is material.
+    return abs(expected - exported) <= quantum / 2
 
 
 @dataclass(frozen=True)
@@ -404,6 +486,9 @@ class QuantConnectResultImporter(BaseImporter):
 
         resolved_source = str(source_path.resolve())
         symbols = sorted({trade.symbol for trade in normalized_trades})
+        timeframe = _resolve_reference_timeframe(
+            normalized_trades, explicit=kwargs.get("timeframe")
+        )
         strategy_name = str(
             state.get("Name")
             or configuration.get("name")
@@ -440,7 +525,7 @@ class QuantConnectResultImporter(BaseImporter):
             strategy_name=strategy_name,
             source_framework="lean",
             symbol=",".join(symbols),
-            timeframe="unknown",
+            timeframe=timeframe,
             settings=_sorted_copy(settings),
             trades=normalized_trades,
             stats=canonical_stats,
@@ -735,7 +820,8 @@ class QuantConnectResultImporter(BaseImporter):
                 f"remainder={format(fee_remainder, 'f')}"
             )
         if not unreferenced_ids:
-            if fee_remainder != Decimal("0"):
+            # B3: cent tolerance band instead of exact Decimal("0") equality.
+            if abs(fee_remainder) > Decimal("0.01"):
                 raise ValueError(
                     "portfolio total fees do not reconcile with closed-trade "
                     "fees when every order is referenced: "
@@ -800,7 +886,7 @@ class QuantConnectResultImporter(BaseImporter):
                 }
             )
         reconciliation_delta = derived_total - fee_remainder
-        if reconciliation_delta != Decimal("0"):
+        if abs(reconciliation_delta) > Decimal("0.01"):
             raise ValueError(
                 "derived unreferenced-order fees do not reconcile with "
                 "portfolio total minus closed-trade total: "

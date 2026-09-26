@@ -199,3 +199,96 @@ class TestResampleMerge:
         assert observed["path"] != outputs[0], "resample target must be written via temp file"
         assert len(pd.read_parquet(outputs[0])) == 2
         assert not list(tmp_path.rglob("*.tmp-*")), "no temp files left behind"
+
+
+class TestResampleWithOrigin:
+    """C5: explicit UTC buckets, extra-column retention, loud gap drops."""
+
+    def test_buckets_align_to_utc_day(self, sample_1m_df):
+        from data_tools.resample import resample_with_origin
+
+        out = resample_with_origin(sample_1m_df, "1h")
+        # 09:00 and 10:00 UTC boundaries, not pandas-default alignment drift.
+        assert out["timestamp"].dt.minute.eq(0).all()
+
+    def test_extra_columns_retained(self, sample_1m_df):
+        from data_tools.resample import resample_with_origin
+
+        frame = sample_1m_df.copy()
+        frame["spread"] = 0.5
+        out = resample_with_origin(frame, "5min")
+        assert "spread" in out.columns
+        assert (out["spread"] == 0.5).all()
+
+    def test_empty_buckets_warn_loudly(self, sample_1m_df, caplog):
+        import logging
+
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        # Bars on both sides of a fully missing 10:00 hour: the empty
+        # bucket materializes (and warns) instead of vanishing silently.
+        morning = sample_1m_df.iloc[:60].copy()
+        late = sample_1m_df.iloc[:60].copy()
+        late["timestamp"] = pd.date_range("2024-01-02 11:00", periods=60, freq="min")
+        gapped = pd.concat([morning, late], ignore_index=True)
+        with caplog.at_level(logging.WARNING, logger="data_tools.resample"):
+            out = resample_with_origin(gapped, "1h")
+        assert any("empty bucket" in record.message for record in caplog.records)
+        assert len(out) == 2
+
+
+class TestBidAskAggregation:
+    """C5/CodeRabbit: bid_/ask_ siblings aggregate like true ranges."""
+
+    def test_bid_high_uses_max_not_last(self) -> None:
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=5, freq="min", tz="UTC"),
+                "open": [1.0, 1.1, 1.2, 1.3, 1.4],
+                "high": [1.1, 1.2, 1.3, 1.4, 1.5],
+                "low": [0.9, 1.0, 1.1, 1.2, 1.3],
+                "close": [1.05, 1.15, 1.25, 1.35, 1.45],
+                "volume": [10, 20, 30, 40, 50],
+                "bid_high": [1.05, 9.99, 1.25, 1.35, 1.45],
+                "ask_low": [0.95, 1.05, 0.01, 1.25, 1.35],
+                "bid_open": [1.0, 1.1, 1.2, 1.3, 1.4],
+                "spread": [0.1, 0.2, 0.3, 0.4, 0.5],
+            }
+        )
+        result = resample_with_origin(frame, "5min")
+        assert len(result) == 1
+        bar = result.iloc[0]
+        assert bar["bid_high"] == 9.99
+        assert bar["ask_low"] == 0.01
+        assert bar["bid_open"] == 1.0
+        assert bar["spread"] == 0.5
+
+    def test_zero_volume_flag_recomputed_from_merged_volume(self) -> None:
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=5, freq="min", tz="UTC"),
+                "open": [1.0, 1.1, 1.2, 1.3, 1.4],
+                "high": [1.1, 1.2, 1.3, 1.4, 1.5],
+                "low": [0.9, 1.0, 1.1, 1.2, 1.3],
+                "close": [1.05, 1.15, 1.25, 1.35, 1.45],
+                "volume": [0, 0, 0, 0, 10],
+                "zero_volume_bar": [True, True, True, True, False],
+            }
+        )
+        result = resample_with_origin(frame, "5min")
+        # Merged volume is 10 (one live sub-bucket) → not zero-volume.
+        assert bool(result.iloc[0]["zero_volume_bar"]) is False
+
+        frame["volume"] = 0
+        result = resample_with_origin(frame, "5min")
+        assert bool(result.iloc[0]["zero_volume_bar"]) is True

@@ -60,7 +60,12 @@ def _sanitize_json_numbers(obj: Any) -> Any:
 
 
 def _stats_from_reference(reference: ValidationReference) -> TradeStatistics:
-    """Build TradeStatistics from reference.stats when no trades are present."""
+    """Build TradeStatistics from reference.stats when no trades are present.
+
+    Legacy fallback, kept for direct callers. Report generation
+    (:func:`generate_json_report`) always recomputes from trades instead —
+    single canonical computation path (C4), never stored/curated numbers.
+    """
     allowed_fields = set(TradeStatistics.model_fields.keys())
     filtered = {k: v for k, v in reference.stats.items() if k in allowed_fields}
     return TradeStatistics(**filtered)
@@ -408,28 +413,11 @@ def generate_json_report(
 
     # --- stat deltas ---------------------------------------------------
     if stats_delta is None:
-        if reference.trades:
-            ref_stats = compute_trade_statistics(reference.trades)
-        elif reference.stats:
-            ref_stats = _stats_from_reference(reference)
-        else:
-            ref_stats = compute_trade_statistics(reference.trades)
-        if platform_bt.trades:
-            act_stats = compute_trade_statistics(platform_bt.trades)
-        else:
-            platform_raw_stats: dict[str, Any] | None = None
-            if isinstance(platform_result, ValidationReference):
-                platform_raw_stats = platform_result.stats
-            elif hasattr(platform_result, 'stats'):
-                platform_raw_stats = getattr(platform_result, 'stats')
-            elif isinstance(platform_result, dict):
-                platform_raw_stats = platform_result.get('stats')
-            if platform_raw_stats:
-                allowed_fields = set(TradeStatistics.model_fields.keys())
-                filtered = {k: v for k, v in platform_raw_stats.items() if k in allowed_fields}
-                act_stats = TradeStatistics(**filtered)
-            else:
-                act_stats = compute_trade_statistics(platform_bt.trades)
+        # C4: single canonical computation path — always recompute from
+        # trades on both sides, never prefer stored/curated numbers
+        # (comparing recomputed vs stored stats is apples vs oranges).
+        ref_stats = compute_trade_statistics(reference.trades)
+        act_stats = compute_trade_statistics(platform_bt.trades)
         stat_deltas: list[StatDelta] = _compare_stats(
             ref_stats, act_stats, abs_tol=stats_abs_tol, rel_tol=stats_rel_tol
         )

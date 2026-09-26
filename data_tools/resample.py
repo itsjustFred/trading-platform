@@ -39,6 +39,88 @@ TIMEFRAME_MAP = {
 TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
 
+def _aggregation_for(columns: list[str]) -> dict[str, str]:
+    """OHLCV aggregation with retention for extra columns (C5).
+
+    Spread / bid_* / ask_* OHLCV siblings aggregate like their plain
+    counterparts (high→max, low→min, open→first, close→last, volume→sum),
+    so resampled bid/ask ranges stay true ranges instead of last-ticks.
+    Other numeric extras ride along with "last"; non-numeric extras keep
+    "first". ``zero_volume_bar`` is excluded here and recomputed from the
+    merged volume after resampling (a merged bucket is zero-volume only
+    when every sub-bucket was).
+    """
+    agg: dict[str, str] = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
+    for column in columns:
+        if column in agg or column == "timestamp" or column == "zero_volume_bar":
+            continue
+        lowered = column.lower()
+        if lowered.endswith(("_high", ".high")):
+            agg[column] = "max"
+        elif lowered.endswith(("_low", ".low")):
+            agg[column] = "min"
+        elif lowered.endswith(("_open", ".open")):
+            agg[column] = "first"
+        elif lowered.endswith(("_close", ".close")):
+            agg[column] = "last"
+        elif "volume" in lowered or lowered.endswith("_vol"):
+            agg[column] = "sum"
+        elif lowered == "spread":
+            # Current spread, not the bucket's first tick.
+            agg[column] = "last"
+        else:
+            agg[column] = "first"
+    return agg
+
+
+def resample_with_origin(
+    df: pd.DataFrame,
+    rule: str,
+    *,
+    origin: str = "start_day",
+    timestamp_col: str = "timestamp",
+) -> pd.DataFrame:
+    """Shared resample helper with explicit bucket origin (C5).
+
+    Buckets align to UTC via ``origin`` (default ``"start_day"``) instead of
+    pandas defaults; empty buckets are dropped LOUDLY (count-logged, so gaps
+    stay visible instead of vanishing); extra columns (spread, bid_*/ask_*)
+    are retained via :func:`_aggregation_for`.
+    """
+    frame = df.copy()
+    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True)
+    frame = frame.set_index(timestamp_col).sort_index()
+    had_zero_volume_flag = "zero_volume_bar" in frame.columns
+    resampled = frame.resample(rule, origin=origin).agg(
+        _aggregation_for([str(column) for column in frame.columns])
+    )
+    if had_zero_volume_flag:
+        if "volume" in resampled.columns:
+            # Recompute from merged volume: zero only when every
+            # sub-bucket was zero (CodeRabbit round).
+            resampled["zero_volume_bar"] = (
+                pd.to_numeric(resampled["volume"], errors="coerce").fillna(0.0) <= 0.0
+            )
+        else:
+            resampled["zero_volume_bar"] = (
+                frame[["zero_volume_bar"]].resample(rule, origin=origin).min()
+            )
+    empty_buckets = int(resampled["open"].isna().sum()) if "open" in resampled else 0
+    if empty_buckets:
+        logger.warning(
+            "Resample %s dropped %d empty bucket(s); gaps stay visible in coverage checks",
+            rule,
+            empty_buckets,
+        )
+    return resampled.dropna(subset=["open"]).reset_index()
+
+
 def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     """Resample OHLCV DataFrame to a higher timeframe.
 
@@ -52,28 +134,7 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     if target_tf not in TIMEFRAME_MAP:
         raise ValueError(f"Unknown timeframe '{target_tf}'. Use: {list(TIMEFRAME_MAP.keys())}")
 
-    pandas_freq = TIMEFRAME_MAP[target_tf]
-
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.set_index("timestamp").sort_index()
-
-    resampled = (
-        df.resample(pandas_freq)
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
-        .dropna(subset=["open"])
-    )
-
-    resampled = resampled.reset_index()
-    return resampled
+    return resample_with_origin(df, TIMEFRAME_MAP[target_tf])
 
 
 def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.DataFrame:
