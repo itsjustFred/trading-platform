@@ -1403,6 +1403,88 @@ def test_process_environment_cannot_override_the_accounts_file(monkeypatch):
     assert daemon._resolve_discord_auth_scheme("NITRO", env) == "bot"
 
 
+# ─── an unknown auth scheme is a config error, not a guess ───────────────────
+#
+# `raw`/`account` name a user credential, `bot` a bot credential; they are not
+# interchangeable, so an unrecognised value (a typo such as `bearer`) must be
+# refused at config load. Guessing it instead means sending the wrong
+# Authorization header and 401ing at send time, once per poll.
+
+
+def _no_auth_scheme_in_environment(monkeypatch) -> None:
+    monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_NITRO_AUTH_SCHEME", raising=False)
+
+
+def test_daemon_rejects_an_unknown_global_auth_scheme(monkeypatch):
+    _no_auth_scheme_in_environment(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        daemon._resolve_discord_auth_scheme(
+            "NITRO", {"DISCORD_AUTH_SCHEME": "bearer"}
+        )
+
+
+def test_daemon_rejects_an_unknown_per_bot_auth_scheme(monkeypatch):
+    _no_auth_scheme_in_environment(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        daemon._resolve_discord_auth_scheme(
+            "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": "bearer"}
+        )
+
+
+@pytest.mark.parametrize("configured", ["  Bearer  ", "\tbearer\n", "BEARER  "])
+def test_daemon_rejects_an_unknown_auth_scheme_hidden_by_whitespace(
+    monkeypatch, configured
+):
+    """Surrounding whitespace must not smuggle a typo past the vocabulary.
+
+    The value is trimmed and case-folded before it is checked, so a padded
+    unknown value is still an unknown value; without that, a stray space is a
+    second way to end up with a `Bot` header on an account token.
+    """
+    _no_auth_scheme_in_environment(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        daemon._resolve_discord_auth_scheme(
+            "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": configured}
+        )
+
+
+@pytest.mark.parametrize("configured", ["user", "account_token", "bearer"])
+def test_daemon_rejects_any_scheme_outside_the_recorded_vocabulary(
+    monkeypatch, configured
+):
+    """Only raw/account/bot are accepted; nothing else is silently honoured."""
+    _no_auth_scheme_in_environment(monkeypatch)
+
+    with pytest.raises(ValueError, match="Unsupported Discord auth_scheme"):
+        daemon._resolve_discord_auth_scheme(
+            "NITRO", {"DISCORD_AUTH_SCHEME": configured}
+        )
+
+
+def test_daemon_treats_a_whitespace_only_auth_scheme_as_unset(monkeypatch):
+    """A blank value means "not configured", so it falls through to the default.
+
+    It is not an unknown vocabulary word: an env file line an editor left
+    blank is a missing credential, not a typo, and must not block startup.
+    """
+    _no_auth_scheme_in_environment(monkeypatch)
+
+    assert (
+        daemon._resolve_discord_auth_scheme("NITRO", {"DISCORD_AUTH_SCHEME": "   "})
+        == "raw"
+    )
+    assert (
+        daemon._resolve_discord_auth_scheme(
+            "NITRO", {"DISCORD_BOT_NITRO_AUTH_SCHEME": "\t \n"}
+        )
+        == "raw"
+    )
+
+
 # ─── Real message shapes from the live channels ──────────────────────────────
 #
 # Captured verbatim (structure only) from the three Discord signal channels so

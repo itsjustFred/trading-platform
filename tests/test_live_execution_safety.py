@@ -5396,6 +5396,75 @@ def test_legacy_response_without_a_status_is_not_treated_as_a_failure():
     )
 
 
+def _alpaca_cancel_adapter_with_status(status: int):
+    """A cancel adapter whose broker answers with one order in `status`."""
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Order:
+        def __init__(self, oid, status):
+            self.id = oid
+            self.status = status
+
+    class _Client:
+        def cancel_orders(self):
+            return type("R", (), {"cancelled_orders": [_Order("o1", status)]})()
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+    return adapter
+
+
+@pytest.mark.parametrize("status", [200, 201, 204, 299])
+def test_alpaca_two_hundred_status_is_counted_as_a_successful_cancel(status):
+    """The whole 2xx band is success: that is the band the broker documents."""
+    import asyncio
+
+    adapter = _alpaca_cancel_adapter_with_status(status)
+
+    assert asyncio.run(adapter.cancel_open_orders()) == 1
+
+
+@pytest.mark.parametrize("status", [300, 301, 302, 399, 400, 403, 404, 422, 500])
+def test_alpaca_status_outside_two_hundred_is_reported_as_a_failed_cancel(status):
+    """Everything outside 2xx means "not done as asked", 3xx included.
+
+    A 3xx is not a redirect to follow here: the order was not cancelled. The
+    daemon marks a STOPPED deployment enforced from this count, so accepting a
+    3xx would report the deployment as flattened while its orders and
+    positions are still live.
+    """
+    import asyncio
+
+    adapter = _alpaca_cancel_adapter_with_status(status)
+
+    with pytest.raises(RuntimeError, match=r"o1=" + str(status)):
+        asyncio.run(adapter.cancel_open_orders())
+
+
+def test_alpaca_close_all_positions_also_refuses_a_redirect_status():
+    """The same 2xx-only rule guards the flatten count, not just cancels."""
+    import asyncio
+
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Position:
+        def __init__(self, pid, status):
+            self.id = pid
+            self.status = status
+
+    class _Client:
+        def close_all_positions(self):
+            return type("R", (), {"orders": [_Position("p1", 302)]})()
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+
+    with pytest.raises(RuntimeError, match="did not succeed"):
+        asyncio.run(adapter.close_all_positions())
+
+
 def test_widened_market_data_request_asks_for_the_newest_bars():
     """The response is capped at `limit`, so ordering decides which bars arrive.
 

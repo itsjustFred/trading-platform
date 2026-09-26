@@ -915,7 +915,9 @@ def test_cancel_skips_market_orders_and_cancels_resting_ones():
         )
     )
     assert cancelled == 3, "market orders fill immediately and cannot be cancelled"
-    ids = [int(getattr(r, "orderId", 0) or 0) for r in adapter.sent if getattr(r, "orderId", 0)]
+    # `orderId` is an int64 field, so the real request always reads back an
+    # int. Coercing here would hide a string that reached the wire.
+    ids = [r.orderId for r in adapter.sent if getattr(r, "orderId", 0)]
     assert 101 not in ids, "market orders fill immediately and cannot be cancelled"
     assert {102, 103, 104} <= set(ids)
 
@@ -956,10 +958,12 @@ def test_flatten_closes_every_open_position():
     adapter._fetch_open_positions = _positions
     closed = _run(CTraderLiveAdapter.close_all_positions(adapter))
     assert closed == 2
-    closed_ids = [int(r.positionId) for r in adapter.sent]
+    # `positionId`/`volume` are int64 fields, so the real request always reads
+    # back ints. Coercing here would hide a string that reached the wire.
+    closed_ids = [r.positionId for r in adapter.sent]
     assert closed_ids == [201, 202]
     # A full close must carry the position volume; cTrader rejects volume 0.
-    assert all(int(r.volume) > 0 for r in adapter.sent)
+    assert all(r.volume > 0 for r in adapter.sent)
 
 
 def test_flatten_skips_positions_without_an_id():
@@ -1044,13 +1048,15 @@ def _make_cancel_adapter(tmp_path: Path, orders):
     for order in orders:
         response.order.add().CopyFrom(order)
 
-    cancelled: list[int] = []
+    cancelled: list[Any] = []
 
     async def _fake_send(request, **_kwargs):
         if isinstance(request, ProtoOAReconcileReq):
             return response
         if isinstance(request, ProtoOACancelOrderReq):
-            cancelled.append(int(request.orderId))
+            # Recorded verbatim: `int()` here would coerce away a string id
+            # that reached the wire instead of failing the assertion.
+            cancelled.append(request.orderId)
             return ProtoOAReconcileRes()
         raise AssertionError(f"unexpected request {type(request).__name__}")
 
@@ -1152,3 +1158,342 @@ def test_cancel_open_orders_treats_a_missing_status_as_working(tmp_path):
         f"a missing status must still be cancelled, got {adapter.cancelled_ids}"
     )
     assert count == 1
+
+
+# ─── exit-only is a sell-only path ──────────────────────────────────────────
+#
+# `risk_sizing_mode="exit_only"` addresses a close request at an existing broker
+# position, which carries no SL/TP because the position already has them. A buy
+# is an *entry*: routing it down the close path would liquidate a position
+# instead of opening one, and would skip the new-order path's mandatory SL/TP
+# entry guard. The Alpaca twin of this is
+# test_alpaca_buy_cannot_use_exit_only_mode_to_bypass_entry_guards.
+
+
+def _make_submit_adapter(tmp_path: Path, *, open_position_ids=(77,)):
+    """Adapter whose transport records the request type it is handed.
+
+    `open_position_ids` seeds the broker positions the exit-only path resolves
+    against, so the close branch is genuinely reachable: a buy must not reach
+    it, and a sell must.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAClosePositionReq,
+        ProtoOAExecutionEvent,
+        ProtoOANewOrderReq,
+        ProtoOAOrderErrorEvent,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderType,
+        ProtoOATimeInForce,
+        ProtoOATradeSide,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._position_ids_by_symbol = {"EURUSD": tuple(open_position_ids)}
+    adapter._ProtoOANewOrderReq = ProtoOANewOrderReq
+    adapter._ProtoOAClosePositionReq = ProtoOAClosePositionReq
+    adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter._ProtoOAExecutionEvent = ProtoOAExecutionEvent
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._ProtoOATimeInForce = ProtoOATimeInForce
+
+    close_requests: list[Any] = []
+    new_order_requests: list[Any] = []
+    persisted: list[tuple[str, str]] = []
+
+    async def _fake_send(request, **_kwargs):
+        if isinstance(request, ProtoOAClosePositionReq):
+            close_requests.append(request)
+        elif isinstance(request, ProtoOANewOrderReq):
+            new_order_requests.append(request)
+        else:
+            raise AssertionError(f"unexpected request {type(request).__name__}")
+        return SimpleNamespace(orderId=555)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    adapter.close_requests = close_requests
+    adapter.new_order_requests = new_order_requests
+    adapter.persisted_order_ids = persisted
+    return adapter
+
+
+def _offline_signal_persistence(monkeypatch, module, adapter, signal) -> None:
+    """Keep the database out of a submit_order, recording what it persists."""
+    persisted: list[tuple[str, str]] = adapter.persisted_order_ids
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda _signal: (str(signal.id), True)
+    )
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted.append((sid, oid)) or True,
+    )
+
+
+def test_ctrader_buy_cannot_use_exit_only_mode_to_bypass_entry_guards(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A BUY labelled exit-only is refused as an entry, never sent as a close."""
+    from live_runner import ctrader_adapter as module
+
+    adapter = _make_submit_adapter(tmp_path)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        # What the daemon stamps on a sized exit-only order, but on the wrong
+        # side: a broker position id is present, so nothing but the action
+        # check stands between this buy and a position close.
+        metadata={"qty": 3.0, "risk_sizing_mode": "exit_only", "position_id": 77},
+    )
+    _offline_signal_persistence(monkeypatch, module, adapter, signal)
+
+    # No SL/TP: an entry without them is refused by the new-order path, which
+    # is exactly the guard the close path would have skipped.
+    with pytest.raises(ValueError, match="without stop_loss"):
+        asyncio.run(adapter.submit_order(signal, qty=3.0))
+
+    assert adapter.close_requests == [], (
+        "a buy must never be routed to the position-close request; that would "
+        "liquidate a position instead of opening one"
+    )
+    assert adapter.new_order_requests == [], "nothing may reach the broker"
+    assert adapter.persisted_order_ids == [], "no broker order id to persist"
+
+
+def test_ctrader_sell_with_exit_only_mode_still_closes_the_position(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The control for the guard above: a sell may take the close path.
+
+    Without this, "never close" would satisfy the buy test while silently
+    disabling exit-only exits altogether.
+    """
+    from live_runner import ctrader_adapter as module
+
+    adapter = _make_submit_adapter(tmp_path)
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 3.0, "risk_sizing_mode": "exit_only", "position_id": 77},
+    )
+    _offline_signal_persistence(monkeypatch, module, adapter, signal)
+
+    assert asyncio.run(adapter.submit_order(signal, qty=3.0)) == "555"
+
+    assert [request.positionId for request in adapter.close_requests] == [77]
+    assert adapter.new_order_requests == []
+    assert adapter.persisted_order_ids == [(str(signal.id), "555")]
+
+
+# ─── int64 ids: a shape the wire cannot carry must be skipped ────────────────
+#
+# `orderId`/`positionId` are protobuf int64. The string form cannot be assigned
+# (TypeError on the wire) and the coerced comparison is what keeps the loop
+# going: a single unusable id must not abort the loop and leave every other
+# order resting or position open.
+
+
+class _ListedOrder:
+    """A reconcile order row whose id is not a protobuf int64 value.
+
+    A real ProtoOAOrder cannot hold a string in an int64 field, so this shape is
+    only representable off the wire; the cancel *request* stays the real
+    protobuf type, so a leaked string still raises TypeError on assignment.
+    """
+
+    def __init__(self, order_id: Any, *, order_type: int, order_status: int) -> None:
+        self.orderId = order_id
+        self.orderType = order_type
+        self.orderStatus = order_status
+
+
+class _ReconcileListing:
+    """A reconcile response carrying off-wire order rows.
+
+    `cancel_open_orders` only needs `isinstance(response, _ProtoOAReconcileRes)`
+    plus the repeated `order` rows, so this stand-in keeps the id shapes a
+    protobuf message cannot represent.
+    """
+
+    def __init__(self, orders: list[Any]) -> None:
+        self.order = list(orders)
+
+
+def _make_listing_cancel_adapter(tmp_path: Path, orders: list[Any]):
+    """Cancel adapter answering with an off-wire order listing.
+
+    Unlike `_make_cancel_adapter`, the recorded ids are stored exactly as the
+    adapter produced them: a leaked string must show up as a string, not be
+    coerced away by the recorder.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOACancelOrderReq,
+        ProtoOAReconcileReq,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAReconcileReq = ProtoOAReconcileReq
+    adapter._ProtoOAReconcileRes = _ReconcileListing
+    adapter._ProtoOACancelOrderReq = ProtoOACancelOrderReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+
+    response = _ReconcileListing(orders)
+    cancelled: list[Any] = []
+
+    async def _fake_send(request, **_kwargs):
+        if isinstance(request, ProtoOAReconcileReq):
+            return response
+        if isinstance(request, ProtoOACancelOrderReq):
+            cancelled.append(request.orderId)
+            return ProtoOACancelOrderReq()
+        raise AssertionError(f"unexpected request {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    adapter.cancelled_ids = cancelled
+    return adapter
+
+
+def _listed_order(order_id: Any, order_type: int | None = None) -> "_ListedOrder":
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    return _ListedOrder(
+        order_id,
+        order_type=ProtoOAOrderType.LIMIT if order_type is None else order_type,
+        order_status=ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+    )
+
+
+def test_cancel_open_orders_skips_an_order_whose_id_is_not_an_int(tmp_path: Path):
+    """An id the wire cannot carry is skipped, not raised.
+
+    The cancel request assigns `orderId` outside any error handling, so a
+    string reaching it raises TypeError out of the whole call and every other
+    order stays resting after an operator asked to stop.
+    """
+    adapter = _make_listing_cancel_adapter(tmp_path, [_listed_order("order-abc")])
+
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [], (
+        f"an unusable id must not be sent, got {adapter.cancelled_ids!r}"
+    )
+    assert count == 0
+
+
+def test_cancel_open_orders_keeps_cancelling_after_an_unusable_id(tmp_path: Path):
+    """A skipped order must not abort the loop over the orders behind it."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    orders = [
+        _listed_order("order-abc"),
+        _listed_order(55),
+        _listed_order(66, ProtoOAOrderType.STOP),
+    ]
+    adapter = _make_listing_cancel_adapter(tmp_path, orders)
+
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [55, 66], (
+        "the working orders must still be cancelled, got "
+        f"{adapter.cancelled_ids!r}"
+    )
+    assert count == 2
+
+
+def test_flatten_skips_a_position_whose_id_is_not_an_int():
+    """An unparseable positionId is skipped instead of aborting the flatten.
+
+    Without the coercion the loop raises out of `close_all_positions` and the
+    remaining positions stay open.
+    """
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [
+        SimpleNamespace(
+            positionId="position-abc",
+            tradeData=SimpleNamespace(volume=1000),
+        )
+    ]
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+
+    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert adapter.sent == []
+
+
+def test_flatten_skips_a_string_zero_position_id():
+    """"0" is not a position: cTrader rejects it instead of closing anything."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [
+        SimpleNamespace(positionId="0", tradeData=SimpleNamespace(volume=1000))
+    ]
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+
+    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert adapter.sent == []
+
+
+def test_flatten_closes_the_other_positions_after_an_unusable_id():
+    """A skipped position must not abort the loop over the positions behind it."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [
+        SimpleNamespace(
+            positionId="position-abc",
+            tradeData=SimpleNamespace(volume=1000),
+        ),
+        _real_position(201, 1000),
+        _real_position(202, 2000),
+    ]
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+
+    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 2
+    assert [request.positionId for request in adapter.sent] == [201, 202]

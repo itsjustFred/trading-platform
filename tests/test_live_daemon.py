@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -1787,3 +1789,182 @@ def test_stopped_deployment_refuses_to_flatten_an_account_with_a_paused_sibling(
     asyncio.run(_run())
     assert adapter.flatten_calls == 0, "must not flatten a paused sibling's positions"
     assert enforced == set(), "the stop stays un-enforced and is retried"
+
+
+# ─── The demo-only gate itself ────────────────────────────────────────────────
+#
+# `_deployment_account_is_demo` is the last thing standing between a parsed
+# Discord signal and a real order on a live-money account, and the fixture above
+# stubs it out for every other test in this file. So the gate body itself needs
+# its own tests: an unverified account must be refused, loudly, every time.
+
+# Captured at import time, before the autouse fixture replaces the module
+# attribute: the tests below must exercise the real gate, not the stub.
+_REAL_DEPLOYMENT_ACCOUNT_IS_DEMO = daemon._deployment_account_is_demo
+
+_DAEMON_LOGGER = logging.getLogger("trading.live-runner")
+
+
+@contextmanager
+def _daemon_log_records(*, level: int = logging.ERROR):
+    """Collect records emitted by the daemon logger.
+
+    `shared.logging.get_logger` sets `propagate = False`, so caplog (which
+    hooks the root logger) only sees these records once some earlier test has
+    happened to attach a handler to this logger. Attach our own for the
+    duration of the block, as the Discord ingestion tests do, so the assertion
+    cannot depend on test ordering.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.levelno >= level:
+                records.append(record)
+
+    handler = _Capture(level=level)
+    _DAEMON_LOGGER.addHandler(handler)
+    try:
+        yield records
+    finally:
+        _DAEMON_LOGGER.removeHandler(handler)
+
+
+def _live_account(*, is_demo: bool) -> LiveAccountConfig:
+    return LiveAccountConfig(
+        id="acc-live", broker="ctrader", name="Live", is_demo=is_demo
+    )
+
+
+def _raise_account_lookup(_account_id: str) -> LiveAccountConfig:
+    raise RuntimeError("database is unreachable")
+
+
+@pytest.mark.parametrize(
+    ("account_lookup", "expected_message"),
+    [
+        pytest.param(
+            lambda _account_id: None,
+            "missing or not verified demo",
+            id="account-row-missing",
+        ),
+        pytest.param(
+            lambda _account_id: _live_account(is_demo=False),
+            "missing or not verified demo",
+            id="account-is-not-demo",
+        ),
+        pytest.param(
+            _raise_account_lookup,
+            "verification failed",
+            id="account-lookup-raises",
+        ),
+    ],
+)
+def test_demo_gate_refuses_anything_it_cannot_verify_as_demo(
+    monkeypatch, account_lookup, expected_message
+) -> None:
+    """Every unverifiable account is refused, and every refusal is logged.
+
+    "I could not check" is not "it is fine": a missing row, an account the
+    operator never marked as demo, and a database error all have to fail
+    closed, otherwise a real order routes to a live-money account.
+    """
+    looked_up: list[str] = []
+
+    def _get_live_account(account_id: str) -> LiveAccountConfig:
+        looked_up.append(account_id)
+        return account_lookup(account_id)
+
+    monkeypatch.setattr(daemon, "get_live_account", _get_live_account)
+
+    with _daemon_log_records() as records:
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is False
+
+    assert looked_up == ["acc-live"], "the verdict must come from the stored row"
+    assert records, "a refused dispatch must be logged, not silently dropped"
+    assert any(expected_message in record.getMessage() for record in records)
+    named = [getattr(record, "data", {}).get("account_id") for record in records]
+    assert named == ["acc-live"], f"every refusal must name the account, got {named}"
+
+
+def test_demo_gate_allows_a_verified_demo_account(monkeypatch) -> None:
+    """The control for the refusals: a verified demo account still trades.
+
+    Without this, a gate hard-wired to refuse everything would pass them.
+    """
+    monkeypatch.setattr(daemon, "get_live_account", lambda _id: _live_account(is_demo=True))
+
+    with _daemon_log_records() as records:
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is True
+
+    assert records == [], f"a verified demo account must not log an error: {records}"
+
+
+def test_submission_path_runs_the_real_demo_gate_and_refuses_a_live_account(
+    monkeypatch,
+) -> None:
+    """End to end: the real gate, a live-money row, and no broker call.
+
+    The other submission tests here stub the gate out, so the wiring between
+    `_deployment_account_is_demo` and `_submit_normalized_discord_signal` is
+    only pinned when the real one runs.
+    """
+    deployment = _deployment_with_signal_config({})
+    released: list[str] = []
+    submitted: list[object] = []
+
+    class _NoSubmitAdapter:
+        async def get_positions(self):
+            raise AssertionError("must not be reached")
+
+        async def get_balance(self):
+            raise AssertionError("must not be reached")
+
+    from risk import TradeSignal
+
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=1.0,
+        take_profit=1.2,
+        timeframe="15m",
+        # `signal_is_fresh` is fail-closed on a missing `received_at`, and the
+        # real Discord dispatch path always stamps one at receipt. Without it
+        # this fixture is discarded as stale before any gate below runs.
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+    # The real gate, not the autouse stub.
+    monkeypatch.setattr(
+        daemon, "_deployment_account_is_demo", _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO
+    )
+    monkeypatch.setattr(
+        daemon, "get_live_account", lambda account_id: _live_account(is_demo=False)
+    )
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda token: released.append(token)
+    )
+
+    async def _record_submit(_adapter, _deployment_arg, live_signal):
+        submitted.append(live_signal)
+
+    monkeypatch.setattr(daemon, "submit_order_with_risk", _record_submit)
+
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            "acc-1",
+            _NoSubmitAdapter(),
+            deployment,
+            trade_signal,
+            signal_timeframe="15m",
+            wait_enabled=False,
+        )
+    )
+
+    assert submitted == [], "a live-money account must never reach the broker"
+    assert released == [], (
+        "the refusal happens before the submission claim is taken, so nothing "
+        f"is released: {released}"
+    )
