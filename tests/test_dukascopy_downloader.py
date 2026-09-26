@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import types
@@ -96,6 +97,151 @@ def test_native_downloader_accepts_control_events_and_reports_progress(
     assert any(pct == 0.0 for pct, _ in progress_updates)
     assert any("Halfway there" in msg for _, msg in progress_updates)
     assert progress_updates[-1][0] == 100.0
+
+
+def _tick_request_and_options(native, *, offer_side: str = "bid", price_type: str = "bid"):
+    from datetime import datetime, timezone
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    request = native._TickRequest(
+        instrument="EURUSD",
+        sym="EURUSD",
+        normalized_tf="tick",
+        price_type=price_type,
+        offer_side=offer_side,
+        decimal_factor=1000,
+        start_dt=start,
+        end_dt=start,
+        requested_start="2024-01-01",
+        requested_end="2024-01-01",
+    )
+    options = native._TickDownloadOptions(
+        batch_size=4,
+        pipeline_batches=2,
+        pause_ms=7,
+        max_retries=6,
+        stop_event=None,
+        pause_event=None,
+        report_progress=None,
+        log_callback=None,
+    )
+    return request, options
+
+
+def test_tick_strategy_helpers_bind_download_bi5_arguments_once(monkeypatch):
+    """The single-side tick helper must bind download_bi5_files' args once.
+
+    ``batch_size`` and ``max_retries`` are positional-or-keyword, so passing
+    them positionally *and* by keyword raises TypeError at download time.
+    """
+    import data_tools.downloaders.dukascopy_native as native
+
+    monkeypatch.setattr(
+        native,
+        "generate_tick_urls",
+        lambda instrument, start_dt, end_dt, price_type="both": [],
+    )
+
+    seen: dict[str, object] = {}
+
+    # Signature mirrors the real download_bi5_files so a duplicated argument
+    # raises TypeError here exactly as it would in production.
+    async def fake_download_bi5_files(
+        urls,
+        batch_size=10,
+        max_retries=3,
+        *,
+        pipeline_batches=1,
+        pause_ms=1000,
+        report_progress=None,
+        progress_unit="files",
+        stop_event=None,
+        pause_event=None,
+        log_callback=None,
+    ):
+        seen["batch_size"] = batch_size
+        seen["max_retries"] = max_retries
+        seen["pipeline_batches"] = pipeline_batches
+        seen["pause_ms"] = pause_ms
+        return []
+
+    monkeypatch.setattr(native, "download_bi5_files", fake_download_bi5_files)
+
+    request, options = _tick_request_and_options(native)
+    downloader = native.DukascopyNativeDownloader()
+    df, warnings = asyncio.run(
+        downloader._download_single_side_ticks(request=request, options=options)
+    )
+
+    assert df.empty
+    assert warnings == ["offer_side:bid", "price_type:bid"]
+    assert seen == {
+        "batch_size": 4,
+        "max_retries": 6,
+        "pipeline_batches": 2,
+        "pause_ms": 7,
+    }
+
+
+def test_merged_tick_strategy_helper_forwards_every_option(monkeypatch):
+    """The merged tick helper must forward its options as keywords.
+
+    ``_download_and_assemble_merged_ticks`` declares pipeline_batches,
+    pause_ms and max_retries keyword-only; passing them positionally raises
+    TypeError the moment a merged tick download runs (DV-C1).
+    """
+    import data_tools.downloaders.dukascopy_native as native
+
+    seen: dict[str, object] = {}
+
+    async def fake_merged(
+        instrument,
+        start_dt,
+        end_dt,
+        batch_size,
+        *,
+        pipeline_batches=1,
+        pause_ms=1000,
+        max_retries=3,
+        report_progress=None,
+        stop_event=None,
+        pause_event=None,
+        log_callback=None,
+    ):
+        seen["batch_size"] = batch_size
+        seen["pipeline_batches"] = pipeline_batches
+        seen["pause_ms"] = pause_ms
+        seen["max_retries"] = max_retries
+        seen["report_progress"] = report_progress
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True),
+                "bid": [1.10],
+                "ask": [1.12],
+                "bid_vol": [1.0],
+                "ask_vol": [2.0],
+            }
+        )
+
+    monkeypatch.setattr(native, "_download_and_assemble_merged_ticks", fake_merged)
+
+    request, options = _tick_request_and_options(native, offer_side="both", price_type="both")
+    downloader = native.DukascopyNativeDownloader()
+    df, warnings = asyncio.run(
+        downloader._download_tick_strategy(
+            request=request, options=options, merge_bid_ask=True
+        )
+    )
+
+    assert len(df) == 1
+    assert warnings == ["offer_side:both", "price_type:bid+ask"]
+    assert seen == {
+        "batch_size": 4,
+        "pipeline_batches": 2,
+        "pause_ms": 7,
+        "max_retries": 6,
+        "report_progress": None,
+    }
 
 
 def test_download_bi5_files_batches_and_increases_pause_on_throttle(monkeypatch):

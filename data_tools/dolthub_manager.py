@@ -85,6 +85,15 @@ def run_dolt(
         ) from exc
 
 
+def build_distinct_symbol_select(table_name: str) -> str:
+    """Build the distinct-symbol query without raw interpolation (DV-B27).
+
+    The table name goes through :func:`shared.sql.quote_identifier`, which
+    raises ``ValueError`` on an empty or otherwise unusable identifier.
+    """
+    return f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}"
+
+
 def build_symbol_select(table_name: str, symbol: str) -> str:
     """Build the distinct-symbol query without raw interpolation (DV-B27).
 
@@ -214,12 +223,15 @@ def _export_stocks() -> None:
 
 
 def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
-    result = subprocess.run(
-        ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
-        cwd=stocks_repo,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = run_dolt(
+            ["dolt", "sql", "-q", build_distinct_symbol_select(table_name), "-r", "csv"],
+            cwd=stocks_repo,
+            capture=True,
+        )
+    except (subprocess.CalledProcessError, DoltTimeoutError, ValueError) as exc:
+        logger.exception("Failed to list symbols in %s: %s", stocks_repo, exc)
+        return []
     lines = result.stdout.strip().split("\n")[1:]  # skip header
     return [l.strip() for l in lines if l.strip()]
 
@@ -237,12 +249,12 @@ def _export_symbol_csv(
         out_parquet.parent.mkdir(parents=True, exist_ok=True)
         sym_csv = target_dir / f"{symbol}.csv"
         with open(sym_csv, "w") as f:
-            subprocess.check_call(
+            run_dolt(
                 [
                     "dolt",
                     "sql",
                     "-q",
-                    f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                    build_ohlcv_select(table_name, symbol),
                     "-r",
                     "csv",
                 ],
@@ -309,7 +321,7 @@ def export_data():
 
             # Get symbols
             result = run_dolt(
-                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}", "-r", "csv"],
+                ["dolt", "sql", "-q", build_distinct_symbol_select(table_name), "-r", "csv"],
                 cwd=stocks_repo,
                 capture=True,
             )
