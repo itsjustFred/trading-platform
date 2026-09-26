@@ -1,5 +1,7 @@
 import { useState, useMemo } from "react";
 
+import { stringifyUnknownValue } from "../lib/unknownValue";
+
 interface Column<T> {
   key: string;
   label: string;
@@ -16,7 +18,7 @@ interface DataTableProps<T> {
   maxHeight?: string;
 }
 
-export function DataTable<T extends Record<string, any>>({
+export function DataTable<T extends Record<string, unknown>>({
   columns,
   data,
   onRowClick,
@@ -32,8 +34,8 @@ export function DataTable<T extends Record<string, any>>({
       const bv = b[sortKey];
       if (av == null || bv == null) return 0;
       const cmp =
-        typeof av === "number"
-          ? av - (bv as number)
+        typeof av === "number" && typeof bv === "number"
+          ? av - bv
           : String(av).localeCompare(String(bv));
       return sortDir === "asc" ? cmp : -cmp;
     });
@@ -85,7 +87,7 @@ export function DataTable<T extends Record<string, any>>({
                   color: "var(--color-text-muted)",
                   fontWeight: 600,
                   padding: "8px 6px",
-                  textAlign: (col.align || "center") as any,
+                  textAlign: col.align || "center",
                   borderBottom: "2px solid var(--color-border)",
                   cursor: "pointer",
                   userSelect: "none",
@@ -121,12 +123,14 @@ export function DataTable<T extends Record<string, any>>({
                   key={col.key}
                   style={{
                     padding: "6px 6px",
-                    textAlign: (col.align || "center") as any,
+                    textAlign: col.align || "center",
                     borderBottom: "1px solid var(--color-border)",
                     whiteSpace: "nowrap",
                   }}
                 >
-                  {col.render ? col.render(row) : row[col.key]}
+                  {col.render
+                    ? col.render(row)
+                    : stringifyUnknownValue(row[col.key], "\u2014")}
                 </td>
               ))}
             </tr>

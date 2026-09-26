@@ -1,43 +1,11 @@
-import { useEffect, useState } from "react";
-import type { CSSProperties, ReactElement } from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  Loader2,
-  RefreshCw,
-  RotateCcw,
-  XCircle,
-} from "lucide-react";
+import { useState } from "react";
+import type { CSSProperties } from "react";
+import { ArrowRight, RefreshCw, RotateCcw } from "lucide-react";
 
 import { resampleData } from "../api/client";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
-
-const STATUS_ICON_COLORS = {
-  ok: "#86efac",
-  failed: "#fda4af",
-  running: "#67e8f9",
-} as const;
-
-/** Shared task-status glyph used by the data-task modals. */
-export function renderTaskStatusIcon(
-  status: string | null | undefined,
-  size = 18,
-): ReactElement {
-  if (status === "completed") {
-    return <CheckCircle2 size={size} color={STATUS_ICON_COLORS.ok} />;
-  }
-  if (status === "failed") {
-    return <XCircle size={size} color={STATUS_ICON_COLORS.failed} />;
-  }
-  return (
-    <Loader2
-      size={size}
-      className="animate-spin"
-      color={STATUS_ICON_COLORS.running}
-    />
-  );
-}
+import { renderTaskStatusIcon } from "./taskStatusIcon";
 
 interface ResampleModalProps {
   open: boolean;
@@ -63,29 +31,37 @@ export function ResampleModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  const [completionNotified, setCompletionNotified] = useState(false);
+  // Job whose terminal status has already been reported upstream.
+  const [notifiedJobId, setNotifiedJobId] = useState<string | null>(null);
+  const [wasOpen, setWasOpen] = useState(open);
 
-  useEffect(() => {
-    if (!open) {
-      return;
+  // Reopening starts a fresh form; adjusting during render beats a
+  // setState-in-effect cascade.
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) {
+      setSourcePath(defaultSourcePath);
+      setTargetTimeframes(defaultTargetTimeframes);
+      setError("");
+      setJobId(null);
+      setJobStatus("idle");
+      setNotifiedJobId(null);
     }
-    setSourcePath(defaultSourcePath);
-    setTargetTimeframes(defaultTargetTimeframes);
-    setError("");
-    setJobId(null);
-    setJobStatus("idle");
-    setCompletionNotified(false);
-  }, [defaultSourcePath, defaultTargetTimeframes, open]);
+  }
 
-  useEffect(() => {
-    if (!jobId || completionNotified) {
-      return;
+  // The task feed reports each status transition once, so the terminal status is
+  // forwarded from the callback rather than mirrored by an effect.
+  const handleStatusChange = (status: string) => {
+    setJobStatus(status);
+    if (
+      (status === "completed" || status === "failed") &&
+      jobId &&
+      notifiedJobId !== jobId
+    ) {
+      setNotifiedJobId(jobId);
+      onTaskFinished?.(status, jobId);
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
-      setCompletionNotified(true);
-    }
-  }, [completionNotified, jobId, jobStatus, onTaskFinished]);
+  };
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
@@ -99,7 +75,7 @@ export function ResampleModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setCompletionNotified(false);
+    setNotifiedJobId(null);
     setError("");
   };
 
@@ -117,10 +93,14 @@ export function ResampleModal({
       });
       setJobId(res.task_id);
       setJobStatus(res.status || "starting");
-      setCompletionNotified(false);
+      setNotifiedJobId(null);
       onTaskStarted?.(res.task_id);
-    } catch (err: any) {
-      setError(err.message || "Failed to start resample task.");
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start resample task.",
+      );
     }
   };
 
@@ -331,7 +311,7 @@ export function ResampleModal({
               </div>
             </div>
 
-            <LiveTerminal jobId={jobId} onStatusChange={setJobStatus} />
+            <LiveTerminal jobId={jobId} onStatusChange={handleStatusChange} />
 
             <div
               style={{

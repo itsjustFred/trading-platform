@@ -27,7 +27,7 @@ import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { Sparkline } from "../components/Sparkline";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 
 type SortField =
   | "created_at"
@@ -759,8 +759,10 @@ export function BacktestsPage() {
   }, [nameFilter]);
 
   useEffect(() => {
+    // `debouncedNameFilter` reaches the loader through its useCallback deps;
+    // it is listed here as well so the dependency is self-evident.
     void loadAllMetadata(debouncedNameFilter.trim().length === 0);
-  }, [loadAllMetadata]);
+  }, [loadAllMetadata, debouncedNameFilter]);
 
   const allStrategies = useMemo(
     () =>

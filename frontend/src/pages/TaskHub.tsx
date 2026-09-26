@@ -18,7 +18,7 @@ import {
   resumeDataTask,
 } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 
 const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
 const FINAL_STATUSES = new Set([
@@ -227,8 +227,13 @@ export function TaskHubPage() {
         current.map((task) => (task.id === updated.id ? updated : task)),
       );
       showToast(success, "info");
-    } catch (error: any) {
-      showToast(error.message || "Task action failed.", "error");
+    } catch (error: unknown) {
+      showToast(
+        error instanceof Error && error.message
+          ? error.message
+          : "Task action failed.",
+        "error",
+      );
     } finally {
       setBusy((current) => ({ ...current, [taskId]: false }));
     }

@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { CSSProperties } from "react";
 import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 
 import { harvestData } from "../api/client";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
-import { renderTaskStatusIcon } from "./ResampleModal";
+import { renderTaskStatusIcon } from "./taskStatusIcon";
 
 interface SmartHarvestModalProps {
   open: boolean;
@@ -35,31 +35,39 @@ export function SmartHarvestModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  const [completionNotified, setCompletionNotified] = useState(false);
+  // Job whose terminal status has already been reported upstream.
+  const [notifiedJobId, setNotifiedJobId] = useState<string | null>(null);
+  const [wasOpen, setWasOpen] = useState(open);
 
-  useEffect(() => {
-    if (!open) {
-      return;
+  // Reopening starts a fresh form; adjusting during render beats a
+  // setState-in-effect cascade.
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) {
+      setSource(defaultSource || "dukascopy");
+      setSymbol(defaultSymbol);
+      setAssetClass(defaultAssetClass);
+      setStartDate(defaultStartDate);
+      setError("");
+      setJobId(null);
+      setJobStatus("idle");
+      setNotifiedJobId(null);
     }
-    setSource(defaultSource || "dukascopy");
-    setSymbol(defaultSymbol);
-    setAssetClass(defaultAssetClass);
-    setStartDate(defaultStartDate);
-    setError("");
-    setJobId(null);
-    setJobStatus("idle");
-    setCompletionNotified(false);
-  }, [defaultAssetClass, defaultSource, defaultStartDate, defaultSymbol, open]);
+  }
 
-  useEffect(() => {
-    if (!jobId || completionNotified) {
-      return;
+  // The task feed reports each status transition once, so the terminal status is
+  // forwarded from the callback rather than mirrored by an effect.
+  const handleStatusChange = (status: string) => {
+    setJobStatus(status);
+    if (
+      (status === "completed" || status === "failed") &&
+      jobId &&
+      notifiedJobId !== jobId
+    ) {
+      setNotifiedJobId(jobId);
+      onTaskFinished?.(status, jobId);
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
-      setCompletionNotified(true);
-    }
-  }, [completionNotified, jobId, jobStatus, onTaskFinished]);
+  };
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
@@ -73,7 +81,7 @@ export function SmartHarvestModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setCompletionNotified(false);
+    setNotifiedJobId(null);
     setError("");
   };
 
@@ -95,10 +103,14 @@ export function SmartHarvestModal({
       });
       setJobId(res.task_id);
       setJobStatus(res.status || "starting");
-      setCompletionNotified(false);
+      setNotifiedJobId(null);
       onTaskStarted?.(res.task_id);
-    } catch (err: any) {
-      setError(err.message || "Failed to start Smart Harvest task.");
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start Smart Harvest task.",
+      );
     }
   };
 
@@ -354,7 +366,7 @@ export function SmartHarvestModal({
               </div>
             </div>
 
-            <LiveTerminal jobId={jobId} onStatusChange={setJobStatus} />
+            <LiveTerminal jobId={jobId} onStatusChange={handleStatusChange} />
 
             <div
               style={{

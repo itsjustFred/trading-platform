@@ -40,12 +40,10 @@ async function main() {
   shots.push(await snap(page, "/portfolios", "portfolios-overview.png"));
 
   await browser.close();
-  // eslint-disable-next-line no-console
   console.log(JSON.stringify({ baseUrl, shots }, null, 2));
 }
 
 main().catch((err) => {
-  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });

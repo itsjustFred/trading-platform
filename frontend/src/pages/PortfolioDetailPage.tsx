@@ -35,7 +35,7 @@ import {
 import { RenameModal } from "../components/RenameModal";
 import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
@@ -967,6 +967,8 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const [tooltip, setTooltip] = useState<ChartTooltip | null>(null);
+  // Chart container width, tracked by the chart's ResizeObserver.
+  const [containerWidth, setContainerWidth] = useState(0);
 
   useEffect(() => {
     if (!containerRef.current || !data.length) return;
@@ -1090,7 +1092,11 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
 
     chart.timeScale().fitContent();
     const resizeObserver = new ResizeObserver(() => {
-      if (container.clientWidth > 0) chart.resize(container.clientWidth, 340);
+      if (container.clientWidth > 0) {
+        chart.resize(container.clientWidth, 340);
+        // Tracked in state so the tooltip can be placed during render.
+        setContainerWidth(container.clientWidth);
+      }
     });
     resizeObserver.observe(container);
 
@@ -1108,10 +1114,7 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
         <div
           style={{
             position: "absolute",
-            left: Math.min(
-              tooltip.x + 16,
-              (containerRef.current?.clientWidth || 800) - 180,
-            ),
+            left: Math.min(tooltip.x + 16, (containerWidth || 800) - 180),
             top: Math.max(tooltip.y - 80, 4),
             background: "rgba(22,27,34,0.95)",
             border: "1px solid var(--color-border)",

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { getLogContent, getLogs } from "../api/client";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 import { stringifyUnknownValue } from "../lib/unknownValue";

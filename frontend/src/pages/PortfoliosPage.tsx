@@ -23,7 +23,7 @@ import {
 import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 let componentIdCounter = 0;

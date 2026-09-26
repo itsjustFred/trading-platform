@@ -8,7 +8,7 @@ import {
 } from "../api/queries";
 import type { Service, ServiceStatus } from "../api/types";
 import { Modal } from "../components/Modal";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 
 function relativeTime(value?: string | null): string {
@@ -60,7 +60,7 @@ export function ServicesPage() {
     enabled: Boolean(logsService?.id),
   });
 
-  const services = servicesQuery.data ?? [];
+  const services = useMemo(() => servicesQuery.data ?? [], [servicesQuery.data]);
   const summary = useMemo(
     () => ({
       running: services.filter((service) => service.status === "running")

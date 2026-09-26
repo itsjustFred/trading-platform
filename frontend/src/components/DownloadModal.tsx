@@ -6,8 +6,8 @@ import { downloadData, getDukascopyGenesis } from "../api/client";
 import type { DukascopyGenesisResponse } from "../api/types";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
-import { renderTaskStatusIcon } from "./ResampleModal";
-import { useToast } from "./ToastProvider";
+import { renderTaskStatusIcon } from "./taskStatusIcon";
+import { useToast } from "./toastContext";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 const TIMEFRAME_OPTIONS = [
@@ -94,6 +94,15 @@ function normalizeGenesisTimeframe(timeframe: string): string {
 }
 
 type DukascopyCoverageMap = DukascopyGenesisResponse["coverage"];
+
+const EMPTY_COVERAGE: DukascopyCoverageMap = {};
+
+interface CoverageResult {
+  key: string;
+  coverage: DukascopyCoverageMap;
+  loaded: boolean;
+  error: string;
+}
 
 interface DukascopyTimeframeCoverageRow {
   timeframe: string;
@@ -763,6 +772,7 @@ export function DownloadModal({
     [defaultTimeframes],
   );
   const [source, setSource] = useState(defaultSource);
+  const [wasOpen, setWasOpen] = useState(open);
   const [symbols, setSymbols] = useState(defaultSymbols);
   const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>(
     normalizedDefaultTimeframes,
@@ -778,11 +788,12 @@ export function DownloadModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  const [completionNotified, setCompletionNotified] = useState(false);
-  const [dukascopyCoverage, setDukascopyCoverage] =
-    useState<DukascopyCoverageMap>({});
-  const [dukascopyCoverageLoaded, setDukascopyCoverageLoaded] = useState(false);
-  const [dukascopyCoverageError, setDukascopyCoverageError] = useState("");
+  // Job whose terminal status has already been reported upstream.
+  const [notifiedJobId, setNotifiedJobId] = useState<string | null>(null);
+  // Coverage is stored per request key and read through the current key, so a
+  // changed request drops the stale map without a state write in an effect.
+  const [coverageResult, setCoverageResult] =
+    useState<CoverageResult | null>(null);
 
   const isDukascopy = source === "dukascopy";
   const isJForex = source === "jforex";
@@ -794,7 +805,6 @@ export function DownloadModal({
         ? "EURUSD, XAUUSD, US500"
         : "AAPL, MSFT";
   const isStreaming = jobId !== null;
-  const defaultTimeframesKey = normalizedDefaultTimeframes.join("|");
   const parsedSymbols = useMemo(
     () =>
       symbols
@@ -817,6 +827,16 @@ export function DownloadModal({
     return ordered;
   }, [selectedTimeframes]);
   const debouncedCoverageSymbols = useDebouncedValue(parsedSymbols, COVERAGE_DEBOUNCE_MS);
+  const coverageRequestKey =
+    open && isDukascopy && !isStreaming && parsedSymbols.length > 0 && requestedTimeframes.length > 0
+      ? `${debouncedCoverageSymbols.join(",")}|${requestedTimeframes.join(",")}`
+      : null;
+  const coverageMatches = coverageResult !== null && coverageResult.key === coverageRequestKey;
+  const dukascopyCoverage: DukascopyCoverageMap = coverageMatches
+    ? coverageResult.coverage
+    : EMPTY_COVERAGE;
+  const dukascopyCoverageLoaded = coverageMatches && coverageResult.loaded;
+  const dukascopyCoverageError = coverageMatches ? coverageResult.error : "";
 
   const dukascopyMinStart = useMemo(() => {
     if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
@@ -893,89 +913,76 @@ export function DownloadModal({
     });
   }, [dukascopyCoverage, isDukascopy, parsedSymbols, requestedTimeframes]);
 
-  useEffect(() => {
-    if (!open) {
-      return;
+  // Reopening starts a fresh form; adjusting during render beats a
+  // setState-in-effect cascade.
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) {
+      setSource(defaultSource);
+      setSymbols(defaultSymbols);
+      setSelectedTimeframes(normalizedDefaultTimeframes);
+      setStartDate("");
+      setEndDate("");
+      setPriceType("bid");
+      setMergeTick(false);
+      setMergeS1(false);
+      setShowAdvancedSettings(false);
+      setBatchSize(10);
+      setPauseMs(1000);
+      setError("");
+      setJobId(null);
+      setJobStatus("idle");
+      setNotifiedJobId(null);
     }
-    setSource(defaultSource);
-    setSymbols(defaultSymbols);
-    setSelectedTimeframes(normalizedDefaultTimeframes);
-    setStartDate("");
-    setEndDate("");
-    setPriceType("bid");
-    setMergeTick(false);
-    setMergeS1(false);
-    setShowAdvancedSettings(false);
-    setBatchSize(10);
-    setPauseMs(1000);
-    setError("");
-    setJobId(null);
-    setJobStatus("idle");
-    setCompletionNotified(false);
-    setDukascopyCoverage({});
-    setDukascopyCoverageLoaded(false);
-    setDukascopyCoverageError("");
-  }, [
-    defaultSource,
-    defaultSymbols,
-    defaultTimeframesKey,
-    normalizedDefaultTimeframes,
-    open,
-  ]);
+  }
 
   useEffect(() => {
-    if (!open || !isDukascopy || isStreaming) {
-      return;
-    }
-    if (debouncedCoverageSymbols.length === 0 || requestedTimeframes.length === 0) {
-      setDukascopyCoverage({});
-      setDukascopyCoverageLoaded(false);
-      setDukascopyCoverageError("");
+    if (coverageRequestKey === null) {
       return;
     }
 
     let cancelled = false;
-    setDukascopyCoverageLoaded(false);
-    setDukascopyCoverageError("");
     getDukascopyGenesis(debouncedCoverageSymbols, selectedTimeframes)
       .then((res) => {
         if (!cancelled) {
-          setDukascopyCoverage(res.coverage || {});
-          setDukascopyCoverageLoaded(true);
-          setDukascopyCoverageError("");
+          setCoverageResult({
+            key: coverageRequestKey,
+            coverage: res.coverage || {},
+            loaded: true,
+            error: "",
+          });
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setDukascopyCoverage({});
-          setDukascopyCoverageLoaded(true);
-          setDukascopyCoverageError(
-            "Could not load Dukascopy coverage right now. Start-date guardrails may be less strict.",
-          );
+          setCoverageResult({
+            key: coverageRequestKey,
+            coverage: EMPTY_COVERAGE,
+            loaded: true,
+            error:
+              "Could not load Dukascopy coverage right now. Start-date guardrails may be less strict.",
+          });
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [
-    debouncedCoverageSymbols,
-    isDukascopy,
-    isStreaming,
-    open,
-    requestedTimeframes,
-    selectedTimeframes,
-  ]);
+  }, [coverageRequestKey, debouncedCoverageSymbols, selectedTimeframes]);
 
-  useEffect(() => {
-    if (!jobId || completionNotified) {
-      return;
+  // The task feed reports each status transition once, so the terminal status is
+  // forwarded from the callback rather than mirrored by an effect.
+  const handleStatusChange = (status: string) => {
+    setJobStatus(status);
+    if (
+      (status === "completed" || status === "failed") &&
+      jobId &&
+      notifiedJobId !== jobId
+    ) {
+      setNotifiedJobId(jobId);
+      onTaskFinished?.(status, jobId);
     }
-    if (jobStatus === "completed" || jobStatus === "failed") {
-      onTaskFinished?.(jobStatus, jobId);
-      setCompletionNotified(true);
-    }
-  }, [completionNotified, jobId, jobStatus, onTaskFinished]);
+  };
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
@@ -998,7 +1005,7 @@ export function DownloadModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setCompletionNotified(false);
+    setNotifiedJobId(null);
     setError("");
   };
 
@@ -1335,7 +1342,7 @@ export function DownloadModal({
               </div>
             </div>
 
-            <LiveTerminal jobId={jobId} onStatusChange={setJobStatus} />
+            <LiveTerminal jobId={jobId} onStatusChange={handleStatusChange} />
 
             <div
               style={{

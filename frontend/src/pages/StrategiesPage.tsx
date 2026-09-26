@@ -116,7 +116,10 @@ export function StrategiesPage() {
   const [sortBy, setSortBy] = useState("name_asc");
 
   const strategiesQuery = useStrategies();
-  const strategies = strategiesQuery.data ?? [];
+  const strategies = useMemo(
+    () => strategiesQuery.data ?? [],
+    [strategiesQuery.data],
+  );
   const loading = strategiesQuery.isLoading;
   const [search, setSearch] = useState("");
   const types = useMemo(
@@ -124,7 +127,13 @@ export function StrategiesPage() {
     [strategies],
   );
   const sources = useMemo(
-    () => [...new Set(strategies.map((s) => s.tags?.source).filter(Boolean))],
+    () => [
+      ...new Set(
+        strategies
+          .map((s) => s.tags?.source)
+          .filter((source): source is string => Boolean(source)),
+      ),
+    ],
     [strategies],
   );
   const assetClasses = useMemo(
@@ -133,13 +142,17 @@ export function StrategiesPage() {
   );
   const complexities = useMemo(
     () => [
-      ...new Set(strategies.map((s) => s.tags?.complexity).filter(Boolean)),
+      ...new Set(
+        strategies
+          .map((s) => s.tags?.complexity)
+          .filter((complexity): complexity is string => Boolean(complexity)),
+      ),
     ],
     [strategies],
   );
 
   const filtered = useMemo(() => {
-    let result = strategies.filter((s) => {
+    const matches = strategies.filter((s) => {
       const q = search.toLowerCase();
       const matchSearch =
         !q ||
@@ -158,7 +171,7 @@ export function StrategiesPage() {
         matchSearch && matchType && matchSource && matchAsset && matchComplexity
       );
     });
-    result.sort((a, b) => {
+    matches.sort((a, b) => {
       switch (sortBy) {
         case "name_desc":
           return (b.name || "").localeCompare(a.name || "");
@@ -178,7 +191,7 @@ export function StrategiesPage() {
           return (a.name || "").localeCompare(b.name || "");
       }
     });
-    return result;
+    return matches;
   }, [strategies, search, filters, sortBy]);
 
   return (

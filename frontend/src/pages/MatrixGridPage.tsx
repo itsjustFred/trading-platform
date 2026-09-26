@@ -284,10 +284,9 @@ export function MatrixGridPage() {
   const [sortDir, setSortDir] = useState<SortDirection>("desc");
   const [page, setPage] = useState(1);
 
+  // Mount-only fetch: loading/error already start in this state.
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
     getMatrixGrid("all", 3)
       .then((data) => {
         if (!cancelled) setOverview(data);
@@ -304,9 +303,12 @@ export function MatrixGridPage() {
     };
   }, []);
 
-  const rows = overview?.rows ?? [];
-  const summaries = overview?.strategy_summaries ?? [];
-  const blocked = overview?.blocked_strategies ?? [];
+  const overviewRows = overview?.rows;
+  const overviewSummaries = overview?.strategy_summaries;
+  const overviewBlocked = overview?.blocked_strategies;
+  const rows = useMemo(() => overviewRows ?? [], [overviewRows]);
+  const summaries = useMemo(() => overviewSummaries ?? [], [overviewSummaries]);
+  const blocked = useMemo(() => overviewBlocked ?? [], [overviewBlocked]);
 
   const strategies = useMemo(
     () => uniqueSorted(rows.map((row) => row.strategy)),
@@ -328,27 +330,25 @@ export function MatrixGridPage() {
     [rows],
   );
 
-  useEffect(() => {
-    if (!selectedStrategy && strategies.length > 0) {
-      setSelectedStrategy(strategies[0]);
-    }
-  }, [selectedStrategy, strategies]);
+  // An unset filter falls back to the first strategy, so the default selection
+  // is derived instead of being written into state by an effect.
+  const effectiveStrategy = selectedStrategy || strategies[0] || "";
 
   const selectedStrategyRows = useMemo(
     () =>
-      selectedStrategy
-        ? rows.filter((row) => row.strategy === selectedStrategy)
+      effectiveStrategy
+        ? rows.filter((row) => row.strategy === effectiveStrategy)
         : rows,
-    [rows, selectedStrategy],
+    [rows, effectiveStrategy],
   );
   const selectedStrategySummary = summaries.find(
-    (summary) => summary.strategy === selectedStrategy,
+    (summary) => summary.strategy === effectiveStrategy,
   );
 
   const filteredRows = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return rows.filter((row) => {
-      if (selectedStrategy && row.strategy !== selectedStrategy) return false;
+      if (effectiveStrategy && row.strategy !== effectiveStrategy) return false;
       if (symbolFilter && row.symbol !== symbolFilter) return false;
       if (timeframeFilter && row.timeframe !== timeframeFilter) return false;
       if (statusFilter && row.status !== statusFilter) return false;
@@ -360,7 +360,7 @@ export function MatrixGridPage() {
   }, [
     rows,
     search,
-    selectedStrategy,
+    effectiveStrategy,
     symbolFilter,
     timeframeFilter,
     statusFilter,
@@ -387,12 +387,13 @@ export function MatrixGridPage() {
   }, [filteredRows, sortDir, sortKey]);
 
   const totalPages = Math.max(1, Math.ceil(sortedRows.length / PAGE_SIZE));
+  // Filters and reloads can shrink the result set under the current page, so the
+  // page is clamped while rendering instead of writing state mid-render.
+  const safePage = Math.min(Math.max(1, page), totalPages);
   const pagedRows = useMemo(() => {
-    const safePage = Math.min(page, totalPages);
-    if (safePage !== page) setPage(safePage);
     const start = (safePage - 1) * PAGE_SIZE;
     return sortedRows.slice(start, start + PAGE_SIZE);
-  }, [page, sortedRows, totalPages]);
+  }, [safePage, sortedRows]);
 
   const topSharpe = useMemo(
     () =>
@@ -452,7 +453,7 @@ export function MatrixGridPage() {
     },
     {
       label: "Ausgewählte Strategie",
-      value: selectedStrategy || "Alle",
+      value: effectiveStrategy || "Alle",
       hint: `${selectedStrategyRows.length} Combos`,
     },
     {
@@ -582,7 +583,7 @@ export function MatrixGridPage() {
               </div>
               {[
                 {
-                  value: selectedStrategy,
+                  value: effectiveStrategy,
                   onChange: setSelectedStrategy,
                   options: strategies,
                   label: "Strategie",
@@ -708,13 +709,13 @@ export function MatrixGridPage() {
               summaries={summaries}
               filteredRows={filteredRows}
               pagedRows={pagedRows}
-              page={page}
+              page={safePage}
               totalPages={totalPages}
               sortKey={sortKey}
               sortDir={sortDir}
               handleSort={handleSort}
               sortLabel={sortLabel}
-              onPageChange={(updater) => setPage((current) => updater(current))}
+              onPageChange={(updater) => setPage(updater(safePage))}
             />
           ) : null}
         </>

@@ -6,8 +6,8 @@ import {
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
-import { useToast } from "./ToastProvider";
-import { useStrategiesCache } from "./StrategiesProvider";
+import { useToast } from "./toastContext";
+import { useStrategiesCache } from "./strategiesContext";
 import { useStrategyDetail } from "../api/queries";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 

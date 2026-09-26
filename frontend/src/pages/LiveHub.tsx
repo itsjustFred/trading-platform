@@ -37,8 +37,8 @@ import type {
   Service,
   StrategyMeta,
 } from "../api/types";
-import { useToast } from "../components/ToastProvider";
-import { applyFillToPosition } from "./LiveDetail";
+import { useToast } from "../components/toastContext";
+import { applyFillToPosition } from "../lib/livePositionMath";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import { formatSignedUsd } from "../lib/statFormat";
 
