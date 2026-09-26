@@ -24,6 +24,29 @@ def is_unbounded_tp(metadata: object) -> bool:
     return str(metadata.get("take_profit_policy") or "") == UNBOUNDED_TP_POLICY
 
 
+def is_exit_only_metadata(metadata: object) -> bool:
+    """Whether metadata is system-stamped as an exit-only (flatten) order.
+
+    This is the SINGLE definition of the exit-only contract, deliberately
+    resting on the producer's stamp alone and never on ``signal.action``.
+
+    The close side is derived from the broker book by the daemon
+    (``daemon._exit_only_close_action``): closing a SHORT is a BUY. So an
+    action test inverts the meaning on exactly the orders that matter -- every
+    stop-loss and take-profit on a short would be refused while long exits
+    passed. The action is a consequence of the position side, not an input.
+
+    The dangerous case -- exit-only metadata with no broker position, which
+    would OPEN one -- is not this function's job. It is refused where the
+    position is resolved (daemon ``_metadata_for_exit_only_order``; cTrader
+    ``_position_id_for_exit``; Alpaca ``_require_exit_position``), so that the
+    refusal is broker-derived and observable.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+
+
 def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")

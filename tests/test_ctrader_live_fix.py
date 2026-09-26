@@ -1160,14 +1160,21 @@ def test_cancel_open_orders_treats_a_missing_status_as_working(tmp_path):
     assert count == 1
 
 
-# ─── exit-only is a sell-only path ──────────────────────────────────────────
+# ─── exit-only is decided by the stamp, not by the order side ───────────────
 #
 # `risk_sizing_mode="exit_only"` addresses a close request at an existing broker
-# position, which carries no SL/TP because the position already has them. A buy
-# is an *entry*: routing it down the close path would liquidate a position
-# instead of opening one, and would skip the new-order path's mandatory SL/TP
-# entry guard. The Alpaca twin of this is
-# test_alpaca_buy_cannot_use_exit_only_mode_to_bypass_entry_guards.
+# position, which carries no SL/TP because the position already has them. The
+# decision rests on that system-stamped metadata and never on `signal.action`:
+# the close side is DERIVED from the broker book by `daemon._exit_only_close_action`,
+# and flattening a SHORT is a BUY. Gating on the action therefore refused
+# precisely the orders that matter -- every stop-loss and take-profit on a short
+# -- while long exits passed, and CodeRabbit flagged it critical.
+#
+# The protective intent that survives is real but different: an exit-only order
+# must never become an unbounded entry. That is refused where the position is
+# resolved (`_position_id_for_exit` finding no broker position), not by
+# string-matching the side. The Alpaca twin of this is
+# test_alpaca_exit_only_is_decided_by_metadata_not_by_the_order_side.
 
 
 def _make_submit_adapter(tmp_path: Path, *, open_position_ids=(77,)):
@@ -1242,37 +1249,73 @@ def _offline_signal_persistence(monkeypatch, module, adapter, signal) -> None:
     )
 
 
-def test_ctrader_buy_cannot_use_exit_only_mode_to_bypass_entry_guards(
+def test_ctrader_exit_only_buy_closes_a_short_and_an_unbacked_exit_is_refused(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A BUY labelled exit-only is refused as an entry, never sent as a close."""
+    """The exit-only contract, asserted through the real cTrader submit path.
+
+    A close's side is DERIVED from the broker book: flattening a SHORT is a
+    BUY. An action-based rule therefore refuses exactly the exits that matter
+    -- every stop-loss and take-profit on a short -- while letting long exits
+    through, and it would also skip the new-order path's mandatory SL/TP entry
+    guard for nothing. The decision rests on the system-stamped metadata; what
+    must still be refused is exit-only metadata with no broker position, which
+    would OPEN a position instead of closing one.
+    """
     from live_runner import ctrader_adapter as module
 
+    # (a) closing a short: action "buy" + exit-only metadata is a legitimate
+    # exit. It must reach the position-close path and a close request must
+    # actually be sent -- this is the regression test.
     adapter = _make_submit_adapter(tmp_path)
-    signal = LiveSignal(
+    short_close = LiveSignal(
         deployment_id="dep-1",
         symbol="EURUSD",
         action="buy",
         theoretical_price=1.1,
         timestamp=datetime.now(timezone.utc),
-        # What the daemon stamps on a sized exit-only order, but on the wrong
-        # side: a broker position id is present, so nothing but the action
-        # check stands between this buy and a position close.
         metadata={"qty": 3.0, "risk_sizing_mode": "exit_only", "position_id": 77},
     )
-    _offline_signal_persistence(monkeypatch, module, adapter, signal)
+    _offline_signal_persistence(monkeypatch, module, adapter, short_close)
 
-    # No SL/TP: an entry without them is refused by the new-order path, which
-    # is exactly the guard the close path would have skipped.
-    with pytest.raises(ValueError, match="without stop_loss"):
-        asyncio.run(adapter.submit_order(signal, qty=3.0))
+    assert asyncio.run(adapter.submit_order(short_close, qty=3.0)) == "555"
 
-    assert adapter.close_requests == [], (
-        "a buy must never be routed to the position-close request; that would "
-        "liquidate a position instead of opening one"
+    assert [request.positionId for request in adapter.close_requests] == [77], (
+        "a short close carries action 'buy' and must still be routed to the "
+        "position-close request"
     )
-    assert adapter.new_order_requests == [], "nothing may reach the broker"
-    assert adapter.persisted_order_ids == [], "no broker order id to persist"
+    # Resolved to a real broker volume (>0), not dropped or zeroed.
+    assert all(request.volume > 0 for request in adapter.close_requests)
+    assert adapter.new_order_requests == [], (
+        "the close must not fall through to a new order, which would open a "
+        "second position and skip the mandatory SL/TP entry guard"
+    )
+    assert adapter.persisted_order_ids == [(str(short_close.id), "555")]
+
+    # (b) exit-only metadata with no broker position has nothing to close, and
+    # the close path would have skipped the entry guard: it would OPEN an
+    # unbounded position. Refused for BOTH sides, with nothing sent at all.
+    for action in ("buy", "sell"):
+        flat_adapter = _make_submit_adapter(tmp_path, open_position_ids=())
+        unbacked = LiveSignal(
+            deployment_id="dep-1",
+            symbol="EURUSD",
+            action=action,
+            theoretical_price=1.1,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 3.0, "risk_sizing_mode": "exit_only", "position_id": 77},
+        )
+        _offline_signal_persistence(monkeypatch, module, flat_adapter, unbacked)
+
+        with pytest.raises(ValueError, match="no broker position id"):
+            asyncio.run(flat_adapter.submit_order(unbacked, qty=3.0))
+
+        assert flat_adapter.close_requests == [], "nothing may be closed"
+        assert flat_adapter.new_order_requests == [], "nothing may reach the broker"
+        assert flat_adapter.persisted_order_ids == [], (
+            "no broker order id to persist: a persisted signal row without one "
+            "wedges every redelivery on the duplicate-recovery path"
+        )
 
 
 def test_ctrader_sell_with_exit_only_mode_still_closes_the_position(

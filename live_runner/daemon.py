@@ -961,17 +961,21 @@ async def submit_order_with_risk(
         or str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
     )
     if exit_only_requested:
-        if signal.action != "sell":
-            # An exit-only request that is not a sell would open new exposure
-            # while claiming to reduce it. Refuse rather than size it as an
-            # entry with a misleading flag attached.
-            raise ValueError(
-                "Refusing exit-only request for a non-sell action "
-                f"(action={signal.action}, symbol={signal.symbol})"
-            )
         # Exit-only orders close an existing position at the broker-observed
         # quantity. They bypass risk sizing and the entry fail-closed SL/TP
         # guard: they reduce exposure instead of opening a new position.
+        #
+        # The decision rests on the system-stamped metadata alone, never on
+        # signal.action: the close side is DERIVED from the broker book by
+        # _exit_only_close_action (a short must be bought back), so the action
+        # arriving here is a consequence, not an input. An action test here
+        # refused every stop-loss and take-profit on a short while letting long
+        # exits through.
+        #
+        # The genuinely dangerous case -- exit-only metadata with no position,
+        # which would OPEN one -- is refused inside
+        # _metadata_for_exit_only_order below, against the broker book, as a
+        # real exception.
         metadata["exit_only"] = True
         metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
         # The close side is derived from the broker book (a short must be
@@ -3056,7 +3060,14 @@ async def _enforce_stopped_deployments(
             continue
 
         try:
-            cancelled = await adapter.cancel_open_orders() if adapter.supports_cancel_orders else 0
+            # Unsupported is UNKNOWN, not zero: `None` is what the check below
+            # reads as "not enforced". Returning 0 here recorded a deployment
+            # with resting orders as enforced even though nothing was cancelled.
+            cancelled = (
+                await adapter.cancel_open_orders()
+                if adapter.supports_cancel_orders
+                else None
+            )
         except NotImplementedError:
             cancelled = None
         except Exception as exc:

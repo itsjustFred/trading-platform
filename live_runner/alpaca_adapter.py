@@ -16,9 +16,9 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import (
-    EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     coerce_positive_live_qty,
+    is_exit_only_metadata,
     is_unbounded_tp,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
@@ -331,6 +331,16 @@ def resolve_alpaca_credentials(
 class AlpacaLiveAdapter(BaseLiveAdapter):
     """Live adapter for Alpaca trading + trade update streaming."""
 
+    #: Response keys under which alpaca-py reports per-item outcomes for the
+    #: bulk cancel / flatten endpoints. A response matching none of them is
+    #: indeterminate, not empty.
+    _OPERATION_ENTRY_KEYS: tuple[str, ...] = (
+        "cancelled_orders",
+        "cancelled_order_ids",
+        "orders",
+        "symbols",
+    )
+
     def __init__(
         self,
         *,
@@ -609,12 +619,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = signal.metadata or {}
         stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
         take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
-        exit_only = (
-            # A buy is an entry, whatever the metadata claims: exit-only
-            # sizing mode must not be usable to open an unbounded position.
-            signal.action == "sell"
-            and str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
-        )
+        exit_only = is_exit_only_metadata(metadata)
         # C1: explicit unbounded-take-profit policy (processor-declared) —
         # stop-only order, never an invented bracket.
         unbounded_tp = not exit_only and take_profit is None and is_unbounded_tp(metadata)
@@ -669,13 +674,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side = order_side.BUY
         else:
             side = order_side.SELL
-        exit_only = (
-            # Same entry guard as _resolve_broker_sl_tp: only a sell may take
-            # the exit-only path, so a buy cannot shed its mandatory SL/TP.
-            signal.action == "sell"
-            and str((signal.metadata or {}).get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        )
+        exit_only = is_exit_only_metadata(signal.metadata)
         if extended_hours and not exit_only:
             # The broker rejects bracket orders with extended_hours enabled
             # ("bracket order has non-zero extended_hours value", HTTP 422), and
@@ -730,6 +729,63 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
 
+    async def _require_exit_position(self, signal: LiveSignal) -> None:
+        """Fail closed unless an exit-only order provably reduces a live position.
+
+        Alpaca closes a position with an ordinary opposing market order, so
+        there is no separate close endpoint to fail: an exit-only order whose
+        position has already gone would silently OPEN one, and because the
+        exit-only path drops the mandatory SL/TP legs it would open it
+        unbounded. Refusing here is the counterpart of cTrader's
+        ``_position_id_for_exit``.
+
+        Two broker-derived refusals, both observable exceptions raised before
+        anything is persisted or sent:
+
+        1. No live position for the symbol -- there is nothing to close.
+        2. The order side is not the close side for the position that exists
+           (a short must be bought back, a long must be sold). The daemon
+           derives that side from the same book, so a disagreement means the
+           book moved under us and the order would add exposure instead of
+           removing it.
+
+        Called before ``save_live_signal``: a persisted signal row with no
+        broker order wedges every redelivery on the duplicate-recovery path.
+        """
+        if not is_exit_only_metadata(signal.metadata):
+            return
+        symbol = str(signal.symbol or "").strip().upper()
+        quantities = [
+            quantity
+            for position in await self.get_positions()
+            if str(position.get("symbol") or "").strip().upper() == symbol
+            and (quantity := _to_float(position.get("qty"), default=0.0)) != 0.0
+        ]
+        if not quantities:
+            raise ValueError(
+                "Refusing Alpaca exit-only order for "
+                f"{symbol} (action={signal.action}, signal_id={signal.id}): "
+                "no live broker position to close. An exit-only order without a "
+                "position would OPEN one, and without its mandatory SL/TP."
+            )
+        if any(quantity > 0 for quantity in quantities) and any(
+            quantity < 0 for quantity in quantities
+        ):
+            raise ValueError(
+                f"Refusing Alpaca exit-only order for {symbol}: the broker book "
+                "holds mixed long and short positions, so no single close is "
+                "unambiguous."
+            )
+        close_action = "sell" if quantities[0] > 0 else "buy"
+        if signal.action != close_action:
+            position_side = "long" if close_action == "sell" else "short"
+            raise ValueError(
+                f"Refusing Alpaca exit-only order for {symbol}: a {signal.action} "
+                f"does not close a {position_side} position (its close side is "
+                f"{close_action!r}); it would open or extend exposure instead of "
+                "reducing it."
+            )
+
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         if not self._connected or self._trading_client is None:
             await self.connect()
@@ -761,6 +817,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
             ) from exc
         qty = qty_value
+
+        # Must precede save_live_signal (see B-8 above): an exit-only order with
+        # no position to close is refused before the signal row is persisted.
+        await self._require_exit_position(signal)
 
         order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
 
@@ -906,57 +966,97 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     def supports_flatten(self) -> bool:
         return True
 
-    @staticmethod
-    def _response_entries(result: Any) -> list[Any]:
+    @classmethod
+    def _response_entries(cls, result: Any) -> list[Any] | None:
         """Entries of an alpaca-py response that may be a model or a dict.
 
         The installed client returns pydantic models, but the repository also
         supports the legacy raw-dict response shape, so both are handled.
+
+        Returns None -- never [] -- for a shape we could not read. "I could not
+        parse the response" is INDETERMINATE; "the broker had nothing to do" is
+        a genuine zero. Collapsing them made ``cancel_open_orders()`` report 0
+        for an unreadable response, which satisfies the daemon's
+        ``cancelled is not None`` check and records a STOPPED deployment as
+        enforced while its orders and positions are still live.
         """
         if result is None:
-            return []
+            return None
         if isinstance(result, dict):
-            for key in ("cancelled_orders", "cancelled_order_ids", "orders", "symbols"):
+            for key in cls._OPERATION_ENTRY_KEYS:
                 value = result.get(key)
                 if isinstance(value, list):
                     return list(value)
-            return []
+            return None
         if isinstance(result, (list, tuple)):
             return list(result)
-        for key in ("cancelled_orders", "cancelled_order_ids", "orders", "symbols"):
+        for key in cls._OPERATION_ENTRY_KEYS:
             value = getattr(result, key, None)
             if isinstance(value, (list, tuple)):
                 return list(value)
-        return []
+        return None
 
     @classmethod
     def _response_count(cls, result: Any) -> int:
-        return len(cls._response_entries(result))
+        entries = cls._response_entries(result)
+        if entries is None:
+            raise RuntimeError(
+                f"Alpaca bulk response returned an unrecognised response shape "
+                f"({type(result).__name__}); refusing to report a count."
+            )
+        return len(entries)
 
     @classmethod
-    def _raise_on_failed_operations(cls, result: Any, *, operation: str) -> None:
-        """Fail closed when the broker reports any item as not done.
+    def _checked_response_operations(cls, result: Any, *, operation: str) -> list[Any]:
+        """Parse a bulk response, failing closed unless it is readable and clean.
 
-        The caller marks a STOPPED deployment enforced based on these counts, so
-        counting a rejected cancel or close as success would report the
-        deployment as flattened while its orders and positions are still live.
-        A response without a status field is not treated as a failure: the
-        legacy raw-dict shape carries no status and is assumed successful.
+        The daemon marks a STOPPED deployment enforced based on these counts, so
+        every "I do not actually know" must surface as an exception rather than
+        a count. Three cases, one silent-success hole closed:
+
+        1. An unrecognised (or absent) response shape is INDETERMINATE and
+           raises -- it is not a broker report of zero.
+        2. A present but non-numeric ``status`` is a FAILED operation. Skipping
+           it silently counted a rejected cancel or close as a success.
+        3. An out-of-range numeric status is a failure (as before).
+
+        A *missing* status is still assumed successful: the legacy raw-dict
+        shape omits the field rather than reporting a bad one.
         """
+        entries = cls._response_entries(result)
+        if entries is None:
+            raise RuntimeError(
+                f"Alpaca {operation} returned an unrecognised response shape "
+                f"({type(result).__name__}); refusing to report a count. Reading "
+                "it as 'nothing to do' would record a stopped deployment as "
+                "enforced while its orders and positions are still live."
+            )
         failures: list[str] = []
-        for entry in cls._response_entries(result):
+        for entry in entries:
             status = entry.get("status") if isinstance(entry, dict) else getattr(entry, "status", None)
             if status is None:
                 continue
-            if not 200 <= int(status) < 300:
-                identifier = (
-                    entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
-                )
+            identifier = (
+                entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
+            )
+            try:
+                code = int(status)
+            except (TypeError, ValueError):
+                failures.append(f"{identifier or '?'}={status!r}")
+                continue
+            if not 200 <= code < 300:
                 failures.append(f"{identifier or '?'}={status}")
         if failures:
             raise RuntimeError(
                 f"Alpaca {operation} did not succeed for: {', '.join(failures)}"
             )
+        return entries
+
+    @classmethod
+    def _raise_on_failed_operations(cls, result: Any, *, operation: str) -> None:
+        """Fail closed when the response is unreadable or the broker reports
+        any item as not done."""
+        cls._checked_response_operations(result, operation=operation)
 
     async def cancel_open_orders(self) -> int:
         """Cancel every open order for this account.
@@ -970,8 +1070,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is not connected")
 
         result = await asyncio.to_thread(self._trading_client.cancel_orders)
-        self._raise_on_failed_operations(result, operation="cancel_orders")
-        return self._response_count(result)
+        return len(self._checked_response_operations(result, operation="cancel_orders"))
 
     async def close_all_positions(self) -> int:
         """Flatten every open position for this account."""
@@ -981,8 +1080,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is not connected")
 
         result = await asyncio.to_thread(self._trading_client.close_all_positions)
-        self._raise_on_failed_operations(result, operation="close_all_positions")
-        return self._response_count(result)
+        return len(
+            self._checked_response_operations(result, operation="close_all_positions")
+        )
 
     async def get_positions(self) -> list[dict[str, Any]]:
         """Return open positions with pricing and unrealized PnL."""

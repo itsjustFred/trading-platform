@@ -1477,6 +1477,40 @@ def test_stopped_deployment_not_marked_enforced_when_adapter_cannot_flatten(monk
     assert adapter.cancel_calls == 1
 
 
+def test_stopped_deployment_not_marked_enforced_when_adapter_cannot_cancel(monkeypatch):
+    """An adapter that cannot cancel must NOT be reported as stopped-flat.
+
+    "Cannot cancel" is UNKNOWN, not zero. The ledger check is `is not None`, so
+    a `0` substituted for "unsupported" recorded the deployment as enforced
+    while its resting entry orders were still live at the broker -- skipping
+    the flatten for a deployment the operator had stopped.
+    """
+    adapter = _RecordingAdapter(supports_cancel=False)
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert enforced == set(), "unsupported cancel is not a successful cancel"
+    assert adapter.cancel_calls == 0
+    assert adapter.flatten_calls == 0, (
+        "must not proceed to flatten once the cancel step is known-unknown"
+    )
+
+    # The same adapter, once it does support cancel, is enforced and recorded.
+    supported = _RecordingAdapter()
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": supported}, already_enforced=enforced
+        )
+    )
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
 def test_stopped_deployment_not_marked_enforced_when_cancel_fails(monkeypatch):
     adapter = _RecordingAdapter(fail_cancel=True)
     enforced: set[str] = set()

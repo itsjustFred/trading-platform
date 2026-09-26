@@ -3999,6 +3999,50 @@ def test_entry_metadata_discards_raw_broker_volume_but_keeps_risk_qty() -> None:
     assert "ctrader_volume" not in adapter.submitted_signal.metadata
 
 
+def test_exit_only_close_action_derives_the_close_side_from_the_book():
+    """Pins `short -> "buy"`, the fact an action-based exit-only rule inverts.
+
+    The close side is a CONSEQUENCE of the position side: a negative broker
+    quantity is a short, and flattening a short means buying it back. If this
+    ever returned "sell" for a short, every stop-loss and take-profit on a short
+    would be submitted as a sell that doubles the position instead of closing
+    it. Kept as a direct pin so the mapping cannot be "simplified" away.
+    """
+    from live_runner.daemon import _exit_only_close_action
+
+    assert _exit_only_close_action([{"symbol": "EURUSD", "qty": -3.0}], "EURUSD") == "buy"
+    assert _exit_only_close_action([{"symbol": "EURUSD", "qty": 3.0}], "EURUSD") == "sell"
+    # Symbol matching is case-insensitive and other symbols are ignored.
+    assert _exit_only_close_action(
+        [{"symbol": "eurusd", "qty": -1.0}, {"symbol": "GBPUSD", "qty": 5.0}],
+        "EURUSD",
+    ) == "buy"
+    # A flat book has no side to derive; the default is a long close, and the
+    # no-position refusal upstream means this is never reached in practice.
+    assert _exit_only_close_action([], "EURUSD") == "sell"
+
+    # The daemon must stamp that derived side onto the metadata and onto the
+    # signal, overriding the side the producer asked for.
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[{"symbol": "EURUSD", "qty": -3.0}])
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.action == "buy"
+    assert adapter.submitted_signal.metadata["action"] == "buy"
+    assert adapter.submitted_signal.metadata["signal_action"] == "sell"
+
+
 def test_exit_only_orders_close_short_positions_with_a_buy():
     """#76: an exit-only signal on a net-short book must submit a BUY that
     flattens the short magnitude instead of raising 'no long position'."""
@@ -4026,6 +4070,10 @@ def test_exit_only_orders_close_short_positions_with_a_buy():
 
 
 def test_exit_only_metadata_cannot_open_a_long():
+    """Exit-only metadata with no broker position would OPEN a position, so it
+    is refused. The refusal is broker-derived (`no position is open`), not a
+    string match on the action: the action is a consequence of the position
+    side, and closing a short legitimately arrives as a buy."""
     from live_runner.daemon import submit_order_with_risk
 
     deployment = _deployment()
@@ -4039,7 +4087,7 @@ def test_exit_only_metadata_cannot_open_a_long():
         metadata={"risk_sizing_mode": "exit_only"},
     )
 
-    with pytest.raises(ValueError, match="non-sell"):
+    with pytest.raises(ValueError, match="no position is open"):
         asyncio.run(submit_order_with_risk(adapter, deployment, signal))
 
     assert adapter.submitted_signal is None
@@ -4076,21 +4124,99 @@ def test_risk_sized_entry_cannot_inherit_exit_only_metadata():
     assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "risk_sized"
 
 
-def test_alpaca_buy_cannot_use_exit_only_mode_to_bypass_entry_guards():
+def _alpaca_exit_only_adapter(module, monkeypatch, positions):
+    """Alpaca adapter wired to a fake broker holding `positions`.
+
+    `submitted` collects every request that reached the broker, so a refusal is
+    observable as "nothing was sent" rather than inferred from a raised error.
+    """
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    submitted: list[object] = []
+
+    class _Client:
+        def submit_order(self, order_data=None, **_kwargs):
+            submitted.append(order_data)
+            return SimpleNamespace(id=_alpaca_order_id("alpaca-exit-only"))
+
+        def get_all_positions(self):
+            return [
+                SimpleNamespace(
+                    symbol=position["symbol"],
+                    qty=str(position["qty"]),
+                    avg_entry_price="100.0",
+                    current_price="100.0",
+                    unrealized_pl="0.0",
+                )
+                for position in positions
+            ]
+
+    adapter._trading_client = _Client()
+    monkeypatch.setattr(
+        module, "save_live_signal", lambda signal: (str(signal.id), True)
+    )
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda *_: True)
+    return adapter, submitted, _alpaca_order_id("alpaca-exit-only")
+
+
+def test_alpaca_exit_only_is_decided_by_metadata_not_by_the_order_side(monkeypatch):
+    """The exit-only contract, asserted through the real submit path.
+
+    A close's side is DERIVED from the broker book: flattening a SHORT is a
+    BUY. An action-based rule therefore refuses exactly the exits that matter
+    -- every stop-loss and take-profit on a short -- while letting long exits
+    through. The decision must rest on the system-stamped metadata; what must
+    still be refused is exit-only metadata with no broker position, which would
+    OPEN an unbounded position instead of closing one.
+    """
+    from alpaca.trading.enums import OrderClass, OrderSide
+
     from live_runner import alpaca_adapter as module
 
-    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
-    signal = LiveSignal(
+    # (a) closing a short: action "buy" + exit-only metadata is a legitimate
+    # exit, is routed down the close path, and the order is actually sent.
+    adapter, submitted, broker_order_id = _alpaca_exit_only_adapter(
+        module, monkeypatch, [{"symbol": "AAPL", "qty": -4.0}]
+    )
+    short_close = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+        metadata={"qty": 4.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
     )
 
-    with pytest.raises(ValueError, match="without stop_loss"):
-        adapter._resolve_broker_sl_tp(signal)
+    assert asyncio.run(adapter.submit_order(short_close, qty=4.0)) == broker_order_id
+
+    assert len(submitted) == 1, "a short close must actually reach the broker"
+    request = submitted[0]
+    assert request.side == OrderSide.BUY, "a short is closed by buying it back"
+    assert request.qty == pytest.approx(4.0)
+    # The close path sheds the entry bracket, which is exactly what an
+    # action-based guard wrongly protected against.
+    assert request.order_class is OrderClass.SIMPLE
+    assert request.stop_loss is None
+    assert request.take_profit is None
+
+    # (b) exit-only metadata with nothing to close would OPEN a position
+    # instead, unbounded, because this path drops the mandatory SL/TP. Refused
+    # for BOTH sides, with no order of any kind sent.
+    empty_adapter, empty_submitted, _ = _alpaca_exit_only_adapter(
+        module, monkeypatch, []
+    )
+    for action in ("buy", "sell"):
+        unbacked = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action=action,
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+        )
+        with pytest.raises(ValueError, match="no live broker position to close"):
+            asyncio.run(empty_adapter.submit_order(unbacked, qty=2.0))
+    assert empty_submitted == [], "an unbacked exit-only order must never be sent"
 
 
 def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
@@ -4465,19 +4591,71 @@ def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
         builder(signal, symbol_id=7)
 
 
-def test_ctrader_buy_cannot_use_exit_only_mode_to_bypass_entry_guards():
+def test_ctrader_exit_only_is_decided_by_metadata_not_by_the_order_side():
+    """The exit-only contract, asserted where cTrader builds requests.
+
+    A close's side is DERIVED from the broker book: flattening a SHORT is a
+    BUY. An action-based rule therefore refuses exactly the exits that matter
+    -- every stop-loss and take-profit on a short -- while letting long exits
+    through. What the new-order path must refuse is exit-only metadata itself,
+    for BOTH sides: an exit-only order is always a close addressed at a broker
+    position id, never a new order.
+    """
+    from live_runner.daemon import submit_order_with_risk
+
     _module, adapter = _make_ctrader_request_builder_adapter()
+    for action in ("buy", "sell"):
+        exit_only = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action=action,
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+        )
+        with pytest.raises(ValueError, match="position-addressed close request"):
+            adapter._build_new_order_request(exit_only, symbol_id=7)
+
+    # (a) the proof that a short close is action "buy": the daemon derives the
+    # side from the book, so the exit reaches the adapter as a BUY.
+    deployment = _deployment()
+    positions_adapter = _PositionsAdapter(
+        positions=[{"symbol": "EURUSD", "qty": -2.0}]
+    )
     signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="AAPL",
-        action="buy",
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="sell",
         theoretical_price=100.0,
         timestamp=datetime.now(timezone.utc),
-        metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+        metadata={"exit_only": True},
     )
+    asyncio.run(submit_order_with_risk(positions_adapter, deployment, signal))
 
-    with pytest.raises(ValueError, match="without stop_loss"):
-        adapter._build_new_order_request(signal, symbol_id=7)
+    assert positions_adapter.submitted_signal is not None
+    assert positions_adapter.submitted_signal.action == "buy", (
+        "closing a short is a buy; an action-based exit-only rule would have "
+        "refused this order"
+    )
+    assert positions_adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+
+    # (b) exit-only metadata with no broker position would OPEN a position
+    # instead of closing one. Refused for BOTH sides, before anything is sent.
+    for action in ("buy", "sell"):
+        unbacked_adapter = _PositionsAdapter(positions=[])
+        unbacked = LiveSignal(
+            deployment_id=str(deployment.id),
+            symbol="EURUSD",
+            action=action,
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"risk_sizing_mode": "exit_only"},
+        )
+        with pytest.raises(ValueError, match="no position is open"):
+            asyncio.run(
+                submit_order_with_risk(unbacked_adapter, deployment, unbacked)
+            )
+        assert unbacked_adapter.submitted_signal is None
 
 
 def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
@@ -5463,6 +5641,109 @@ def test_alpaca_close_all_positions_also_refuses_a_redirect_status():
 
     with pytest.raises(RuntimeError, match="did not succeed"):
         asyncio.run(adapter.close_all_positions())
+
+
+def _alpaca_bulk_adapter_with_result(result, method: str = "cancel_orders"):
+    """A bulk-operation adapter whose broker answers with `result`, verbatim."""
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Client:
+        pass
+
+    setattr(_Client, method, staticmethod(lambda: result))
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+    return adapter
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        pytest.param(None, id="no-response"),
+        pytest.param(object(), id="unknown-object"),
+        pytest.param({"unexpected_key": ["a"]}, id="dict-without-known-key"),
+        pytest.param(type("R", (), {"unexpected_key": ["a"]})(), id="model-without-known-key"),
+    ],
+)
+def test_alpaca_unreadable_bulk_response_raises_instead_of_reporting_zero(unreadable):
+    """"I could not parse the response" is INDETERMINATE, not a broker zero.
+
+    Collapsing the two made `cancel_open_orders()` return 0 for a response we
+    could not read. The daemon's ledger check is `is not None`, so 0 satisfied
+    it and recorded the STOPPED deployment as enforced while its orders and
+    positions were still live -- exactly what the enforcement exists to
+    prevent. It must raise instead.
+    """
+    import asyncio
+
+    adapter = _alpaca_bulk_adapter_with_result(unreadable)
+
+    with pytest.raises(RuntimeError, match="unrecognised response shape"):
+        asyncio.run(adapter.cancel_open_orders())
+
+    # The count helper must refuse too, so no caller can reintroduce the zero.
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    with pytest.raises(RuntimeError, match="unrecognised response shape"):
+        AlpacaLiveAdapter._response_count(unreadable)
+
+
+def test_alpaca_genuine_zero_is_still_reported_as_zero():
+    """The fail-closed fix must not invent a failure: a readable response with
+    no operations IS a real zero, and reporting it keeps the daemon's ledger
+    honest in the other direction."""
+    import asyncio
+
+    adapter = _alpaca_bulk_adapter_with_result({"cancelled_orders": []})
+
+    assert asyncio.run(adapter.cancel_open_orders()) == 0
+
+
+def test_alpaca_flatten_also_refuses_an_unreadable_response():
+    """Same rule for close_all_positions: it is the other half of the flatten."""
+    import asyncio
+
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    adapter = _alpaca_bulk_adapter_with_result(object(), method="close_all_positions")
+
+    with pytest.raises(RuntimeError, match="unrecognised response shape"):
+        asyncio.run(adapter.close_all_positions())
+
+    with pytest.raises(RuntimeError, match="unrecognised response shape"):
+        AlpacaLiveAdapter._raise_on_failed_operations(
+            object(), operation="close_all_positions"
+        )
+
+
+@pytest.mark.parametrize("status", ["rejected", "CANCELLED", True, object()])
+def test_alpaca_non_numeric_status_is_a_failed_operation_not_a_skipped_one(status):
+    """A status we cannot read is a FAILED operation, never a silent success.
+
+    It used to be skipped by a bare `continue`, so a broker that reported the
+    item as anything other than a number counted as cancelled. The daemon
+    marks a STOPPED deployment enforced from that count.
+    """
+    import asyncio
+
+    class _Order:
+        def __init__(self, oid, status):
+            self.id = oid
+            self.status = status
+
+    class _Client:
+        def cancel_orders(self):
+            return type("R", (), {"cancelled_orders": [_Order("o1", status)]})()
+
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+
+    with pytest.raises(RuntimeError, match="did not succeed"):
+        asyncio.run(adapter.cancel_open_orders())
 
 
 def test_widened_market_data_request_asks_for_the_newest_bars():

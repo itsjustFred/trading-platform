@@ -19,6 +19,7 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     coerce_positive_live_qty,
+    is_exit_only_metadata,
     is_unbounded_tp,
 )
 from live_runner.credential_env import resolve_env_value
@@ -1872,16 +1873,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 }
             }
         )
-        exit_only = (
-            # Only a sell may take the exit-only path. A buy labelled
-            # exit-only is an entry attempt, and letting it reach the
-            # position-close branch below would close a position instead of
-            # opening one, while _build_new_order_request would skip its
-            # mandatory SL/TP entry guard.
-            signal.action == "sell"
-            and str((signal.metadata or {}).get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        )
+        exit_only = is_exit_only_metadata(signal.metadata)
         self._resolve_order_volume(signal)
         signal = signal.model_copy(
             update={
@@ -2062,10 +2054,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if signal.action not in {"buy", "sell"}:
             raise ValueError(f"Unsupported signal action: {signal.action}")
         metadata = signal.metadata or {}
-        if (
-            signal.action == "sell"
-            and str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
-        ):
+        if is_exit_only_metadata(metadata):
+            # The exit-only decision rests on the system-stamped metadata, not
+            # on the order side: the close side is DERIVED from the book (a
+            # short must be bought back), so it is a consequence, never an
+            # input. The invariant enforced here is therefore positional, not
+            # directional -- an exit-only order is always a close addressed at a
+            # broker position id, and this new-order path can never be one.
             raise ValueError(
                 "cTrader exit-only orders must use a broker position-addressed close request."
             )
