@@ -1689,3 +1689,35 @@ def test_per_bot_scheme_falls_back_to_the_global_scheme(monkeypatch):
     token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
     assert token == "tok"
     assert scheme == "account", "the global scheme applies when no per-bot override exists"
+
+
+def test_stopped_deployment_refuses_to_flatten_an_account_with_a_paused_sibling():
+    """PAUSED still owns positions, so it must block a wholesale flatten.
+
+    Pausing drains and blocks new entries; it does not liquidate. Treating only
+    ACTIVE as position-owning meant stopping one deployment would have closed a
+    paused sibling's positions as collateral damage.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    stopped = _stopped_deployment()
+    paused = _Config(
+        id="aaaaaaaa-1111-4111-8111-111111111111",
+        strategy_name="sibling",
+        account_id=stopped.account_id,
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="internal",
+    )
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [stopped, paused], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+    assert adapter.flatten_calls == 0, "must not flatten a paused sibling's positions"
+    assert enforced == set(), "the stop stays un-enforced and is retried"

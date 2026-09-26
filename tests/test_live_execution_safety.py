@@ -3894,3 +3894,89 @@ def test_short_market_data_history_is_refused_not_truncated():
         asyncio.run(adapter.get_market_data("AAPL", timeframe="1h", limit=100))
     # It must have tried to widen before giving up.
     assert len(adapter._historical_data_client.starts) == 2
+
+
+# ─── Alpaca stop controls must not count failures as success ────────────────
+
+
+def test_cancel_open_orders_raises_when_the_broker_reports_a_failure():
+    """A rejected cancel must not be counted as cancelled.
+
+    The daemon marks a STOPPED deployment enforced from this count, so counting
+    a failure would report the deployment as stopped while its order is live.
+    """
+    import asyncio
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Resp:
+        cancelled_order_ids = ["o1", "o2"]
+
+    class _Order:
+        def __init__(self, oid, status):
+            self.id = oid
+            self.status = status
+
+    class _Client:
+        def cancel_orders(self):
+            return type(
+                "R",
+                (),
+                {"cancelled_orders": [_Order("o1", 200), _Order("o2", 422)]},
+            )()
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+
+    with pytest.raises(RuntimeError, match="did not succeed"):
+        asyncio.run(adapter.cancel_open_orders())
+
+
+def test_close_all_positions_raises_when_the_broker_reports_a_failure():
+    import asyncio
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Order:
+        def __init__(self, oid, status):
+            self.id = oid
+            self.status = status
+
+    class _Client:
+        def close_all_positions(self):
+            return type("R", (), {"orders": [_Order("p1", 500)]})()
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+
+    with pytest.raises(RuntimeError, match="did not succeed"):
+        asyncio.run(adapter.close_all_positions())
+
+
+def test_successful_operations_still_return_their_count():
+    import asyncio
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    class _Order:
+        def __init__(self, oid, status):
+            self.id = oid
+            self.status = status
+
+    class _Client:
+        def cancel_orders(self):
+            return type("R", (), {"cancelled_orders": [_Order("o1", 200)]})()
+
+    adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._trading_client = _Client()
+    assert asyncio.run(adapter.cancel_open_orders()) == 1
+
+
+def test_legacy_response_without_a_status_is_not_treated_as_a_failure():
+    """The raw-dict response shape carries no status; it must still pass."""
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    assert AlpacaLiveAdapter._response_count({"cancelled_order_ids": ["a", "b"]}) == 2
+    AlpacaLiveAdapter._raise_on_failed_operations(
+        {"cancelled_order_ids": ["a", "b"]}, operation="cancel_orders"
+    )

@@ -209,6 +209,10 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
 # closure is legitimately longer than several bars of an intraday series.
 GAP_SPACING_MULTIPLE = 3.0
 MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
+# A single long weekend reaches four calendar days: Friday and Monday both
+# closed, with Saturday and Sunday between. Christmas and Easter routinely
+# produce exactly that, and a 3-day allowance reported them as data holes.
+LONG_WEEKEND_GAP_DAYS = 4.0
 
 
 def timeframe_nominal_days(timeframe: str | None) -> float:
@@ -242,10 +246,25 @@ def timeframe_nominal_days(timeframe: str | None) -> float:
     return count
 
 
-def scaled_gap_threshold_days(timeframe: str | None, base_days: float) -> float:
-    """Allowed hole length for ``timeframe``, widened for long-spaced series."""
+def scaled_gap_threshold_days(
+    timeframe: str | None,
+    base_days: float,
+    *,
+    allow_long_weekend: bool = False,
+) -> float:
+    """Allowed hole length for ``timeframe``, widened for long-spaced series.
+
+    ``allow_long_weekend`` raises the floor to cover a Friday-and-Monday
+    closure. It is set only for the threshold that *fails* coverage: a long
+    weekend is real market behaviour and must not block a backtest, but it is
+    still worth warning about, so the warning threshold keeps the tighter floor
+    that surfaces genuine intraday holes.
+    """
     scaled = timeframe_nominal_days(timeframe) * GAP_SPACING_MULTIPLE
-    return max(float(base_days), scaled, MIN_INTERNAL_GAP_THRESHOLD_DAYS)
+    floor = MIN_INTERNAL_GAP_THRESHOLD_DAYS
+    if allow_long_weekend:
+        floor = max(floor, LONG_WEEKEND_GAP_DAYS)
+    return max(float(base_days), scaled, floor)
 
 
 def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
@@ -663,7 +682,11 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         [
             gap
             for gap in gaps
-            if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
+            if float(gap.get("gap_days", 0)) > scaled_gap_threshold_days(
+                requirement.timeframe,
+                INTERNAL_GAP_FAIL_DAYS,
+                allow_long_weekend=True,
+            )
         ],
         required_start,
         required_end,

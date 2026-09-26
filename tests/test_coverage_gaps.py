@@ -308,16 +308,21 @@ def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
 def test_gap_threshold_scales_with_timeframe_but_keeps_an_intraday_floor():
     from data_tools.auto_download import scaled_gap_threshold_days
 
-    # Sub-daily keeps the 1-day floor so overnight closures are not holes.
+    # The warning threshold keeps a tight 1-day floor for sub-daily timeframes,
+    # so a genuine intraday hole is still surfaced rather than accepted.
     assert scaled_gap_threshold_days("1m", 1) == 1.0
     assert scaled_gap_threshold_days("1h", 1) == 1.0
+    # The threshold that fails coverage additionally tolerates a long weekend,
+    # which reaches four calendar days when Friday and Monday are both closed.
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) == 4.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) == 4.0
     # Longer-spaced series widen proportionally.
     assert scaled_gap_threshold_days("1d", 1) == 3.0
     assert scaled_gap_threshold_days("1w", 1) == 21.0
     assert scaled_gap_threshold_days("1mo", 1) == 90.0
     # The fail threshold never becomes stricter than before.
-    assert scaled_gap_threshold_days("1h", 3) >= 3.0
-    assert scaled_gap_threshold_days("1d", 3) >= 3.0
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) >= 3.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) >= 3.0
 
 
 def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
@@ -394,3 +399,41 @@ def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
     assert gaps and gaps[0]["gap_days"] == pytest.approx(2.0), (
         f"a 2-day hole must be reported when no timeframe is known: {gaps}"
     )
+
+
+def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
+    """Friday close to Monday open is about three days even for hourly bars.
+
+    With a fixed 3-day fail threshold that escalated to `failed` and blocked the
+    backtest. It must stay a warning: the closure is real market behaviour, and a
+    warning is still surfaced rather than silently accepted.
+    """
+    import pandas as pd
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    stamps = list(
+        pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC")
+    ) + [pd.Timestamp("2024-03-11 22:00", tz="UTC")]
+    _write_series(root / "ohlcv" / "GOLD1", "1h.parquet", stamps)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="GOLD1", timeframe="1h",
+            start="2024-03-06", end="2024-03-11",
+        ),
+    )
+    assert report["status"] != "failed", f"a long weekend must not fail coverage: {report}"
+    assert report["gaps"], "the closure should still be reported as a gap"
+
+
+def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    stamps = list(pd.date_range("2024-03-01", periods=5, freq="1h", tz="UTC")) + list(
+        pd.date_range("2024-03-09", periods=5, freq="1h", tz="UTC")
+    )
+    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1h.parquet", stamps)
+    gaps = find_internal_gaps(symbol_dir, "1h")
+    assert gaps and gaps[0]["gap_days"] > 4, f"an 8-day hole must be reported: {gaps}"

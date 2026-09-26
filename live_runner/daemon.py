@@ -2558,10 +2558,14 @@ async def _enforce_stopped_deployments(
     # positions. If another deployment on the same account is still ACTIVE, its
     # positions would be liquidated as collateral damage, so refuse and say so
     # rather than pretending the stop succeeded.
-    active_accounts = {
+    # A PAUSED deployment still owns its positions: pausing drains and blocks new
+    # entries, it does not liquidate. So both ACTIVE and PAUSED deployments make
+    # the account shared, and only an account whose deployments are all STOPPED
+    # may be flattened wholesale.
+    position_owning_accounts = {
         deployment.account_id
         for deployment in deployments
-        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+        if _normalize_deployment_status(deployment.status) in {"ACTIVE", "PAUSED"}
     }
 
     for deployment in stopped:
@@ -2570,10 +2574,10 @@ async def _enforce_stopped_deployments(
             continue
 
         adapter = active_adapters.get(deployment.account_id)
-        if deployment.account_id in active_accounts:
+        if deployment.account_id in position_owning_accounts:
             logger.error(
                 "Refusing to flatten a shared account: another deployment on it is "
-                "still ACTIVE and its positions would be closed too",
+                "still ACTIVE or PAUSED and its positions would be closed too",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,

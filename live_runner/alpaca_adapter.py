@@ -823,27 +823,56 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return True
 
     @staticmethod
-    def _response_count(result: Any) -> int:
-        """Count entries in an alpaca-py response that may be a model or a dict.
+    def _response_entries(result: Any) -> list[Any]:
+        """Entries of an alpaca-py response that may be a model or a dict.
 
         The installed client returns pydantic models, but the repository also
         supports the legacy raw-dict response shape, so both are handled.
         """
         if result is None:
-            return 0
+            return []
         if isinstance(result, dict):
             for key in ("cancelled_orders", "cancelled_order_ids", "orders", "symbols"):
                 value = result.get(key)
                 if isinstance(value, list):
-                    return len(value)
-            return 0
+                    return list(value)
+            return []
         if isinstance(result, (list, tuple)):
-            return len(result)
+            return list(result)
         for key in ("cancelled_orders", "cancelled_order_ids", "orders", "symbols"):
             value = getattr(result, key, None)
             if isinstance(value, (list, tuple)):
-                return len(value)
-        return 0
+                return list(value)
+        return []
+
+    @classmethod
+    def _response_count(cls, result: Any) -> int:
+        return len(cls._response_entries(result))
+
+    @classmethod
+    def _raise_on_failed_operations(cls, result: Any, *, operation: str) -> None:
+        """Fail closed when the broker reports any item as not done.
+
+        The caller marks a STOPPED deployment enforced based on these counts, so
+        counting a rejected cancel or close as success would report the
+        deployment as flattened while its orders and positions are still live.
+        A response without a status field is not treated as a failure: the
+        legacy raw-dict shape carries no status and is assumed successful.
+        """
+        failures: list[str] = []
+        for entry in cls._response_entries(result):
+            status = entry.get("status") if isinstance(entry, dict) else getattr(entry, "status", None)
+            if status is None:
+                continue
+            if not 200 <= int(status) < 300:
+                identifier = (
+                    entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
+                )
+                failures.append(f"{identifier or '?'}={status}")
+        if failures:
+            raise RuntimeError(
+                f"Alpaca {operation} did not succeed for: {', '.join(failures)}"
+            )
 
     async def cancel_open_orders(self) -> int:
         """Cancel every open order for this account.
@@ -857,6 +886,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is not connected")
 
         result = await asyncio.to_thread(self._trading_client.cancel_orders)
+        self._raise_on_failed_operations(result, operation="cancel_orders")
         return self._response_count(result)
 
     async def close_all_positions(self) -> int:
@@ -867,6 +897,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is not connected")
 
         result = await asyncio.to_thread(self._trading_client.close_all_positions)
+        self._raise_on_failed_operations(result, operation="close_all_positions")
         return self._response_count(result)
 
     async def get_positions(self) -> list[dict[str, Any]]:
