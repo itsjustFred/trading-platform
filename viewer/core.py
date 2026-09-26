@@ -1611,8 +1611,20 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
 _DOLTHUB_REPOS = Path.home() / "data" / "dolthub"
 
 
+#: Per-repo cap for `dolt pull`. Four repos at 30s each is two minutes of
+#: waiting, and this runs per backtest request, so a slow or unreachable remote
+#: used to pile up threads that kept the process alive long after the work was
+#: done.
+_DOLTHUB_PULL_TIMEOUT_SECONDS = 10
+
+
 def _dolthub_pull():
-    """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
+    """Best-effort dolt pull in all Dolthub repos. Logs warnings on failure.
+
+    A pull that misses its deadline is killed and logged rather than retried: the
+    data is refreshed on the next request anyway, and blocking here only delays
+    the request that triggered it.
+    """
     if not _DOLTHUB_REPOS.is_dir():
         return
     if shutil.which("dolt") is None:
@@ -1628,7 +1640,13 @@ def _dolthub_pull():
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=_DOLTHUB_PULL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "dolt pull %s exceeded %ss and was abandoned",
+                repo,
+                _DOLTHUB_PULL_TIMEOUT_SECONDS,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             logger.warning("dolt pull %s failed: %s", repo, exc)

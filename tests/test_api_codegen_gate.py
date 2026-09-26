@@ -20,6 +20,11 @@ def client(monkeypatch, tmp_path):
     strategies_dir = tmp_path / "strategies"
     strategies_dir.mkdir()
     monkeypatch.setattr("viewer.main.STRATEGIES_DIR", strategies_dir)
+    # Point the dolthub scan at a path that does not exist. Otherwise a developer
+    # machine that has ~/data/dolthub checked out makes every TestClient start
+    # shell out to `dolt pull`, and the suite stalls on network git operations
+    # that have nothing to do with the approval gate.
+    monkeypatch.setattr("viewer.core._DOLTHUB_REPOS", tmp_path / "no-such-dolthub")
     with fastapi_testclient.TestClient(app) as test_client:
         yield test_client, strategies_dir
 
