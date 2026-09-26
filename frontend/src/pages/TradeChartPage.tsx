@@ -27,6 +27,7 @@ import {
   SkipForward,
 } from "lucide-react";
 import { TradingViewChart } from "../components/TradingViewChart";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 
 function formatTradeMetaValue(value: unknown): string {
   if (value === null || value === undefined) {
@@ -742,7 +743,7 @@ export function TradeChartPage() {
 
   useEffect(() => {
     if (!downloadTaskId) return;
-    if (["completed", "failed", "cancelled"].includes(downloadStatus)) return;
+    if (isTerminalTaskStatus(downloadStatus)) return;
 
     const interval = window.setInterval(() => {
       getDataTask(downloadTaskId)

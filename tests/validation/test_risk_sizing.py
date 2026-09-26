@@ -10,7 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import pytest
@@ -21,7 +20,6 @@ from shared.models import Trade, TradeExit
 from validation.reference import ValidationReference
 from validation.risk.adapter import RiskAdapter, _trade_to_signal
 from validation.risk.models import RiskSizingResult, TradeRiskProfile
-
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -124,6 +122,13 @@ def test_trade_to_signal_none_stop_loss() -> None:
     trade = _make_trade(stop_loss=None)
     signal = _trade_to_signal(trade, "EURUSD", "1h")
     assert signal.stop_loss is None
+
+
+def test_private_trade_conversion_is_not_exported() -> None:
+    import validation.risk as risk_package
+
+    assert "_trade_to_signal" not in risk_package.__all__
+    assert not hasattr(risk_package, "_trade_to_signal")
 
 
 # ─── RiskAdapter single trade ───────────────────────────────────────────────

@@ -15,6 +15,7 @@ Logic:
 - sl_price is emitted per entry bar as ATR-based distance from the entry close.
 """
 
+from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import logging
@@ -74,6 +75,24 @@ _TF_FREQ_MAP = {
     "d1": "1D",
     "w1": "1W",
 }
+
+
+def _resolve_session_zone(session_timezone: object, offset_hours: object):
+    name = str(session_timezone or "").strip()
+    offset = float(offset_hours or 0)
+    if name and offset:
+        raise ValueError("session_timezone_offset_hours cannot be combined with an IANA timezone")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid session_timezone: {name!r}") from exc
+    if offset:
+        try:
+            return timezone(timedelta(hours=offset))
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("session_timezone_offset_hours must be between -24 and 24") from exc
+    return timezone.utc
 
 
 def _parse_minutes(value: str) -> int:
@@ -166,18 +185,17 @@ def generate_signals(df: pd.DataFrame, params: dict):
         params.get("max_entry_time", params.get("Max_Entry_Time", "18:05"))
     )
     exit_time = str(params.get("exit_time", params.get("Exit_Time", "22:55")))
-    session_timezone = str(
-        params.get(
-            "session_timezone",
-            params.get("Session_Timezone", ""),
-        )
-        or ""
-    ).strip()
-    session_timezone_offset_hours = float(
-        params.get(
-            "session_timezone_offset_hours",
-            params.get("Session_Timezone_Offset_Hours", 0),
-        )
+    session_timezone = params.get(
+        "session_timezone",
+        params.get("Session_Timezone", ""),
+    )
+    session_timezone_offset_hours = params.get(
+        "session_timezone_offset_hours",
+        params.get("Session_Timezone_Offset_Hours", 0),
+    )
+    session_zone = _resolve_session_zone(
+        session_timezone,
+        session_timezone_offset_hours,
     )
     evaluate_on_confirmation_bar = bool(
         params.get(
@@ -192,35 +210,29 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     def _to_session_time(values):
         converted = pd.to_datetime(values, utc=True, errors="coerce")
-        if session_timezone:
-            try:
-                return converted.dt.tz_convert(ZoneInfo(session_timezone))
-            except (ZoneInfoNotFoundError, TypeError, AttributeError):
-                pass
-        return converted + pd.to_timedelta(session_timezone_offset_hours, unit="h")
+        if getattr(converted, "dt", None) is None:
+            raise ValueError("timestamp values must be datetime-like")
+        return converted.dt.tz_convert(session_zone)
 
     def _index_to_session_time(values):
         converted = pd.DatetimeIndex(pd.to_datetime(values, utc=True, errors="coerce"))
-        if session_timezone:
-            try:
-                return converted.tz_convert(ZoneInfo(session_timezone))
-            except ZoneInfoNotFoundError:
-                pass
-        return converted + pd.to_timedelta(session_timezone_offset_hours, unit="h")
+        if converted.tz is None:
+            raise ValueError("datetime index must be timezone-aware")
+        return converted.tz_convert(session_zone)
 
     # --- Time features -------------------------------------------------------
     if "timestamp" in df.columns:
         session_ts = _to_session_time(df["timestamp"])
         day = pd.Series(session_ts.dt.date.values, index=idx)
         minute_of_day = pd.Series(session_ts.dt.hour * 60 + session_ts.dt.minute, index=idx)
-    elif hasattr(idx, "hour"):
+    elif isinstance(idx, pd.DatetimeIndex) or pd.api.types.is_datetime64_any_dtype(idx):
         session_idx = _index_to_session_time(idx)
         day = pd.Series(session_idx.date, index=idx)
         minute_of_day = pd.Series(session_idx.hour * 60 + session_idx.minute, index=idx)
     else:
-        # Fallback: synthetic day every 100 bars
-        day = pd.Series(range(len(df)) // 100, index=idx)
-        minute_of_day = pd.Series(range(len(df)), index=idx)
+        raise ValueError(
+            "intraday_volatility_breakout requires a timestamp column or datetime index"
+        )
 
     entry_minute = _parse_minutes(entry_time)
     max_entry_minute = _parse_minutes(max_entry_time)

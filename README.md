@@ -35,6 +35,21 @@ cd frontend && npm install && npm run dev
 # Strategy Lab live conversion runs also require NVIDIA_API_KEY
 ```
 
+## Dependency Reproducibility
+
+`uv.lock` is the authoritative Python dependency resolution. Use the locked
+environment for development and CI:
+
+```bash
+uv lock --check
+uv sync --frozen --extra dev
+python scripts/check_requirements_drift.py
+```
+
+`requirements.txt` is generated from the locked base and development export.
+Regenerate it with `python scripts/sync_requirements_from_lock.py` after an
+intentional lockfile change.
+
 ## Data Directory
 
 All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./data` relativ zum Projekt-Root):

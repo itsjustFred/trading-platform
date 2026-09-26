@@ -1,16 +1,16 @@
 """Tests for runner.stats — performance metrics calculation."""
 
-from datetime import datetime, timedelta, timezone
 import math
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from runner.stats import (
-    compute_stats,
-    compute_stats_for_result,
     _daily_returns_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
+    compute_stats,
+    compute_stats_for_result,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
@@ -43,6 +43,11 @@ class TestComputeStats:
         stats = compute_stats([])
         assert stats["total_trades"] == 0
         assert stats["win_rate"] == 0.0
+        assert stats["risk_free_rate"] == pytest.approx(0.0)
+
+    def test_empty_trades_emit_supplied_risk_free_rate(self):
+        stats = compute_stats([], risk_free_rate=0.0375)
+        assert stats["risk_free_rate"] == pytest.approx(0.0375)
 
     def test_all_winners(self):
         trades = [_trade(100), _trade(200), _trade(50)]
@@ -230,6 +235,10 @@ class TestComputeStats:
         assert stats["total_return"] > 0
         assert stats["sharpe_ratio"] > 0
         assert len(daily_returns) == 29
+
+    def test_emit_supplied_risk_free_rate(self):
+        stats = compute_stats([_trade(100)], risk_free_rate=0.0375)
+        assert stats["risk_free_rate"] == pytest.approx(0.0375)
 
 
 class TestMaxConsecutiveLosses:

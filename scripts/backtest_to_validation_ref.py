@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
-from validation.reference import ValidationReference
+from validation.reference import ValidationReference, resolve_initial_capital
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
@@ -31,6 +31,23 @@ def _load_backtest_result(path: Path) -> BacktestResult:
     )
 
 
+def _to_validation_reference(result: BacktestResult) -> ValidationReference:
+    raw_metadata = dict(result.meta.__dict__)
+    raw_metadata["parsed_meta"] = result.meta.to_dict()
+    reference = ValidationReference(
+        strategy_name=result.meta.strategies[0] if result.meta.strategies else "unknown",
+        source_framework=result.meta.engine,
+        symbol=result.meta.data["symbols"][0],
+        timeframe=result.meta.data["timeframes"][0],
+        settings=dict(result.meta.parameters),
+        trades=result.trades,
+        stats=result.stats,
+        raw_metadata=raw_metadata,
+    )
+    reference.settings["initial_capital"] = resolve_initial_capital(reference)
+    return reference
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert BacktestResult JSON to ValidationReference JSON."
@@ -40,16 +57,7 @@ def main() -> None:
     args = parser.parse_args()
 
     res = _load_backtest_result(args.input)
-    ref = ValidationReference(
-        strategy_name=res.meta.strategies[0] if res.meta.strategies else "unknown",
-        source_framework=res.meta.engine,
-        symbol=res.meta.data["symbols"][0],
-        timeframe=res.meta.data["timeframes"][0],
-        settings=res.meta.parameters,
-        trades=res.trades,
-        stats=res.stats,
-        raw_metadata=res.meta.__dict__,
-    )
+    ref = _to_validation_reference(res)
     args.output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
     print(f"Wrote ValidationReference to {args.output}")
 

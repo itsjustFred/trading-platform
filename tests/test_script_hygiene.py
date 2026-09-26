@@ -139,6 +139,18 @@ def test_acquire_lock_never_deletes_a_live_lock(queue_runner) -> None:
     assert module.LOCK_PATH.read_text(encoding="utf-8").startswith("held\n")
 
 
+def test_acquire_lock_does_not_overwrite_lock_file_metadata(queue_runner) -> None:
+    module = queue_runner
+    module.MATRIX_DIR.mkdir(parents=True, exist_ok=True)
+    module.LOCK_PATH.write_text("operator-metadata\n", encoding="utf-8")
+
+    assert module.acquire_lock() is True
+    assert module.LOCK_PATH.read_text(encoding="utf-8") == ""
+    metadata = json.loads(module._lock_metadata_path().read_text(encoding="utf-8"))
+    assert metadata["pid"] > 0
+    module.release_lock()
+
+
 def test_release_lock_removes_only_own_lock(queue_runner) -> None:
     module = queue_runner
     assert module.acquire_lock() is True
@@ -196,8 +208,8 @@ def test_dedupe_reports_without_confirm_too() -> None:
 def test_signal_bot_registry_mapping_is_complete_and_loadable() -> None:
     """Every registered bot must have a mapped config that yields a non-empty mapping."""
     from signal_bots.registry import (
-        SIGNAL_PROCESSORS,
         SIGNAL_PROCESSOR_OPTIONS,
+        SIGNAL_PROCESSORS,
         get_signal_processor_config_path,
     )
 

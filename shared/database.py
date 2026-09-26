@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -192,32 +193,87 @@ def _configure_sqlite_connection(dbapi_connection: Any, _connection_record: Any)
 _DB_INIT_LOCK = threading.Lock()
 _DB_INITIALIZED = False
 _CACHED_GIT_SHA: str | None = None
-_FINAL_TASK_STATUSES = {
-    "completed",
-    "failed",
-    "cancelled",
-    "interrupted",
-    "partial",
-    "skipped",
+_EXECUTABLE_COMMAND_KEYS = frozenset(
+    {"argv", "cmd", "command", "commandline", "entrypoint", "executable", "shell"}
+)
+TASK_STATUS_VALUES = frozenset(
+    {
+        "queued",
+        "starting",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+ACTIVE_TASK_STATUSES = frozenset({"queued", "starting", "running", "paused"})
+FINAL_TASK_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+_FINAL_TASK_STATUSES = FINAL_TASK_STATUSES
+_TASK_STATUS_TO_EVIDENCE_STATUS = {
+    "queued": VerificationEvidenceStatus.PARTIAL.value,
+    "starting": VerificationEvidenceStatus.PARTIAL.value,
+    "running": VerificationEvidenceStatus.PARTIAL.value,
+    "paused": VerificationEvidenceStatus.PARTIAL.value,
+    "completed": VerificationEvidenceStatus.SUCCESS.value,
+    "failed": VerificationEvidenceStatus.FAILED.value,
+    "cancelled": VerificationEvidenceStatus.SKIPPED.value,
+    "interrupted": VerificationEvidenceStatus.FAILED.value,
+    "partial": VerificationEvidenceStatus.PARTIAL.value,
+    "skipped": VerificationEvidenceStatus.SKIPPED.value,
+    "manual_required": VerificationEvidenceStatus.FAILED.value,
+    "cleanup_pending": VerificationEvidenceStatus.PARTIAL.value,
+    "cleanup_exhausted": VerificationEvidenceStatus.FAILED.value,
 }
+
+
+def normalize_task_status(status: object) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized not in TASK_STATUS_VALUES:
+        raise ValueError(f"unknown task status: {status!r}")
+    return normalized
+
+
+def _strip_executable_command_fields(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_executable_command_fields(child)
+            for key, child in value.items()
+            if re.sub(r"[^a-z0-9]", "", str(key).lower()) not in _EXECUTABLE_COMMAND_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_executable_command_fields(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_executable_command_fields(child) for child in value)
+    return value
 
 
 def is_final_task_status(status: object) -> bool:
-    """True when ``status`` is a final background-task status.
+    """True when ``status`` is a known final background-task status."""
+    try:
+        return normalize_task_status(status) in FINAL_TASK_STATUSES
+    except ValueError:
+        return False
 
-    Public predicate so callers (e.g. the scheduler consuming a job handler's
-    reported outcome) do not have to import the private ``_FINAL_TASK_STATUSES``
-    set.
-    """
-    return isinstance(status, str) and status in _FINAL_TASK_STATUSES
-_TASK_STATUS_TO_EVIDENCE_STATUS = {
-    "completed": VerificationEvidenceStatus.SUCCESS.value,
-    "failed": VerificationEvidenceStatus.FAILED.value,
-    "interrupted": VerificationEvidenceStatus.FAILED.value,
-    "cancelled": VerificationEvidenceStatus.SKIPPED.value,
-    "partial": VerificationEvidenceStatus.PARTIAL.value,
-    "skipped": VerificationEvidenceStatus.SKIPPED.value,
-}
+
 _MANUAL_VALIDATION_CATEGORIES = {
     "discord",
     "discord_bot",
@@ -3205,10 +3261,8 @@ def list_verification_evidence_summary(
 
 
 def _task_status_to_evidence_status(task_status: str) -> str:
-    return _TASK_STATUS_TO_EVIDENCE_STATUS.get(
-        str(task_status or "").strip().lower(),
-        VerificationEvidenceStatus.SKIPPED.value,
-    )
+    normalized = normalize_task_status(task_status)
+    return _TASK_STATUS_TO_EVIDENCE_STATUS[normalized]
 
 
 def _task_requires_manual_validation(category: str) -> bool:
@@ -3377,8 +3431,8 @@ def upsert_background_task_record(
         raise ValueError("task_id is required")
 
     normalized_type = str(task_type or "").strip() or "unknown"
-    normalized_status = str(status or "").strip() or "unknown"
-    normalized_config = dict(config_json or {})
+    normalized_status = normalize_task_status(status)
+    normalized_config = _strip_executable_command_fields(dict(config_json or {}))
     now_iso = _now_iso()
     created_value = str(created_at or "").strip() or now_iso
     updated_value = str(updated_at or "").strip() or now_iso
@@ -3416,7 +3470,7 @@ def upsert_background_task_record(
         session.add(record)
         session.commit()
 
-    if normalized_status in _FINAL_TASK_STATUSES:
+    if normalized_status in FINAL_TASK_STATUSES:
         _record_task_completion_evidence(
             task_id=normalized_id,
             task_type=normalized_type,
@@ -3460,7 +3514,7 @@ def list_background_task_records(*, statuses: list[str] | None = None) -> list[d
     with get_session() as session:
         statement = select(BackgroundTaskRecord)
         if statuses:
-            normalized_statuses = [str(status).strip() for status in statuses if str(status).strip()]
+            normalized_statuses = [normalize_task_status(status) for status in statuses]
             if normalized_statuses:
                 statement = statement.where(BackgroundTaskRecord.status.in_(normalized_statuses))
         rows = session.exec(
@@ -3493,7 +3547,7 @@ def mark_background_tasks_interrupted(
     *,
     from_statuses: list[str] | tuple[str, ...] = ("queued", "running"),
 ) -> list[dict[str, Any]]:
-    normalized = [str(status).strip() for status in from_statuses if str(status).strip()]
+    normalized = [normalize_task_status(status) for status in from_statuses]
     if not normalized:
         return []
 
@@ -3831,14 +3885,26 @@ def _apply_backtest_trade_risk_fallbacks(
         return position_size, risk_amount, risk_percent
     if position_size is None:
         position_size = risk_math.get("position_size")
+    realized_amount = risk_math.get("realized_risk_amount")
+    realized_percent = risk_math.get("realized_risk_percent")
+    if realized_amount is None:
+        realized_amount = row.meta.get("realized_risk_amount")
+    if realized_percent is None:
+        realized_percent = row.meta.get("realized_risk_percent")
     if risk_amount is None:
-        risk_amount = risk_math.get("risk_target_usd")
+        risk_amount = realized_amount
     if risk_percent is None:
-        risk_percent = risk_math.get("risk_target_pct")
-        if risk_percent is None:
-            max_position_pct = risk_math.get("max_position_pct")
-            if max_position_pct is not None:
-                risk_percent = max_position_pct
+        risk_percent = realized_percent
+        if risk_percent is None and realized_amount is not None:
+            equity_at_entry = risk_math.get("equity_at_entry")
+            try:
+                equity_value = float(equity_at_entry)
+                amount_value = float(realized_amount)
+            except (TypeError, ValueError):
+                equity_value = 0.0
+                amount_value = 0.0
+            if equity_value > 0 and amount_value >= 0:
+                risk_percent = amount_value / equity_value
     return position_size, risk_amount, risk_percent
 
 

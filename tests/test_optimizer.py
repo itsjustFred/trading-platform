@@ -466,6 +466,14 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert payload["effective_best_parameters"] == {"fixed": 3, "window": 3}
     assert payload["train_stats"]["sharpe_ratio"] == 2.5
     assert payload["test_stats"]["sharpe_ratio"] == 1.7
+    assert payload["best_metric_key"] == "sharpe_ratio"
+    assert payload["best_raw_value"] == 2.5
+    assert payload["oos_comparison"] == {
+        "metric_key": "sharpe_ratio",
+        "in_sample_value": 2.5,
+        "compatible": True,
+    }
+    assert payload["oos_status"] == "available"
     assert len(payload["top_trials"]) == 4
     assert payload["top_trials"][0]["params"] == {"window": 3}
     assert any(trial["penalty_applied"] for trial in payload["top_trials"])
@@ -480,6 +488,46 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     saved_payload = json.loads(saved_files[0].read_text(encoding="utf-8"))
     assert saved_payload["best_params"] == {"window": 3}
     assert saved_payload["test_stats"]["sharpe_ratio"] == 1.7
+
+
+def test_run_optimization_persists_raw_metric_for_risk_adjusted_objective(
+    monkeypatch, tmp_path: Path
+):
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        metric = 2.0 if config.start_date.startswith("2024-01-01T00:00:00") else 1.0
+        return _trial_result(config, metric=metric, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: {**result.stats, "total_trades": len(result.trades)},
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="total_pnl",
+            n_trials=1,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
+            risk_adjust_objective=True,
+            min_trades_for_full_credit=30,
+            drawdown_penalty_weight=1.0,
+        )
+    )
+
+    assert payload["best_value"] == pytest.approx(60.0)
+    assert payload["best_raw_value"] == pytest.approx(2000.0)
+    assert payload["best_value_is_risk_adjusted"] is True
+    assert payload["oos_comparison"] == {
+        "metric_key": "total_pnl",
+        "in_sample_value": pytest.approx(2000.0),
+        "compatible": True,
+    }
+    assert payload["top_trials"][0]["raw_metric_value"] == pytest.approx(2000.0)
 
 
 def test_run_optimization_rejects_legacy_base_before_study(monkeypatch, tmp_path: Path):
@@ -649,6 +697,7 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
 
     assert payload["optimization_mode"] == "risk_parity_covariance"
     assert payload["target_metric"] == "risk_parity_score"
+    assert payload["oos_status"] == "available"
     assert set(payload["best_symbols"]) <= {"SPY", "TLT", "GLD"}
     assert payload["effective_best_parameters"]["risk_parity_weights"]
     weights = payload["effective_best_parameters"]["risk_parity_weights"].values()

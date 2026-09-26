@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { normalizeWinRate } from "../api/metricScale";
+import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
@@ -977,7 +978,12 @@ export function BacktestsPage() {
 
     try {
       const result = await deleteBacktestsBulk(ids);
-      showToast(`Deleted ${result.deleted} backtest(s).`, "success");
+      const notice = formatMaintenanceDeletionResult(
+        "backtest(s)",
+        result.deleted,
+        result.items,
+      );
+      showToast(notice.message, notice.tone);
       await loadAllMetadata(true);
     } catch (error: unknown) {
       showToast(toErrorMessage(error, "Bulk delete failed."), "error");
@@ -1010,10 +1016,12 @@ export function BacktestsPage() {
     setRunningDeduplicate(true);
     try {
       const payload = await deduplicateBacktests();
-      showToast(
-        `Removed ${payload.deleted_ids.length} duplicate backtest(s).`,
-        "success",
+      const notice = formatMaintenanceDeletionResult(
+        "duplicate backtest(s)",
+        payload.deleted_ids.length,
+        payload.items,
       );
+      showToast(notice.message, notice.tone);
       setShowDuplicatesModal(false);
       await loadAllMetadata(true);
     } catch (error: unknown) {
@@ -1042,7 +1050,12 @@ export function BacktestsPage() {
     setRunningRemoveEmpty(true);
     try {
       const payload = await removeEmptyBacktests();
-      showToast(`Removed ${payload.removed} empty backtest(s).`, "success");
+      const notice = formatMaintenanceDeletionResult(
+        "empty backtest(s)",
+        payload.removed,
+        payload.items,
+      );
+      showToast(notice.message, notice.tone);
       await loadAllMetadata(true);
     } catch (error: unknown) {
       showToast(

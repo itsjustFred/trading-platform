@@ -35,8 +35,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import Field as PydanticField
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from sqlmodel import SQLModel
@@ -47,6 +46,7 @@ from data_tools import cache_manager
 from data_tools import auto_download as _auto_download_config
 from data_tools.auto_download import reload_coverage_windows
 from data_tools.signal_import import load_signals_from_csv
+from shared.atomic_io import write_text_atomically
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
@@ -66,7 +66,7 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
-from shared.logging import get_logger
+from shared.logging import get_logger, redact_text, redact_value
 from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
@@ -116,6 +116,7 @@ from shared.database import (
     load_portfolio as load_portfolio_record,
     mark_background_tasks_interrupted,
     migrate_json_to_sqlite,
+    normalize_task_status,
     save_result_to_sqlite,
     save_portfolio as save_portfolio_record,
     upsert_verification_evidence,
@@ -218,6 +219,20 @@ REPLAY_MIN_BARS_PER_EVENT = 4
 REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_SINGLEFLIGHT_PERSISTED_KEYS = (
+    "download_request_key",
+    "owner_pid",
+    "owner_thread_id",
+    "owner_token",
+    "singleflight_owner_boot_id",
+    "singleflight_heartbeat_at",
+    "singleflight_lease_until",
+    "singleflight_lease_expires_at",
+)
+_TASK_LOG_WS_CHUNK_BYTES = 64 * 1024
+_TASK_LOG_WS_MAX_BYTES = 2 * 1024 * 1024
+_TASK_LOG_RESPONSE_MAX_LINES = 2000
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -501,6 +516,427 @@ def _run_backtest_sync(runner: Callable[[Any], Any], payload: Any) -> Any:
     return _run_coroutine_sync(lambda: _invoke())
 
 
+_RECOVERY_SPEC_VERSION = 1
+_RECOVERY_BACKTEST_ENGINES = {"native", "vectorbt", "lean", "pynecore"}
+_RECOVERY_DOWNLOAD_SOURCES = {"yfinance", "huggingface", "alpaca", "dolthub", "dukascopy", "jforex"}
+_RECOVERY_OPERATIONS = {"download", "resample", "harvest", "validate", "calibrate"}
+_RECOVERY_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
+_RECOVERY_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+_RECOVERY_EXECUTABLE_KEYS = {
+    "argv",
+    "cmd",
+    "command",
+    "commandline",
+    "entrypoint",
+    "executable",
+    "shell",
+}
+
+
+def _is_executable_recovery_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return normalized in _RECOVERY_EXECUTABLE_KEYS
+
+
+def _contains_executable_command(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _is_executable_recovery_key(key) or _contains_executable_command(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_executable_command(child) for child in value)
+    return False
+
+
+def _strip_executable_command_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_executable_command_fields(child)
+            for key, child in value.items()
+            if not _is_executable_recovery_key(key)
+        }
+    if isinstance(value, list):
+        return [_strip_executable_command_fields(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_executable_command_fields(child) for child in value)
+    return value
+
+
+class _BacktestRecoveryParameters(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: str
+    engine: str = "native"
+    symbols: list[str]
+    timeframe: str = "1d"
+    start: str = ""
+    end: str = ""
+    capital: float = 100000.0
+    risk_per_trade_pct: float | None = None
+    max_position_pct: float | None = None
+    max_leverage: float | None = None
+    modeling_resolution: str | None = None
+    intrabar_resolution: str | None = None
+    parameters: dict[str, Any] = PydanticField(default_factory=dict)
+
+
+class _BacktestRecoverySpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    kind: Literal["backtest"]
+    operation: Literal["run"]
+    parameters: _BacktestRecoveryParameters
+
+
+class _DataRecoverySpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    kind: Literal["data"]
+    operation: Literal["download", "resample", "harvest", "validate", "calibrate"]
+    source: str | None = None
+    symbols: list[str] | str | None = None
+    timeframes: list[str] | str | None = None
+    target_timeframes: list[str] | str | None = None
+    symbol: str | None = None
+    start: str | None = None
+    end: str | None = None
+    offer_side: str | None = None
+    price_type: str | None = None
+    merge_tick: bool = False
+    merge_s1: bool = False
+    batch_size: int | None = None
+    pause_ms: int | None = None
+    query_timeout_seconds: int | None = None
+    source_path: str | None = None
+    asset_class: str | None = None
+    report: str | None = None
+    start_year: int | None = None
+    min_year: int | None = None
+    force: bool = False
+    verbose: bool = False
+    parameters: dict[str, Any] = PydanticField(default_factory=dict)
+
+
+def _parse_recovery_spec(
+    raw_config: dict[str, Any], expected_kind: Literal["backtest", "data"]
+) -> _BacktestRecoverySpec | _DataRecoverySpec | None:
+    if not isinstance(raw_config, dict):
+        return None
+    candidate = raw_config.get("task_spec")
+    if not isinstance(candidate, dict):
+        return None
+    if _contains_executable_command(candidate):
+        return None
+    kind = str(candidate.get("kind") or "").strip().lower()
+    if kind != expected_kind:
+        return None
+    if kind == "data":
+        model_candidate = dict(candidate)
+        nested = model_candidate.pop("parameters", None)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                model_candidate.setdefault(key, value)
+        try:
+            return _DataRecoverySpec.model_validate(model_candidate)
+        except ValidationError:
+            return None
+    try:
+        return _BacktestRecoverySpec.model_validate(candidate)
+    except ValidationError:
+        return None
+
+
+def _recovery_spec(raw_config: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    if kind not in {"backtest", "data"}:
+        return None
+    spec = _parse_recovery_spec(raw_config, kind)
+    return spec.model_dump() if spec is not None else None
+
+
+def _recovery_backtest_spec(raw_config: dict[str, Any]) -> dict[str, Any] | None:
+    spec = _parse_recovery_spec(raw_config, "backtest")
+    return spec.model_dump() if spec is not None else None
+
+
+def _recovery_list(payload: dict[str, Any], key: str, *, required: bool) -> list[str]:
+    raw = payload.get(key)
+    if raw is None and not required:
+        return []
+    if isinstance(raw, str):
+        raw = [item for item in raw.split(",") if item.strip()]
+    if not isinstance(raw, list):
+        raise ValueError(f"{key} must be a list")
+    values: list[str] = []
+    for item in raw:
+        value = str(item or "").strip()
+        if not value or value in values:
+            continue
+        values.append(value)
+    if required and not values:
+        raise ValueError(f"{key} is required")
+    if len(values) > 256:
+        raise ValueError(f"{key} has too many values")
+    return values
+
+
+def _recovery_symbols(payload: dict[str, Any], *, required: bool) -> list[str]:
+    values = _recovery_list(payload, "symbols", required=required)
+    for value in values:
+        if _RECOVERY_SYMBOL_RE.fullmatch(value) is None:
+            raise ValueError("invalid recovery symbol")
+    return [value.upper() for value in values]
+
+
+def _recovery_timeframes(payload: dict[str, Any], *, required: bool) -> list[str]:
+    values = _recovery_list(payload, "timeframes", required=required)
+    for value in values:
+        if _RECOVERY_TIMEFRAME_RE.fullmatch(value) is None:
+            raise ValueError("invalid recovery timeframe")
+    return [value.lower() for value in values]
+
+
+def _recovery_date(payload: dict[str, Any], key: str) -> str | None:
+    value = str(payload.get(key) or "").strip()
+    if not value:
+        return None
+    if len(value) > 64 or pd.isna(pd.to_datetime(value, utc=True, errors="coerce")):
+        raise ValueError(f"invalid recovery {key}")
+    return value
+
+
+def _recovery_bool(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"invalid recovery {key}")
+    return value
+
+
+def _recovery_int(payload: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    value = payload.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError(f"invalid recovery {key}")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid recovery {key}") from exc
+    if normalized < low or normalized > high:
+        raise ValueError(f"recovery {key} is out of range")
+    return normalized
+
+
+def _backtest_request_from_recovery_spec(
+    spec: _BacktestRecoverySpec | dict[str, Any],
+) -> BacktestRunRequest:
+    if isinstance(spec, BaseModel):
+        spec = spec.model_dump()
+    nested_parameters = spec.get("parameters")
+    if isinstance(nested_parameters, dict) and "strategy" in nested_parameters:
+        payload = nested_parameters
+    else:
+        payload = spec
+    strategy = str(payload.get("strategy") or "").strip()
+    engine = str(payload.get("engine") or "native").strip().lower()
+    symbols = _recovery_symbols(payload, required=True)
+    timeframe = str(payload.get("timeframe") or "1d").strip().lower()
+    if not strategy or engine not in _RECOVERY_BACKTEST_ENGINES:
+        raise ValueError("invalid recovery backtest configuration")
+    if _RECOVERY_TIMEFRAME_RE.fullmatch(timeframe) is None:
+        raise ValueError("invalid recovery timeframe")
+    capital = _safe_float(payload.get("capital"), 100000.0)
+    if not math.isfinite(capital) or capital <= 0:
+        raise ValueError("invalid recovery capital")
+    parameters = payload.get("parameters")
+    if parameters is not None and not isinstance(parameters, dict):
+        raise ValueError("invalid recovery parameters")
+    return BacktestRunRequest(
+        strategy=strategy,
+        engine=engine,
+        symbols=symbols,
+        timeframe=timeframe,
+        start=str(payload.get("start") or ""),
+        end=str(payload.get("end") or ""),
+        capital=capital,
+        risk_per_trade_pct=payload.get("risk_per_trade_pct"),
+        max_position_pct=payload.get("max_position_pct"),
+        max_leverage=payload.get("max_leverage"),
+        modeling_resolution=(
+            str(payload["modeling_resolution"])
+            if payload.get("modeling_resolution") is not None
+            else None
+        ),
+        intrabar_resolution=(
+            str(payload["intrabar_resolution"])
+            if payload.get("intrabar_resolution") is not None
+            else None
+        ),
+        parameters=dict(parameters or {}),
+    )
+
+
+def _download_request_from_recovery_spec(
+    spec: _DataRecoverySpec | dict[str, Any],
+) -> _PreparedDownloadRequest:
+    if isinstance(spec, BaseModel):
+        spec = spec.model_dump()
+    source = str(spec.get("source") or "").strip().lower()
+    if source not in _RECOVERY_DOWNLOAD_SOURCES:
+        raise ValueError("unsupported recovery download source")
+    symbols = _recovery_symbols(spec, required=source != "dolthub")
+    timeframes = _recovery_timeframes(spec, required=source != "dolthub")
+    offer_side = str(spec.get("offer_side") or spec.get("price_type") or "bid").strip().lower()
+    if offer_side not in {"bid", "ask", "both"}:
+        raise ValueError("invalid recovery offer side")
+    request = _PreparedDownloadRequest(
+        source=source,
+        symbols=",".join(symbols),
+        timeframes=",".join(timeframes),
+        start=_recovery_date(spec, "start") or "",
+        end=_recovery_date(spec, "end") or "",
+        offer_side=offer_side,
+        merge_tick=_recovery_bool(spec, "merge_tick"),
+        merge_s1=_recovery_bool(spec, "merge_s1"),
+        batch_size=_recovery_int(spec, "batch_size", 10, 1, 50),
+        pause_ms=_recovery_int(spec, "pause_ms", 1000, 0, 60000),
+        query_timeout_seconds=_recovery_int(
+            spec,
+            "query_timeout_seconds",
+            900,
+            30,
+            int(legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS),
+        ),
+        symbol_list=symbols,
+        timeframe_list=timeframes,
+    )
+    _validate_download_limits(request)
+    return request
+
+
+def _mark_task_manual_required(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any], reason: str
+) -> None:
+    config = dict(raw_config)
+    for key in _RECOVERY_EXECUTABLE_KEYS:
+        config.pop(key, None)
+    config.pop("restart_config", None)
+    config["recovery_rejected"] = redact_text(str(reason))
+    config["recovery_mode"] = "manual"
+    config = _strip_executable_command_fields(config)
+    task = None
+    with DATA_TASKS_LOCK:
+        task = DATA_TASKS.get(task_id)
+        if task is not None:
+            was_failed = str(task.get("status") or "").lower() == "failed"
+            for key in _RECOVERY_EXECUTABLE_KEYS:
+                task.pop(key, None)
+            task.pop("restart_config", None)
+            task["status"] = "manual_required"
+            task["error"] = config["recovery_rejected"]
+            task["recovery_rejected"] = config["recovery_rejected"]
+            task["recovery_mode"] = "manual"
+            if was_failed:
+                progress_detail = dict(task.get("progress_detail") or {})
+                progress_detail["failed"] = max(1, int(progress_detail.get("failed", 0) or 0))
+                progress_detail["percent"] = 100.0
+                progress_detail["current"] = "Manual recovery required"
+                task["progress_detail"] = progress_detail
+                task["progress"] = 100.0
+            task["finished_at"] = _now_iso()
+            task["updated_at"] = task["finished_at"]
+            task_snapshot = dict(task)
+        else:
+            task_snapshot = None
+    if task_snapshot is not None:
+        _persist_task_snapshot(task_id, task_snapshot)
+        config["progress_detail"] = _json_safe(task_snapshot.get("progress_detail"))
+        config["progress_percent"] = float(task_snapshot.get("progress", 100.0) or 100.0)
+        config["finished_at"] = task_snapshot.get("finished_at")
+        config["error"] = config["recovery_rejected"]
+    upsert_background_task_record(
+        task_id=task_id,
+        task_type=str(record.get("type") or "data"),
+        status="manual_required",
+        config_json=config,
+        progress_message="Manual recovery required; typed operation was not executed",
+        name=str(record.get("name") or ""),
+        description=str(record.get("description") or ""),
+        source=str(record.get("source") or ""),
+        created_at=str(record.get("created_at") or ""),
+        updated_at=_now_iso(),
+    )
+
+
+def _queue_unrecoverable_task(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any], reason: str
+) -> None:
+    _mark_task_manual_required(record, task_id, raw_config, reason)
+
+
+def _dispatch_typed_data_recovery(
+    record: dict[str, Any], task_id: str, raw_config: dict[str, Any], spec: _DataRecoverySpec
+) -> bool:
+    payload = spec.model_dump()
+    operation = spec.operation
+    if operation not in {"download", "resample"}:
+        _mark_task_manual_required(
+            record,
+            task_id,
+            raw_config,
+            f"typed data operation '{operation}' is unsupported for automatic recovery",
+        )
+        return False
+    try:
+        if operation == "download":
+            request = _download_request_from_recovery_spec(spec)
+            name = str(record.get("name") or "Recovered data task")
+            description = str(record.get("description") or "")
+            if request.source in {"dukascopy", "jforex"}:
+                _start_jforex_download(task_id, request, name=name, description=description)
+            else:
+                _start_generic_download(task_id, request, name=name, description=description)
+            return True
+        source_path = _contained_client_data_file(
+            str(payload.get("source_path") or ""), allowed_suffix=OHLCV_PARQUET_SUFFIX
+        )
+        target_timeframes = _recovery_timeframes(
+            {"timeframes": payload.get("target_timeframes")}, required=True
+        )
+        if source_path is None or not target_timeframes:
+            raise ValueError("invalid recovery resample input")
+        command = [
+            sys.executable,
+            "-u",
+            "-m",
+            "data_tools.resample",
+            "--source",
+            str(source_path),
+            "--timeframes",
+            ",".join(target_timeframes),
+        ]
+        _start_data_task(
+            task_id,
+            command,
+            total_items=1,
+            name=str(record.get("name") or "Recovered resample task"),
+            description=str(record.get("description") or ""),
+            source="resample",
+        )
+        _apply_recovery_data_metadata(
+            task_id,
+            command=command,
+            downloader="resample",
+            task_spec=payload,
+        )
+        return True
+    except Exception as exc:
+        _mark_task_manual_required(record, task_id, raw_config, str(exc))
+        return False
+
+
 def _resume_interrupted_tasks() -> None:
     if not _LEGACY_HOOKS_INSTALLED:
         raise RuntimeError(
@@ -512,73 +948,13 @@ def _resume_interrupted_tasks() -> None:
     for record in records:
         try:
             task_id = str(record.get("id") or "").strip()
-            if not task_id:
+            if not task_id or _TASK_ID_RE.fullmatch(task_id) is None:
                 continue
-
-            task_type = str(record.get("type") or "")
+            task_type = str(record.get("type") or "").strip().lower()
             raw_config = dict(record.get("config_json") or {})
-
             if task_type == "backtest":
-                strategy = str(backtest_config.get("strategy") or "").strip()
-                symbols = backtest_config.get("symbols")
-                if not strategy or not isinstance(symbols, list) or not symbols:
-                    logger.warning(
-                        "Skipping auto-recovery for task %s: incomplete backtest restart config",
-                        task_id,
-                    )
-                    continue
-
-                logger.info(
-                    "Auto-restarting backtest task %s (%s %s %s)",
-                    task_id,
-                    strategy,
-                    ",".join(str(symbol) for symbol in symbols),
-                    str(backtest_config.get("timeframe") or "1d"),
-                )
-                request_payload = BacktestRunRequest(
-                    strategy=strategy,
-                    engine=str(backtest_config.get("engine") or "native"),
-                    symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-                    timeframe=str(backtest_config.get("timeframe") or "1d"),
-                    start=str(backtest_config.get("start") or ""),
-                    end=str(backtest_config.get("end") or ""),
-                    capital=float(backtest_config.get("capital") or 100000.0),
-                    risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
-                    max_position_pct=backtest_config.get("max_position_pct"),
-                    max_leverage=backtest_config.get("max_leverage"),
-                    modeling_resolution=(
-                        str(backtest_config.get("modeling_resolution"))
-                        if backtest_config.get("modeling_resolution") is not None
-                        else None
-                    ),
-                    intrabar_resolution=(
-                        str(backtest_config.get("intrabar_resolution"))
-                        if backtest_config.get("intrabar_resolution") is not None
-                        else None
-                    ),
-                    parameters=dict(backtest_config.get("parameters") or {}),
-                )
-                restarted = _run_backtest_sync(run_backtest, request_payload)
-                restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
-                upsert_background_task_record(
-                    task_id=task_id,
-                    task_type=task_type,
-                    status="completed",
-                    config_json=raw_config,
-                    progress_message=(
-                        f"Auto-restarted as task {restarted_task_id}"
-                        if restarted_task_id
-                        else "Auto-restarted as new task"
-                    ),
-                    name=str(record.get("name") or ""),
-                    description=str(record.get("description") or ""),
-                    source=str(record.get("source") or ""),
-                    created_at=str(record.get("created_at") or ""),
-                    updated_at=_now_iso(),
-                )
-                continue
-
-            if task_type == "data":
+                _resume_interrupted_backtest_task(record, task_id, raw_config)
+            elif task_type == "data":
                 _resume_interrupted_data_task(record, task_id, raw_config)
         except Exception as exc:
             logger.warning("Failed to recover interrupted task %s: %s", record.get("id"), exc)
@@ -587,54 +963,38 @@ def _resume_interrupted_tasks() -> None:
 def _resume_interrupted_backtest_task(
     record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
 ) -> None:
-    restart_config = raw_config.get("restart_config")
-    backtest_config = dict(restart_config) if isinstance(restart_config, dict) else dict(raw_config)
-    strategy = str(backtest_config.get("strategy") or "").strip()
-    symbols = backtest_config.get("symbols")
-    if not strategy or not isinstance(symbols, list) or not symbols:
-        logger.warning(
-            "Skipping auto-recovery for task %s: incomplete backtest restart config",
-            task_id,
-        )
+    spec = _parse_recovery_spec(raw_config, "backtest")
+    if spec is None:
+        _mark_task_manual_required(record, task_id, raw_config, "missing typed backtest spec")
         return
-
+    try:
+        request_payload = _backtest_request_from_recovery_spec(spec)
+    except (TypeError, ValueError) as exc:
+        _mark_task_manual_required(record, task_id, raw_config, str(exc))
+        return
     logger.info(
         "Auto-restarting backtest task %s (%s %s %s)",
         task_id,
-        strategy,
-        ",".join(str(symbol) for symbol in symbols),
-        str(backtest_config.get("timeframe") or "1d"),
+        request_payload.strategy,
+        ",".join(request_payload.symbols),
+        request_payload.timeframe,
     )
-    request_payload = BacktestRunRequest(
-        strategy=strategy,
-        engine=str(backtest_config.get("engine") or "native"),
-        symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-        timeframe=str(backtest_config.get("timeframe") or "1d"),
-        start=str(backtest_config.get("start") or ""),
-        end=str(backtest_config.get("end") or ""),
-        capital=float(backtest_config.get("capital") or 100000.0),
-        risk_per_trade_pct=backtest_config.get("risk_per_trade_pct"),
-        max_position_pct=backtest_config.get("max_position_pct"),
-        max_leverage=backtest_config.get("max_leverage"),
-        modeling_resolution=(
-            str(backtest_config.get("modeling_resolution"))
-            if backtest_config.get("modeling_resolution") is not None
-            else None
-        ),
-        intrabar_resolution=(
-            str(backtest_config.get("intrabar_resolution"))
-            if backtest_config.get("intrabar_resolution") is not None
-            else None
-        ),
-        parameters=dict(backtest_config.get("parameters") or {}),
-    )
-    restarted = _run_backtest_sync(run_backtest, request_payload)
+    try:
+        restarted = _run_backtest_sync(run_backtest, request_payload)
+    except Exception as exc:
+        _mark_task_manual_required(
+            record,
+            task_id,
+            raw_config,
+            f"backtest recovery failed: {exc}",
+        )
+        return
     restarted_task_id = restarted.get("task_id") if isinstance(restarted, dict) else None
     upsert_background_task_record(
         task_id=task_id,
-        task_type=str(record.get("type") or ""),
+        task_type=str(record.get("type") or "backtest"),
         status="completed",
-        config_json=raw_config,
+        config_json=_strip_executable_command_fields(raw_config),
         progress_message=(
             f"Auto-restarted as task {restarted_task_id}"
             if restarted_task_id
@@ -651,99 +1011,11 @@ def _resume_interrupted_backtest_task(
 def _resume_interrupted_data_task(
     record: dict[str, Any], task_id: str, raw_config: dict[str, Any]
 ) -> None:
-    task_type = str(record.get("type") or "")
-    source = str(record.get("source") or raw_config.get("source") or "").strip().lower()
-    downloader = str(raw_config.get("downloader") or source or "").strip().lower()
-    symbols = [str(item).strip().upper() for item in raw_config.get("symbols", []) if str(item).strip()]
-    timeframes = [
-        str(item).strip().lower()
-        for item in raw_config.get("timeframes", [])
-        if str(item).strip()
-    ]
-    total_items = max(int(raw_config.get("total_items", 0) or 0), 0)
-    name = str(record.get("name") or "Recovered data task")
-    description = str(record.get("description") or "")
-    start = str(raw_config.get("start") or "").strip() or None
-    end = str(raw_config.get("end") or "").strip() or None
-
-    if downloader in {"dukascopy", "jforex"} and symbols and timeframes:
-        _resume_interrupted_downloader_task(
-            record=record,
-            task_id=task_id,
-            raw_config=raw_config,
-            downloader=downloader,
-            symbols=symbols,
-            timeframes=timeframes,
-            total_items=total_items,
-            name=name,
-            description=description,
-            start=start,
-            end=end,
-        )
+    spec = _parse_recovery_spec(raw_config, "data")
+    if spec is None:
+        _mark_task_manual_required(record, task_id, raw_config, "missing typed data spec")
         return
-
-    command = raw_config.get("command")
-    if isinstance(command, list) and command:
-        logger.info("Auto-restarting data task %s via persisted command", task_id)
-        _start_data_task(
-            task_id,
-            [str(part) for part in command],
-            total_items=total_items,
-            name=name,
-            description=description,
-            kind="data",
-            source=source or downloader or "data",
-        )
-        _apply_recovery_data_metadata(
-            task_id,
-            command=[str(part) for part in command],
-            downloader=downloader or None,
-            symbols=symbols or None,
-            timeframes=timeframes or None,
-            start=start,
-            end=end,
-            offer_side=str(raw_config.get("offer_side") or "") or None,
-            price_type=str(raw_config.get("price_type") or "") or None,
-            merge_tick=(
-                bool(raw_config.get("merge_tick"))
-                if raw_config.get("merge_tick") is not None
-                else None
-            ),
-            merge_s1=(
-                bool(raw_config.get("merge_s1"))
-                if raw_config.get("merge_s1") is not None
-                else None
-            ),
-            batch_size=(
-                _safe_int(raw_config.get("batch_size"))
-                if raw_config.get("batch_size") is not None
-                else None
-            ),
-            pause_ms=(
-                _safe_int(raw_config.get("pause_ms"))
-                if raw_config.get("pause_ms") is not None
-                else None
-            ),
-            query_timeout_seconds=(
-                _safe_int(raw_config.get("query_timeout_seconds"))
-                if raw_config.get("query_timeout_seconds") is not None
-                else None
-            ),
-        )
-        return
-
-    upsert_background_task_record(
-        task_id=task_id,
-        task_type=task_type,
-        status="queued",
-        config_json=raw_config,
-        progress_message="Recovery pending manual restart; missing restart metadata",
-        name=str(record.get("name") or ""),
-        description=str(record.get("description") or ""),
-        source=str(record.get("source") or ""),
-        created_at=str(record.get("created_at") or ""),
-        updated_at=_now_iso(),
-    )
+    _dispatch_typed_data_recovery(record, task_id, raw_config, spec)
 
 
 def _resume_interrupted_downloader_task(
@@ -760,71 +1032,27 @@ def _resume_interrupted_downloader_task(
     start: str | None,
     end: str | None,
 ) -> None:
-    task_type = str(record.get("type") or "")
-    downloader = "dukascopy" if downloader == "dukascopy" else "jforex"
-    cmd = raw_config.get("command")
-    if not isinstance(cmd, list) or not cmd:
-        logger.warning(
-            "Skipping auto-recovery for data task %s: missing command for %s",
-            task_id,
-            downloader,
-        )
-        upsert_background_task_record(
-            task_id=task_id,
-            task_type=task_type,
-            status="queued",
-            config_json=raw_config,
-            progress_message="Recovery pending manual restart; missing restart command",
-            name=str(record.get("name") or ""),
-            description=str(record.get("description") or ""),
-            source=str(record.get("source") or ""),
-            created_at=str(record.get("created_at") or ""),
-            updated_at=_now_iso(),
+    spec = _parse_recovery_spec(raw_config, "data")
+    if spec is None or spec.operation != "download":
+        _mark_task_manual_required(record, task_id, raw_config, "missing typed downloader spec")
+        return
+    requested_source = str(spec.source or "").strip().lower()
+    if requested_source not in {"dukascopy", "jforex"}:
+        _mark_task_manual_required(
+            record, task_id, raw_config, "downloader source is not allowlisted"
         )
         return
-
-    logger.info("Auto-restarting %s data task %s", downloader, task_id)
-    cmd_list = [str(part) for part in cmd]
-    _start_jforex_task(
-        task_id,
-        cmd_list,
-        source_label=downloader,
-        allow_native_fallback=(downloader == "dukascopy"),
-        symbols=symbols,
-        timeframes=timeframes,
-        start=start,
-        end=end,
-        offer_side=str(raw_config.get("offer_side") or raw_config.get("price_type") or "bid"),
-        merge_tick=bool(raw_config.get("merge_tick", False)),
-        merge_s1=bool(raw_config.get("merge_s1", False)),
-        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-        total_items=total_items or max(len(symbols) * len(timeframes), 1),
-        name=name,
-        description=description,
-    )
-    _apply_recovery_data_metadata(
-        task_id,
-        command=cmd_list,
-        downloader=downloader,
-        symbols=symbols,
-        timeframes=timeframes,
-        start=start,
-        end=end,
-        offer_side=str(raw_config.get("offer_side") or "bid"),
-        price_type=str(raw_config.get("price_type") or "bid"),
-        merge_tick=bool(raw_config.get("merge_tick", False)),
-        merge_s1=bool(raw_config.get("merge_s1", False)),
-        batch_size=_safe_int(raw_config.get("batch_size"), 10),
-        pause_ms=_safe_int(raw_config.get("pause_ms"), 1000),
-        query_timeout_seconds=_safe_int(raw_config.get("query_timeout_seconds"), 900),
-    )
+    if requested_source != downloader:
+        _mark_task_manual_required(record, task_id, raw_config, "downloader source mismatch")
+        return
+    if not _dispatch_typed_data_recovery(record, task_id, raw_config, spec):
+        return
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
+    await asyncio.to_thread(_recover_maintenance_deletes)
     json_migration_task = asyncio.create_task(asyncio.to_thread(_run_json_to_sqlite_migration))
     data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
@@ -843,7 +1071,10 @@ async def lifespan(app: FastAPI):
     app.state.task_cache_prewarm_task = task_cache_prewarm_task
     app.state.jforex_jvm_prewarm_task = jforex_jvm_prewarm_task
     app.state.live_market_data_sync_task = live_market_data_sync_task
-    await asyncio.to_thread(mark_background_tasks_interrupted, from_statuses=["queued", "running"])
+    await asyncio.to_thread(
+        mark_background_tasks_interrupted,
+        from_statuses=["queued", "starting", "running", "paused"],
+    )
     # The hooks swap the persistence-aware task implementations onto the legacy
     # module; they MUST be installed before any helper that creates or updates
     # task records (resume below), or those writes land on the in-memory
@@ -1149,6 +1380,7 @@ class BacktestsDeduplicateResponse(SQLModel):
     deleted_ids: list[str]
     kept_ids: list[str]
     groups_affected: int
+    items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
 
 class PortfoliosDuplicatesResponse(SQLModel):
@@ -1161,6 +1393,7 @@ class PortfoliosDeduplicateResponse(SQLModel):
     deleted_ids: list[str]
     kept_ids: list[str]
     groups_affected: int
+    items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
 
 class BacktestsBulkDeleteRequest(SQLModel):
@@ -1204,7 +1437,10 @@ def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | 
     if not normalized:
         return None
     base = base_dir.resolve()
-    candidate = (base / f"{normalized}{suffix}").resolve()
+    raw_candidate = base_dir / f"{normalized}{suffix}"
+    if raw_candidate.is_symlink():
+        return None
+    candidate = raw_candidate.resolve()
     if candidate.parent != base:
         return None
     return candidate
@@ -1394,18 +1630,23 @@ async def api_request_logging_middleware(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    error_id = uuid.uuid4().hex
     logger.exception(
         "Unhandled server exception",
         extra={
             "data": {
                 "method": request.method,
                 "path": request.url.path,
+                "error_id": error_id,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
         },
     )
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error (error_id={error_id})"},
+    )
 
 
 def _load_result(backtest_id: str) -> BacktestResult | None:
@@ -1426,10 +1667,59 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
         return None
 
 
+def _validated_task_id(task_id: str) -> str:
+    normalized = str(task_id or "").strip()
+    if _TASK_ID_RE.fullmatch(normalized) is None:
+        raise HTTPException(status_code=400, detail="Invalid task id")
+    return normalized
+
+
+def _validated_task_log_path(task_id: str) -> Path:
+    normalized = _validated_task_id(task_id)
+    if TASK_LOGS_DIR.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    root = TASK_LOGS_DIR.resolve()
+    raw_candidate = root / f"task_{normalized}.log"
+    if raw_candidate.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    candidate = raw_candidate.resolve()
+    if candidate.parent != root or candidate.is_symlink():
+        raise HTTPException(status_code=400, detail="Invalid task log path")
+    return candidate
+
+
+def _task_for_log_access(task_id: str) -> tuple[str, dict[str, Any], Path]:
+    normalized = _validated_task_id(task_id)
+    record = get_background_task_record(normalized)
+    if record is None or str(record.get("id") or "") != normalized:
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
+    task = _get_task(normalized)
+    if task is None:
+        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
+    log_file = _validated_task_log_path(normalized)
+    configured_log = task.get("log_file")
+    if configured_log:
+        try:
+            configured_raw = Path(str(configured_log))
+            configured_path = configured_raw.resolve()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid task log path") from exc
+        if (
+            configured_raw.is_symlink()
+            or configured_path != log_file
+            or configured_path.is_symlink()
+        ):
+            raise HTTPException(status_code=400, detail="Invalid task log path")
+    return normalized, task, log_file
+
+
 def _task_status(task_id: str) -> str | None:
+    normalized = str(task_id or "").strip()
+    if _TASK_ID_RE.fullmatch(normalized) is None:
+        return None
     with DATA_TASKS_LOCK:
-        task = DATA_TASKS.get(task_id)
-        return task.get("status") if task else None
+        task = DATA_TASKS.get(normalized)
+        return _task_status_or_manual(task.get("status")) if task else None
 
 
 def _task_action_payload(task_id: str) -> dict[str, Any]:
@@ -1443,48 +1733,42 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
-    current_status = str(task.get("status") or "").lower()
+    current_status = _task_status_or_manual(task.get("status"))
     if current_status not in {"interrupted", "failed"}:
-        raise HTTPException(status_code=409, detail="Only interrupted or failed tasks can be restarted")
+        raise HTTPException(
+            status_code=409,
+            detail="Only interrupted or failed tasks can be restarted",
+        )
 
     record = get_background_task_record(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Task persistence record not found")
-    config_payload = dict(record.get("config_json") or {})
-    restart_config = config_payload.get("restart_config")
-    if isinstance(restart_config, dict):
-        config_payload = dict(restart_config)
-    task_type = str(record.get("type") or "")
+    raw_config = dict(record.get("config_json") or {})
+    task_type = str(record.get("type") or "").strip().lower()
 
     if task_type == "backtest":
-        strategy = str(config_payload.get("strategy") or "").strip()
-        symbols = config_payload.get("symbols")
-        if not strategy or not isinstance(symbols, list) or not symbols:
-            raise HTTPException(status_code=409, detail="Backtest restart configuration is incomplete")
-        request_payload = BacktestRunRequest(
-            strategy=strategy,
-            engine=str(config_payload.get("engine") or "native"),
-            symbols=[str(symbol) for symbol in symbols if str(symbol).strip()],
-            timeframe=str(config_payload.get("timeframe") or "1d"),
-            start=str(config_payload.get("start") or ""),
-            end=str(config_payload.get("end") or ""),
-            capital=float(config_payload.get("capital") or 100000.0),
-            risk_per_trade_pct=config_payload.get("risk_per_trade_pct"),
-            max_position_pct=config_payload.get("max_position_pct"),
-            max_leverage=config_payload.get("max_leverage"),
-            modeling_resolution=(
-                str(config_payload.get("modeling_resolution"))
-                if config_payload.get("modeling_resolution") is not None
-                else None
-            ),
-            intrabar_resolution=(
-                str(config_payload.get("intrabar_resolution"))
-                if config_payload.get("intrabar_resolution") is not None
-                else None
-            ),
-            parameters=dict(config_payload.get("parameters") or {}),
-        )
-        restarted = _run_backtest_sync(run_backtest, request_payload)
+        spec = _parse_recovery_spec(raw_config, "backtest")
+        if spec is None:
+            _mark_task_manual_required(
+                record, task_id, raw_config, "missing typed backtest spec"
+            )
+            return _task_action_payload(task_id)
+        try:
+            request_payload = _backtest_request_from_recovery_spec(spec)
+        except (HTTPException, TypeError, ValueError) as exc:
+            _mark_task_manual_required(record, task_id, raw_config, str(exc))
+            return _task_action_payload(task_id)
+        try:
+            restarted = _run_backtest_sync(run_backtest, request_payload)
+        except Exception as exc:
+            _mark_task_manual_required(
+                record,
+                task_id,
+                raw_config,
+                f"backtest restart failed: {exc}",
+            )
+            return _task_action_payload(task_id)
+        completed_config = _strip_executable_command_fields(raw_config)
         _update_task_fields(
             task_id,
             status="completed",
@@ -1501,7 +1785,7 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
             task_id=task_id,
             task_type=task_type,
             status="completed",
-            config_json=config_payload,
+            config_json=completed_config,
             progress_message="Restarted as new task",
             name=str(record.get("name") or ""),
             description=str(record.get("description") or ""),
@@ -1510,66 +1794,18 @@ def _restart_interrupted_task(task_id: str) -> dict[str, Any]:
             updated_at=_now_iso(),
         )
         payload = _task_action_payload(task_id)
-        payload["restarted_task_id"] = restarted.get("task_id") if isinstance(restarted, dict) else None
+        payload["restarted_task_id"] = (
+            restarted.get("task_id") if isinstance(restarted, dict) else None
+        )
         return payload
 
     if task_type == "data":
-        downloader = str(config_payload.get("downloader") or "").strip().lower()
-        if downloader == "jforex":
-            _update_task_fields(
-                task_id,
-                status="interrupted",
-                progress=100.0,
-                progress_detail={
-                    "completed": 0,
-                    "failed": 1,
-                    "total": max(int(task.get("total_items", 0) or 0), 0),
-                    "percent": 100.0,
-                    "current": "JForex task can only be restarted from Data page controls",
-                },
-            )
-            refreshed_task = _get_task(task_id)
-            refreshed_progress = dict((refreshed_task or {}).get("progress_detail") or {})
-            upsert_background_task_record(
-                task_id=task_id,
-                task_type=task_type,
-                status="interrupted",
-                config_json=_task_config_payload(refreshed_task) if refreshed_task is not None else config_payload,
-                progress_message=str(
-                    refreshed_progress.get("current")
-                    or "JForex task requires manual restart from Data page"
-                ),
-                name=str(record.get("name") or ""),
-                description=str(record.get("description") or ""),
-                source=str(record.get("source") or ""),
-                created_at=str(record.get("created_at") or ""),
-                updated_at=_now_iso(),
-            )
+        spec = _parse_recovery_spec(raw_config, "data")
+        if spec is None:
+            _mark_task_manual_required(record, task_id, raw_config, "missing typed data spec")
             return _task_action_payload(task_id)
-        upsert_background_task_record(
-            task_id=task_id,
-            task_type=task_type,
-            status="queued",
-            config_json=config_payload,
-            progress_message="Restart requested; re-run manually from Data page",
-            name=str(record.get("name") or ""),
-            description=str(record.get("description") or ""),
-            source=str(record.get("source") or ""),
-            created_at=str(record.get("created_at") or ""),
-            updated_at=_now_iso(),
-        )
-        _update_task_fields(
-            task_id,
-            status="queued",
-            progress=5.0,
-            progress_detail={
-                "completed": 0,
-                "failed": 0,
-                "total": max(int(task.get("total_items", 0) or 0), 0),
-                "percent": 5.0,
-                "current": "Restart requested; start a new data task",
-            },
-        )
+        if not _dispatch_typed_data_recovery(record, task_id, raw_config, spec):
+            return _task_action_payload(task_id)
         return _task_action_payload(task_id)
 
     raise HTTPException(status_code=409, detail=f"Task type '{task_type}' does not support restart")
@@ -1611,10 +1847,16 @@ _TASK_STATUS_WEIGHTS: dict[str, float] = {
     "queued": 5.0,
     "starting": 10.0,
     "running": 50.0,
+    "paused": 50.0,
     "completed": 100.0,
     "failed": 100.0,
     "cancelled": 100.0,
     "interrupted": 100.0,
+    "partial": 100.0,
+    "skipped": 100.0,
+    "manual_required": 100.0,
+    "cleanup_pending": 100.0,
+    "cleanup_exhausted": 100.0,
 }
 
 
@@ -1864,6 +2106,17 @@ def _sanitize_progress_history(entries: Any) -> list[dict[str, Any]]:
     return history[-120:]
 
 
+def _task_status_or_manual(value: object) -> str:
+    try:
+        return normalize_task_status(value)
+    except ValueError:
+        return "manual_required"
+
+
+def _task_status_weight(value: object) -> float:
+    return _TASK_STATUS_WEIGHTS.get(_task_status_or_manual(value), 100.0)
+
+
 def _ensure_task_runtime_metadata(task: dict[str, Any]) -> None:
     started_at = str(task.get("started_at") or task.get("created_at") or _now_iso())
     task["started_at"] = started_at
@@ -1895,6 +2148,7 @@ def _append_task_progress_history(task: dict[str, Any], percent: Any) -> None:
 
 
 def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
+    status = _task_status_or_manual(status)
     started = _parse_iso_datetime(task.get("started_at") or task.get("created_at"))
     if started is None:
         return None
@@ -1911,6 +2165,7 @@ def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
 
 
 def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
+    status = _task_status_or_manual(status)
     if elapsed_seconds is None or status in FINAL_TASK_STATUSES:
         return None
     progress = _safe_float(task.get("progress"), 0.0)
@@ -2090,7 +2345,11 @@ def _portfolio_stats_from_trades(
     max_drawdown = 0.0
 
     for trade in ordered_trades:
-        pnl = _safe_float(trade.get("pnl"), 0.0)
+        pnl_value = trade.get("net_pnl")
+        if pnl_value is None:
+            pnl_value = _safe_float(trade.get("pnl"), 0.0)
+            pnl_value -= _safe_float(trade.get("fees"), 0.0)
+        pnl = _safe_float(pnl_value, 0.0)
         total_pnl += pnl
         equity += pnl
         peak = max(peak, equity)
@@ -2361,30 +2620,339 @@ def _group_duplicate_portfolios() -> tuple[list[dict[str, Any]], int]:
     return duplicates, total_items
 
 
-def _delete_portfolio_with_artifacts(portfolio_id: str) -> bool:
+def _maintenance_journal_path(artifact_path: Path) -> Path:
+    return artifact_path.with_name(f".{artifact_path.name}.delete-journal.json")
+
+
+def _maintenance_staged_path(artifact_path: Path) -> Path:
+    return artifact_path.with_name(f".{artifact_path.name}.delete-staged")
+
+
+def _write_maintenance_journal(path: Path, payload: dict[str, Any]) -> None:
+    write_text_atomically(path, json.dumps(payload, sort_keys=True))
+
+
+def _remove_maintenance_journal(path: Path) -> bool:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _recover_maintenance_delete_journal(
+    journal_path: Path,
+    *,
+    kind: str,
+    expected_path: Path,
+    db_delete: Callable[[str], bool],
+) -> bool:
+    try:
+        payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    task_id = _safe_asset_id(payload.get("asset_id"))
+    if not task_id or str(payload.get("kind") or "") != kind:
+        return False
+    original = expected_path.resolve()
+    staged = _maintenance_staged_path(original)
+    if Path(str(payload.get("original") or "")).resolve() != original:
+        return False
+    if Path(str(payload.get("staged") or "")).resolve() != staged:
+        return False
+    if staged.is_symlink():
+        return False
+    phase = str(payload.get("phase") or "prepared")
+    if phase == "rollback_failed":
+        return False
+    if staged.exists():
+        if not staged.is_file():
+            return False
+        if phase != "db_deleted":
+            try:
+                db_delete(task_id)
+            except Exception:
+                return False
+        try:
+            _write_maintenance_journal(
+                journal_path,
+                {**payload, "phase": "db_deleted"},
+            )
+        except OSError:
+            return False
+        try:
+            staged.unlink()
+        except OSError:
+            return False
+        return _remove_maintenance_journal(journal_path)
+    if original.exists():
+        _remove_maintenance_journal(journal_path)
+        return False
+    if phase == "db_deleted":
+        return _remove_maintenance_journal(journal_path)
+
+    return False
+
+
+def _recover_maintenance_deletes() -> None:
+    targets = (
+        ("backtest", BACKTESTS_DIR, BACKTEST_TRADES_SUFFIX, lambda value: delete_backtest(value)),
+        (
+            "portfolio",
+            PORTFOLIOS_DIR,
+            ".json",
+            lambda value: delete_portfolio_record(value),
+        ),
+    )
+    for kind, base_dir, suffix, db_delete in targets:
+        if base_dir.is_symlink() or not base_dir.exists():
+            continue
+        try:
+            journals = list(base_dir.glob(".*.delete-journal.json"))
+        except OSError:
+            continue
+        for journal_path in journals:
+            try:
+                payload = json.loads(journal_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            asset_id = _safe_asset_id(payload.get("asset_id") if isinstance(payload, dict) else "")
+            if not asset_id:
+                continue
+            expected_path = _contained_asset_path(base_dir, asset_id, suffix)
+            if expected_path is None:
+                continue
+            _recover_maintenance_delete_journal(
+                journal_path,
+                kind=kind,
+                expected_path=expected_path,
+                db_delete=db_delete,
+            )
+
+
+def _delete_asset_with_artifacts(
+    asset_id: str,
+    *,
+    kind: str,
+    artifact_path: Path | None,
+    db_delete: Callable[[str], bool],
+) -> dict[str, Any]:
+    normalized_id = _safe_asset_id(asset_id)
+    result: dict[str, Any] = {
+        "id": normalized_id,
+        "status": "failed",
+        "database": "not_attempted",
+        "artifact": "not_attempted",
+    }
+    if not normalized_id or artifact_path is None:
+        result["error"] = "invalid asset"
+        return result
+    raw_path = artifact_path
+    if raw_path.is_symlink() or raw_path.parent.is_symlink():
+        result["error"] = "invalid artifact path"
+        return result
+    if raw_path.exists() and not raw_path.is_file():
+        result["artifact"] = "failed"
+        result["error"] = "artifact is not a regular file"
+        return result
+
+    journal_path = _maintenance_journal_path(raw_path)
+    staged_path = _maintenance_staged_path(raw_path)
+    if journal_path.exists():
+        recovered = _recover_maintenance_delete_journal(
+            journal_path,
+            kind=kind,
+            expected_path=raw_path,
+            db_delete=db_delete,
+        )
+        if (
+            recovered
+            and not journal_path.exists()
+            and not staged_path.exists()
+            and not raw_path.exists()
+        ):
+            result.update(
+                status="deleted",
+                database="recovered",
+                artifact="deleted",
+            )
+            return result
+    if staged_path.exists():
+        result.update(
+            status="cleanup_pending",
+            database="unknown",
+            artifact="staged",
+            recovery_required=True,
+            manual_required=True,
+            error="previous delete is awaiting cleanup",
+        )
+        return result
+
+    staged = False
+    if raw_path.exists():
+        payload = {
+            "version": 1,
+            "kind": kind,
+            "asset_id": normalized_id,
+            "original": str(raw_path.resolve()),
+            "staged": str(staged_path.resolve()),
+            "phase": "prepared",
+        }
+        try:
+            _write_maintenance_journal(journal_path, payload)
+            os.replace(raw_path, staged_path)
+            staged = True
+            _write_maintenance_journal(journal_path, {**payload, "phase": "staged"})
+        except OSError as exc:
+            rollback_error: OSError | None = None
+            if staged and staged_path.exists() and not raw_path.exists():
+                try:
+                    os.replace(staged_path, raw_path)
+                except OSError as restore_exc:
+                    rollback_error = restore_exc
+            if rollback_error is not None:
+                try:
+                    _write_maintenance_journal(
+                        journal_path,
+                        {**payload, "phase": "rollback_failed"},
+                    )
+                except OSError:
+                    pass
+                result.update(
+                    status="cleanup_pending",
+                    artifact="staged",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(rollback_error))[:300],
+                )
+                return result
+            if not _remove_maintenance_journal(journal_path):
+                result.update(
+                    status="cleanup_pending",
+                    artifact="restored",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(exc))[:300],
+                )
+                return result
+            result["artifact"] = "failed"
+            result["error"] = redact_text(str(exc))[:300]
+            return result
+
+    try:
+        database_deleted = bool(db_delete(normalized_id))
+    except Exception as exc:
+        if staged:
+            try:
+                os.replace(staged_path, raw_path)
+                if not _remove_maintenance_journal(journal_path):
+                    result.update(
+                        status="cleanup_pending",
+                        artifact="restored",
+                        recovery_required=True,
+                        manual_required=True,
+                        journal_pending=True,
+                        error=redact_text(str(exc))[:300],
+                    )
+                else:
+                    result["artifact"] = "restored"
+            except OSError as restore_exc:
+                try:
+                    _write_maintenance_journal(
+                        journal_path,
+                        {**payload, "phase": "rollback_failed"},
+                    )
+                except OSError:
+                    pass
+                result.update(
+                    status="cleanup_pending",
+                    artifact="staged",
+                    recovery_required=True,
+                    manual_required=True,
+                    journal_pending=True,
+                    error=redact_text(str(restore_exc))[:300],
+                )
+        else:
+            result["artifact"] = "absent"
+            result["error"] = redact_text(str(exc))[:300]
+        result["database"] = "failed"
+        return result
+
+    result["database"] = "deleted" if database_deleted else "absent"
+    if staged:
+        try:
+            _write_maintenance_journal(
+                journal_path,
+                {
+                    "version": 1,
+                    "kind": kind,
+                    "asset_id": normalized_id,
+                    "original": str(raw_path.resolve()),
+                    "staged": str(staged_path.resolve()),
+                    "phase": "db_deleted",
+                },
+            )
+        except OSError as exc:
+            result.update(
+                status="cleanup_pending",
+                artifact="staged",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
+                error=redact_text(str(exc))[:300],
+            )
+            return result
+        try:
+            staged_path.unlink()
+        except OSError as exc:
+            result.update(
+                status="cleanup_pending",
+                artifact="staged",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
+                error=redact_text(str(exc))[:300],
+            )
+            return result
+        result["artifact"] = "deleted"
+        result["status"] = "deleted"
+        if not _remove_maintenance_journal(journal_path):
+            result.update(
+                status="cleanup_pending",
+                recovery_required=True,
+                manual_required=True,
+                journal_pending=True,
+            )
+        return result
+
+    result["artifact"] = "absent"
+    result["status"] = "deleted" if database_deleted else "not_found"
+    return result
+
+
+def _delete_portfolio_with_artifacts(portfolio_id: str) -> dict[str, Any]:
     normalized_id = _safe_asset_id(portfolio_id)
     if not normalized_id:
-        return False
-
-    deleted_db = False
-    try:
-        deleted_db = delete_portfolio_record(normalized_id)
-    except Exception as exc:
-        logger.warning("Could not delete portfolio %s from DB: %s", _log_safe(normalized_id), exc)
-
+        return {
+            "id": str(portfolio_id or ""),
+            "status": "not_found",
+            "database": "absent",
+            "artifact": "absent",
+        }
     path = _contained_asset_path(PORTFOLIOS_DIR, normalized_id, ".json")
-    deleted_file = False
-    if path is not None and path.exists():
-        try:
-            path.unlink()
-            deleted_file = True
-        except OSError as exc:
-            logger.warning("Could not delete portfolio %s: %s", normalized_id, exc)
-
-    deleted = deleted_db or deleted_file
-    if deleted:
+    result = _delete_asset_with_artifacts(
+        normalized_id,
+        kind="portfolio",
+        artifact_path=path,
+        db_delete=delete_portfolio_record,
+    )
+    if result.get("status") in {"deleted", "cleanup_pending"}:
         _remove_portfolio_meta_cache(normalized_id)
-    return deleted
+    return result
 
 
 def _current_backtest_store_mtime_ns() -> int:
@@ -2908,22 +3476,25 @@ def _group_duplicate_backtests() -> tuple[list[dict[str, Any]], int]:
     return duplicates, total_items
 
 
-def _delete_backtest_with_artifacts(backtest_id: str) -> bool:
+def _delete_backtest_with_artifacts(backtest_id: str) -> dict[str, Any]:
     normalized_id = _safe_asset_id(backtest_id)
     if not normalized_id:
-        return False
-
-    deleted_in_db = delete_backtest(normalized_id)
-    _remove_backtest_meta_cache(normalized_id)
+        return {
+            "id": str(backtest_id or ""),
+            "status": "not_found",
+            "database": "absent",
+            "artifact": "absent",
+        }
     json_path = _contained_asset_path(BACKTESTS_DIR, normalized_id, BACKTEST_TRADES_SUFFIX)
-    deleted_json = False
-    if json_path is not None and json_path.exists():
-        try:
-            json_path.unlink()
-            deleted_json = True
-        except OSError as exc:
-            logger.warning("Could not delete JSON backtest %s: %s", _log_safe(normalized_id), exc)
-    return deleted_in_db or deleted_json
+    result = _delete_asset_with_artifacts(
+        normalized_id,
+        kind="backtest",
+        artifact_path=json_path,
+        db_delete=delete_backtest,
+    )
+    if result.get("status") in {"deleted", "cleanup_pending"}:
+        _remove_backtest_meta_cache(normalized_id)
+    return result
 
 
 def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
@@ -2947,11 +3518,12 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
         "error": _json_safe(task.get("error")),
         "result": _json_safe(task.get("result")),
         "restart_config": _json_safe(task.get("restart_config")),
+        "task_spec": _json_safe(task.get("task_spec")),
+        "recovery_rejected": _json_safe(task.get("recovery_rejected")),
+        "recovery_mode": _json_safe(task.get("recovery_mode")),
     }
     if task.get("pid") is not None:
         payload["pid"] = task.get("pid")
-    if task.get("command") is not None:
-        payload["command"] = _json_safe(task.get("command"))
     if task.get("downloader") is not None:
         payload["downloader"] = _json_safe(task.get("downloader"))
     for key in (
@@ -2969,20 +3541,25 @@ def _task_config_payload(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in task and task.get(key) is not None:
             payload[key] = _json_safe(task.get(key))
-    return payload
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in task and task.get(key) is not None:
+            payload[key] = _json_safe(task.get(key))
+    return _strip_executable_command_fields(payload)
 
 
 def _persist_task_snapshot(task_id: str, task: dict[str, Any]) -> None:
     try:
         _ensure_task_runtime_metadata(task)
-        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        status = _task_status_or_manual(task.get("status"))
+        task["status"] = status
+        if status in FINAL_TASK_STATUSES and not task.get("finished_at"):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         progress_detail = dict(task.get("progress_detail") or {})
         progress_message = str(progress_detail.get("current") or "")
         upsert_background_task_record(
             task_id=task_id,
             task_type=str(task.get("kind") or "unknown"),
-            status=str(task.get("status") or "unknown"),
+            status=status,
             config_json=_task_config_payload(task),
             progress_message=progress_message,
             name=str(task.get("name") or ""),
@@ -3014,7 +3591,9 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     if task.get("kind") in (None, ""):
         task["kind"] = record.get("type", "data")
     if task.get("status") in (None, ""):
-        task["status"] = record.get("status", "unknown")
+        task["status"] = _task_status_or_manual(record.get("status"))
+    else:
+        task["status"] = _task_status_or_manual(task.get("status"))
 
     config_payload = dict(record.get("config_json") or {})
     task["category"] = _normalize_task_category(
@@ -3037,9 +3616,14 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     progress_detail.setdefault("total", max(total_items, 0))
     progress_detail.setdefault(
         "percent",
-        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(str(task.get("status")), 0.0))),
+        float(config_payload.get("progress_percent", _task_status_weight(task.get("status")))),
     )
-    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    progress_detail.setdefault(
+        "current",
+        redact_text(str(record.get("progress_message") or "")),
+    )
+    if progress_detail.get("current"):
+        progress_detail["current"] = redact_text(str(progress_detail["current"]))
     task["progress"] = float(progress_detail.get("percent", 0.0) or 0.0)
     task["progress_detail"] = progress_detail
 
@@ -3049,26 +3633,68 @@ def _decorate_task_from_record(task_id: str, task: dict[str, Any]) -> None:
     task.setdefault("pause_event", threading.Event())
     task.setdefault("stop_event", threading.Event())
     task.setdefault("log_file", str(_task_log_path(task_id)))
+    if config_payload.get("task_spec") is not None:
+        task["task_spec"] = config_payload.get("task_spec")
+    for key in ("recovery_rejected", "recovery_mode"):
+        if config_payload.get(key) is not None:
+            task[key] = config_payload[key]
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in config_payload and key not in task:
+            task[key] = config_payload[key]
     record_history = _sanitize_progress_history(config_payload.get("progress_history"))
     if record_history:
         task["progress_history"] = record_history
     _ensure_task_runtime_metadata(task)
 
 
+def _singleflight_reservation_is_stale(
+    record: dict[str, Any], config_payload: dict[str, Any]
+) -> bool:
+    status = _task_status_or_manual(record.get("status"))
+    if status not in ACTIVE_TASK_STATUSES or not config_payload.get("download_request_key"):
+        return False
+    if str(config_payload.get("singleflight_owner_boot_id") or "") != str(
+        getattr(legacy_viewer, "SINGLEFLIGHT_BOOT_ID", "")
+    ):
+        return True
+    try:
+        return int(config_payload.get("owner_pid")) != os.getpid()
+    except (TypeError, ValueError):
+        return True
+
+
 def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
     task_id = str(record.get("id") or "").strip()
     config_payload = dict(record.get("config_json") or {})
     total_items = int(config_payload.get("total_items", 0) or 0)
-    status = str(record.get("status") or "unknown")
+    raw_status = str(record.get("status") or "").strip().lower()
+    stale_singleflight = _singleflight_reservation_is_stale(record, config_payload)
+    if stale_singleflight:
+        raw_status = "interrupted"
+    status = _task_status_or_manual(raw_status)
+    status_error = None
+    if stale_singleflight:
+        status_error = "Singleflight reservation invalidated by server restart"
+        for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+            config_payload.pop(key, None)
+    elif status == "manual_required" and raw_status != "manual_required":
+        status_error = "Unknown persisted task status; manual review required"
+    if status not in ACTIVE_TASK_STATUSES and config_payload.get("download_request_key"):
+        for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+            config_payload.pop(key, None)
     progress_detail = dict(config_payload.get("progress_detail") or {})
     progress_detail.setdefault("completed", 0)
     progress_detail.setdefault("failed", 0)
     progress_detail.setdefault("total", max(total_items, 0))
     progress_detail.setdefault(
         "percent",
-        float(config_payload.get("progress_percent", _TASK_STATUS_WEIGHTS.get(status, 0.0))),
+        float(config_payload.get("progress_percent", _task_status_weight(status))),
     )
-    progress_detail.setdefault("current", str(record.get("progress_message") or ""))
+    progress_detail.setdefault(
+        "current",
+        redact_text(str(record.get("progress_message") or "")),
+    )
+    raw_error = config_payload.get("error")
     task = {
         "id": task_id,
         "name": str(record.get("name") or ""),
@@ -3084,7 +3710,9 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "control_mode": str(config_payload.get("control_mode", "thread") or "thread"),
         "created_at": str(record.get("created_at") or _now_iso()),
         "updated_at": str(record.get("updated_at") or _now_iso()),
-        "started_at": str(config_payload.get("started_at") or record.get("created_at") or _now_iso()),
+        "started_at": str(
+            config_payload.get("started_at") or record.get("created_at") or _now_iso()
+        ),
         "finished_at": str(config_payload.get("finished_at") or ""),
         "category": _normalize_task_category(
             config_payload.get("category"),
@@ -3094,15 +3722,21 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "progress_history": _sanitize_progress_history(config_payload.get("progress_history")),
         "pause_event": threading.Event(),
         "stop_event": threading.Event(),
-        "error": config_payload.get("error"),
+        "error": redact_text(str(raw_error)) if raw_error is not None else status_error,
         "result": config_payload.get("result"),
     }
     if config_payload.get("pid") is not None:
         task["pid"] = config_payload.get("pid")
-    if config_payload.get("command") is not None:
-        task["command"] = config_payload.get("command")
     if config_payload.get("downloader") is not None:
         task["downloader"] = config_payload.get("downloader")
+    for key in _SINGLEFLIGHT_PERSISTED_KEYS:
+        if key in config_payload and key not in task:
+            task[key] = config_payload[key]
+    if config_payload.get("task_spec") is not None:
+        task["task_spec"] = config_payload["task_spec"]
+    for key in ("recovery_rejected", "recovery_mode"):
+        if config_payload.get(key) is not None:
+            task[key] = config_payload[key]
     for key in (
         "symbols",
         "timeframes",
@@ -3117,7 +3751,10 @@ def _build_task_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "query_timeout_seconds",
     ):
         if key in config_payload and config_payload.get(key) is not None:
-            task[key] = config_payload.get(key)
+            task[key] = config_payload[key]
+    if status_error:
+        task["recovery_mode"] = "manual"
+        task["recovery_rejected"] = status_error
     _ensure_task_runtime_metadata(task)
     return task
 
@@ -3127,6 +3764,7 @@ def _apply_recovery_data_metadata(
     *,
     command: list[str],
     downloader: str | None = None,
+    task_spec: dict[str, Any] | None = None,
     symbols: list[str] | None = None,
     timeframes: list[str] | None = None,
     start: str | None = None,
@@ -3143,8 +3781,11 @@ def _apply_recovery_data_metadata(
     if task is None:
         logger.warning("Cannot apply recovery metadata for unknown task %s", task_id)
         return
+    with DATA_TASKS_LOCK:
+        task["command"] = [str(part) for part in command]
     payload_updates: dict[str, Any] = {}
-    payload_updates["command"] = list(command)
+    if task_spec is not None:
+        payload_updates["task_spec"] = _json_safe(task_spec)
     if downloader is not None:
         payload_updates["downloader"] = downloader
     if symbols is not None:
@@ -3182,35 +3823,268 @@ def _create_task_record(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return task
 
 
+def _coalesced_cleanup_state_path() -> Path:
+    return DATA_DIR / ".coalesced-cleanup-state.json"
+
+
+def _load_coalesced_cleanup_state() -> dict[str, dict[str, Any]]:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        try:
+            payload = json.loads(_coalesced_cleanup_state_path().read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        state: dict[str, dict[str, Any]] = {}
+        for task_id, entry in payload.items():
+            normalized = str(task_id or "").strip()
+            if _TASK_ID_RE.fullmatch(normalized) is None or not isinstance(entry, dict):
+                continue
+            try:
+                attempts = max(0, int(entry.get("attempts", 0)))
+            except (TypeError, ValueError):
+                attempts = 0
+            state[normalized] = {
+                "attempts": attempts,
+                "exhausted": bool(entry.get("exhausted")),
+            }
+            if len(state) >= _COALESCED_CLEANUP_MAX_ENTRIES:
+                break
+        return state
+
+
+def _write_coalesced_cleanup_state(state: dict[str, dict[str, Any]]) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        path = _coalesced_cleanup_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomically(path, json.dumps(state, sort_keys=True))
+
+
+def _update_coalesced_cleanup_state(
+    task_id: str, *, attempts: int, exhausted: bool
+) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        state = _load_coalesced_cleanup_state()
+        state[task_id] = {
+            "attempts": max(0, int(attempts)),
+            "exhausted": bool(exhausted),
+        }
+        while len(state) > _COALESCED_CLEANUP_MAX_ENTRIES:
+            state.pop(next(iter(state)))
+        _write_coalesced_cleanup_state(state)
+
+
+def _clear_coalesced_cleanup_state(task_id: str) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        state = _load_coalesced_cleanup_state()
+        if task_id not in state:
+            return
+        state.pop(task_id, None)
+        if state:
+            _write_coalesced_cleanup_state(state)
+            return
+        try:
+            _coalesced_cleanup_state_path().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _is_coalesced_cleanup_marker(record: dict[str, Any]) -> bool:
-    return bool(dict(record.get("config_json") or {}).get("coalesced_cleanup_pending"))
+    config = dict(record.get("config_json") or {})
+    return bool(config.get("coalesced_cleanup_pending"))
+
+
+def _is_coalesced_cleanup_pending(record: dict[str, Any]) -> bool:
+    status = _task_status_or_manual(record.get("status"))
+    if status == "cleanup_exhausted":
+        return False
+    if status == "cleanup_pending" or _is_coalesced_cleanup_marker(record):
+        return True
+    if status not in {"queued", "starting", "running", "paused"}:
+        return False
+    task_id = str(record.get("id") or "").strip()
+    state = _load_coalesced_cleanup_state().get(task_id, {})
+    if state.get("exhausted"):
+        return False
+    return _coalesced_cleanup_attempts(task_id, record) > 0
+
+
+def _is_coalesced_cleanup_exhausted(record: dict[str, Any]) -> bool:
+    config = dict(record.get("config_json") or {})
+    status = _task_status_or_manual(record.get("status"))
+    if status == "cleanup_exhausted" or config.get("coalesced_cleanup_exhausted"):
+        return True
+    if status == "cleanup_pending":
+        return False
+    task_id = str(record.get("id") or "").strip()
+    state = _load_coalesced_cleanup_state().get(task_id, {})
+    return bool(state.get("exhausted"))
+
+
+def _coalesced_cleanup_attempts(
+    task_id: str, record: dict[str, Any] | None = None
+) -> int:
+    state = _load_coalesced_cleanup_state().get(task_id, {})
+    try:
+        persisted = int(state.get("attempts", 0))
+    except (TypeError, ValueError):
+        persisted = 0
+    if record is None:
+        try:
+            record = get_background_task_record(task_id)
+        except Exception:
+            record = None
+    config_attempts = 0
+    if isinstance(record, dict):
+        try:
+            config_attempts = int(
+                dict(record.get("config_json") or {}).get("coalesced_cleanup_attempts", 0)
+            )
+        except (TypeError, ValueError):
+            config_attempts = 0
+    return max(persisted, config_attempts, _COALESCED_CLEANUP_ATTEMPTS.get(task_id, 0))
 
 
 _COALESCED_CLEANUP_PENDING: set[str] = set()
+_COALESCED_CLEANUP_ORDER: list[str] = []
+_COALESCED_CLEANUP_ATTEMPTS: dict[str, int] = {}
+_COALESCED_CLEANUP_EXHAUSTED: set[str] = set()
+_COALESCED_CLEANUP_MAX_ENTRIES = 1024
+_COALESCED_CLEANUP_MAX_ATTEMPTS = 5
+_COALESCED_CLEANUP_STATE_LOCK = threading.RLock()
+
+
+def _remember_coalesced_cleanup(task_id: str) -> tuple[str, ...]:
+    evicted: list[str] = []
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        if task_id not in _COALESCED_CLEANUP_PENDING:
+            _COALESCED_CLEANUP_PENDING.add(task_id)
+            while task_id in _COALESCED_CLEANUP_ORDER:
+                _COALESCED_CLEANUP_ORDER.remove(task_id)
+            _COALESCED_CLEANUP_ORDER.append(task_id)
+        while len(_COALESCED_CLEANUP_ORDER) > _COALESCED_CLEANUP_MAX_ENTRIES:
+            oldest = _COALESCED_CLEANUP_ORDER.pop(0)
+            _COALESCED_CLEANUP_PENDING.discard(oldest)
+            _COALESCED_CLEANUP_ATTEMPTS.pop(oldest, None)
+            evicted.append(oldest)
+    return tuple(evicted)
+
+
+def _forget_coalesced_cleanup(task_id: str) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        _COALESCED_CLEANUP_PENDING.discard(task_id)
+        _COALESCED_CLEANUP_ATTEMPTS.pop(task_id, None)
+        _COALESCED_CLEANUP_EXHAUSTED.discard(task_id)
+        try:
+            _COALESCED_CLEANUP_ORDER.remove(task_id)
+        except ValueError:
+            pass
+
+
+def _persist_coalesced_cleanup_state(
+    task_id: str,
+    *,
+    attempts: int,
+    exhausted: bool,
+    fallback: dict[str, Any] | None = None,
+) -> bool:
+    try:
+        _update_coalesced_cleanup_state(
+            task_id, attempts=attempts, exhausted=exhausted
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Could not persist local coalesced cleanup state: %s", exc)
+
+    try:
+        record = get_background_task_record(task_id) or {}
+    except Exception:
+        record = {}
+    if not record and fallback is not None:
+        record = dict(fallback)
+    config = dict(record.get("config_json") or {})
+    config.pop("coalesced_cleanup_pending", None)
+    if exhausted:
+        config["coalesced_cleanup_exhausted"] = True
+    else:
+        config["coalesced_cleanup_pending"] = True
+        config["coalesced_cleanup_attempts"] = max(0, int(attempts))
+    record_values: dict[str, Any] = {
+        "task_id": task_id,
+        "task_type": str(record.get("type") or "data"),
+        "status": "cleanup_exhausted" if exhausted else "cleanup_pending",
+        "config_json": config,
+        "progress_message": (
+            "Cleanup exhausted; manual removal required"
+            if exhausted
+            else "Pending cleanup of coalesced provisional task"
+        ),
+    }
+    for key in ("name", "description", "source", "created_at"):
+        if record.get(key):
+            record_values[key] = str(record[key])
+    try:
+        upsert_background_task_record(**record_values)
+    except Exception as exc:
+        logger.warning("Could not persist coalesced cleanup marker: %s", exc)
+        return False
+    return True
+
+
+def _remember_coalesced_cleanup_exhausted(task_id: str) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        _COALESCED_CLEANUP_EXHAUSTED.add(task_id)
+        while len(_COALESCED_CLEANUP_EXHAUSTED) > _COALESCED_CLEANUP_MAX_ENTRIES:
+            _COALESCED_CLEANUP_EXHAUSTED.pop()
+
+
+def _exhaust_coalesced_cleanup(task_id: str, attempts: int) -> None:
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        _forget_coalesced_cleanup(task_id)
+    _remember_coalesced_cleanup_exhausted(task_id)
+    _persist_coalesced_cleanup_state(task_id, attempts=attempts, exhausted=True)
 
 
 def _retry_coalesced_cleanup(task_id: str) -> bool:
     try:
         delete_background_task_record(task_id)
     except Exception as exc:
-        with DATA_TASKS_LOCK:
-            _COALESCED_CLEANUP_PENDING.add(task_id)
+        attempts = _coalesced_cleanup_attempts(task_id) + 1
+        with _COALESCED_CLEANUP_STATE_LOCK:
+            _COALESCED_CLEANUP_ATTEMPTS[task_id] = attempts
+            _remember_coalesced_cleanup(task_id)
+        if attempts >= _COALESCED_CLEANUP_MAX_ATTEMPTS:
+            _exhaust_coalesced_cleanup(task_id, attempts)
+        else:
+            _persist_coalesced_cleanup_state(
+                task_id, attempts=attempts, exhausted=False
+            )
         logger.warning(
             "Could not retry provisional coalesced task cleanup %s: %s",
             task_id,
             exc,
         )
         return False
-    with DATA_TASKS_LOCK:
-        _COALESCED_CLEANUP_PENDING.discard(task_id)
+    with _COALESCED_CLEANUP_STATE_LOCK:
+        _forget_coalesced_cleanup(task_id)
+    try:
+        _clear_coalesced_cleanup_state(task_id)
+    except OSError:
+        pass
     return True
 
 
 def _get_task(task_id: str) -> dict[str, Any] | None:
+    normalized = str(task_id or "").strip()
+    if _TASK_ID_RE.fullmatch(normalized) is None:
+        return None
+    task_id = normalized
     with DATA_TASKS_LOCK:
         cleanup_pending = task_id in _COALESCED_CLEANUP_PENDING
-        if cleanup_pending:
+        cleanup_exhausted = task_id in _COALESCED_CLEANUP_EXHAUSTED
+        if cleanup_pending or cleanup_exhausted:
             DATA_TASKS.pop(task_id, None)
+    if cleanup_exhausted:
+        return None
     if cleanup_pending:
         _retry_coalesced_cleanup(task_id)
         return None
@@ -3218,7 +4092,13 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
     task = _LEGACY_GET_TASK(task_id)
     if task is not None:
         record = get_background_task_record(task_id)
-        if record is not None and _is_coalesced_cleanup_marker(record):
+        if record is not None and _is_coalesced_cleanup_exhausted(record):
+            with DATA_TASKS_LOCK:
+                DATA_TASKS.pop(task_id, None)
+            _forget_coalesced_cleanup(task_id)
+            _remember_coalesced_cleanup_exhausted(task_id)
+            return None
+        if record is not None and _is_coalesced_cleanup_pending(record):
             with DATA_TASKS_LOCK:
                 DATA_TASKS.pop(task_id, None)
             _retry_coalesced_cleanup(task_id)
@@ -3229,7 +4109,11 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
     record = get_background_task_record(task_id)
     if record is None:
         return None
-    if _is_coalesced_cleanup_marker(record):
+    if _is_coalesced_cleanup_exhausted(record):
+        _forget_coalesced_cleanup(task_id)
+        _remember_coalesced_cleanup_exhausted(task_id)
+        return None
+    if _is_coalesced_cleanup_pending(record):
         _retry_coalesced_cleanup(task_id)
         return None
     hydrated = _build_task_from_record(record)
@@ -3249,8 +4133,12 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
 
 def _evict_coalesced_cleanup_tasks() -> tuple[set[str], int]:
     with DATA_TASKS_LOCK:
-        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
-        for task_id in cleanup_ids:
+        cleanup_ids = {
+            task_id
+            for task_id in _COALESCED_CLEANUP_PENDING
+            if task_id not in _COALESCED_CLEANUP_EXHAUSTED
+        }
+        for task_id in set(_COALESCED_CLEANUP_PENDING):
             DATA_TASKS.pop(task_id, None)
         return cleanup_ids, len(DATA_TASKS)
 
@@ -3258,22 +4146,52 @@ def _evict_coalesced_cleanup_tasks() -> tuple[set[str], int]:
 def _hydrate_background_task_records(
     records: list[dict[str, Any]],
 ) -> tuple[set[str], int]:
+    cleanup_ids: set[str] = {
+        task_id
+        for task_id in _COALESCED_CLEANUP_PENDING
+        if task_id not in _COALESCED_CLEANUP_EXHAUSTED
+    }
+    exhausted_ids: set[str] = set()
     with DATA_TASKS_LOCK:
-        cleanup_ids = set(_COALESCED_CLEANUP_PENDING)
-        for task_id in cleanup_ids:
+        for task_id in set(_COALESCED_CLEANUP_PENDING) | _COALESCED_CLEANUP_EXHAUSTED:
             DATA_TASKS.pop(task_id, None)
         for record in records:
             task_id = str(record.get("id") or "").strip()
-            if not task_id:
+            if not task_id or _TASK_ID_RE.fullmatch(task_id) is None:
                 continue
-            if _is_coalesced_cleanup_marker(record):
+            if _is_coalesced_cleanup_exhausted(record):
                 DATA_TASKS.pop(task_id, None)
-                cleanup_ids.add(task_id)
+                exhausted_ids.add(task_id)
+                continue
+            if _is_coalesced_cleanup_pending(record):
+                DATA_TASKS.pop(task_id, None)
+                if _coalesced_cleanup_attempts(task_id, record) >= _COALESCED_CLEANUP_MAX_ATTEMPTS:
+                    exhausted_ids.add(task_id)
+                else:
+                    _remember_coalesced_cleanup(task_id)
+                    cleanup_ids.add(task_id)
                 continue
             if task_id in cleanup_ids or task_id in DATA_TASKS:
                 continue
             DATA_TASKS[task_id] = _build_task_from_record(record)
-        return cleanup_ids, len(DATA_TASKS)
+        terminal = sorted(
+            (
+                str(task.get("updated_at") or ""),
+                task_id,
+            )
+            for task_id, task in DATA_TASKS.items()
+            if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
+        )
+        max_terminal_tasks = int(getattr(legacy_viewer, "MAX_TERMINAL_TASKS", 1024))
+        excess = len(terminal) - max_terminal_tasks
+        if excess > 0:
+            for _, task_id in terminal[:excess]:
+                DATA_TASKS.pop(task_id, None)
+    for task_id in exhausted_ids:
+        _exhaust_coalesced_cleanup(
+            task_id, max(_COALESCED_CLEANUP_MAX_ATTEMPTS, _coalesced_cleanup_attempts(task_id))
+        )
+    return cleanup_ids, len(DATA_TASKS)
 
 
 def _hydrate_task_cache_once(force: bool = False) -> int:
@@ -3296,7 +4214,10 @@ def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
     task = _LEGACY_UPDATE_TASK_FIELDS(task_id, **updates)
     if task is not None:
         _ensure_task_runtime_metadata(task)
-        if str(task.get("status") or "").lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        if (
+            _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
+            and not task.get("finished_at")
+        ):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         if "progress" in updates:
             _append_task_progress_history(task, task.get("progress"))
@@ -3308,7 +4229,7 @@ def _set_task_status(task_id: str, status: str) -> dict[str, Any] | None:
     task = _LEGACY_SET_TASK_STATUS(task_id, status)
     if task is not None:
         _ensure_task_runtime_metadata(task)
-        if str(status).lower() in FINAL_TASK_STATUSES and not task.get("finished_at"):
+        if _task_status_or_manual(status) in FINAL_TASK_STATUSES and not task.get("finished_at"):
             task["finished_at"] = str(task.get("updated_at") or _now_iso())
         _append_task_progress_history(task, task.get("progress"))
         _persist_task_snapshot(task_id, task)
@@ -3357,31 +4278,27 @@ def _mark_task_finished(
 
 
 def _discard_coalesced_download_registration(task_id: str) -> None:
-    """Remove the provisional task created by a request that coalesced."""
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.pop(task_id, None)
     try:
         delete_background_task_record(task_id)
     except Exception as exc:
-        with DATA_TASKS_LOCK:
-            _COALESCED_CLEANUP_PENDING.add(task_id)
-        try:
-            upsert_background_task_record(
-                task_id=task_id,
-                task_type=str((task or {}).get("kind") or "data"),
-                status="cleanup_pending",
-                config_json={"coalesced_cleanup_pending": True},
-                progress_message="Pending cleanup of coalesced provisional task",
-                source=str((task or {}).get("source") or ""),
-            )
-        except Exception as marker_exc:
-            logger.exception(
-                "Could not persist cleanup marker for provisional coalesced task %s; "
-                "cleanup remains pending in memory: %s",
-                task_id,
-                marker_exc,
-            )
-            return
+        attempts = 1
+        persisted = _persist_coalesced_cleanup_state(
+            task_id,
+            attempts=attempts,
+            exhausted=False,
+            fallback={
+                "id": task_id,
+                "type": str((task or {}).get("kind") or "data"),
+                "status": "cleanup_pending",
+                "source": str((task or {}).get("source") or ""),
+                "name": str((task or {}).get("name") or ""),
+                "description": str((task or {}).get("description") or ""),
+            },
+        )
+        if not persisted:
+            _remember_coalesced_cleanup(task_id)
         logger.warning(
             "Could not remove provisional coalesced task %s; persisted cleanup marker: %s",
             task_id,
@@ -3543,7 +4460,7 @@ def _serialize_task(
         include_log=include_log,
         max_log_bytes=max_log_bytes,
     )
-    status = str(payload.get("status") or task.get("status") or "").lower()
+    status = _task_status_or_manual(payload.get("status") or task.get("status"))
     elapsed_seconds = _task_elapsed_seconds(task, status)
     eta_seconds = _task_eta_seconds(task, status, elapsed_seconds)
     progress_payload = dict(payload.get("progress") or {})
@@ -3557,6 +4474,8 @@ def _serialize_task(
         error_message = None
     elif not isinstance(error_message, str):
         error_message = str(error_message)
+    if error_message is not None:
+        error_message = redact_text(error_message)
     payload["can_restart"] = status in {"interrupted", "failed"}
     payload["category"] = _normalize_task_category(
         task.get("category"),
@@ -3575,7 +4494,8 @@ def _serialize_task(
     payload["error_message"] = error_message
     payload["provider"] = task.get("provider")
     payload["model"] = task.get("model")
-    return payload
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 _LEGACY_HOOKS_INSTALLED = False
@@ -3617,9 +4537,17 @@ def _serialize_live_timestamp(value: datetime | str | None) -> tuple[str, float]
 
 def _stable_payload_signature(payload: Any) -> str:
     try:
-        return json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+        safe_payload = redact_value(payload)
+        return json.dumps(safe_payload, sort_keys=True, default=str, separators=(",", ":"))
     except Exception:
-        return repr(payload)
+        return redact_text(repr(payload))
+
+
+def _redact_ws_message(message: Any) -> dict[str, Any]:
+    safe_message = redact_value(message)
+    if isinstance(safe_message, dict):
+        return safe_message
+    return {"type": "error", "error": "Live stream unavailable"}
 
 
 async def _queue_live_ws_message(
@@ -3629,19 +4557,21 @@ async def _queue_live_ws_message(
     if queue.full():
         with suppress(asyncio.QueueEmpty):
             queue.get_nowait()
-    await queue.put(message)
+    await queue.put(_redact_ws_message(message))
 
 
 def _live_ws_error_detail(exc: Exception) -> str:
     if isinstance(exc, HTTPException):
         detail = exc.detail
         if isinstance(detail, str):
-            return detail
+            return redact_text(detail)
         try:
-            return json.dumps(detail, ensure_ascii=False, default=str)
+            return redact_text(
+                json.dumps(redact_value(detail), ensure_ascii=False, default=str)
+            )
         except Exception:
-            return str(detail)
-    return str(exc)
+            return "Live stream unavailable"
+    return "Live stream unavailable"
 
 
 async def _consume_live_ws_messages(
@@ -3688,18 +4618,23 @@ async def _stream_live_payload(
         initial_payload = await fetch_payload()
     except Exception as exc:
         error_message = _live_ws_error_detail(exc)
-        await websocket.send_json({"type": "error", "topic": topic, "error": error_message})
+        await websocket.send_json(
+            _redact_ws_message({"type": "error", "topic": topic, "error": error_message})
+        )
+
         with suppress(Exception):
             await websocket.close(code=1008)
         return
 
     await websocket.send_json(
-        {
-            "type": "snapshot",
-            "topic": topic,
-            "data": initial_payload,
-            "ts": time.time(),
-        }
+        _redact_ws_message(
+            {
+                "type": "snapshot",
+                "topic": topic,
+                "data": initial_payload,
+                "ts": time.time(),
+            }
+        )
     )
 
     queue = await _LIVE_STREAM_BROKER.subscribe(
@@ -3720,7 +4655,7 @@ async def _stream_live_payload(
                     return
             except asyncio.TimeoutError:
                 outbound = {"type": "ping", "topic": topic, "ts": time.time()}
-            await websocket.send_json(outbound)
+            await websocket.send_json(_redact_ws_message(outbound))
     except WebSocketDisconnect:
         return
     except Exception:
@@ -3749,7 +4684,7 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
 
 
 def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
-    return {
+    payload = {
         "id": str(deployment.id),
         "strategy_name": deployment.strategy_name,
         "account_id": deployment.account_id,
@@ -3763,10 +4698,12 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "signal_config": deployment.signal_config,
         "settings": deployment.settings,
     }
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _serialize_service_payload(service: Service) -> dict[str, Any]:
-    return {
+    payload = {
         "id": str(service.id),
         "name": service.name,
         "type": service.type.value,
@@ -3775,6 +4712,8 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         "last_activity": service.last_activity.isoformat() if service.last_activity else None,
         "created_at": service.created_at.isoformat(),
     }
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
@@ -4770,9 +5709,18 @@ def _normalize_portfolio_trade_fields(raw_trade: dict[str, Any]) -> dict[str, An
     )
     trade["size"] = _safe_float(size, _safe_float(quantity, 0.0))
 
-    pnl = _trade_numeric_value(trade, "pnl", "realized_pnl", "profit", "net_profit")
-    if pnl is not None:
-        trade["pnl"] = pnl
+    gross_pnl = _trade_numeric_value(trade, "gross_pnl", "pnl", "realized_pnl", "profit")
+    net_pnl = _trade_numeric_value(trade, "net_pnl", "net_profit")
+    fees = _trade_numeric_value(trade, "fees", "commission")
+    if net_pnl is None and gross_pnl is not None:
+        net_pnl = gross_pnl - (fees or 0.0)
+    if net_pnl is not None:
+        trade["net_pnl"] = net_pnl
+        trade["pnl"] = net_pnl
+    if gross_pnl is not None:
+        trade["gross_pnl"] = gross_pnl
+    if fees is not None:
+        trade["fees"] = fees
     pnl_pct = _trade_numeric_value(trade, "pnl_pct", "profit_pct", "return_pct")
     if pnl_pct is not None:
         trade["pnl_pct"] = pnl_pct
@@ -5274,7 +6222,11 @@ def _accumulate_trade_pnls(
             if component_id not in component_ids:
                 continue
             bucket = grouped[key]
-            pnl_value = _safe_float(trade.get("pnl"), 0.0)
+            pnl_value = trade.get("net_pnl")
+            if pnl_value is None:
+                pnl_value = _safe_float(trade.get("pnl"), 0.0)
+                pnl_value -= _safe_float(trade.get("fees"), 0.0)
+            pnl_value = _safe_float(pnl_value, 0.0)
             bucket["trade_count"] = int(bucket.get("trade_count") or 0) + 1
             if pnl_value > 0:
                 bucket["wins"] = int(bucket.get("wins") or 0) + 1
@@ -7242,7 +8194,7 @@ async def get_strategy(name: str) -> dict[str, Any]:
         return legacy_viewer._strategy_payload(entry)
     except Exception as exc:
         logger.exception("Failed to build strategy payload for %s: %s", name, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy payload")) from exc
 
 
 @app.patch("/api/strategies/{name:path}")
@@ -7267,7 +8219,7 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise
     except Exception as exc:
         logger.exception("Failed to rename strategy %s: %s", _log_safe(name), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
 def _matrix_result_path(filename: str) -> Path:
@@ -7284,7 +8236,7 @@ def _matrix_summary_payload() -> dict[str, Any]:
     try:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid matrix summary: {exc}") from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -7312,7 +8264,7 @@ def _load_matrix_grid_overview_payload() -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        raise HTTPException(status_code=500, detail=f"Invalid matrix grid overview: {exc}") from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix grid overview")) from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="Invalid matrix grid overview payload")
     payload["api_source"] = str(path)
@@ -7524,6 +8476,7 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
     groups, _ = _group_duplicate_backtests()
     deleted_ids: list[str] = []
     kept_ids: list[str] = []
+    items: list[dict[str, Any]] = []
     affected = 0
 
     for group in groups:
@@ -7539,7 +8492,9 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
             backtest_id = str(entry.get("id") or "")
             if not backtest_id:
                 continue
-            if _delete_backtest_with_artifacts(backtest_id):
+            result = _delete_backtest_with_artifacts(backtest_id)
+            items.append(result)
+            if result.get("status") == "deleted":
                 deleted_ids.append(backtest_id)
                 removed_in_group = True
         if removed_in_group:
@@ -7549,12 +8504,14 @@ async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
         groups_affected=affected,
+        items=items,
     )
 
 
 @app.post("/api/backtests/remove-empty")
-async def remove_empty_backtests() -> dict[str, int]:
+async def remove_empty_backtests() -> dict[str, Any]:
     removed = 0
+    items: list[dict[str, Any]] = []
     for item in _snapshot_backtest_meta_cache():
         backtest_id = str(item.get("id") or "").strip()
         if not backtest_id:
@@ -7562,23 +8519,28 @@ async def remove_empty_backtests() -> dict[str, int]:
         trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
         if trade_count != 0:
             continue
-        if _delete_backtest_with_artifacts(backtest_id):
+        result = _delete_backtest_with_artifacts(backtest_id)
+        items.append(result)
+        if result.get("status") == "deleted":
             removed += 1
-    return {"removed": removed}
+    return {"removed": removed, "items": items}
 
 
 @app.post("/api/backtests/delete-bulk")
-async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, int]:
+async def delete_backtests_bulk(payload: BacktestsBulkDeleteRequest) -> dict[str, Any]:
     deleted = 0
     seen: set[str] = set()
+    items: list[dict[str, Any]] = []
     for raw_id in payload.ids:
         backtest_id = str(raw_id or "").strip()
         if not backtest_id or backtest_id in seen:
             continue
         seen.add(backtest_id)
-        if _delete_backtest_with_artifacts(backtest_id):
+        result = _delete_backtest_with_artifacts(backtest_id)
+        items.append(result)
+        if result.get("status") == "deleted":
             deleted += 1
-    return {"deleted": deleted}
+    return {"deleted": deleted, "items": items}
 
 
 @app.get("/api/backtests/compare")
@@ -7650,14 +8612,25 @@ async def get_backtest(
         return payload
     except Exception as exc:
         logger.exception("Failed to serialize backtest '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest serialization")) from exc
 
 
 @app.delete("/api/backtests/{backtest_id}")
 async def delete_single_backtest(backtest_id: str) -> dict[str, Any]:
-    if not _delete_backtest_with_artifacts(backtest_id):
+    result = _delete_backtest_with_artifacts(backtest_id)
+    if result.get("status") == "not_found":
         raise HTTPException(status_code=404, detail=f"Backtest '{backtest_id}' not found")
-    return {"id": backtest_id, "status": "deleted"}
+    if result.get("status") == "cleanup_pending":
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Backtest deletion is pending cleanup", "result": result},
+        )
+    if result.get("status") != "deleted":
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Backtest deletion failed", "result": result},
+        )
+    return result
 
 
 @app.patch("/api/backtests/{backtest_id}")
@@ -7685,7 +8658,7 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
         }
     except Exception as exc:
         logger.exception("Failed to rename backtest '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest rename")) from exc
 
 
 @app.put("/api/backtests/{backtest_id}/name")
@@ -7713,7 +8686,7 @@ async def get_backtest_stats(backtest_id: str) -> dict[str, Any]:
         return await asyncio.to_thread(legacy_viewer._stats_payload_from_result, result)
     except Exception as exc:
         logger.exception("Failed to compute stats for '%s': %s", backtest_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "backtest stats")) from exc
 
 
 @app.get("/api/backtest/{backtest_id}/equity")
@@ -7900,7 +8873,7 @@ async def get_backtest_capm(
     try:
         strategy_returns = _returns_from_equity_curve(equity_curve)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     benchmark_returns = _benchmark_daily_returns(
         benchmark_symbol,
@@ -7912,7 +8885,7 @@ async def get_backtest_capm(
         capm = calculate_capm(strategy_returns, benchmark_returns)
         aligned = align_return_series(strategy_returns, benchmark_returns)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     scatter = [
         CapmScatterPoint(
@@ -8475,8 +9448,12 @@ def _compare_backtests_payload(ids: str) -> dict[str, Any]:
                     "stats": stats,
                     "trades": {
                         "total_trades": len(result.trades),
-                        "winning_trades": sum(1 for trade in result.trades if trade.pnl > 0),
-                        "losing_trades": sum(1 for trade in result.trades if trade.pnl <= 0),
+                        "winning_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+                        ),
+                        "losing_trades": sum(
+                            1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) <= 0
+                        ),
                     },
                 }
             )
@@ -8511,7 +9488,9 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         )
     )
     win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
-    winning_trades = sum(1 for trade in result.trades if _safe_float(trade.pnl, 0.0) > 0)
+    winning_trades = sum(
+        1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
+    )
     losing_trades = max(len(result.trades) - winning_trades, 0)
 
     return {
@@ -8556,7 +9535,7 @@ def _run_backtest_process(
 
     Returns ``(proc, latest_message, output_path, backtest_id)``.
     """
-    command_display = " ".join(str(part) for part in cmd)
+    command_display = redact_text(" ".join(str(part) for part in cmd))
     _write_task_log_line(
         handle,
         task_id,
@@ -8861,22 +9840,29 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             "job_id": task_id,
         },
     )
+    restart_config = {
+        "strategy": strategy,
+        "engine": engine,
+        "symbols": symbols,
+        "timeframe": timeframe,
+        "start": start,
+        "end": end,
+        "capital": capital,
+        "risk_per_trade_pct": risk_pct,
+        "max_position_pct": max_position_pct,
+        "max_leverage": max_leverage,
+        "modeling_resolution": payload.modeling_resolution,
+        "intrabar_resolution": payload.intrabar_resolution,
+        "parameters": dict(params),
+    }
     _update_task_fields(
         task_id,
-        restart_config={
-            "strategy": strategy,
-            "engine": engine,
-            "symbols": symbols,
-            "timeframe": timeframe,
-            "start": start,
-            "end": end,
-            "capital": capital,
-            "risk_per_trade_pct": risk_pct,
-            "max_position_pct": max_position_pct,
-            "max_leverage": max_leverage,
-            "modeling_resolution": payload.modeling_resolution,
-            "intrabar_resolution": payload.intrabar_resolution,
-            "parameters": dict(params),
+        restart_config=restart_config,
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "backtest",
+            "operation": "run",
+            "parameters": restart_config,
         },
     )
 
@@ -8916,7 +9902,10 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             cmd.extend(["--max-leverage", str(max_leverage)])
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
-        _update_task_fields(task_id, command=list(cmd))
+        with DATA_TASKS_LOCK:
+            task = DATA_TASKS.get(task_id)
+            if task is not None:
+                task["command"] = list(cmd)
         return cmd
 
     def _run() -> None:
@@ -9121,7 +10110,7 @@ def _validate_signal_processor_name(signal_processor: Any) -> str:
         try:
             get_signal_processor(signal_processor_name, {})
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return signal_processor_name
 
 
@@ -9197,6 +10186,20 @@ def _log_safe(value: object) -> str:
     """Sanitize user-controlled values before writing them to logs (S5145)."""
     text = str(value)
     return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
+def _internal_error_detail(exc: Exception, operation: str) -> str:
+    error_id = uuid.uuid4().hex
+    logger.exception(
+        "%s failed",
+        operation,
+        extra={"data": {"operation": operation, "error_id": error_id, "error": str(exc)}},
+    )
+    return f"Internal server error (error_id={error_id})"
+
+
+def _public_value_error_detail(exc: Exception) -> str:
+    return redact_text(str(exc))[:300]
 
 
 def _validated_signal_replay_request(
@@ -9629,9 +10632,9 @@ async def _load_and_filter_csv_signals(
     try:
         loaded_signals = await asyncio.to_thread(load_signals_from_csv, file_path)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail="Signal CSV not found") from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
     if not loaded_signals:
         raise HTTPException(status_code=400, detail="CSV file contains no replayable signals")
@@ -9902,7 +10905,7 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
         payload = _load_optimization_payload(optimization_id)
     except (OSError, TypeError, ValueError) as exc:
         logger.exception("Failed to load optimization '%s': %s", _log_safe(optimization_id), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "optimization load")) from exc
 
     if payload is None:
         raise HTTPException(status_code=404, detail=f"Optimization '{optimization_id}' not found")
@@ -9959,6 +10962,7 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
     groups, _ = _group_duplicate_portfolios()
     deleted_ids: list[str] = []
     kept_ids: list[str] = []
+    items: list[dict[str, Any]] = []
     affected = 0
 
     for group in groups:
@@ -9974,7 +10978,9 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
             portfolio_id = str(entry.get("id") or "")
             if not portfolio_id:
                 continue
-            if _delete_portfolio_with_artifacts(portfolio_id):
+            result = _delete_portfolio_with_artifacts(portfolio_id)
+            items.append(result)
+            if result.get("status") == "deleted":
                 deleted_ids.append(portfolio_id)
                 removed_in_group = True
         if removed_in_group:
@@ -9984,6 +10990,7 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
         groups_affected=affected,
+        items=items,
     )
 
 
@@ -9991,13 +10998,16 @@ async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
 async def remove_empty_portfolios() -> dict[str, Any]:
     portfolios = _snapshot_portfolio_payloads()
     removed_ids: list[str] = []
+    items: list[dict[str, Any]] = []
     for portfolio in portfolios:
         portfolio_id = str(portfolio.get("id") or "").strip()
         components = portfolio.get("components")
         has_components = isinstance(components, list) and len(components) > 0
         if not portfolio_id or has_components:
             continue
-        if _delete_portfolio_with_artifacts(portfolio_id):
+        result = _delete_portfolio_with_artifacts(portfolio_id)
+        items.append(result)
+        if result.get("status") == "deleted":
             removed_ids.append(portfolio_id)
 
     remaining = len(_snapshot_portfolio_payloads())
@@ -10005,7 +11015,14 @@ async def remove_empty_portfolios() -> dict[str, Any]:
         "removed": len(removed_ids),
         "remaining": remaining,
         "removed_ids": removed_ids,
+        "items": items,
     }
+
+
+def _weighted_trade_value(value: Any, weight: float) -> float | None:
+    if value is None:
+        return None
+    return round(_safe_float(value, 0.0) * weight, 6)
 
 
 def _build_portfolio_components_from_backtests(
@@ -10079,6 +11096,9 @@ def _build_portfolio_components_from_backtests(
                     "timeframe": timeframe,
                     "backtest_id": backtest_id,
                     "pnl": round(_safe_float(viewer_trade.get("pnl"), 0.0) * weight, 6),
+                    "net_pnl": _weighted_trade_value(viewer_trade.get("net_pnl"), weight),
+                    "gross_pnl": _weighted_trade_value(viewer_trade.get("gross_pnl"), weight),
+                    "fees": _weighted_trade_value(viewer_trade.get("fees"), weight),
                 }
             )
             trade_payload["time"] = _component_trade_time(trade_payload)
@@ -10291,17 +11311,20 @@ def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/portfolios/delete-bulk")
-async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[str, int]:
+async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[str, Any]:
     deleted = 0
     seen: set[str] = set()
+    items: list[dict[str, Any]] = []
     for raw_id in payload.ids:
         portfolio_id = str(raw_id or "").strip()
         if not portfolio_id or portfolio_id in seen:
             continue
         seen.add(portfolio_id)
-        if _delete_portfolio_with_artifacts(portfolio_id):
+        result = _delete_portfolio_with_artifacts(portfolio_id)
+        items.append(result)
+        if result.get("status") == "deleted":
             deleted += 1
-    return {"deleted": deleted}
+    return {"deleted": deleted, "items": items}
 
 
 @app.get("/api/portfolios/{portfolio_id}")
@@ -10331,7 +11354,7 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
         logger.exception("Failed to rename portfolio '%s': %s", _log_safe(portfolio_id), exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "portfolio rename")) from exc
 
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
@@ -10369,9 +11392,20 @@ async def get_portfolio_trades(
 
 @app.delete("/api/portfolios/{portfolio_id}")
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
-    if not _delete_portfolio_with_artifacts(portfolio_id):
+    result = _delete_portfolio_with_artifacts(portfolio_id)
+    if result.get("status") == "not_found":
         raise HTTPException(status_code=404, detail="Portfolio not found")
-    return {"status": "deleted", "id": portfolio_id}
+    if result.get("status") == "cleanup_pending":
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Portfolio deletion is pending cleanup", "result": result},
+        )
+    if result.get("status") != "deleted":
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Portfolio deletion failed", "result": result},
+        )
+    return result
 
 
 def _execution_risk_value(
@@ -10582,7 +11616,7 @@ async def create_service_endpoint(payload: ServiceCreateRequest) -> dict[str, An
         )
         created = await asyncio.to_thread(create_service, service)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return _serialize_service_payload(created)
 
 
@@ -10602,7 +11636,7 @@ async def update_service_status_endpoint(
     try:
         updated = await asyncio.to_thread(update_service_status, service_id, payload.status)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     return _serialize_service_payload(updated)
@@ -10665,6 +11699,26 @@ def _entry_matches_service_log(entry: dict[str, Any], *, service: Service, token
     return False
 
 
+def _log_entry_level_search_predicate(
+    level: str,
+    search: str,
+) -> Callable[[str, dict[str, Any] | None], bool] | None:
+    level_filter = legacy_viewer._normalize_log_levels(level)
+    query = search.lower() if search else ""
+    if not level_filter and not query:
+        return None
+
+    def matches(safe_line: str, payload: dict[str, Any] | None) -> bool:
+        if query and query not in safe_line.lower():
+            return False
+        if not level_filter:
+            return True
+        entry_level = legacy_viewer._extract_log_level(safe_line, payload)
+        return entry_level in level_filter
+
+    return matches
+
+
 @app.get("/api/services/{service_id}/logs")
 async def get_service_logs_endpoint(
     service_id: str,
@@ -10676,21 +11730,19 @@ async def get_service_logs_endpoint(
     if service is None:
         raise HTTPException(status_code=404, detail=SERVICE_NOT_FOUND_DETAIL)
     try:
-        entries = legacy_viewer._collect_log_entries(legacy_viewer._available_log_files())
-        level_filter = legacy_viewer._normalize_log_levels(level)
-        if level_filter:
-            entries = [entry for entry in entries if entry.get("level") in level_filter]
+        entries = legacy_viewer._collect_log_entries(
+            legacy_viewer._available_log_files(),
+            predicate=_log_entry_level_search_predicate(level, search),
+        )
         service_terms = _service_log_tokens(service)
         entries = [
             entry
             for entry in entries
             if _entry_matches_service_log(entry, service=service, tokens=service_terms)
         ]
-        if search:
-            query_lower = search.lower()
-            entries = [entry for entry in entries if query_lower in entry["line"].lower()]
         total_lines = len(entries)
-        recent_entries = entries[-lines:] if len(entries) > lines else entries
+        response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
+        recent_entries = entries[-response_limit:] if len(entries) > response_limit else entries
         return LogContentModel(
             name=f"service:{service.name}",
             lines=[entry["line"] for entry in recent_entries],
@@ -10698,7 +11750,7 @@ async def get_service_logs_endpoint(
         )
     except Exception as exc:
         logger.exception("Failed to load service logs for %s: %s", service_id, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "service logs")) from exc
 
 
 @app.get("/api/verification/evidence")
@@ -10717,7 +11769,7 @@ async def get_verification_evidence(
             limit=limit,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 @app.get("/api/verification/evidence/summary")
@@ -10734,7 +11786,7 @@ async def get_verification_evidence_summary(
             limit=limit,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 @app.post(
@@ -10766,7 +11818,7 @@ async def create_verification_evidence(
             run_id=payload.run_id,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
 
 
 async def _resolve_live_deployment_signal_source(
@@ -10949,7 +12001,7 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         try:
             created_deployment = await asyncio.to_thread(create_live_deployment, deployment)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
         created.append(_serialize_live_deployment_payload(created_deployment))
     return {
         "status": "created",
@@ -11001,7 +12053,7 @@ async def create_live_deployment_endpoint(
         try:
             get_signal_processor(signal_processor_name, {})
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
         signal_config_payload["signal_processor"] = signal_processor_name
 
     (
@@ -11035,11 +12087,11 @@ async def create_live_deployment_endpoint(
     try:
         validate_stockkit_deployment_route(deployment)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return _serialize_live_deployment_payload(created)
 
 
@@ -11057,7 +12109,7 @@ async def update_live_deployment_status_endpoint(
             update_live_deployment_status, deployment_id, payload.status
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
     return _serialize_live_deployment_payload(updated)
@@ -11310,10 +12362,15 @@ def _validate_download_limits(request: _PreparedDownloadRequest) -> None:
     if request.pause_ms < 0 or request.pause_ms > 60000:
         raise HTTPException(status_code=400, detail="pause_ms must be between 0 and 60000")
     if request.source in {"dukascopy", "jforex"} and (
-        request.query_timeout_seconds < 30 or request.query_timeout_seconds > 7200
+        request.query_timeout_seconds < 30
+        or request.query_timeout_seconds > legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS
     ):
         raise HTTPException(
-            status_code=400, detail="query_timeout_seconds must be between 30 and 7200"
+            status_code=400,
+            detail=(
+                "query_timeout_seconds must be between 30 and "
+                f"{int(legacy_viewer.MAX_DATA_QUERY_TIMEOUT_SECONDS)}"
+            ),
         )
 
 
@@ -11365,6 +12422,27 @@ def _prepare_download_request(payload: DataDownloadRequest) -> _PreparedDownload
     _validate_download_limits(request)
     _validate_download_genesis(request)
     return request
+
+
+def _download_task_spec(
+    request: _PreparedDownloadRequest, *, source: str | None = None
+) -> dict[str, Any]:
+    return {
+        "version": _RECOVERY_SPEC_VERSION,
+        "kind": "data",
+        "operation": "download",
+        "source": str(source or request.source).strip().lower(),
+        "symbols": list(request.symbol_list),
+        "timeframes": list(request.timeframe_list),
+        "start": request.start or None,
+        "end": request.end or None,
+        "offer_side": request.offer_side,
+        "merge_tick": request.merge_tick,
+        "merge_s1": request.merge_s1,
+        "batch_size": request.batch_size,
+        "pause_ms": request.pause_ms,
+        "query_timeout_seconds": request.query_timeout_seconds,
+    }
 
 
 def _jforex_download_command(request: _PreparedDownloadRequest) -> list[str]:
@@ -11422,6 +12500,7 @@ def _start_jforex_download(
             task_id,
             command=[str(part) for part in cmd],
             downloader=source_label,
+            task_spec=_download_task_spec(request, source=source_label),
             symbols=request.symbol_list,
             timeframes=request.timeframe_list,
             start=request.start or None,
@@ -11486,6 +12565,7 @@ def _start_generic_download(
             task_id,
             command=[str(part) for part in cmd],
             downloader=request.source,
+            task_spec=_download_task_spec(request),
             symbols=request.symbol_list,
             timeframes=request.timeframe_list,
             start=request.start or None,
@@ -11659,6 +12739,17 @@ async def data_resample(payload: DataResampleRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="resample",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "resample",
+            "source_path": str(source_path),
+            "target_timeframes": [
+                item.strip().lower()
+                for item in str(target_timeframes).split(",")
+                if item.strip()
+            ],
+        },
     )
     return result
 
@@ -11702,6 +12793,15 @@ async def data_harvest(payload: DataHarvestRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="harvest",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "harvest",
+            "source": "dukascopy",
+            "symbols": [symbol],
+            "asset_class": asset_class or None,
+            "start": start or None,
+        },
         symbols=[symbol],
         start=start or None,
     )
@@ -11728,6 +12828,13 @@ async def data_validate(payload: DataValidateRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="validate",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "validate",
+            "symbol": str(payload.symbol).strip().upper() if payload.symbol else None,
+            "report": str(payload.report).strip() if payload.report else None,
+        },
         symbols=[str(payload.symbol).strip().upper()] if payload.symbol else None,
     )
     return result
@@ -11773,6 +12880,23 @@ async def data_calibrate(payload: DataCalibrateRequest) -> dict[str, Any]:
         task_id,
         command=[str(part) for part in cmd],
         downloader="calibrate",
+        task_spec={
+            "version": _RECOVERY_SPEC_VERSION,
+            "kind": "data",
+            "operation": "calibrate",
+            "source": "dukascopy",
+            "symbols": [s.strip().upper() for s in symbols.split(",") if s.strip()],
+            "timeframes": (
+                [tf.strip().lower() for tf in str(payload.timeframes).split(",") if tf.strip()]
+                if payload.timeframes
+                else []
+            ),
+            "price_type": str(payload.price_type or "bid").strip().lower(),
+            "start_year": int(payload.start_year),
+            "min_year": int(payload.min_year),
+            "force": bool(payload.force),
+            "verbose": bool(payload.verbose),
+        },
         symbols=[s.strip().upper() for s in symbols.split(",") if s.strip()],
         timeframes=(
             [tf.strip().lower() for tf in str(payload.timeframes).split(",") if tf.strip()]
@@ -11791,7 +12915,7 @@ async def list_data_tasks() -> dict[str, Any]:
         snapshots = [(task_id, dict(task)) for task_id, task in DATA_TASKS.items()]
     payload: list[dict[str, Any]] = []
     for task_id, task in snapshots:
-        status = str(task.get("status") or "").lower()
+        status = _task_status_or_manual(task.get("status"))
         include_log = status not in FINAL_TASK_STATUSES
         item = _serialize_task(task_id, task, include_log=include_log, max_log_bytes=64)
         item.pop("log", None)
@@ -11812,6 +12936,7 @@ async def list_tasks() -> dict[str, Any]:
 
 @app.get("/api/data/tasks/{task_id}")
 async def get_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _snapshot_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
@@ -11820,17 +12945,19 @@ async def get_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/restart")
 async def restart_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     return await asyncio.to_thread(_restart_interrupted_task, task_id)
 
 
 @app.post("/api/data/tasks/{task_id}/pause")
 async def pause_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["pause_event"].set()
@@ -11845,12 +12972,13 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/resume")
 async def resume_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["pause_event"].clear()
@@ -11865,12 +12993,13 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
 
 @app.post("/api/data/tasks/{task_id}/cancel")
 async def cancel_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     task = _get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be cancelled")
-    if task.get("status") in FINAL_TASK_STATUSES:
+    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
         return _task_action_payload(task_id)
 
     task["stop_event"].set()
@@ -11886,23 +13015,21 @@ async def cancel_data_task(task_id: str) -> dict[str, Any]:
 
 @app.get("/api/data/tasks/{task_id}/logs")
 async def get_data_task_logs(task_id: str) -> dict[str, Any]:
-    task = _snapshot_task(task_id)
-    log_file = _task_log_path(task_id)
-    if task is None and not log_file.exists():
-        raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
+    task_id, task, log_file = _task_for_log_access(task_id)
     return {
-        "logs": _read_task_log(task.get("log_file", log_file) if task else log_file),
-        "status": task.get("status", "unknown") if task else "unknown",
+        "logs": _read_task_log(log_file, max_bytes=64 * 1024),
+        "status": _task_status_or_manual(task.get("status")),
     }
 
 
 @app.delete("/api/data/tasks/{task_id}")
 async def delete_data_task(task_id: str) -> dict[str, Any]:
+    task_id = _validated_task_id(task_id)
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
-        if task.get("status") not in FINAL_TASK_STATUSES:
+        if _task_status_or_manual(task.get("status")) not in FINAL_TASK_STATUSES:
             raise HTTPException(
                 status_code=409,
                 detail="Only completed, failed, or cancelled tasks can be removed",
@@ -11940,7 +13067,7 @@ async def delete_symbol_data(path: str = Query(default="")) -> dict[str, Any]:
         _refresh_catalog()
         return {"status": "deleted"}
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "data deletion")) from exc
 
 
 @app.get("/api/logs")
@@ -11989,7 +13116,10 @@ async def get_log(
         raise HTTPException(status_code=404, detail="Log file not found")
 
     try:
-        entries = legacy_viewer._collect_log_entries(paths)
+        entries = legacy_viewer._collect_log_entries(
+            paths,
+            predicate=_log_entry_level_search_predicate(level, search),
+        )
         if log_name == ALL_LOGS_NAME:
             entries.sort(
                 key=lambda item: (
@@ -12000,16 +13130,9 @@ async def get_log(
                 )
             )
 
-        level_filter = legacy_viewer._normalize_log_levels(level)
-        if level_filter:
-            entries = [entry for entry in entries if entry.get("level") in level_filter]
-
-        if search:
-            query_lower = search.lower()
-            entries = [entry for entry in entries if query_lower in entry["line"].lower()]
-
         total_lines = len(entries)
-        recent_entries = entries[-lines:] if len(entries) > lines else entries
+        response_limit = min(lines, _TASK_LOG_RESPONSE_MAX_LINES)
+        recent_entries = entries[-response_limit:] if len(entries) > response_limit else entries
         return LogContentModel(
             name=log_name,
             lines=[entry["line"] for entry in recent_entries],
@@ -12017,7 +13140,7 @@ async def get_log(
         )
     except Exception as exc:
         logger.exception("Failed to read log '%s': %s", log_name, exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "log read")) from exc
 
 
 def _symbols_payload() -> dict[str, Any]:
@@ -12168,40 +13291,66 @@ async def live_executions_socket(websocket: WebSocket, account_id: str) -> None:
 
 @app.websocket("/ws/tasks/{job_id}")
 async def task_log_socket(websocket: WebSocket, job_id: str) -> None:
+    try:
+        task_id, _task, log_path = _task_for_log_access(job_id)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
 
-    log_path = TASK_LOGS_DIR / f"task_{job_id}.log"
     position = 0
+    total_sent = 0
+    pending = ""
     idle_cycles = 0
 
     try:
         while True:
-            if log_path.exists():
-                with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                    handle.seek(position)
-                    chunk = handle.read()
-                    position = handle.tell()
-
+            if log_path.is_file() and not log_path.is_symlink():
+                try:
+                    size = log_path.stat().st_size
+                    if size < position:
+                        position = 0
+                    with log_path.open("rb") as handle:
+                        handle.seek(position)
+                        remaining = min(_TASK_LOG_WS_CHUNK_BYTES, _TASK_LOG_WS_MAX_BYTES - total_sent)
+                        chunk = handle.read(max(0, remaining))
+                        position = handle.tell()
+                except OSError:
+                    chunk = b""
                 if chunk:
-                    for line in chunk.splitlines():
-                        await websocket.send_text(line)
+                    total_sent += len(chunk)
+                    pending += chunk.decode("utf-8", errors="replace")
+                    complete_lines = pending.splitlines(keepends=True)
+                    if complete_lines and not complete_lines[-1].endswith(("\n", "\r")):
+                        pending = complete_lines.pop()
+                    else:
+                        pending = ""
+                    for raw_line in complete_lines:
+                        await websocket.send_text(redact_text(raw_line.rstrip("\r\n")))
                 idle_cycles = 0
             else:
                 idle_cycles += 1
 
-            status = _task_status(job_id)
+            status = _task_status(task_id)
             if status in FINAL_TASK_STATUSES:
-                await websocket.send_text(f"[task:{job_id}] status={status}")
+                if pending:
+                    await websocket.send_text(redact_text(pending))
+                await websocket.send_text(f"[task:{task_id}] status={status}")
                 await websocket.close()
                 return
 
+            if total_sent >= _TASK_LOG_WS_MAX_BYTES:
+                await websocket.send_text("[task:log] output limit reached")
+                await websocket.close(code=1009)
+                return
+
             if idle_cycles > 120 and status is None:
-                await websocket.send_text(f"[task:{job_id}] no log stream available")
+                await websocket.send_text(f"[task:{task_id}] no log stream available")
                 await websocket.close(code=1000)
                 return
 
             await asyncio.sleep(0.5)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, OSError, ValueError):
         return
 
 

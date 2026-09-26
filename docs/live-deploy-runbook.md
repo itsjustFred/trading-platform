@@ -9,6 +9,22 @@ Status: credential-gated as of 2026-07-13.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 
+## Provisioning and Rotation
+
+Provision the deployment file from `live_deployments.example.yaml` into the
+ignored `live_deployments.yaml`. Replace every environment placeholder with a
+value obtained from the broker or Discord administration console; do not copy
+account references, channel IDs, or author IDs into the example or any tracked
+file.
+
+Keep secrets and account references in the ignored `.accounts.env` and local
+deployment file. When a broker account, API key, OAuth token, Discord channel,
+or trusted author changes, provision the replacement through the provider,
+update the local files, run the non-ordering preflight, and revoke the old
+credential or access grant. Keep deployments paused until paper verification is
+complete. Account references are routing metadata rather than secrets, but they
+must still be rotated when an account is retired or reassigned.
+
 ## Non-Ordering Preflight
 
 ```bash

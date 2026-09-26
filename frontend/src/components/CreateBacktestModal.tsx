@@ -13,6 +13,13 @@ import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 // Canonical timeframe order from smallest to largest (matches shared/constants.py)
 const TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
+const ENGINE_BADGE_TONES: Record<string, CSSProperties> = {
+  native: { color: "#86efac", backgroundColor: "rgba(20, 83, 45, 0.35)" },
+  pynecore: { color: "#93c5fd", backgroundColor: "rgba(30, 64, 175, 0.35)" },
+  lean: { color: "#c4b5fd", backgroundColor: "rgba(76, 29, 149, 0.35)" },
+  vectorbt: { color: "#fcd34d", backgroundColor: "rgba(120, 53, 15, 0.35)" },
+  default: { color: "#e2e8f0", backgroundColor: "rgba(51, 65, 85, 0.45)" },
+};
 const TIMEFRAME_LABELS: Record<string, string> = {
   tick: "Tick",
   s1: "1 Second",

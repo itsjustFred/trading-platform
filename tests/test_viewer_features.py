@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+from io import StringIO
 import threading
 import time
 import traceback
@@ -15,6 +17,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.websockets import WebSocketDisconnect
+
 from shared.models import (
     BacktestMeta,
     BacktestResult,
@@ -1360,7 +1364,7 @@ def test_download_registry_coalesces_concurrent_identical_requests(viewer_client
 
     def register(index: int) -> None:
         barrier.wait()
-        record = {"id": f"task-{index}", "status": "starting"}
+        record = {"id": f"task-{index:03d}", "status": "starting"}
         existing = viewer_app_module.legacy_viewer._register_download_task(
             record, request_key
         )
@@ -1804,6 +1808,46 @@ def test_data_download_discards_persisted_record_for_coalesced_request(
     assert deleted.isdisjoint(persisted)
 
 
+def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "DATA_DIR", tmp_path)
+    first_write_started = threading.Event()
+    release_first_write = threading.Event()
+    write_calls: list[dict] = []
+    real_write = viewer_app_module._write_coalesced_cleanup_state
+
+    def blocking_write(state):
+        write_calls.append(dict(state))
+        if len(write_calls) == 1:
+            first_write_started.set()
+            assert release_first_write.wait(timeout=2)
+        real_write(state)
+
+    monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+    first = threading.Thread(
+        target=viewer_app_module._update_coalesced_cleanup_state,
+        args=("cleanup-0001",),
+        kwargs={"attempts": 1, "exhausted": False},
+    )
+    second = threading.Thread(
+        target=viewer_app_module._update_coalesced_cleanup_state,
+        args=("cleanup-0002",),
+        kwargs={"attempts": 1, "exhausted": False},
+    )
+    first.start()
+    assert first_write_started.wait(timeout=2)
+    second.start()
+    time.sleep(0.05)
+    assert len(write_calls) == 1
+    release_first_write.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    state = viewer_app_module._load_coalesced_cleanup_state()
+    assert set(state) == {"cleanup-0001", "cleanup-0002"}
+
+
 def test_coalesced_cleanup_failure_persists_retryable_marker(
     viewer_client, monkeypatch
 ):
@@ -1840,7 +1884,10 @@ def test_coalesced_cleanup_failure_persists_retryable_marker(
             "task_id": "task-provisional",
             "task_type": "data",
             "status": "cleanup_pending",
-            "config_json": {"coalesced_cleanup_pending": True},
+            "config_json": {
+                "coalesced_cleanup_pending": True,
+                "coalesced_cleanup_attempts": 1,
+            },
             "progress_message": "Pending cleanup of coalesced provisional task",
             "source": "yfinance",
         }
@@ -1932,12 +1979,82 @@ def test_coalesced_cleanup_marker_failure_retries_from_memory(
         "delete_background_task_record",
         lambda value: delete_attempts.append(value) or True,
     )
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
+    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
 
     viewer_app_module._hydrate_task_cache_once(force=True)
 
     assert delete_attempts == [task_id, task_id]
     assert task_id not in viewer_app_module.DATA_TASKS
     assert task_id not in viewer_app_module._COALESCED_CLEANUP_PENDING
+
+
+def test_coalesced_cleanup_exhaustion_is_terminal_across_restart(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "task-exhausted-cleanup"
+    delete_attempts: list[str] = []
+    persisted: list[dict] = []
+
+    def fail_delete(value: str) -> bool:
+        delete_attempts.append(value)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_background_task_record", fail_delete)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **record: persisted.append(record),
+    )
+
+    viewer_app_module._discard_coalesced_download_registration(task_id)
+    for _ in range(viewer_app_module._COALESCED_CLEANUP_MAX_ATTEMPTS - 1):
+        viewer_app_module._retry_coalesced_cleanup(task_id)
+
+    terminal = [record for record in persisted if record.get("status") == "cleanup_exhausted"]
+    assert terminal
+    assert terminal[-1]["config_json"]["coalesced_cleanup_exhausted"] is True
+    assert task_id in viewer_app_module._COALESCED_CLEANUP_EXHAUSTED
+
+    with viewer_app_module.DATA_TASKS_LOCK:
+        viewer_app_module.DATA_TASKS.clear()
+    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
+    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
+    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
+    delete_attempts.clear()
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda: [
+            {
+                "id": task_id,
+                "type": "data",
+                "status": "cleanup_pending",
+                "config_json": {"coalesced_cleanup_pending": True},
+            }
+        ],
+    )
+
+    viewer_app_module._hydrate_task_cache_once(force=True)
+
+    assert delete_attempts == []
+    assert task_id not in viewer_app_module.DATA_TASKS
+
+
+def test_coalesced_cleanup_exhausted_memory_is_bounded(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "_COALESCED_CLEANUP_MAX_ENTRIES", 2)
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
+    for index in range(3):
+        viewer_app_module._remember_coalesced_cleanup_exhausted(f"exhausted-{index}")
+
+    assert len(viewer_app_module._COALESCED_CLEANUP_EXHAUSTED) == 2
+    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
 
 
 def test_hydrated_cache_retries_pending_coalesced_cleanup(viewer_client, monkeypatch):
@@ -2107,7 +2224,17 @@ def test_data_download_rejects_invalid_query_timeout_for_jforex(viewer_client):
             "query_timeout_seconds": 10,
         },
     )
+    too_long = viewer_client.post(
+        "/api/data/download",
+        json={
+            "source": "jforex",
+            "symbols": "EURUSD",
+            "timeframes": "h1",
+            "query_timeout_seconds": 7201,
+        },
+    )
     assert response.status_code == 400
+    assert too_long.status_code == 400
     message = response.json().get("detail", "")
     assert "query_timeout_seconds" in message
 
@@ -2634,7 +2761,7 @@ def test_failed_task_can_restart(viewer_client, tmp_path):
     restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
     assert restart_resp.status_code == 200
     restarted = restart_resp.json()
-    assert restarted["status"] == "queued"
+    assert restarted["status"] == "manual_required"
     assert restarted["can_restart"] is False
 
 
@@ -2656,13 +2783,15 @@ def test_failed_jforex_task_restart_marks_interrupted(viewer_client, tmp_path):
         supports_control=True,
     )
     viewer_app_module._update_task_fields(task_id, downloader="jforex")
-    viewer_app_module._mark_task_finished(task_id, status="failed", returncode=1, error="jforex error")
+    viewer_app_module._mark_task_finished(
+        task_id, status="failed", returncode=1, error="jforex error"
+    )
 
     restart_resp = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
     assert restart_resp.status_code == 200
     payload = restart_resp.json()
-    assert payload["status"] == "interrupted"
-    assert payload["can_restart"] is True
+    assert payload["status"] == "manual_required"
+    assert payload["can_restart"] is False
     assert payload["progress"]["failed"] >= 1
 
 
@@ -2720,7 +2849,9 @@ def test_data_task_delete_rejects_active_task(viewer_client, tmp_path):
     assert task_id in viewer_app_module.DATA_TASKS
 
 
-def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_client, tmp_path):
+def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(
+    viewer_client, tmp_path, monkeypatch
+):
     import viewer.main as viewer_app_module
 
     task_id = "missing-log"
@@ -2728,6 +2859,11 @@ def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_cli
         "status": "running",
         "log_file": str(tmp_path / "logs" / "tasks" / f"task_{task_id}.log"),
     }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "running", "config_json": {}},
+    )
 
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
@@ -2735,7 +2871,7 @@ def test_data_task_logs_endpoint_returns_empty_logs_when_file_missing(viewer_cli
     assert resp.json() == {"logs": "", "status": "running"}
 
 
-def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
+def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path, monkeypatch):
     import viewer.main as viewer_app_module
 
     task_id = "completed-log"
@@ -2746,6 +2882,11 @@ def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
         "status": "completed",
         "log_file": str(log_file),
     }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "completed", "config_json": {}},
+    )
 
     resp = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
 
@@ -2756,7 +2897,106 @@ def test_data_task_logs_endpoint_returns_full_logs(viewer_client, tmp_path):
     }
 
 
-def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, monkeypatch, tmp_path):
+def test_data_task_logs_endpoint_bounds_and_redacts_output(
+    viewer_client, tmp_path, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "bounded-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text(
+        ("x" * 70000) + "Authorization: Bearer endpoint-secret\n",
+        encoding="utf-8",
+    )
+    viewer_app_module.DATA_TASKS[task_id] = {
+        "status": "running",
+        "log_file": str(log_file),
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_background_task_record",
+        lambda _task_id: {"id": task_id, "type": "data", "status": "running", "config_json": {}},
+    )
+
+    response = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
+
+    assert response.status_code == 200
+    logs = response.json()["logs"]
+    assert len(logs.encode("utf-8")) <= 64 * 1024
+    assert "endpoint-secret" not in logs
+    assert "Bearer [Filtered]" in logs
+
+
+def test_task_log_writer_redacts_before_persisting():
+    from viewer import core
+
+    handle = StringIO()
+    core._write_task_log_line(
+        handle,
+        "task-redact",
+        "secret_key=task-secret Authorization: Basic task-auth-secret",
+        stream="stdout",
+    )
+
+    persisted = handle.getvalue()
+    assert "task-secret" not in persisted
+    assert "task-auth-secret" not in persisted
+    assert "Basic [Filtered]" in persisted
+
+
+def test_service_payload_redacts_structured_secrets():
+    import viewer.main as viewer_app_module
+
+    service = SimpleNamespace(
+        id="service-redact",
+        name="Service",
+        type=SimpleNamespace(value="scheduled_job"),
+        status=SimpleNamespace(value="running"),
+        config={
+            "secret_key": "service-secret",
+            "app_secret": "service-app-secret",
+            "safe": "visible",
+        },
+        last_activity=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    payload = viewer_app_module._serialize_service_payload(service)
+
+    assert payload["config"]["secret_key"] == "[Filtered]"
+    assert payload["config"]["app_secret"] == "[Filtered]"
+    assert payload["config"]["safe"] == "visible"
+
+
+def test_data_task_logs_rejects_syntactically_valid_unknown_task(viewer_client, tmp_path):
+    task_id = "unknown-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("secret\n")
+
+    response = viewer_client.get(f"/api/data/tasks/{task_id}/logs")
+
+    assert response.status_code == 404
+    assert "secret" not in response.text
+
+
+def test_task_log_websocket_rejects_unknown_task_identity(viewer_client, tmp_path):
+    task_id = "unknown-ws-log"
+    log_file = tmp_path / "logs" / "tasks" / f"task_{task_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("secret\n")
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with viewer_client.websocket_connect(f"/ws/tasks/{task_id}") as websocket:
+            websocket.receive_text()
+
+    assert exc_info.value.code == 1008
+
+
+def test_start_data_task_writes_task_logs_and_refreshes_catalog(
+    viewer_client, monkeypatch, tmp_path
+):
     import viewer.main as viewer_app_module
 
     refresh_calls: list[str] = []
@@ -2803,6 +3043,10 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(viewer_client, m
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
+    thread = task.get("thread")
+    if isinstance(thread, threading.Thread):
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
@@ -4104,6 +4348,108 @@ def test_backtests_bulk_delete_and_single_delete(viewer_client, tmp_path):
     assert not (backtests_dir / "delete-c.trades.json").exists()
 
 
+def test_backtest_delete_database_failure_restores_json_and_reports_failed(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    artifact = backtests_dir / "delete-failure.trades.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    def fail_delete(_backtest_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_backtest", fail_delete)
+    response = viewer_client.post(
+        "/api/backtests/delete-bulk", json={"ids": ["delete-failure"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "failed"
+    assert payload["items"][0]["database"] == "failed"
+    assert payload["items"][0]["artifact"] == "restored"
+    assert artifact.exists()
+    assert not (backtests_dir / ".delete-failure.trades.json.delete-staged").exists()
+
+
+def test_backtest_delete_cleanup_failure_is_recoverable_and_truthful(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    artifact = backtests_dir / "delete-pending.trades.json"
+    artifact.write_text("{}", encoding="utf-8")
+    database_deletes: list[str] = []
+    original_unlink = Path.unlink
+
+    def delete_from_db(backtest_id: str) -> bool:
+        database_deletes.append(backtest_id)
+        return True
+
+    def fail_staged_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path.name.endswith(".delete-staged"):
+            raise OSError("artifact cleanup failed")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(viewer_app_module, "delete_backtest", delete_from_db)
+    monkeypatch.setattr(Path, "unlink", fail_staged_unlink)
+    response = viewer_client.post(
+        "/api/backtests/delete-bulk", json={"ids": ["delete-pending"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "cleanup_pending"
+    assert payload["items"][0]["database"] == "deleted"
+    assert payload["items"][0]["artifact"] == "staged"
+    assert not artifact.exists()
+    staged = backtests_dir / ".delete-pending.trades.json.delete-staged"
+    journal = backtests_dir / ".delete-pending.trades.json.delete-journal.json"
+    assert staged.exists()
+    assert journal.exists()
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    viewer_app_module._recover_maintenance_deletes()
+
+    assert database_deletes == ["delete-pending"]
+    assert not staged.exists()
+    assert not journal.exists()
+
+
+def test_portfolio_delete_database_failure_restores_json_and_reports_failed(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    artifact = portfolios_dir / "delete-failure.json"
+    artifact.write_text("{}", encoding="utf-8")
+
+    def fail_delete(_portfolio_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", fail_delete)
+    response = viewer_client.post(
+        "/api/portfolios/delete-bulk", json={"ids": ["delete-failure"]}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["deleted"] == 0
+    assert payload["items"][0]["status"] == "failed"
+    assert payload["items"][0]["database"] == "failed"
+    assert payload["items"][0]["artifact"] == "restored"
+    assert artifact.exists()
+
+
 def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
@@ -4199,6 +4545,168 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
     assert trades_payload[0]["strategy_name"] == "Portfolio Signal"
     assert trades_payload[0]["symbol"] == "AAPL"
     assert trades_payload[0]["timeframe"] == "1d"
+
+
+def test_create_portfolio_applies_component_weight_to_trade_fields(viewer_client, tmp_path):
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="portfolio-weight-source",
+            created_at="2026-03-10T12:00:00Z",
+            engine="vectorbt",
+            strategies=["Weighted Strategy"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+            initial_capital=100000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
+        ),
+        trades=[
+            Trade(
+                id=1,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                exits=[
+                    TradeExit(
+                        time="2024-01-10T00:00:00+00:00",
+                        price=105.0,
+                        quantity=10.0,
+                        pnl=50.0,
+                    )
+                ],
+                pnl=50.0,
+                fees=5.0,
+            )
+        ],
+        equity_curve=_equity_curve_from_returns([0.010, 0.012, 0.009, 0.014]),
+    )
+    result.save(backtests_dir / "portfolio-weight-source.trades.json")
+
+    response = viewer_client.post(
+        "/api/portfolios",
+        json={
+            "name": "Weighted Basket",
+            "account_capital": 100000,
+            "components": [
+                {
+                    "strategy_name": "Weighted Strategy",
+                    "symbol": "AAPL",
+                    "timeframe": "1d",
+                    "weight": 0.5,
+                    "risk_config": {"max_positions": 5},
+                    "settings": {},
+                    "backtest_id": "portfolio-weight-source",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert len(payload["trades"]) == 1
+    trade = payload["trades"][0]
+    assert trade["gross_pnl"] == pytest.approx(25.0, abs=1e-6)
+    assert trade["net_pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert trade["pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert trade["fees"] == pytest.approx(2.5, abs=1e-6)
+
+
+def test_portfolio_trade_pnl_survives_payload_normalization(viewer_client, monkeypatch):
+    import viewer.main as viewer_app_module
+
+    backtest_trade = {
+        "nr": 7,
+        "symbol": "AAPL",
+        "direction": "LONG",
+        "entry_time_iso": "2024-01-02T00:00:00+00:00",
+        "exit_time_iso": "2024-01-10T00:00:00+00:00",
+        "entry_price": 100.0,
+        "exit_price": 105.0,
+        "quantity": 10.0,
+        "position_size": 10.0,
+        "pnl": 45.0,
+        "net_pnl": 45.0,
+        "gross_pnl": 50.0,
+        "fees": 5.0,
+    }
+    result = SimpleNamespace(
+        meta=SimpleNamespace(initial_capital=100000.0),
+        stats={},
+        trades=[
+            SimpleNamespace(
+                id=7,
+                symbol="AAPL",
+                direction="LONG",
+                entry_time="2024-01-02T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=10.0,
+                position_size=10.0,
+                exits=[],
+                exit_reason=None,
+                pnl=50.0,
+                net_pnl=45.0,
+                pnl_pct=0.05,
+                r_multiple=1.0,
+                holding_bars=8,
+                fees=5.0,
+                tags=[],
+                meta={},
+            )
+        ],
+        equity_curve=[],
+    )
+    monkeypatch.setattr(viewer_app_module, "_load_result", lambda _backtest_id: result)
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_trade_to_viewer",
+        lambda _trade: dict(backtest_trade),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_ensure_equity_curve",
+        lambda _result, *, initial_capital: [
+            EquityPoint(time="2024-01-02T00:00:00+00:00", equity=initial_capital * 1.01)
+        ],
+    )
+
+    components, component_returns, trades = (
+        viewer_app_module._build_portfolio_components_from_backtests(
+            [
+                {
+                    "component_id": "component-weight",
+                    "strategy_name": "Weighted Strategy",
+                    "symbol": "AAPL",
+                    "timeframe": "1d",
+                    "weight": 0.5,
+                    "risk_config": {},
+                    "settings": {},
+                    "backtest_id": "portfolio-weight-source",
+                }
+            ],
+            account_capital=100000.0,
+        )
+    )
+    normalized = viewer_app_module._normalize_portfolio_payload(
+        {
+            "id": "portfolio-weight",
+            "account_capital": 100000.0,
+            "components": components,
+            "combined_stats": {},
+            "trades": trades,
+        }
+    )
+
+    assert len(component_returns) == 1
+    normalized_trade = normalized["trades"][0]
+    assert normalized_trade["gross_pnl"] == pytest.approx(25.0, abs=1e-6)
+    assert normalized_trade["net_pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert normalized_trade["pnl"] == pytest.approx(22.5, abs=1e-6)
+    assert normalized_trade["fees"] == pytest.approx(2.5, abs=1e-6)
+    assert normalized["combined_stats"]["net_profit"] == pytest.approx(22.5, abs=1e-6)
 
 
 def test_create_portfolio_allows_empty_components(viewer_client):
@@ -4748,6 +5256,189 @@ def test_logs_endpoint_supports_all_logs_and_multi_level_filters(viewer_client, 
     ]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/logs/ALL_LOGS",
+        "/api/services/service-log-test/logs",
+    ],
+)
+def test_log_endpoints_cap_response_lines(viewer_client, monkeypatch, path):
+    import viewer.main as viewer_app_module
+
+    entries = [
+        {
+            "line": f"line-{index}",
+            "timestamp": None,
+            "level": "INFO",
+            "path": "viewer.log",
+            "line_number": index,
+        }
+        for index in range(2001)
+    ]
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_collect_log_entries",
+        lambda _paths, **_kwargs: entries,
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_service",
+        lambda _service_id: SimpleNamespace(
+            id="service-log-test",
+            name="service-log-test",
+            config={},
+            type=SimpleNamespace(value="runner"),
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_entry_matches_service_log",
+        lambda *_args, **_kwargs: True,
+    )
+
+    requested = viewer_client.get(f"{path}?lines=3")
+    capped = viewer_client.get(f"{path}?lines=100000")
+
+    assert requested.status_code == 200
+    assert requested.json()["lines"] == ["line-1998", "line-1999", "line-2000"]
+    assert capped.status_code == 200
+    capped_lines = capped.json()["lines"]
+    assert len(capped_lines) == 2000
+    assert capped_lines[0] == "line-1"
+    assert capped_lines[-1] == "line-2000"
+    assert capped.json()["total_lines"] == 2001
+
+
+def test_logs_endpoint_level_filter_matches_older_lines_beyond_line_budget(viewer_client, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    error_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "ERROR",
+                "message": f"error-{index}",
+            }
+        )
+        for index in range(100)
+    ]
+    info_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "INFO",
+                "message": f"info-{index}",
+            }
+        )
+        for index in range(2000)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(error_lines + info_lines) + "\n", encoding="utf-8"
+    )
+
+    resp = viewer_client.get("/api/logs/ALL_LOGS?level=ERROR&lines=3")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 100
+    assert [json.loads(line)["message"] for line in payload["lines"]] == [
+        "error-97",
+        "error-98",
+        "error-99",
+    ]
+
+
+def test_logs_endpoint_search_filter_reaches_lines_beyond_line_budget(viewer_client, tmp_path):
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    needle_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "INFO",
+                "message": f"needle-{index}",
+            }
+        )
+        for index in range(50)
+    ]
+    noise_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "INFO",
+                "message": f"noise-{index}",
+            }
+        )
+        for index in range(2000)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(needle_lines + noise_lines) + "\n", encoding="utf-8"
+    )
+
+    resp = viewer_client.get("/api/logs/ALL_LOGS?search=NEEDLE-&lines=2")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 50
+    assert [json.loads(line)["message"] for line in payload["lines"]] == ["needle-48", "needle-49"]
+
+
+def test_service_logs_endpoint_filters_before_line_budget(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    service_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T10:00:00+00:00",
+                "level": "ERROR",
+                "message": f"runner-fail-{index}",
+            }
+        )
+        for index in range(60)
+    ]
+    noise_lines = [
+        json.dumps(
+            {
+                "timestamp": "2026-03-08T11:00:00+00:00",
+                "level": "ERROR",
+                "message": f"noise-{index}",
+            }
+        )
+        for index in range(2100)
+    ]
+    (logs_dir / "viewer.log").write_text(
+        "\n".join(service_lines + noise_lines) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "get_service",
+        lambda _service_id: SimpleNamespace(
+            id="service-log-bulk",
+            name="service-log-bulk",
+            config={},
+            type=SimpleNamespace(value="runner"),
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_entry_matches_service_log",
+        lambda *_args, **_kwargs: True,
+    )
+
+    resp = viewer_client.get("/api/services/service-log-bulk/logs?search=runner-fail&lines=2")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total_lines"] == 60
+    assert [json.loads(line)["message"] for line in payload["lines"]] == [
+        "runner-fail-58",
+        "runner-fail-59",
+    ]
+
+
 def test_logs_endpoint_sorts_space_separated_timestamps(viewer_client, tmp_path):
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -4833,3 +5524,832 @@ def test_verify_missing_download_coverage_uses_given_timeframe(monkeypatch):
     )
 
     assert checked == ["1m"]
+
+
+def test_resume_dispatches_backtest_recovery_to_bound_helper(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    calls = []
+    record = {
+        "id": "task-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {"task_spec": {"version": 1, "kind": "backtest", "operation": "run"}},
+    }
+    monkeypatch.setattr(viewer_app_module, "_LEGACY_HOOKS_INSTALLED", True)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda **_kwargs: [record],
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_resume_interrupted_backtest_task",
+        lambda received_record, task_id, raw_config: calls.append(
+            (received_record["id"], task_id, raw_config)
+        ),
+    )
+
+    viewer_app_module._resume_interrupted_tasks()
+
+    assert calls == [("task-recovery", "task-recovery", record["config_json"])]
+
+
+def test_backtest_recovery_builds_request_from_typed_spec(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    started = []
+    persisted = []
+    record = {
+        "id": "task-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {
+            "task_spec": {
+                "version": 1,
+                "kind": "backtest",
+                "operation": "run",
+                "parameters": {
+                    "strategy": "demo",
+                    "engine": "vectorbt",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1d",
+                    "capital": 100000,
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_run_backtest_sync",
+        lambda runner, request: started.append((runner, request)) or {"task_id": "task-new"},
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+
+    viewer_app_module._resume_interrupted_backtest_task(
+        record,
+        "task-recovery",
+        record["config_json"],
+    )
+
+    assert len(started) == 1
+    request = started[0][1]
+    assert request.strategy == "demo"
+    assert request.engine == "vectorbt"
+    assert request.symbols == ["AAPL"]
+    assert persisted[0]["status"] == "completed"
+
+
+def test_internal_error_detail_is_generic_and_redacted():
+    import viewer.main as viewer_app_module
+
+    detail = viewer_app_module._internal_error_detail(
+        RuntimeError("Authorization: Bearer api-secret"),
+        "test operation",
+    )
+
+    assert "api-secret" not in detail
+    assert detail.startswith("Internal server error (error_id=")
+
+
+def test_data_recovery_rejects_persisted_command_without_typed_spec(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    updates = []
+    record = {
+        "id": "task-recovery",
+        "type": "data",
+        "status": "interrupted",
+        "config_json": {"command": [sys.executable, "-c", "raise SystemExit('executed')"]},
+    }
+    started = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(record, "task-recovery", record["config_json"])
+
+    assert started == []
+    assert updates[0]["status"] == "manual_required"
+    assert updates[0]["config_json"]["recovery_rejected"] == "missing typed data spec"
+    assert updates[0]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in updates[0]["config_json"]
+
+
+def test_typed_only_unsupported_recovery_is_manual_and_not_executable(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    updates: list[dict] = []
+    started: list[tuple] = []
+    record = {
+        "id": "task-typed-only",
+        "type": "data",
+        "status": "interrupted",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "harvest",
+                "source": "dukascopy",
+                "symbols": ["EURUSD"],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(
+        record, "task-typed-only", record["config_json"]
+    )
+
+    assert started == []
+    assert updates[0]["status"] == "manual_required"
+    assert updates[0]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in updates[0]["config_json"]
+
+
+def test_manual_recovery_typed_only_unsupported_is_not_executable(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    task_id = "manual-typed-only"
+    viewer_app_module.DATA_TASKS[task_id] = {
+        "id": task_id,
+        "kind": "data",
+        "status": "failed",
+    }
+    record = {
+        "id": task_id,
+        "type": "data",
+        "status": "failed",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "validate",
+                "symbol": "EURUSD",
+            },
+        },
+    }
+    started: list[tuple] = []
+    updates: list[dict] = []
+    monkeypatch.setattr(
+        viewer_app_module, "get_background_task_record", lambda _task_id: record
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_data_task",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: updates.append(kwargs),
+    )
+
+    response = viewer_client.post(f"/api/data/tasks/{task_id}/restart")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "manual_required"
+    assert started == []
+    assert updates[-1]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in updates[-1]["config_json"]
+
+
+def test_typed_data_recovery_rebuilds_request_and_ignores_command(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    started = []
+    record = {
+        "id": "task-recovery",
+        "type": "data",
+        "status": "interrupted",
+        "name": "Download",
+        "config_json": {
+            "command": [sys.executable, "-c", "raise SystemExit('executed')"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "download",
+                "source": "yfinance",
+                "symbols": ["AAPL"],
+                "timeframes": ["1d"],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_start_generic_download",
+        lambda task_id, request, **kwargs: started.append((task_id, request, kwargs)),
+    )
+
+    viewer_app_module._resume_interrupted_data_task(record, "task-recovery", record["config_json"])
+
+    assert len(started) == 1
+    task_id, request, _ = started[0]
+    assert task_id == "task-recovery"
+    assert request.symbol_list == ["AAPL"]
+    assert request.timeframe_list == ["1d"]
+
+
+def test_terminal_task_retention_is_bounded(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "MAX_TERMINAL_TASKS", 2)
+    for index in range(3):
+        core.DATA_TASKS[f"task-terminal-{index}"] = {
+            "status": "failed",
+            "updated_at": f"2026-01-01T00:00:0{index}",
+        }
+    core._prune_terminal_tasks_locked()
+
+    assert set(core.DATA_TASKS) == {"task-terminal-1", "task-terminal-2"}
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_expired_reservation_does_not_block_new_work(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 0.01)
+    stale = {
+        "id": "task-stale",
+        "status": "running",
+        "download_request_key": "same-request",
+        "singleflight_lease_until": time.monotonic() - 1,
+    }
+    core.DATA_TASKS["task-stale"] = stale
+    reservation = {"id": "task-new", "status": "starting"}
+
+    existing = core._register_download_task(reservation, "same-request")
+
+    assert existing is None
+    assert stale["status"] == "failed"
+    assert core.DATA_TASKS["task-new"]["download_request_key"] == "same-request"
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_lease_covers_max_admitted_query_timeout():
+    from viewer import core
+
+    now = 100.0
+    task = {
+        "status": "running",
+        "download_request_key": "same-request",
+        "singleflight_lease_until": now + core.SINGLEFLIGHT_LEASE_SECONDS,
+    }
+
+    assert core.SINGLEFLIGHT_LEASE_SECONDS > core.MAX_DATA_QUERY_TIMEOUT_SECONDS
+    assert (
+        core._singleflight_lease_expired(
+            task,
+            now + core.MAX_DATA_QUERY_TIMEOUT_SECONDS,
+        )
+        is False
+    )
+
+
+def test_task_log_read_is_bounded_and_redacted(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "task-log.log"
+    log_path.write_text(
+        ("x" * 200) + "\nAuthorization: Bearer super-secret\n",
+        encoding="utf-8",
+    )
+
+    content = core._read_task_log(log_path, max_bytes=64)
+
+    assert len(content.encode("utf-8")) <= 64
+    assert "super-secret" not in content
+    assert "Bearer [Filtered]" in content
+
+
+def test_general_log_collection_caps_lines_and_redacts_json(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            json.dumps({"level": "INFO", "message": f"line-{index}", "api_key": "secret"})
+            for index in range(2500)
+        ),
+        encoding="utf-8",
+    )
+
+    entries = core._collect_log_entries([log_path], max_bytes=1024 * 1024, max_lines=3)
+
+    assert len(entries) == 3
+    assert all("secret" not in entry["line"] for entry in entries)
+
+
+def test_general_log_collection_spreads_line_budget_across_files(tmp_path):
+    from viewer import core
+
+    paths = []
+    for name in ("viewer.log", "runner.log"):
+        path = tmp_path / name
+        path.write_text("\n".join(f"{name}:{index}" for index in range(8)), encoding="utf-8")
+        paths.append(path)
+
+    entries = core._collect_log_entries(paths, max_bytes=1024 * 1024, max_lines=4)
+
+    assert len(entries) == 4
+    assert {entry["path"] for entry in entries} == {"viewer.log", "runner.log"}
+    assert all(sum(entry["path"] == path.name for entry in entries) == 2 for path in paths)
+
+
+def test_general_log_collection_counts_only_matching_lines_toward_line_budget(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            json.dumps({"level": "INFO" if index % 2 else "ERROR", "message": f"line-{index}"})
+            for index in range(20)
+        ),
+        encoding="utf-8",
+    )
+
+    entries = core._collect_log_entries(
+        [log_path],
+        max_bytes=1024 * 1024,
+        max_lines=3,
+        predicate=lambda safe_line, payload: core._extract_log_level(safe_line, payload)
+        == "ERROR",
+    )
+
+    assert [entry["line"] for entry in entries] == [
+        json.dumps({"level": "ERROR", "message": f"line-{index}"}) for index in (14, 16, 18)
+    ]
+    assert all(entry["level"] == "ERROR" for entry in entries)
+
+
+def test_general_log_collection_predicate_receives_redacted_line_and_payload(tmp_path):
+    from viewer import core
+
+    log_path = tmp_path / "viewer.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"level": "ERROR", "message": "api_key=needle-secret"}),
+                json.dumps({"level": "INFO", "message": "plain"}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    seen: list[tuple[str, dict | None]] = []
+
+    entries = core._collect_log_entries(
+        [log_path],
+        max_bytes=1024 * 1024,
+        max_lines=5,
+        predicate=lambda safe_line, payload: (
+            seen.append((safe_line, payload)) or "api_key=[Filtered]" in safe_line
+        ),
+    )
+
+    assert len(entries) == 1
+    assert "needle-secret" not in entries[0]["line"]
+    assert seen == [
+        (
+            json.dumps({"level": "INFO", "message": "plain"}),
+            {"level": "INFO", "message": "plain"},
+        ),
+        (
+            json.dumps({"level": "ERROR", "message": "api_key=[Filtered]"}),
+            {"level": "ERROR", "message": "api_key=[Filtered]"},
+        ),
+    ]
+
+
+def test_ctrader_report_is_atomic_and_private(tmp_path, monkeypatch):
+    import importlib.util
+
+    script_path = Path(__file__).parents[1] / "scripts" / "verify_ctrader_order.py"
+    spec = importlib.util.spec_from_file_location("verify_ctrader_order_test", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "REPORTS_DIR", tmp_path / "reports")
+
+    output_path = module._write_report_for_run({"verified": True})
+
+    assert output_path.exists()
+    if os.name == "posix":
+        assert output_path.stat().st_mode & 0o777 == 0o600
+        assert output_path.parent.stat().st_mode & 0o777 == 0o700
+    assert json.loads(output_path.read_text(encoding="utf-8"))["verified"] is True
+
+
+def test_core_task_id_boundaries_are_exact():
+    from viewer import core
+
+    assert core._normalized_task_id("a" * 7) == ""
+    assert core._normalized_task_id("a" * 8) == "a" * 8
+    assert core._normalized_task_id("a" * 64) == "a" * 64
+    assert core._normalized_task_id("a" * 65) == ""
+    core.DATA_TASKS["../escape"] = {"id": "../escape", "status": "running"}
+    assert core._update_task_fields("../escape", status="failed") is None
+    core.DATA_TASKS.pop("../escape", None)
+
+
+def test_singleflight_lease_boundary_and_owner_authorization(monkeypatch):
+    from viewer import core
+
+    task = {
+        "status": "running",
+        "download_request_key": "request",
+        "singleflight_lease_until": 100.0,
+    }
+    assert core._singleflight_lease_expired(task, 99.999) is False
+    assert core._singleflight_lease_expired(task, 100.0) is True
+
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 100.0)
+    monkeypatch.setattr(core, "SINGLEFLIGHT_HEARTBEAT_SECONDS", 10.0)
+    owner_token = "owner-token"
+    task.update(
+        {
+            "owner_pid": core.os.getpid(),
+            "owner_token": owner_token,
+            "singleflight_heartbeat_at": 100.0,
+            "singleflight_lease_until": 200.0,
+        }
+    )
+    assert core._touch_singleflight_lease(task, 105.0, owner_token=owner_token) is False
+    assert task["singleflight_lease_until"] == 200.0
+    assert core._touch_singleflight_lease(task, 105.0, owner_token="wrong-token") is False
+    assert task["singleflight_lease_until"] == 200.0
+    task["owner_pid"] = core.os.getpid() + 1
+    assert core._touch_singleflight_lease(task, 110.0, owner_token=owner_token) is False
+    assert task["singleflight_lease_until"] == 200.0
+    task["owner_pid"] = core.os.getpid()
+    assert core._touch_singleflight_lease(task, 110.0, owner_token=owner_token) is True
+    assert task["singleflight_lease_until"] == 210.0
+
+
+def test_singleflight_requester_cannot_renew_existing_owner_lease(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    monkeypatch.setattr(core, "SINGLEFLIGHT_LEASE_SECONDS", 100.0)
+    monkeypatch.setattr(core, "SINGLEFLIGHT_HEARTBEAT_SECONDS", 10.0)
+    now = time.monotonic()
+    existing = {
+        "id": "task-owned-reservation",
+        "status": "running",
+        "download_request_key": "same-request",
+        "owner_pid": core.os.getpid(),
+        "owner_token": "owner-token",
+        "singleflight_owner_boot_id": core.SINGLEFLIGHT_BOOT_ID,
+        "singleflight_heartbeat_at": now - 20,
+        "singleflight_lease_until": now + 100,
+    }
+    core.DATA_TASKS[existing["id"]] = existing
+
+    result = core._register_download_task(
+        {"id": "task-new-owner", "status": "starting"},
+        "same-request",
+        owner_token="new-owner",
+    )
+
+    assert result is not None
+    assert result["id"] == existing["id"]
+    assert existing["singleflight_lease_until"] == now + 100
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_requester_invalidates_reservation_from_old_boot(monkeypatch):
+    from viewer import core
+
+    core.DATA_TASKS.clear()
+    now = time.monotonic()
+    existing = {
+        "id": "task-old-boot-reservation",
+        "status": "running",
+        "download_request_key": "same-request",
+        "owner_pid": core.os.getpid(),
+        "owner_token": "old-owner",
+        "singleflight_owner_boot_id": "old-boot",
+        "singleflight_heartbeat_at": now,
+        "singleflight_lease_until": now + 100,
+    }
+    core.DATA_TASKS[existing["id"]] = existing
+
+    result = core._register_download_task(
+        {"id": "task-new-boot-owner", "status": "starting"},
+        "same-request",
+        owner_token="new-owner",
+    )
+
+    assert result is None
+    assert existing["status"] == "failed"
+    assert "download_request_key" not in existing
+    assert core.DATA_TASKS["task-new-boot-owner"]["download_request_key"] == "same-request"
+    core.DATA_TASKS.clear()
+
+
+def test_singleflight_reservation_is_invalidated_after_restart():
+    import viewer.main as viewer_app_module
+
+    task = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-stale-reservation",
+            "type": "data",
+            "status": "starting",
+            "config_json": {
+                "download_request_key": "same-request",
+                "owner_pid": viewer_app_module.os.getpid(),
+                "owner_token": "old-owner",
+                "singleflight_owner_boot_id": "old-boot",
+            },
+        }
+    )
+
+    assert task["status"] == "interrupted"
+    assert "download_request_key" not in task
+    assert "owner_token" not in task
+    assert "invalidated by server restart" in task["error"]
+
+    terminal = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-terminal-reservation",
+            "type": "data",
+            "status": "completed",
+            "config_json": {
+                "download_request_key": "old-request",
+                "owner_token": "old-owner",
+            },
+        }
+    )
+
+    assert terminal["status"] == "completed"
+    assert "download_request_key" not in terminal
+    assert "owner_token" not in terminal
+
+
+def test_singleflight_runtime_state_is_in_persisted_task_config():
+    import viewer.main as viewer_app_module
+
+    config = viewer_app_module._task_config_payload(
+        {
+            "id": "task-persisted-reservation",
+            "kind": "data",
+            "status": "starting",
+            "download_request_key": "same-request",
+            "owner_pid": 123,
+            "owner_thread_id": 456,
+            "owner_token": "owner-token",
+            "singleflight_owner_boot_id": "boot-id",
+            "singleflight_lease_expires_at": 789.5,
+        }
+    )
+
+    assert config["download_request_key"] == "same-request"
+    assert config["owner_pid"] == 123
+    assert config["owner_token"] == "owner-token"
+    assert config["singleflight_owner_boot_id"] == "boot-id"
+    assert config["singleflight_lease_expires_at"] == 789.5
+
+
+def test_task_status_evidence_mapping_is_exhaustive_and_fail_closed():
+    import viewer.main as viewer_app_module
+    from shared import database
+    from viewer import core
+
+    assert core.TASK_STATUS_VALUES == database.TASK_STATUS_VALUES
+    assert set(viewer_app_module._TASK_STATUS_WEIGHTS) == set(database.TASK_STATUS_VALUES)
+    assert set(database._TASK_STATUS_TO_EVIDENCE_STATUS) == set(database.TASK_STATUS_VALUES)
+    assert database._task_status_to_evidence_status("completed") == "success"
+    assert database._task_status_to_evidence_status("cleanup_pending") == "partial"
+    assert database._task_status_to_evidence_status("cleanup_exhausted") == "failed"
+    assert database.is_final_task_status("cleanup_pending") is True
+    assert database.is_final_task_status("mystery") is False
+    with pytest.raises(ValueError, match="unknown task status"):
+        database.normalize_task_status("mystery")
+
+
+def test_unknown_persisted_task_status_requires_manual_review():
+    import viewer.main as viewer_app_module
+
+    task = viewer_app_module._build_task_from_record(
+        {
+            "id": "task-unknown",
+            "type": "data",
+            "status": "mystery",
+            "config_json": {},
+        }
+    )
+
+    assert task["status"] == "manual_required"
+    assert task["recovery_mode"] == "manual"
+    assert "Unknown persisted task status" in task["recovery_rejected"]
+
+
+def test_task_snapshot_does_not_persist_executable_command_fields(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    persisted: list[dict] = []
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    viewer_app_module._persist_task_snapshot(
+        "task-command",
+        {
+            "id": "task-command",
+            "kind": "data",
+            "status": "running",
+            "command": ["/bin/sh", "-c", "echo secret"],
+            "task_spec": {
+                "version": 1,
+                "kind": "data",
+                "operation": "download",
+                "parameters": {"commandLine": "echo secret"},
+            },
+            "restart_config": {"executable": "/bin/sh"},
+        },
+    )
+
+    config = persisted[-1]["config_json"]
+    assert "command" not in config
+    assert "commandLine" not in config["task_spec"]["parameters"]
+    assert "executable" not in config["restart_config"]
+
+
+def test_database_task_config_strips_nested_executable_fields():
+    from shared.database import _strip_executable_command_fields
+
+    sanitized = _strip_executable_command_fields(
+        {
+            "commandLine": "echo secret",
+            "nested": {"argv": ["echo", "secret"], "safe": "value"},
+            "items": [{"executable": "/bin/sh"}],
+        }
+    )
+
+    assert sanitized == {"nested": {"safe": "value"}, "items": [{}]}
+
+
+def test_recovery_spec_round_trip_uses_typed_data_fields():
+    import viewer.main as viewer_app_module
+
+    request = viewer_app_module._PreparedDownloadRequest(
+        source="yfinance",
+        symbols="AAPL",
+        timeframes="1d,5m",
+        start="2026-01-01",
+        end="2026-01-02",
+        offer_side="bid",
+        merge_tick=True,
+        merge_s1=False,
+        batch_size=10,
+        pause_ms=1000,
+        query_timeout_seconds=900,
+        symbol_list=["AAPL"],
+        timeframe_list=["1d", "5m"],
+    )
+    spec = viewer_app_module._download_task_spec(request)
+    parsed = viewer_app_module._parse_recovery_spec({"task_spec": spec}, "data")
+    assert parsed is not None
+    recovered = viewer_app_module._download_request_from_recovery_spec(parsed)
+    assert recovered.symbol_list == request.symbol_list
+    assert recovered.timeframe_list == request.timeframe_list
+    assert recovered.merge_tick is True
+    assert "command" not in spec
+
+    backtest_spec = {
+        "version": 1,
+        "kind": "backtest",
+        "operation": "run",
+        "parameters": {
+            "strategy": "demo",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000.0,
+        },
+    }
+    parsed_backtest = viewer_app_module._parse_recovery_spec(
+        {"task_spec": backtest_spec},
+        "backtest",
+    )
+    assert parsed_backtest is not None
+    backtest_request = viewer_app_module._backtest_request_from_recovery_spec(parsed_backtest)
+    assert backtest_request.strategy == "demo"
+    assert backtest_request.symbols == ["AAPL"]
+    assert backtest_request.timeframe == "1d"
+
+
+def test_recovery_parser_rejects_nested_executable_fields():
+    import viewer.main as viewer_app_module
+
+    raw_config = {
+        "task_spec": {
+            "version": 1,
+            "kind": "data",
+            "operation": "download",
+            "source": "yfinance",
+            "symbols": ["AAPL"],
+            "timeframes": ["1d"],
+            "parameters": {"commandLine": ["/bin/sh", "-c", "echo secret"]},
+        }
+    }
+
+    assert viewer_app_module._parse_recovery_spec(raw_config, "data") is None
+
+
+def test_failed_backtest_recovery_persists_final_manual_record(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    persisted: list[dict] = []
+    record = {
+        "id": "task-backtest-recovery",
+        "type": "backtest",
+        "status": "interrupted",
+        "config_json": {
+            "task_spec": {
+                "version": 1,
+                "kind": "backtest",
+                "operation": "run",
+                "parameters": {
+                    "strategy": "demo",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1d",
+                },
+            }
+        },
+    }
+    def fail_recovery(*_args):
+        raise RuntimeError("worker failed")
+
+    monkeypatch.setattr(viewer_app_module, "_run_backtest_sync", fail_recovery)
+    monkeypatch.setattr(viewer_app_module, "_persist_task_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    viewer_app_module.DATA_TASKS.pop(record["id"], None)
+
+    viewer_app_module._resume_interrupted_backtest_task(
+        record,
+        record["id"],
+        record["config_json"],
+    )
+
+    assert persisted[-1]["status"] == "manual_required"
+    assert persisted[-1]["config_json"]["recovery_mode"] == "manual"
+    assert "command" not in persisted[-1]["config_json"]
+
+
+def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
+    import viewer.main as viewer_app_module
+
+    class _Unknown:
+        def __str__(self):
+            return "gateway api_key=gateway-key-secret status=ok"
+
+    safe = viewer_app_module._redact_ws_message(
+        {
+            "type": "snapshot",
+            "data": {
+                "apiKey": "key-secret",
+                "secret_key": "nested-secret-key",
+                "headers": {"Authorization": "Digest digest-secret"},
+                "opaque": "opaque-secret",
+                "unknown": _Unknown(),
+                "safe": "visible",
+            },
+        }
+    )
+
+    assert safe["data"]["apiKey"] == "[Filtered]"
+    assert safe["data"]["secret_key"] == "[Filtered]"
+    assert safe["data"]["headers"]["Authorization"] == "[Filtered]"
+    assert safe["data"]["opaque"] == "[Filtered]"
+    assert safe["data"]["unknown"] == "gateway api_key=[Filtered] status=ok"
+    assert safe["data"]["safe"] == "visible"

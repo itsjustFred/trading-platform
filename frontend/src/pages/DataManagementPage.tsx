@@ -27,6 +27,7 @@ import {
 import type { DataCategorySummary, DataSymbolEntry } from "../api/types";
 import { DownloadModal } from "../components/DownloadModal";
 import { stringifyUnknownValue } from "../lib/unknownValue";
+import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { ResampleModal } from "../components/ResampleModal";
 import { SmartHarvestModal } from "../components/SmartHarvestModal";
 
@@ -105,8 +106,6 @@ const TIMEFRAME_ORDER = [
   "mn1",
   "repo",
 ];
-
-const FINAL_DATA_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 function formatSizeMB(sizeMb: number) {
   if (!Number.isFinite(sizeMb) || sizeMb <= 0) {
@@ -521,7 +520,7 @@ export function DataManagementPage() {
           return;
         }
         const nextStatus = payload.status || "unknown";
-        if (FINAL_DATA_TASK_STATUSES.has(nextStatus)) {
+        if (isTerminalTaskStatus(nextStatus)) {
           window.clearInterval(intervalId);
           setBackgroundTaskId((current) =>
             current === trackedTaskId ? null : current,

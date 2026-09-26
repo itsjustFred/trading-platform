@@ -208,23 +208,48 @@ Kommentar      str
 
 ## Gemeinsames Schema
 
-### Trades-Tabelle (primäre Datenquelle für Einzeltrades)
+### Trades-Tabelle (primäre Datenquelle für Positionen)
+
+Die Trades-Tabelle enthält **Deal-Zeilen**, nicht zwingend genau zwei Zeilen pro
+Position. Ein Position-Trade kann aus mehreren Entry- und/oder Exit-Fills
+bestehen. Die Zuordnung erfolgt bevorzugt über eine gemeinsame Position-ID,
+sofern mehrere Zeilen dieselbe ID verwenden; andernfalls werden die Fills in
+Report-Reihenfolge positionsweise gepaart. `balance`-Zeilen werden ignoriert.
 
 | Konzept | XLSX-Spalte(n) | Typ | Kommentar |
 |---------|---------------|-----|-----------|
-| **Entry Time** | `Zeit` (Zeile mit `Richtung == "in"`) | `datetime`-String | Format: `YYYY.MM.DD HH:MM:SS` |
-| **Exit Time** | `Zeit` (Zeile mit `Richtung == "out"`) | `datetime`-String | Folgt direkt auf Entry-Zeile (1:1 Paarung) |
-| **Direction** | `Typ` auf Entry-Zeile | `str` | `buy` → `LONG`, `sell` → `SHORT` |
-| **Entry Price** | `Preis` auf Entry-Zeile | `float` | |
-| **Exit Price** | `Preis` auf Exit-Zeile | `float` | |
-| **Volume / Lots** | `Volumen` | `float` | Einheit: Lots (identisch für Entry & Exit) |
-| **PnL** | `Gewinn` auf Exit-Zeile | `float` | Realisierter Brutto-PnL des Trades |
-| **Stop Loss** | `S / L` aus **Orders**-Tabelle | `float` | Nur auf Entry-Orders vorhanden; Mapping über `Auftrag` |
-| **Take Profit** | `T / P` aus **Orders**-Tabelle | `float` | In vorliegenden Reports durchgehend `NaN` |
-| **Commission** | `Kommission` | `float/int` | Hier konstant `0` |
-| **Swap** | `Swap` | `float` | Fast immer `0`; bei Overnight-Trades > 0 / < 0 |
+| **Entry Time** | `Zeit` auf jeder `Richtung == "in"`-Zeile | `datetime`-String | Erster Entry-Fill ist der Trade-Entry |
+| **Exit Time** | `Zeit` auf jeder `Richtung == "out"`-Zeile | `datetime`-String | Jeder Exit-Fill wird als eigener `TradeExit` übernommen |
+| **Direction** | `Typ` auf dem ersten Entry-Fill | `str` | `buy` → `LONG`, `sell` → `SHORT` |
+| **Entry Price** | `Preis` auf dem ersten Entry-Fill | `float` | |
+| **Exit Prices** | `Preis` auf allen Exit-Fills | `float` | Ein Exit je Zeile |
+| **Volume / Lots** | `Volumen` auf allen Fills | `float` | Entry-Volumen wird summiert; Exit-Volumen bleibt je Fill erhalten |
+| **PnL** | `Gewinn` auf allen Exit-Fills | `float` | Trade-PnL ist die Summe der Exit-PnL |
+| **Stop Loss** | `S / L` aus **Orders**-Tabelle | `float` | Join über die Entry-Order-ID |
+| **Take Profit** | `T / P` aus **Orders**-Tabelle | `float` | Join über die Entry-Order-ID; `None`, wenn nicht gesetzt |
+| **Commission** | `Kommission` auf allen Fills | `float/int` | Wird über alle Entry- und Exit-Fills summiert |
+| **Swap** | `Swap` auf allen Fills | `float` | Wird über alle Entry- und Exit-Fills summiert |
 | **Symbol** | `Symbol` | `str` | |
 | **Timeframe** | Aus Report-Kopf (nicht in Tabelle) | `str` | `H1`, `M15`, `M1` etc. |
+
+### Fill-Status und Evidence
+
+`MT5XLSXImporter` klassifiziert jede rekonstruierte Position und legt die
+vollständige Evidence unter `raw_metadata.position_fills` sowie
+`raw_metadata.open_positions` ab:
+
+| Status | Bedeutung | Ergebnis |
+|--------|-----------|----------|
+| `closed` | Entry- und Exit-Menge stimmen innerhalb der Toleranz überein | Ein `Trade` mit allen Exit-Fills |
+| `partial` | Exit-Menge ist kleiner als Entry-Menge | Kein ausführbarer `Trade`; Restmenge wird als `residual_quantity` evidence |
+| `open` | Entry ohne Ausstieg | Kein `Trade`; Position bleibt Open/Partial Evidence |
+| `orphan` | Exit ohne vorheriges Entry | Kein `Trade`; Exit wird als `orphan_exit` evidence |
+
+Nur `closed`-Positionen werden in `ValidationReference.trades` ausgegeben.
+`open_position_count` umfasst offene und partielle Positionen;
+`open_only_count` zählt ausschließlich Positionen ohne Exit. Die Felder
+`closed_position_count`, `partial_position_count`, `open_only_count` und
+`orphan_exit_count` sind daher die kanonischen Zählwerte.
 
 ### Orders-Tabelle (Sekundär für SL/TP)
 
@@ -233,7 +258,7 @@ Kommentar      str
 | Order Open Time | `Eröffnungszeit` | `datetime`-String | |
 | Order ID | `Auftrag` | `float/int` | Foreign Key zu Trades.Auftrag |
 | Order Type | `Typ` | `str` | `buy` / `sell` |
-| Order Volume | `Volumen` | `str` | `"lots / lots"` |
+| Order Volume | `Volumen` | `str` | `"initial / current"`; kann mehrere Fills abbilden |
 | Order Price | `Preis` | `float` | `0` bei Market-Orders |
 | Stop Loss | `S / L` | `float` | |
 | Take Profit | `T / P` | `float` | |
@@ -248,13 +273,15 @@ Kommentar      str
 | Aspekt | EURUSD_H1 | NAS100_M15 | SP500_M1 | Bemerkung |
 |--------|-----------|------------|----------|-----------|
 | **Trades-Startzeile** | 1063 | 1273 | 1103 | Verschiebung durch unterschiedliche Orders-Tabelle |
-| **Anzahl Trades** | 492 | 597 | 512 | Positionsanzahl (In/Out-Paare) |
-| **Anzahl Deals** | 984 | 1194 | 1024 | `2 × Trades` (1 Entry + 1 Exit pro Trade) |
+| **Anzahl Trades** | 492 | 597 | 512 | Vollständig geschlossene Positionen |
+| **Anzahl Deals** | 984 | 1194 | 1024 | In den Fixtures je ein Entry- und ein Exit-Fill; der Vertrag erlaubt mehrere Fills |
 | **Swap ≠ 0** | 2 Fälle | 0 Fälle | 0 Fälle | Vom Timeframe / Asset abhängig |
 | **TP gesetzt** | Nein | Nein | Nein | Strategie verwendet kein Take-Profit |
 | **Commission** | Immer 0 | Immer 0 | Immer 0 | Demo-Account / Broker-Einstellung |
 
-**Wichtige Feststellung:** Keine Datei enthält partielle Schließungen. Entry- und Exit-Volumen stimmen in 100 % der Fälle überein.
+**Fixture-Hinweis:** Die drei Referenzdateien enthalten nur vollständig
+geschlossene Positionen. Das ist keine allgemeine XLSX-Annahme: der Importer
+macht Multi-Fill-, Partial-, Open- und Orphan-Fälle explizit sichtbar.
 
 ---
 
@@ -267,34 +294,46 @@ Kommentar      str
 | ValidationReference-Feld | Quelle im MT5-XLSX | Transformationsregel |
 |--------------------------|--------------------|----------------------|
 | `strategy_name` | Report-Kopf: `Expertenprogramm:` | String extrahieren, z.B. `"ZenomTrader Discord IntradayVolatilityBreakout"` |
-| `source_framework` | Konstant | `"mt5"` |
+| `source_framework` | Konstant | `"mt5_xlsx"` |
 | `symbol` | Report-Kopf: `Symbol:` | z.B. `"EURUSD"`, `"USATECH.IDX"`, `"USA500.IDX"` |
 | `timeframe` | Report-Kopf: `Periode:` | Regex auf Zeitframe, z.B. `"H1"`, `"M15"`, `"M1"` |
 | `settings` | Settings-Block (Zeilen 3–~29) | Dictionary aus `Parameter=Wert`-Paaren |
-| `trades` | Trades-Tabelle (Zeilen ab ~1063) | Reconstruction: je zwei Zeilen (`in` + `out`) → ein `Trade`-Objekt |
+| `trades` | Trades-Tabelle (Zeilen ab ~1063) | Rekonstruktion aus vollständig geschlossenen Positionen; Multi-Fills werden zu einem Trade mit mehreren Exits zusammengefasst |
 | `stats` | Ergebnisse-Block (Zeilen ~30–~55) | Mapping auf `BacktestStats`-Felder |
 | `raw_metadata` | Gesamter Report-Kopf + Summary | Rohes Dictionary zur Nachvollziehbarkeit |
 
-### Trade-Rekonstruktion (zwei Deal-Zeilen → ein `Trade`)
+### Trade-Rekonstruktion (Position-Fills → ein `Trade`)
 
-Für jede aufeinanderfolgende Zeilenpaar `(in, out)` in der Trades-Tabelle (`Typ != "balance"`):
+Der Importer erzeugt für jede vollständig geschlossene Position genau ein
+`Trade`. Die Zuordnung ist fill-basiert:
+
+1. Entry- und Exit-Fills mit gemeinsamer Position-ID werden gruppiert.
+2. Wenn IDs je Zeile eindeutig sind, werden offene Positionen in der
+   Reihenfolge des Reports gepaart.
+3. Jede Entry-Zeile erhöht die Entry-Menge; jede Exit-Zeile schließt die
+   zugehörige Position anteilig.
+4. Nur wenn die Mengen vollständig ausgeglichen sind, wird der Trade in
+   `ValidationReference.trades` aufgenommen.
 
 | `Trade`-Feld (intern) | Quelle | Mapping-Logik |
 |-----------------------|--------|---------------|
-| `id` | `Trade`-ID auf Entry-Zeile | Fortlaufend, beginnend bei 1 |
-| `symbol` | `Symbol` | Direkt übernehmen |
-| `direction` | `Typ` auf Entry-Zeile | `"buy"` → `"LONG"`, `"sell"` → `"SHORT"` |
-| `entry_time` | `Zeit` auf Entry-Zeile | In ISO-8601-UTC konvertieren |
-| `entry_price` | `Preis` auf Entry-Zeile | Direkt übernehmen |
-| `quantity` | `Volumen` auf Entry-Zeile | Direkt übernehmen |
-| `exits` | Exit-Zeile | Erzeugt ein `TradeExit`-Objekt (siehe unten) |
-| `pnl` | `Gewinn` auf Exit-Zeile | Direkt übernehmen |
-| `fees` | `Kommission` + `Swap` auf Exit-Zeile | Summieren |
+| `id` | Import-Reihenfolge | Fortlaufend, beginnend bei 1 |
+| `symbol` | `Symbol` des ersten Entry-Fills | Direkt übernehmen |
+| `direction` | `Typ` des ersten Entry-Fills | `"buy"` → `"LONG"`, `"sell"` → `"SHORT"` |
+| `entry_time` | `Zeit` des ersten Entry-Fills | In ISO-8601-UTC konvertieren |
+| `entry_price` | `Preis` des ersten Entry-Fills | Direkt übernehmen |
+| `quantity` | `Volumen` aller Entry-Fills | Summe der Entry-Mengen |
+| `exits` | Alle Exit-Fills | Ein `TradeExit` pro Exit-Zeile |
+| `pnl` | `Gewinn` aller Exit-Fills | Summe der Exit-PnL |
+| `fees` | `Kommission` + `Swap` aller Fills | Über Entry- und Exit-Fills summieren |
 | `net_pnl` | `pnl - fees` | Berechnen |
-| `exit_reason` | `Kommentar` auf Exit-Zeile | z.B. `"sl 1.20643"` → `"stop_loss"`; leer → `"close"` oder `"time_exit"` |
-| `tags` | `Kommentar` auf Entry-Zeile | `["Breakout Long"]` etc. |
+| `exit_reason` | Letzter Exit-Kommentar | z.B. `"sl 1.20643"` → `"stop_loss"` |
+| `tags` | Kommentar des ersten Entry-Fills | z.B. `["Breakout Long"]` |
 
-### `TradeExit`-Rekonstruktion (aus Exit-Deal-Zeile)
+### `TradeExit`-Rekonstruktion (aus Exit-Deal-Zeilen)
+
+Jede Exit-Zeile wird zu einem `TradeExit`; es gibt pro Position einen
+`TradeExit` pro Exit-Fill. Die Felder werden zeilenweise übernommen:
 
 | `TradeExit`-Feld | Quelle |
 |------------------|--------|
@@ -328,7 +367,7 @@ Für jede aufeinanderfolgende Zeilenpaar `(in, out)` in der Trades-Tabelle (`Typ
 | `avg_loser` | `Durchschnitt Verlusttrade` | |
 | `max_drawdown_pct` | `Rückgang Kontostand relativ` | Prozentwert extrahieren |
 | `sharpe_ratio` | `Sharpe-Ratio` | |
-| `total_return` | `Nettogewinn gesamt` | Berechnen als % der Ersteinlage |
+| `total_return` | `Nettogewinn gesamt` und `Ersteinlage` | **Fraktion**: `total_pnl / initial_capital` (z. B. `0.2186881`), nicht Prozent |
 | `max_consecutive_wins` | `Maximum Gewinntrades in Folge` | Zahl extrahieren |
 | `max_consecutive_losses` | `Maximum Verlusttrades in Folge` | Zahl extrahieren |
 
@@ -338,7 +377,10 @@ Für jede aufeinanderfolgende Zeilenpaar `(in, out)` in der Trades-Tabelle (`Typ
 
 1. **Zeitzone:** Die Zeitstempel enthalten keine TZ-Info. Annahme: Broker-Zeit (Dukascopy-Demo). Für `ValidationReference` ist eine Normalisierung auf UTC empfohlen.
 2. **Equity-Kurve:** Die XLSX-Dateien enthalten keine ticksweise Equity-Kurve, nur den `Kontostand` pro Deal. Für Drawdown-Berechnungen kann eine synthetische Equity-Kurve aus den Deal-Balances rekonstruiert werden.
-3. **Teilschließungen:** In den vorliegenden Reports nicht vorhanden, aber der Importer sollte robust gegen `Volumen_in != Volumen_out` sein.
+3. **Teilschließungen und offene Positionen:** Der Vertrag unterstützt
+   `Volumen_in != Volumen_out` sowie offene Positionen. Diese Fälle werden
+   nicht als abgeschlossene Trades exportiert, sondern in
+   `raw_metadata.position_fills` mit Restmenge und Status dokumentiert.
 4. **Sprachabhängigkeit:** Die Report-Kopf-Begriffe sind deutsch (`Strategietesterbericht`, `Ergebnisse`, `Eröffnungszeit`, etc.). Der Importer sollte auf Spalten-Index-Ebene arbeiten (nicht auf Begriffsebene), um Mehrsprachigkeit zu unterstützen.
 5. **Keine HTML-Reports:** Es liegen ausschließlich XLSX-Dateien vor. Der geplante `MT5HTMLConverter` benötigt separate Fixture-Dateien.
 
@@ -353,7 +395,8 @@ Die drei MT5-XLSX-Reports sind **strukturell identisch** und enthalten zwei masc
 
 Die primäre Import-Arbeit besteht in:
 1. Lokalisierung der Header-Zeilen (row-scan nach `"Trades"` → nächste Zeile = Header)
-2. Paarung von `in`- und `out`-Zeilen
-3. Join mit Orders-Tabelle für SL/TP
-4. Parsen des Summary-Blocks für Statistiken
-5. Normalisierung in `ValidationReference` → `BacktestResult`
+2. Gruppierung von Entry-/Exit-Fills und Klassifizierung als `closed`, `partial`, `open` oder `orphan`
+3. Erzeugung eines Trades nur für vollständig geschlossene Positionen
+4. Join mit Orders-Tabelle für SL/TP
+5. Parsen des Summary-Blocks für Statistiken
+6. Normalisierung in `ValidationReference` → `BacktestResult`

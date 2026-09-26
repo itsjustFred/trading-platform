@@ -1,4 +1,6 @@
 import asyncio
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -432,6 +434,69 @@ def test_listener_clears_reconciliation_flag_after_success(monkeypatch) -> None:
     assert attempts == 1
     assert adapter._reconciliation_required is False
     assert adapter._reconciliation_retry_at == 0.0
+
+
+def test_write_env_key_uses_portable_lock_around_atomic_replace(monkeypatch, tmp_path) -> None:
+    from live_runner import ctrader_adapter as module
+
+    env_path = tmp_path / ".accounts.env"
+    env_path.write_text("CTRADER_ACCESS_TOKEN=old\nUNCHANGED=value\n", encoding="utf-8")
+    events: list[str] = []
+    replacement: tuple[Path, Path] | None = None
+    active_lock = None
+    real_replace = module.os.replace
+
+    class _TrackingLock:
+        def __init__(self, lock_file: str) -> None:
+            self.path = Path(lock_file)
+            self.active = False
+
+        def __enter__(self):
+            self.active = True
+            events.append("lock-enter")
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.active = False
+            events.append("lock-exit")
+
+    @contextmanager
+    def tracking_lock(handle):
+        nonlocal active_lock
+        active_lock = _TrackingLock(handle.name)
+        active_lock.active = True
+        events.append("lock-enter")
+        try:
+            yield
+        finally:
+            active_lock.active = False
+            events.append("lock-exit")
+
+    def tracked_replace(source: Path, destination: Path) -> None:
+        nonlocal replacement
+        assert active_lock is not None
+        assert active_lock.active
+        replacement = (Path(source), Path(destination))
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(module, "_exclusive_file_lock", tracking_lock)
+    monkeypatch.setattr(module.os, "replace", tracked_replace)
+
+    module._write_env_key(env_path, "CTRADER_ACCESS_TOKEN", "new")
+
+    assert active_lock is not None
+    assert active_lock.path == env_path.with_name(f"{env_path.name}.lock")
+    assert events == ["lock-enter", "replace", "lock-exit"]
+    assert replacement is not None
+    source, destination = replacement
+    assert source.parent == env_path.parent
+    assert source.name.startswith(f".{env_path.name}.")
+    assert source.suffix == ".tmp"
+    assert destination == env_path.resolve()
+    assert env_path.read_text(encoding="utf-8") == (
+        "CTRADER_ACCESS_TOKEN=new\nUNCHANGED=value\n"
+    )
 
 
 def test_refresh_access_token_updates_runtime_and_dotenv(tmp_path) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 
@@ -132,3 +133,183 @@ def test_stats_payload_percent_scale_matches_frontend_contract():
             f"{key}={value!r} is not a fraction (0..1); "
             "update frontend/src/api/metricScale.ts if the unit changed"
         )
+
+
+def test_stats_payload_uses_net_pnl_when_fees_are_recorded():
+    from viewer import core
+
+    trade = Trade(
+        id=1,
+        symbol="X",
+        direction="LONG",
+        entry_time="2021-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=10,
+        exits=[
+            TradeExit(
+                time="2021-01-02T00:00:00Z",
+                price=110.0,
+                quantity=10,
+                pnl=100.0,
+            )
+        ],
+        pnl=100.0,
+        fees=10.0,
+        net_pnl=90.0,
+    )
+
+    payload = core._stats_payload_from_result(_result([trade]))
+
+    assert payload["net_profit"] == 90.0
+    assert payload["best_trade"] == 90.0
+    assert core._equity_curve_from_trades(_result([trade]))[-1]["equity"] == 100090.0
+
+
+def test_viewer_trade_risk_uses_realized_evidence_only():
+    from viewer import core
+
+    policy_trade = Trade(
+        id=1,
+        symbol="X",
+        direction="LONG",
+        entry_time="2021-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=1,
+        exits=[],
+        pnl=0.0,
+        risk_amount=100.0,
+        risk_percent=0.01,
+        meta={"risk_math": {"risk_target_usd": 100.0, "risk_target_pct": 0.01}},
+    )
+    realized_trade = Trade(
+        id=2,
+        symbol="X",
+        direction="LONG",
+        entry_time="2021-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=1,
+        exits=[],
+        pnl=0.0,
+        risk_amount=100.0,
+        risk_percent=0.01,
+        meta={
+            "risk_math": {
+                "realized_risk_amount": 75.0,
+                "realized_risk_percent": 0.0075,
+            }
+        },
+    )
+
+    assert core._trade_to_viewer(policy_trade)["risk_amount"] is None
+    realized = core._trade_to_viewer(realized_trade)
+    assert realized["risk_amount"] == 75.0
+    assert realized["risk_percent"] == 0.0075
+
+
+def test_database_risk_fallback_preserves_policy_values():
+    from shared.database import _apply_backtest_trade_risk_fallbacks
+
+    row = SimpleNamespace(
+        meta={
+            "risk_math": {
+                "risk_target_usd": 100.0,
+                "risk_target_pct": 0.01,
+                "max_position_pct": 0.05,
+            }
+        }
+    )
+
+    assert _apply_backtest_trade_risk_fallbacks(row, 2.0, 100.0, 0.01) == (2.0, 100.0, 0.01)
+
+
+def test_database_risk_fallback_accepts_explicit_realized_values():
+    from shared.database import _apply_backtest_trade_risk_fallbacks
+
+    row = SimpleNamespace(
+        meta={
+            "risk_math": {
+                "realized_risk_amount": 75.0,
+                "equity_at_entry": 10000.0,
+            }
+        }
+    )
+
+    assert _apply_backtest_trade_risk_fallbacks(row, None, None, None) == (
+        None,
+        75.0,
+        0.0075,
+    )
+
+
+def test_core_stats_payload_preserves_zero_net_pnl_for_flat_trade():
+    from viewer import core
+
+    trade = Trade(
+        id=1,
+        symbol="X",
+        direction="LONG",
+        entry_time="2021-01-01T00:00:00Z",
+        entry_price=100.0,
+        quantity=10,
+        exits=[],
+        pnl=100.0,
+        fees=100.0,
+        net_pnl=0.0,
+    )
+    result = _result([trade])
+    result.stats = {"total_pnl": 999.0}
+
+    payload = core._stats_payload_from_result(result)
+
+    assert payload["net_profit"] == 0.0
+    assert payload["net_profit_pct"] == 0.0
+    assert payload["total_trades"] == 1
+    assert payload["winners"] == 0
+    assert payload["losers"] == 0
+
+
+def test_portfolio_summary_preserves_zero_pnl_trade_count():
+    import viewer.main as viewer_app_module
+
+    summary = viewer_app_module._portfolio_summary_from_payload(
+        {
+            "account_capital": 100000.0,
+            "combined_stats": {},
+            "trades": [
+                {
+                    "entry_time": "2026-01-01T00:00:00Z",
+                    "exit_time": "2026-01-02T00:00:00Z",
+                    "pnl": 100.0,
+                    "fees": 100.0,
+                    "net_pnl": 0.0,
+                }
+            ],
+        }
+    )
+
+    assert summary["trade_count"] == 1
+    assert summary["net_profit"] == 0.0
+    assert summary["total_return"] == 0.0
+    assert summary["win_rate"] == 0.0
+
+
+def test_optimization_summary_preserves_zero_oos_baseline():
+    from viewer import core
+
+    summary = core._optimization_summary_payload(
+        {
+            "id": "opt-zero",
+            "best_value": 0.0,
+            "best_params": {},
+            "effective_best_parameters": {},
+            "train_stats": {"total_pnl": 0.0},
+            "test_stats": {"total_pnl": 0.0},
+            "oos_status": "available",
+        },
+        Path("opt-zero.json"),
+    )
+
+    assert summary["best_value"] == 0.0
+    assert summary["train_stats"]["total_pnl"] == 0.0
+    assert summary["test_stats"]["total_pnl"] == 0.0
+    assert summary["oos_status"] == "available"

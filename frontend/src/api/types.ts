@@ -151,6 +151,9 @@ export interface Trade {
   risk_percent?: number | null;
   exit_reason?: string | null;
   pnl: number;
+  gross_pnl?: number | null;
+  net_pnl?: number | null;
+  fees?: number | null;
   pnl_pct: number;
   duration: string;
   bars_held?: number;
@@ -304,11 +307,23 @@ export interface OptimizationTrial {
   symbols?: string[];
   trade_count: number;
   penalty_applied: boolean;
+  raw_metric_value?: number | null;
   train_stats: OptimizationStatMap;
 }
 
 export type OptimizationStatValue = number | string | boolean | null;
 export type OptimizationStatMap = Record<string, OptimizationStatValue>;
+export type OptimizationOosStatus =
+  | "available"
+  | "insufficient_overlap"
+  | "no_oos_requested"
+  | "unavailable";
+
+export interface OptimizationOosComparison {
+  metric_key: string;
+  in_sample_value: number | null;
+  compatible: boolean;
+}
 
 export interface OptimizationSummary {
   id: string;
@@ -319,6 +334,10 @@ export interface OptimizationSummary {
   n_trials: number;
   train_split_pct: number;
   best_value: number | null;
+  best_metric_key?: string | null;
+  best_raw_value?: number | null;
+  best_value_is_risk_adjusted?: boolean;
+  oos_comparison?: OptimizationOosComparison | null;
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
   symbols?: string[];
@@ -329,6 +348,7 @@ export interface OptimizationSummary {
   test_period: OptimizationPeriod;
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
+  oos_status?: OptimizationOosStatus | null;
 }
 
 export interface OptimizationDetail {
@@ -355,10 +375,15 @@ export interface OptimizationDetail {
   best_params: Record<string, StrategyParameterValue>;
   effective_best_parameters: Record<string, StrategyParameterValue>;
   best_value: number | null;
+  best_metric_key?: string | null;
+  best_raw_value?: number | null;
+  best_value_is_risk_adjusted?: boolean;
+  oos_comparison?: OptimizationOosComparison | null;
   train_period: OptimizationPeriod;
   test_period: OptimizationPeriod;
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
+  oos_status?: OptimizationOosStatus | null;
   top_trials: OptimizationTrial[];
 }
 
@@ -939,16 +964,28 @@ export interface MatrixGridOverview {
   rows: MatrixGridRow[];
 }
 
+export interface MaintenanceDeleteItem {
+  id: string;
+  status: "deleted" | "not_found" | "failed" | "cleanup_pending";
+  database: string;
+  artifact: string;
+  error?: string;
+  journal_pending?: boolean;
+}
+
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface BacktestsRemoveEmptyResponse {
   removed: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfoliosBulkDeleteResponse {
   deleted: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface BacktestDuplicateGroup {
@@ -975,6 +1012,7 @@ export interface BacktestsDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfolioDuplicateGroup {
@@ -999,12 +1037,14 @@ export interface PortfoliosDeduplicateResponse {
   deleted_ids: string[];
   kept_ids: string[];
   groups_affected: number;
+  items: MaintenanceDeleteItem[];
 }
 
 export interface PortfoliosRemoveEmptyResponse {
   removed: number;
   remaining: number;
   removed_ids: string[];
+  items: MaintenanceDeleteItem[];
 }
 
 export interface TradeDetail extends Trade {

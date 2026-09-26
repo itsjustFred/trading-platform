@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -27,13 +28,24 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
 from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
 from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
-from runner.optimizer import OptimizationConfig, run_optimization as execute_optimization
+from runner.optimizer import OptimizationConfig
+from runner.optimizer import run_optimization as execute_optimization
 from runner.stats import compute_stats, compute_stats_for_result
+from shared.constants import (
+    DATA_DIR,
+    LOG_DIR,
+    OHLCV_COLUMNS,
+    OPTIMIZATIONS_DIR,
+    normalize_timeframe,
+)
+from shared.logging import get_logger, redact_text, redact_value
 from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -41,18 +53,20 @@ from shared.strategy_registry import (
     iter_strategy_files,
     load_strategy_meta,
     matches_strategy_identifier,
+    read_strategy_documentation,
     strategy_documentation_path,
     strategy_relative_file,
     strategy_slug_for_path,
-    read_strategy_documentation,
     update_strategy_display_name,
 )
 from viewer.comparison import compare_backtests, compute_drawdown_pct
 
-from shared.constants import DATA_DIR, LOG_DIR, OPTIMIZATIONS_DIR
-from shared.logging import get_logger
-
 logger = get_logger("viewer")
+
+
+def _log_safe(value: object) -> str:
+    return "".join(character if character.isprintable() else "?" for character in str(value))
+
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 REACT_DIST = Path(__file__).parent.parent / "frontend" / "dist"
@@ -72,6 +86,35 @@ TASK_NOT_FOUND_ERROR = "Task not found"
 JFOREX_SDK_UNAVAILABLE_ERROR = "JForex SDK classes unavailable"
 JAVA_RUNTIME_UNAVAILABLE_ERROR = "Java/JVM runtime unavailable"
 ALL_LOGS_NAME = "ALL_LOGS"
+
+
+def _environment_float(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    return max(value, minimum)
+
+
+MAX_DATA_QUERY_TIMEOUT_SECONDS = 7200.0
+SINGLEFLIGHT_LEASE_SECONDS = max(
+    _environment_float(
+        "VIEWER_SINGLEFLIGHT_LEASE_SECONDS",
+        MAX_DATA_QUERY_TIMEOUT_SECONDS + 60.0,
+        1.0,
+    ),
+    MAX_DATA_QUERY_TIMEOUT_SECONDS + 60.0,
+)
+SINGLEFLIGHT_HEARTBEAT_SECONDS = _environment_float(
+    "VIEWER_SINGLEFLIGHT_HEARTBEAT_SECONDS", 30.0, 0.1
+)
+SINGLEFLIGHT_BOOT_ID = secrets.token_urlsafe(16)
+TASK_LOG_MAX_BYTES = 64 * 1024
+GENERAL_LOG_MAX_BYTES = 2 * 1024 * 1024
+GENERAL_LOG_MAX_LINES = 2000
+MAX_TERMINAL_TASKS = 1024
 _running_jobs: dict[str, dict] = {}  # job_id -> {status, result, error}
 _JOBS_LOCK = threading.RLock()
 _JOBS_TIMESTAMP: dict[str, float] = {}  # job_id -> last lifecycle transition (monotonic)
@@ -158,12 +201,30 @@ def evict_jobs(*, max_age_seconds: float = 3600.0) -> int:
 
 BARS_BEFORE = 60
 BARS_AFTER = 25
-_OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+_OHLCV_COLUMNS = list(OHLCV_COLUMNS)
+_OHLCV_SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+:-]{0,63}$")
+_OHLCV_TIMEFRAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+_OHLCV_MAX_MATCHES = 32
+_OHLCV_MAX_BYTES = 256 * 1024 * 1024
+_OHLCV_MAX_ROWS = 2_000_000
+_OHLCV_SOURCE_PRIORITY = {
+    "dukascopy": 0,
+    "yfinance": 1,
+    "huggingface": 2,
+    "alpaca": 3,
+    "dolthub": 4,
+}
 _OHLCV_DF_CACHE_LOCK = threading.RLock()
+_OHLCV_SOURCE_SIGNATURE = tuple[tuple[str, int, int], ...]
 _OHLCV_DF_CACHE: dict[
     tuple[str, str],
-    tuple[tuple[tuple[str, int, int], ...], pd.DataFrame],
+    tuple[_OHLCV_SOURCE_SIGNATURE, int, pd.DataFrame | None],
 ] = {}
+
+
+def _invalidate_ohlcv_cache(cache_key: tuple[str, str]) -> None:
+    with _OHLCV_DF_CACHE_LOCK:
+        _OHLCV_DF_CACHE.pop(cache_key, None)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,7 +252,7 @@ def _load_optimization_payload(optimization_id: str) -> dict[str, Any] | None:
 
 
 def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[str, Any]:
-    return {
+    summary = {
         "id": payload.get("id", path.stem),
         "filename": path.name,
         "created_at": payload.get("created_at"),
@@ -211,6 +272,17 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "train_stats": payload.get("train_stats", {}),
         "test_stats": payload.get("test_stats", {}),
     }
+    for key in (
+        "best_metric_key",
+        "best_raw_value",
+        "best_value_is_risk_adjusted",
+        "oos_comparison",
+    ):
+        if key in payload:
+            summary[key] = payload.get(key)
+    if "oos_status" in payload:
+        summary["oos_status"] = payload.get("oos_status")
+    return summary
 
 
 def _strategy_entries() -> list[StrategyEntry]:
@@ -356,6 +428,50 @@ def _normalize_equity_points(points: list[dict]) -> list[dict]:
     return collapsed
 
 
+def _trade_net_pnl(trade: Trade) -> float:
+    value = getattr(trade, "net_pnl", None)
+    if value is not None:
+        numeric = _safe_float(value, float("nan"))
+        if math.isfinite(numeric):
+            return numeric
+    gross = _safe_float(getattr(trade, "pnl", 0.0), 0.0)
+    fees = _safe_float(getattr(trade, "fees", 0.0), 0.0)
+    return gross - fees
+
+
+def _trade_realized_risk(trade: Trade) -> tuple[float | None, float | None]:
+    metadata = trade.meta if isinstance(getattr(trade, "meta", None), dict) else {}
+    risk_math = metadata.get("risk_math") if isinstance(metadata.get("risk_math"), dict) else {}
+    realized_amount = risk_math.get("realized_risk_amount")
+    realized_percent = risk_math.get("realized_risk_percent")
+    if realized_amount is None:
+        realized_amount = metadata.get("realized_risk_amount")
+    if realized_percent is None:
+        realized_percent = metadata.get("realized_risk_percent")
+    if realized_amount is not None:
+        amount = _safe_float(realized_amount, float("nan"))
+        if math.isfinite(amount) and amount >= 0:
+            percent = realized_percent
+            if percent is None:
+                equity = _safe_float(risk_math.get("equity_at_entry"), 0.0)
+                percent = amount / equity if equity > 0 else None
+            else:
+                percent = _safe_float(percent, float("nan"))
+                if not math.isfinite(percent):
+                    percent = None
+            return amount, percent
+    if realized_percent is not None:
+        percent = _safe_float(realized_percent, float("nan"))
+        if math.isfinite(percent):
+            return None, percent
+    if not risk_math:
+        amount = _safe_float(getattr(trade, "risk_amount", None), float("nan"))
+        if math.isfinite(amount) and amount >= 0:
+            percent = _safe_float(getattr(trade, "risk_percent", None), float("nan"))
+            return amount, (percent if math.isfinite(percent) else None)
+    return None, None
+
+
 def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
     if not result.trades:
         return []
@@ -370,7 +486,9 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
         ),
     )
 
-    first_trade_time = _iso_to_unix(ordered_trades[0].entry_time or ordered_trades[0].last_exit_time)
+    first_trade_time = _iso_to_unix(
+        ordered_trades[0].entry_time or ordered_trades[0].last_exit_time
+    )
     points: list[dict] = []
     if first_trade_time > 0:
         points.append({"time": first_trade_time, "equity": round(initial_capital, 2)})
@@ -380,7 +498,7 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
         event_time = _iso_to_unix(trade.last_exit_time or trade.entry_time)
         if event_time <= 0:
             continue
-        running_equity += _safe_float(trade.pnl, 0.0)
+        running_equity += _trade_net_pnl(trade)
         points.append({"time": event_time, "equity": round(running_equity, 2)})
 
     return _normalize_equity_points(points)
@@ -396,25 +514,13 @@ def _trade_to_viewer(trade) -> dict:
     if position_size is None:
         position_size = risk_math.get("position_size")
 
-    risk_amount = trade.risk_amount
-    if risk_amount is None:
-        risk_amount = risk_math.get("risk_target_usd")
-
-    risk_percent = trade.risk_percent
-    if risk_percent is None:
-        direct_percent = risk_math.get("risk_target_pct")
-        if direct_percent is not None:
-            risk_percent = direct_percent
-        else:
-            equity_at_entry = _safe_float(risk_math.get("equity_at_entry"), 0.0)
-            target_risk_usd = _safe_float(risk_math.get("risk_target_usd"), 0.0)
-            if equity_at_entry > 0 and target_risk_usd > 0:
-                risk_percent = target_risk_usd / equity_at_entry
+    risk_amount, risk_percent = _trade_realized_risk(trade)
 
     exit_reason = trade.exit_reason or (last_exit.reason if last_exit else None)
     if exit_reason is None and isinstance(trade_meta.get("exit_reason"), str):
         exit_reason = str(trade_meta.get("exit_reason"))
 
+    net_pnl = _trade_net_pnl(trade)
     payload = {
         "nr": trade.id,
         "symbol": trade.symbol,
@@ -430,7 +536,9 @@ def _trade_to_viewer(trade) -> dict:
         "risk_amount": risk_amount,
         "risk_percent": risk_percent,
         "exit_reason": exit_reason,
-        "pnl": trade.pnl,
+        "pnl": net_pnl,
+        "gross_pnl": trade.pnl,
+        "net_pnl": net_pnl,
         "pnl_pct": trade.pnl_pct,
         "r_multiple": trade.r_multiple,
         "holding_bars": trade.holding_bars,
@@ -453,56 +561,192 @@ def _trade_to_viewer(trade) -> dict:
     return payload
 
 
+def _ohlcv_candidates(root: Path, symbol: str, timeframe: str) -> list[Path]:
+    normalized_symbol = symbol.casefold()
+    normalized_timeframe = normalize_timeframe(timeframe).casefold()
+    candidates: list[tuple[int, str, Path]] = []
+    for path in root.rglob("*.parquet"):
+        try:
+            relative = path.relative_to(root)
+            parts = relative.parts
+            if len(parts) < 2 or path.is_symlink() or not path.is_file():
+                continue
+            if parts[-2].casefold() != normalized_symbol:
+                continue
+            file_timeframe = path.stem
+            if normalize_timeframe(file_timeframe).casefold() != normalized_timeframe:
+                continue
+            source = parts[0].casefold()
+            priority = _OHLCV_SOURCE_PRIORITY.get(source, len(_OHLCV_SOURCE_PRIORITY))
+            candidates.append((priority, source, path))
+            if len(candidates) > _OHLCV_MAX_MATCHES:
+                return []
+        except (OSError, ValueError):
+            continue
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: (item[0], item[1], str(item[2])))
+    selected_source = candidates[0][1]
+    return [item[2] for item in candidates if item[1] == selected_source]
+
+
+def _parquet_row_count(path: Path) -> int:
+    metadata = pq.ParquetFile(path).metadata
+    if metadata is None:
+        raise ValueError("Parquet metadata is unavailable")
+    rows = int(metadata.num_rows)
+    if rows < 0:
+        raise ValueError("Parquet row count is invalid")
+    return rows
+
+
+def _read_parquet_frame_bounded(path: Path, max_rows: int) -> pd.DataFrame | None:
+    row_limit = max(0, int(max_rows))
+    parquet_file = pq.ParquetFile(path)
+    try:
+        schema_names = [str(name) for name in parquet_file.schema.names]
+        canonical_names: dict[str, str] = {}
+        for schema_name in schema_names:
+            canonical_names.setdefault(schema_name.lower(), schema_name)
+        missing = [column for column in _OHLCV_COLUMNS if column not in canonical_names]
+        if missing:
+            raise ValueError(f"OHLCV parquet is missing canonical columns: {missing}")
+        columns = [canonical_names[column] for column in _OHLCV_COLUMNS]
+        batches = iter(
+            parquet_file.iter_batches(
+                columns=columns,
+                batch_size=min(65_536, max(1, row_limit)),
+            )
+        )
+        frames: list[pd.DataFrame] = []
+        rows = 0
+        while True:
+            if rows >= row_limit:
+                extra = next(batches, None)
+                if extra is not None and extra.num_rows:
+                    return None
+                break
+            batch = next(batches, None)
+            if batch is None:
+                break
+            if rows + int(batch.num_rows) > row_limit:
+                return None
+            frame = batch.to_pandas()
+            rows += int(batch.num_rows)
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            return pd.DataFrame()
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, ignore_index=True, sort=False)
+    finally:
+        parquet_file.close()
+
+
 def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
-    """Find and load OHLCV parquet for a symbol+timeframe."""
-    ohlcv_root = DATA_DIR / "ohlcv"
-    normalized_symbol = str(symbol or "").strip()
-    normalized_timeframe = str(timeframe or "").strip()
-    cache_key = (normalized_symbol.upper(), normalized_timeframe.lower())
-    matches = sorted(ohlcv_root.rglob(f"**/{normalized_symbol}/{normalized_timeframe}.parquet"))
-    if not matches:
-        with _OHLCV_DF_CACHE_LOCK:
-            _OHLCV_DF_CACHE.pop(cache_key, None)
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    cache_key = (normalized_symbol, normalized_timeframe)
+    if (
+        _OHLCV_SYMBOL_RE.fullmatch(normalized_symbol) is None
+        or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
+    ):
+        _invalidate_ohlcv_cache(cache_key)
         return None
+
+    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
+    if not matches or len(matches) > _OHLCV_MAX_MATCHES:
+        _invalidate_ohlcv_cache(cache_key)
+        return None
+
     signature_parts: list[tuple[str, int, int]] = []
+    total_bytes = 0
     for path in matches:
         try:
             stat = path.stat()
-        except OSError:
-            continue
+        except OSError as exc:
+            _invalidate_ohlcv_cache(cache_key)
+            logger.warning("Could not stat OHLCV source %s: %s", _log_safe(path), exc)
+            return None
+        total_bytes += int(stat.st_size)
+        if total_bytes > _OHLCV_MAX_BYTES:
+            _invalidate_ohlcv_cache(cache_key)
+            logger.warning(
+                "OHLCV byte budget exceeded for %s %s",
+                normalized_symbol,
+                normalized_timeframe,
+            )
+            return None
         signature_parts.append((str(path), int(stat.st_mtime_ns), int(stat.st_size)))
-    signature: tuple[tuple[str, int, int], ...] = tuple(signature_parts)
+    signature: _OHLCV_SOURCE_SIGNATURE = tuple(signature_parts)
+
     with _OHLCV_DF_CACHE_LOCK:
         cached_entry = _OHLCV_DF_CACHE.get(cache_key)
-        if cached_entry is not None:
-            cached_signature, cached_df = cached_entry
-            if cached_signature == signature:
-                return cached_df.copy(deep=False)
+    cached = cached_entry if cached_entry is not None and cached_entry[0] == signature else None
+    if cached is not None and cached[2] is not None:
+        return cached[2].copy(deep=False)
+
+    if cached is not None:
+        total_rows = cached[1]
+    else:
+        total_rows = 0
+        for path in matches:
+            try:
+                total_rows += _parquet_row_count(path)
+            except (OSError, ValueError, TypeError, pa.ArrowException) as exc:
+                _invalidate_ohlcv_cache(cache_key)
+                logger.warning("Could not inspect OHLCV metadata from %s: %s", _log_safe(path), exc)
+                return None
+
+    if total_rows > _OHLCV_MAX_ROWS:
+        _invalidate_ohlcv_cache(cache_key)
+        logger.warning(
+            "OHLCV row budget exceeded for %s %s",
+            normalized_symbol,
+            normalized_timeframe,
+        )
+        return None
+
+    if cached is None:
+        with _OHLCV_DF_CACHE_LOCK:
+            _OHLCV_DF_CACHE[cache_key] = (signature, total_rows, None)
 
     frames: list[pd.DataFrame] = []
+    materialized_rows = 0
     for path in matches:
         try:
-            try:
-                df = pd.read_parquet(path, columns=_OHLCV_COLUMNS)
-            except (ValueError, KeyError):
-                df = pd.read_parquet(path)
-        except (ValueError, KeyError, OSError) as exc:
+            frame = _read_parquet_frame_bounded(
+                path,
+                _OHLCV_MAX_ROWS - materialized_rows,
+            )
+        except (ValueError, KeyError, OSError, pa.ArrowException) as exc:
             logger.warning("Could not load OHLCV segment from %s: %s", _log_safe(path), exc)
             continue
-        df.columns = [str(column).lower() for column in df.columns]
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            df = df.dropna(subset=["timestamp"])
-        if not df.empty:
-            frames.append(df)
+        if frame is None:
+            _invalidate_ohlcv_cache(cache_key)
+            logger.warning(
+                "OHLCV row budget exceeded while streaming %s %s",
+                normalized_symbol,
+                normalized_timeframe,
+            )
+            return None
+        materialized_rows += len(frame)
+        frame.columns = [str(column).lower() for column in frame.columns]
+        if "timestamp" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["timestamp"])
+        if not frame.empty:
+            frames.append(frame)
 
     if not frames:
         return None
-    if len(frames) == 1:
-        merged = frames[0].copy()
-    else:
-        merged = pd.concat(frames, ignore_index=True, sort=False)
-
+    merged = (
+        frames[0].copy()
+        if len(frames) == 1
+        else pd.concat(frames, ignore_index=True, sort=False)
+    )
     if "timestamp" in merged.columns:
         merged = (
             merged.dropna(subset=["timestamp"])
@@ -514,7 +758,7 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
         merged = merged.drop_duplicates().reset_index(drop=True)
 
     with _OHLCV_DF_CACHE_LOCK:
-        _OHLCV_DF_CACHE[cache_key] = (signature, merged)
+        _OHLCV_DF_CACHE[cache_key] = (signature, total_rows, merged)
     return merged.copy(deep=False)
 
 
@@ -994,7 +1238,13 @@ def _quick_stats_and_equity(
         equity = [initial_capital]
         running = initial_capital
         for trade in trades:
-            pnl = _safe_float(trade.get("pnl", 0))
+            if isinstance(trade, Trade):
+                pnl = _trade_net_pnl(trade)
+            else:
+                pnl = _safe_float(trade.get("net_pnl"), float("nan"))
+                if not math.isfinite(pnl):
+                    pnl = _safe_float(trade.get("pnl"), 0.0)
+                    pnl -= _safe_float(trade.get("fees"), 0.0)
             running += pnl
             equity.append(round(running, 2))
         total_pnl = running - initial_capital
@@ -1085,31 +1335,49 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     """
     raw = _canonical_stats_from_result(result)
 
-    pnls = [
-        _safe_float(trade.pnl, 0.0)
-        for trade in (result.trades or [])
-        if _safe_float(trade.pnl, 0.0) != 0.0
-    ]
+    net_pnls = [_trade_net_pnl(trade) for trade in (result.trades or [])]
+    pnls = [pnl for pnl in net_pnls if not math.isclose(pnl, 0.0, abs_tol=1e-12)]
     best_trade = max(pnls) if pnls else 0
     worst_trade = min(pnls) if pnls else 0
+    net_total = sum(net_pnls)
+    winners = sum(1 for pnl in net_pnls if pnl > 0)
+    losers = sum(1 for pnl in net_pnls if pnl < 0)
+    avg_winner = sum(pnl for pnl in net_pnls if pnl > 0) / winners if winners else 0
+    avg_loser = sum(pnl for pnl in net_pnls if pnl < 0) / losers if losers else 0
+    win_rate = winners / len(net_pnls) if net_pnls else 0.0
+    profit_factor = (
+        sum(pnl for pnl in net_pnls if pnl > 0) / abs(sum(pnl for pnl in net_pnls if pnl < 0))
+        if any(pnl < 0 for pnl in net_pnls)
+        else None
+    )
 
     stats = {
-        "net_profit": raw.get("total_pnl", 0),
+        "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
         "net_profit_pct": round(
-            raw.get("total_pnl", 0) / (result.meta.initial_capital or 100000) * 100, 2
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / (result.meta.initial_capital or 100000)
+            * 100,
+            2,
         ),
         "sharpe": raw.get("sharpe_ratio", 0),
         "sortino": raw.get("sortino_ratio", 0),
         "calmar": raw.get("calmar_ratio", 0),
         "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
-        "win_rate": round(raw.get("win_rate", 0) * 100, 1),
-        "profit_factor": raw.get("profit_factor", 0),
-        "total_trades": raw.get("total_trades", 0),
-        "winners": raw.get("winners", 0),
-        "losers": raw.get("losers", 0),
-        "avg_winner": raw.get("avg_winner", 0),
-        "avg_loser": raw.get("avg_loser", 0),
-        "avg_trade_pnl": round(raw.get("total_pnl", 0) / max(raw.get("total_trades", 1), 1), 2),
+        "win_rate": round(
+            (win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)) * 100,
+            1,
+        ),
+        "profit_factor": profit_factor if net_pnls else raw.get("profit_factor", 0),
+        "total_trades": len(net_pnls) if net_pnls else raw.get("total_trades", 0),
+        "winners": winners if net_pnls else raw.get("winners", 0),
+        "losers": losers if net_pnls else raw.get("losers", 0),
+        "avg_winner": round(avg_winner, 2) if net_pnls else raw.get("avg_winner", 0),
+        "avg_loser": round(avg_loser, 2) if net_pnls else raw.get("avg_loser", 0),
+        "avg_trade_pnl": round(
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / max(len(net_pnls) if net_pnls else raw.get("total_trades", 1), 1),
+            2,
+        ),
         "avg_bars_held": raw.get("avg_holding_bars", 0),
         "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
         "best_trade": best_trade,
@@ -1118,9 +1386,11 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "expectancy": 0,  # computed below
     }
     # Expectancy
-    wr = raw.get("win_rate", 0)
+    wr = win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)
+    winner_average = avg_winner if net_pnls else _safe_float(raw.get("avg_winner"), 0.0)
+    loser_average = avg_loser if net_pnls else _safe_float(raw.get("avg_loser"), 0.0)
     stats["expectancy"] = round(
-        wr * raw.get("avg_winner", 0) + (1 - wr) * raw.get("avg_loser", 0), 2
+        wr * winner_average + (1 - wr) * loser_average, 2
     )
     # PSR / p-value
     stats["psr"] = raw.get("psr")
@@ -1587,13 +1857,14 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
 
 def _dolthub_pull():
     """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
-    if not _DOLTHUB_REPOS.is_dir():
+    dolthub_repos = DATA_DIR / "dolthub"
+    if not dolthub_repos.is_dir():
         return
     if shutil.which("dolt") is None:
         logger.info("Skipping dolthub pull: optional 'dolt' binary not installed")
         return
     for repo in ("stocks", "earnings", "options", "rates"):
-        repo_path = _DOLTHUB_REPOS / repo
+        repo_path = dolthub_repos / repo
         if not (repo_path / ".dolt").is_dir():
             continue
         try:
@@ -1663,33 +1934,113 @@ def _extract_log_level(line: str, payload: dict | None = None) -> str | None:
     return None
 
 
-def _collect_log_entries(paths: list[Path]) -> list[dict]:
-    entries: list[dict] = []
+def _read_log_tail(path: Path, max_bytes: int) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_log_entry_payload(line: str) -> dict | None:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return redact_value(parsed)
+
+
+def _build_log_entry(
+    safe_line: str,
+    payload: dict | None,
+    *,
+    path: Path,
+    line_number: int,
+) -> dict:
+    return {
+        "line": safe_line,
+        "timestamp": _parse_log_timestamp(payload.get("timestamp")) if payload else None,
+        "level": _extract_log_level(safe_line, payload),
+        "path": path.name,
+        "line_number": line_number,
+    }
+
+
+def _collect_log_entries(
+    paths: list[Path],
+    *,
+    max_bytes: int = GENERAL_LOG_MAX_BYTES,
+    max_lines: int = GENERAL_LOG_MAX_LINES,
+    predicate: Callable[[str, dict | None], bool] | None = None,
+) -> list[dict]:
+    line_limit = max(0, int(max_lines))
+    byte_limit = max(0, int(max_bytes))
+    if line_limit <= 0 or byte_limit <= 0:
+        return []
+
+    unique_paths: list[Path] = []
+    seen_paths: set[str] = set()
     for path in paths:
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
+        key = str(path)
+        if key in seen_paths:
             continue
-        for line_number, line in enumerate(lines):
-            payload: dict | None = None
-            timestamp: datetime | None = None
-            try:
-                parsed = json.loads(line)
-                if isinstance(parsed, dict):
-                    payload = parsed
-                    timestamp = _parse_log_timestamp(parsed.get("timestamp"))
-            except json.JSONDecodeError:
-                payload = None
-            entries.append(
-                {
-                    "line": line,
-                    "timestamp": timestamp,
-                    "level": _extract_log_level(line, payload),
-                    "path": path.name,
-                    "line_number": line_number,
-                }
+        seen_paths.add(key)
+        unique_paths.append(path)
+    if not unique_paths:
+        return []
+
+    base_byte_limit, byte_remainder = divmod(byte_limit, len(unique_paths))
+    file_lines: list[list[tuple[int, str]]] = []
+    for index, path in enumerate(unique_paths):
+        per_file_limit = min(
+            256 * 1024,
+            base_byte_limit + (1 if index < byte_remainder else 0),
+        )
+        if per_file_limit <= 0:
+            file_lines.append([])
+            continue
+        text = _read_log_tail(path, per_file_limit)
+        file_lines.append(list(enumerate(text.splitlines())) if text else [])
+
+    offsets = [len(lines) - 1 for lines in file_lines]
+    selected: list[tuple[int, int, dict]] = []
+    while len(selected) < line_limit:
+        added = False
+        for file_index, lines in enumerate(file_lines):
+            line_index = offsets[file_index]
+            if line_index < 0:
+                continue
+            line_number, line = lines[line_index]
+            offsets[file_index] -= 1
+            added = True
+            safe_line = redact_text(line)
+            payload = _parse_log_entry_payload(line)
+            if predicate is not None and not predicate(safe_line, payload):
+                continue
+            selected.append(
+                (
+                    file_index,
+                    line_number,
+                    _build_log_entry(
+                        safe_line,
+                        payload,
+                        path=unique_paths[file_index],
+                        line_number=line_number,
+                    ),
+                )
             )
-    return entries
+            if len(selected) >= line_limit:
+                break
+        if not added:
+            break
+
+    selected.sort(key=lambda item: (item[0], item[1]))
+    return [entry for _, _, entry in selected]
 
 
 def _warning_message_from_entry(entry: dict) -> str | None:
@@ -1805,8 +2156,60 @@ def _refresh_catalog() -> None:
 
 DATA_TASKS: dict[str, dict[str, Any]] = {}
 DATA_TASKS_LOCK = threading.Lock()
-ACTIVE_TASK_STATUSES = {"starting", "running", "paused"}
-FINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+TASK_STATUS_VALUES = frozenset(
+    {
+        "queued",
+        "starting",
+        "running",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+ACTIVE_TASK_STATUSES = frozenset({"queued", "starting", "running", "paused"})
+FINAL_TASK_STATUSES = frozenset(
+    {
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "partial",
+        "skipped",
+        "manual_required",
+        "cleanup_pending",
+        "cleanup_exhausted",
+    }
+)
+
+
+def _normalized_task_status(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in TASK_STATUS_VALUES else "unknown"
+
+
+def _task_status_or_manual(value: object) -> str:
+    normalized = _normalized_task_status(value)
+    return "manual_required" if normalized == "unknown" else normalized
+
+
+def _prune_terminal_tasks_locked() -> None:
+    terminal = [
+        (str(task.get("updated_at") or ""), task_id)
+        for task_id, task in DATA_TASKS.items()
+        if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES
+    ]
+    terminal.sort()
+    excess = len(terminal) - MAX_TERMINAL_TASKS
+    if excess > 0:
+        for _, task_id in terminal[:excess]:
+            DATA_TASKS.pop(task_id, None)
 
 
 def _download_request_key(identity: dict[str, Any]) -> str:
@@ -1840,18 +2243,148 @@ def _download_request_key(identity: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
+_SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
+_SINGLEFLIGHT_RUNTIME_KEYS = (
+    "download_request_key",
+    "owner_pid",
+    "owner_thread_id",
+    "owner_token",
+    "singleflight_owner_boot_id",
+    "singleflight_heartbeat_at",
+    "singleflight_lease_until",
+    "singleflight_lease_expires_at",
+)
+
+
+def _clear_singleflight_reservation(task: dict[str, Any]) -> None:
+    for key in _SINGLEFLIGHT_RUNTIME_KEYS:
+        task.pop(key, None)
+
+
+def _new_singleflight_owner_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _current_singleflight_owner_token() -> str | None:
+    token = getattr(_SINGLEFLIGHT_OWNER_CONTEXT, "token", None)
+    return str(token) if token else None
+
+
+def _set_singleflight_owner_token(token: str | None) -> None:
+    _SINGLEFLIGHT_OWNER_CONTEXT.token = token
+
+
+def _singleflight_owner_matches(
+    task: dict[str, Any], owner_token: str | None = None
+) -> bool:
+    expected_token = (
+        owner_token if owner_token is not None else _current_singleflight_owner_token()
+    )
+    if not expected_token:
+        return False
+    try:
+        owner_pid = int(task.get("owner_pid"))
+    except (TypeError, ValueError):
+        return False
+    return owner_pid == os.getpid() and str(task.get("owner_token") or "") == expected_token
+
+
+def _singleflight_lease_expired(task: dict[str, Any], now: float) -> bool:
+    if _normalized_task_status(task.get("status")) not in ACTIVE_TASK_STATUSES:
+        return False
+    lease_until = task.get("singleflight_lease_until")
+    uses_wall_clock = lease_until is None
+    lease_clock = time.time if uses_wall_clock else time.monotonic
+    if uses_wall_clock:
+        lease_until = task.get("singleflight_lease_expires_at")
+    if lease_until is None:
+        return True
+    try:
+        lease_until_value = float(lease_until)
+        current_value = float(lease_clock())
+        if not math.isfinite(lease_until_value) or not math.isfinite(current_value):
+            return True
+        if not uses_wall_clock:
+            if not math.isfinite(float(now)):
+                return True
+            current_value = float(now)
+        return current_value >= lease_until_value
+    except (TypeError, ValueError):
+        return True
+
+
+def _singleflight_reservation_is_owned_by_current_process(task: dict[str, Any]) -> bool:
+    if str(task.get("singleflight_owner_boot_id") or "") != SINGLEFLIGHT_BOOT_ID:
+        return False
+    try:
+        owner_pid = int(task.get("owner_pid"))
+    except (TypeError, ValueError):
+        return False
+    return owner_pid == os.getpid() and bool(task.get("owner_token"))
+
+
+def _touch_singleflight_lease(
+    task: dict[str, Any],
+    now: float | None = None,
+    owner_token: str | None = None,
+) -> bool:
+    has_reservation = bool(task.get("download_request_key") or task.get("owner_token"))
+    if has_reservation and not _singleflight_owner_matches(task, owner_token):
+        return False
+    current = time.monotonic() if now is None else now
+    last_heartbeat = task.get("singleflight_heartbeat_at")
+    if last_heartbeat is not None:
+        try:
+            heartbeat_interval = min(
+                float(SINGLEFLIGHT_HEARTBEAT_SECONDS), float(SINGLEFLIGHT_LEASE_SECONDS)
+            )
+            if current < float(last_heartbeat) + max(0.0, heartbeat_interval):
+                return False
+        except (TypeError, ValueError):
+            pass
+    task["singleflight_owner_boot_id"] = SINGLEFLIGHT_BOOT_ID
+    task["singleflight_heartbeat_at"] = current
+    task["singleflight_lease_until"] = current + SINGLEFLIGHT_LEASE_SECONDS
+    task["singleflight_lease_expires_at"] = time.time() + SINGLEFLIGHT_LEASE_SECONDS
+    return True
+
+
 def _register_download_task(
-    record: dict[str, Any], request_key: str | None
+    record: dict[str, Any],
+    request_key: str | None,
+    owner_token: str | None = None,
 ) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(record.get("id"))
+    if not normalized_task_id:
+        raise ValueError("Invalid task id")
+    record["id"] = normalized_task_id
+    now = time.monotonic()
+    reservation_token = owner_token or record.get("owner_token") or _new_singleflight_owner_token()
     with DATA_TASKS_LOCK:
         if request_key:
             for task in DATA_TASKS.values():
                 if task.get("download_request_key") != request_key:
                     continue
-                if task.get("status") in ACTIVE_TASK_STATUSES:
-                    return dict(task)
+                if _normalized_task_status(task.get("status")) in ACTIVE_TASK_STATUSES:
+                    if (
+                        _singleflight_reservation_is_owned_by_current_process(task)
+                        and not _singleflight_lease_expired(task, now)
+                    ):
+                        return dict(task)
+                    task["status"] = "failed"
+                    task["error"] = "singleflight reservation lease expired"
+                    task["finished_at"] = _task_now_iso()
+                    _clear_singleflight_reservation(task)
+                else:
+                    _clear_singleflight_reservation(task)
             record["download_request_key"] = request_key
+        record["owner_pid"] = os.getpid()
+        record["owner_thread_id"] = threading.get_ident()
+        record["owner_token"] = str(reservation_token)
+        record["singleflight_owner_boot_id"] = SINGLEFLIGHT_BOOT_ID
+        _touch_singleflight_lease(record, now, owner_token=reservation_token)
         DATA_TASKS[record["id"]] = record
+        _prune_terminal_tasks_locked()
         return None
 
 
@@ -1862,12 +2395,25 @@ def _start_singleflight_download(
     *args: Any,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        raise ValueError("Invalid task id")
+    task_id = normalized_task_id
+    owner_token = _new_singleflight_owner_token()
     reservation = {
         "id": task_id,
         "status": "starting",
         "download_request_key": request_key,
+        "owner_pid": os.getpid(),
+        "owner_thread_id": threading.get_ident(),
+        "owner_token": owner_token,
+        "singleflight_owner_boot_id": SINGLEFLIGHT_BOOT_ID,
     }
-    existing = _register_download_task(reservation, request_key)
+    existing = _register_download_task(
+        reservation,
+        request_key,
+        owner_token=owner_token,
+    )
     if existing is not None:
         return {
             "task_id": existing["id"],
@@ -1875,6 +2421,8 @@ def _start_singleflight_download(
             "coalesced": True,
         }
 
+    previous_token = _current_singleflight_owner_token()
+    _set_singleflight_owner_token(owner_token)
     try:
         return starter(task_id, *args, **kwargs)
     except Exception as exc:
@@ -1883,6 +2431,8 @@ def _start_singleflight_download(
         if current is not None:
             _mark_task_finished(task_id, status="failed", returncode=1, error=str(exc))
         raise
+    finally:
+        _set_singleflight_owner_token(previous_token)
 
 
 def _task_now_iso() -> str:
@@ -1894,27 +2444,33 @@ def _task_timestamp() -> str:
 
 
 def _task_log_path(task_id: str) -> Path:
-    return TASK_LOGS_DIR / f"task_{task_id}.log"
+    normalized = _normalized_task_id(task_id)
+    if not normalized:
+        raise ValueError("Invalid task id")
+    return TASK_LOGS_DIR / f"task_{normalized}.log"
 
 
 def _read_task_log(log_file: str | Path, *, max_bytes: int | None = None) -> str:
     path = Path(log_file)
-    if not path.exists():
+    if not path.exists() or path.is_symlink() or not path.is_file():
         return ""
 
-    if max_bytes is None:
-        return path.read_text(encoding="utf-8", errors="replace")
-
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size > max_bytes:
-            handle.seek(size - max_bytes)
-        return handle.read().decode("utf-8", errors="replace")
+    limit = TASK_LOG_MAX_BYTES if max_bytes is None else max(0, int(max_bytes))
+    if limit <= 0:
+        return ""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > limit:
+                handle.seek(size - limit)
+            return redact_text(handle.read(limit).decode("utf-8", errors="replace"))
+    except OSError:
+        return ""
 
 
 def _append_task_log(log_file: Path, message: str) -> None:
     with log_file.open("a", encoding="utf-8") as handle:
-        handle.write(message)
+        handle.write(redact_text(message))
 
 
 class _ThreadBoundTaskLogHandler(logging.Handler):
@@ -1954,6 +2510,7 @@ def _write_task_log_line(
     source: str = "data-task",
     ingest_task_progress: bool = True,
 ) -> None:
+    message = redact_text(message)
     if not message.endswith("\n"):
         message = f"{message}\n"
     handle.write(message)
@@ -2045,9 +2602,12 @@ def _create_task_record(
         "updated_at": now,
     }
     with DATA_TASKS_LOCK:
+        _prune_terminal_tasks_locked()
         reservation = DATA_TASKS.get(task_id)
         if reservation is not None and reservation.get("download_request_key"):
-            record["download_request_key"] = reservation["download_request_key"]
+            for key in _SINGLEFLIGHT_RUNTIME_KEYS:
+                if key in reservation:
+                    record[key] = reservation[key]
     return record
 
 
@@ -2058,14 +2618,10 @@ def _get_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _normalized_task_id(task_id: str) -> str:
-    """Normalize a task-id path parameter to a bounded charset (python:S5131).
-
-    Task ids are uuid4-derived hex/uuid strings; anything else is mapped to an
-    empty string, which cannot match a task.
-    """
-    return task_id[:64] if task_id and not any(
-        not ch.isprintable() or ch in {"/", chr(92)} for ch in task_id
-    ) else ""
+    value = str(task_id or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9-]{8,64}", value) is None:
+        return ""
+    return value
 
 
 def _snapshot_task(task_id: str) -> dict[str, Any] | None:
@@ -2076,13 +2632,21 @@ def _snapshot_task(task_id: str) -> dict[str, Any] | None:
 
 
 def _update_task_fields(task_id: str, **updates: Any) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return None
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
             return None
         task.update(updates)
-        if task.get("status") in FINAL_TASK_STATUSES:
-            task.pop("download_request_key", None)
+        status = _task_status_or_manual(task.get("status"))
+        task["status"] = status
+        if status in FINAL_TASK_STATUSES:
+            _clear_singleflight_reservation(task)
+        elif task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
         return dict(task)
 
@@ -2098,6 +2662,10 @@ def _update_task_progress(
     current: str | None = None,
     total: int | None = None,
 ) -> dict[str, Any] | None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return None
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
@@ -2110,7 +2678,7 @@ def _update_task_progress(
             detail["total"] = max(int(task.get("total_items", 0) or 0), 0)
 
         if current is not None:
-            detail["current"] = current
+            detail["current"] = redact_text(str(current))
 
         next_percent = float(task.get("progress", 0.0) or 0.0)
         if percent is not None:
@@ -2119,11 +2687,17 @@ def _update_task_progress(
         detail["percent"] = next_percent
         task["progress"] = next_percent
         task["progress_detail"] = detail
+        if task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
         return dict(task)
 
 
 def _ingest_task_log_line(task_id: str, text: str) -> None:
+    normalized_task_id = _normalized_task_id(task_id)
+    if not normalized_task_id:
+        return
+    task_id = normalized_task_id
     with DATA_TASKS_LOCK:
         task = DATA_TASKS.get(task_id)
         if task is None:
@@ -2131,7 +2705,7 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
 
         detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
         detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
-        detail["current"] = text
+        detail["current"] = redact_text(text)
 
         if text.startswith(("✅", "❌")):
             if text.startswith("✅"):
@@ -2148,17 +2722,21 @@ def _ingest_task_log_line(task_id: str, text: str) -> None:
             detail["percent"] = float(task.get("progress", detail.get("percent", 0.0)) or 0.0)
 
         task["progress_detail"] = detail
+        if task.get("download_request_key"):
+            _touch_singleflight_lease(task)
         task["updated_at"] = _task_now_iso()
 
 
 def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[str, Any]:
     detail = dict(task.get("progress_detail") or _new_task_progress(task.get("total_items", 0)))
     detail["total"] = max(int(detail.get("total") or task.get("total_items", 0) or 0), 0)
+    if detail.get("current"):
+        detail["current"] = redact_text(str(detail["current"]))
 
     if not detail.get("current") and log_content:
         lines = [line.strip() for line in log_content.splitlines() if line.strip()]
         if lines:
-            detail["current"] = lines[-1]
+            detail["current"] = redact_text(lines[-1])
 
     if detail["total"] > 0 and detail.get("completed", 0) == 0 and detail.get("failed", 0) == 0 and log_content:
         detail["completed"] = log_content.count("✅")
@@ -2170,7 +2748,7 @@ def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[
         if done > 0:
             percent = min(100.0, done / detail["total"] * 100.0)
 
-    if task.get("status") == "completed":
+    if _normalized_task_status(task.get("status")) == "completed":
         percent = 100.0
 
     detail["percent"] = round(percent, 2)
@@ -2178,7 +2756,7 @@ def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[
 
 
 def _task_controls_payload(task: dict[str, Any]) -> dict[str, bool]:
-    status = task.get("status", "unknown")
+    status = _task_status_or_manual(task.get("status"))
     supports_control = bool(task.get("supports_control", False))
     return {
         "can_pause": supports_control and status in {"starting", "running"},
@@ -2205,14 +2783,15 @@ def _serialize_task(
         "description": task.get("description"),
         "kind": task.get("kind", "data"),
         "source": task.get("source"),
-        "status": task.get("status", "unknown"),
+        "status": _task_status_or_manual(task.get("status")),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
         "progress": _task_progress_payload(task, log_content),
         "log": log_content,
     }
     payload.update(_task_controls_payload(task))
-    return payload
+    safe_payload = redact_value(payload)
+    return safe_payload if isinstance(safe_payload, dict) else {}
 
 
 def _mark_task_finished(
@@ -2226,7 +2805,7 @@ def _mark_task_finished(
     if returncode is not None:
         updates["returncode"] = returncode
     if error is not None:
-        updates["error"] = error
+        updates["error"] = redact_text(str(error))
     task = _update_task_fields(task_id, **updates)
     if status == "completed":
         _update_task_progress(task_id, percent=100.0)
@@ -2328,10 +2907,16 @@ def _start_data_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
     def run_proc() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        command_display = " ".join(str(part) for part in cmd)
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
 
@@ -2410,6 +2995,7 @@ def _start_data_task(
             )
         finally:
             _update_task_fields(task_id, process=None)
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_proc, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -2452,8 +3038,12 @@ def _start_dukascopy_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
-    def run_download() -> None:
-        command_display = " ".join(str(part) for part in cmd)
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
+    def _run_download() -> None:
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         downloader = DukascopyNativeDownloader()
@@ -2640,6 +3230,14 @@ def _start_dukascopy_task(
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
+
+    def run_download() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
+        try:
+            _run_download()
+        finally:
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_download, daemon=True)
     _update_task_fields(task_id, thread=thread)
@@ -2852,8 +3450,12 @@ def _start_jforex_task(
     with DATA_TASKS_LOCK:
         DATA_TASKS[task_id] = record
 
-    def run_download() -> None:
-        command_display = " ".join(str(part) for part in cmd)
+    owner_token = (
+        str(record.get("owner_token") or _current_singleflight_owner_token() or "") or None
+    )
+
+    def _run_download() -> None:
+        command_display = redact_text(" ".join(str(part) for part in cmd))
         pause_event = record["pause_event"]
         stop_event = record["stop_event"]
         jforex_downloader = JForexDownloader()
@@ -3050,6 +3652,14 @@ def _start_jforex_task(
                 exc,
                 extra={"data": {"task_id": task_id, "stream": "task", "source": "data-task"}},
             )
+
+    def run_download() -> None:
+        previous_token = _current_singleflight_owner_token()
+        _set_singleflight_owner_token(owner_token)
+        try:
+            _run_download()
+        finally:
+            _set_singleflight_owner_token(previous_token)
 
     thread = threading.Thread(target=run_download, daemon=True)
     _update_task_fields(task_id, thread=thread)

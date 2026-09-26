@@ -5,7 +5,10 @@ import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target } from "lucide-react";
 import { getBacktestInfo, getOptimization } from "../api/client";
 import { DataTable } from "../components/DataTable";
 import type { BacktestInfo, OptimizationDetail } from "../api/types";
-import { classifyOptimizationOosEvidence } from "../lib/optimizationEvidence";
+import {
+  classifyOptimizationOosEvidence,
+  resolveCompatibleInSampleValue,
+} from "../lib/optimizationEvidence";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 
 const COMPARISON_ROWS = [
@@ -174,10 +177,21 @@ export function OptimizationResultsPage() {
     );
   }
 
+  const compatibleMetric = optimization.oos_comparison ?? {
+    metric_key: optimization.best_metric_key,
+    in_sample_value: optimization.best_raw_value,
+    compatible:
+      optimization.best_metric_key != null && optimization.best_raw_value != null,
+  };
+  const compatibleInSampleValue = resolveCompatibleInSampleValue(
+    optimization.target_metric,
+    compatibleMetric,
+  );
   const oosEvidence = classifyOptimizationOosEvidence(
     optimization.target_metric,
-    optimization.best_value,
+    compatibleInSampleValue,
     optimization.test_stats,
+    optimization.oos_status ?? "unavailable",
   );
 
   return (

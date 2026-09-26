@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import math
 import os
@@ -420,10 +421,18 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
                 prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
             )
             tmp_path = Path(tmp_name)
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_handle:
-                tmp_handle.write("\n".join(lines) + "\n")
-            tmp_path.chmod(0o600)
-            os.replace(tmp_path, target)
+            try:
+                tmp_handle = os.fdopen(tmp_fd, "w", encoding="utf-8")
+                tmp_fd = -1
+                with tmp_handle:
+                    tmp_handle.write("\n".join(lines) + "\n")
+                tmp_path.chmod(0o600)
+                os.replace(tmp_path, target)
+            finally:
+                if tmp_fd >= 0:
+                    with contextlib.suppress(OSError):
+                        os.close(tmp_fd)
+                tmp_path.unlink(missing_ok=True)
 
 
 def _write_env_key(path: Path, key: str, value: str) -> None:

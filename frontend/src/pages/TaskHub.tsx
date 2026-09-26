@@ -11,16 +11,15 @@ import {
 } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
 import { useToast } from "../components/ToastProvider";
+import {
+  isActiveTaskStatus,
+  isFailedTaskStatus,
+  isTerminalTaskStatus,
+  normalizeTaskStatus,
+} from "../lib/taskStatus";
 
-const ACTIVE_STATUSES = new Set(["queued", "starting", "running", "paused"]);
-const FINAL_STATUSES = new Set([
-  "completed",
-  "failed",
-  "cancelled",
-  "interrupted",
-]);
 const TASK_POLL_MS = 3000;
-const COMPLETED_TASK_LIMIT = 100;
+const TERMINAL_TASK_LIMIT = 100;
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -129,15 +128,20 @@ export function TaskHubPage() {
     for (const task of tasks) {
       const id = task.id || "";
       if (!id) continue;
-      const status = String(task.status || "");
+      const status = normalizeTaskStatus(task.status);
       next[id] = status;
       if (!previous[id] || previous[id] === status) continue;
       if (status === "completed") {
         showToast(`${task.name || "Task"} completed`, "success");
-      } else if (status === "failed") {
+      } else if (isFailedTaskStatus(status)) {
         showToast(
           `${task.name || "Task"} failed: ${task.error_message || task.error || taskMessage(task)}`,
           "error",
+        );
+      } else if (status === "cleanup_pending") {
+        showToast(
+          `${task.name || "Task"} cleanup is pending: ${task.progress_message || taskMessage(task)}`,
+          "warning",
         );
       }
     }
@@ -147,32 +151,27 @@ export function TaskHubPage() {
   const activeTasks = useMemo(
     () =>
       tasks
-        .filter((task) =>
-          ACTIVE_STATUSES.has(String(task.status || "").toLowerCase()),
-        )
+        .filter((task) => isActiveTaskStatus(task.status))
         .sort(byNewest),
     [tasks],
   );
-  const completedTasks = useMemo(
+  const terminalTasks = useMemo(
     () =>
       tasks
-        .filter((task) =>
-          FINAL_STATUSES.has(String(task.status || "").toLowerCase()),
-        )
+        .filter((task) => isTerminalTaskStatus(task.status))
         .sort(byNewest)
-        .slice(0, COMPLETED_TASK_LIMIT),
+        .slice(0, TERMINAL_TASK_LIMIT),
     [tasks],
   );
 
   const summary = useMemo(() => {
     const counts = { running: 0, queued: 0, completed: 0, failed: 0 };
     for (const task of tasks) {
-      const status = String(task.status || "").toLowerCase();
-      if (status === "running" || status === "starting" || status === "paused")
-        counts.running += 1;
+      const status = normalizeTaskStatus(task.status);
       if (status === "queued") counts.queued += 1;
+      else if (isActiveTaskStatus(status)) counts.running += 1;
       if (status === "completed") counts.completed += 1;
-      if (status === "failed" || status === "interrupted") counts.failed += 1;
+      if (isFailedTaskStatus(status)) counts.failed += 1;
     }
     return counts;
   }, [tasks]);
@@ -189,8 +188,10 @@ export function TaskHubPage() {
         current.map((task) => (task.id === updated.id ? updated : task)),
       );
       showToast(success, "info");
-    } catch (error: any) {
-      showToast(error.message || "Task action failed.", "error");
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Task action failed.";
+      showToast(message, "error");
     } finally {
       setBusy((current) => ({ ...current, [taskId]: false }));
     }
@@ -261,7 +262,7 @@ export function TaskHubPage() {
           activeTasks.length > 0 &&
           activeTasks.map((task) => {
             const taskId = task.id || "";
-            const status = String(task.status || "").toLowerCase();
+            const status = normalizeTaskStatus(task.status);
             const percent = taskPercent(task);
             const isBusy = Boolean(taskId && busy[taskId]);
             return (
@@ -399,19 +400,20 @@ export function TaskHubPage() {
 
       <section style={{ display: "grid", gap: "10px" }}>
         <div style={{ fontWeight: 700, fontSize: "1.03rem" }}>
-          Completed Tasks
+          Terminal Tasks
         </div>
         <div style={{ ...cardStyle(), padding: "10px 0" }}>
-          {completedTasks.length === 0 ? (
+          {terminalTasks.length === 0 ? (
             <div
               style={{ padding: "6px 16px", color: "var(--color-text-muted)" }}
             >
-              No completed tasks yet.
+              No terminal tasks yet.
             </div>
           ) : (
-            completedTasks.map((task) => {
-              const status = String(task.status || "").toLowerCase();
-              const isFailed = status === "failed" || status === "interrupted";
+            terminalTasks.map((task) => {
+              const status = normalizeTaskStatus(task.status);
+              const isFailed = isFailedTaskStatus(status);
+              const needsAttention = isFailed || status === "cleanup_pending";
               const taskId = task.id || "";
               const isBusy = Boolean(taskId && busy[taskId]);
               return (
@@ -424,7 +426,11 @@ export function TaskHubPage() {
                     justifyContent: "space-between",
                     alignItems: "center",
                     gap: "10px",
-                    color: isFailed ? "#fecaca" : "var(--color-text)",
+                    color: isFailed
+                      ? "#fecaca"
+                      : needsAttention
+                        ? "#fde68a"
+                        : "var(--color-text)",
                   }}
                 >
                   <div style={{ minWidth: 0 }}>
@@ -441,7 +447,11 @@ export function TaskHubPage() {
                       </span>
                       <span
                         style={{
-                          color: "var(--color-text-muted)",
+                          color: isFailed
+                            ? "#fecaca"
+                            : needsAttention
+                              ? "#fde68a"
+                              : "var(--color-text-muted)",
                           fontSize: "0.82rem",
                         }}
                       >
@@ -452,7 +462,11 @@ export function TaskHubPage() {
                       style={{
                         marginTop: "2px",
                         fontSize: "0.82rem",
-                        color: isFailed ? "#fecaca" : "var(--color-text-muted)",
+                        color: isFailed
+                          ? "#fecaca"
+                          : needsAttention
+                            ? "#fde68a"
+                            : "var(--color-text-muted)",
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",

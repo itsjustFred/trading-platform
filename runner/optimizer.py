@@ -506,7 +506,8 @@ def run_optimization(
             trial.set_user_attr("metric_value", float(penalty))
             return penalty
 
-        metric_value = _metric_value(train_stats, config.target_metric)
+        raw_metric_value = _metric_value(train_stats, config.target_metric)
+        metric_value = raw_metric_value
         # C3: raw maximize targets (total_pnl/profit_factor/win_rate/...)
         # carry mandatory trade-count/drawdown haircuts so lucky sparse
         # runs cannot beat robust ones. Terms are recorded for transparency.
@@ -551,7 +552,8 @@ def run_optimization(
                 ),
             )
         trial.set_user_attr("penalty_applied", False)
-        trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
+        trial.set_user_attr("metric_name", metric_key)
+        trial.set_user_attr("raw_metric_value", raw_metric_value)
         trial.set_user_attr("metric_value", metric_value)
         return metric_value
 
@@ -605,6 +607,13 @@ def run_optimization(
     effective_best_params.update(best_params)
     best_train_stats = dict(best_trial.user_attrs.get("train_stats") or {})
     best_value = best_trial.value
+    best_metric_key = _metric_key(config.target_metric, best_train_stats)
+    best_raw_value = _metric_value(best_train_stats, config.target_metric)
+    best_value_is_risk_adjusted = bool(
+        config.risk_adjust_objective
+        and best_metric_key in RAW_MAXIMIZE_METRICS
+        and best_raw_value >= 0
+    )
 
     test_result = _run_vectorbt_backtest(
         BacktestConfig(
@@ -650,10 +659,19 @@ def run_optimization(
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(best_value),
+        "best_metric_key": best_metric_key,
+        "best_raw_value": _safe_float_or_none(best_raw_value),
+        "best_value_is_risk_adjusted": best_value_is_risk_adjusted,
+        "oos_comparison": {
+            "metric_key": best_metric_key,
+            "in_sample_value": _safe_float_or_none(best_raw_value),
+            "compatible": True,
+        },
         "train_period": train_period,
         "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
         "test_stats": _json_safe(test_stats),
+        "oos_status": "available",
         "top_trials": _top_trials_payload(
             study.trials,
             limit=10,
@@ -992,6 +1010,7 @@ def _run_risk_parity_covariance_optimization(
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
         "test_stats": _json_safe(test_stats),
+        "oos_status": "available",
         "risk_parity": _json_safe(selection),
         "top_trials": [],
     }
@@ -1139,6 +1158,9 @@ def _top_trials_payload(
                 "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
                 "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
                 "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
+                "raw_metric_value": _safe_float_or_none(
+                    trial.user_attrs.get("raw_metric_value")
+                ),
                 "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
             }
         )
