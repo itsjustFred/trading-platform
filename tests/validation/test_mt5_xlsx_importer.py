@@ -437,3 +437,49 @@ class TestOrphanOutDeal:
         assert len(ref.trades) == 2
         assert [t.pnl for t in ref.trades] == [pytest.approx(500.0), pytest.approx(500.0)]
         assert [t.meta["position_id"] for t in ref.trades] == ["position-1", "position-2"]
+
+
+class TestTradeColumnRequired:
+    """The Trade column drives position reconstruction and cannot be optional.
+
+    Without it every deal id resolves to "", so every row looks like a deal of
+    the same position and the whole report imports as one giant position.
+    """
+
+    def _write_report(self, tmp_path: Path, include_trade: bool) -> Path:
+        header = ["Zeit"] + (["Trade"] if include_trade else []) + [
+            "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Kommentar",
+        ]
+
+        def _row(time_value: str, deal: int, typ: str, direction: str, price: float):
+            return [time_value] + ([deal] if include_trade else []) + [
+                "EURUSD", typ, direction, "0.10", price, "",
+            ]
+
+        rows = [
+            ["Trades"] + [None] * (len(header) - 1),
+            header,
+            _row("2024.01.03 08:00:00", 2, "buy", "in", 1.085),
+            _row("2024.01.03 16:00:00", 3, "sell", "out", 1.09),
+        ]
+        trades = pd.DataFrame(rows)
+        # All-string Orders table; a mixed-type cell becomes NaN and breaks the
+        # importer's frame handling before the Trades table is even read.
+        orders = pd.DataFrame([["Orders", None], [None, None]])
+
+        path = tmp_path / f"report_{'with' if include_trade else 'no'}_trade.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            trades.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    def test_missing_trade_column_raises(self, tmp_path: Path):
+        path = self._write_report(tmp_path, include_trade=False)
+        importer = MT5XLSXImporter()
+        with pytest.raises(ValueError) as excinfo:
+            importer.load(path)
+        assert "Trade" in str(excinfo.value)
+
+    def test_present_trade_column_still_imports(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(self._write_report(tmp_path, include_trade=True))
+        assert len(ref.trades) == 1, "one in/out pair must reconstruct one position"

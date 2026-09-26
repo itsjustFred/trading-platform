@@ -512,6 +512,16 @@ class MT5XLSXImporter(BaseImporter):
                 "Trades table is missing required columns (Zeit / Typ / Richtung)."
             )
 
+        # The Trade column drives position reconstruction. Without it every deal
+        # id resolves to "", so every row looks like a deal of the same position
+        # and the whole report is imported as one giant position. Refuse rather
+        # than silently produce that.
+        if col_trade_id is None:
+            raise ValueError(
+                "Trades table is missing required column (Trade): position "
+                "reconstruction would collapse every trade into one position."
+            )
+
         # DV-B43: reconstruct one Trade per position with one TradeExit per
         # out row; the positional walker previously dropped every fill after
         # a second consecutive "in".
