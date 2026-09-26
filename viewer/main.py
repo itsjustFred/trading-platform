@@ -9569,7 +9569,7 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         "symbols": symbols,
         "timeframe": timeframe,
         "stats": {
-            "total_return": round(_safe_float(raw.get("total_return"), 0.0) * 100.0, 6),
+            "total_return": round(_safe_float(raw.get("total_return"), 0.0), 6),
             "net_profit": round(_safe_float(raw.get("total_pnl"), 0.0), 6),
             "sharpe_ratio": round(_safe_float(raw.get("sharpe_ratio"), 0.0), 6),
             "psr": round(_safe_float(raw.get("psr"), 0.0) * 100.0, 6),

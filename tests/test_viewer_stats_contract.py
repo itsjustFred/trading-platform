@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -58,6 +60,17 @@ def _trades() -> list[Trade]:
         _trade(3, 40.0),
         _trade(4, -300.0),
         _trade(5, 90.0),
+    ]
+
+
+def _net_gaining_trades() -> list[Trade]:
+    """+3.125% on 100k of capital: 0.03125 as a fraction, 3.125 as points."""
+    return [
+        _trade(1, 2000.0),
+        _trade(2, -500.0),
+        _trade(3, 900.0),
+        _trade(4, -275.0),
+        _trade(5, 1000.0),
     ]
 
 
@@ -148,13 +161,40 @@ def test_core_stats_payload_expectancy_equals_average_trade():
     assert payload["expectancy"] == 0.0
 
 
-def test_core_stats_payload_reports_total_return_in_percent_points():
+def test_core_stats_payload_reports_total_return_as_a_fraction():
+    """`total_return` is the engine's fraction; `net_profit_pct` stays in points.
+
+    The two keys describe the same quantity, so the payload must serve them a
+    hundred to one apart. This test used to assert they were EQUAL, which was
+    only true because `total_return` was being emitted in percent points; see
+    tests/test_metric_scale_contract.py for the cross-language half.
+    """
     from viewer import core
 
     payload = core._stats_payload_from_result(_result(_trades()))
 
     assert payload["total_return"] == 0.0
-    assert payload["total_return"] == payload["net_profit_pct"]
+    assert payload["total_return"] * 100 == pytest.approx(payload["net_profit_pct"])
+
+
+def test_core_stats_payload_reports_a_non_zero_total_return_as_a_fraction():
+    """The zero case above cannot tell 0.0 (fraction) from 0.0 (points)."""
+    from viewer import core
+
+    result = _result(_net_gaining_trades())
+    result.equity_curve = [
+        core.EquityPoint(**point) for point in core._equity_curve_from_trades(result)
+    ]
+
+    payload = core._stats_payload_from_result(result)
+
+    # +3.125% on 100k of capital: 0.03125 as a fraction, 3.125 as points.
+    assert payload["net_profit_pct"] == pytest.approx(3.12)
+    assert payload["total_return"] == pytest.approx(0.03125)
+    assert abs(payload["total_return"]) <= 1.0, (
+        "a fraction can never exceed 1.0 in magnitude; a points value of 3.12 "
+        "here is the bug this assertion exists to catch"
+    )
 
 
 def test_core_stats_payload_uses_net_trade_values_after_fees():
@@ -174,25 +214,60 @@ def test_core_stats_payload_uses_net_trade_values_after_fees():
 def test_stats_payload_percent_scale_matches_frontend_contract():
     """The frontend `PERCENT_METRIC_SCALES` table claims specific units for each
     percent-like key. This pins the backend half of that contract so a producer
-    cannot silently flip between fraction (0..1) and percent points (0..100)."""
+    cannot silently flip between fraction (0..1) and percent points (0..100).
+
+    A `-100..100` bound proves nothing about the unit — it is satisfied by a
+    fraction of 1.5 and by percent points of 12.5 alike — so each key is checked
+    against the EXACT value the engine produced, converted into the unit the
+    table declares. tests/test_metric_scale_contract.py is the cross-language
+    half: it reads the table itself instead of a copy of these keys.
+    """
+    from runner.stats import compute_stats_for_result
     from viewer import core
 
-    payload = core._stats_payload_from_result(_result(_trades()))
+    result = _result(_net_gaining_trades())
+    result.equity_curve = [
+        core.EquityPoint(**point) for point in core._equity_curve_from_trades(result)
+    ]
+    canonical = compute_stats_for_result(result)
+    net_pnl = sum(trade.pnl for trade in result.trades)
 
-    # "points"-scaled keys in frontend/src/api/metricScale.ts.
-    for key in ("net_profit_pct", "total_return", "win_rate", "max_drawdown_pct", "cagr"):
-        value = payload[key]
-        assert value is None or -100.0 <= value <= 100.0, (
-            f"{key}={value!r} is not in percent points (-100..100); "
-            "update frontend/src/api/metricScale.ts if the unit changed"
+    payload = core._stats_payload_from_result(result)
+
+    # Canonical engine fractions, in the same order as metricScale.ts.
+    fractions = {
+        "net_profit_pct": net_pnl / result.meta.initial_capital,
+        "win_rate": 3 / 5,  # three of the five trades closed positive
+        "max_drawdown_pct": canonical["max_drawdown_pct"],
+        "cagr": canonical["cagr"],
+        "total_return": canonical["total_return"],
+    }
+    # metricScale.ts declares these percent-like keys in percent points.
+    points_keys = {"net_profit_pct", "win_rate", "max_drawdown_pct", "cagr"}
+    # The producer rounds each key; compare at that published precision.
+    places = {
+        "net_profit_pct": 2,
+        "win_rate": 1,
+        "max_drawdown_pct": 2,
+        "cagr": 2,
+        "total_return": 6,
+    }
+
+    for key, fraction in fractions.items():
+        scale = 100.0 if key in points_keys else 1.0
+        tolerance = 0.5 * 10.0**-places[key] + 0.5 * 10.0**-6 + 1e-12
+        assert payload[key] == pytest.approx(fraction * scale, abs=tolerance), (
+            f"{key}={payload[key]!r} is not the canonical {fraction!r} in the "
+            "unit metricScale.ts declares; update "
+            "frontend/src/api/metricScale.ts if the unit changed"
         )
-    # "fraction"-scaled keys: probabilities and bounded ratios in 0..1.
-    for key in ("psr",):
-        value = payload[key]
-        assert value is None or 0.0 <= value <= 1.0, (
-            f"{key}={value!r} is not a fraction (0..1); "
-            "update frontend/src/api/metricScale.ts if the unit changed"
-        )
+    # `psr` is only defined once the equity curve spans enough days, which this
+    # one-trade-per-day fixture does not reach. For a probability the range IS
+    # the discriminating check: 12.5 is not a PSR in either unit.
+    assert payload["psr"] is None or 0.0 <= payload["psr"] <= 1.0, (
+        f"psr={payload['psr']!r} is not a fraction (0..1); "
+        "update frontend/src/api/metricScale.ts if the unit changed"
+    )
 
 
 def test_stats_payload_uses_net_pnl_when_fees_are_recorded():

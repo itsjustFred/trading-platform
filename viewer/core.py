@@ -1257,7 +1257,8 @@ def _quick_stats_and_equity(
             equity.append(round(running, 2))
         total_pnl = running - initial_capital
 
-    net_profit_pct = round(total_pnl / initial_capital * 100, 2) if initial_capital else 0
+    total_return_fraction = (total_pnl / initial_capital) if initial_capital else 0.0
+    net_profit_pct = round(total_return_fraction * 100, 2)
 
     if "max_drawdown_pct" in derived_stats:
         max_drawdown_pct = round(abs(_safe_float(derived_stats.get("max_drawdown_pct"))) * 100, 2)
@@ -1286,10 +1287,10 @@ def _quick_stats_and_equity(
         "max_drawdown_pct": max_drawdown_pct,
         "net_profit": round(total_pnl, 2),
         "net_profit_pct": net_profit_pct,
-        # Percent points, matching net_profit_pct and the frontend's "points"
-        # scale. The frontend reads both keys, so a payload without this one
-        # renders the total-return tile as unavailable.
-        "total_return": net_profit_pct,
+        # A fraction, the engine definition (E_end / E_start - 1) that
+        # frontend/src/api/metricScale.ts declares for total_return. The
+        # net_profit_pct above is this same number in percent points.
+        "total_return": round(total_return_fraction, 8),
         "psr": psr_val,
         "p_value": p_value,
         "equity_mini": equity_mini,
@@ -1363,12 +1364,14 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         else None
     )
 
-    # Persisted runner stats carry total_return as a FRACTION; the payload is in
-    # percent points to match the frontend's "points" scale and net_profit_pct.
-    # Fall back to the net figure when the engine did not record it.
-    _total_return_fraction = _safe_float(raw.get("total_return"), float("nan"))
-    if not math.isfinite(_total_return_fraction):
-        _total_return_fraction = (
+    # Persisted runner stats carry total_return as a FRACTION (the engine
+    # definition is E_end / E_start - 1, see runner/stats.py) and
+    # frontend/src/api/metricScale.ts declares it a "fraction" for this payload,
+    # so it is passed through unscaled. Fall back to the net figure when the
+    # engine did not record it.
+    total_return_fraction = _safe_float(raw.get("total_return"), float("nan"))
+    if not math.isfinite(total_return_fraction):
+        total_return_fraction = (
             (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
             / (result.meta.initial_capital or 100000)
         )
@@ -1405,7 +1408,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
-        "total_return": round(_total_return_fraction * 100, 2),
+        "total_return": round(total_return_fraction, 6),
         "expectancy": 0,  # computed below
     }
     # Expectancy

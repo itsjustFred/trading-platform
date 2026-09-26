@@ -15,6 +15,11 @@ import {
 } from "recharts";
 
 import { compareBacktests } from "../api/client";
+import {
+  requireMetricScale,
+  toPercentPoints,
+  type PercentScale,
+} from "../api/metricScale";
 import type { BacktestsCompareResponse } from "../api/types";
 
 const COLORS = ["#58a6ff", "#3fb950"];
@@ -23,27 +28,61 @@ type MetricConfig = {
   key: keyof BacktestsCompareResponse["backtest1"]["stats"];
   label: string;
   better: "higher" | "lower";
-  format: "number" | "percent" | "currency" | "integer";
-};
+} & (
+  | { format: "percent"; scale: PercentScale }
+  | { format: "number" | "currency" | "integer" }
+);
 
-// The /api/backtests/compare payload serves every percent-like metric here in
-// percent points (see _backtest_compare_payload in viewer/main.py), so no
-// per-metric scale is needed on this page.
+// /api/backtests/compare is NOT unit-homogeneous: total_return stays in the
+// engine's fraction, the rest are normalized to percent points (see
+// _backtest_compare_payload in viewer/main.py). Every percent row therefore
+// states its own scale, resolved from the shared contract table so the page
+// cannot drift from the payload.
 const METRICS: MetricConfig[] = [
-  { key: "total_return", label: "Total Return", better: "higher", format: "percent" },
+  {
+    key: "total_return",
+    label: "Total Return",
+    better: "higher",
+    format: "percent",
+    scale: requireMetricScale("total_return"),
+  },
   { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },
   { key: "sharpe_ratio", label: "Sharpe (higher = better)", better: "higher", format: "number" },
-  { key: "psr", label: "PSR (higher = better)", better: "higher", format: "percent" },
+  {
+    key: "psr",
+    label: "PSR (higher = better)",
+    better: "higher",
+    format: "percent",
+    scale: "points",
+  },
   { key: "p_value", label: "p-Value (lower = better)", better: "lower", format: "number" },
-  { key: "cagr", label: "CAGR (higher = better)", better: "higher", format: "percent" },
-  { key: "max_drawdown", label: "Max DD (lower = better)", better: "lower", format: "percent" },
-  { key: "win_rate", label: "Win Rate (higher = better)", better: "higher", format: "percent" },
+  {
+    key: "cagr",
+    label: "CAGR (higher = better)",
+    better: "higher",
+    format: "percent",
+    scale: "points",
+  },
+  {
+    key: "max_drawdown",
+    label: "Max DD (lower = better)",
+    better: "lower",
+    format: "percent",
+    scale: "points",
+  },
+  {
+    key: "win_rate",
+    label: "Win Rate (higher = better)",
+    better: "higher",
+    format: "percent",
+    scale: "points",
+  },
   { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];
 
-function formatMetric(value: number, format: MetricConfig["format"]): string {
+function formatMetric(value: number, metric: MetricConfig): string {
   if (!Number.isFinite(value)) return "—";
-  if (format === "currency") {
+  if (metric.format === "currency") {
     return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toLocaleString(
       "en-US",
       {
@@ -51,10 +90,10 @@ function formatMetric(value: number, format: MetricConfig["format"]): string {
       },
     )}`;
   }
-  if (format === "percent") {
-    return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+  if (metric.format === "percent") {
+    return `${value >= 0 ? "+" : ""}${(toPercentPoints(value, metric.scale) ?? 0).toFixed(2)}%`;
   }
-  if (format === "integer") {
+  if (metric.format === "integer") {
     return `${value >= 0 ? "+" : ""}${Math.trunc(value)}`;
   }
   return value.toFixed(3);
@@ -68,18 +107,15 @@ function deltaColorFor(delta: number, betterSecond: boolean): string {
   return betterSecond ? "#3fb950" : "#f85149";
 }
 
-function formatMetricRaw(
-  value: number,
-  format: MetricConfig["format"],
-): string {
+function formatMetricRaw(value: number, metric: MetricConfig): string {
   if (!Number.isFinite(value)) return "—";
-  if (format === "currency") {
+  if (metric.format === "currency") {
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   }
-  if (format === "percent") {
-    return `${value.toFixed(2)}%`;
+  if (metric.format === "percent") {
+    return `${(toPercentPoints(value, metric.scale) ?? 0).toFixed(2)}%`;
   }
-  if (format === "integer") {
+  if (metric.format === "integer") {
     return Math.trunc(value).toLocaleString("en-US");
   }
   return value.toFixed(3);
@@ -310,13 +346,13 @@ export function ComparePage() {
                   <tr key={metric.key}>
                     <td style={tdStyle}>{metric.label}</td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(left, metric.format)}
+                      {formatMetricRaw(left, metric)}
                     </td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(right, metric.format)}
+                      {formatMetricRaw(right, metric)}
                     </td>
                     <td style={{ ...tdStyle, color: deltaColor }}>
-                      {formatMetric(delta, metric.format)}
+                      {formatMetric(delta, metric)}
                     </td>
                   </tr>
                 );

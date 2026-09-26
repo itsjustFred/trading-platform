@@ -36,6 +36,7 @@ import { RenameModal } from "../components/RenameModal";
 import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { useToast } from "../components/toastContext";
+import { requireMetricScale } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
@@ -502,7 +503,7 @@ export function PortfolioDetailPage() {
           label="Total Return"
           value={stats.total_return ?? 0}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("total_return")}
         />
         <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
         <StatCard

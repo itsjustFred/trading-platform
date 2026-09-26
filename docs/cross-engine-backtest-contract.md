@@ -232,6 +232,31 @@ canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
 
+### 6.1 Units of the percent-like keys
+
+**`total_return` is a fraction in every payload, at every layer.** It is the
+engine's equity-endpoint ratio (`E_end / E_start - 1`, see
+`docs/cleanup-16d1-money-path-semantics.md` D5), and that is what
+`runner.stats.compute_stats` writes into `BacktestResult.stats` and therefore
+what the persisted artifact (`meta["total_return"]`,
+`portfolio.combined_stats["total_return"]`) holds. Every API producer
+(`/api/backtest/{id}/stats`, `/api/backtests/all`, `/api/backtests/compare`,
+the portfolio list and detail payloads) passes it through unscaled, and the
+frontend renders it with the `"fraction"` scale declared in
+`frontend/src/api/metricScale.ts`. Reading it as percent points inflates a
+12.54% return to 1254.00%; the mirror-image mistake (a fraction rendered as
+points) deflates it to 0.13%.
+
+`net_profit_pct` is the one deliberate exception: it stays in percent points,
+because several readers format it as `value.toFixed(1) + "%"` with no
+conversion. The two keys are therefore always a hundred to one apart, which
+makes them a free cross-check on each other.
+
+**Pinned by:** `tests/test_metric_scale_contract.py`, which parses
+`frontend/src/api/metricScale.ts` and asserts per key that the backend producer
+emits the declared unit, plus a dedicated test that every `total_return`
+producer serves the canonical fraction.
+
 ## 7. `total_bars`
 
 Decision Record (Cleanup 16-A, F6): **`meta.total_bars` is the number of bars

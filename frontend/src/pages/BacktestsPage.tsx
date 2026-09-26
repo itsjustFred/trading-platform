@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { normalizeWinRate } from "../api/metricScale";
+import { normalizeWinRate, toPercentPointsForKey } from "../api/metricScale";
 import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
@@ -249,7 +249,9 @@ function toBounds(values: number[], fallback: NumericRange): NumericRange {
 function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
   return {
     totalReturn: toBounds(
-      items.map((item) => metricValue(item.total_return) * 100),
+      items.map(
+        (item) => toPercentPointsForKey("total_return", metricValue(item.total_return)) ?? 0,
+      ),
       { min: -50, max: 50 },
     ),
     sharpe: toBounds(
@@ -814,7 +816,8 @@ export function BacktestsPage() {
         }
       }
 
-      const totalReturn = metricValue(item.total_return) * 100;
+      const totalReturn =
+        toPercentPointsForKey("total_return", metricValue(item.total_return)) ?? 0;
       const sharpe = metricValue(item.sharpe_ratio);
       const psr = metricValue(item.psr);
       const pValue = metricValue(item.p_value, 1);
@@ -1636,7 +1639,8 @@ export function BacktestsPage() {
         >
           {currentPageItems.map((item) => {
             const selected = selectedIds.has(item.id);
-            const totalReturnPct = metricValue(item.total_return) * 100;
+            const totalReturnPct =
+              toPercentPointsForKey("total_return", metricValue(item.total_return)) ?? 0;
             const cagrPct = metricValue(item.cagr) * 100;
             const maxDrawdownPct =
               Math.abs(metricValue(item.max_drawdown)) * 100;
