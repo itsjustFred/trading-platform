@@ -2,6 +2,7 @@ import { memo } from "react";
 
 import { toPercentPoints, type PercentScale } from "../api/metricScale";
 import {
+  formatStatCardValue,
   isUnavailableStatValue,
   UNAVAILABLE_STAT_TEXT,
 } from "../lib/statFormat";
@@ -47,22 +48,17 @@ export const StatCard = memo(function StatCard({
   // An unavailable metric renders as an em dash, never as 0 / $0 / 0.00%, so a
   // missing value is never mistaken for a genuine zero.
   const unavailable = isUnavailableStatValue(value);
-  let formatted = unavailable ? UNAVAILABLE_STAT_TEXT : String(value);
-
-  if (!unavailable) {
-    if (format === "currency") {
-      const abs = Math.abs(numVal);
-      formatted =
-        numVal >= 0
-          ? `$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
-          : `-$${abs.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
-    } else if (format === "percent" && finite) {
-      const points = toPercentPoints(numVal, percentScale) ?? 0;
-      formatted = `${points.toFixed(2)}%`;
-    } else if (format === "number") {
-      formatted = numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
-    }
-  }
+  // Delegate to the shared formatter so this card cannot drift from the rest of
+  // the UI. Formatting here directly meant a deliberate non-numeric label such
+  // as "n/a" reached Math.abs/toLocaleString as NaN and rendered "$NaN".
+  const formatted =
+    format === "percent" && finite
+      ? `${(toPercentPoints(numVal, percentScale) ?? 0).toFixed(2)}%`
+      : format === "none"
+        ? unavailable
+          ? UNAVAILABLE_STAT_TEXT
+          : String(value)
+        : formatStatCardValue(value, format);
 
   return (
     <div

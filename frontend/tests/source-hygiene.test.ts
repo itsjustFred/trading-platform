@@ -94,3 +94,16 @@ test("request storms are debounced", async () => {
   assert.match(createBacktestModal, /useDebouncedValue/);
   assert.doesNotMatch(createBacktestModal, /\[open, symbolList, timeframe, start, end\]/);
 });
+
+test("StatCard delegates formatting instead of formatting inline", async () => {
+  // Formatting inline is how a deliberate label such as "n/a" reached
+  // Math.abs/toLocaleString as NaN and rendered "$NaN". The shared formatter
+  // handles the pass-through; this pins that the card actually uses it.
+  const statCard = await read("../src/components/StatCard.tsx");
+
+  assert.match(statCard, /formatStatCardValue/);
+  assert.match(statCard, /formatStatCardValue\(value, format\)/);
+  // No inline numeric formatting of a possibly-NaN value.
+  assert.doesNotMatch(statCard, /Math\.abs\(numVal\)\.toLocaleString/);
+  assert.doesNotMatch(statCard, /\$\$\{abs\.toLocaleString/);
+});

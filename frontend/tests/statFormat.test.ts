@@ -92,3 +92,14 @@ test("unavailable values are never coloured as gains or losses", () => {
     assert.equal(resolveStatCardColor(undefined, missing, "percent"), "#c9d1d9");
   }
 });
+
+test("no currency or number format can render NaN", () => {
+  // StatCard used to format inline, so a deliberate label reached
+  // Math.abs/toLocaleString as NaN and rendered "$NaN". It now delegates here.
+  for (const label of ["n/a", "pending", "—"]) {
+    for (const format of ["currency", "number", "percent"] as const) {
+      const out = formatStatCardValue(label, format);
+      assert.ok(!out.includes("NaN"), `${format} rendered NaN for ${label}: ${out}`);
+    }
+  }
+});
