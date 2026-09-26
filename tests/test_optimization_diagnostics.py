@@ -216,10 +216,14 @@ def test_correction_reports_nothing_without_finite_metrics():
 
 
 def test_correction_tightens_threshold_with_more_trials():
+    # The trials need spread: with every trial identical the standard deviation
+    # is zero, the best-of-N cannot be inflated by search, and the expected max
+    # collapses to the mean. A zero-variance input cannot exercise "more trials
+    # tighten the correction".
     few = multiple_testing_correction([0.1, 0.2, 0.3])
-    many = multiple_testing_correction([0.1] * 200)
+    many = multiple_testing_correction([0.1, 0.2, 0.3] * 60)
     assert many["bonferroni_threshold"] < few["bonferroni_threshold"]
-    assert many["expected_max_under_null"] > few["expected_max_under_null"]
+    assert many["significance_threshold"] > few["significance_threshold"]
 
 
 def test_single_trial_has_no_selection_bias_to_correct():
@@ -237,7 +241,11 @@ def test_weak_best_of_many_does_not_survive_selection_bias():
     noise = [rng.gauss(0.0, 1.0) for _ in range(100)]
     result = multiple_testing_correction(noise)
     assert result["survives_selection_bias"] is False
-    assert result["best_trial_metric"] < result["expected_max_under_null"]
+    # Compared against the significance bar, not expected_max_under_null: the
+    # expected max is the *centre* of the best-of-N distribution, so about half
+    # of all pure-noise searches beat it. Measured over 2,000 noise draws the old
+    # comparison reported 60.6% of noise as surviving, against 4.3% here.
+    assert result["best_trial_metric"] < result["significance_threshold"]
 
 
 def test_strong_observed_metric_survives_selection_bias():
@@ -307,3 +315,42 @@ def test_diagnostics_payload_reports_embargo_in_bars():
     assert len(payload["walk_forward"]) == 2
     assert payload["plateau"]["parameter"] == "window"
     assert payload["multiple_testing"]["n_trials"] == 4
+
+
+def test_penalty_trials_do_not_poison_the_spread():
+    """No-trade trials carry a -1e9 sentinel, not a strategy performance.
+
+    Leaving them in put a -1e9 in the sample, so the mean and standard deviation
+    described the sentinel rather than the strategies and every comparison below
+    it looked like a real edge.
+    """
+    penalty = -1e9
+    result = multiple_testing_correction(
+        [0.10, 0.20, 0.30, penalty, penalty], penalty_floor=penalty
+    )
+    assert result["n_trials"] == 3, "penalty trials must not count as trials"
+    assert result["n_penalty_trials_excluded"] == 2
+    # The payload rounds to 6 decimals.
+    assert result["trial_metric_mean"] == pytest.approx(0.20, abs=1e-6)
+    assert result["trial_metric_std"] == pytest.approx(0.0816497, abs=1e-6)
+
+
+def test_without_a_penalty_floor_penalties_still_count_as_trials():
+    """Callers that do not declare a floor get the old behaviour."""
+    result = multiple_testing_correction([0.10, -1e9])
+    assert result["n_trials"] == 2
+    assert result["n_penalty_trials_excluded"] == 0
+
+
+def test_expected_max_is_scaled_onto_the_metrics_own_distribution():
+    """The bar must be in metric units, not a dimensionless z-score.
+
+    Comparing a raw z-score against a metric value is meaningless: a Sharpe of
+    1.5 against a z of 2.5 says nothing about the spread of the trials.
+    """
+    tight = multiple_testing_correction([1.0, 1.1, 0.9, 1.05, 0.95])
+    wide = multiple_testing_correction([-50.0, 50.0, 0.0, 0.0, 0.0])
+    # Same number of trials, so the same z; the bars differ only by the spread.
+    assert tight["significance_threshold"] > 1.0
+    assert wide["significance_threshold"] > 30.0
+    assert wide["expected_max_under_null"] != tight["expected_max_under_null"]

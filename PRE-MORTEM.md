@@ -421,8 +421,30 @@ The correct behaviour is to leave the deployment out of the ledger so the next
 sync, once the adapter connects, performs the cancel and flatten.
 
 This is described as post-mortem 7 above because the *shape* of the fragility is
-the point, but the current behaviour is already wrong and the fix is small:
-remove the `already_enforced.add(deployment_id)` from that branch. The daemon
-would then retry on each sync until an adapter is available, which is the intended
-behaviour and is bounded because the deployment is not ACTIVE and cannot submit
-anything in the meantime.
+the point.
+
+**Status: fixed, in two parts.** Removing the `already_enforced.add()` from that
+branch was necessary but not sufficient, and the first half alone still left the
+stop unenforced forever:
+
+1. `182cbe3` stopped recording the deployment as enforced, so the daemon retries
+   each sync instead of claiming success. Covered by
+   `test_stopped_deployment_without_adapter_is_retried_not_marked_enforced`.
+2. `40d5078` fixed the reason the retry could never succeed. Adapters were
+   connected only for *runnable* (active) accounts, so an account whose
+   deployments were all STOPPED never received one and the retry always found
+   `adapter is None`. Such accounts are now connected for enforcement, the
+   enforcement step runs after the connect, and they are deliberately excluded
+   from the task set so connecting for enforcement never grants trading
+   permission. Covered by
+   `test_account_ids_needing_stopped_enforcement_covers_stopped_only_accounts`
+   and `test_already_enforced_stopped_accounts_do_not_keep_an_adapter_alive`.
+
+Enforcement is also now refused when another deployment on the same account is
+still ACTIVE or PAUSED, because `cancel_open_orders` and `close_all_positions` act
+on the whole account and would otherwise close a sibling's positions.
+
+**Known and accepted:** the enforcement ledger is in-memory only, so a daemon
+restart re-enforces every STOPPED deployment once. That is idempotent and
+fail-safe rather than a safety hole, and persisting it would need a schema
+migration on the live deployments table, so it has not been done.

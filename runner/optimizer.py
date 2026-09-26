@@ -727,7 +727,8 @@ def _build_diagnostics_payload(
         payload["plateau"] = None
 
     payload["multiple_testing"] = multiple_testing_correction(
-        [float(row["metric"]) for row in trial_rows]
+        [float(row["metric"]) for row in trial_rows],
+        penalty_floor=_NO_TRADE_PENALTY,
     )
     payload["target_metric"] = target_metric
     return payload
