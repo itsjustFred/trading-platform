@@ -21,6 +21,7 @@ selection should be trusted.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
@@ -304,6 +305,7 @@ def multiple_testing_correction(
     *,
     observed_metric: float | None = None,
     alpha: float = 0.05,
+    penalty_floor: float | None = None,
 ) -> dict[str, Any]:
     """Correct for selecting the best of many trials.
 
@@ -313,14 +315,23 @@ def multiple_testing_correction(
     is supplied it is compared against that expectation, so a result can be
     labelled as surviving selection bias or not.
     """
+    # No-trade trials are sentinels, not strategy performances: their metric is a
+    # large fixed penalty. Leaving them in would put a -1e9 in the sample and
+    # make every spread statistic meaningless, so they are counted separately.
+    penalty = penalty_floor
     clean: list[float] = []
+    penalties = 0
     for value in trial_metrics or []:
         try:
             numeric = float(value)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(numeric):
-            clean.append(numeric)
+        if not math.isfinite(numeric):
+            continue
+        if penalty is not None and numeric <= penalty:
+            penalties += 1
+            continue
+        clean.append(numeric)
 
     n_trials = len(clean)
     if n_trials == 0:
@@ -336,10 +347,26 @@ def multiple_testing_correction(
 
     bonferroni = alpha / n_trials
     # Expected maximum of N standard normals under the null, via the standard
-    # normal quantile and Euler-Mascheroni.
-    expected_max = math.sqrt(2.0 * math.log(n_trials)) - (
-        math.log(math.log(n_trials)) + 0.5772156649015329
-    ) / math.sqrt(2.0 * math.log(n_trials)) if n_trials > 1 else 0.0
+    # normal quantile and Euler-Mascheroni. This is a dimensionless z-score: it
+    # has to be scaled onto the metric's own distribution before it can be
+    # compared with a metric value.
+    z_expected_max = (
+        math.sqrt(2.0 * math.log(n_trials))
+        - (math.log(math.log(n_trials)) + 0.5772156649015329)
+        / math.sqrt(2.0 * math.log(n_trials))
+        if n_trials > 1
+        else 0.0
+    )
+    mean_metric = statistics.fmean(clean)
+    sigma_metric = statistics.pstdev(clean) if len(clean) > 1 else 0.0
+    expected_max = mean_metric + sigma_metric * z_expected_max
+
+    # The *expected* max is the centre of the best-of-N distribution, so roughly
+    # half of all pure-noise searches would beat it: it is a diagnostic, not a
+    # bar to clear. The bar is the Bonferroni-corrected one-sided quantile, so a
+    # noise search passes it only alpha of the time.
+    z_significance = statistics.NormalDist().inv_cdf(1.0 - bonferroni)
+    significance_threshold = mean_metric + sigma_metric * z_significance
 
     best_observed = max(clean)
     reported = best_observed if observed_metric is None else float(observed_metric)
@@ -349,13 +376,23 @@ def multiple_testing_correction(
         "alpha": alpha,
         "bonferroni_threshold": round(bonferroni, 8),
         "expected_max_under_null": round(expected_max, 6),
+        "significance_threshold": round(significance_threshold, 6),
+        "n_penalty_trials_excluded": penalties,
+        "trial_metric_mean": round(mean_metric, 6),
+        "trial_metric_std": round(sigma_metric, 6),
         "observed_metric": round(reported, 6),
         "best_trial_metric": round(best_observed, 6),
         # A single-trial result has no search bias to correct for.
-        "survives_selection_bias": None if n_trials <= 1 else reported >= expected_max,
+        "survives_selection_bias": (
+            None if n_trials <= 1 else reported >= significance_threshold
+        ),
         "note": (
-            "expected_max_under_null is the expected maximum of "
-            f"{n_trials} independent trials under the null; an observed metric "
-            "below it is consistent with pure selection noise"
+            "expected_max_under_null is the trial mean plus the standard "
+            f"deviation times the expected maximum of {n_trials} independent "
+            "standard normals under the null, and is the centre of the "
+            "best-of-N distribution rather than a bar to clear. "
+            "significance_threshold is the Bonferroni-corrected one-sided "
+            "quantile, which is what survives_selection_bias compares against. "
+            "No-trade penalty trials are excluded from the mean and spread."
         ),
     }
