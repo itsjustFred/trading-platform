@@ -3362,27 +3362,53 @@ def test_optimization_run_rejects_train_split_above_max_before_queueing(viewer_c
 
 def test_live_deployment_pause_drain_waits_for_in_flight_submission(monkeypatch):
     import asyncio
+    from datetime import datetime, timedelta, timezone
 
     import viewer.main as viewer_app_module
+    from shared.database import LiveDeploymentSubmissionClaim
 
-    counts = iter([2, 1, 0])
+    expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
+    claims = iter(
+        [
+            [
+                LiveDeploymentSubmissionClaim(token="tok-1", expires_at=expires_at, expired=False),
+                LiveDeploymentSubmissionClaim(token="tok-2", expires_at=expires_at, expired=False),
+            ],
+            [LiveDeploymentSubmissionClaim(token="tok-2", expires_at=expires_at, expired=False)],
+            [],
+        ]
+    )
     monkeypatch.setattr(
         viewer_app_module,
-        "count_live_deployment_submissions",
-        lambda _deployment_id: next(counts),
+        "list_live_deployment_submission_claims",
+        lambda _deployment_id: next(claims),
     )
 
-    drained, remaining = asyncio.run(
+    result = asyncio.run(
         viewer_app_module._drain_live_deployment_submissions(
             "dep-1", timeout_seconds=1.0
         )
     )
 
-    assert drained is True
-    assert remaining == 0
+    assert result.outcome is viewer_app_module.LiveSubmissionDrainOutcome.DRAINED
+    assert result.complete is True
+    assert result.in_flight == 0
+    assert result.expired_unreleased == 0
 
 
-def test_live_pause_returns_conflict_when_submission_drain_times_out(viewer_client, monkeypatch):
+def test_live_pause_reports_the_truth_when_the_submission_drain_times_out(
+    viewer_client, monkeypatch
+):
+    """A PAUSE whose drain did not finish is still a PAUSE that happened.
+
+    The status write commits before the drain runs, and it is that write which
+    stops new claims, so the operator's stop has already taken effect. The old
+    behaviour raised 409 *after* the committed write and labelled the whole
+    operation a failure; the operator's obvious response to a red error on a stop
+    is to click ACTIVE, which re-arms the bot through a fresh broker
+    verification. The response must therefore be 200, carrying the new status and
+    an explicit non-clean drain outcome.
+    """
     from shared.models import LiveDeploymentConfig
     import viewer.main as viewer_app_module
 
@@ -3399,8 +3425,12 @@ def test_live_pause_returns_conflict_when_submission_drain_times_out(viewer_clie
         lambda _deployment_id, _status: deployment,
     )
 
-    async def _incomplete_drain(_deployment_id, *, timeout_seconds=10.0):
-        return False, 2
+    async def _incomplete_drain(_deployment_id, **_kwargs):
+        return viewer_app_module.LiveSubmissionDrainResult(
+            outcome=viewer_app_module.LiveSubmissionDrainOutcome.IN_FLIGHT,
+            in_flight=2,
+            expired_unreleased=0,
+        )
 
     monkeypatch.setattr(
         viewer_app_module,
@@ -3413,8 +3443,14 @@ def test_live_pause_returns_conflict_when_submission_drain_times_out(viewer_clie
         json={"status": "PAUSED"},
     )
 
-    assert resp.status_code == 409
-    assert resp.json()["detail"]["in_flight_submissions"] == 2
+    assert resp.status_code == 200, "a committed status change must not report failure"
+    body = resp.json()
+    assert body["status"] == "PAUSED"
+    assert body["status_change_applied"] is True
+    assert body["submission_drain_complete"] is False
+    assert body["submission_drain_outcome"] == "IN_FLIGHT"
+    assert body["in_flight_submissions"] == 2
+    assert "Verify the broker before resuming" in body["warning"]
 
 
 def test_backtest_run_rejects_out_of_range_sizing_fractions(viewer_client):
@@ -6757,8 +6793,12 @@ def test_pause_does_not_call_broker_reverification(viewer_client, monkeypatch):
     async def _must_not_verify(_account_id: str) -> bool:
         raise AssertionError("PAUSE must not trigger a broker round trip")
 
-    async def _drained(_deployment_id, *, timeout_seconds=10.0):
-        return True, 0
+    async def _drained(_deployment_id, **_kwargs):
+        return viewer_app_module.LiveSubmissionDrainResult(
+            outcome=viewer_app_module.LiveSubmissionDrainOutcome.DRAINED,
+            in_flight=0,
+            expired_unreleased=0,
+        )
 
     monkeypatch.setattr(
         viewer_app_module, "_reverify_account_against_broker", _must_not_verify

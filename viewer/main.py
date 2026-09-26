@@ -13,9 +13,11 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
@@ -123,7 +125,10 @@ from shared.database import (
     save_portfolio as save_portfolio_record,
     upsert_verification_evidence,
     upsert_background_task_record,
-    count_live_deployment_submissions,
+    list_live_deployment_submission_claims,
+    LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    LiveDeploymentSubmissionClaim,
+    utcnow_naive,
     create_service,
     delete_service,
     record_live_account_demo_verification,
@@ -12227,20 +12232,119 @@ async def create_live_deployment_endpoint(
     return _serialize_live_deployment_payload(created)
 
 
+class LiveSubmissionDrainOutcome(str, Enum):
+    """What a PAUSE can honestly claim about orders that were already at the broker."""
+
+    #: Every lease held when the status changed was released before its TTL.
+    DRAINED = "DRAINED"
+    #: A dispatcher still holds a live lease, so an order may still be in flight.
+    IN_FLIGHT = "IN_FLIGHT"
+    #: A lease expired without being released, so whether its order landed is
+    #: unknown. Never reported as a clean drain.
+    INDETERMINATE = "INDETERMINATE"
+
+
+@dataclass(frozen=True)
+class LiveSubmissionDrainResult:
+    outcome: LiveSubmissionDrainOutcome
+    in_flight: int
+    expired_unreleased: int
+
+    @property
+    def complete(self) -> bool:
+        return self.outcome is LiveSubmissionDrainOutcome.DRAINED
+
+
 async def _drain_live_deployment_submissions(
     deployment_id: str,
     *,
-    timeout_seconds: float = 10.0,
-) -> tuple[bool, int]:
+    timeout_seconds: float = LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    initial_claims: Sequence[LiveDeploymentSubmissionClaim] | None = None,
+) -> LiveSubmissionDrainResult:
+    """Wait out the submission leases held when a status change was applied.
+
+    The budget defaults to :data:`LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS`, which is
+    derived from the claim TTL so the drain can always outlast the lease it is
+    waiting on. A drain that gave up before the lease expired would report "in
+    flight" for perfectly healthy submissions.
+
+    ``initial_claims`` is the inventory taken *before* the status write and seeds
+    the ledger. Without it there is a window in which a lease could expire and be
+    reaped by a later claim attempt before the first poll ever saw it, and the
+    drain would then report a clean stop for a submission nobody observed. Seeds
+    and observations together cover every lease: a lease taken after the snapshot
+    is seen by the poll loop, and one that existed at the snapshot is accounted
+    for by the ledger.
+
+    The verdict is deliberately one-directional. ``DRAINED`` is returned only
+    when every lease seen during the drain was still within its TTL at the
+    moment it disappeared, i.e. it was released by a live claimor. A lease that
+    was ever observed expired, or that vanished only after its TTL had passed, is
+    reported as ``INDETERMINATE`` instead: the row disappearing proves nothing,
+    because the reaper in ``claim_live_deployment_submission`` deletes exactly the
+    same rows. Under-reporting progress is safe here; under-reporting the doubt
+    is not, so an ambiguous end state can never be reported as a clean stop.
+    Exactly one lease can exist per deployment (``UNIQUE(deployment_id)`` on the
+    claim table), so a lease that is still live is the only thing worth waiting
+    for.
+    """
     deadline = asyncio.get_running_loop().time() + max(float(timeout_seconds), 0.0)
+    expired_seen: set[str] = set()
+    leases: dict[str, datetime] = {}
+    for claim in initial_claims or ():
+        leases[claim.token] = claim.expires_at
+        if claim.expired:
+            expired_seen.add(claim.token)
     while True:
-        remaining = await asyncio.to_thread(
-            count_live_deployment_submissions, deployment_id
+        observed = await asyncio.to_thread(
+            list_live_deployment_submission_claims, deployment_id
         )
-        if remaining <= 0:
-            return True, 0
+        present: dict[str, datetime] = {}
+        for claim in observed:
+            present[claim.token] = claim.expires_at
+            if claim.expired:
+                expired_seen.add(claim.token)
+        # A lease that vanished after its own TTL lapsed was either reaped or
+        # released too late to tell apart, so it can no longer vouch for a stop.
+        for token, expires_at in leases.items():
+            if token not in present and utcnow_naive() >= expires_at:
+                expired_seen.add(token)
+        leases = present
+
+        if not present:
+            if expired_seen:
+                return LiveSubmissionDrainResult(
+                    outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                    in_flight=0,
+                    expired_unreleased=len(expired_seen),
+                )
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.DRAINED,
+                in_flight=0,
+                expired_unreleased=0,
+            )
+        # A lease that has already outlived its TTL settles the verdict on its
+        # own: waiting cannot help, because a claimor that releases it later is
+        # still indistinguishable from the reaper deleting it. Say so now rather
+        # than holding the operator's request open for the whole budget.
+        if all(token in expired_seen for token in present):
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                in_flight=0,
+                expired_unreleased=len(expired_seen),
+            )
         if asyncio.get_running_loop().time() >= deadline:
-            return False, remaining
+            if expired_seen:
+                return LiveSubmissionDrainResult(
+                    outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                    in_flight=len([t for t in present if t not in expired_seen]),
+                    expired_unreleased=len(expired_seen),
+                )
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.IN_FLIGHT,
+                in_flight=len(present),
+                expired_unreleased=0,
+            )
         await asyncio.sleep(0.05)
 
 
@@ -12288,6 +12392,7 @@ async def update_live_deployment_status_endpoint(
         status=payload.status,
     )
     requested_status = str(payload.status or "").strip().upper()
+    pending_claims: list[LiveDeploymentSubmissionClaim] = []
 
     if requested_status == "ACTIVE":
         # Re-verify the account against the broker immediately before arming.
@@ -12305,6 +12410,14 @@ async def update_live_deployment_status_endpoint(
                 ),
             )
 
+    # Inventory the leases to account for *before* the write, so a lease that is
+    # reaped in the window between the commit and the drain's first poll is still
+    # part of the ledger and cannot be mistaken for "nothing was in flight".
+    if requested_status != "ACTIVE":
+        pending_claims = await asyncio.to_thread(
+            list_live_deployment_submission_claims, deployment_id
+        )
+
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_status, deployment_id, payload.status
@@ -12315,27 +12428,51 @@ async def update_live_deployment_status_endpoint(
         raise HTTPException(status_code=404, detail="Live deployment not found")
     payload = _serialize_live_deployment_payload(updated)
     if updated.status != "ACTIVE":
-        drained, remaining = await _drain_live_deployment_submissions(deployment_id)
-        payload["submission_drain_complete"] = drained
-        payload["in_flight_submissions"] = remaining
-        if not drained:
+        # The status write above has already committed, and it is what stops new
+        # claims: `claim_live_deployment_submission` only inserts while the row
+        # reads ACTIVE. The pause therefore *has* taken effect by the time we get
+        # here, and the drain is an observation of orders that were already at
+        # the broker, not a precondition for the change. Reporting a failure
+        # here would tell an operator that a stop which succeeded did not happen,
+        # and their obvious response - clicking ACTIVE - re-arms the bot through
+        # a fresh broker verification. So the response states what is true: the
+        # new status is in effect, plus an explicit, non-clean outcome for the
+        # submissions that were already in flight.
+        drain = await _drain_live_deployment_submissions(
+            deployment_id, initial_claims=pending_claims
+        )
+        payload["submission_drain_outcome"] = drain.outcome.value
+        payload["submission_drain_complete"] = drain.complete
+        payload["in_flight_submissions"] = drain.in_flight
+        payload["expired_unreleased_submissions"] = drain.expired_unreleased
+        payload["status_change_applied"] = True
+        if drain.outcome is LiveSubmissionDrainOutcome.IN_FLIGHT:
+            payload["warning"] = (
+                f"Status is now {updated.status}, but {drain.in_flight} "
+                "submission(s) were already in flight when the change was applied. "
+                "The new status blocks any further orders; the in-flight "
+                "submission(s) may still reach the broker. Verify the broker "
+                "before resuming."
+            )
+        elif drain.outcome is LiveSubmissionDrainOutcome.INDETERMINATE:
+            payload["warning"] = (
+                f"Status is now {updated.status}, but {drain.expired_unreleased} "
+                "submission lease(s) expired without being released, so whether "
+                "those orders reached the broker is unknown. Verify the broker "
+                "before resuming."
+            )
+        if not drain.complete:
             logger.error(
-                "Live deployment status persisted but submission drain did not complete",
+                "Live deployment status persisted; submission drain did not "
+                "complete cleanly",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
                         "status": updated.status,
-                        "in_flight_submissions": remaining,
+                        "submission_drain_outcome": drain.outcome.value,
+                        "in_flight_submissions": drain.in_flight,
+                        "expired_unreleased_submissions": drain.expired_unreleased,
                     }
-                },
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "Deployment status changed but in-flight submissions remain",
-                    "deployment_id": deployment_id,
-                    "status": updated.status,
-                    "in_flight_submissions": remaining,
                 },
             )
     return payload

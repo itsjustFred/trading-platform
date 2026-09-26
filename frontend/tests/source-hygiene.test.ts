@@ -107,3 +107,54 @@ test("StatCard delegates formatting instead of formatting inline", async () => {
   assert.doesNotMatch(statCard, /Math\.abs\(numVal\)\.toLocaleString/);
   assert.doesNotMatch(statCard, /\$\$\{abs\.toLocaleString/);
 });
+
+test("a pause that had to wait out submissions is never reported as a failure", async () => {
+  // The backend answers 200 with the new status plus an explicit, possibly
+  // non-clean drain outcome. Typing that as LiveDeploymentConfig dropped the
+  // outcome fields, so the only thing the UI could show was the generic success
+  // toast - or, when the pause was refused, a red error for a stop that had
+  // actually worked, which is what led operators to click ACTIVE and re-arm the
+  // bot they were trying to stop.
+  const types = await read("../src/api/types.ts");
+  const client = await read("../src/api/client.ts");
+  const liveHub = await read("../src/pages/LiveHub.tsx");
+
+  assert.match(types, /interface LiveDeploymentStatusUpdateResponse/);
+  for (const field of [
+    "submission_drain_outcome",
+    "submission_drain_complete",
+    "in_flight_submissions",
+    "expired_unreleased_submissions",
+  ]) {
+    assert.ok(types.includes(field), `the drain outcome field ${field} must be typed`);
+  }
+  assert.match(types, /INDETERMINATE/);
+
+  // The status endpoint must be typed with the response that carries them.
+  assert.match(
+    client,
+    /updateLiveDeploymentStatus[\s\S]*?fetchJSON<LiveDeploymentStatusUpdateResponse>/,
+  );
+
+  // A non-clean drain is surfaced as a warning, from the returned result, and
+  // the control flow must not fall through to the plain success toast.
+  const control = liveHub.match(
+    /const handleControl[\s\S]*?\n {2}\}, \[refreshDeployments, showToast\]\);/,
+  );
+  assert.ok(control, "the deployment control flow must exist");
+  assert.match(control[0], /submission_drain_complete === false/);
+  assert.match(control[0], /showToast\(\s*result\.warning/);
+  assert.match(control[0], /"warning"/);
+  assert.match(control[0], /getLiveDeployments\(\)/);
+
+  // The failure branch has to check whether the change actually landed before
+  // telling the operator it failed: the request may have been applied with the
+  // response lost in flight.
+  const catchBranch = control[0].match(/catch \(error_: unknown\) \{[\s\S]*?\n {4}\}/);
+  assert.ok(catchBranch, "the control flow must have a failure branch");
+  assert.match(catchBranch[0], /deployment\.status === targetStatus/);
+  assert.ok(
+    catchBranch[0].indexOf('"warning"') < catchBranch[0].indexOf('"error"'),
+    "a status change that did land must be reported before the error toast",
+  );
+});

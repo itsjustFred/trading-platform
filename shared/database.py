@@ -11,6 +11,7 @@ import subprocess
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -491,6 +492,16 @@ class GridRecord(SQLModel, table=True):
 
 def _utcnow_naive() -> datetime:
     """Timezone-aware UTC now, stored naive to keep the existing schema."""
+    return utcnow_naive()
+
+
+def utcnow_naive() -> datetime:
+    """The clock the claim-lease timestamps are written with.
+
+    Exposed so a caller comparing a lease's ``expires_at`` against "now" uses
+    this clock rather than reimplementing the naive-UTC conversion, and cannot
+    silently disagree with the timestamps it is reading.
+    """
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -2559,11 +2570,30 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+# One lease, one budget, one place. The drain that an operator's PAUSE waits on
+# and the lease that a dispatcher holds are two halves of the same wait, so they
+# are derived from this single pair of constants and must never be written
+# independently.
+#
+# The relationship is the whole point: the drain budget is strictly greater than
+# the claim TTL. A dispatcher releases its lease in a `finally`, so a lease is
+# held for at most one TTL - but a lease may already be partly spent when the
+# drain starts, so its remaining life can still be a full TTL. If the budget
+# were shorter than the TTL then a submission that is merely slow would be
+# reported as "still in flight" while it was in fact perfectly healthy, and the
+# endpoint would have to guess. Two TTLs covers a full remaining lease plus one
+# more lease window of slack, which is also what lets the drain outlast a lease
+# that overran and make the expired-but-never-released case observable instead
+# of silently reading as "drained".
+LIVE_SUBMISSION_CLAIM_TTL_SECONDS = 30.0
+LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS = LIVE_SUBMISSION_CLAIM_TTL_SECONDS * 2.0
+
+
 def claim_live_deployment_submission(
     deployment_id: str,
     token: str,
     *,
-    ttl_seconds: float = 30.0,
+    ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
@@ -2579,7 +2609,9 @@ def claim_live_deployment_submission(
     transaction, so a claimor that died mid-submission cannot wedge the
     deployment forever. That cleanup is committed separately on purpose: it must
     survive a refused claim, otherwise a permanently-busy deployment would also
-    stop reaping its own dead leases.
+    stop reaping its own dead leases. This function is therefore the only place
+    that reaps; observers must use
+    :func:`list_live_deployment_submission_claims`, which never deletes.
     """
     normalized_id = str(deployment_id or "").strip()
     normalized_token = str(token or "").strip()
@@ -2646,35 +2678,51 @@ def release_live_deployment_submission(token: str) -> bool:
         return int(result.rowcount or 0) > 0
 
 
-def count_live_deployment_submissions(deployment_id: str) -> int:
+@dataclass(frozen=True)
+class LiveDeploymentSubmissionClaim:
+    """One observed submission lease, and whether it is still within its TTL."""
+
+    token: str
+    expires_at: datetime
+    expired: bool
+
+
+def list_live_deployment_submission_claims(
+    deployment_id: str,
+) -> list[LiveDeploymentSubmissionClaim]:
+    """Read-only inventory of the submission leases held for ``deployment_id``.
+
+    This never deletes anything. An earlier version of this function purged
+    expired leases before counting them, which made an expired-but-never-released
+    claim indistinguishable from "nothing was in flight" and let a stop report
+    success for an order whose outcome nobody had observed. Reaping belongs to
+    :func:`claim_live_deployment_submission` alone, which is what keeps a dead
+    claimor from wedging the deployment; an observer that also deletes cannot be
+    used to decide whether an operation's outcome is known.
+
+    ``expired`` is computed against the database's own clock so a caller never
+    has to compare wall time itself.
+    """
     normalized_id = str(deployment_id or "").strip()
     if not normalized_id:
-        return 0
+        return []
     init_db()
     now = _utcnow_naive()
     with get_session() as session:
-        expired = session.exec(
-            select(LiveDeploymentSubmissionClaimModel.token)
-            .where(
-                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
-                & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
-            )
-            .limit(1)
-        ).first()
-        if expired is not None:
-            session.exec(
-                delete(LiveDeploymentSubmissionClaimModel).where(
-                    (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
-                    & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
-                )
-            )
-            session.commit()
-        count = session.exec(
-            select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
-                LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id
-            )
-        ).one()
-    return int(count or 0)
+        rows = session.exec(
+            select(
+                LiveDeploymentSubmissionClaimModel.token,
+                LiveDeploymentSubmissionClaimModel.expires_at,
+            ).where(LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+        ).all()
+    return [
+        LiveDeploymentSubmissionClaim(
+            token=str(row[0]),
+            expires_at=row[1],
+            expired=row[1] <= now,
+        )
+        for row in rows
+    ]
 
 
 def live_account_identity_fingerprint(

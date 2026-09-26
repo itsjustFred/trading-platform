@@ -18,6 +18,7 @@ import type {
   LiveBalancesResponse,
   LiveDeploymentCreateRequest,
   LiveDeploymentConfig,
+  LiveDeploymentStatusUpdateResponse,
   LiveSignalLogResponse,
   LivePositionsResponse,
   LiveQuoteResponse,
@@ -387,7 +388,7 @@ export const updateLiveDeploymentStatus = (
   deploymentId: string,
   status: LiveDeploymentStatus,
 ) =>
-  fetchJSON<LiveDeploymentConfig>(
+  fetchJSON<LiveDeploymentStatusUpdateResponse>(
     `/live/deployments/${encodeURIComponent(deploymentId)}/status`,
     {
       method: "PUT",

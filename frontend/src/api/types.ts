@@ -569,6 +569,24 @@ export interface LiveDeploymentConfig {
   settings: Record<string, unknown>;
 }
 
+export interface LiveDeploymentStatusUpdateResponse extends LiveDeploymentConfig {
+  /**
+   * Only present on a status change that is not ACTIVE. `DRAINED` means every
+   * submission lease held when the status changed was released before its TTL.
+   * `IN_FLIGHT` means a dispatcher still held one, `INDETERMINATE` means a lease
+   * expired without being released so whether the order reached the broker is
+   * unknown. A non-`DRAINED` outcome is still a *successful* status change - the
+   * pause is in effect and blocks further orders - and must never be shown to
+   * the operator as a failed pause.
+   */
+  submission_drain_outcome?: "DRAINED" | "IN_FLIGHT" | "INDETERMINATE";
+  submission_drain_complete?: boolean;
+  in_flight_submissions?: number;
+  expired_unreleased_submissions?: number;
+  status_change_applied?: boolean;
+  warning?: string;
+}
+
 export interface LiveDeploymentCreateRequest {
   strategy_name?: string;
   account_id: string;

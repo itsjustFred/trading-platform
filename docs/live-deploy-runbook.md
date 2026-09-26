@@ -86,13 +86,42 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 - Der Daemon verweigert Adapter-Construction und jede Signal-Dispatch-Ausführung,
   wenn das DB-Konto nicht als Demo verifiziert ist. Alpaca-Adapter müssen
   zusätzlich `paper=True` sein.
-- `PAUSED`/`STOPPED` werden zuerst atomar in SQLite gespeichert. Danach wartet
-  der Status-Endpunkt auf laufende Submission-Claims. Ist der Drain nach 10
-  Sekunden unvollständig, antwortet der Endpunkt mit HTTP `409` und
-  `in_flight_submissions`; `PAUSED` bleibt trotzdem erhalten.
+- `PAUSED`/`STOPPED` werden zuerst atomar in SQLite gespeichert. Dieser Write ist
+  es, der neue Claims stoppt (`claim_live_deployment_submission` fügt nur ein,
+  solange die Zeile `ACTIVE` liest) — der Pause ist also **bereits wirksam**,
+  bevor der Endpunkt drainiert. Der anschließende Drain ist eine *Beobachtung*
+  der Orders, die schon beim Broker waren, und keine Vorbedingung für den
+  Statuswechsel.
+- Der Status-Endpunkt meldet deshalb **niemals** einen Fehlschlag für einen
+  Statuswechsel, der committed wurde. Er antwortet mit HTTP `200`, dem neuen
+  Status und einem expliziten Drain-Ergebnis:
+  - `submission_drain_outcome: "DRAINED"` — jeder Claim wurde innerhalb seiner
+    TTL freigegeben; nichts war mehr im Flug.
+  - `submission_drain_outcome: "IN_FLIGHT"` mit `in_flight_submissions` — ein
+    Dispatcher hielt beim Statuswechsel noch einen Claim. Die neue Sperre greift,
+    die Order kann aber noch beim Broker ankommen. `warning` sagt das explizit.
+  - `submission_drain_outcome: "INDETERMINATE"` mit
+    `expired_unreleased_submissions` — ein Claim ist abgelaufen, ohne
+    freigegeben zu werden. Ob die Order den Broker erreicht hat, ist **unbekannt**
+    und wird nie als sauberer Drain gemeldet.
+  In beiden Nicht-`DRAINED`-Fällen gilt `submission_drain_complete: false`,
+  `status_change_applied: true` plus ein `warning`. Der Operator wird gewarnt,
+  nicht aber so getäuscht, der Pause sei fehlgeschlagen: ein Fehler an einem Stop
+  verleitet dazu, auf `ACTIVE` zu klicken und den Bot über eine neue
+  Broker-Verifizierung wieder scharf zu schalten. Vor dem Fortsetzen ist der
+  Broker zu prüfen.
+- Drain-Budget und Claim-TTL hängen an einer einzigen Konstanten
+  (`LIVE_SUBMISSION_CLAIM_TTL_SECONDS`, daraus abgeleitet
+  `LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS = TTL * 2`). Das Budget muss **größer**
+  sein als die TTL: gibt der Drain vorher auf, meldet er eine gesunde, langsame
+  Submission fälschlich als „im Flug".
 - Ein Claim beendet eine bereits laufende Broker-Submission nicht abrupt. Die
-  PAUSE-Antwort garantiert deshalb erst nach erfolgreichem Drain, dass keine
-  Submission mehr im Flug ist.
+  PAUSE-Antwort garantiert deshalb nur bei `DRAINED`, dass keine Submission mehr
+  im Flug ist.
+- Der Drain-Observer (`list_live_deployment_submission_claims`) **liest nur** und
+  löscht nie. Ein abgelaufener, nie freigegebener Claim bleibt als solcher
+  sichtbar; dadurch ist er von „nichts war im Flug“ unterscheidbar. Gereapt wird
+  ausschließlich im Claim-Pfad.
 - Es gibt **genau einen** Submission-Claim pro Deployment: `deployment_id` ist in
   `live_deployment_submission_claims` UNIQUE, durchgesetzt von der Datenbank. Ein
   zweiter Dispatcher (z. B. ein zweiter Daemon-Prozess) bekommt den Claim nicht und

@@ -548,8 +548,24 @@ export function LiveHubPage() {
 
     setDeploymentBusy(card.id, true);
     try {
-      await updateLiveDeploymentStatus(card.id, targetStatus);
+      const result = await updateLiveDeploymentStatus(card.id, targetStatus);
       await refreshDeployments(true);
+      // A PAUSE that had to wait out submissions still succeeded: the status is
+      // in effect and blocks new orders. Saying "success" and hiding the
+      // leftovers would be as dishonest as the old red error, and an operator
+      // who reads a warning as a failure clicks ACTIVE - which re-arms the bot
+      // they were trying to stop. So the status change and the leftovers are
+      // reported as two separate facts.
+      if (result.submission_drain_complete === false) {
+        showToast(
+          result.warning ??
+            `${card.strategy_name} switched to ${targetStatus.toLowerCase()}, but ${
+              result.in_flight_submissions ?? 0
+            } submission(s) were still settling. Verify the broker before resuming.`,
+          "warning",
+        );
+        return;
+      }
       showToast(
         `${card.strategy_name} switched to ${targetStatus.toLowerCase()}.`,
         "success",
@@ -557,6 +573,21 @@ export function LiveHubPage() {
     } catch (error_: unknown) {
       const message =
         error_ instanceof Error ? error_.message : "Failed to update deployment status";
+      // The request may have been applied and its response lost, in which case
+      // an error toast would tell the operator a stop failed when it did not.
+      // Re-read the deployment before believing the failure.
+      const applied = await getLiveDeployments()
+        .then((deployments) =>
+          deployments.some((deployment) => deployment.id === card.id && deployment.status === targetStatus),
+        )
+        .catch(() => false);
+      if (applied) {
+        showToast(
+          `${card.strategy_name} is ${targetStatus.toLowerCase()}, but the viewer could not confirm the submission drain. Verify the broker before resuming.`,
+          "warning",
+        );
+        return;
+      }
       showToast(message, "error");
     } finally {
       setDeploymentBusy(card.id, false);

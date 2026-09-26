@@ -1620,9 +1620,13 @@ async def _submit_normalized_discord_signal(
     # snapshot; between them and the broker call an operator can pause the
     # deployment. The claim turns "still ACTIVE" into a single atomic database
     # fact taken immediately before submission, so a PAUSE either wins the race
-    # (the claim fails and nothing is sent) or is refused until the drain
-    # completes. The claim is released in `finally` so a broker error cannot
-    # wedge the deployment permanently.
+    # (the claim fails and nothing is sent) or is already in effect while this
+    # dispatcher finishes the order it had already claimed. The operator's PAUSE
+    # is never refused on account of this claim: the status write is what stops
+    # new orders, and the drain that follows it reports this submission as
+    # IN_FLIGHT (or INDETERMINATE if the lease below is never released) rather
+    # than pretending the stop failed. The claim is released in `finally` so a
+    # broker error cannot wedge the deployment permanently.
     claim_token = uuid.uuid4().hex
     claimed = await asyncio.to_thread(
         claim_live_deployment_submission,

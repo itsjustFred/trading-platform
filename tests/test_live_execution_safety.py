@@ -2132,17 +2132,27 @@ def test_submission_claim_is_atomic_with_deployment_status(isolated_db):
 
     deployment_id = str(deployment.id)
     assert database.claim_live_deployment_submission(deployment_id, "token-1") is True
-    assert database.count_live_deployment_submissions(deployment_id) == 1
+    assert len(database.list_live_deployment_submission_claims(deployment_id)) == 1
 
     database.update_live_deployment_status(deployment_id, "PAUSED")
 
     assert database.claim_live_deployment_submission(deployment_id, "token-2") is False
-    assert database.count_live_deployment_submissions(deployment_id) == 1
+    assert len(database.list_live_deployment_submission_claims(deployment_id)) == 1
     assert database.release_live_deployment_submission("token-1") is True
-    assert database.count_live_deployment_submissions(deployment_id) == 0
+    assert database.list_live_deployment_submission_claims(deployment_id) == []
 
 
-def test_expired_submission_claim_does_not_block_pause(isolated_db):
+def test_expired_submission_claim_is_reaped_but_never_hidden(isolated_db):
+    """A dead claimor must not wedge a deployment, and must not be papered over.
+
+    This test used to assert that counting submissions returned 0 once a lease
+    expired, because the count purged expired rows before counting. That made an
+    expired-but-never-released claim indistinguishable from "nothing was in
+    flight", so a PAUSE could be reported as a clean stop for an order whose
+    outcome nobody had observed. The anti-wedge requirement is still real and is
+    asserted here, but it belongs to the claim path: a fresh claim reaps the
+    dead lease. The observer only reports, so the ambiguity stays visible.
+    """
     database = isolated_db
     deployment = _deployment()
     _verified_demo_account(database, "acc-1", "ctrader")
@@ -2154,7 +2164,28 @@ def test_expired_submission_claim_does_not_block_pause(isolated_db):
     ) is True
     time.sleep(0.05)
 
-    assert database.count_live_deployment_submissions(deployment_id) == 0
+    # The observer reports the dead lease as expired rather than deleting it.
+    observed = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in observed] == ["expired-token"]
+    assert observed[0].expired is True
+
+    # Reading it is side-effect free: the row is still there afterwards, because
+    # an observer that deletes evidence cannot be used to decide whether a stop
+    # reached the broker.
+    from sqlmodel import select
+
+    with database.get_session() as session:
+        rows = session.exec(select(database.LiveDeploymentSubmissionClaimModel)).all()
+    assert [row.token for row in rows] == ["expired-token"]
+
+    # A fresh claim still reaps it, so a crashed claimor cannot wedge the
+    # deployment forever.
+    assert database.claim_live_deployment_submission(
+        deployment_id, "after-ttl", ttl_seconds=30.0
+    ) is True
+    reaped = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in reaped] == ["after-ttl"]
+    assert reaped[0].expired is False
 
 
 def test_ctrader_reconciliation_candidates_include_partially_executed_signal(isolated_db):
@@ -5987,7 +6018,7 @@ def test_submission_claim_is_mutually_exclusive_per_deployment(isolated_db):
 
     assert database.claim_live_deployment_submission(deployment_id, "token-1") is True
     assert database.claim_live_deployment_submission(deployment_id, "token-2") is False
-    assert database.count_live_deployment_submissions(deployment_id) == 1
+    assert len(database.list_live_deployment_submission_claims(deployment_id)) == 1
 
     # A different deployment is unaffected: the exclusion is per deployment.
     other = database.create_live_deployment(_deployment())
@@ -6018,5 +6049,262 @@ def test_a_dead_claimor_does_not_wedge_a_deployment(isolated_db):
     time.sleep(0.05)
     # Past the TTL the stale lease is reaped and the deployment trades again.
     assert database.claim_live_deployment_submission(deployment_id, "after-ttl") is True
-    assert database.count_live_deployment_submissions(deployment_id) == 1
+    remaining = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in remaining] == ["after-ttl"]
     assert database.release_live_deployment_submission("crashed-token") is False
+
+
+# ─── What an operator is told when a PAUSE cannot reach a clean stop ──────────
+
+
+def test_pause_with_an_in_flight_submission_is_applied_and_reported_as_applied(
+    isolated_db, viewer_client, monkeypatch
+):
+    """The status change and the leftover submissions are two separate facts.
+
+    The status write commits before the drain runs, and it is that write which
+    stops new claims, so the operator's stop has already taken effect. The old
+    code answered with 409 *after* the committed write: the operator saw a red
+    failure for a stop that had worked, and the obvious response to a red error
+    on a stop is to click ACTIVE, which re-arms the bot through a fresh broker
+    verification. The response has to be a 200 that says the status is in
+    effect *and* that N submissions were still in flight.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-in-flight", ttl_seconds=30.0
+    ) is True
+
+    # Keep the real drain logic, but with a budget the test can afford.
+    real_drain = viewer_app_module._drain_live_deployment_submissions
+
+    async def _budgeted_drain(target_deployment_id, **_kwargs):
+        return await real_drain(target_deployment_id, timeout_seconds=0.2)
+
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _budgeted_drain
+    )
+
+    resp = viewer_client.put(
+        f"/api/live/deployments/{deployment_id}/status", json={"status": "PAUSED"}
+    )
+
+    assert resp.status_code == 200, "a committed status change must not report failure"
+    body = resp.json()
+    assert body["status"] == "PAUSED"
+    assert body["status_change_applied"] is True
+    assert body["submission_drain_outcome"] == "IN_FLIGHT"
+    assert body["submission_drain_complete"] is False
+    assert body["in_flight_submissions"] == 1
+    assert "Verify the broker before resuming" in body["warning"]
+
+    # The stop really is in effect, which is what a failure code would deny.
+    assert database.get_live_deployment(deployment_id).status == "PAUSED"
+    assert (
+        database.claim_live_deployment_submission(deployment_id, "tok-after-pause")
+        is False
+    )
+
+
+def test_pause_drain_budget_outlives_the_claim_lease_it_waits_on(isolated_db):
+    """The drain budget and the lease TTL are one decision, not two numbers.
+
+    They used to be 10s and 30s, so a submission slower than the drain was
+    reported as in flight while the order was perfectly healthy - and the
+    endpoint turned that into a 409. The relationship has to be derivable and
+    the drain has to be able to outlast the lease it is waiting on.
+    """
+    import inspect
+
+    import viewer.main as viewer_app_module
+    from shared import database as database_module
+
+    database = isolated_db
+
+    # The relationship itself: the budget must exceed the lease, or the drain
+    # gives up on a healthy submission.
+    assert (
+        database_module.LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS
+        > database_module.LIVE_SUBMISSION_CLAIM_TTL_SECONDS
+    )
+    # And both sides default to those constants, so there is no second literal
+    # left to drift.
+    assert (
+        inspect.signature(database_module.claim_live_deployment_submission)
+        .parameters["ttl_seconds"]
+        .default
+        == database_module.LIVE_SUBMISSION_CLAIM_TTL_SECONDS
+    )
+    assert (
+        inspect.signature(viewer_app_module._drain_live_deployment_submissions)
+        .parameters["timeout_seconds"]
+        .default
+        == database_module.LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS
+    )
+
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    # A budget shorter than the lease it is waiting on - the shape that made a
+    # 30s-lease submission fail against a 10s drain - gives up while a perfectly
+    # healthy lease is still held, and says so rather than inventing a stop.
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-slow", ttl_seconds=30.0
+    ) is True
+    too_short = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.2
+        )
+    )
+    assert too_short.outcome is viewer_app_module.LiveSubmissionDrainOutcome.IN_FLIGHT
+    assert too_short.in_flight == 1
+    assert too_short.complete is False
+
+    # The same submission, released while its lease is still valid, drains
+    # cleanly - but only for a budget that outlasts the lease, which is what the
+    # derived relationship guarantees.
+    assert database.release_live_deployment_submission("tok-slow") is True
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-within-lease", ttl_seconds=5.0
+    ) is True
+    releaser = ThreadPoolExecutor(max_workers=1)
+    try:
+        releaser.submit(
+            lambda: (time.sleep(0.3), database.release_live_deployment_submission("tok-within-lease"))
+        )
+        outlasted = asyncio.run(
+            viewer_app_module._drain_live_deployment_submissions(
+                deployment_id, timeout_seconds=1.0
+            )
+        )
+    finally:
+        releaser.shutdown(wait=True)
+    assert outlasted.outcome is viewer_app_module.LiveSubmissionDrainOutcome.DRAINED
+    assert outlasted.complete is True
+
+    # A lease released after its TTL is not a clean stop: a late release and the
+    # reaper deleting the row look identical from here.
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-overran", ttl_seconds=0.2
+    ) is True
+    time.sleep(0.3)
+    overran = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.6
+        )
+    )
+    assert overran.outcome is viewer_app_module.LiveSubmissionDrainOutcome.INDETERMINATE
+    assert overran.complete is False
+    assert overran.expired_unreleased == 1
+
+
+def test_pause_reports_an_indeterminate_outcome_not_a_clean_stop(
+    isolated_db, viewer_client
+):
+    """A lease that expired without being released is never "drained".
+
+    The old count purged expired leases before counting, so a claimor that
+    blew past its TTL and never released read as zero in-flight submissions and
+    the stop reported 200 OK for an order whose outcome nobody had observed.
+    An unknown outcome must be reported as unknown - in the response body the
+    operator's UI actually reads.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-dead", ttl_seconds=0.2
+    ) is True
+    time.sleep(0.3)
+
+    # The observer reports the dead lease rather than deleting it, and marks it
+    # expired, so the ambiguity stays visible.
+    observed = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in observed] == ["tok-dead"]
+    assert observed[0].expired is True
+
+    result = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.2
+        )
+    )
+    assert result.outcome is viewer_app_module.LiveSubmissionDrainOutcome.INDETERMINATE
+    assert result.complete is False
+    assert result.expired_unreleased == 1
+
+    # Reading the drain state never reaps: the reaper is the claim path alone,
+    # which is what stops a dead claimor from wedging the deployment.
+    assert [
+        claim.token
+        for claim in database.list_live_deployment_submission_claims(deployment_id)
+    ] == ["tok-dead"]
+
+    # And the endpoint says so, instead of a clean stop.
+    resp = viewer_client.put(
+        f"/api/live/deployments/{deployment_id}/status", json={"status": "PAUSED"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "PAUSED"
+    assert body["status_change_applied"] is True
+    assert body["submission_drain_outcome"] == "INDETERMINATE"
+    assert body["submission_drain_complete"] is False
+    assert body["expired_unreleased_submissions"] == 1
+    assert "is unknown" in body["warning"]
+    assert database.get_live_deployment(deployment_id).status == "PAUSED"
+
+
+def test_pause_stays_indeterminate_when_a_dead_lease_is_reaped_before_the_drain(
+    isolated_db,
+):
+    """A reaped lease is indistinguishable from a late release, so it is not clean.
+
+    ``claim_live_deployment_submission`` deletes exactly the same expired rows
+    that a late release would remove, so once a dead lease is gone there is no
+    evidence left to distinguish "the claimor finished" from "the reaper cleaned
+    up after a claimor that may still be at the broker". The ledger therefore
+    starts at the moment the stop is requested, before the status write, so the
+    reaper cannot erase the evidence from under the drain.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-dead", ttl_seconds=0.2
+    ) is True
+    time.sleep(0.3)
+
+    # The inventory the endpoint takes before the status write.
+    pending = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in pending] == ["tok-dead"]
+
+    # A later claim attempt reaps the dead lease, and the row is gone.
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-next", ttl_seconds=30.0
+    ) is True
+    assert [
+        claim.token
+        for claim in database.list_live_deployment_submission_claims(deployment_id)
+    ] == ["tok-next"]
+    assert database.release_live_deployment_submission("tok-next") is True
+
+    result = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.2, initial_claims=pending
+        )
+    )
+    assert result.outcome is viewer_app_module.LiveSubmissionDrainOutcome.INDETERMINATE
+    assert result.complete is False
+    assert result.expired_unreleased == 1
