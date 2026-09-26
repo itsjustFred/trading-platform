@@ -1716,21 +1716,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.connect()
         self._raise_if_terminal_auth_failed()
 
-        order_list_req = self._ProtoOAOrderListReq()
-        order_list_req.ctidTraderAccountId = self.ctid_trader_account_id
-        order_list_req.fromTimestamp = 0
-        order_list_req.toTimestamp = 0
+        # Reconcile, not OrderList. OrderList is a historical query bounded by
+        # from/toTimestamp; 0/0 does not mean "now", so it can answer with
+        # nothing (and a cancel that finds nothing reports success while leaving
+        # the order resting) or with unrelated history. Reconcile takes no time
+        # bounds and is by definition current state, which is the same call
+        # _fetch_open_positions already makes for positions.
+        reconcile_req = self._ProtoOAReconcileReq()
+        reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
         try:
-            order_list_res = await self._send_request_with_refresh_retry(
-                order_list_req, timeout_seconds=15
+            reconcile_res = await self._send_request_with_refresh_retry(
+                reconcile_req, timeout_seconds=15
             )
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if not isinstance(order_list_res, self._ProtoOAOrderListRes):
+        if not isinstance(reconcile_res, self._ProtoOAReconcileRes):
             raise RuntimeError(
-                f"Unexpected order-list response: {type(order_list_res).__name__}"
+                f"Unexpected reconcile response: {type(reconcile_res).__name__}"
             )
+        order_list_res = reconcile_res
 
         # Market and market-range orders fill immediately and cannot be
         # cancelled; everything else can still be resting.

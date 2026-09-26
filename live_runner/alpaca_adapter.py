@@ -738,6 +738,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         timeframe: str,
         limit: int = 200,
     ) -> pd.DataFrame:
+        from alpaca.common.enums import Sort
         from alpaca.data.requests import StockBarsRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -760,6 +761,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 limit=1000,
                 adjustment="raw",
                 feed="iex",
+                # Newest first. The response is capped at `limit`, so an ascending
+                # request over a widened window returns the *oldest* bars in that
+                # window: widening to recover a short history would have
+                # returned staler data than the first attempt. Sorted back to
+                # ascending below before any consumer sees it.
+                sort=Sort.DESC,
             )
             return self._historical_data_client.get_stock_bars(request).df
 

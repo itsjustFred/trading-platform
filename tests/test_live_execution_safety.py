@@ -3980,3 +3980,69 @@ def test_legacy_response_without_a_status_is_not_treated_as_a_failure():
     AlpacaLiveAdapter._raise_on_failed_operations(
         {"cancelled_order_ids": ["a", "b"]}, operation="cancel_orders"
     )
+
+
+def test_widened_market_data_request_asks_for_the_newest_bars():
+    """The response is capped at `limit`, so ordering decides which bars arrive.
+
+    An ascending request over a widened window returns the oldest bars in it, so
+    the widening retry meant to recover a short history would have returned
+    staler data than the first attempt.
+    """
+    import asyncio
+    from live_runner import alpaca_adapter as mod
+    from alpaca.common.enums import Sort
+
+    seen_sorts = []
+    # Recent timestamps: the adapter rejects stale data, which is itself correct.
+    recent = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=100, freq="1h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "timestamp": recent,
+            "open": [1.0] * 100, "high": [1.0] * 100,
+            "low": [1.0] * 100, "close": [1.0] * 100,
+        }
+    ).set_index("timestamp")
+
+    class _Client:
+        def get_stock_bars(self, request):
+            seen_sorts.append(request.sort)
+            return type("R", (), {"df": frame})()
+
+    adapter = mod.AlpacaLiveAdapter.__new__(mod.AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._historical_data_client = _Client()
+
+    asyncio.run(adapter.get_market_data("AAPL", timeframe="1h", limit=50))
+
+    assert seen_sorts, "the client must have been called"
+    assert all(s is Sort.DESC for s in seen_sorts), (
+        f"every request must ask for the newest bars first, got {seen_sorts}"
+    )
+
+
+def test_returned_bars_are_sorted_ascending_regardless_of_request_order():
+    """Callers index chronologically, so the descending response is re-sorted."""
+    import asyncio
+    from live_runner import alpaca_adapter as mod
+
+    recent = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=10, freq="1h", tz="UTC")
+    descending = pd.DataFrame(
+        {
+            "timestamp": recent[::-1],
+            "open": [1.0] * 10, "high": [1.0] * 10,
+            "low": [1.0] * 10, "close": [1.0] * 10,
+        }
+    ).set_index("timestamp")
+
+    class _Client:
+        def get_stock_bars(self, request):
+            return type("R", (), {"df": descending})()
+
+    adapter = mod.AlpacaLiveAdapter.__new__(mod.AlpacaLiveAdapter)
+    adapter._connected = True
+    adapter._historical_data_client = _Client()
+
+    out = asyncio.run(adapter.get_market_data("AAPL", timeframe="1h", limit=5))
+    timestamps = pd.to_datetime(out["timestamp"], utc=True)
+    assert timestamps.is_monotonic_increasing, "bars must be returned oldest first"

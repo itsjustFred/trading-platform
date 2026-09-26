@@ -713,26 +713,31 @@ class _FakeCTraderAdapter:
     # Use the REAL protobuf message classes. Hand-rolled stand-ins accepted
     # whatever the adapter assigned to them, so a str being assigned to an
     # int64 field (which raises TypeError on the wire) passed these tests.
-    _ProtoOAOrderListReq = _real.ProtoOAOrderListReq
     _ProtoOACancelOrderReq = _real.ProtoOACancelOrderReq
     _ProtoOAClosePositionReq = _real.ProtoOAClosePositionReq
     _ProtoOAOrderType = _real_model.ProtoOAOrderType
-
-    class _OrderListRes:
-        """Real response shape: the repeated field is named `order`, not `orders`."""
-
-        def __init__(self, orders):
-            self.order = list(orders)
-
-    _ProtoOAOrderListRes = _OrderListRes
+    _ProtoOAOrderStatus = _real_model.ProtoOAOrderStatus
+    _ProtoOAReconcileReq = _real.ProtoOAReconcileReq
+    _ProtoOAReconcileRes = _real.ProtoOAReconcileRes
+    _ProtoOAPositionStatus = _real_model.ProtoOAPositionStatus
 
     async def connect(self):
         return None
 
     async def _send_request_with_refresh_retry(self, request, timeout_seconds=None):
+        """Answer reconcile with the real repeated `order` field.
+
+        The field is named `order`, not `orders`, and the response is built from
+        the real ProtoOAReconcileRes so a wrong field name fails here.
+        """
         self.sent.append(request)
-        if hasattr(request, "fromTimestamp") and hasattr(request, "toTimestamp"):
-            return self._OrderListRes(self._orders)
+        if isinstance(request, self._ProtoOAReconcileReq):
+            response = self._ProtoOAReconcileRes()
+            for order in self._orders:
+                response.order.add().CopyFrom(order)
+            for position in self._positions:
+                response.position.add().CopyFrom(position)
+            return response
         return object()
 
     async def cancel_open_orders(self):
@@ -790,10 +795,10 @@ def test_cancel_rejects_an_unexpected_response_type():
     adapter = _FakeCTraderAdapter([], [])
 
     async def _bad(request, timeout_seconds=None):
-        return "not-an-order-list-response"
+        return "not-a-reconcile-response"
 
     adapter._send_request_with_refresh_retry = _bad
-    with pytest.raises(RuntimeError, match="Unexpected order-list response"):
+    with pytest.raises(RuntimeError, match="Unexpected reconcile response"):
         _run(adapter.cancel_open_orders())
 
 
@@ -873,7 +878,7 @@ def _real_position(position_id: int, volume: int):
 
 
 def _make_cancel_adapter(tmp_path: Path, orders):
-    """Adapter whose transport answers the order list, then records cancels."""
+    """Adapter whose transport answers the reconcile, then records cancels."""
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
@@ -882,8 +887,8 @@ def _make_cancel_adapter(tmp_path: Path, orders):
     )
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOACancelOrderReq,
-        ProtoOAOrderListReq,
-        ProtoOAOrderListRes,
+        ProtoOAReconcileReq,
+        ProtoOAReconcileRes,
     )
 
     adapter = CTraderLiveAdapter(
@@ -892,26 +897,25 @@ def _make_cancel_adapter(tmp_path: Path, orders):
     )
     adapter._connected = True
     adapter._authenticated = True
-    adapter._ProtoOAOrderListReq = ProtoOAOrderListReq
-    adapter._ProtoOAOrderListRes = ProtoOAOrderListRes
+    adapter._ProtoOAReconcileReq = ProtoOAReconcileReq
+    adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
     adapter._ProtoOACancelOrderReq = ProtoOACancelOrderReq
     adapter._ProtoOAOrderType = ProtoOAOrderType
     adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
 
-    response = ProtoOAOrderListRes()
+    # Real ProtoOAReconcileRes, so the repeated `order` field is the real one.
+    response = ProtoOAReconcileRes()
     for order in orders:
         response.order.add().CopyFrom(order)
 
     cancelled: list[int] = []
-    state = {"listed": False}
 
     async def _fake_send(request, **_kwargs):
-        if isinstance(request, ProtoOAOrderListReq):
-            state["listed"] = True
+        if isinstance(request, ProtoOAReconcileReq):
             return response
         if isinstance(request, ProtoOACancelOrderReq):
             cancelled.append(int(request.orderId))
-            return ProtoOAOrderListRes()
+            return ProtoOAReconcileRes()
         raise AssertionError(f"unexpected request {type(request).__name__}")
 
     adapter._send_request_with_refresh_retry = _fake_send
