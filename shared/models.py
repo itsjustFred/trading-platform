@@ -23,6 +23,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from shared.atomic_io import write_text_atomically
+
 logger = logging.getLogger(__name__)
 
 
@@ -354,6 +356,8 @@ class Trade:
     holding_bars: int | None = None  # entry to last exit
     tags: list[str] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -379,6 +383,8 @@ class Trade:
             "mae",
             "mfe",
             "holding_bars",
+            "stop_loss",
+            "take_profit",
         ):
             val = getattr(self, fld)
             if val is not None:
@@ -413,6 +419,8 @@ class Trade:
             holding_bars=d.get("holding_bars"),
             tags=d.get("tags", []),
             meta=d.get("meta", {}),
+            stop_loss=d.get("stop_loss"),
+            take_profit=d.get("take_profit"),
         )
 
     @property
@@ -477,6 +485,14 @@ class BacktestMeta:
     # Capital
     initial_capital: float = 100_000.0
     currency: str = "USD"
+    risk_per_trade_pct: float | None = None
+    max_position_exposure_pct: float | None = None
+    max_leverage: float | None = None
+    modeling_resolution: str = "main_timeframe"
+    signal_exit_fill: str = "close"
+    allow_fallback_stop: bool = True
+    reject_missing_stop: bool = False
+    require_explicit_column_roles: bool = False
 
     # Parameter (strategie-spezifisch)
     parameters: dict = field(default_factory=dict)
@@ -506,6 +522,24 @@ class BacktestMeta:
             d["data"] = self.data
         if self.currency != "USD":
             d["currency"] = self.currency
+        for name in (
+            "risk_per_trade_pct",
+            "max_position_exposure_pct",
+            "max_leverage",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                d[name] = value
+        if self.modeling_resolution != "main_timeframe":
+            d["modeling_resolution"] = self.modeling_resolution
+        if self.signal_exit_fill != "close":
+            d["signal_exit_fill"] = self.signal_exit_fill
+        if not self.allow_fallback_stop:
+            d["allow_fallback_stop"] = False
+        if self.reject_missing_stop:
+            d["reject_missing_stop"] = True
+        if self.require_explicit_column_roles:
+            d["require_explicit_column_roles"] = True
         if self.parameters:
             d["parameters"] = self.parameters
         if self.tags:
@@ -528,6 +562,14 @@ class BacktestMeta:
             data=d.get("data", {}),
             initial_capital=d.get("initial_capital", 100_000.0),
             currency=d.get("currency", "USD"),
+            risk_per_trade_pct=d.get("risk_per_trade_pct"),
+            max_position_exposure_pct=d.get("max_position_exposure_pct"),
+            max_leverage=d.get("max_leverage"),
+            modeling_resolution=d.get("modeling_resolution", "main_timeframe"),
+            signal_exit_fill=d.get("signal_exit_fill", "close"),
+            allow_fallback_stop=d.get("allow_fallback_stop", True),
+            reject_missing_stop=d.get("reject_missing_stop", False),
+            require_explicit_column_roles=d.get("require_explicit_column_roles", False),
             parameters=d.get("parameters", {}),
             tags=d.get("tags", []),
             notes=d.get("notes", ""),
@@ -685,6 +727,13 @@ class BacktestResult:
     stats: dict[str, Any] = field(default_factory=dict)
     indicators: list[IndicatorSeries] = field(default_factory=list)
     drawings: list[dict[str, Any]] = field(default_factory=list)
+    equity_evidence_status: Literal["unknown", "available", "missing"] = "unknown"
+
+    def __post_init__(self) -> None:
+        if self.equity_curve and self.equity_evidence_status == "unknown":
+            self.equity_evidence_status = "available"
+        if self.equity_evidence_status == "available" and not self.equity_curve:
+            raise ValueError("equity_evidence_status=available requires an equity curve")
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -699,6 +748,8 @@ class BacktestResult:
             d["indicators"] = [i.to_dict() for i in self.indicators]
         if self.drawings:
             d["drawings"] = self.drawings
+        if self.equity_evidence_status != "unknown":
+            d["equity_evidence_status"] = self.equity_evidence_status
         return d
 
     @classmethod
@@ -710,6 +761,7 @@ class BacktestResult:
             stats=d.get("stats", {}),
             indicators=[IndicatorSeries.from_dict(i) for i in d.get("indicators", [])],
             drawings=d.get("drawings", []),
+            equity_evidence_status=d.get("equity_evidence_status", "unknown"),
         )
 
     def to_json(self, indent: int = 2) -> str:
@@ -722,10 +774,7 @@ class BacktestResult:
     def save(self, path: str | Path) -> Path:
         """Save to JSON file. Returns the path written to."""
         p = Path(path).resolve()
-        if not p.parent.is_dir():
-            raise FileNotFoundError(f"Target directory does not exist: {p.parent}")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.to_json(), encoding="utf-8")
+        write_text_atomically(p, self.to_json())
         logger.info("Saved backtest result to %s", p)
         return p
 

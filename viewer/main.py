@@ -125,6 +125,7 @@ from shared.database import (
     update_live_deployment_status,
     update_service_status,
 )
+from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from risk.config import RiskConfig
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
@@ -8919,7 +8920,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         return cmd
 
     def _run() -> None:
-        env = os.environ.copy()
+        env = build_backtest_child_env()
         cmd = _build_command(env)
 
         latest_message = ""

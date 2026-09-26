@@ -6,9 +6,10 @@ reference backtest to justify moving to paper trading.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from validation.comparison.delta_report import TradeDelta, TradeDeltaReport
+from validation.comparison.delta_report import TradeDeltaReport
 from validation.readiness.models import (
     PaperReadinessLevel,
     ReadinessCheck,
@@ -16,7 +17,7 @@ from validation.readiness.models import (
     ReadinessReport,
 )
 from validation.regression.runner import RegressionResult
-from validation.risk.comparison import RiskComparisonReport, RiskComparisonResult
+from validation.risk.comparison import RiskComparisonReport
 from validation.stats.calculator import TradeStatistics
 
 
@@ -60,6 +61,7 @@ class ReadinessValidator:
         risk_report: RiskComparisonReport | None = None,
         stats: tuple[TradeStatistics, TradeStatistics] | None = None,
         config: ReadinessConfig | None = None,
+        equity_evidence_status: str | None = None,
     ) -> ReadinessReport:
         """Run all readiness checks and return a structured report.
 
@@ -77,6 +79,8 @@ class ReadinessValidator:
         config:
             Optional :class:`ReadinessConfig` with thresholds.  Defaults are
             used when not provided.
+        equity_evidence_status:
+            Optional combined equity evidence status. ``missing`` fails closed.
 
         Returns
         -------
@@ -97,6 +101,9 @@ class ReadinessValidator:
         checks.extend(cls._check_regression(regression, cfg, recommendations))
         checks.extend(cls._check_risk(risk_report, cfg, recommendations))
         checks.extend(cls._check_stats(stats, cfg, recommendations))
+        checks.extend(
+            cls._check_equity_evidence(equity_evidence_status, recommendations)
+        )
 
         # Check for required artifacts - missing required = NOT_READY
         missing_required = []
@@ -122,7 +129,9 @@ class ReadinessValidator:
                 )
 
         errors = sum(1 for c in checks if not c.passed and c.severity == "error")
-        warnings = sum(1 for c in checks if c.severity == "warning")
+        warnings = sum(
+            1 for c in checks if c.severity == "warning" and not c.passed
+        )
 
         if errors > 0:
             level = PaperReadinessLevel.NOT_READY
@@ -160,6 +169,35 @@ class ReadinessValidator:
             warnings=warnings,
             recommendations=recommendations,
         )
+
+    @classmethod
+    def _check_equity_evidence(
+        cls,
+        equity_evidence_status: str | None,
+        recommendations: list[str],
+    ) -> list[ReadinessCheck]:
+        if equity_evidence_status is None:
+            return []
+        available = equity_evidence_status == "available"
+        if not available:
+            recommendations.append(
+                "Provide complete equity evidence for both reference and platform "
+                "before certifying readiness."
+            )
+        return [
+            ReadinessCheck(
+                name="equity_evidence",
+                description="Reference and platform equity evidence is complete",
+                passed=available,
+                severity="info" if available else "error",
+                message=(
+                    "Equity evidence is available"
+                    if available
+                    else "Equity evidence is missing or incomplete; readiness cannot be certified."
+                ),
+                details={"status": equity_evidence_status},
+            )
+        ]
 
     @classmethod
     def _check_required_artifacts(
@@ -387,7 +425,6 @@ class ReadinessValidator:
         checks: list[ReadinessCheck] = []
 
         if regression is None:
-            # #83: fail closed — a missing regression result is not a pass.
             checks.append(
                 ReadinessCheck(
                     name="regression_status",
@@ -456,9 +493,14 @@ class ReadinessValidator:
             )
             return checks
 
-        failed_results = [
-            r for r in risk_report.trade_results if not r.passed and r.severity != "info"
-        ]
+        failed_results = [r for r in risk_report.trade_results if not r.passed]
+        has_risk_evidence = any(
+            any(
+                field_result.expected is not None or field_result.actual is not None
+                for field_result in result.field_results.values()
+            )
+            for result in risk_report.trade_results
+        )
         position_size_issues: list[dict[str, Any]] = []
         stop_distance_issues: list[dict[str, Any]] = []
         structural_failures = 0
@@ -508,7 +550,35 @@ class ReadinessValidator:
         # failures that carry no numeric evidence.  An empty report counts as
         # vacuously passing only when the producer marked it passed; both
         # conditions surface as error-level checks below.
-        report_verdict_passed = bool(risk_report.passed)
+        report_verdict_passed = (
+            bool(risk_report.passed)
+            and has_risk_evidence
+            and not failed_results
+        )
+
+        checks.append(
+            ReadinessCheck(
+                name="risk_evidence",
+                description="Risk comparison contains comparable field evidence",
+                passed=has_risk_evidence,
+                severity="info" if has_risk_evidence else "error",
+                message=(
+                    f"Risk evidence contains {len(risk_report.trade_results)} comparable result(s)"
+                    if has_risk_evidence
+                    else "Risk comparison has no comparable field evidence"
+                ),
+                details={
+                    "result_count": len(risk_report.trade_results),
+                    "field_evidence_count": sum(
+                        len(result.field_results) for result in risk_report.trade_results
+                    ),
+                },
+            )
+        )
+        if not has_risk_evidence:
+            recommendations.append(
+                "Provide non-empty risk comparison evidence before certifying readiness."
+            )
 
         checks.append(
             ReadinessCheck(
@@ -637,6 +707,29 @@ class ReadinessValidator:
             return checks
 
         expected_stats, actual_stats = stats
+        risk_free_rates = (
+            float(getattr(expected_stats, "risk_free_rate", 0.0)),
+            float(getattr(actual_stats, "risk_free_rate", 0.0)),
+        )
+        canonical_rf = all(math.isfinite(rate) and rate == 0.0 for rate in risk_free_rates)
+        checks.append(
+            ReadinessCheck(
+                name="stats_risk_free_rate",
+                description="Statistics use the canonical zero risk-free rate",
+                passed=canonical_rf,
+                severity="info" if canonical_rf else "error",
+                message=(
+                    "Both statistics sides use risk_free_rate=0"
+                    if canonical_rf
+                    else f"Expected risk_free_rate=0 on both sides, got {risk_free_rates}"
+                ),
+                details={"expected": risk_free_rates[0], "actual": risk_free_rates[1]},
+            )
+        )
+        if not canonical_rf:
+            recommendations.append(
+                "Recompute statistics with risk_free_rate=0 before readiness validation."
+            )
 
         win_rate_diff = _abs_pct_diff(expected_stats.win_rate, actual_stats.win_rate)
         win_rate_passed = win_rate_diff <= cfg.stats_win_rate_tolerance_pct

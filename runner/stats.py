@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 MIN_CALMAR_DRAWDOWN = 0.001
 SECONDS_PER_DAY = 24 * 60 * 60
 DAILY_RETURN_PERIODS_PER_YEAR = 252
+DEFAULT_RISK_FREE_RATE = 0.0
 
 try:
     import quantstats as qs
@@ -39,7 +40,9 @@ def compute_stats(
     trades: list[Trade],
     initial_capital: float = 100_000.0,
     equity_curve: list[EquityPoint] | None = None,
-    risk_free_rate: float = 0.04,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    backtest_start: str | None = None,
+    backtest_end: str | None = None,
 ) -> dict[str, Any]:
     """Compute comprehensive performance metrics from a list of trades.
 
@@ -52,8 +55,12 @@ def compute_stats(
     Returns:
         Dictionary of metric name → value.
     """
+    if not math.isfinite(float(initial_capital)) or float(initial_capital) <= 0:
+        raise ValueError("initial_capital must be finite and > 0")
+    if not math.isfinite(float(risk_free_rate)):
+        raise ValueError("risk_free_rate must be finite")
     if not trades and not equity_curve:
-        return _empty_stats()
+        return _empty_stats(risk_free_rate)
 
     if trades:
         # #84: net-based stats — gross t.pnl ignores fees and flatters every
@@ -109,13 +116,33 @@ def compute_stats(
     total_return = 0.0
     psr = None  # Probabilistic Sharpe Ratio
     p_value = 1.0
+    undefined_metrics: set[str] = set()
+    return_frequency = "none"
+    duplicate_timestamp_count = _duplicate_timestamp_count(equity_curve or [])
 
     if equity_curve and len(equity_curve) > 1:
         equities = [e.equity for e in equity_curve]
         daily_returns = _daily_returns_from_equity_curve(equity_curve)
         p_value = _one_sided_p_value(daily_returns)
-        cagr = _cagr_from_backtest_period(equity_curve=equity_curve, trades=trades)
+        cagr = _cagr_from_backtest_period(
+            equity_curve=equity_curve,
+            trades=trades,
+            initial_capital=initial_capital,
+            backtest_start=backtest_start,
+            backtest_end=backtest_end,
+        )
         daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
+        if (
+            daily_return_series is not None
+            and not daily_return_series.empty
+            and isinstance(daily_return_series.index, pd.DatetimeIndex)
+        ):
+            return_frequency = "daily"
+            if len(daily_return_series) <= 1:
+                undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
+        else:
+            return_frequency = "unknown"
+            undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
 
         # Environment-independent definitions (Cleanup 16-D1, F17): the two
         # code paths below previously published DIFFERENT metric definitions
@@ -128,7 +155,11 @@ def compute_stats(
         # - sharpe/sortino: daily-resampled returns, annualized with 252
         #   periods (quantstats when available, manual fallback otherwise).
         max_drawdown_pct = -_max_drawdown_pct_manual(equities)
-        total_return = (equities[-1] / equities[0]) - 1 if equities[0] > 0 else 0
+        total_return = (
+            (equities[-1] / float(initial_capital)) - 1
+            if float(initial_capital) > 0
+            else 0
+        )
         calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
         max_drawdown_duration = _max_drawdown_duration(equities)
 
@@ -141,14 +172,20 @@ def compute_stats(
                 # _safe_qs call return 0.0 silently. Treat QS as unusable.
                 qs_usable = False
             if not qs_usable:
-                # QS installed but unusable (no daily series resolvable, or a
-                # non-datetime index). Fall through to the manual path on raw
-                # period returns instead of silently leaving Sharpe/Sortino at
-                # 0.0 — same definition family as the QS branch.
-                if len(daily_returns) > 1:
-                    sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
-                    sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
+                if return_frequency == "unknown" and len(daily_returns) > 1:
+                    sharpe_ratio = _sharpe_manual(
+                        daily_returns,
+                        risk_free_rate,
+                        annualization_factor=1.0,
+                    )
+                    sortino_ratio = _sortino_manual(
+                        daily_returns,
+                        risk_free_rate,
+                        annualization_factor=1.0,
+                    )
                     psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
+                else:
+                    undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
             elif len(returns_series) > 1:
                 sharpe_ratio = _safe_qs(
                     qs.stats.sharpe,
@@ -164,12 +201,38 @@ def compute_stats(
                 )
                 psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
         else:
-            # Manual fallback mirrors the quantstats definitions above
-            # (daily returns, 252-period annualization).
-            if len(daily_returns) > 1:
+            if return_frequency == "daily" and len(daily_returns) > 1:
                 sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                 sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
+            elif return_frequency == "unknown" and len(daily_returns) > 1:
+                sharpe_ratio = _sharpe_manual(
+                    daily_returns,
+                    risk_free_rate,
+                    annualization_factor=1.0,
+                )
+                sortino_ratio = _sortino_manual(
+                    daily_returns,
+                    risk_free_rate,
+                    annualization_factor=1.0,
+                )
+                psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
+            else:
+                undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
+    else:
+        undefined_metrics.update(
+            {
+                "max_drawdown_pct",
+                "max_drawdown_duration",
+                "sharpe_ratio",
+                "sortino_ratio",
+                "calmar_ratio",
+                "cagr",
+                "total_return",
+                "psr",
+                "p_value",
+            }
+        )
 
     return BacktestStats(
         total_trades=total_trades,
@@ -192,11 +255,17 @@ def compute_stats(
         total_return=round(float(total_return), 6),
         psr=round(float(psr), 4) if psr is not None else None,
         p_value=round(float(p_value), 6),
+        extras={
+            "risk_free_rate": float(risk_free_rate),
+            "undefined_metrics": sorted(undefined_metrics),
+            "equity_return_frequency": return_frequency,
+            "duplicate_equity_timestamps": duplicate_timestamp_count,
+        },
     ).to_dict()
 
 
 def compute_stats_for_result(
-    result: BacktestResult, risk_free_rate: float = 0.04
+    result: BacktestResult, risk_free_rate: float = DEFAULT_RISK_FREE_RATE
 ) -> dict[str, Any]:
     """Convenience: compute stats from a BacktestResult."""
     return compute_stats(
@@ -204,10 +273,15 @@ def compute_stats_for_result(
         initial_capital=result.meta.initial_capital,
         equity_curve=result.equity_curve or None,
         risk_free_rate=risk_free_rate,
+        backtest_start=result.meta.backtest_start or None,
+        backtest_end=result.meta.backtest_end or None,
     )
 
 
-def merge_canonical_stats(result: BacktestResult, risk_free_rate: float = 0.04) -> None:
+def merge_canonical_stats(
+    result: BacktestResult,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+) -> None:
     """Merge freshly computed canonical stats over engine-provided stats.
 
     Engines may return arbitrary (stale or partially canonical) stats dicts;
@@ -242,14 +316,19 @@ def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | No
     if dates[0] is not None:
         try:
             dt_index = pd.to_datetime(dates, utc=True)
-            eq_series = pd.Series(equities, index=dt_index, dtype=float).sort_index()
-            eq_series = eq_series.groupby(level=0).last()
-            return eq_series.pct_change().dropna()
+            eq_series = pd.Series(equities, index=dt_index, dtype=float).sort_index(kind="stable")
+            previous = eq_series.shift(1)
+            returns = eq_series.pct_change(fill_method=None)
+            returns.loc[previous <= 0] = pd.NA
+            return returns.replace([math.inf, -math.inf], pd.NA).dropna()
         except Exception:
             logger.debug("Could not build datetime-indexed returns series", exc_info=True)
 
     eq_series = pd.Series(equities, dtype=float)
-    return eq_series.pct_change().dropna()
+    previous = eq_series.shift(1)
+    returns = eq_series.pct_change(fill_method=None)
+    returns.loc[previous <= 0] = pd.NA
+    return returns.replace([math.inf, -math.inf], pd.NA).dropna()
 
 
 def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> pd.Series | None:
@@ -267,10 +346,12 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
         timestamps = pd.to_datetime(
             [point.time for point in equity_curve], utc=True, format="ISO8601"
         )
-        series = pd.Series(equities, index=timestamps, dtype=float).sort_index()
+        series = pd.Series(equities, index=timestamps, dtype=float).sort_index(kind="stable")
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()
-        returns = daily_equity.pct_change().dropna()
+        previous = daily_equity.shift(1)
+        returns = daily_equity.pct_change(fill_method=None)
+        returns.loc[previous <= 0] = pd.NA
         returns = returns.replace([math.inf, -math.inf], pd.NA).dropna()
         return returns if not returns.empty else None
     except Exception:
@@ -311,16 +392,32 @@ def _net_trade_pnl(trade: Trade) -> float:
     return float(trade.pnl) - fees
 
 
-def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[Trade]) -> float:
+def _cagr_from_backtest_period(
+    *,
+    equity_curve: list[EquityPoint],
+    trades: list[Trade],
+    initial_capital: float = 0.0,
+    backtest_start: str | None = None,
+    backtest_end: str | None = None,
+) -> float:
     if len(equity_curve) < 2:
         return 0.0
 
-    equity_initial = float(equity_curve[0].equity)
+    equity_initial = (
+        float(initial_capital)
+        if math.isfinite(float(initial_capital)) and initial_capital > 0
+        else float(equity_curve[0].equity)
+    )
     equity_final = float(equity_curve[-1].equity)
     if equity_initial <= 0 or equity_final <= 0:
         return 0.0
 
-    start_dt, end_dt = _resolve_backtest_period_bounds(equity_curve=equity_curve, trades=trades)
+    start_dt, end_dt = _resolve_backtest_period_bounds(
+        equity_curve=equity_curve,
+        trades=trades,
+        backtest_start=backtest_start,
+        backtest_end=backtest_end,
+    )
     days = float((end_dt - start_dt).total_seconds()) / SECONDS_PER_DAY
     if days <= 0:
         return 0.0
@@ -328,7 +425,11 @@ def _cagr_from_backtest_period(*, equity_curve: list[EquityPoint], trades: list[
 
 
 def _resolve_backtest_period_bounds(
-    *, equity_curve: list[EquityPoint], trades: list[Trade]
+    *,
+    equity_curve: list[EquityPoint],
+    trades: list[Trade],
+    backtest_start: str | None = None,
+    backtest_end: str | None = None,
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
     """Calendar-window bounds for CAGR annualization (#84).
 
@@ -337,14 +438,48 @@ def _resolve_backtest_period_bounds(
     the equity-curve endpoints; trades are only a fallback when the curve
     carries no usable timestamps.
     """
+    configured_start = (
+        pd.to_datetime(backtest_start, utc=True, errors="coerce")
+        if backtest_start
+        else pd.NaT
+    )
+    configured_end = (
+        pd.to_datetime(backtest_end, utc=True, errors="coerce")
+        if backtest_end
+        else pd.NaT
+    )
+    if (
+        not pd.isna(configured_start)
+        and not pd.isna(configured_end)
+        and "T" not in str(backtest_end)
+        and ":" not in str(backtest_end)
+    ):
+        configured_end = configured_end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    if not pd.isna(configured_start) and not pd.isna(configured_end):
+        if configured_end > configured_start:
+            return pd.Timestamp(configured_start), pd.Timestamp(configured_end)
+
     try:
         equity_times = [
             pd.Timestamp(ts)
-            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+            for ts in pd.to_datetime(
+                [point.time for point in equity_curve],
+                utc=True,
+                errors="coerce",
+            )
             if not pd.isna(ts)
         ]
     except Exception:
         equity_times = []
+
+    if not pd.isna(configured_start) and pd.isna(configured_end):
+        candidate_end = max(equity_times) if equity_times else configured_start
+        if candidate_end > configured_start:
+            return pd.Timestamp(configured_start), pd.Timestamp(candidate_end)
+    if pd.isna(configured_start) and not pd.isna(configured_end):
+        candidate_start = min(equity_times) if equity_times else configured_end
+        if configured_end > candidate_start:
+            return pd.Timestamp(candidate_start), pd.Timestamp(configured_end)
 
     if len(equity_times) >= 2:
         return min(equity_times), max(equity_times)
@@ -393,8 +528,41 @@ def _safe_qs(func, returns: pd.Series, **kwargs) -> float:
 # ─── Manual fallback helpers ─────────────────────────────────────────────────
 
 
-def _empty_stats() -> dict[str, Any]:
-    return BacktestStats().to_dict()
+def _duplicate_timestamp_count(equity_curve: list[EquityPoint]) -> int:
+    if len(equity_curve) < 2:
+        return 0
+    try:
+        timestamps = pd.to_datetime(
+            [point.time for point in equity_curve],
+            utc=True,
+            format="ISO8601",
+            errors="coerce",
+        )
+    except (TypeError, ValueError):
+        return 0
+    valid = pd.DatetimeIndex(timestamps).dropna()
+    return int(valid.duplicated(keep="first").sum())
+
+
+def _empty_stats(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, Any]:
+    return BacktestStats(
+        extras={
+            "risk_free_rate": float(risk_free_rate),
+            "undefined_metrics": [
+                "max_drawdown_pct",
+                "max_drawdown_duration",
+                "sharpe_ratio",
+                "sortino_ratio",
+                "calmar_ratio",
+                "cagr",
+                "total_return",
+                "psr",
+                "p_value",
+            ],
+            "equity_return_frequency": "none",
+            "duplicate_equity_timestamps": 0,
+        }
+    ).to_dict()
 
 
 def _max_consecutive(pnls: list[float], positive: bool = False) -> int:
@@ -481,25 +649,33 @@ def _one_sided_p_value(returns: list[float]) -> float:
         return 1.0
 
 
-def _sharpe_manual(returns: list[float], risk_free_rate: float) -> float:
+def _sharpe_manual(
+    returns: list[float],
+    risk_free_rate: float,
+    annualization_factor: float = math.sqrt(252),
+) -> float:
     """Annualized Sharpe ratio (manual)."""
     if not returns:
         return 0.0
-    daily_rf = risk_free_rate / 252
-    excess = [r - daily_rf for r in returns]
+    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
+    excess = [r - period_rf for r in returns]
     mean_excess = sum(excess) / len(excess)
     variance = sum((r - mean_excess) ** 2 for r in excess) / len(excess)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
-    return (mean_excess / std) * math.sqrt(252)
+    return (mean_excess / std) * annualization_factor
 
 
-def _sortino_manual(returns: list[float], risk_free_rate: float) -> float:
+def _sortino_manual(
+    returns: list[float],
+    risk_free_rate: float,
+    annualization_factor: float = math.sqrt(252),
+) -> float:
     """Annualized Sortino ratio (manual)."""
     if not returns:
         return 0.0
-    daily_rf = risk_free_rate / 252
+    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
     mean_return = sum(returns) / len(returns)
     downside = [r for r in returns if r < 0]
     if len(downside) < 2:
@@ -508,8 +684,8 @@ def _sortino_manual(returns: list[float], risk_free_rate: float) -> float:
     downside_std = math.sqrt(downside_var) if downside_var > 0 else 0
     if downside_std == 0:
         return 0.0
-    excess_mean = mean_return - daily_rf
-    return (excess_mean / downside_std) * math.sqrt(252)
+    excess_mean = mean_return - period_rf
+    return (excess_mean / downside_std) * annualization_factor
 
 
 def _probabilistic_sharpe(

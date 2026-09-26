@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 def _lean_order(
@@ -85,6 +88,22 @@ class TestLeanPairing:
         (trade,) = convert_lean_result(path).trades
         assert trade.fees == 2.0
 
+    def test_list_orders_with_same_timestamp_sort_numeric_ids(self, tmp_path: Path) -> None:
+        from runner.converters.lean_converter import convert_lean_result
+
+        payload = {
+            "orders": [
+                _lean_order(10, "2024-01-01T10:00:00Z", -10.0, 101.0, tag="Exit"),
+                _lean_order(2, "2024-01-01T10:00:00Z", 10.0, 100.0, tag="Entry"),
+            ],
+            "profitLoss": {},
+        }
+        path = tmp_path / "lean.json"
+        path.write_text(json.dumps(payload))
+        result = convert_lean_result(path)
+        assert len(result.trades) == 1
+        assert result.trades[0].quantity == 10.0
+
     def test_meta_carries_real_bounds(self, tmp_path: Path) -> None:
         from runner.converters.lean_converter import convert_lean_result
 
@@ -100,6 +119,38 @@ class TestLeanPairing:
         assert meta.backtest_start.startswith("2024-01-01")
         assert meta.backtest_end.startswith("2024-01-05")
         assert meta.initial_capital == 100000.0
+
+
+def test_converter_output_preserves_existing_file_on_write_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from runner.converters.cli import cmd_convert
+
+    source = tmp_path / "lean.json"
+    source.write_text(
+        json.dumps(
+            _lean_payload([_lean_order(1, "2024-01-01T00:00:00Z", 1, 100)])
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "result.json"
+    output.write_text("previous", encoding="utf-8")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("simulated converter write failure")
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+    with pytest.raises(OSError, match="simulated"):
+        cmd_convert(
+            SimpleNamespace(
+                engine="lean",
+                input=str(source),
+                name="demo",
+                output=str(output),
+            )
+        )
+
+    assert output.read_text(encoding="utf-8") == "previous"
 
 
 class TestStockkitConverter:

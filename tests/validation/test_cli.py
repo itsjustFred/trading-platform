@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from shared.models import Trade, TradeExit
+from validation import cli as validation_cli
 from validation.reference import ValidationReference
 
 
@@ -29,6 +30,8 @@ def _make_sample_trade(
         quantity=1000.0,
         exits=[TradeExit(time="2024-01-01T11:00:00Z", price=1.1050, quantity=1000.0)],
         pnl=pnl,
+        stop_loss=1.0000,
+        take_profit=1.2000,
     )
 
 
@@ -42,6 +45,10 @@ def _make_reference(**overrides: Any) -> ValidationReference:
         "trades": [_make_sample_trade()],
         "stats": {"total_trades": 1, "win_rate": 100.0},
         "raw_metadata": {"sheet": "Report"},
+        "equity_curve": [
+            {"time": "2024-01-01T00:00:00Z", "equity": 100_000.0},
+            {"time": "2024-01-01T01:00:00Z", "equity": 100_050.0},
+        ],
     }
     defaults.update(overrides)
     return ValidationReference(**defaults)
@@ -80,6 +87,57 @@ class TestCliHelp:
         assert "usage:" in result.stdout.lower()
         assert "--reference" in result.stdout
         assert "--platform" in result.stdout
+        assert "quantconnect" in result.stdout
+
+
+class TestCliAutoImporterFallback:
+    def test_auto_fallback_forwards_timeframe(self, tmp_path: Path, monkeypatch) -> None:
+        source = tmp_path / "result.json"
+        source.write_text("{}", encoding="utf-8")
+        seen: dict[str, Any] = {}
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                seen["path"] = path
+                seen.update(kwargs)
+                return _make_reference()
+
+        monkeypatch.setattr(validation_cli, "QuantConnectResultImporter", _Importer)
+
+        result = validation_cli._load_validation_reference(source, "auto", timeframe="5m")
+
+        assert result.timeframe == "1h"
+        assert seen["path"] == source
+        assert seen["timeframe"] == "5m"
+
+    def test_auto_fallback_reports_both_parse_errors(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        source = tmp_path / "result.json"
+        source.write_text("{}", encoding="utf-8")
+        fallback_error = ValueError("fallback exploded")
+
+        class _Importer:
+            def load(self, path: Path, **kwargs: Any) -> ValidationReference:
+                raise fallback_error
+
+        monkeypatch.setattr(validation_cli, "QuantConnectResultImporter", _Importer)
+
+        with pytest.raises(ValueError) as exc_info:
+            validation_cli._load_validation_reference(source, "auto", timeframe="5m")
+
+        message = str(exc_info.value)
+        assert "canonical ValidationReference" in message
+        assert "fallback exploded" in message
+        assert exc_info.value.__cause__ is fallback_error
+
+    def test_cli_capital_resolver_uses_settings_before_metadata(self) -> None:
+        reference = _make_reference(
+            settings={"initial_capital": 12_345},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        assert validation_cli._initial_capital(reference) == pytest.approx(12_345.0)
 
 
 class TestCliJsonOutput:
@@ -87,6 +145,7 @@ class TestCliJsonOutput:
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(tmp_reference_json),
             "--format", "json",
         ])
         assert result.returncode == 0
@@ -102,11 +161,15 @@ class TestCliMarkdownOutput:
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(tmp_reference_json),
             "--format", "markdown",
         ])
         assert result.returncode == 0
         assert "# Validation Report: test_strategy" in result.stdout
-        assert "Overall Passed**:** Yes" in result.stdout or "Overall Passed**: Yes" in result.stdout
+        assert (
+            "Overall Passed**:** Yes" in result.stdout
+            or "Overall Passed**: Yes" in result.stdout
+        )
 
 
 class TestCliMissingTradeExitCode1:
@@ -127,11 +190,14 @@ class TestCliMissingTradeExitCode1:
 
 
 class TestCliOutputToFile:
-    def test_cli_output_to_file(self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path):
+    def test_cli_output_to_file(
+        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+    ):
         out_path = tmp_path / "report.json"
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(tmp_reference_json),
             "--format", "json",
             "--output", str(out_path),
         ])
@@ -184,20 +250,56 @@ class TestCliAutoImporterXLSX:
             "--format", "json",
             "--importer", "auto",
         ])
-        assert result.returncode == 0
+        assert result.returncode == 1
         data = json.loads(result.stdout)
         assert data["strategy_name"] == "TestStrategy"
-        assert data["passed"] is True
+        assert data["passed"] is False
+        assert data["equity_evidence_status"] == "missing"
+        assert data["readiness"] is not None
 
 
 class TestCliExitCode0OnPerfectMatch:
-    def test_cli_exit_code_0_on_perfect_match(self, tmp_reference_json: Path, tmp_platform_json: Path):
+    def test_cli_exit_code_0_on_perfect_match(
+        self, tmp_reference_json: Path, tmp_platform_json: Path
+    ):
+        result = _invoke_cli([
+            "--reference", str(tmp_reference_json),
+            "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(tmp_reference_json),
+            "--format", "json",
+        ])
+        assert result.returncode == 0
+
+    def test_cli_runs_readiness_without_golden_and_fails_closed(
+        self, tmp_reference_json: Path, tmp_platform_json: Path
+    ) -> None:
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--format", "json",
         ])
+
+        assert result.returncode == 1
+        data = json.loads(result.stdout)
+        assert data["readiness"] is not None
+        assert data["readiness"]["level"] == "NOT_READY"
+        assert data["readiness"]["passed"] is False
+
+    def test_cli_runs_readiness_when_golden_is_supplied(
+        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+    ):
+        golden_path = tmp_path / "golden.json"
+        golden_path.write_text(tmp_reference_json.read_text(encoding="utf-8"), encoding="utf-8")
+        result = _invoke_cli([
+            "--reference", str(tmp_reference_json),
+            "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(golden_path),
+            "--format", "json",
+        ])
         assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["readiness"]["level"] == "READY"
+        assert data["readiness"]["passed"] is True
 
 
 class TestCliTimeToleranceArgument:
@@ -226,6 +328,7 @@ class TestCliTimeToleranceArgument:
         result_with_tol = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
+            "--readiness-golden", str(ref_path),
             "--format", "json",
             "--time-tolerance", "10",
         ])
@@ -247,7 +350,11 @@ class TestCliInvalidReferencePathExitCode2:
             "--format", "json",
         ])
         assert result.returncode == 2
-        assert "not found" in result.stderr.lower() or "failed to load reference" in result.stderr.lower() or "no such file or directory" in result.stderr.lower()
+        assert (
+            "not found" in result.stderr.lower()
+            or "failed to load reference" in result.stderr.lower()
+            or "no such file or directory" in result.stderr.lower()
+        )
 
 
 class TestCliStatsToleranceArgument:
@@ -283,6 +390,7 @@ class TestCliStatsToleranceArgument:
         result_loose = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
+            "--readiness-golden", str(ref_path),
             "--format", "json",
             "--stats-tolerance", "1.0",
             "--pnl-absolute-tolerance", "1000.0",
@@ -366,10 +474,11 @@ class TestCliHtmlImporter:
             "--format", "json",
             "--importer", "mt5_html",
         ])
-        assert result.returncode == 0
+        assert result.returncode == 1
         data = json.loads(result.stdout)
         assert data["strategy_name"] == "HtmlStrategy"
-        assert data["passed"] is True
+        assert data["passed"] is False
+        assert data["equity_evidence_status"] == "missing"
 
 
 class TestCliStdinStdoutBehavior:
@@ -377,6 +486,7 @@ class TestCliStdinStdoutBehavior:
         result = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
+            "--readiness-golden", str(tmp_reference_json),
         ])
         assert result.returncode == 0
         # Default format is markdown, so verify markdown output on stdout

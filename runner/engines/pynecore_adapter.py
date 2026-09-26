@@ -12,31 +12,40 @@ import ast
 import csv
 import inspect
 import logging
-import os
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone, date as _date
+from datetime import date as _date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from runner.agent_process import build_backtest_child_env
+from runner.approval_gate import require_generated_strategy_approval
 from runner.codegen_safety import BANNED_CALL_NAMES, import_root
 from runner.engines import contract
+from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import (
+    resolve_bar_spread,
+)
+from runner.engines._shared import (
+    resolve_max_leverage as _resolve_max_leverage,
+)
+from runner.engines._shared import (
+    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
+)
+from runner.engines._shared import (
+    serialize_meta_value as _serialize_meta_value,
+)
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
     resolve_strategy_parameters,
-)
-from runner.engines._drawings import _normalize_drawings
-from runner.engines._shared import (
-    resolve_bar_spread,
-    resolve_max_leverage as _resolve_max_leverage,
-    resolve_max_position_exposure_pct as _resolve_max_position_exposure_pct,
-    serialize_meta_value as _serialize_meta_value,
 )
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
@@ -246,6 +255,7 @@ class PyneCoreAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        require_generated_strategy_approval(strategy_path)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.
@@ -255,6 +265,7 @@ class PyneCoreAdapter(EngineAdapter):
         all_trades: list[Trade] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
+        asset_classes: dict[str, str] = {}
         trade_counter = 0
         total_bars = 0
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
@@ -282,6 +293,12 @@ class PyneCoreAdapter(EngineAdapter):
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
             )
+            asset_class = _infer_asset_class(
+                Path(config.data_dir) if config.data_dir else DATA_DIR,
+                symbol,
+                config.timeframe,
+            )
+            asset_classes[str(symbol).upper()] = asset_class
             trade_counter += len(trades)
             all_trades.extend(trades)
             # Merge, never overwrite (F11): `all_stats =` here would silently
@@ -298,7 +315,12 @@ class PyneCoreAdapter(EngineAdapter):
                 )
             )
 
-        _apply_fee_model(all_trades, fee_model)
+        _apply_risk_sizing(
+            all_trades,
+            config,
+            asset_class_by_symbol=asset_classes,
+            fee_model=fee_model,
+        )
         result = BacktestResult(
             meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
@@ -327,11 +349,6 @@ class PyneCoreAdapter(EngineAdapter):
         """Run the pyne CLI for one symbol and parse its trade/stats output."""
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         trade_context = _build_trade_context(context_builder, df, resolved_parameters)
-        asset_class = _infer_asset_class(
-            Path(config.data_dir) if config.data_dir else DATA_DIR,
-            symbol,
-            config.timeframe,
-        )
         trades: list[Trade] = []
         stats: dict[str, Any] = {}
 
@@ -352,7 +369,15 @@ class PyneCoreAdapter(EngineAdapter):
             stats_csv = tmpdir_path / "stats.csv"
 
             self._run_pyne_cli(
-                config, symbol, strategy_copy_path, csv_path, trade_csv, stats_csv, workdir_path, tmpdir_path, len(df)
+                config,
+                symbol,
+                strategy_copy_path,
+                csv_path,
+                trade_csv,
+                stats_csv,
+                workdir_path,
+                tmpdir_path,
+                len(df),
             )
 
             if trade_csv.exists():
@@ -364,7 +389,7 @@ class PyneCoreAdapter(EngineAdapter):
                 # resized quantities/pnl build on parity prices.
                 trades = _gate_warmup_trades(trades, config)
                 _apply_fill_parity(trades, df, config, resolved_parameters)
-                _apply_risk_sizing(trades, config, asset_class)
+
 
             if stats_csv.exists():
                 stats.update(_parse_stats_csv(stats_csv))
@@ -415,6 +440,7 @@ class PyneCoreAdapter(EngineAdapter):
                 capture_output=True,
                 text=True,
                 cwd=str(tmpdir_path),
+                env=build_backtest_child_env(),
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
@@ -484,16 +510,39 @@ def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
 
 
 def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
-    """Build the equity curve from the merged, time-ordered trades (#84: net)."""
-    equity = config.initial_capital
-    curve: list[EquityPoint] = []
-    for trade in sorted(all_trades, key=lambda item: item.entry_time):
-        equity += (
+    """Build a net, exit-timed equity curve from merged trades."""
+    equity = float(config.initial_capital)
+    events: list[tuple[str, float]] = []
+    for trade in all_trades:
+        exits = sorted(trade.exits or [], key=lambda item: str(item.time))
+        if not exits:
+            events.append((str(trade.entry_time), float(trade.net_pnl or 0.0)))
+            continue
+        gross_total = sum(float(leg.pnl or 0.0) for leg in exits)
+        net_total = (
             float(trade.net_pnl)
             if trade.net_pnl is not None
             else float(trade.pnl) - float(trade.fees or 0.0)
         )
-        curve.append(EquityPoint(time=trade.entry_time, equity=round(equity, 2)))
+        fee_delta = net_total - gross_total
+        for leg in exits:
+            gross_leg = float(leg.pnl or 0.0)
+            share = gross_leg / gross_total if gross_total else 1.0 / len(exits)
+            events.append((str(leg.time), gross_leg + fee_delta * share))
+
+    if not events:
+        return []
+    start = pd.to_datetime(config.start_date, utc=True, errors="coerce")
+    if pd.isna(start):
+        start = pd.to_datetime(events[0][0], utc=True)
+    curve = [EquityPoint(time=pd.Timestamp(start).isoformat(), equity=round(equity, 2))]
+    for timestamp, pnl in sorted(events, key=lambda item: (pd.Timestamp(item[0]), item[0])):
+        equity += pnl
+        point = EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=round(equity, 2))
+        if curve[-1].time == point.time:
+            curve[-1] = point
+        else:
+            curve.append(point)
     return curve
 
 
@@ -529,6 +578,14 @@ def _pyne_meta(
             "source": "yfinance",
         },
         initial_capital=config.initial_capital,
+        risk_per_trade_pct=config.risk_per_trade_pct,
+        max_position_exposure_pct=config.max_position_exposure_pct,
+        max_leverage=config.max_leverage,
+        modeling_resolution=config.modeling_resolution,
+        signal_exit_fill=config.signal_exit_fill,
+        allow_fallback_stop=config.allow_fallback_stop,
+        reject_missing_stop=config.reject_missing_stop,
+        require_explicit_column_roles=config.require_explicit_column_roles,
         parameters=resolved_parameters,
     )
 
@@ -555,6 +612,7 @@ def _load_strategy_artifacts(path: str, fallback_name: str) -> tuple[str, Any, A
 
 
 def _load_strategy_helper_namespace(strategy_path: Path, source: str) -> dict[str, Any]:
+    require_generated_strategy_approval(strategy_path)
     namespace: dict[str, Any] = {}
 
     helper_path = strategy_path.with_name(f"{strategy_path.stem}_context.py")
@@ -695,6 +753,7 @@ def _compile_helper_namespace(
     strict_structure: bool = False,
     ignored_roots: frozenset[str] | None = None,
 ) -> dict[str, Any]:
+    require_generated_strategy_approval(source_path)
     tree = ast.parse(source, filename=str(source_path))
     helper_nodes: list[ast.stmt] = []
     allowed_names = function_names or {"build_trade_context", "build_drawings"}
@@ -890,6 +949,20 @@ def _locate_trade_bar(timestamp_series: pd.Series, raw_time: str) -> int | None:
     return None
 
 
+def _finite_meta_value(meta: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = meta.get(key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
 def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_prefix: str) -> None:
     long_key = f"{key_prefix}_long"
     short_key = f"{key_prefix}_short"
@@ -900,6 +973,19 @@ def _promote_directional_price_meta(meta: dict[str, Any], direction: str, key_pr
     meta.pop(short_key, None)
 
 
+def _validate_trade_exit_order(trade: Trade) -> None:
+    entry_time = _normalize_trade_timestamp(trade.entry_time)
+    if entry_time is None:
+        return
+    for exit_leg in trade.exits:
+        exit_time = _normalize_trade_timestamp(exit_leg.time)
+        if exit_time is not None and exit_time < entry_time:
+            raise ValueError(
+                f"PyneCore exit time {exit_leg.time!r} is before entry time "
+                f"{trade.entry_time!r}"
+            )
+
+
 def _enrich_trades_with_context(
     trades: list[Trade], trade_context: IndicatorMap, df: pd.DataFrame
 ) -> None:
@@ -908,6 +994,7 @@ def _enrich_trades_with_context(
 
     timestamp_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     for trade in trades:
+        _validate_trade_exit_order(trade)
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
         exit_idx = _locate_trade_bar(timestamp_series, trade.last_exit_time)
         meta = dict(trade.meta or {})
@@ -925,6 +1012,14 @@ def _enrich_trades_with_context(
         _promote_directional_price_meta(meta, trade.direction, "sl_price")
         _promote_directional_price_meta(meta, trade.direction, "tp_price")
         _materialize_exit_price_levels(meta, trade)
+        trade.stop_loss = _finite_meta_value(
+            meta,
+            ("sl_price_at_exit", "sl_price", "initial_sl"),
+        )
+        trade.take_profit = _finite_meta_value(
+            meta,
+            ("tp_price_at_exit", "tp_price", "initial_tp"),
+        )
         trade.meta = meta or None
         if trade.exits:
             inferred_reason = None
@@ -946,7 +1041,10 @@ def _load_ohlcv(
 ) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol."""
     ohlcv_root = data_root / "ohlcv"
-    matches = list(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return None
 
@@ -964,7 +1062,10 @@ def _load_ohlcv(
 
 
 def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
-    matches = list((data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
         return "unknown"
     parts = matches[0].parts
@@ -977,13 +1078,19 @@ def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
 
 def _normalize_trade_exits(trades: list[Trade]) -> None:
     for trade in trades:
+        _validate_trade_exit_order(trade)
         if not trade.exits or not trade.meta:
             continue
 
+        sl_price = trade.meta.get(
+            "sl_price_at_exit",
+            trade.meta.get("sl_price", trade.meta.get("initial_sl")),
+        )
+        tp_price = trade.meta.get(
+            "tp_price_at_exit",
+            trade.meta.get("tp_price", trade.meta.get("initial_tp")),
+        )
         exit_leg = trade.exits[-1]
-        sl_price = trade.meta.get("sl_price_at_exit", trade.meta.get("sl_price"))
-        tp_price = trade.meta.get("tp_price_at_exit", trade.meta.get("tp_price"))
-
         if trade.direction == "LONG":
             if sl_price is not None and exit_leg.price < float(sl_price):
                 exit_leg.price = round(float(sl_price), 6)
@@ -1029,58 +1136,159 @@ def _materialize_exit_price_levels(meta: dict[str, Any], trade: Trade) -> None:
             meta.setdefault("tp_price_at_exit", round(tp_exit, 6))
 
 
-def _apply_risk_sizing(trades: list[Trade], config: BacktestConfig, asset_class: str) -> None:
-    if not trades or config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
+def _apply_risk_sizing(
+    trades: list[Trade],
+    config: BacktestConfig,
+    asset_class: str = "unknown",
+    *,
+    asset_class_by_symbol: dict[str, str] | None = None,
+    fee_model: Any | None = None,
+) -> None:
+    if not trades:
         return
-
-    equity = config.initial_capital
-    max_position_exposure_pct = _resolve_max_position_exposure_pct(
-        config.max_position_exposure_pct, asset_class
-    )
-    # A-C3: mirror vectorbt _size_trade min() semantics. max_leverage is an
-    # INDEPENDENT cap, not a floor above the position cap — max() here
-    # silently disabled the position cap whenever leverage allowed more.
+    for trade in trades:
+        _validate_trade_exit_order(trade)
+    if config.risk_per_trade_pct is None or config.risk_per_trade_pct <= 0:
+        raise ValueError(
+            "Risk sizing is not configured (risk_per_trade_pct unset); "
+            "refusing unsized PyneCore trades"
+        )
+    risk_pct = float(config.risk_per_trade_pct)
+    if not math.isfinite(risk_pct) or not 0 < risk_pct <= 1:
+        raise ValueError("PyneCore risk_per_trade_pct must be finite and between 0 and 1")
+    equity = float(config.initial_capital)
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("PyneCore initial capital must be finite and > 0")
     max_leverage = _resolve_max_leverage(config.max_leverage)
+    if not math.isfinite(max_leverage) or max_leverage <= 0:
+        raise ValueError("PyneCore max_leverage must be finite and > 0")
 
-    for trade in sorted(trades, key=lambda item: item.entry_time):
-        meta = trade.meta or {}
+    class_by_symbol = {
+        str(symbol).upper(): str(value).lower()
+        for symbol, value in (asset_class_by_symbol or {}).items()
+    }
+
+    def _time(value: object, field_name: str) -> pd.Timestamp:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(f"PyneCore {field_name} must be a valid timestamp")
+        return pd.Timestamp(parsed)
+
+    ordered: list[tuple[Trade, pd.Timestamp, pd.Timestamp]] = []
+    for trade in trades:
+        entry_time = _time(trade.entry_time, "entry_time")
+        exit_time = entry_time
+        if trade.exits:
+            exit_time = max(
+                _time(leg.time, "exit_time") for leg in trade.exits
+            )
+        ordered.append((trade, entry_time, exit_time))
+    ordered.sort(key=lambda item: (item[1], str(item[0].entry_time), int(item[0].id or 0)))
+    by_exit = sorted(
+        ordered,
+        key=lambda item: (item[2], str(item[0].entry_time), int(item[0].id or 0)),
+    )
+
+    open_ledger: dict[int, tuple[pd.Timestamp, float, float, float]] = {}
+    released = 0
+    rejected_trade_keys: set[int] = set()
+
+    def _release_through(cutoff: pd.Timestamp) -> None:
+        nonlocal released, equity
+        while released < len(by_exit):
+            trade, _entry_time, exit_time = by_exit[released]
+            if exit_time > cutoff:
+                break
+            key = id(trade)
+            booked = open_ledger.pop(key, None)
+            if booked is not None:
+                equity += booked[3]
+            released += 1
+
+    for trade, entry_time, _exit_time in ordered:
+        _release_through(entry_time)
+        symbol_class = class_by_symbol.get(str(trade.symbol).upper(), asset_class)
+        max_position_exposure_pct = _resolve_max_position_exposure_pct(
+            config.max_position_exposure_pct, symbol_class
+        )
+        if not 0 < max_position_exposure_pct <= 1:
+            raise ValueError("PyneCore position exposure must be between 0 and 1")
+
+        meta = dict(trade.meta or {})
         sl_price = meta.get("sl_price")
         if sl_price is None:
-            equity += trade.pnl
-            continue
+            if config.reject_missing_stop or not config.allow_fallback_stop:
+                rejected_trade_keys.add(id(trade))
+                logger.warning(
+                    "Rejecting PyneCore trade %s: no stop_loss and fallback sizing is disabled",
+                    trade.id,
+                )
+                continue
+            direction_sign = 1.0 if str(trade.direction).upper() == "LONG" else -1.0
+            stop_distance = float(trade.entry_price) * 0.02
+            sl_price = float(trade.entry_price) - direction_sign * stop_distance
+            meta["sl_price"] = sl_price
+            meta["stop_source"] = "fallback_percent"
+        entry_price = float(trade.entry_price)
+        stop_distance = abs(entry_price - float(sl_price))
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            raise ValueError("PyneCore entry price must be finite and > 0")
+        if not math.isfinite(stop_distance) or stop_distance <= 0:
+            raise ValueError("PyneCore stop distance must be finite and > 0")
 
-        stop_distance = abs(trade.entry_price - float(sl_price))
-        if stop_distance <= 0:
-            equity += trade.pnl
-            continue
+        old_qty = float(trade.quantity or 0.0)
+        if not math.isfinite(old_qty) or old_qty <= 0:
+            raise ValueError("PyneCore trade quantity must be finite and > 0")
+        risk_amount = equity * risk_pct
+        required_notional = risk_amount / stop_distance * entry_price
+        position_notional = equity * max_position_exposure_pct
+        open_notional = sum(item[1] for item in open_ledger.values())
+        aggregate_notional = max(0.0, equity * max_leverage - open_notional)
+        final_notional = min(required_notional, position_notional, aggregate_notional)
+        new_qty = round(final_notional / entry_price, 4)
+        scale = new_qty / old_qty
 
-        risk_amount = equity * config.risk_per_trade_pct
-        base_qty = risk_amount / stop_distance
-        required_notional = base_qty * trade.entry_price
-        cap_notional = equity * max_position_exposure_pct
-        leverage_notional_limit = equity * max_leverage
+        for leg in trade.exits:
+            leg.quantity = round(float(leg.quantity or 0.0) * scale, 4)
+            if str(trade.direction).upper() == "LONG":
+                leg.pnl = round((float(leg.price) - entry_price) * leg.quantity, 2)
+            else:
+                leg.pnl = round((entry_price - float(leg.price)) * leg.quantity, 2)
+        trade.quantity = new_qty
+        trade.pnl = round(sum(float(leg.pnl or 0.0) for leg in trade.exits), 2)
+        if fee_model is not None:
+            exit_price = float(trade.exits[-1].price) if trade.exits else entry_price
+            trade.fees = round(
+                float(fee_model.fee_for_trade(entry_price, exit_price, new_qty)),
+                2,
+            )
+        elif trade.fees is not None:
+            trade.fees = round(float(trade.fees) * scale, 2)
+        trade.net_pnl = round(float(trade.pnl) - float(trade.fees or 0.0), 2)
+        trade.meta = meta
 
-        # A-C3: the binding notional is min(position cap, leverage limit),
-        # mirroring vectorbt _size_trade — a conservative position cap binds
-        # even when leverage would allow more (no over-cap fill).
-        binding_notional = min(cap_notional, leverage_notional_limit)
-        if required_notional <= binding_notional:
-            final_notional = required_notional
-        else:
-            final_notional = binding_notional
+        open_notional += new_qty * entry_price
+        open_risk = sum(item[2] for item in open_ledger.values()) + new_qty * stop_distance
+        if new_qty > 0:
+            open_ledger[id(trade)] = (
+                _exit_time,
+                new_qty * entry_price,
+                new_qty * stop_distance,
+                float(trade.net_pnl),
+            )
+        meta["risk_math"] = {
+            "equity_at_entry": round(equity, 2),
+            "position_size": round(new_qty, 4),
+            "open_positions": len(open_ledger),
+            "open_notional": round(open_notional, 2),
+            "open_notional_pct": round(open_notional / equity, 6) if equity > 0 else None,
+            "open_risk": round(open_risk, 2),
+            "open_risk_pct": round(open_risk / equity, 6) if equity > 0 else None,
+        }
+        trade.meta = meta
 
-        qty = round(final_notional / trade.entry_price, 4)
-        exit_price = trade.exits[-1].price
-        if trade.direction == "LONG":
-            pnl = round((exit_price - trade.entry_price) * qty, 2)
-        else:
-            pnl = round((trade.entry_price - exit_price) * qty, 2)
-
-        trade.quantity = qty
-        trade.pnl = pnl
-        trade.exits[-1].quantity = qty
-        trade.exits[-1].pnl = pnl
-        equity += pnl
+    if rejected_trade_keys:
+        trades[:] = [trade for trade in trades if id(trade) not in rejected_trade_keys]
 
 
 def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str | None:
@@ -1090,6 +1298,8 @@ def _infer_exit_reason_from_meta(exit_price: float, meta: dict[str, Any]) -> str
         ("tp_price_at_exit", "take_profit"),
         ("sl_price", "stop_loss"),
         ("tp_price", "take_profit"),
+        ("initial_sl", "stop_loss"),
+        ("initial_tp", "take_profit"),
     ]
     for key, reason in checks:
         value = meta.get(key)
@@ -1125,47 +1335,63 @@ def _initial_exit_reason(raw_signal: str) -> str | None:
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
     trades: list[Trade] = []
     entries: dict[int, dict[str, Any]] = {}
+    exits: dict[int, list[TradeExit]] = {}
 
-    with open(csv_path, "r") as handle:
+    with open(csv_path, "r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
             trade_num = int(row["Trade #"])
             trade_type = row["Type"].strip().lower()
 
             if "entry" in trade_type:
-                entries[trade_num] = {
-                    "time": row["Date/Time"],
-                    "price": float(row["Price USD"]),
-                    "contracts": float(row["Contracts"]),
-                    "direction": "LONG" if "long" in trade_type else "SHORT",
-                }
-            elif "exit" in trade_type and trade_num in entries:
-                entry = entries[trade_num]
-                exit_price = float(row["Price USD"])
-                exit_time = row["Date/Time"]
-                profit = float(row["Profit USD"])
-                qty = float(row["Contracts"])
-
-                trade = Trade(
-                    id=id_offset + trade_num,
-                    symbol=symbol,
-                    direction=entry["direction"],
-                    entry_time=entry["time"],
-                    entry_price=round(entry["price"], 6),
-                    quantity=round(qty, 4),
-                    exits=[
-                        TradeExit(
-                            time=exit_time,
-                            price=round(exit_price, 6),
-                            quantity=round(qty, 4),
-                            pnl=round(profit, 2),
-                            reason=_initial_exit_reason(row.get("Signal", "")),
-                        )
-                    ],
-                    pnl=round(profit, 2),
-                    tags=["pynecore"],
+                entry = entries.setdefault(
+                    trade_num,
+                    {
+                        "time": row["Date/Time"],
+                        "price": 0.0,
+                        "contracts": 0.0,
+                        "direction": "LONG" if "long" in trade_type else "SHORT",
+                    },
                 )
-                trades.append(trade)
+                quantity = float(row["Contracts"])
+                entry["contracts"] += quantity
+                entry["price"] = (
+                    (
+                        entry["price"] * (entry["contracts"] - quantity)
+                        + float(row["Price USD"]) * quantity
+                    )
+                    / entry["contracts"]
+                    if entry["contracts"]
+                    else float(row["Price USD"])
+                )
+            elif "exit" in trade_type and trade_num in entries:
+                exits.setdefault(trade_num, []).append(
+                    TradeExit(
+                        time=row["Date/Time"],
+                        price=round(float(row["Price USD"]), 6),
+                        quantity=round(float(row["Contracts"]), 4),
+                        pnl=round(float(row["Profit USD"]), 2),
+                        reason=_initial_exit_reason(row.get("Signal", "")),
+                    )
+                )
+
+    for trade_num, entry in entries.items():
+        trade_exits = sorted(exits.get(trade_num, []), key=lambda item: str(item.time))
+        if not trade_exits:
+            continue
+        trades.append(
+            Trade(
+                id=id_offset + trade_num,
+                symbol=symbol,
+                direction=str(entry["direction"]),
+                entry_time=str(entry["time"]),
+                entry_price=round(float(entry["price"]), 6),
+                quantity=round(float(entry["contracts"]), 4),
+                exits=trade_exits,
+                pnl=round(sum(float(leg.pnl or 0.0) for leg in trade_exits), 2),
+                tags=["pynecore"],
+            )
+        )
 
     return trades
 

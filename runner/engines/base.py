@@ -7,6 +7,7 @@ so the Runner CLI can invoke any of them uniformly.
 
 from __future__ import annotations
 
+import math
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -82,11 +83,14 @@ class BacktestConfig(BaseModel):
     # Maximum loss per trade, as a fraction of equity (Cleanup 16-E Decision
     # Record: "risk_per_trade_pct means maximum loss per trade").
     risk_per_trade_pct: float | None = Field(None, ge=0.0, le=1.0)
+    allow_fallback_stop: bool = True
+    reject_missing_stop: bool = False
+    require_explicit_column_roles: bool = False
     # Position-size semantics (Cleanup 16-E Decision Record): maximum notional
     # exposure of a single position as a fraction of equity (0.05 = 5%).
     # Not an aggregate-portfolio limit and not a loss budget — those are
     # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
-    max_position_exposure_pct: float | None = Field(None, gt=0.0)
+    max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
     # Fill convention for signal-driven
@@ -112,7 +116,9 @@ class BacktestConfig(BaseModel):
         # Fold the deprecated max_position_pct spelling through the same shared
         # resolver the batch entry points use (conflict check + warning).
         resolved = resolve_legacy_max_position_kwarg(
-            data.get("max_position_exposure_pct"), data.get(LEGACY_MAX_POSITION_PCT), caller="BacktestConfig"
+            data.get("max_position_exposure_pct"),
+            data.get(LEGACY_MAX_POSITION_PCT),
+            caller="BacktestConfig",
         )
         data.pop(LEGACY_MAX_POSITION_PCT, None)
         if resolved is not None or data.get("max_position_exposure_pct") is not None:
@@ -130,6 +136,39 @@ class BacktestConfig(BaseModel):
             stacklevel=2,
         )
         return self.max_position_exposure_pct
+
+    @field_validator(
+        "initial_capital",
+        "risk_per_trade_pct",
+        "max_position_exposure_pct",
+        "max_leverage",
+        mode="before",
+    )
+    @classmethod
+    def _validate_finite_numbers(cls, value: Any, info: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{info.field_name} must be numeric") from exc
+        if not math.isfinite(parsed):
+            raise ValueError(f"{info.field_name} must be finite")
+        return parsed
+
+    @field_validator(
+        "allow_fallback_stop",
+        "reject_missing_stop",
+        "require_explicit_column_roles",
+        mode="before",
+    )
+    @classmethod
+    def _validate_policy_flags(cls, value: Any) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError("policy flags must be boolean")
+        return value
 
     @field_validator("signal_exit_fill")
     @classmethod

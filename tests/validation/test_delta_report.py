@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 from shared.models import Trade
+from tests.validation.data_factory import (
+    make_platform_result as _make_platform_result,
+)
+from tests.validation.data_factory import (
+    make_reference as _make_reference,
+)
+from tests.validation.data_factory import (
+    make_trade as _make_trade,
+)
 from validation.comparison.anomalies import AnomalyDetector, AnomalyType, TradeAnomaly
 from validation.comparison.comparison import (
     FieldComparisonResult,
     MatchedTrade,
-    TradeComparisonConfig,
-    TradeComparisonResult,
     TradeComparator,
 )
 from validation.comparison.delta_report import (
@@ -22,13 +27,6 @@ from validation.comparison.delta_report import (
     TradeDeltaReport,
 )
 from validation.comparison.matcher import MatchKey
-
-
-from tests.validation.data_factory import (
-    make_platform_result as _make_platform_result,
-    make_reference as _make_reference,
-    make_trade as _make_trade,
-)
 
 
 def _make_matched(
@@ -203,7 +201,7 @@ class TestReportWithMismatch:
         assert len(report.matched_trades) == 1
         trade_delta = report.matched_trades[0]
         assert trade_delta.anomaly_type == "mismatch"
-        assert trade_delta.severity == "warning"
+        assert trade_delta.severity == "error"
         # Check field deltas contain entry_price failure
         entry_fd = next(
             (fd for fd in trade_delta.field_deltas if fd.field == "entry_price"), None
@@ -215,7 +213,7 @@ class TestReportWithMismatch:
         assert entry_fd.absolute_diff is not None
         assert entry_fd.relative_diff is not None
         assert "differs" in entry_fd.explanation
-        assert report.passed is True  # warning-only mismatch allows passed=True
+        assert report.passed is False
 
     def test_direction_mismatch_severity_error_and_not_passed(self):
         ref = _make_trade(direction="LONG")
@@ -273,7 +271,7 @@ class TestPassedLogic:
         ref_model = _make_reference([ref])
         platform = _make_platform_result([act])
         report = DeltaReportBuilder.build(ref_model, platform, [comp], [])
-        assert report.passed is True  # entry_price mismatch is warning severity
+        assert report.passed is False
 
     def test_passed_false_due_to_error(self):
         ref = _make_trade(direction="LONG")

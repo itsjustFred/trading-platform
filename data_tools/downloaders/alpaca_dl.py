@@ -16,7 +16,8 @@ from typing import Any
 
 import pandas as pd
 
-from data_tools.downloaders.base import DownloadResult, Downloader, SourceMeta
+from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from data_tools.path_safety import build_dataset_path
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,15 @@ class AlpacaDownloader(Downloader):
         ]
 
     def _make_us_equity_output_path(self, output_dir: Path, symbol: str, timeframe: str) -> Path:
-        path = output_dir / "ohlcv" / self.source_name / "equity" / "US" / symbol / f"{timeframe}.parquet"
+        path = build_dataset_path(
+            output_dir,
+            "ohlcv",
+            self.source_name,
+            "equity",
+            "US",
+            symbol,
+            f"{timeframe}.parquet",
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -178,7 +187,7 @@ class AlpacaDownloader(Downloader):
         if not required.issubset(set(working.columns)):
             return pd.DataFrame()
         if "volume" not in working.columns:
-            working["volume"] = 0
+            working["volume"] = float("nan")
 
         working["timestamp"] = pd.to_datetime(working["timestamp"], utc=True, errors="coerce")
         for column in ("open", "high", "low", "close", "volume"):

@@ -17,6 +17,7 @@ from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    coerce_positive_live_qty,
     is_unbounded_tp,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
@@ -41,6 +42,21 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 
 
+def _normalize_broker_order_id(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() in {"none", "null", "false"}:
+        return None
+    try:
+        uuid_value = UUID(normalized)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if uuid_value.int == 0:
+        return None
+    return str(uuid_value)
+
+
 def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
     """Strict boolean parsing shared with live_runner.credential_env.
 
@@ -61,7 +77,6 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
 
 
 def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
-    """Return the first parseable positive-precision float from metadata keys."""
     for key in keys:
         if key not in metadata:
             continue
@@ -69,9 +84,10 @@ def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) 
         if value is None:
             continue
         try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {key}: {value!r}") from exc
+        return parsed
     return None
 
 
@@ -375,7 +391,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         missing_filled_qty = broker_filled_qty - local_filled_qty
         if missing_filled_qty <= 0:
             return False
-        broker_order_id = str(getattr(order, "id", ""))
+        broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
+        if broker_order_id is None:
+            return False
         execution = LiveExecution(
             signal_id=UUID(signal_id),
             actual_price=_to_float(
@@ -480,11 +498,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         trading_client: Any,
         canonical_signal_id: str,
     ) -> str:
-        existing_order_id = await asyncio.to_thread(
+        raw_existing_order_id = await asyncio.to_thread(
             get_live_signal_broker_order_id, canonical_signal_id
         )
-        if existing_order_id:
+        if raw_existing_order_id:
+            existing_order_id = _normalize_broker_order_id(raw_existing_order_id)
+            if existing_order_id is None:
+                raise RuntimeError(
+                    "Alpaca persisted broker order id is invalid; refusing duplicate submission."
+                )
             return existing_order_id
+
         try:
             recovered_order = await asyncio.to_thread(
                 trading_client.get_order_by_client_id,
@@ -495,8 +519,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca canonical signal already exists and broker recovery failed; "
                 "refusing possible duplicate submission."
             ) from exc
-        recovered_order_id = str(getattr(recovered_order, "id", "")).strip()
-        if not recovered_order_id:
+        recovered_order_id = _normalize_broker_order_id(getattr(recovered_order, "id", None))
+        if recovered_order_id is None:
             raise RuntimeError(
                 "Alpaca canonical signal already exists without a recoverable broker "
                 "order id; refusing possible duplicate submission."
@@ -578,12 +602,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         market_request_cls: Any,
         client_order_id: str,
     ) -> Any:
+        qty = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
         if signal.action not in {"buy", "sell"}:
             # Fail closed: an unmapped action must never fall through to SELL.
             raise ValueError(f"Unsupported signal action: {signal.action}")
         stop_loss_price, take_profit_price = self._resolve_broker_sl_tp(signal)
         extended_hours = bool((signal.metadata or {}).get("extended_hours"))
-        limit_price = _to_float((signal.metadata or {}).get("limit_price"), default=0.0)
         if signal.action == "buy":
             side = order_side.BUY
         else:
@@ -637,10 +661,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         canonical_signal_id: str,
         broker_order_id: str,
     ) -> None:
-        if not broker_order_id:
-            return
+        normalized_order_id = _normalize_broker_order_id(broker_order_id)
+        if normalized_order_id is None:
+            raise RuntimeError("Alpaca order response has no valid broker order id.")
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+            set_live_signal_broker_order_id, canonical_signal_id, normalized_order_id
         )
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
@@ -669,17 +694,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
         try:
-            qty_value = float(qty)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"Alpaca order qty is not a number: {qty!r} "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
-            )
-        if not math.isfinite(qty_value) or qty_value <= 0:
+            qty_value = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
+        except ValueError as exc:
             raise ValueError(
                 "Alpaca order qty must be finite and positive, "
                 f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
-            )
+            ) from exc
         qty = qty_value
 
         order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
@@ -699,7 +719,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             client_order_id=canonical_signal_id,
         )
         order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
-        broker_order_id = str(getattr(order, "id", ""))
+        broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
+        if broker_order_id is None:
+            raise RuntimeError(
+                "Alpaca order response carried no valid positive broker order id "
+                f"(signal_id={signal.id}, symbol={signal.symbol})."
+            )
         await self._persist_submitted_order_id(canonical_signal_id, broker_order_id)
         logger.info(
             "Submitted Alpaca live order",
@@ -812,6 +837,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if parsed is None:
                 return
             event, order, client_order_id, signal_uuid = parsed
+            raw_broker_order_id = getattr(order, "id", None)
+            broker_order_id = _normalize_broker_order_id(raw_broker_order_id)
+            if broker_order_id is None:
+                logger.warning(
+                    "Trade update missing valid broker order id",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "client_order_id": str(client_order_id),
+                            "broker_order_id": str(raw_broker_order_id or ""),
+                        }
+                    },
+                )
+                return
 
             fill_price = getattr(data, "fill_price", None)
             if fill_price is None:
@@ -833,7 +872,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             filled_qty = _to_float(filled_qty_value)
             commission = _to_float(commission_value)
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
-            broker_order_id = str(getattr(order, "id", ""))
 
             execution_id = str(getattr(data, "execution_id", "") or "")
             if execution_id:

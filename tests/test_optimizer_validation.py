@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import optuna
@@ -21,9 +20,7 @@ import pytest
 
 from runner import optimizer as optimizer_module
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimizer import OptimizationConfig, run_optimization
-
 
 # ─── F30: covariance from market data, not trade-PnL pseudo-equity ──────────
 
@@ -46,7 +43,10 @@ class TestRiskParityCovarianceSource:
             recorded["returns"] = returns_frame
             return {
                 "best_symbols": list(returns_frame.columns),
-                "best_weights": {name: 1.0 / len(returns_frame.columns) for name in returns_frame.columns},
+                "best_weights": {
+                    name: 1.0 / len(returns_frame.columns)
+                    for name in returns_frame.columns
+                },
                 "best_score": 1.0,
                 "best_sharpe": 1.0,
                 "best_volatility": 0.1,
@@ -118,7 +118,11 @@ class TestNoTradeTrialsCannotWin:
             return _empty_vectorbt_result(config)
 
         monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_vectorbt)
-        monkeypatch.setattr(optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path))
+        monkeypatch.setattr(
+            optimizer_module,
+            "_load_base_backtest",
+            lambda _id: _base_result(tmp_path),
+        )
         monkeypatch.setattr(
             optimizer_module,
             "_asset_returns_frame_from_base_result",
@@ -136,7 +140,11 @@ class TestNoTradeTrialsCannotWin:
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
         )
-        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s"))
+        monkeypatch.setattr(
+            optimizer_module,
+            "_resolve_strategy_reference",
+            lambda r: ("s", Path("mock_strategy.py"), "s"),
+        )
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
         monkeypatch.setattr(
             optimizer_module,
@@ -243,9 +251,19 @@ def _base_result(tmp_path: Path):
         total_bars=100,
         data={"symbols": ["GOLD1", "GOLD2"], "timeframes": ["1h"], "data_dir": str(tmp_path)},
         initial_capital=100_000,
+        risk_per_trade_pct=0.01,
         parameters={"fast_length": 5, "slow_length": 20},
     )
     return BacktestResult(meta=meta, trades=[])
+
+
+def test_runtime_config_accepts_zero_risk_sizing(tmp_path: Path):
+    result = _base_result(tmp_path)
+    result.meta.risk_per_trade_pct = 0.0
+
+    runtime = optimizer_module._runtime_config_from_base_result(result)
+
+    assert runtime["risk_per_trade_pct"] == 0.0
 
 
 # ─── Mutation hardening: penalty margin + empty-study guard ─────────────────
@@ -365,7 +383,11 @@ class TestMetricDirection:
         monkeypatch.setattr(
             optimizer_module, "_run_vectorbt_backtest", lambda *a, **k: _empty_vectorbt_result(a[0])
         )
-        monkeypatch.setattr(optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path))
+        monkeypatch.setattr(
+            optimizer_module,
+            "_load_base_backtest",
+            lambda _id: _base_result(tmp_path),
+        )
         monkeypatch.setattr(
             optimizer_module,
             "_asset_returns_frame_from_base_result",
@@ -385,10 +407,16 @@ class TestMetricDirection:
             ),
         )
         monkeypatch.setattr(
-            optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s")
+            optimizer_module,
+            "_resolve_strategy_reference",
+            lambda r: ("s", Path("mock_strategy.py"), "s"),
         )
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
-        monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True)
+        monkeypatch.setattr(
+            optimizer_module,
+            "has_sufficient_segment_coverage",
+            lambda **kwargs: True,
+        )
 
         config = OptimizationConfig(
             base_backtest_id="bt_x",

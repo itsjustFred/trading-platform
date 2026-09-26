@@ -7,7 +7,7 @@ matches after the matcher and comparator have run.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -17,7 +17,7 @@ from validation.comparison.comparison import (
     MatchedTrade,
     TradeComparisonResult,
 )
-from validation.comparison.matcher import TradeMatcher
+from validation.comparison.matcher import MatchResult, TradeMatcher
 from validation.reference import ValidationReference
 
 
@@ -55,7 +55,7 @@ class AnomalyDetector:
         reference: ValidationReference,
         platform_trades: list[Trade],
         comparison_results: list[TradeComparisonResult] | None = None,
-        match_result: Any | None = None,
+        match_result: MatchResult | None = None,
         **match_kwargs: Any,
     ) -> list[TradeAnomaly]:
         """Run all detection methods and return aggregated anomalies.
@@ -240,9 +240,5 @@ class AnomalyDetector:
     def _severity_for_mismatches(
         field_mismatches: list[FieldComparisonResult],
     ) -> Literal["info", "warning", "error"]:
-        """Map field mismatches to an overall anomaly severity."""
-        error_fields = {"direction", "pnl"}
-        for fm in field_mismatches:
-            if fm.field in error_fields:
-                return "error"
-        return "warning"
+        """Map any gate-relevant field mismatch to an error."""
+        return "error" if field_mismatches else "info"

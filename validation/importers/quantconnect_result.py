@@ -14,7 +14,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
 
-from shared.models import Trade, TradeExit
+from shared.models import EquityPoint, Trade, TradeExit
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
 
@@ -456,6 +456,7 @@ class QuantConnectResultImporter(BaseImporter):
 
         clusters, cluster_summary = self._submission_clusters(orders)
         equity_evidence = self._strategy_equity_evidence(payload.get("charts"))
+        equity_curve = self._equity_curve_from_evidence(equity_evidence)
         fee_reconciliation = self._fee_reconciliation(
             statistics, normalized_trades, orders, source_order_quantities
         )
@@ -530,6 +531,7 @@ class QuantConnectResultImporter(BaseImporter):
             trades=normalized_trades,
             stats=canonical_stats,
             raw_metadata=raw_metadata,
+            equity_curve=equity_curve,
             source_path=resolved_source,
             source_hash=hashlib.sha256(source_bytes).hexdigest(),
             allow_empty=False,
@@ -785,6 +787,25 @@ class QuantConnectResultImporter(BaseImporter):
             "last_point": deepcopy(points[-1]) if points else None,
             "points": points,
         }
+
+    @staticmethod
+    def _equity_curve_from_evidence(evidence: Mapping[str, Any]) -> list[EquityPoint]:
+        points = evidence.get("points", [])
+        curve: list[EquityPoint] = []
+        for point in points:
+            if not isinstance(point, list) or len(point) != 5:
+                raise ValueError("Strategy Equity evidence points are malformed")
+            try:
+                timestamp = datetime.fromtimestamp(int(point[0]), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise ValueError("Strategy Equity timestamp is out of range") from exc
+            curve.append(
+                EquityPoint(
+                    time=timestamp.isoformat().replace("+00:00", "Z"),
+                    equity=float(point[4]),
+                )
+            )
+        return curve
 
     def _fee_reconciliation(
         self,

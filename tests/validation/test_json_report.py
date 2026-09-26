@@ -9,15 +9,22 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import typing
 
 import pytest
 
+from tests.validation.data_factory import (
+    make_passing_risk_evidence,
+    make_reference,
+    make_trade,
+)
 from validation.reporting import json_report
 from validation.reporting.json_report import (
     StatDelta,
     TradeStatistics,
     _compare_stats,
+    _stats_from_values,
     generate_json_report,
 )
 
@@ -107,6 +114,75 @@ class TestAndToleranceGate:
 
         wr = _delta(_compare_stats(expected, actual), "win_rate")
         assert wr.passed is False
+
+
+class TestCanonicalStats:
+    def test_mt5_percentage_fields_are_normalized_to_fractions(self) -> None:
+        stats = _stats_from_values(
+            {"win_rate": 45.12, "max_drawdown_pct": 5.52},
+            source_framework="mt5_xlsx",
+        )
+        assert stats.win_rate == pytest.approx(0.4512)
+        assert stats.max_drawdown_pct == pytest.approx(0.0552)
+
+
+class TestRiskEvidenceGate:
+    def test_empty_statistics_evidence_fails_report(self) -> None:
+        reference = make_reference([])
+        data = json.loads(
+            json_report.generate_json_report(
+                reference,
+                reference,
+                risk_delta_report=make_passing_risk_evidence(),
+            )
+        )
+        assert data["stat_passed"] is False
+        assert any(
+            delta["field"] == "statistics_evidence"
+            for delta in data["stat_deltas"]
+        )
+
+    def test_missing_equity_evidence_fails_certification(self) -> None:
+        reference = make_reference([make_trade()])
+        reference.equity_curve = []
+        reference.equity_evidence_status = "missing"
+        data = json.loads(
+            json_report.generate_json_report(
+                reference,
+                reference,
+                risk_delta_report=make_passing_risk_evidence(),
+            )
+        )
+        assert data["passed"] is False
+        assert data["equity_passed"] is False
+        assert data["equity_evidence_status"] == "missing"
+
+    def test_missing_risk_evidence_fails_report(self) -> None:
+        reference = make_reference([make_trade()])
+        data = json.loads(json_report.generate_json_report(reference, reference))
+        assert data["passed"] is False
+        assert data["risk_passed"] is False
+        assert data["risk_evidence_status"] == "missing"
+
+    def test_empty_risk_evidence_fails_report(self) -> None:
+        reference = make_reference([make_trade()])
+        data = json.loads(
+            json_report.generate_json_report(reference, reference, risk_delta_report=[])
+        )
+        assert data["passed"] is False
+        assert data["risk_evidence_status"] == "empty"
+
+    def test_failed_risk_evidence_fails_report(self) -> None:
+        reference = make_reference([make_trade()])
+        risk = make_passing_risk_evidence()
+        risk[0].passed = False
+        data = json.loads(
+            json_report.generate_json_report(
+                reference, reference, risk_delta_report=risk
+            )
+        )
+        assert data["passed"] is False
+        assert data["risk_evidence_status"] == "failed"
 
 
 class TestStatDeltaDefaults:

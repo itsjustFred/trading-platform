@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shared.atomic_io import write_text_atomically
 from shared.models import StrategyType
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -108,6 +109,9 @@ def load_strategy_module(path: Path, strategies_dir: Path = DEFAULT_STRATEGIES_D
     Only real backtest/engine runs should call this: listing or looking up
     strategies uses :func:`load_strategy_meta`, which parses instead.
     """
+    from runner.approval_gate import require_generated_strategy_approval
+
+    require_generated_strategy_approval(path, strategies_root=strategies_dir)
     module_name = f"strategy_{strategy_slug_for_path(path, strategies_dir).replace('-', '_')}"
     spec = importlib.util.spec_from_file_location(module_name, str(path))
     if spec is None or spec.loader is None:
@@ -350,7 +354,7 @@ def update_strategy_display_name(
             start = _offset_from_position(line_offsets, value.lineno, value.col_offset)
             end = _offset_from_position(line_offsets, value.end_lineno, value.end_col_offset)
             updated = source[:start] + repr(new_name) + source[end:]
-            strategy_file.write_text(updated, encoding="utf-8")
+            write_text_atomically(strategy_file, updated)
             entry = find_strategy_entry(
                 strategy_slug_for_path(strategy_file, strategies_dir),
                 strategies_dir,

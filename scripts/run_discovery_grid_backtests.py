@@ -8,7 +8,6 @@ required data files, and runs runner.cli with explicit --params and --output.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -17,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from runner.agent_process import build_backtest_child_env
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DISCOVERY_PATH = Path("/mnt/block-volume-data/discovered_strategies/discovery_20260618_0752.json")
@@ -144,8 +145,7 @@ def run_trial(trial: dict[str, Any]) -> dict[str, Any]:
         str(output),
         "--progress-stdout",
     ]
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    env = build_backtest_child_env()
 
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(

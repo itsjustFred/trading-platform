@@ -9,8 +9,71 @@ from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.daemon import submit_order_with_risk
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.models import RiskDecision, TradeSignal
+from risk.models import RiskDecision, SizedOrder, TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+)
+@pytest.mark.parametrize("value", [0.0, -0.01, 1.01, math.nan, math.inf])
+def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
+    with pytest.raises(ValueError):
+        RiskConfig(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+)
+def test_risk_config_accepts_upper_fraction_boundary(field_name):
+    config = RiskConfig(**{field_name: 1.0})
+    assert getattr(config, field_name) == 1.0
+
+
+def _risk_decision(risk_percent: float) -> RiskDecision:
+    return RiskDecision(
+        signal_id="signal",
+        accepted=True,
+        quantity=1.0,
+        risk_amount=1.0,
+        risk_percent=risk_percent,
+        risk_distance=1.0,
+        stop_price_used=99.0,
+        take_profit_used=None,
+    )
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, math.nan, math.inf])
+def test_risk_decision_rejects_non_fraction_risk_percent(value: float) -> None:
+    with pytest.raises(ValueError, match="risk_percent must"):
+        _risk_decision(value)
+
+
+@pytest.mark.parametrize("value", [0.0, 1.0])
+def test_risk_decision_accepts_fraction_boundaries(value: float) -> None:
+    assert _risk_decision(value).risk_percent == value
+
+
+def test_sized_order_rejects_non_fraction_risk_percent() -> None:
+    signal = TradeSignal(
+        action="buy",
+        symbol="X",
+        entry_price=100.0,
+        stop_loss=99.0,
+        take_profit=None,
+        timeframe="1d",
+        metadata={},
+    )
+    with pytest.raises(ValueError, match="risk_percent must be between 0 and 1"):
+        SizedOrder(
+            signal=signal,
+            position_size=1.0,
+            risk_amount=1.0,
+            risk_percent=1.01,
+            risk_reward_ratio=None,
+        )
 
 
 def test_calculate_position_size_normal_case():
@@ -54,6 +117,36 @@ def test_calculate_position_size_normal_case():
     assert sized.decision.take_profit_used == pytest.approx(104.0)
     assert sized.decision.rejection_reason is None
     assert sized.decision.metadata["stop_source"] == "signal"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("account_balance", math.nan),
+        ("pip_value", math.nan),
+        ("current_exposure", math.nan),
+    ],
+)
+def test_calculate_position_size_rejects_non_finite_inputs(
+    field_name: str, value: float
+) -> None:
+    sizing_inputs = {
+        "account_balance": 10_000.0,
+        "pip_value": 1.0,
+        "current_exposure": 0.0,
+    }
+    sizing_inputs[field_name] = value
+    signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        timeframe="1h",
+    )
+
+    with pytest.raises(ValueError, match=f"{field_name} must be finite"):
+        RiskEngine().calculate_position_size(signal=signal, **sizing_inputs)
 
 
 def test_calculate_position_size_notional_cap_respects_entry_price():
@@ -216,6 +309,31 @@ def test_calculate_position_size_blocks_stop_on_wrong_side():
     assert sized.decision.stop_price_used == pytest.approx(102.0)
 
 
+def test_calculate_position_size_zero_distance_wrong_side_returns_rejection():
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=100.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = RiskEngine().calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.risk_distance is None
+
+
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
     engine = RiskEngine(
         RiskConfig(
@@ -253,7 +371,69 @@ def test_calculate_position_size_missing_stop_loss_uses_fallback():
     assert ":none:" in sized.decision.signal_id
 
 
-def test_calculate_position_size_uses_explicit_signal_id_in_decision():
+def test_calculate_position_size_rejects_missing_stop_when_fallback_disabled():
+    engine = RiskEngine(RiskConfig(reject_missing_stop=True))
+    signal = TradeSignal(
+        action="buy",
+        symbol="BTCUSD",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=105.0,
+        timeframe="1h",
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "missing_stop"
+    assert sized.decision.metadata["fallback_stop_allowed"] is False
+
+
+def test_legacy_signal_ids_are_unique_and_stable_per_signal():
+    engine = RiskEngine()
+    first = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h",
+    )
+    second = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h",
+    )
+
+    first_id = engine.calculate_position_size(
+        signal=first, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    first_id_again = engine.calculate_position_size(
+        signal=first, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    second_id = engine.calculate_position_size(
+        signal=second, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+
+    assert first_id == first_id_again
+    assert first_id != second_id
+
+    fallback = TradeSignal(
+        action="buy", symbol="X", entry_price=100.0, stop_loss=None,
+        take_profit=None, timeframe="1h",
+    )
+    fallback_id = engine.calculate_position_size(
+        signal=fallback, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    fallback_id_again = engine.calculate_position_size(
+        signal=fallback, account_balance=10_000.0, pip_value=1.0, current_exposure=0.0,
+    ).decision.signal_id
+    assert fallback_id == fallback_id_again
+
+
+def test_calculate_position_size_uses_explicit_signal_id() -> None:
     engine = RiskEngine()
     signal = TradeSignal(
         action="sell",

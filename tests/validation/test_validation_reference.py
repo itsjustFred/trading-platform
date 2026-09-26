@@ -6,8 +6,12 @@ from datetime import datetime
 
 import pytest
 
-from shared.models import BacktestResult, Trade, TradeExit
-from validation.reference import ALLOWED_FRAMEWORKS, ALLOWED_STATUSES, ValidationReference
+from shared.models import BacktestResult, EquityPoint, Trade, TradeExit
+from validation.reference import (
+    ALLOWED_FRAMEWORKS,
+    ALLOWED_STATUSES,
+    ValidationReference,
+)
 
 
 def _make_sample_trade() -> Trade:
@@ -100,6 +104,40 @@ class TestToBacktestResult:
         assert result.meta.data["timeframes"] == ["1h"]
         assert result.meta.parameters == {"period": 14}
 
+    def test_settings_initial_capital_precedes_parsed_metadata(self):
+        ref = _make_minimal_valid_reference(
+            settings={"initial_capital": 12_345},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        result = ref.to_backtest_result()
+
+        assert result.meta.initial_capital == pytest.approx(12_345.0)
+
+    def test_parsed_metadata_supplies_missing_initial_capital(self):
+        ref = _make_minimal_valid_reference(
+            settings={},
+            raw_metadata={"parsed_meta": {"initial_capital": 67_890}},
+        )
+
+        result = ref.to_backtest_result()
+
+        assert result.meta.initial_capital == pytest.approx(67_890.0)
+
+    @pytest.mark.parametrize(
+        "invalid_capital",
+        [0.0, -1.0, float("nan"), float("inf"), float("-inf")],
+    )
+    def test_invalid_initial_capital_uses_default_fallback(self, invalid_capital):
+        from validation.reference import resolve_initial_capital
+
+        ref = _make_minimal_valid_reference(
+            settings={"initial_capital": invalid_capital},
+            raw_metadata={},
+        )
+
+        assert resolve_initial_capital(ref) == pytest.approx(100_000.0)
+
     def test_trades_preserved(self):
         ref = _make_minimal_valid_reference()
         result = ref.to_backtest_result()
@@ -117,6 +155,25 @@ class TestToBacktestResult:
         assert result.equity_curve == []
         assert result.indicators == []
         assert result.drawings == []
+
+    def test_missing_equity_evidence_is_explicit(self):
+        ref = _make_minimal_valid_reference()
+        result = ref.to_backtest_result()
+        assert ref.equity_evidence_status == "missing"
+        assert result.equity_curve == []
+        assert result.equity_evidence_status == "missing"
+
+    def test_equity_curve_is_preserved_with_available_status(self):
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0)]
+        ref = _make_minimal_valid_reference(equity_curve=curve)
+        result = ref.to_backtest_result()
+        assert ref.equity_evidence_status == "available"
+        assert result.equity_curve == curve
+        assert result.equity_evidence_status == "available"
+
+    def test_available_status_requires_curve(self):
+        with pytest.raises(ValueError, match="requires an equity curve"):
+            _make_minimal_valid_reference(equity_evidence_status="available")
 
     def test_notes_contains_source_info(self):
         ref = _make_minimal_valid_reference(source_path="/tmp/report.xlsx")

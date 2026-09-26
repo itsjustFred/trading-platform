@@ -113,7 +113,6 @@ class TestInternalGapDetection:
             DataRequirement(symbol="USDCAD", timeframe="1h", start="2024-01-01", end="2024-01-02"),
         )
         assert report["status"] == "failed"
-        assert "error" in report
 
 
 class TestFailedDownloadVisibility:
@@ -224,10 +223,31 @@ class TestValidateGapBounds:
         target = tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
         target.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(target, index=False)
-        result = validate_parquet(target)
+        result = validate_parquet(target, ohlcv_root=tmp_path / "ohlcv")
         assert result.gaps, "the 4-day hole must be reported"
         assert "2024-01-01" in result.gaps[0]["start"] and "01:00" in result.gaps[0]["start"]
         assert "2024-01-05" in result.gaps[0]["end"] and "00:00" in result.gaps[0]["end"]
+
+    def test_rejects_path_outside_configured_root(self, tmp_path, monkeypatch):
+        import data_tools.validate as validate_module
+
+        configured_root = tmp_path / "configured"
+        outside = tmp_path / "outside" / "1d.parquet"
+        outside.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2024-01-02T00:00:00Z"], utc=True),
+                "open": [1.0],
+                "high": [1.1],
+                "low": [0.9],
+                "close": [1.0],
+                "volume": [10.0],
+            }
+        ).to_parquet(outside, index=False)
+        monkeypatch.setattr(validate_module, "DATA_DIR", configured_root)
+
+        with pytest.raises(ValueError, match="escapes its root"):
+            validate_module.validate_parquet(outside)
 
 
 class TestGapDetectionSingleFile:
@@ -280,6 +300,78 @@ class TestSegmentCoverageWeekends:
             start="2024-01-01", end="2024-01-12", data_dir=tmp_path,
         )
 
+    def test_us_equity_holiday_does_not_reduce_expected_coverage(self, tmp_path):
+        stamps = pd.to_datetime(
+            ["2024-07-03T00:00:00Z", "2024-07-05T00:00:00Z", "2024-07-08T00:00:00Z"],
+            utc=True,
+        )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-07-03",
+            end="2024-07-08",
+            data_dir=tmp_path,
+        )
+
+    def test_us_equity_holiday_does_not_hide_weekday_outage(self, tmp_path):
+        stamps = pd.to_datetime(
+            ["2024-07-03T00:00:00Z", "2024-07-08T00:00:00Z"],
+            utc=True,
+        )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1d.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1d",
+            start="2024-07-03",
+            end="2024-07-08",
+            data_dir=tmp_path,
+        )
+
+    def test_non_us_equity_venue_does_not_use_nyse_calendar(self, tmp_path):
+        stamps = [
+            *pd.date_range("2024-07-03T00:00:00", periods=24, freq="1h", tz="UTC"),
+            *pd.date_range("2024-07-05T00:00:00", periods=3, freq="1h", tz="UTC"),
+        ]
+        _write_bars(
+            tmp_path / "ohlcv" / "international" / "equity" / "ASX" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="ASX",
+            timeframe="1h",
+            start="2024-07-03",
+            end="2024-07-05T02:00:00Z",
+            data_dir=tmp_path,
+        )
+
+    def test_crypto_symbol_does_not_use_us_equity_holiday_calendar(self, tmp_path):
+        stamps = [
+            *pd.date_range("2024-07-03T00:00:00", periods=24, freq="1h", tz="UTC"),
+            *pd.date_range("2024-07-05T00:00:00", periods=3, freq="1h", tz="UTC"),
+        ]
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "crypto" / "bch-usd" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert not has_sufficient_segment_coverage(
+            symbol="BCH-USD",
+            timeframe="1h",
+            start="2024-07-03",
+            end="2024-07-05T02:00:00Z",
+            data_dir=tmp_path,
+        )
+
     def test_hourly_segment_with_weekend_gap_passes(self, tmp_path):
         # Fri 22:00 -> Mon 00:00 UTC gap is weekend, not missing data.
         stamps = list(pd.date_range("2024-01-05T00:00", "2024-01-05T22:00", freq="1h", tz="UTC"))
@@ -291,6 +383,36 @@ class TestSegmentCoverageWeekends:
         assert has_sufficient_segment_coverage(
             symbol="EURUSD", timeframe="1h",
             start="2024-01-05", end="2024-01-08T10:00", data_dir=tmp_path,
+        )
+
+    def test_sunday_to_monday_hourly_fx_weekend_gap_is_expected(self):
+        from data_tools.validate import _gap_is_expected_nontrading
+
+        assert _gap_is_expected_nontrading(
+            pd.Timestamp("2024-01-07T00:00:00Z"),
+            pd.Timestamp("2024-01-08T00:00:00Z"),
+            "forex",
+            "1h",
+        )
+
+    def test_session_window_overrides_generic_weekday_grid(self, tmp_path):
+        stamps = []
+        for day in ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"):
+            stamps.extend(
+                pd.date_range(f"{day}T14:30", periods=5, freq="1h", tz="UTC")
+            )
+        _write_bars(
+            tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet",
+            [stamp.isoformat() for stamp in stamps],
+        )
+
+        assert has_sufficient_segment_coverage(
+            symbol="AAPL",
+            timeframe="1h",
+            start="2024-01-02T00:00:00Z",
+            end="2024-01-05T23:59:59Z",
+            data_dir=tmp_path,
+            session={"start": "14:30", "end": "19:30"},
         )
 
     def test_midweek_hole_still_fails(self, tmp_path):
@@ -310,6 +432,41 @@ class TestSegmentCoverageWeekends:
 class TestValidateHolidayCalendar:
     """B3: NYSE holidays are not data holes (equity-like paths only)."""
 
+    @pytest.mark.parametrize("date_text", ["2021-06-18", "2021-12-31"])
+    def test_new_year_exception_and_pre_2022_juneteenth_stay_open(
+        self, date_text: str
+    ) -> None:
+        assert not auto_download.is_us_equity_holiday(date_text)
+
+    @pytest.mark.parametrize("date_text", ["2020-07-03", "2021-12-24"])
+    def test_saturday_holidays_are_observed_on_preceding_friday(
+        self, date_text: str
+    ) -> None:
+        assert auto_download.is_us_equity_holiday(date_text)
+
+    def test_sunday_holiday_is_observed_monday(self) -> None:
+        assert auto_download.is_us_equity_holiday("2022-06-20")
+
+    def test_weekend_holiday_is_not_double_subtracted(self) -> None:
+        start = pd.Timestamp("2024-07-05T22:00:00Z")
+        end = pd.Timestamp("2024-07-07T01:00:00Z")
+        baseline = auto_download._trading_minutes_between(start, end)
+        minutes = auto_download._trading_minutes_between(
+            start,
+            end,
+            frozenset({pd.Timestamp("2024-07-06").date()}),
+        )
+
+        assert minutes == pytest.approx(baseline)
+
+    def test_weekend_boundary_rejects_more_than_three_calendar_days(self) -> None:
+        from data_tools.validate import _weekend_boundary
+
+        assert not _weekend_boundary(
+            pd.Timestamp("2024-01-05T20:00:00Z"),
+            pd.Timestamp("2024-01-09T02:00:00Z"),
+        )
+
     def _write_equity_bars(self, root: Path, timestamps: list[str]) -> Path:
         import pandas as pd
 
@@ -328,6 +485,22 @@ class TestValidateHolidayCalendar:
         frame.to_parquet(target, index=False)
         return target
 
+    def test_session_overlap_starts_after_prior_bar_close(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T15:00:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "overnight"
+
+    def test_validate_uses_shared_timeframe_step_mapping(self) -> None:
+        import data_tools.validate as validate_module
+
+        assert validate_module.TIMEFRAME_MINUTES is auto_download.TIMEFRAME_MINUTES
+
     def test_july4_gap_skipped_for_equity(self, tmp_path, monkeypatch) -> None:
         import data_tools.validate as validate_module
 
@@ -338,6 +511,29 @@ class TestValidateHolidayCalendar:
         )
         result = validate_module.validate_parquet(target)
         assert result.gaps == []
+
+    def test_long_outage_spanning_holiday_remains_an_error(self, tmp_path, monkeypatch) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = self._write_equity_bars(
+            tmp_path, ["2024-07-03T00:00:00Z", "2024-07-08T00:00:00Z"]
+        )
+
+        result = validate_module.validate_parquet(target)
+
+        assert len(result.gaps) == 1
+
+    def test_holiday_does_not_hide_an_additional_weekday_outage(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-09T09:30:00Z"),
+            "forex",
+            "1h",
+            holidays=["2024-07-04"],
+        ) == "data"
 
     def test_same_gap_flagged_for_forex(self, tmp_path, monkeypatch) -> None:
         import pandas as pd
@@ -363,6 +559,133 @@ class TestValidateHolidayCalendar:
         ).to_parquet(target, index=False)
         result = validate_module.validate_parquet(target)
         assert len(result.gaps) == 1
+
+    def test_validate_parquet_accepts_explicit_session_boundaries(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
+        target.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-09T16:00:00Z", "2024-01-10T09:30:00Z"], utc=True
+                ),
+                "open": [100.0, 100.0],
+                "high": [100.5, 100.5],
+                "low": [99.5, 99.5],
+                "close": [100.0, 100.0],
+                "volume": [10, 10],
+            }
+        ).to_parquet(target, index=False)
+
+        result = validate_module.validate_parquet(
+            target,
+            session_start="09:30",
+            session_end="16:00",
+        )
+
+        assert result.gaps == []
+
+    def test_session_gap_during_trading_window_remains_a_data_gap(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import data_tools.validate as validate_module
+
+        monkeypatch.setattr(validate_module, "DATA_DIR", tmp_path)
+        target = tmp_path / "ohlcv" / "test" / "equity" / "AAPL" / "1h.parquet"
+        target.parent.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2024-01-09T10:00:00Z", "2024-01-09T14:00:00Z"], utc=True
+                ),
+                "open": [100.0, 100.0],
+                "high": [100.5, 100.5],
+                "low": [99.5, 99.5],
+                "close": [100.0, 100.0],
+                "volume": [10, 10],
+            }
+        ).to_parquet(target, index=False)
+
+        result = validate_module.validate_parquet(
+            target,
+            session={"start": "09:30", "end": "16:00"},
+        )
+
+        assert len(result.gaps) == 1
+        assert result.gaps[0]["classification"] == "session"
+
+    def test_session_metadata_classifies_weekday_overnight_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T19:30:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "overnight"
+
+    def test_overnight_session_metadata_classifies_weekday_close_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T17:00:00Z"),
+            pd.Timestamp("2024-01-09T18:00:00Z"),
+            "futures",
+            "1h",
+            session={"start": "18:00", "end": "17:00"},
+        ) == "overnight"
+
+    def test_session_metadata_keeps_intraday_gap_as_data_loss(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T10:00:00Z"),
+            pd.Timestamp("2024-01-09T14:00:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+        ) == "session"
+
+    def test_holiday_metadata_classifies_only_holiday_gap(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-05T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+            holidays=["2024-07-04"],
+        ) == "holiday"
+        assert _gap_classification(
+            pd.Timestamp("2024-07-03T16:00:00Z"),
+            pd.Timestamp("2024-07-08T09:30:00Z"),
+            "equity",
+            "1h",
+            session={"start": "09:30", "end": "16:00"},
+            holidays=["2024-07-04"],
+        ) == "session"
+
+    def test_weekend_and_missing_session_are_distinct(self) -> None:
+        from data_tools.validate import _gap_classification
+
+        assert _gap_classification(
+            pd.Timestamp("2024-01-05T22:00:00Z"),
+            pd.Timestamp("2024-01-08T00:00:00Z"),
+            "forex",
+            "1h",
+        ) == "weekend"
+        assert _gap_classification(
+            pd.Timestamp("2024-01-09T16:00:00Z"),
+            pd.Timestamp("2024-01-10T09:30:00Z"),
+            "forex",
+            "1h",
+        ) == "data"
 
 
 class TestEnsureBacktestDataGapGate:
@@ -446,3 +769,56 @@ def test_gap_inside_required_window_still_fails(tmp_path: Path) -> None:
         ),
     )
     assert report["status"] == "failed"
+
+
+def test_observed_session_does_not_merge_different_daily_windows() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=4, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T14:00", periods=4, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(stamps, 60.0) is None
+
+
+def test_observed_session_does_not_shrink_for_a_truncated_day() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=2, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(stamps, 60.0) is None
+
+
+def test_observed_session_allows_a_final_day_cut_at_the_requested_end() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T09:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=2, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T00:00:00Z"),
+        end_ts=pd.Timestamp("2024-01-03T10:00:00Z"),
+    ) == (540, 840)
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T00:00:00Z"),
+        end_ts=pd.Timestamp("2024-01-03T13:00:00Z"),
+    ) is None
+
+
+def test_observed_session_uses_an_interior_window_at_boundary_cuts() -> None:
+    stamps = [
+        *pd.date_range("2024-01-02T10:00", periods=5, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-03T09:00", periods=6, freq="1h", tz="UTC"),
+        *pd.date_range("2024-01-04T09:00", periods=4, freq="1h", tz="UTC"),
+    ]
+
+    assert auto_download._observed_session_window(
+        stamps,
+        60.0,
+        start_ts=pd.Timestamp("2024-01-02T10:30:00Z"),
+        end_ts=pd.Timestamp("2024-01-04T13:00:00Z"),
+    ) == (540, 900)

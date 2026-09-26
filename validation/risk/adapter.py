@@ -17,9 +17,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.models import SizedOrder, TradeSignal
+from risk.models import TradeSignal
 from shared.models import Trade
 from validation.reference import ValidationReference
 from validation.risk.fixed_risk import FixedRiskConfig, FixedRiskModel
@@ -53,9 +52,7 @@ def _trade_to_signal(
     metadata: dict[str, Any] = dict(trade.meta) if trade.meta else {}
     if account_balance is not None:
         metadata["account_balance"] = float(account_balance)
-    # C4: mirror the live daemon path — wrong-side stops size to zero on
-    # both sides of the comparison instead of sizing through silently.
-    metadata.setdefault("enforce_stop_direction", True)
+    metadata["enforce_stop_direction"] = True
 
     return TradeSignal(
         action=action,

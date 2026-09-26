@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
+from runner.approval_gate import require_generated_strategy_approval
 from runner.backtest_grid import (
     GRID_SYMBOLS,
     GRID_TIMEFRAMES,
@@ -86,6 +87,7 @@ def run_strategy_grid(
     if entry is None:
         return {"status": "error", "message": f"Strategy {strategy_slug} not found"}
 
+    require_generated_strategy_approval(str(entry.file_path))
     engine = get_engine(engine_name)
     results_matrix: dict[str, dict[str, dict[str, Any]]] = {sym: {} for sym in symbols}
 
@@ -262,6 +264,7 @@ def _run_strategy_matrix_cell(
     keep_indicators: bool,
 ) -> dict[str, Any]:
     strategy_engine = engine or entry.engine
+    require_generated_strategy_approval(str(entry.file_path))
     strategy_output_dir = output_dir / entry.slug
     strategy_output_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Running matrix strategy=%s engine=%s", entry.slug, strategy_engine)

@@ -142,15 +142,14 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
 
     separator = _detect_separator(path)
     frame = pd.read_csv(path, sep=separator, dtype=str, encoding="utf-8-sig")
-    if frame.empty:
-        return []
-
     normalized_columns = {_normalize_header(column): column for column in frame.columns}
     symbol_column = _find_column(normalized_columns, _SYMBOL_KEYS)
     if symbol_column is None:
         raise ValueError("CSV requires a symbol column (e.g. Symbol)")
 
     action_column = _find_column(normalized_columns, _ACTION_KEYS)
+    if action_column is None:
+        raise ValueError("CSV requires an action column (e.g. Action or Side)")
     price_column = _find_column(normalized_columns, _PRICE_KEYS)
     timestamp_column = _find_column(normalized_columns, _TIMESTAMP_KEYS)
     date_column = _find_column(normalized_columns, _DATE_KEYS)
@@ -162,6 +161,8 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
         )
     if price_column is None:
         raise ValueError("CSV requires an entry/price column (e.g. Signal Price)")
+    if frame.empty:
+        return []
 
     source_label = f"csv:{path.name}"
     signals: list[dict[str, Any]] = []
@@ -187,21 +188,18 @@ def load_signals_from_csv(filepath: str) -> list[dict[str, Any]]:
             )
             continue
 
-        if action_column:
-            action = _parse_action(row.get(action_column))
-            if action is None:
-                logger.warning(
-                    "Skipping CSV row with unknown action (never default buy)",
-                    extra={
-                        "data": {
-                            "csv_row": int(index) + 2,
-                            "action": str(row.get(action_column)),
-                        }
-                    },
-                )
-                continue
-        else:
-            action = "buy"
+        action = _parse_action(row.get(action_column))
+        if action is None:
+            logger.warning(
+                "Skipping CSV row with unknown action (never default buy)",
+                extra={
+                    "data": {
+                        "csv_row": int(index) + 2,
+                        "action": str(row.get(action_column)),
+                    }
+                },
+            )
+            continue
         metadata: dict[str, Any] = {
             "csv_file": str(path),
             "csv_row": int(index) + 2,

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -15,8 +16,9 @@ from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
     closed_positions,
+    entry_side_scope,
     group_position_fills,
-    open_position_summary,
+    position_fill_summary,
 )
 from validation.importers.base import BaseImporter
 from validation.reference import ValidationReference
@@ -74,6 +76,16 @@ for label, key in _STAT_LABELS:
     _STAT_LABEL_MAP[label] = key
     _STAT_LABEL_MAP[label.rstrip(" :")] = key
 
+_META_LABELS = frozenset(
+    {
+        "Expertenprogramm:",
+        "Symbol:",
+        "Periode:",
+        "Ersteinlage:",
+        "Hebel:",
+    }
+)
+
 
 def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
     if source_tz is None:
@@ -89,7 +101,12 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
 class MT5XLSXImporter(BaseImporter):
     """Import MT5 Strategy Tester XLSX reports (German UI)."""
 
-    def load(self, source: str | Path, source_timezone: str | tzinfo | None = None, **kwargs: Any) -> ValidationReference:
+    def load(
+        self,
+        source: str | Path,
+        source_timezone: str | tzinfo | None = None,
+        **kwargs: Any,
+    ) -> ValidationReference:
         """Read an MT5 XLSX report and return a ``ValidationReference``.
 
         Parameters
@@ -97,7 +114,8 @@ class MT5XLSXImporter(BaseImporter):
         source:
             Path to the ``.xlsx`` file.
         source_timezone:
-            Optional IANA timezone name (e.g. "Europe/Athens") or ``tzinfo`` of the report's timestamps.
+            Optional IANA timezone name (e.g. "Europe/Athens") or ``tzinfo`` of
+            the report's timestamps.
             If provided, naive timestamps will be interpreted in this timezone and
             converted to UTC. Defaults to UTC if not provided.
         **kwargs:
@@ -131,7 +149,11 @@ class MT5XLSXImporter(BaseImporter):
         # Parse meta, settings, stats from header area
         meta = self._parse_meta(rows, orders_header_idx)
         settings = meta.pop("settings", {})
-        stats = self._parse_stats(rows, orders_header_idx)
+        stats = self._parse_stats(
+            rows,
+            orders_header_idx,
+            initial_capital=meta.get("initial_capital"),
+        )
         raw_metadata = {
             "parsed_meta": meta,
             "parsed_stats": stats,
@@ -144,15 +166,19 @@ class MT5XLSXImporter(BaseImporter):
 
         # Parse Trades / Deals table
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades, open_summary = self._build_trades(trades_df, sltp_map, resolved_timezone)
-        # C4: open positions are accounted explicitly (counts + ids), never
-        # silently dropped into survivorship bias.
-        raw_metadata["open_positions"] = open_summary
-        if open_summary.get("open_position_count"):
+        trades, fill_summary = self._build_trades(trades_df, sltp_map, resolved_timezone)
+        raw_metadata["position_fills"] = fill_summary
+        raw_metadata["open_positions"] = fill_summary
+        if fill_summary.get("open_position_count_including_partial"):
             logger.warning(
-                "MT5 XLSX report ends with %d open position(s): %s",
-                open_summary["open_position_count"],
-                open_summary["open_position_ids"],
+                "MT5 XLSX report ends with %d open or partial position(s): %s",
+                fill_summary["open_position_count_including_partial"],
+                fill_summary["open_position_ids"],
+            )
+        if fill_summary.get("orphan_exit_count"):
+            logger.warning(
+                "MT5 XLSX report contains %d orphan exit position(s)",
+                fill_summary["orphan_exit_count"],
             )
 
         return ValidationReference(
@@ -170,6 +196,55 @@ class MT5XLSXImporter(BaseImporter):
     # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
+    def _is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        try:
+            return bool(pd.isna(value))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _normalize_label(value: Any) -> str:
+        return str(value).strip().rstrip(":").strip()
+
+    @staticmethod
+    def _next_label_value(
+        row: list[Any],
+        start: int,
+        labels: frozenset[str],
+    ) -> Any:
+        normalized_labels = {MT5XLSXImporter._normalize_label(label) for label in labels}
+        for value in row[start:]:
+            if MT5XLSXImporter._is_missing(value):
+                continue
+            text = str(value).strip()
+            if MT5XLSXImporter._normalize_label(text) in normalized_labels:
+                break
+            return value
+        return None
+
+    @staticmethod
+    def _label_value_pairs(
+        row: list[Any],
+        labels: frozenset[str],
+    ) -> list[tuple[str, Any]]:
+        pairs: list[tuple[str, Any]] = []
+        for index, value in enumerate(row):
+            if MT5XLSXImporter._is_missing(value):
+                continue
+            label = str(value).strip()
+            if MT5XLSXImporter._normalize_label(label) not in {
+                MT5XLSXImporter._normalize_label(candidate)
+                for candidate in labels
+            }:
+                continue
+            pairs.append(
+                (label, MT5XLSXImporter._next_label_value(row, index + 1, labels))
+            )
+        return pairs
+
+    @staticmethod
     def _find_row_with_cell(rows: list[list[Any]], target: str) -> int | None:
         for idx, row in enumerate(rows):
             for cell in row:
@@ -178,7 +253,11 @@ class MT5XLSXImporter(BaseImporter):
         return None
 
     @staticmethod
-    def _extract_table(df_raw: pd.DataFrame, header_idx: int, end_idx: int | None = None) -> pd.DataFrame:
+    def _extract_table(
+        df_raw: pd.DataFrame,
+        header_idx: int,
+        end_idx: int | None = None,
+    ) -> pd.DataFrame:
         """Slice a clean DataFrame out of the raw sheet given the header row index."""
         header_row = df_raw.iloc[header_idx + 1]
         # Drop completely-NaN columns to avoid phantom unnamed columns
@@ -210,20 +289,19 @@ class MT5XLSXImporter(BaseImporter):
         in_settings = False
         current_section: str | None = None
 
+        section_labels = frozenset({"Einstellungen", "Ergebnisse", "Firma:"})
         for row in rows[:orders_header_idx]:
-            label = row[0] if len(row) > 0 and pd.notna(row[0]) else None
-            label_str = str(label).strip() if label is not None else ""
-
-            # Section detectors
-            if label_str == "Einstellungen":
-                in_settings = True
-                continue
-            if label_str in ("Ergebnisse", "Firma:"):
-                in_settings = False
-                continue
-
-            if MT5XLSXImporter._apply_meta_row(row, label_str, meta):
-                continue
+            pairs = MT5XLSXImporter._label_value_pairs(
+                row,
+                _META_LABELS | section_labels,
+            )
+            for label_str, _value in pairs:
+                if label_str == "Einstellungen":
+                    in_settings = True
+                elif label_str in ("Ergebnisse", "Firma:"):
+                    in_settings = False
+                elif label_str in _META_LABELS:
+                    MT5XLSXImporter._apply_meta_row(row, label_str, meta)
 
             if in_settings:
                 current_section = MT5XLSXImporter._parse_settings_row(
@@ -233,13 +311,25 @@ class MT5XLSXImporter(BaseImporter):
         return meta
 
     @staticmethod
-    def _meta_val(row: list[Any]) -> Any:
-        return row[3] if len(row) > 3 and pd.notna(row[3]) else None
+    def _meta_val(row: list[Any], label_str: str = "") -> Any:
+        if not label_str:
+            return row[3] if len(row) > 3 and not MT5XLSXImporter._is_missing(row[3]) else None
+        for index, value in enumerate(row):
+            if MT5XLSXImporter._is_missing(value):
+                continue
+            if str(value).strip() != label_str:
+                continue
+            return MT5XLSXImporter._next_label_value(
+                row,
+                index + 1,
+                _META_LABELS | frozenset({"Einstellungen", "Ergebnisse", "Firma:"}),
+            )
+        return None
 
     @staticmethod
     def _apply_meta_row(row: list[Any], label_str: str, meta: dict[str, Any]) -> bool:
         """Apply one meta row (label in column 0); True when the row was a meta label."""
-        val = MT5XLSXImporter._meta_val(row)
+        val = MT5XLSXImporter._meta_val(row, label_str)
         if label_str == "Expertenprogramm:":
             meta["strategy_name"] = str(val) if val is not None else "unknown"
         elif label_str == "Symbol:":
@@ -302,7 +392,11 @@ class MT5XLSXImporter(BaseImporter):
     # ── stats parsing ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_stats(rows: list[list[Any]], orders_header_idx: int) -> dict[str, Any]:
+    def _parse_stats(
+        rows: list[list[Any]],
+        orders_header_idx: int,
+        initial_capital: Any | None = None,
+    ) -> dict[str, Any]:
         stats: dict[str, Any] = {}
         recognized = 0
         for row in rows[:orders_header_idx]:
@@ -332,28 +426,37 @@ class MT5XLSXImporter(BaseImporter):
         # Derive total_return as a FRACTION (#84: the runner reports
         # total_return as equity_end/equity_start - 1, e.g. 0.21 — the old
         # *100.0 percent diverged by a factor of 100 in comparisons).
-        if "total_pnl" in stats and "initial_capital" in stats:
-            ic = stats.get("initial_capital")
-            if isinstance(ic, (int, float)) and ic != 0:
-                stats["total_return"] = stats["total_pnl"] / ic
+        if "total_pnl" in stats and initial_capital is not None:
+            try:
+                capital = float(initial_capital)
+                total_pnl = float(stats["total_pnl"])
+            except (TypeError, ValueError):
+                capital = 0.0
+                total_pnl = 0.0
+            if capital > 0.0 and math.isfinite(capital) and math.isfinite(total_pnl):
+                stats["total_return"] = total_pnl / capital
 
         return stats
 
     @staticmethod
     def _stat_label_value_groups(row: list[Any]) -> list[tuple[str, Any]]:
-        """Extract (label, value) pairs; stats can be in columns 0-3, 4-7 or 8-11."""
-        label_value_groups: list[tuple[str, Any]] = []
-        for col_offset in (0, 4, 8):
-            if len(row) <= col_offset:
+        """Extract stat label/value pairs without assuming fixed columns."""
+        stat_labels = frozenset(_STAT_LABEL_MAP)
+        pairs: list[tuple[str, Any]] = []
+        for index, value in enumerate(row):
+            if MT5XLSXImporter._is_missing(value):
                 continue
-            label = row[col_offset]
-            if label is None or (isinstance(label, float) and pd.isna(label)):
+            label = str(value).strip()
+            normalized_label = MT5XLSXImporter._normalize_label(label)
+            if normalized_label not in {
+                MT5XLSXImporter._normalize_label(candidate)
+                for candidate in stat_labels
+            }:
                 continue
-            label_str = str(label).strip()
-            val_col = col_offset + 3
-            val = row[val_col] if len(row) > val_col and pd.notna(row[val_col]) else None
-            label_value_groups.append((label_str, val))
-        return label_value_groups
+            pairs.append(
+                (label, MT5XLSXImporter._next_label_value(row, index + 1, stat_labels))
+            )
+        return pairs
 
     @staticmethod
     def _apply_stat_key(key: str, val: Any, stats: dict[str, Any]) -> None:
@@ -366,9 +469,9 @@ class MT5XLSXImporter(BaseImporter):
                 stats["win_rate"] = pct
             return
         if key == "losers_with_pct":
-            l, _pct = MT5XLSXImporter._parse_count_pct(val)
-            if l is not None:
-                stats["losers"] = l
+            losses, _pct = MT5XLSXImporter._parse_count_pct(val)
+            if losses is not None:
+                stats["losers"] = losses
             return
         if key == "max_drawdown_pct":
             pct = MT5XLSXImporter._extract_first_percent(val)
@@ -516,7 +619,7 @@ class MT5XLSXImporter(BaseImporter):
         source_timezone: str | tzinfo | None = None,
     ) -> tuple[list[Trade], dict[str, Any]]:
         if trades_df.empty:
-            return [], open_position_summary([])
+            return [], position_fill_summary([])
 
         col_time = MT5XLSXImporter._find_col(trades_df, ["Zeit"])
         col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
@@ -534,9 +637,21 @@ class MT5XLSXImporter(BaseImporter):
         # DV-B42: direction is derived from the Typ column, so it must be
         # present.  Without this check a missing or locale-variant Typ column
         # silently relabels every trade as SHORT.
-        if col_time is None or col_direction is None or col_typ is None:
+        required_columns = {
+            "Zeit": col_time,
+            "Typ": col_typ,
+            "Richtung": col_direction,
+            "Symbol": col_symbol,
+            "Volumen": col_volume,
+            "Preis": col_price,
+            "Gewinn": col_profit,
+        }
+        missing_columns = [name for name, index in required_columns.items() if index is None]
+        if missing_columns:
             raise ValueError(
-                "Trades table is missing required columns (Zeit / Typ / Richtung)."
+                "Trades table is missing required columns "
+                "(Zeit / Typ / Richtung / Symbol / Volumen / Preis / Gewinn): "
+                + ", ".join(missing_columns)
             )
 
         # DV-B43: reconstruct one Trade per position with one TradeExit per
@@ -564,76 +679,27 @@ class MT5XLSXImporter(BaseImporter):
                 return ""
             return str(value).strip()
 
-        # Prefer shared position ids when the report has them (every deal of
-        # a position carries the same id); fall back to the sequential deal
-        # walker when the ids are unique per row (a pure deal counter).
         def _is_trade_row(row: dict[str, Any]) -> bool:
             return MT5XLSXImporter._get_str(row, col_typ, "").lower() != "balance"
 
-        id_counts: dict[str, int] = {}
-        for row in rows_list:
-            if not _is_trade_row(row):
-                continue
-            deal_id = _deal_id(row)
-            if deal_id:
-                id_counts[deal_id] = id_counts.get(deal_id, 0) + 1
-        shared_ids = any(count > 1 for count in id_counts.values())
-
-        if shared_ids:
-            position_id_of: Callable[[dict[str, Any]], str] = _deal_id
-        else:
-            # Sequential deal walker: an "out" closes the *oldest* position
-            # whose entries are not yet fully exited, so an in/in/out/out
-            # sequence reconstructs one position entered with two fills and
-            # closed with two exits, and the next "in" starts the next
-            # position.
-            entry_volume: list[float] = []  # summed entry volume per position
-            exit_volume: list[float] = []  # summed exit volume per position
-
-            def _assign_sequential_position(row: dict[str, Any]) -> str:
-                """Assign a position id from the deal sequence.
-
-                An "in" deal opens a new position once every existing one is
-                fully exited; an "out" deal closes volume on the oldest open
-                position.  An orphan "out" with no open position gets no
-                position id, so its fill is skipped instead of inflating the
-                pnl of the next reconstructed position.
-                """
-                if _deal_id(row) == "":
-                    return ""
-                direction = _row_direction(row)
-                volume = MT5XLSXImporter._to_float(row.get(col_volume)) or 0.0
-                if direction == "in":
-                    for index, remaining in enumerate(entry_volume):
-                        if exit_volume[index] < remaining:
-                            break
-                    else:
-                        index = len(entry_volume)
-                        entry_volume.append(0.0)
-                        exit_volume.append(0.0)
-                    entry_volume[index] += volume
-                    return f"position-{index + 1}"
-                for index, remaining in enumerate(entry_volume):
-                    if exit_volume[index] < remaining:
-                        exit_volume[index] += volume
-                        return f"position-{index + 1}"
-                logger.warning(
-                    "Orphan 'out' deal %r (%s %s at %s): no open position to "
-                    "close; the fill is skipped.",
-                    _deal_id(row),
-                    volume,
-                    MT5XLSXImporter._get_str(row, col_symbol, ""),
-                    MT5XLSXImporter._get_str(row, col_time, ""),
-                )
-                return ""
-
-            position_id_of = _assign_sequential_position
+        def _row_quantity(row: dict[str, Any]) -> float:
+            value = MT5XLSXImporter._to_float(row.get(col_volume))
+            if value is None or not math.isfinite(value) or value <= 0.0:
+                raise ValueError("Trade fill quantity must be a positive finite number")
+            return value
 
         position_fills = group_position_fills(
             rows_list,
-            position_id_of=position_id_of,
+            position_id_of=_deal_id,
             direction_of=_row_direction,
             is_trade_row=_is_trade_row,
+            quantity_of=_row_quantity,
+            scope_of=lambda row: entry_side_scope(
+                row,
+                lambda item: MT5XLSXImporter._get_str(item, col_symbol, ""),
+                lambda item: MT5XLSXImporter._get_str(item, col_typ, ""),
+                _row_direction,
+            ),
         )
 
         trades: list[Trade] = []
@@ -723,6 +789,8 @@ class MT5XLSXImporter(BaseImporter):
                 pnl=pnl,
                 fees=fees if fees != 0.0 else None,
                 net_pnl=pnl - fees,
+                stop_loss=sl,
+                take_profit=tp,
                 exit_reason=exit_reason,
                 tags=tags,
                 meta={
@@ -737,7 +805,7 @@ class MT5XLSXImporter(BaseImporter):
             trades.append(trade)
             trade_id_counter += 1
 
-        return trades, open_position_summary(position_fills)
+        return trades, position_fill_summary(position_fills)
 
     @staticmethod
     def _find_exit_row(

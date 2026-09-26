@@ -7,14 +7,16 @@ from pathlib import Path
 
 import pandas as pd
 
+from data_tools.path_safety import build_dataset_path
+from shared.atomic_io import atomic_replace, write_parquet_atomically
+from shared.constants import DATA_DIR
+from shared.sql import quote_identifier, quote_literal
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("dolthub_manager")
-
-from shared.constants import DATA_DIR
-from shared.sql import quote_identifier, quote_literal
 
 DOLT_DIR = DATA_DIR / "dolthub"
 EXPORT_DIR = DATA_DIR / "ohlcv" / "dolthub"
@@ -153,14 +155,22 @@ def _list_tables(repo_path: Path) -> list[str]:
 
 def _export_table_csv(repo_path: Path, table: str, output_csv: Path):
     """Export a dolt table to CSV using 'dolt table export'."""
-    with open(output_csv, "w") as f:
-        run_dolt(["dolt", "table", "export", "-f", table], cwd=repo_path, stdout=f)
+
+    def _write(target: Path) -> None:
+        with target.open("w", encoding="utf-8", newline="") as handle:
+            run_dolt(
+                ["dolt", "table", "export", "-f", table],
+                cwd=repo_path,
+                stdout=handle,
+            )
+
+    atomic_replace(output_csv, _write)
 
 
 def _stock_export_path(target_dir: Path, symbol: str) -> Path:
     """Return the canonical OHLCV output path and migrate legacy flat exports."""
-    legacy_path = target_dir / f"{symbol}.parquet"
-    canonical_path = target_dir / symbol / "1d.parquet"
+    legacy_path = build_dataset_path(target_dir, f"{symbol}.parquet")
+    canonical_path = build_dataset_path(target_dir, symbol, "1d.parquet")
 
     if legacy_path.exists() and not canonical_path.exists():
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,7 +207,7 @@ def _export_stocks() -> None:
     logger.info(f"Found {len(symbols)} symbols to export.")
 
     for i, symbol in enumerate(symbols):
-        if not _SYMBOL_RE.match(symbol):
+        if not _is_safe_symbol(symbol):
             logger.warning("Skipping unexpected symbol value: %r", symbol)
             continue
 
@@ -219,43 +229,51 @@ def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
         text=True,
     )
     lines = result.stdout.strip().split("\n")[1:]  # skip header
-    return [l.strip() for l in lines if l.strip()]
+    return [line.strip() for line in lines if line.strip()]
 
 
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
 
 
+def _is_safe_symbol(value: str) -> bool:
+    return value not in {".", ".."} and _SYMBOL_RE.fullmatch(value) is not None
+
+
 def _export_symbol_csv(
     stocks_repo: Path, table_name: str, symbol: str, target_dir: Path, out_parquet: Path
 ) -> None:
-    if not _SYMBOL_RE.match(symbol):
+    if not _is_safe_symbol(symbol):
         logger.warning("Skipping unexpected symbol value: %r", symbol)
         return
     try:
         out_parquet.parent.mkdir(parents=True, exist_ok=True)
-        sym_csv = target_dir / f"{symbol}.csv"
-        with open(sym_csv, "w") as f:
-            subprocess.check_call(
-                [
-                    "dolt",
-                    "sql",
-                    "-q",
-                    build_ohlcv_select(table_name, symbol),
-                    "-r",
-                    "csv",
-                ],
-                cwd=stocks_repo,
-                stdout=f,
-            )
+        sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
+
+        def _write_csv(target: Path) -> None:
+            with target.open("w", encoding="utf-8", newline="") as handle:
+                subprocess.check_call(
+                    [
+                        "dolt",
+                        "sql",
+                        "-q",
+                        build_ohlcv_select(table_name, symbol),
+                        "-r",
+                        "csv",
+                    ],
+                    cwd=stocks_repo,
+                    stdout=handle,
+                )
+
+        atomic_replace(sym_csv, _write_csv)
         df = pd.read_csv(sym_csv)
         if not df.empty:
             df.rename(columns={"date": "timestamp"}, inplace=True)
             df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df.to_parquet(out_parquet, index=False)
+            write_parquet_atomically(out_parquet, df)
     except Exception as e:
         logger.warning(f"Failed to export {symbol}: {e}")
     finally:
-        csv_path = target_dir / f"{symbol}.csv"
+        csv_path = build_dataset_path(target_dir, f"{symbol}.csv")
         if csv_path.exists():
             csv_path.unlink()
 
@@ -270,19 +288,25 @@ def _export_repo_tables(repo_name: str, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for table in _list_tables(repo_path):
-        out_parquet = output_dir / f"{table}.parquet"
-        if out_parquet.exists():
+        if not _is_safe_symbol(table):
+            logger.warning("Skipping unexpected table value: %r", table)
             continue
+        csv_path: Path | None = None
         try:
-            csv_path = output_dir / f"{table}.csv"
+            out_parquet = build_dataset_path(output_dir, f"{table}.parquet")
+            if out_parquet.exists():
+                continue
+            csv_path = build_dataset_path(output_dir, f"{table}.csv")
             _export_table_csv(repo_path, table, csv_path)
             df = pd.read_csv(csv_path)
             if not df.empty:
-                df.to_parquet(out_parquet, index=False)
+                write_parquet_atomically(out_parquet, df)
                 logger.info(f"  Exported {table}: {len(df)} rows")
-            csv_path.unlink()
         except Exception as e:
             logger.warning(f"Failed to export {repo_name}/{table}: {e}")
+        finally:
+            if csv_path is not None:
+                csv_path.unlink(missing_ok=True)
 
 
 def export_data():
@@ -307,49 +331,63 @@ def export_data():
 
             # Get symbols
             result = run_dolt(
-                ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}", "-r", "csv"],
+                [
+                    "dolt",
+                    "sql",
+                    "-q",
+                    f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}",
+                    "-r",
+                    "csv",
+                ],
                 cwd=stocks_repo,
                 capture=True,
             )
             lines = result.stdout.strip().split("\n")[1:]  # skip header
-            symbols = [l.strip() for l in lines if l.strip()]
+            symbols = [line.strip() for line in lines if line.strip()]
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):
-                out_parquet = _stock_export_path(target_dir, symbol)
-                if out_parquet.exists():
-                    continue  # skip already exported
-
+                if not _is_safe_symbol(symbol):
+                    logger.warning("Skipping unexpected symbol value: %r", symbol)
+                    continue
                 if i % 500 == 0:
                     logger.info(f"  Progress: {i}/{len(symbols)} symbols...")
 
+                csv_path: Path | None = None
                 try:
+                    out_parquet = _stock_export_path(target_dir, symbol)
+                    if out_parquet.exists():
+                        continue  # skip already exported
                     out_parquet.parent.mkdir(parents=True, exist_ok=True)
-                    sym_csv = target_dir / f"{symbol}.csv"
-                    with open(sym_csv, "w") as f:
-                        run_dolt(
-                            [
-                                "dolt",
-                                "sql",
-                                "-q",
-                                build_ohlcv_select(table_name, symbol),
-                                "-r",
-                                "csv",
-                            ],
-                            cwd=stocks_repo,
-                            stdout=f,
-                        )
+                    sym_csv = build_dataset_path(target_dir, f"{symbol}.csv")
+                    csv_path = sym_csv
+
+                    def _write_csv(target: Path) -> None:
+                        with target.open("w", encoding="utf-8", newline="") as handle:
+                            run_dolt(
+                                [
+                                    "dolt",
+                                    "sql",
+                                    "-q",
+                                    build_ohlcv_select(table_name, symbol),
+                                    "-r",
+                                    "csv",
+                                ],
+                                cwd=stocks_repo,
+                                stdout=handle,
+                            )
+
+                    atomic_replace(sym_csv, _write_csv)
                     df = pd.read_csv(sym_csv)
                     if not df.empty:
                         df.rename(columns={"date": "timestamp"}, inplace=True)
                         df["timestamp"] = pd.to_datetime(df["timestamp"])
-                        df.to_parquet(out_parquet, index=False)
+                        write_parquet_atomically(out_parquet, df)
                 except Exception as e:
                     logger.warning(f"Failed to export {symbol}: {e}")
                 finally:
-                    csv_path = target_dir / f"{symbol}.csv"
-                    if csv_path.exists():
-                        csv_path.unlink()
+                    if csv_path is not None:
+                        csv_path.unlink(missing_ok=True)
 
     # Export Earnings — whole tables as parquet
     _export_repo_tables(

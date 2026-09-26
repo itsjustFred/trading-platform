@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from data_tools.signal_import import load_signals_from_csv
 
 
@@ -50,6 +52,27 @@ def test_load_signals_from_csv_parses_date_only_as_daily(tmp_path: Path) -> None
     assert signals[0]["symbol"] == "MSFT"
     assert signals[0]["timeframe"] == "1d"
     assert signals[0]["entry_price"] == 410.25
+
+
+def test_missing_action_column_is_rejected(tmp_path: Path) -> None:
+    csv_path = tmp_path / "signals.csv"
+    csv_path.write_text(
+        "Symbol,Entry Price,Date\nMSFT,410.25,2026-03-01\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="action column"):
+        load_signals_from_csv(str(csv_path))
+
+
+def test_blank_action_is_rejected(tmp_path: Path) -> None:
+    csv_path = tmp_path / "signals.csv"
+    csv_path.write_text(
+        "Symbol,Entry Price,Date,Action\nMSFT,410.25,2026-03-01,\n",
+        encoding="utf-8",
+    )
+
+    assert load_signals_from_csv(str(csv_path)) == []
 
 
 def test_unknown_action_drops_row_instead_of_buying(tmp_path: Path) -> None:

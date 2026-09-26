@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
+from bs4 import BeautifulSoup
 
-from shared.models import Trade, VALID_DIRECTIONS
+from shared.models import VALID_DIRECTIONS
 from validation.importers.mt5_html import MT5HTMLImporter
 from validation.reference import ValidationReference
 
@@ -128,6 +128,8 @@ class TestTradeFields:
             tp = trade.meta.get("take_profit")
             assert sl is None or isinstance(sl, float)
             assert tp is None or isinstance(tp, float)
+            assert trade.stop_loss == sl
+            assert trade.take_profit == tp
 
 
 class TestStatsPresent:
@@ -270,9 +272,6 @@ class TestGermanNumberParsing:
         )
         sl_values = [t.meta.get("stop_loss") for t in ref.trades]
         tp_values = [t.meta.get("take_profit") for t in ref.trades]
-        # "2.500" in the S/L column resolves to 2500 (German thousands),
-        # "1.234,56" to 1234.56, and the ASCII-looking "2.5" in the T/P
-        # column stays 2.5 under the detected German locale.
         assert 2500.0 in sl_values
         assert 1234.56 in sl_values
         assert 2.5 in tp_values
@@ -287,3 +286,46 @@ def test_build_trades_empty_table_returns_tuple_shape() -> None:
     trades, summary = MT5HTMLImporter._build_trades(empty, {})
     assert trades == []
     assert summary["open_position_count"] == 0
+
+
+class TestPositionFillClassification:
+    def test_partial_open_and_orphan_fills_are_evidence_only(self):
+        table = BeautifulSoup(
+            """
+            <table><thead><tr>
+              <th>Zeit</th><th>Trade</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+              <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th><th>Swap</th>
+              <th>Gewinn</th><th>Kommentar</th>
+            </tr></thead><tbody>
+              <tr>
+                <td>2024.01.01 09:00:00</td><td></td><td>EURUSD</td>
+                <td>sell</td><td>out</td><td>0.10</td><td>1.09</td>
+                <td>901</td><td>0</td><td>0</td><td>50</td><td>TP</td>
+              </tr>
+              <tr>
+                <td>2024.01.02 08:00:00</td><td>1</td><td>EURUSD</td>
+                <td>buy</td><td>in</td><td>0.15</td><td>1.08</td>
+                <td>902</td><td>0</td><td>0</td><td>0</td><td>Entry</td>
+              </tr>
+              <tr>
+                <td>2024.01.02 16:00:00</td><td>1</td><td>EURUSD</td>
+                <td>sell</td><td>out</td><td>0.05</td><td>1.09</td>
+                <td>903</td><td>0</td><td>0</td><td>25</td><td>Partial</td>
+              </tr>
+              <tr>
+                <td>2024.01.03 08:00:00</td><td>2</td><td>EURUSD</td>
+                <td>buy</td><td>in</td><td>0.10</td><td>1.09</td>
+                <td>904</td><td>0</td><td>0</td><td>0</td><td>Open</td>
+              </tr>
+            </tbody></table>
+            """,
+            "lxml",
+        ).find("table")
+        trades, evidence = MT5HTMLImporter._build_trades(table, {})
+        assert trades == []
+        assert evidence["partial_position_count"] == 1
+        assert evidence["open_position_count"] == 2
+        assert evidence["open_only_count"] == 1
+        assert evidence["orphan_exit_count"] == 1
+        assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
+        assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)

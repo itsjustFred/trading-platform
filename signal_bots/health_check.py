@@ -13,13 +13,67 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pandas as pd
+
 from signal_bots.registry import (
-    SIGNAL_PROCESSORS,
     SIGNAL_PROCESSOR_OPTIONS,
+    SIGNAL_PROCESSORS,
     get_signal_processor_config_path,
 )
 
 _BOT_CONFIG_FILE = "config.yaml"
+
+
+def _probe_market_data(rows: int = 80) -> pd.DataFrame:
+    timestamps = pd.date_range("2026-01-01T00:00:00Z", periods=rows, freq="5min", tz="UTC")
+    closes = [100.0 + (index * 0.2) + ((index % 7) * 0.05) for index in range(rows)]
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [value - 0.1 for value in closes],
+            "high": [value + 0.5 for value in closes],
+            "low": [value - 0.5 for value in closes],
+            "close": closes,
+            "volume": [1000.0] * rows,
+        }
+    )
+
+
+def _run_processor_probe(factory: Any) -> dict[str, Any]:
+    try:
+        processor = factory({})
+        process_signal = getattr(processor, "process_signal", None)
+        if not callable(process_signal):
+            raise TypeError("processor does not expose callable process_signal")
+        signal = process_signal(
+            {
+                "symbol": "AAPL",
+                "action": "buy",
+                "timeframe": "5m",
+                "timestamp": "2026-01-01T12:00:00Z",
+            },
+            _probe_market_data(),
+        )
+        action = (
+            signal.get("action")
+            if isinstance(signal, dict)
+            else getattr(signal, "action", None)
+        )
+        symbol = (
+            signal.get("symbol")
+            if isinstance(signal, dict)
+            else getattr(signal, "symbol", None)
+        )
+        if str(action or "").strip().lower() != "buy":
+            raise ValueError(f"probe returned unexpected action: {action!r}")
+        if str(symbol or "").strip().upper() != "AAPL":
+            raise ValueError(f"probe returned unexpected symbol: {symbol!r}")
+        return {"status": "ok", "action": "buy", "symbol": "AAPL"}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def check_signal_bots() -> dict[str, Any]:
@@ -33,14 +87,20 @@ def check_signal_bots() -> dict[str, Any]:
             "description": option.get("description", ""),
             "status": "ok",
             "errors": [],
+            "probe": {"status": "skipped"},
         }
 
-        if name not in SIGNAL_PROCESSORS:
+        factory = SIGNAL_PROCESSORS.get(name)
+        if factory is None:
             result["status"] = "error"
             result["errors"].append(f"Processor factory not found: {name}")
+        else:
+            probe = _run_processor_probe(factory)
+            result["probe"] = probe
+            if probe["status"] != "ok":
+                result["status"] = "error"
+                result["errors"].append(probe["error"])
 
-        # The registry owns per-bot config paths; unknown ids raise instead of
-        # producing a path from the option string.
         try:
             config_path = get_signal_processor_config_path(name)
         except ValueError as exc:

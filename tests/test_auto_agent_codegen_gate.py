@@ -89,23 +89,21 @@ def test_generated_code_is_screened_before_execution(tmp_path, monkeypatch):
     assert not (tmp_path / "strategies" / "unsafe_agent" / "unsafe_agent.py").exists()
 
 
-def test_failed_backtest_removes_last_generated_file(tmp_path, monkeypatch):
+def test_failed_screening_removes_generated_artifacts(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
+    unsafe = "import subprocess\nsubprocess.run(['ls'])\n"
     _install_fake_provider(
         monkeypatch,
-        [
-            STEP_ONE_MARKDOWN,
-            STEP_TWO_META,
-            STEP_THREE_CODE,
-            FIXED_STEP_THREE_CODE,
-            FIXED_STEP_THREE_CODE,
-        ],
+        [STEP_ONE_MARKDOWN, STEP_TWO_META, unsafe, unsafe, unsafe],
     )
+    backtest_calls: list[list[str]] = []
     monkeypatch.setattr(
-        auto_agent, "_run_backtest", lambda cmd, *, log=None: (1, "Traceback: boom")
+        auto_agent,
+        "_run_backtest",
+        lambda cmd, *, log=None: backtest_calls.append(cmd) or (0, "ok"),
     )
 
-    with pytest.raises(RuntimeError, match="Auto-agent failed"):
+    with pytest.raises(RuntimeError, match="screening"):
         auto_agent.run_auto_agent(
             "strategy.entry('Long', strategy.long)",
             strategy_name="Broken Agent",
@@ -114,91 +112,84 @@ def test_failed_backtest_removes_last_generated_file(tmp_path, monkeypatch):
 
     strategy_dir = tmp_path / "strategies" / "broken_agent"
     assert not (strategy_dir / "broken_agent.py").exists()
-    # The failed attempt leaves no runnable file and no orphaned slug directory
-    # that would block a retry of the same slug.
+    assert not (strategy_dir / "broken_agent.py.generated.json").exists()
+    assert backtest_calls == []
     assert not strategy_dir.exists()
 
 
-def test_intermediate_attempts_keep_the_slug_directory(tmp_path, monkeypatch):
-    """Failed intermediate attempts only discard the module and its ledger.
-
-    The next attempt reuses the same artifacts (documentation path, slug
-    directory) to write its README and strategy file, so the directory must
-    survive until the LAST attempt has failed.
-    """
+def test_screening_retry_keeps_only_an_unapproved_draft(tmp_path, monkeypatch):
     _setup_agent(monkeypatch, tmp_path)
+    unsafe = "import subprocess\nsubprocess.run(['ls'])\n"
     _install_fake_provider(
         monkeypatch,
-        [
-            STEP_ONE_MARKDOWN,
-            STEP_TWO_META,
-            STEP_THREE_CODE,
-            # Attempts 2 and 3 only re-ask for the code step (md/meta are reused).
-            FIXED_STEP_THREE_CODE,
-            FIXED_STEP_THREE_CODE,
-        ],
+        [STEP_ONE_MARKDOWN, STEP_TWO_META, unsafe, FIXED_STEP_THREE_CODE],
     )
+    backtest_calls: list[list[str]] = []
     monkeypatch.setattr(
-        auto_agent, "_run_backtest", lambda cmd, *, log=None: (1, "Traceback: boom")
+        auto_agent,
+        "_run_backtest",
+        lambda cmd, *, log=None: backtest_calls.append(cmd) or (0, "ok"),
     )
 
-    with pytest.raises(RuntimeError, match="Auto-agent failed"):
-        auto_agent.run_auto_agent(
-            "strategy.entry('Long', strategy.long)",
-            strategy_name="Mid Agent",
-            log=lambda *args, **kwargs: None,
-        )
-
-    strategy_dir = tmp_path / "strategies" / "mid_agent"
-    # Whole slug directory gone after the final failed attempt.
-    assert not strategy_dir.exists()
-
-
-def test_retry_of_failed_slug_is_not_blocked_by_leftovers(tmp_path, monkeypatch):
-    """A failed attempt removes its slug directory — a retry of the same slug
-    is not permanently blocked by leftovers of the failed attempt."""
-    _setup_agent(monkeypatch, tmp_path)
-    _install_fake_provider(
-        monkeypatch,
-        [
-            STEP_ONE_MARKDOWN,
-            STEP_TWO_META,
-            STEP_THREE_CODE,
-            # Attempts 2 and 3 only re-ask for the code step (md/meta are reused).
-            FIXED_STEP_THREE_CODE,
-            FIXED_STEP_THREE_CODE,
-        ],
-    )
-    monkeypatch.setattr(
-        auto_agent, "_run_backtest", lambda cmd, *, log=None: (1, "Traceback: boom")
-    )
-    with pytest.raises(RuntimeError, match="Auto-agent failed"):
-        auto_agent.run_auto_agent(
-            "strategy.entry('Long', strategy.long)",
-            strategy_name="Retry Agent",
-            log=lambda *args, **kwargs: None,
-        )
-
-    _install_fake_provider(
-        monkeypatch,
-        [STEP_ONE_MARKDOWN, STEP_TWO_META, FIXED_STEP_THREE_CODE],
-    )
-    monkeypatch.setattr(auto_agent, "_run_backtest", _happy_backtest)
     result = auto_agent.run_auto_agent(
         "strategy.entry('Long', strategy.long)",
-        strategy_name="Retry Agent",
+        strategy_name="Mid Agent",
         log=lambda *args, **kwargs: None,
     )
-    assert result["attempts"] == 1
-    assert Path(result["strategy_file"]).exists()
-    # The reused slug directory must end up with a fresh, valid README.
-    assert Path(result["strategy_file"]).with_name("README.md").exists()
+
+    strategy_dir = tmp_path / "strategies" / "mid_agent"
+    assert result["attempts"] == 2
+    assert result["status"] == "awaiting_approval"
+    assert backtest_calls == []
+    assert (strategy_dir / "mid_agent.py").exists()
+    assert (strategy_dir / "mid_agent.py.generated.json").exists()
+
+
+def test_generated_draft_cannot_be_imported_before_approval(tmp_path, monkeypatch):
+    result = _run_conversion(monkeypatch, tmp_path, strategy_name="Import Gate")
+    strategy_file = Path(result["strategy_file"])
+
+    from runner.approval_gate import StrategyNotApprovedError
+    from shared.strategy_registry import load_strategy_module
+
+    with pytest.raises(StrategyNotApprovedError):
+        load_strategy_module(strategy_file, tmp_path / "strategies")
+
+
+def test_approved_route_rescreens_before_execution(tmp_path, monkeypatch):
+    result = _run_conversion(monkeypatch, tmp_path, strategy_name="Screen Gate")
+    strategy_file = Path(result["strategy_file"])
+    strategy_file.write_text("import subprocess\nsubprocess.run(['ls'])\n")
+
+    from runner.approval_gate import StrategyNotApprovedError, approve_strategy
+
+    approve_strategy(strategy_file, approved_by="reviewer", strategies_root=tmp_path / "strategies")
+    backtest_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        auto_agent,
+        "_run_backtest",
+        lambda cmd, *, log=None: backtest_calls.append(cmd) or (0, "ok"),
+    )
+
+    with pytest.raises(StrategyNotApprovedError, match="screening"):
+        auto_agent.run_validated_backtest(
+            strategy_file,
+            engine=result["engine"],
+            target=auto_agent.BacktestTarget(
+                symbols=["AAPL"], timeframe="1h", start="2024-01-01", end="2024-01-31"
+            ),
+            output_path=tmp_path / "screened.trades.json",
+            log=lambda *args, **kwargs: None,
+        )
+
+    assert backtest_calls == []
 
 
 def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeypatch):
     result = _run_conversion(monkeypatch, tmp_path)
     strategy_file = Path(result["strategy_file"])
-    backtest_cmd: list[str] = []
+    backtest_cmd: list[list[str]] = []
+    output_path = tmp_path / "approved.trades.json"
 
     def recorded_backtest(cmd: list[str], *, log=None):
         backtest_cmd.append(cmd)
@@ -206,7 +197,11 @@ def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeyp
 
     monkeypatch.setattr(auto_agent, "_run_backtest", recorded_backtest)
 
-    from runner.approval_gate import StrategyNotApprovedError, approve_strategy, is_strategy_approved
+    from runner.approval_gate import (
+        StrategyNotApprovedError,
+        approve_strategy,
+        is_strategy_approved,
+    )
 
     assert not is_strategy_approved(strategy_file, strategies_root=tmp_path / "strategies")
 
@@ -217,7 +212,7 @@ def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeyp
             target=auto_agent.BacktestTarget(
                 symbols=["AAPL"], timeframe="1h", start="2024-01-01", end="2024-01-31"
             ),
-            output_path=Path(result["backtest_output"]),
+            output_path=output_path,
             log=lambda *args, **kwargs: None,
         )
 
@@ -228,6 +223,41 @@ def test_validated_strategy_is_not_approved_until_human_review(tmp_path, monkeyp
     approve_strategy(strategy_file, approved_by="reviewer", strategies_root=tmp_path / "strategies")
     _run_gate()
     assert len(backtest_cmd) == 1
+    assert output_path.exists()
+
+
+def test_approved_validation_route_preserves_retry_behavior(tmp_path, monkeypatch):
+    result = _run_conversion(monkeypatch, tmp_path, strategy_name="Retry Route")
+    strategy_file = Path(result["strategy_file"])
+    from runner.approval_gate import approve_strategy
+
+    approve_strategy(strategy_file, approved_by="reviewer", strategies_root=tmp_path / "strategies")
+    output_path = tmp_path / "retry.trades.json"
+    calls = 0
+
+    def fake_run(cmd: list[str], *, log=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            output_path.write_text('{"status":"ok"}', encoding="utf-8")
+        return (1, "validation failed") if calls == 1 else (0, "ok")
+
+    monkeypatch.setattr(auto_agent, "_run_backtest", fake_run)
+    returncode, output = auto_agent.run_validated_backtest(
+        strategy_file,
+        engine=result["engine"],
+        target=auto_agent.BacktestTarget(
+            symbols=["AAPL"], timeframe="1h", start="2024-01-01", end="2024-01-31"
+        ),
+        output_path=output_path,
+        max_attempts=2,
+        retry=lambda error: None,
+        log=lambda *args, **kwargs: None,
+    )
+
+    assert returncode == 0
+    assert output == "ok"
+    assert calls == 2
 
 
 def test_slug_collision_is_rejected_without_overwriting(tmp_path, monkeypatch):
@@ -242,11 +272,13 @@ def test_slug_collision_is_rejected_without_overwriting(tmp_path, monkeypatch):
 def test_backtest_child_gets_filtered_environment(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 
-    _setup_agent(monkeypatch, tmp_path)
-    _install_fake_provider(
-        monkeypatch,
-        [STEP_ONE_MARKDOWN, STEP_TWO_META, STEP_THREE_CODE],
-    )
+    real_run_backtest = auto_agent._run_backtest
+    result = _run_conversion(monkeypatch, tmp_path, strategy_name="Env Agent")
+    strategy_file = Path(result["strategy_file"])
+    monkeypatch.setattr(auto_agent, "_run_backtest", real_run_backtest)
+    from runner.approval_gate import approve_strategy
+
+    approve_strategy(strategy_file, approved_by="reviewer", strategies_root=tmp_path / "strategies")
 
     def spy_popen(cmd, **kwargs):
         captured["env"] = kwargs["env"]
@@ -280,13 +312,16 @@ def test_backtest_child_gets_filtered_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
-    result = auto_agent.run_auto_agent(
-        "strategy.entry('Long', strategy.long)",
-        strategy_name="Env Agent",
+    auto_agent.run_validated_backtest(
+        strategy_file,
+        engine=result["engine"],
+        target=auto_agent.BacktestTarget(
+            symbols=["AAPL"], timeframe="1h", start="2024-01-01", end="2024-01-31"
+        ),
+        output_path=tmp_path / "approved.trades.json",
         log=lambda *args, **kwargs: None,
     )
 
-    assert result["attempts"] == 1
     env = captured["env"]
     assert "NIM_API_KEY" not in env
     assert "GITHUB_TOKEN" not in env

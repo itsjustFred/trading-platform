@@ -10,10 +10,8 @@ from __future__ import annotations
 import hashlib
 import io
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pytest
-
 
 # ─── DV-B6a: Dukascopy host allowlist ───────────────────────────────────────
 
@@ -353,7 +351,8 @@ def test_viewer_fallback_fragments_cover_all_bootstrap_error_strings():
         # JAR download:
         "No jar resources found in JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp'.",
         "Failed to download JAR 'https://platform.dukascopy.com/api.jar': timed out",
-        "JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp' did not resolve any downloadable JAR files.",
+        "JNLP 'https://platform.dukascopy.com/demo/jforex.jnlp' did not resolve "
+        "any downloadable JAR files.",
         # DV-B5 JVM startup:
         "Failed to start JVM for JForex SDK.\nJVM candidates tried (2):",
         "Failed to initialize JVM thread context class loader: boom",
@@ -374,7 +373,14 @@ def test_viewer_fallback_fragments_cover_all_bootstrap_error_strings():
     assert "non-dukascopy host" in fragments
 
 
-# ─── local JAR discovery (regression: helper definitions broke _discover_jars)
+def test_timeframe_file_suffix_normalization_preserves_15m():
+    from data_tools.downloaders import jforex_dl
+
+    assert jforex_dl._normalize_timeframe_for_file_suffix("15m") == "m15"
+    assert jforex_dl._normalize_timeframe_for_file_suffix("30m") == "m30"
+    assert jforex_dl._normalize_timeframe_for_file_suffix("1m") == "m1"
+
+
 
 
 def test_discover_jars_finds_local_jars(tmp_path: Path):

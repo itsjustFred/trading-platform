@@ -42,6 +42,27 @@ def test_backtest_timeout_is_defined_and_reasonable():
     assert auto_agent.BACKTEST_TIMEOUT_SECONDS >= 60
 
 
+def test_agent_process_backtest_child_uses_filtered_environment(monkeypatch):
+    from runner.agent_process import build_backtest_child_env
+
+    monkeypatch.setenv("NIM_API_KEY", "secret-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("TEMP", r"C:\Windows\Temp")
+
+    env = build_backtest_child_env()
+
+    assert "NIM_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["SystemRoot"] == r"C:\Windows"
+    assert env["COMSPEC"] == r"C:\Windows\System32\cmd.exe"
+    assert env["TEMP"] == r"C:\Windows\Temp"
+    assert env["PYTHONUNBUFFERED"] == "1"
+
+
 def test_run_backtest_kills_child_on_timeout(monkeypatch):
     proc = FakeProc(timeout_on_wait=True)
     monkeypatch.setattr(auto_agent.subprocess, "Popen", lambda *a, **k: proc)

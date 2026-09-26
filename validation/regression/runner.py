@@ -8,18 +8,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shared.models import BacktestResult, Trade
 from validation.comparison.anomalies import AnomalyDetector
-from validation.comparison.comparison import MatchedTrade, TradeComparisonConfig, TradeComparator
-from validation.comparison.delta_report import DeltaReportBuilder, FieldDelta, TradeDelta, TradeDeltaReport
+from validation.comparison.comparison import (
+    MatchedTrade,
+    TradeComparator,
+    TradeComparisonConfig,
+)
+from validation.comparison.delta_report import (
+    DeltaReportBuilder,
+    FieldDelta,
+    TradeDeltaReport,
+)
 from validation.comparison.matcher import TradeMatcher
+from validation.comparison.tolerances import finite_tolerance, relative_difference
 from validation.reference import ValidationReference
 from validation.stats.calculator import TradeStatistics, compute_trade_statistics
 
 # Statistics fields that are compared between golden and current output.
 _STATS_FIELDS = [
+    "risk_free_rate",
     "win_rate",
     "profit_factor",
     "net_profit",
@@ -134,11 +143,7 @@ def _compare_stats(
 
         if _is_numeric(expected) and _is_numeric(actual):
             abs_diff = abs(float(expected) - float(actual))
-            denom = max(abs(float(expected)), abs(float(actual)))
-            if denom == 0.0:
-                rel_diff = 0.0 if expected == actual else 1.0
-            else:
-                rel_diff = abs(float(expected) - float(actual)) / denom
+            rel_diff = relative_difference(float(expected), float(actual))
 
         # Tolerance bands: every *configured* band must hold (DV-B35 - AND,
         # not OR).  A 0.0 band is therefore exact equality, not "disabled":
@@ -189,6 +194,30 @@ class RegressionConfig(BaseModel):
     default_stats_relative_tolerance: float = 0.001
     golden_base_path: str = ""
     output_mode: Literal["json", "markdown", "both"] = "both"
+
+    @model_validator(mode="after")
+    def _validate_tolerances(self) -> "RegressionConfig":
+        value = finite_tolerance(
+            self.match_time_tolerance_seconds, "match_time_tolerance_seconds"
+        )
+        self.match_time_tolerance_seconds = int(value or 0)
+        value = finite_tolerance(
+            self.default_stats_absolute_tolerance,
+            "default_stats_absolute_tolerance",
+        )
+        self.default_stats_absolute_tolerance = value or 0.0
+        value = finite_tolerance(
+            self.default_stats_relative_tolerance,
+            "default_stats_relative_tolerance",
+        )
+        self.default_stats_relative_tolerance = value or 0.0
+        for name, values in (
+            ("stats_absolute_tolerance", self.stats_absolute_tolerance),
+            ("stats_relative_tolerance", self.stats_relative_tolerance),
+        ):
+            for field, tolerance in values.items():
+                values[field] = finite_tolerance(tolerance, f"{name}.{field}", optional=True)
+        return self
 
 
 class RegressionResult(BaseModel):
@@ -359,8 +388,14 @@ def run_regression(
     )
 
     # --- statistics comparison ------------------------------------------
-    golden_stats = compute_trade_statistics(golden_ref.trades)
-    current_stats = compute_trade_statistics(current_ref.trades)
+    golden_stats = compute_trade_statistics(
+        golden_ref.trades,
+        initial_capital=golden_ref.to_backtest_result().meta.initial_capital,
+    )
+    current_stats = compute_trade_statistics(
+        current_ref.trades,
+        initial_capital=current_ref.to_backtest_result().meta.initial_capital,
+    )
     stats_deltas = _compare_stats(golden_stats, current_stats, cfg)
 
     has_trade_mismatch = any(

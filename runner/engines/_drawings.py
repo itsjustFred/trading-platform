@@ -6,6 +6,7 @@ normalize them into the viewer's drawing contract with UTC ISO timestamps.
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -88,12 +89,39 @@ def _normalize_drawing_time(value: Any, *, field_name: str, drawing_index: int) 
         return datetime(value.year, value.month, value.day, tzinfo=timezone.utc).isoformat()
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"drawing #{drawing_index} field {field_name!r} must be finite")
+        magnitude = abs(numeric)
+        if magnitude >= 1e17:
+            unit = "ns"
+        elif magnitude >= 1e14:
+            unit = "us"
+        elif magnitude >= 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+        return pd.Timestamp(numeric, unit=unit, tz="UTC").isoformat()
 
     if isinstance(value, str):
-        parsed = pd.to_datetime(value, utc=True, errors="coerce")
-        if pd.notna(parsed):
-            return pd.Timestamp(parsed).isoformat()
-        return value
+        raw = value.strip()
+        if not raw:
+            raise ValueError(f"drawing #{drawing_index} field {field_name!r} must not be empty")
+        try:
+            numeric = float(raw)
+        except ValueError:
+            numeric = None
+        if numeric is not None and math.isfinite(numeric):
+            return _normalize_drawing_time(
+                numeric,
+                field_name=field_name,
+                drawing_index=drawing_index,
+            )
+        parsed = pd.to_datetime(raw, utc=True, errors="coerce")
+        if pd.isna(parsed):
+            raise ValueError(
+                f"drawing #{drawing_index} field {field_name!r} is not a valid timestamp"
+            )
+        return pd.Timestamp(parsed).isoformat()
 
     raise TypeError(f"drawing #{drawing_index} field {field_name!r} must be a timestamp-like value")

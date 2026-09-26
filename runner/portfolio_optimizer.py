@@ -10,15 +10,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 import optuna
 import pandas as pd
+
+from shared.atomic_io import write_text_atomically
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -67,6 +73,8 @@ def _parse_time_to_ts(time_str: str | int) -> float:
         from datetime import datetime
         if isinstance(time_str, str):
             dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
     except (ValueError, AttributeError, TypeError):
         pass
@@ -74,7 +82,16 @@ def _parse_time_to_ts(time_str: str | int) -> float:
     try:
         return float(time_str)
     except (ValueError, TypeError):
-        return 0.0
+        pass
+    try:
+        parsed_timestamp = pd.Timestamp(time_str)
+        if not pd.isna(parsed_timestamp):
+            if parsed_timestamp.tzinfo is None:
+                parsed_timestamp = parsed_timestamp.tz_localize("UTC")
+            return parsed_timestamp.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 0.0
 
 
 def _split_equity_curves_by_time(
@@ -142,7 +159,11 @@ def _split_equity_curves_by_time(
     return train_curves, test_curves
 
 
-def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
+def _load_strategy_equity(
+    backtest_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[StrategyEquityPoint]:
     """Load an equity curve for a strategy backtest from SQLite (C3).
 
     Load errors surface with the backtest id attached instead of decaying
@@ -162,9 +183,17 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
     if not result.equity_curve:
         return []
     points = []
+    start_ts = _parse_time_to_ts(start_date) if start_date else None
+    end_ts = _parse_time_to_ts(end_date) if end_date else None
+    if end_ts is not None and "T" not in str(end_date) and ":" not in str(end_date):
+        end_ts += 86_400.0 - 1e-6
     for point in result.equity_curve:
         time_ts = _parse_time_to_ts(point.time)
-        if time_ts and point.equity:
+        if start_ts is not None and time_ts < start_ts:
+            continue
+        if end_ts is not None and time_ts > end_ts:
+            continue
+        if math.isfinite(time_ts) and math.isfinite(float(point.equity)):
             points.append(
                 StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
             )
@@ -264,6 +293,36 @@ def _align_equity_curves(
     return np.array(aligned_columns, dtype=float).T
 
 
+def _normalize_equity_matrix(equity_matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(equity_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        return np.empty((0, 0))
+    baseline = matrix[0]
+    if (
+        not np.all(np.isfinite(matrix))
+        or not np.all(np.isfinite(baseline))
+        or np.any(baseline <= 0)
+    ):
+        raise ValueError("equity matrix must be finite and have a positive first observation")
+    normalized = matrix / baseline
+    if not np.all(np.isfinite(normalized)) or np.any(normalized <= 0):
+        raise ValueError("normalized equity matrix must be finite and positive")
+    return normalized
+
+
+def _period_percentage_returns(equity_matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(equity_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] < 2:
+        return np.empty((0, matrix.shape[1] if matrix.ndim == 2 else 0))
+    previous = matrix[:-1]
+    current = matrix[1:]
+    valid = np.isfinite(previous) & np.isfinite(current) & (previous > 0)
+    returns = np.full((previous.shape[0], matrix.shape[1]), np.nan, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        np.divide(current - previous, previous, out=returns, where=valid)
+    return returns[np.all(np.isfinite(returns), axis=1)]
+
+
 def _compute_correlation_matrix(returns: np.ndarray) -> np.ndarray:
     """Compute correlation matrix of strategy returns."""
     if returns.shape[0] < 2 or returns.shape[1] < 2:
@@ -292,15 +351,12 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
     if equity_matrix.shape[0] < 3 or len(_LAST_PORTFOLIO_TIMESTAMPS) < 3:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    timestamps = pd.DatetimeIndex(_LAST_PORTFOLIO_TIMESTAMPS)
+    timestamps = pd.to_datetime(pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True)
     if len(timestamps) != equity_matrix.shape[0]:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    # Resolution-agnostic: ``asi8`` returns the native unit of the index
-    # (seconds for datetime64[s] stamps, nanoseconds for the pandas default).
-    # Normalize via Timedelta arithmetic instead of a hardcoded 1e9 divisor.
-    spacings = np.diff(timestamps) / np.timedelta64(1, "s")
-    spacing = float(np.median(spacings))
+    spacings = timestamps.diff().dt.total_seconds().dropna()
+    spacing = float(spacings.median()) if not spacings.empty else 0.0
     if not math.isfinite(spacing) or spacing <= 0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
@@ -342,19 +398,25 @@ def _portfolio_sharpe_from_weights(
     if equity_matrix.size == 0 or equity_matrix.shape[0] < 2 or len(weights) == 0:
         return 0.0, 1.0
 
-    # Weighted combination
+    equity_matrix = _normalize_equity_matrix(equity_matrix)
     portfolio_eq = equity_matrix @ weights
-    returns = np.diff(portfolio_eq) / (portfolio_eq[:-1] + 1e-10)
+    if not np.all(np.isfinite(portfolio_eq)) or np.any(portfolio_eq <= 0):
+        raise ValueError("portfolio equity must be finite and positive")
+    returns = np.diff(portfolio_eq) / portfolio_eq[:-1]
 
     mean_ret = np.mean(returns)
-    std_ret = np.std(returns) + 1e-10
+    std_ret = np.std(returns)
 
     periods_per_year = _infer_portfolio_periods_per_year(equity_matrix)
-    sharpe = float(mean_ret / std_ret) * math.sqrt(periods_per_year)
+    sharpe = (
+        float(mean_ret / std_ret) * math.sqrt(periods_per_year)
+        if std_ret > 0
+        else 0.0
+    )
 
     # Max drawdown
     peak = np.maximum.accumulate(portfolio_eq)
-    drawdown = (peak - portfolio_eq) / (peak + 1e-10)
+    drawdown = (peak - portfolio_eq) / peak
     max_dd = float(np.max(drawdown))
 
     return sharpe, max_dd
@@ -379,6 +441,7 @@ def _build_objective(
     backtest_ids: list[str],
     equity_matrix: np.ndarray,
     returns: np.ndarray,
+    target_sharpe: float = 0.0,
 ) -> Callable[[optuna.Trial], float]:
     """Build the Optuna objective for the prepared in-sample data."""
     correlation_matrix = _compute_correlation_matrix(returns)
@@ -396,6 +459,7 @@ def _build_objective(
         score = sharpe - (5.0 * penalty) - (
             3.0 * max(0, max_drawdown - 0.3)
         )
+        score -= max(0.0, float(target_sharpe) - sharpe)
 
         trial.report(sharpe, trial.number)
         return -score
@@ -409,9 +473,18 @@ def _run_optimization(
     progress_callback: Callable[[float, str], None] | None,
 ) -> optuna.Study:
     """Run the requested trials and report progress in ten-trial increments."""
+    if n_trials <= 0:
+        raise ValueError("n_trials must be > 0")
     study = optuna.create_study(direction="minimize")
     for trial_index in range(n_trials):
-        study.optimize(objective, n_trials=1, catch=(ValueError,))
+        try:
+            study.optimize(objective, n_trials=1, catch=())
+        except ValueError as exc:
+            logger.warning(
+                "Portfolio optimization trial %d failed: %s",
+                trial_index + 1,
+                exc,
+            )
         completed_trials = trial_index + 1
         if progress_callback and completed_trials % 10 == 0:
             progress_callback(
@@ -419,6 +492,25 @@ def _run_optimization(
                 f"Trial {completed_trials}/{n_trials}",
             )
     return study
+
+
+def _build_oos_equity_curve(
+    test_curves: list[list[StrategyEquityPoint]],
+    best_weights: np.ndarray,
+) -> list[dict[str, float | int]]:
+    if not test_curves or len(test_curves) < 2:
+        return []
+    timestamps = _common_timestamps(test_curves, require_overlap=True)
+    matrix = _align_equity_curves(test_curves, require_overlap=True)
+    if matrix.size == 0 or matrix.shape[0] < 2 or matrix.shape[1] != len(best_weights):
+        return []
+    matrix = _normalize_equity_matrix(matrix)
+    portfolio = matrix @ best_weights
+    return [
+        {"time": int(timestamp), "equity": float(equity)}
+        for timestamp, equity in zip(timestamps, portfolio, strict=False)
+        if math.isfinite(float(equity))
+    ]
 
 
 def _compute_oos_metrics(
@@ -457,11 +549,17 @@ def _build_optimization_result(
     train_months: int | None,
     test_months: int | None,
     oos_metrics: tuple[float | None, float | None],
+    target_sharpe: float = 0.0,
+    oos_equity_curve: list[dict[str, float | int]] | None = None,
+    train_start: str | None = None,
+    train_end: str | None = None,
+    test_start: str | None = None,
+    test_end: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """Build the persisted result and its output path."""
     now = datetime.now(timezone.utc)
     optimization_id = (
-        f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}"
+        f"portfolio_{len(backtest_ids)}strat_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
     )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     result: dict[str, Any] = {
@@ -483,14 +581,20 @@ def _build_optimization_result(
             for row in range(len(backtest_ids))
         },
         "n_trials": n_trials,
+        "target_sharpe": float(target_sharpe),
+        "target_met": bool(sharpe >= target_sharpe),
+        "target_shortfall": max(0.0, float(target_sharpe) - float(sharpe)),
     }
 
     oos_sharpe, oos_max_drawdown = oos_metrics
     # #87: oos_status is always persisted — missing OOS must be
     # distinguishable from "not requested".
+    oos_requested = test_months is not None or any(
+        value is not None for value in (train_start, train_end, test_start, test_end)
+    )
     if oos_sharpe is not None:
         oos_status = "available"
-    elif test_months is not None:
+    elif oos_requested:
         oos_status = "insufficient_overlap"
     else:
         oos_status = "no_oos_requested"
@@ -501,11 +605,62 @@ def _build_optimization_result(
         result["oos_split"] = {
             "train_months": train_months,
             "test_months": test_months,
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
         }
+        if oos_equity_curve:
+            result["oos_equity_curve"] = oos_equity_curve
     return result, output_path
 
 
 OPTIMIZATIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimizations"
+
+
+def _explicit_boundary(value: str, *, is_end: bool = False) -> float:
+    timestamp = _parse_time_to_ts(value)
+    if timestamp <= 0:
+        raise ValueError(f"Invalid portfolio boundary: {value!r}")
+    raw = str(value).strip()
+    numeric_boundary = isinstance(value, (int, float)) or raw.replace(".", "", 1).isdigit()
+    if is_end and not numeric_boundary and "T" not in raw and ":" not in raw:
+        timestamp += 86_400.0 - 1e-6
+    return timestamp
+
+
+def _split_equity_curves_by_boundaries(
+    curves: list[list[StrategyEquityPoint]],
+    *,
+    train_start: str,
+    train_end: str,
+    test_start: str,
+    test_end: str,
+) -> tuple[list[list[StrategyEquityPoint]], list[list[StrategyEquityPoint]]]:
+    train_start_ts = _explicit_boundary(train_start)
+    train_end_ts = _explicit_boundary(train_end, is_end=True)
+    test_start_ts = _explicit_boundary(test_start)
+    test_end_ts = _explicit_boundary(test_end, is_end=True)
+    if not train_start_ts < train_end_ts < test_start_ts <= test_end_ts:
+        raise ValueError(
+            "Explicit portfolio boundaries must be ordered train_start < train_end "
+            "< test_start <= test_end"
+        )
+
+    train_curves: list[list[StrategyEquityPoint]] = []
+    test_curves: list[list[StrategyEquityPoint]] = []
+    for curve in curves:
+        train_curve: list[StrategyEquityPoint] = []
+        test_curve: list[StrategyEquityPoint] = []
+        for point in curve:
+            point_ts = _parse_time_to_ts(point.time)
+            if train_start_ts <= point_ts <= train_end_ts:
+                train_curve.append(point)
+            if test_start_ts <= point_ts <= test_end_ts:
+                test_curve.append(point)
+        train_curves.append(train_curve)
+        test_curves.append(test_curve)
+    return train_curves, test_curves
 
 
 def _persist_optimization_result(result: dict[str, Any], output_path: Path) -> None:
@@ -516,9 +671,8 @@ def _persist_optimization_result(result: dict[str, Any], output_path: Path) -> N
         raise ValueError("Optimization output path must stay inside OPTIMIZATIONS_DIR")
 
     output_directory.mkdir(parents=True, exist_ok=True)
-    output_filename = validated_path.name
-    with (output_directory / output_filename).open("w", encoding="utf-8") as output_file:
-        json.dump(result, output_file, indent=2)
+    output_path = output_directory / validated_path.name
+    write_text_atomically(output_path, json.dumps(result, indent=2))
 
 
 def optimize_portfolio_allocation(
@@ -528,6 +682,13 @@ def optimize_portfolio_allocation(
     progress_callback: Callable[[float, str], None] | None = None,
     train_months: int | None = None,
     test_months: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    *,
+    train_start: str | None = None,
+    train_end: str | None = None,
+    test_start: str | None = None,
+    test_end: str | None = None,
 ) -> dict[str, Any]:
     """Optimize portfolio weights for maximum Sharpe with negative correlation.
 
@@ -545,19 +706,43 @@ def optimize_portfolio_allocation(
         Optimization result with best weights and stats. Includes both IS (in-sample)
         and OOS (out-of-sample) Sharpe when test_months is provided.
     """
+    if isinstance(target_sharpe, bool):
+        raise ValueError("target_sharpe must be numeric")
+    try:
+        target = float(target_sharpe)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_sharpe must be numeric") from exc
+    if not math.isfinite(target) or target < 0:
+        raise ValueError("target_sharpe must be finite and >= 0")
+
     # Load equity curves
-    curves = [_load_strategy_equity(bt_id) for bt_id in backtest_ids]
+    if start_date or end_date:
+        curves = [
+            _load_strategy_equity(bt_id, start_date=start_date, end_date=end_date)
+            for bt_id in backtest_ids
+        ]
+    else:
+        curves = [_load_strategy_equity(bt_id) for bt_id in backtest_ids]
 
-    # Split curves by time for OOS validation
-    train_curves, test_curves = _split_equity_curves_by_time(curves, train_months, test_months)
+    explicit_boundaries = (train_start, train_end, test_start, test_end)
+    has_explicit_boundaries = all(value is not None for value in explicit_boundaries)
+    if any(value is not None for value in explicit_boundaries) and not has_explicit_boundaries:
+        raise ValueError("All explicit portfolio train/test boundaries are required")
+    if has_explicit_boundaries:
+        train_curves, test_curves = _split_equity_curves_by_boundaries(
+            curves,
+            train_start=train_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+        )
+    else:
+        train_curves, test_curves = _split_equity_curves_by_time(
+            curves, train_months, test_months
+        )
 
-    # Use train curves if available, otherwise all curves
-    curves_to_optimize = train_curves if train_curves else curves
+    curves_to_optimize = train_curves if has_explicit_boundaries or train_curves else curves
     equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
-    _record_portfolio_timestamps(
-        curves_to_optimize,
-        _common_timestamps(curves_to_optimize, require_overlap=True),
-    )
 
     # Weight sum guard: ensure we have valid, non-zero weight capacity
     if equity_matrix.size == 0 or equity_matrix.shape[1] < 2:
@@ -567,9 +752,15 @@ def optimize_portfolio_allocation(
             "backtest_ids": backtest_ids,
         }
 
+    equity_matrix = _normalize_equity_matrix(equity_matrix)
+
     # Overlap alignment validation: warn if insufficient common timestamps
     n_points = equity_matrix.shape[0]
     n_strategies = equity_matrix.shape[1]
+    _record_portfolio_timestamps(
+        curves_to_optimize,
+        _common_timestamps(curves_to_optimize, require_overlap=True),
+    )
     if n_points < 10:
         return {
             "status": "error",
@@ -581,8 +772,13 @@ def optimize_portfolio_allocation(
             "overlap_points": n_points,
         }
 
-    returns = np.diff(equity_matrix, axis=0)
-    objective = _build_objective(backtest_ids, equity_matrix, returns)
+    returns = _period_percentage_returns(equity_matrix)
+    objective = _build_objective(
+        backtest_ids,
+        equity_matrix,
+        returns,
+        target_sharpe=target,
+    )
     study = _run_optimization(objective, n_trials, progress_callback)
     completed_trials = study.get_trials(
         deepcopy=False,
@@ -606,6 +802,7 @@ def optimize_portfolio_allocation(
     )
     correlation_matrix = _compute_correlation_matrix(returns)
     oos_metrics = _compute_oos_metrics(test_curves, best_weights)
+    oos_equity_curve = _build_oos_equity_curve(test_curves, best_weights)
     result, output_path = _build_optimization_result(
         backtest_ids,
         best_weights,
@@ -616,6 +813,12 @@ def optimize_portfolio_allocation(
         train_months,
         test_months,
         oos_metrics,
+        target_sharpe=target,
+        oos_equity_curve=oos_equity_curve,
+        train_start=train_start,
+        train_end=train_end,
+        test_start=test_start,
+        test_end=test_end,
     )
 
     _persist_optimization_result(result, output_path)

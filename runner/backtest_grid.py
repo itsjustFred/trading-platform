@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import re
 import subprocess
 import sys
@@ -25,8 +24,14 @@ import pandas as pd
 from pydantic import ValidationError
 
 from data_tools.auto_download import ensure_backtest_data
+from runner.agent_process import build_backtest_child_env
+from runner.approval_gate import require_generated_strategy_approval
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, resolve_legacy_max_position_kwarg, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    resolve_legacy_max_position_kwarg,
+    resolve_strategy_parameters,
+)
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -250,9 +255,15 @@ def _detect_date_range(symbol: str, timeframe: str, data_dir: str) -> tuple[str,
     contract (F19): no fabricated range may ever flow into a backtest.
     """
     root = Path(data_dir) / "ohlcv" if data_dir else DATA_DIR / "ohlcv"
-    matches = list(root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(
+        root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+        key=lambda path: path.as_posix(),
+    )
     if not matches:
-        matches = list(root.rglob(f"**/{symbol}/*.parquet"))
+        matches = sorted(
+            root.rglob(f"**/{symbol}/*.parquet"),
+            key=lambda path: path.as_posix(),
+        )
     if not matches:
         raise ValueError(
             f"No OHLCV data found for {symbol}/{timeframe} under {root}; "
@@ -473,6 +484,7 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     the caller's failure classification.
     """
     strategy = request.strategy
+    require_generated_strategy_approval(strategy)
     symbol = request.symbol
     timeframe = request.timeframe
     data_dir = request.data_dir
@@ -593,6 +605,7 @@ def run_one_backtest(
     # start/end are resolve-or-detect as a pair: _resolve_dates_for_equity fills
     # both-or-neither from the same detection, so the reported window and the
     # engine window can never diverge. Don't fill only one of them at a call site.
+    require_generated_strategy_approval(strategy)
     request = CellRequest(
         strategy=strategy,
         symbol=symbol,
@@ -646,8 +659,7 @@ def run_one_backtest(
     )
     result["cmd"] = " ".join(cmd)
 
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    env = build_backtest_child_env()
     try:
         proc = subprocess.run(
             cmd,

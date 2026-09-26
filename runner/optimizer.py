@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, NoReturn
+from uuid import uuid4
 
 import optuna
 import pandas as pd
@@ -18,6 +20,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
@@ -121,7 +124,10 @@ def _risk_adjusted_metric_value(
         raise ValueError(
             f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
         )
-    sparsity = min(1.0, trade_count / max(int(min_trades_for_full_credit), 1))
+    sparsity = max(
+        0.0,
+        min(1.0, trade_count / max(int(min_trades_for_full_credit), 1)),
+    )
     drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
     return value * sparsity * drawdown_factor, terms
@@ -327,6 +333,19 @@ class OptimizationConfig(BaseModel):
         return self
 
 
+def _coverage_session_from_result(result: BacktestResult) -> Mapping[str, object] | None:
+    data = result.meta.data if isinstance(result.meta.data, dict) else {}
+    for key in ("session", "trading_session"):
+        value = data.get(key)
+        if isinstance(value, Mapping):
+            return value
+    start = data.get("session_start")
+    end = data.get("session_end")
+    if start is not None and end is not None:
+        return {"start": start, "end": end}
+    return None
+
+
 def run_optimization(
     config: OptimizationConfig,
     progress_callback: ProgressCallback | None = None,
@@ -337,6 +356,8 @@ def run_optimization(
             "Optimization currently supports vectorbt base backtests only, "
             f"got {base_result.meta.engine!r}"
         )
+    base_runtime = _runtime_config_from_base_result(base_result)
+    coverage_session = _coverage_session_from_result(base_result)
 
     symbols = list(base_result.meta.data.get("symbols") or [])
     if not symbols:
@@ -382,6 +403,7 @@ def run_optimization(
             train_period=train_period,
             test_period=test_period,
             base_parameters=base_parameters,
+            base_runtime=base_runtime,
             progress_callback=progress_callback,
         )
 
@@ -402,14 +424,16 @@ def run_optimization(
     )
     for segment_name, period in (("train", train_period), ("test", test_period)):
         for symbol in required_symbols:
-            # #86: density + max-gap gate — a 1-bar month must not pass.
-            if not has_sufficient_segment_coverage(
-                symbol=symbol,
-                timeframe=timeframe,
-                start=period["start"],
-                end=period["end"],
-                data_dir=data_dir,
-            ):
+            coverage_kwargs: dict[str, Any] = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "start": period["start"],
+                "end": period["end"],
+                "data_dir": data_dir,
+            }
+            if coverage_session is not None:
+                coverage_kwargs["session"] = coverage_session
+            if not has_sufficient_segment_coverage(**coverage_kwargs):
                 raise ValueError(
                     f"Optimization {segment_name} segment has insufficient OHLCV "
                     f"coverage for {symbol} {timeframe} ({period['start']} -> "
@@ -453,6 +477,7 @@ def run_optimization(
                     end_date=train_period["end"],
                     initial_capital=initial_capital,
                     parameters=combined_params,
+                    **base_runtime,
                 ),
                 strategy_path,
             )
@@ -556,7 +581,11 @@ def run_optimization(
     if not completed_trials:
         failure_summary = "; ".join(
             f"trial {trial.number}: {trial.state.name}"
-            + (f" ({trial.user_attrs.get('failure_reason')})" if trial.user_attrs.get("failure_reason") else "")
+            + (
+                f" ({trial.user_attrs.get('failure_reason')})"
+                if trial.user_attrs.get("failure_reason")
+                else ""
+            )
             for trial in study.get_trials(deepcopy=False)[-5:]
         )
         raise RuntimeError(
@@ -586,13 +615,16 @@ def run_optimization(
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            **base_runtime,
         ),
         strategy_path,
     )
     test_stats = _canonical_stats(test_result)
 
     now = datetime.now(timezone.utc)
-    optimization_id = f"opt_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+    optimization_id = (
+        f"opt_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
+    )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     payload = {
         "id": optimization_id,
@@ -630,7 +662,7 @@ def run_optimization(
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    write_text_atomically(output_path, json.dumps(_json_safe(payload), indent=2))
     _emit_progress(progress_callback, 100.0, f"Optimization finished: {output_path.name}")
     return payload
 
@@ -735,6 +767,59 @@ def _suggest_parameter(trial: optuna.Trial, name: str, spec: dict[str, Any]) -> 
     raise ValueError(f"Unsupported parameter type for {name!r}: {spec.get('type')!r}")
 
 
+def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
+    data = result.meta.data if isinstance(result.meta.data, dict) else {}
+    parameters = result.meta.parameters if isinstance(result.meta.parameters, dict) else {}
+    stored_runtime = data.get("_backtest_config", {}) if isinstance(data, dict) else {}
+
+    def value(name: str, default: Any = None) -> Any:
+        meta_value = getattr(result.meta, name, None)
+        if meta_value is not None:
+            return meta_value
+        if name in data and data[name] is not None:
+            return data[name]
+        if name in stored_runtime and stored_runtime[name] is not None:
+            return stored_runtime[name]
+        return parameters.get(name, default)
+
+    risk_per_trade_pct = getattr(result.meta, "risk_per_trade_pct", None)
+    if risk_per_trade_pct is None:
+        risk_per_trade_pct = data.get("risk_per_trade_pct")
+    if risk_per_trade_pct is None:
+        risk_per_trade_pct = stored_runtime.get("risk_per_trade_pct")
+    if risk_per_trade_pct is None:
+        raise ValueError(
+            "Base backtest is a legacy artifact without an explicit "
+            "risk_per_trade_pct runtime snapshot. Optimization cannot safely "
+            "reuse it; rerun the base backtest with risk_per_trade_pct configured "
+            "or provide a complete explicit runtime snapshot. No default risk "
+            "was applied."
+        )
+    try:
+        numeric_risk = float(risk_per_trade_pct)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "Base backtest risk_per_trade_pct must be a finite fraction between "
+            f"0 and 1, got {risk_per_trade_pct!r}."
+        ) from exc
+    if not math.isfinite(numeric_risk) or not 0.0 <= numeric_risk <= 1.0:
+        raise ValueError(
+            "Base backtest risk_per_trade_pct must be a finite fraction between "
+            f"0 and 1, got {risk_per_trade_pct!r}."
+        )
+
+    return {
+        "risk_per_trade_pct": numeric_risk,
+        "max_position_exposure_pct": value("max_position_exposure_pct"),
+        "max_leverage": value("max_leverage"),
+        "modeling_resolution": value("modeling_resolution", "open_close"),
+        "signal_exit_fill": value("signal_exit_fill", "close"),
+        "allow_fallback_stop": value("allow_fallback_stop", True),
+        "reject_missing_stop": value("reject_missing_stop", False),
+        "require_explicit_column_roles": value("require_explicit_column_roles", False),
+    }
+
+
 def _run_vectorbt_backtest(config: BacktestConfig, strategy_path: Path) -> BacktestResult:
     ensure_backtest_data(
         symbols=config.symbols,
@@ -815,8 +900,10 @@ def _run_risk_parity_covariance_optimization(
     train_period: dict[str, str],
     test_period: dict[str, str],
     base_parameters: dict[str, Any],
-    progress_callback: ProgressCallback | None,
+    base_runtime: dict[str, Any] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    base_runtime = base_runtime or _runtime_config_from_base_result(base_result)
     _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
     # Covariance input precedence (Cleanup 16-D1, F30): risk-parity weights
     # express ASSET co-movement, so the returns frame must come from market
@@ -860,13 +947,16 @@ def _run_risk_parity_covariance_optimization(
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
+            **base_runtime,
         ),
         strategy_path,
     )
     test_stats = _canonical_stats(test_result)
 
     now = datetime.now(timezone.utc)
-    optimization_id = f"rp_cov_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}"
+    optimization_id = (
+        f"rp_cov_{config.base_backtest_id}_{now.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex}"
+    )
     output_path = OPTIMIZATIONS_DIR / f"{optimization_id}.json"
     payload = {
         "id": optimization_id,
@@ -907,7 +997,7 @@ def _run_risk_parity_covariance_optimization(
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(_json_safe(payload), indent=2), encoding="utf-8")
+    write_text_atomically(output_path, json.dumps(_json_safe(payload), indent=2))
     _emit_progress(
         progress_callback, 100.0, f"Risk parity optimization finished: {output_path.name}"
     )
@@ -962,7 +1052,11 @@ def _asset_returns_frame_from_market_data(
     start_ts = pd.to_datetime(start, utc=True, errors="coerce")
     end_ts = pd.to_datetime(end, utc=True, errors="coerce")
     for symbol in symbols:
-        path = next(root.rglob(f"**/{symbol}/{timeframe}.parquet"), None)
+        matches = sorted(
+            root.rglob(f"**/{symbol}/{timeframe}.parquet"),
+            key=lambda item: item.as_posix(),
+        )
+        path = matches[0] if matches else None
         if path is None:
             continue
         frame = pd.read_parquet(path)

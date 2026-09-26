@@ -2,28 +2,22 @@
 
 from __future__ import annotations
 
-import pytest
-
 from shared.models import Trade
+from tests.validation.data_factory import (
+    make_reference as _make_reference,
+)
+from tests.validation.data_factory import (
+    make_trade as _make_trade,
+)
 from validation.comparison.anomalies import (
     AnomalyDetector,
     AnomalyType,
-    TradeAnomaly,
 )
 from validation.comparison.comparison import (
-    FieldComparisonResult,
     MatchedTrade,
-    TradeComparisonConfig,
-    TradeComparisonResult,
     TradeComparator,
 )
 from validation.comparison.matcher import MatchKey
-
-
-from tests.validation.data_factory import (
-    make_reference as _make_reference,
-    make_trade as _make_trade,
-)
 
 
 def _make_matched(
@@ -196,7 +190,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "entry_time" in anomalies[0].message
 
     def test_exit_time_mismatch_severity_warning(self):
@@ -206,7 +200,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "exit_time" in anomalies[0].message
 
     def test_volume_mismatch_severity_warning(self):
@@ -216,7 +210,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "volume" in anomalies[0].message
 
     def test_stop_loss_mismatch_severity_warning(self):
@@ -226,7 +220,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "stop_loss" in anomalies[0].message
 
     def test_take_profit_mismatch_severity_warning(self):
@@ -236,7 +230,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "take_profit" in anomalies[0].message
 
     def test_multiple_fields_error_takes_precedence(self):
@@ -276,7 +270,7 @@ class TestDetectMismatches:
         comp_result = TradeComparator().compare(matched)
         anomalies = AnomalyDetector.detect_mismatches([comp_result])
         assert len(anomalies) == 1
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert "exit_price" in anomalies[0].message
 
 
@@ -380,5 +374,5 @@ class TestDetectIntegration:
         anomalies = AnomalyDetector.detect(reference, act, comp_results)
         assert len(anomalies) == 1
         assert anomalies[0].anomaly_type == AnomalyType.MISMATCHED_TRADE
-        assert anomalies[0].severity == "warning"
+        assert anomalies[0].severity == "error"
         assert any(fm.field == "stop_loss" for fm in anomalies[0].field_mismatches)

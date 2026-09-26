@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import fcntl
 import math
 import os
 import tempfile
 import time
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,12 +17,14 @@ from uuid import UUID
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    coerce_positive_live_qty,
     is_unbounded_tp,
 )
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
+    get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     get_live_signal_timestamp,
     list_live_signal_ids_for_reconciliation,
@@ -100,9 +103,10 @@ def _first_metadata_float(
         if value is None:
             continue
         try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {key}: {value!r}") from exc
+        return parsed
     return None
 # ── cTrader volume unit contract ───────────────────────────────────────────────
 #
@@ -121,16 +125,14 @@ def _first_metadata_float(
 # Every crossing of that boundary goes through _qty_to_broker_volume /
 # _broker_volume_to_qty with the symbol's scale (adapter._scale_for, #80:
 # broker props first, fallback table second, unknown symbols raise).
-# Signal metadata 'ctrader_volume' / 'volume' are raw
-# broker units coming from the (untrusted) signal payload; they must not pick
-# the traded size on entries — they are read ONLY for exit-only flatten
-# orders (risk_sizing_mode == "exit_only"), where the daemon resolved the
-# exact broker-observed quantity (#79).
 
 
 #: Legacy FX scale, kept as the pinned default for the module-level helpers
 #: and the FX fallback entry below (qty 5.0 -> volume 5000).
 QTY_VOLUME_SCALE = 1000.0
+CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
+EXECUTION_RETRY_LIMIT = 3
+UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,8 +142,8 @@ class SymbolScale:
     ``volume_per_qty``: broker volume units per risk-engine qty unit.
     The qty unit is 0.01 lots, so ``volume_per_qty = lotSize / 100``
     (FX: 100000/100 = 1000, pinned by contract tests).
-    ``price_digits``: symbol price decimals — the relative SL/TP scale is
-    ``10 ** price_digits`` (FX: 5 -> 100_000).
+    ``price_digits``: broker-reported symbol price decimals retained as symbol
+    metadata; relative SL/TP always uses the fixed protocol divisor.
     ``min_volume``: broker minimum order volume (fail-closed floor).
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
     """
@@ -188,8 +190,8 @@ _INDEX_SYMBOLS = frozenset(
 #: Crypto bases that form 6-letter pairs (BTCUSD, ETHUSD, ...). Their lotSize
 #: varies per coin and broker (BTC 1, altcoins differ), so no static fallback
 #: is safe — they are UNKNOWN by design (broker props or no trade). Without
-#: this guard they would fall into the 6-alpha FX branch at up to 100000x the
-#: intended size.
+#: this guard they would fall into the currency-code FX branch at up to
+#: 100000x the intended size.
 _CRYPTO_BASES = frozenset(
     {
         "BTC", "ETH", "XRP", "LTC", "BCH", "DOT", "LINK", "XLM", "ADA",
@@ -197,6 +199,15 @@ _CRYPTO_BASES = frozenset(
         "NEAR", "ARB", "OP", "INJ", "SUI", "UNI", "APT", "HBAR", "VET",
         "ALGO", "SAND", "MANA", "XTZ", "EOS", "AAVE", "SNX", "ZEC",
         "DASH", "XMR", "BNB",
+    }
+)
+
+_FX_CURRENCY_CODES = frozenset(
+    {
+        "AUD", "BRL", "CAD", "CHF", "CNH", "CNY", "CZK", "DKK", "EUR",
+        "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JPY", "KRW", "MXN",
+        "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "RUB", "SAR", "SEK",
+        "SGD", "THB", "TRY", "USD", "ZAR",
     }
 )
 
@@ -211,11 +222,12 @@ def _fallback_scale_class(symbol: str) -> str | None:
     if upper.startswith("XAG"):
         return "xag"
     if len(upper) == 6 and upper.isalpha():
+        if upper[:3] in _CRYPTO_BASES:
+            return None
+        if upper[:3] not in _FX_CURRENCY_CODES or upper[3:] not in _FX_CURRENCY_CODES:
+            return None
         if upper.endswith("JPY"):
             return "jpy"
-        if upper[:3] in _CRYPTO_BASES:
-            # Crypto lotSizes are per-coin: fail closed, never FX.
-            return None
         return "fx"
     if upper in _INDEX_SYMBOLS:
         return "index"
@@ -242,27 +254,33 @@ def _fallback_symbol_scale(symbol: str) -> SymbolScale:
 
 
 def _symbol_scale_from_broker_props(
-    *, digits: int, lot_size: float | None, min_volume: int | None, fallback: SymbolScale
-) -> SymbolScale:
-    """Build a broker-authoritative scale, falling back per-field (#80)."""
+    *,
+    digits: int | None,
+    lot_size: float | None,
+    min_volume: int | None,
+    fallback: SymbolScale | None,
+) -> SymbolScale | None:
+    """Build a broker-authoritative scale, using a fallback only when available."""
     try:
-        digit_count = int(digits)
+        digit_count = int(digits) if digits is not None else None
     except (TypeError, ValueError):
-        digit_count = fallback.price_digits
-    if digit_count < 0 or digit_count > 10:
-        digit_count = fallback.price_digits
+        digit_count = None
+    if digit_count is None or not 0 <= digit_count <= 10:
+        digit_count = fallback.price_digits if fallback is not None else None
     try:
-        lots = float(lot_size) if lot_size is not None else fallback.lot_size
+        lots = float(lot_size) if lot_size is not None else None
     except (TypeError, ValueError):
-        lots = fallback.lot_size
-    if not math.isfinite(lots) or lots <= 0:
-        lots = fallback.lot_size
+        lots = None
+    if lots is None or not math.isfinite(lots) or lots <= 0:
+        lots = fallback.lot_size if fallback is not None else None
     try:
-        minimum = int(min_volume) if min_volume is not None else fallback.min_volume
+        minimum = int(min_volume) if min_volume is not None else None
     except (TypeError, ValueError):
-        minimum = fallback.min_volume
-    if minimum <= 0:
-        minimum = fallback.min_volume
+        minimum = None
+    if minimum is None or minimum <= 0:
+        minimum = fallback.min_volume if fallback is not None else None
+    if digit_count is None or lots is None or minimum is None:
+        return None
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
@@ -274,7 +292,10 @@ def _symbol_scale_from_broker_props(
 
 def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> int:
     """Convert qty units (risk-engine units) into broker volume units."""
-    volume = int(round(float(qty) * float(volume_per_qty)))
+    qty_value = coerce_positive_live_qty(qty)
+    if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
+        raise ValueError("volume_per_qty must be finite and positive")
+    volume = int(round(qty_value * float(volume_per_qty)))
     if volume <= 0:
         raise ValueError(
             "Signal has no positive quantity ('qty'); "
@@ -340,6 +361,38 @@ def _is_terminal_auth_error(error_code: str, error_text: str) -> bool:
     }
 
 
+@contextmanager
+def _exclusive_file_lock(handle: Any) -> Iterator[None]:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write("\0")
+            handle.flush()
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
     """Persist dotenv keys atomically without logging secret material."""
     resolved = path.resolve()
@@ -350,8 +403,7 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
     target = Path(resolved)
     lock_path = target.with_name(f"{target.name}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
+        with _exclusive_file_lock(lock_handle):
             lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
             seen: set[str] = set()
             for index, line in enumerate(lines):
@@ -372,8 +424,6 @@ def _write_env_keys(path: Path, updates: dict[str, str]) -> None:
                 tmp_handle.write("\n".join(lines) + "\n")
             tmp_path.chmod(0o600)
             os.replace(tmp_path, target)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _write_env_key(path: Path, key: str, value: str) -> None:
@@ -408,21 +458,6 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
         reactor.startRunning(installSignalHandlers=False)
 
 
-def _explicit_metadata_volume(metadata: dict[str, Any]) -> int | None:
-    """Explicit broker-volume overrides from metadata ('ctrader_volume', 'volume')."""
-    for key in ("ctrader_volume", "volume"):
-        if key not in metadata:
-            continue
-        try:
-            explicit = int(float(metadata[key]))
-        except (TypeError, ValueError):
-            raise ValueError(f"Invalid '{key}' in signal metadata.")
-        if explicit <= 0:
-            raise ValueError(f"'{key}' must be > 0.")
-        return explicit
-    return None
-
-
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
@@ -446,7 +481,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self.app_secret = app_secret or resolve_env_value(env_values, "CTRADER_APP_SECRET")
         self.access_token = access_token or resolve_env_value(env_values, "CTRADER_ACCESS_TOKEN")
         self.refresh_token = refresh_token or resolve_env_value(env_values, "CTRADER_REFRESH_TOKEN")
-        self.accounts_env_path = Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
+        self.accounts_env_path = (
+            Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
+        )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
         self.demo = (
@@ -475,6 +512,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._client: Any | None = None
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
+        self._execution_retry_counts: dict[int, int] = {}
+        self._unresolved_execution_events: deque[Any] = deque()
         self._reconciliation_required = False
         self._reconciliation_retry_at = 0.0
         self._connected = False
@@ -485,6 +524,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #80: broker-authoritative per-symbol scales (digits/lotSize), keyed
         # by upper symbol name. Tests/fallbacks use _fallback_symbol_scale.
         self._symbol_props: dict[str, SymbolScale] = {}
+        self._position_ids_by_symbol: dict[str, tuple[int, ...]] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
@@ -506,6 +546,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq: Any = None
         self._ProtoOASymbolsListRes: Any = None
         self._ProtoOANewOrderReq: Any = None
+        self._ProtoOAClosePositionReq: Any = None
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
         self._ProtoOAErrorRes: Any = None
@@ -515,6 +556,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes: Any = None
         self._ProtoOAOrderListReq: Any = None
         self._ProtoOAOrderListRes: Any = None
+        self._ProtoOAOrderListByPositionIdReq: Any = None
+        self._ProtoOAOrderListByPositionIdRes: Any = None
         self._ProtoOAReconcileReq: Any = None
         self._ProtoOAReconcileRes: Any = None
         self._ProtoOARefreshTokenReq: Any = None
@@ -544,14 +587,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAAccountAuthRes,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
+                ProtoOAClosePositionReq,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
+                ProtoOAOrderErrorEvent,
+                ProtoOAOrderListByPositionIdReq,
+                ProtoOAOrderListByPositionIdRes,
                 ProtoOAOrderListReq,
                 ProtoOAOrderListRes,
-                ProtoOAOrderErrorEvent,
                 ProtoOAReconcileReq,
                 ProtoOAReconcileRes,
                 ProtoOARefreshTokenReq,
@@ -586,6 +632,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq = ProtoOASymbolsListReq
         self._ProtoOASymbolsListRes = ProtoOASymbolsListRes
         self._ProtoOANewOrderReq = ProtoOANewOrderReq
+        self._ProtoOAClosePositionReq = ProtoOAClosePositionReq
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
         self._ProtoOAErrorRes = ProtoOAErrorRes
@@ -595,6 +642,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
         self._ProtoOAOrderListReq = ProtoOAOrderListReq
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
+        self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
+        self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOAReconcileReq = ProtoOAReconcileReq
         self._ProtoOAReconcileRes = ProtoOAReconcileRes
         self._ProtoOARefreshTokenReq = ProtoOARefreshTokenReq
@@ -878,7 +927,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ):
                 # Token was refreshed successfully; re-authorize the account and
                 # retry once with the new token.
-                if self._ProtoOAAccountAuthReq is not None and self._ProtoOAAccountAuthRes is not None:
+                if (
+                    self._ProtoOAAccountAuthReq is not None
+                    and self._ProtoOAAccountAuthRes is not None
+                ):
                     account_auth_res = await self._send_account_auth_request(timeout_seconds=15)
                     if not isinstance(account_auth_res, self._ProtoOAAccountAuthRes):
                         raise RuntimeError(
@@ -951,14 +1003,70 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _scale_for(self, symbol: str) -> SymbolScale:
         """Return the per-symbol broker scale, failing closed (#80).
 
-        Broker-cached properties win; otherwise the static fallback table
-        applies; unknown symbols raise instead of trading a wrong size.
+        Broker-cached properties win; known classes may use the static table;
+        unknown symbols without broker properties raise instead of guessing.
         """
         upper = str(symbol or "").strip().upper()
         cached = self._symbol_props.get(upper)
         if cached is not None:
             return cached
         return _fallback_symbol_scale(upper)
+
+    def _position_id_for_exit(
+        self, symbol: str, requested_position_id: int | None = None
+    ) -> int:
+        upper = str(symbol or "").strip().upper()
+        position_ids = self._position_ids_by_symbol.get(upper, ())
+        if requested_position_id is not None:
+            if requested_position_id <= 0:
+                raise ValueError(
+                    f"cTrader exit-only for {upper} has an invalid broker position id."
+                )
+            if not position_ids:
+                raise ValueError(
+                    f"cTrader exit-only for {upper} has no broker position id; "
+                    "refusing to submit an unaddressed close."
+                )
+            if requested_position_id not in position_ids:
+                raise ValueError(
+                    f"cTrader exit-only position id {requested_position_id} is not the "
+                    f"current broker position for {upper}."
+                )
+            return requested_position_id
+        if len(position_ids) > 1:
+            raise ValueError(
+                f"cTrader exit-only for {upper} has multiple broker positions; "
+                "a single position-addressed close cannot represent the book."
+            )
+        if not position_ids:
+            raise ValueError(
+                f"cTrader exit-only for {upper} has no broker position id; "
+                "refusing to submit an unaddressed close."
+            )
+        return position_ids[0]
+
+    def _requested_exit_position_id(self, metadata: Mapping[str, Any]) -> int | None:
+        raw_position_id = metadata.get("position_id")
+        raw_position_ids = metadata.get("position_ids")
+        if raw_position_ids is not None:
+            if not isinstance(raw_position_ids, (list, tuple)) or len(raw_position_ids) != 1:
+                raise ValueError(
+                    "cTrader exit-only requires exactly one broker position id."
+                )
+            raw_position_id = raw_position_ids[0]
+        if raw_position_id is None:
+            return None
+        if isinstance(raw_position_id, bool):
+            raise ValueError("cTrader exit-only position id is not an integer.")
+        try:
+            position_id = int(raw_position_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cTrader exit-only position id is not an integer.") from exc
+        if isinstance(raw_position_id, float) and raw_position_id != position_id:
+            raise ValueError("cTrader exit-only position id is not an integer.")
+        if position_id <= 0:
+            raise ValueError("cTrader exit-only position id must be positive.")
+        return position_id
 
     def _symbol_name_for_id(self, symbol_id: int) -> str:
         """Resolve a broker symbol id to its upper name, failing closed (#80).
@@ -1000,14 +1108,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         installed ctrader_open_api descriptors before touching this path:
         digits/pipPosition required, lotSize/min/max/stepVolume optional.
         """
+        if not symbol_name_to_id:
+            self._symbol_props.clear()
+            return
+        for name in symbol_name_to_id:
+            self._symbol_props.pop(name, None)
         try:
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOASymbolByIdReq,
                 ProtoOASymbolByIdRes,
             )
         except (ModuleNotFoundError, ImportError):
-            return
-        if not symbol_name_to_id:
             return
         id_to_name = {sid: name for name, sid in symbol_name_to_id.items()}
         try:
@@ -1035,14 +1146,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if name is None:
                 continue
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
-            if fallback is None:
-                continue
-            self._symbol_props[name] = _symbol_scale_from_broker_props(
-                digits=getattr(detail, "digits", fallback.price_digits),
-                lot_size=getattr(detail, "lotSize", None) or None,
-                min_volume=getattr(detail, "minVolume", None) or None,
+            scale = _symbol_scale_from_broker_props(
+                digits=getattr(detail, "digits", None),
+                lot_size=getattr(detail, "lotSize", None),
+                min_volume=getattr(detail, "minVolume", None),
                 fallback=fallback,
             )
+            if scale is not None:
+                self._symbol_props[name] = scale
 
     def _extract_order_id_from_payload(self, payload: Any) -> int | None:
         if isinstance(payload, self._ProtoOAExecutionEvent):
@@ -1055,48 +1166,36 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return None
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
-        """Resolve the broker volume for an order from signal metadata 'qty'.
-
-        Unit contract: 'qty' is in risk-engine quantity units (0.01 lots);
-        broker volume is qty * the per-symbol scale (FX: QTY_VOLUME_SCALE,
-        #80: lotSize/100 from broker props or the fallback table). The raw
-        broker-unit keys ('ctrader_volume', 'volume') are overrides from the
-        (untrusted) signal payload; they are honored ONLY for exit-only
-        flatten orders (``risk_sizing_mode == "exit_only"``), where the
-        daemon has already resolved the exact broker-observed quantity. On
-        entries they are rejected: an upstream path setting 'volume' must
-        never trade an arbitrary size with zero risk checks (#79).
-        """
+        """Resolve broker volume from the binding risk-engine ``qty``."""
         scale = self._scale_for(signal.symbol)
         metadata = signal.metadata or {}
-        explicit = _explicit_metadata_volume(metadata)
-        if explicit is not None:
-            if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
-                raise ValueError(
-                    "Explicit metadata volume ('ctrader_volume'/'volume') is only "
-                    "allowed for exit-only flatten orders; entries must use the "
-                    "risk-sized 'qty'."
-                )
-            return explicit
-
-        if "qty" in metadata:
-            qty = _to_float(metadata.get("qty"), default=0.0)
-            if math.isfinite(qty) and qty > 0:
-                volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
-                if volume < scale.min_volume:
-                    raise ValueError(
-                        f"Risk-sized volume {volume} for {signal.symbol} is below "
-                        f"the broker minimum ({scale.min_volume}); order rejected "
-                        "instead of silently upsizing beyond the risk limit."
-                    )
-                return volume
-
-        # Fail closed: never trade a default size, and never silently upsize a
-        # risk-sized quantity to the broker minimum.
-        raise ValueError(
-            "Signal has no positive quantity ('qty', 'ctrader_volume' or 'volume'); "
-            "refusing to submit an order with a default size."
-        )
+        raw_keys = [key for key in ("ctrader_volume", "volume") if key in metadata]
+        if raw_keys:
+            raise ValueError(
+                "Raw cTrader volume overrides "
+                f"({', '.join(raw_keys)}) are ambiguous; use the binding 'qty' "
+                "passed by the daemon."
+            )
+        if "qty" not in metadata:
+            raise ValueError(
+                "Signal has no positive quantity ('qty'); refusing to submit "
+                "an order with a default size."
+            )
+        try:
+            qty = coerce_positive_live_qty(metadata.get("qty"))
+        except ValueError as exc:
+            raise ValueError(
+                "Signal has no positive quantity ('qty'); refusing to "
+                "submit an order with a default size."
+            ) from exc
+        volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+        if volume < scale.min_volume:
+            raise ValueError(
+                f"Risk-sized volume {volume} for {signal.symbol} is below "
+                f"the broker minimum ({scale.min_volume}); order rejected "
+                "instead of silently upsizing beyond the risk limit."
+            )
+        return volume
 
     async def connect(self) -> None:
         async with self._connect_lock:
@@ -1169,9 +1268,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderAuthTerminalError:
             raise
         except Exception as exc:
+            self._reconciliation_required = True
+            self._reconciliation_retry_at = 0.0
             logger.warning(
-                "cTrader execution reconciliation failed; "
-                "fills may be missing until retry",
+                "cTrader execution reconciliation failed; retry is pending",
                 extra={
                     "data": {
                         "account_id": self.ctid_trader_account_id,
@@ -1330,26 +1430,45 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self,
         signal_id: str,
         signal_timestamp: datetime | None,
+        *,
+        position_id: int | None = None,
     ) -> str | None:
-        """Find exactly one account-scoped order by its stable client order id."""
+        """Find exactly one account-scoped order for a persisted signal intent."""
         if signal_timestamp is None:
             return None
         if signal_timestamp.tzinfo is None:
             signal_timestamp = signal_timestamp.replace(tzinfo=timezone.utc)
         signal_timestamp = signal_timestamp.astimezone(timezone.utc)
-
-        request = self._ProtoOAOrderListReq()
-        request.ctidTraderAccountId = self.ctid_trader_account_id
-        request.fromTimestamp = int(
+        from_timestamp = int(
             (signal_timestamp - timedelta(minutes=15)).timestamp() * 1000
         )
-        request.toTimestamp = int(
+        to_timestamp = int(
             (signal_timestamp + timedelta(minutes=15)).timestamp() * 1000
         )
+
+        if position_id is None:
+            request_type = self._ProtoOAOrderListReq
+            expected_response_type = self._ProtoOAOrderListRes
+            if request_type is None or expected_response_type is None:
+                return None
+            request = request_type()
+            request.ctidTraderAccountId = self.ctid_trader_account_id
+            request.fromTimestamp = from_timestamp
+            request.toTimestamp = to_timestamp
+        else:
+            request_type = self._ProtoOAOrderListByPositionIdReq
+            expected_response_type = self._ProtoOAOrderListByPositionIdRes
+            if request_type is None or expected_response_type is None:
+                return None
+            request = request_type()
+            request.ctidTraderAccountId = self.ctid_trader_account_id
+            request.positionId = position_id
+            request.fromTimestamp = from_timestamp
+            request.toTimestamp = to_timestamp
         response = await self._send_request_with_refresh_retry(
             request, timeout_seconds=15
         )
-        if not isinstance(response, self._ProtoOAOrderListRes):
+        if not isinstance(response, expected_response_type):
             return None
         if bool(getattr(response, "hasMore", False)):
             logger.warning(
@@ -1357,18 +1476,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"signal_id": signal_id}},
             )
             return None
-        matches = [
-            order
-            for order in getattr(response, "order", [])
-            if str(getattr(order, "clientOrderId", "") or "").strip() == signal_id
-            and int(getattr(order, "orderId", 0) or 0) > 0
-        ]
+        if position_id is None:
+            matches = [
+                order
+                for order in getattr(response, "order", [])
+                if str(getattr(order, "clientOrderId", "") or "").strip() == signal_id
+                and int(getattr(order, "orderId", 0) or 0) > 0
+            ]
+        else:
+            matches = [
+                order
+                for order in getattr(response, "order", [])
+                if int(getattr(order, "positionId", 0) or 0) == position_id
+                and bool(getattr(order, "closingOrder", False))
+                and int(getattr(order, "orderId", 0) or 0) > 0
+            ]
         if len(matches) != 1:
             if len(matches) > 1:
                 logger.error(
                     "Multiple cTrader orders matched one signal; refusing recovery",
                     extra={
-                        "data": {"signal_id": signal_id, "match_count": len(matches)}
+                        "data": {
+                            "signal_id": signal_id,
+                            "position_id": position_id,
+                            "match_count": len(matches),
+                        }
                     },
                 )
             return None
@@ -1422,11 +1554,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
 
     def _coerce_broker_order_id(self, broker_order_id: str) -> int | None:
-        try:
-            return int(broker_order_id)
-        except (TypeError, ValueError):
-            # Order id belongs to another broker (e.g. Alpaca UUIDs).
+        if isinstance(broker_order_id, bool):
             return None
+        try:
+            order_id = int(broker_order_id)
+        except (TypeError, ValueError):
+            return None
+        return order_id if order_id > 0 else None
 
     async def _list_reconciliation_signal_ids(self, max_signals: int) -> list[str]:
         signal_ids: list[str] = []
@@ -1458,12 +1592,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             before = next_before
         return signal_ids
 
+    async def _persisted_exit_position_id(self, signal_id: str) -> int | None:
+        metadata = await asyncio.to_thread(get_live_signal_metadata, signal_id)
+        if not metadata:
+            return None
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+            return None
+        return self._requested_exit_position_id(metadata)
+
     async def _recover_and_persist_broker_order_id(self, signal_id: str) -> str | None:
         signal_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, signal_id
         )
+        position_id = await self._persisted_exit_position_id(signal_id)
         broker_order_id = await self._recover_broker_order_id(
-            signal_id, signal_timestamp
+            signal_id, signal_timestamp, position_id=position_id
         )
         if not broker_order_id:
             return None
@@ -1528,6 +1671,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         *,
         signal_uuid: UUID,
         broker_order_id: str,
+        order: Any | None = None,
     ) -> LiveExecution | None:
         deal_status = int(getattr(deal, "dealStatus", 0) or 0)
         if deal_status not in {
@@ -1538,16 +1682,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         deal_id = int(getattr(deal, "dealId", 0) or 0)
         if deal_id <= 0:
             return None
-        filled_volume = _to_float(getattr(deal, "filledVolume", 0))
-        if filled_volume <= 0:
-            filled_volume = _to_float(getattr(deal, "volume", 0))
+        filled_volume = self._resolve_filled_volume(order=order, deal=deal)
         if filled_volume <= 0:
             return None
         # Unit contract: persist filled_qty in qty units (broker volume per
         # the symbol scale, #80), the same unit the risk engine sized and
         # the viewer consumes.
         deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
+        if not deal_symbol_id and order is not None:
+            deal_symbol_id = int(getattr(order, "symbolId", 0) or 0)
         deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
+        if deal_symbol is None:
+            try:
+                deal_symbol = self._order_id_to_symbol.get(int(broker_order_id))
+            except (TypeError, ValueError):
+                deal_symbol = None
         if deal_symbol is None:
             raise ValueError(
                 "cTrader deal carries no symbolId; refusing to scale its "
@@ -1582,9 +1731,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         details_res: Any,
     ) -> int:
         recovered = 0
+        details_order = getattr(details_res, "order", None)
+        if isinstance(details_order, (list, tuple)):
+            details_order = details_order[0] if details_order else None
         for deal in getattr(details_res, "deal", []):
             execution = self._build_reconciled_execution(
-                deal, signal_uuid=signal_uuid, broker_order_id=broker_order_id
+                deal,
+                signal_uuid=signal_uuid,
+                broker_order_id=broker_order_id,
+                order=details_order,
             )
             if execution is None:
                 continue
@@ -1614,12 +1769,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        self._position_ids_by_symbol.clear()
         # #80: props and order-symbol mappings are session state — a
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
         self._order_id_to_symbol.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
+        self._execution_retry_counts.clear()
+        self._unresolved_execution_events.clear()
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
 
@@ -1662,11 +1820,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             get_live_signal_broker_order_id, signal_id
         )
         if existing_order_id:
-            try:
-                self._order_id_to_signal_id[int(existing_order_id)] = signal_id
-            except (TypeError, ValueError):
-                pass
-            return existing_order_id
+            normalized_order_id = self._coerce_broker_order_id(existing_order_id)
+            if normalized_order_id is None:
+                raise RuntimeError(
+                    "Persisted cTrader broker order id is invalid; refusing duplicate submission."
+                )
+            self._order_id_to_signal_id[normalized_order_id] = signal_id
+            return str(normalized_order_id)
 
         if not self._connected or not self._authenticated:
             await self.connect()
@@ -1682,17 +1842,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
         try:
-            qty_value = float(qty)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"cTrader order qty is not a number: {qty!r} "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
-            )
-        if not math.isfinite(qty_value) or qty_value <= 0:
+            qty_value = coerce_positive_live_qty(qty, field_name="cTrader order qty")
+        except ValueError as exc:
             raise ValueError(
                 "cTrader order qty must be finite and positive, "
                 f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
-            )
+            ) from exc
         signal = signal.model_copy(
             update={
                 "metadata": {
@@ -1702,7 +1857,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 }
             }
         )
-
+        exit_only = (
+            str((signal.metadata or {}).get("risk_sizing_mode") or "")
+            == EXIT_ONLY_RISK_SIZING_MODE
+        )
+        self._resolve_order_volume(signal)
+        signal = signal.model_copy(
+            update={
+                "metadata": {
+                    key: value
+                    for key, value in (signal.metadata or {}).items()
+                    if key not in {"ctrader_volume", "volume"}
+                }
+            }
+        )
         persisted_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, signal_id
         )
@@ -1719,13 +1887,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ),
             )
 
+        position_id: int | None = None
+        if exit_only:
+            requested_position_id = self._requested_exit_position_id(signal.metadata or {})
+            position_id = self._position_id_for_exit(signal.symbol, requested_position_id)
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        **(signal.metadata or {}),
+                        "position_id": position_id,
+                    }
+                }
+            )
+            self._resolve_order_volume(signal)
+
         canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
         if not created:
             return await self._recover_duplicate_signal_order_id(canonical_signal_id)
 
         symbol_id = await self._resolve_symbol_id(signal.symbol)
-
-        request = self._build_new_order_request(signal, symbol_id=symbol_id)
+        if exit_only:
+            if position_id is None:
+                raise RuntimeError("cTrader exit-only position id was not resolved.")
+            request = self._build_close_position_request(
+                position_id=position_id,
+                volume=self._resolve_order_volume(signal),
+            )
+        else:
+            request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -1772,8 +1961,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         unrecovered_error: str,
         unpersisted_error: str,
     ) -> str:
+        position_id = await self._persisted_exit_position_id(signal_id)
         recovered_order_id = await self._recover_broker_order_id(
-            signal_id, signal_timestamp
+            signal_id, signal_timestamp, position_id=position_id
         )
         if not recovered_order_id:
             raise RuntimeError(unrecovered_error)
@@ -1790,11 +1980,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             get_live_signal_broker_order_id, canonical_signal_id
         )
         if existing_order_id:
-            try:
-                self._order_id_to_signal_id[int(existing_order_id)] = canonical_signal_id
-            except (TypeError, ValueError):
-                pass
-            return existing_order_id
+            normalized_order_id = self._coerce_broker_order_id(existing_order_id)
+            if normalized_order_id is None:
+                raise RuntimeError(
+                    "Persisted cTrader broker order id is invalid; refusing duplicate submission."
+                )
+            self._order_id_to_signal_id[normalized_order_id] = canonical_signal_id
+            return str(normalized_order_id)
         canonical_timestamp = await asyncio.to_thread(
             get_live_signal_timestamp, canonical_signal_id
         )
@@ -1822,10 +2014,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         return symbol_id
 
+    def _build_close_position_request(self, *, position_id: int, volume: int) -> Any:
+        if self._ProtoOAClosePositionReq is None:
+            raise RuntimeError("cTrader close-position request type is unavailable.")
+        if isinstance(position_id, bool):
+            raise ValueError("cTrader close position id must be positive.")
+        try:
+            position_id_value = int(position_id)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("cTrader close position id must be positive integer.") from exc
+        if position_id_value <= 0 or (
+            isinstance(position_id, float) and position_id != position_id_value
+        ):
+            raise ValueError("cTrader close position id must be positive integer.")
+        volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
+        broker_volume = int(round(volume_value))
+        if broker_volume <= 0:
+            raise ValueError("cTrader close volume must be a positive integer.")
+        request = self._ProtoOAClosePositionReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.positionId = position_id_value
+        request.volume = broker_volume
+        return request
+
     def _build_new_order_request(self, signal: LiveSignal, *, symbol_id: int) -> Any:
         if signal.action not in {"buy", "sell"}:
-            # Fail closed: an unmapped action must never fall through to SELL.
             raise ValueError(f"Unsupported signal action: {signal.action}")
+        metadata = signal.metadata or {}
+        if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
+            raise ValueError(
+                "cTrader exit-only orders must use a broker position-addressed close request."
+            )
         request = self._ProtoOANewOrderReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
         request.symbolId = int(symbol_id)
@@ -1836,45 +2055,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = self._resolve_order_volume(signal)
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
-        metadata = signal.metadata or {}
         stop_loss = _first_metadata_float(
             metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
         )
         take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-        exit_only = (
-            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
-        )
-        # C1: explicit unbounded-take-profit policy (processor-declared, e.g.
-        # RocketFuel exits on the opposite signal) — stop-only order, never
-        # an invented bracket.
-        unbounded_tp = not exit_only and take_profit is None and is_unbounded_tp(metadata)
+        unbounded_tp = take_profit is None and is_unbounded_tp(metadata)
         if stop_loss is None or (take_profit is None and not unbounded_tp):
-            if exit_only:
-                # Exit-only orders close an existing position; they reduce
-                # exposure and carry no entry SL/TP. Only OPENING orders are
-                # required to be bounded.
-                pass
-            else:
-                # Fail closed: never open a position naked; sizing assumed a stop.
-                missing = [
-                    name
-                    for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
-                    if value is None
-                ]
-                raise ValueError(
-                    "Refusing to submit cTrader order without "
-                    f"{' and '.join(missing)} (signal_id={signal.id}, "
-                    f"symbol={signal.symbol}); opening an unbounded position is not allowed."
-                )
-        elif not exit_only:
-            # MARKET orders ignore absolute stopLoss/takeProfit ("Not supported for
-            # MARKET orders" per the Open API docs); send the distances via the
-            # relative fields, which the protocol accepts for MARKET orders.
-            relative_stop, relative_take = self._resolve_relative_sl_tp(
-                signal, stop_loss, take_profit
+            missing = [
+                name
+                for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
+                if value is None
+            ]
+            raise ValueError(
+                "Refusing to submit cTrader order without "
+                f"{' and '.join(missing)} (signal_id={signal.id}, "
+                f"symbol={signal.symbol}); opening an unbounded position is not allowed."
             )
-            request.relativeStopLoss = relative_stop
-            request.relativeTakeProfit = relative_take
+        relative_stop, relative_take = self._resolve_relative_sl_tp(
+            signal, stop_loss, take_profit
+        )
+        request.relativeStopLoss = relative_stop
+        request.relativeTakeProfit = relative_take
         return request
 
     def _resolve_relative_sl_tp(
@@ -1886,8 +2087,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         stopLoss/takeProfit fields are "Not supported for MARKET orders" — this
         adapter submits MARKET/IMMEDIATE_OR_CANCEL orders, so the distances are
         sent via relativeStopLoss/relativeTakeProfit instead: int64 in
-        1/(10**digits) of a price unit (FX digits=5: 123000 means 1.23),
-        where for BUY stopLoss = entryPrice - relativeStopLoss and takeProfit
+        1/100000 of a price unit (123000 means 1.23), where for BUY
+        stopLoss = entryPrice - relativeStopLoss and takeProfit
         = entryPrice + relativeTakeProfit (reversed for SELL).
         """
         reference_price = float(signal.theoretical_price)
@@ -1896,9 +2097,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        # #80: per-symbol digit scale (FX 5 -> 100_000, JPY 3 -> 1000,
-        # XAU 2 -> 100) from broker props or the fallback table.
-        scale = 10 ** self._scale_for(signal.symbol).price_digits
+        self._scale_for(signal.symbol)
+        scale = CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
 
         def _distance(price: float) -> int:
             if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -2017,6 +2217,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             symbol_id: name for name, symbol_id in self._symbol_name_to_id.items()
         }
         payload: list[dict[str, Any]] = []
+        observed_position_ids: dict[str, list[int]] = {}
+        self._position_ids_by_symbol = {}
         for position in getattr(reconcile_res, "position", []):
             status = int(getattr(position, "positionStatus", 0) or 0)
             if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
@@ -2038,15 +2240,23 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
                 qty = -qty
-            payload.append(
-                {
-                    "symbol": str(symbol).strip().upper(),
-                    "qty": qty,
-                    "entry_price": _to_float(getattr(position, "price", 0)),
-                    "current_price": 0.0,
-                    "unrealized_pnl": 0.0,
-                }
-            )
+            normalized_symbol = str(symbol).strip().upper()
+            row: dict[str, Any] = {
+                "symbol": normalized_symbol,
+                "qty": qty,
+                "entry_price": _to_float(getattr(position, "price", 0)),
+                "current_price": 0.0,
+                "unrealized_pnl": 0.0,
+            }
+            position_id = int(getattr(position, "positionId", 0) or 0)
+            if position_id > 0:
+                row["position_id"] = position_id
+                observed_position_ids.setdefault(normalized_symbol, []).append(position_id)
+            payload.append(row)
+        self._position_ids_by_symbol = {
+            symbol: tuple(position_ids)
+            for symbol, position_ids in observed_position_ids.items()
+        }
         return payload
 
     async def _persist_execution_event(self, event: Any) -> None:
@@ -2057,8 +2267,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         }:
             return
 
-        order = event.order if event.HasField("order") else None
-        deal = event.deal if event.HasField("deal") else None
+        order = getattr(event, "order", None)
+        deal = getattr(event, "deal", None)
 
         order_id, client_order_id = self._extract_order_and_client_ids(order, deal)
         if not client_order_id and order_id is not None:
@@ -2075,10 +2285,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             client_order_id, order_id=order_id, execution_type=execution_type
         )
         if signal_id is None:
-            return
+            raise ValueError(
+                "cTrader fill could not be mapped to a persisted live signal; "
+                "retaining the event for reconciliation."
+            )
 
         timestamp_ms = self._resolve_execution_timestamp_ms(order=order, deal=deal)
         filled_volume = self._resolve_filled_volume(order=order, deal=deal)
+        if filled_volume <= 0:
+            raise ValueError(
+                "cTrader fill carries no positive executed volume; retaining "
+                "the event for reconciliation."
+            )
         # Unit contract (#80): persist filled_qty in qty units per the fill's
         # symbol scale — deal symbolId first, then the submit-time order map.
         fill_symbol: str | None = None
@@ -2098,7 +2316,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_to_float(deal.commission) if deal is not None else 0.0,
+            commission=_to_float(getattr(deal, "commission", 0.0)) if deal is not None else 0.0,
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
@@ -2106,7 +2324,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 filled_volume=filled_volume,
             ),
         )
-        await asyncio.to_thread(save_live_execution, execution)
+        persisted = await asyncio.to_thread(save_live_execution, execution)
+        if not persisted:
+            logger.info(
+                "Skipped duplicate cTrader execution fill",
+                extra={
+                    "data": {
+                        "signal_id": str(execution.signal_id),
+                        "broker_order_id": execution.broker_order_id,
+                        "execution_type": execution_type,
+                    }
+                },
+            )
+            return
         logger.info(
             "Persisted cTrader execution fill",
             extra={
@@ -2127,12 +2357,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         order_id: int | None = None
         client_order_id = ""
         if order is not None:
-            if order.orderId > 0:
-                order_id = int(order.orderId)
-            if order.clientOrderId:
-                client_order_id = str(order.clientOrderId)
-        if order_id is None and deal is not None and deal.orderId > 0:
-            order_id = int(deal.orderId)
+            raw_order_id = _to_float(getattr(order, "orderId", 0), default=0.0)
+            if raw_order_id > 0:
+                order_id = int(raw_order_id)
+            client_order_id = str(getattr(order, "clientOrderId", "") or "")
+        if order_id is None and deal is not None:
+            raw_order_id = _to_float(getattr(deal, "orderId", 0), default=0.0)
+            if raw_order_id > 0:
+                order_id = int(raw_order_id)
         if not client_order_id and order_id is not None:
             client_order_id = self._order_id_to_signal_id.get(order_id, "")
         return order_id, client_order_id
@@ -2172,31 +2404,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
-        if deal is not None and deal.executionPrice:
-            return _to_float(deal.executionPrice)
-        if order is not None and order.executionPrice:
-            return _to_float(order.executionPrice)
+        if deal is not None:
+            value = _to_float(getattr(deal, "executionPrice", 0.0))
+            if value:
+                return value
+        if order is not None:
+            value = _to_float(getattr(order, "executionPrice", 0.0))
+            if value:
+                return value
         return 0.0
 
     @staticmethod
     def _resolve_filled_volume(*, order: Any | None, deal: Any | None) -> float:
         if deal is not None:
-            if deal.filledVolume > 0:
-                return _to_float(deal.filledVolume)
-            if deal.volume > 0:
-                return _to_float(deal.volume)
-        elif order is not None and order.executedVolume > 0:
-            return _to_float(order.executedVolume)
+            for attribute in ("filledVolume", "volume"):
+                value = _to_float(getattr(deal, attribute, 0.0))
+                if math.isfinite(value) and value > 0:
+                    return value
+        if order is not None:
+            value = _to_float(getattr(order, "executedVolume", 0.0))
+            if math.isfinite(value) and value > 0:
+                return value
         return 0.0
 
     @staticmethod
     def _resolve_execution_timestamp_ms(*, order: Any | None, deal: Any | None) -> int:
-        if deal is not None and deal.executionTimestamp > 0:
-            return int(deal.executionTimestamp)
-        if deal is not None and deal.utcLastUpdateTimestamp > 0:
-            return int(deal.utcLastUpdateTimestamp)
-        if order is not None and order.utcLastUpdateTimestamp > 0:
-            return int(order.utcLastUpdateTimestamp)
+        if deal is not None:
+            for attribute in ("executionTimestamp", "utcLastUpdateTimestamp"):
+                value = _to_float(getattr(deal, attribute, 0.0), default=0.0)
+                if value > 0:
+                    return int(value)
+        if order is not None:
+            value = _to_float(getattr(order, "utcLastUpdateTimestamp", 0.0), default=0.0)
+            if value > 0:
+                return int(value)
         return 0
 
     @staticmethod
@@ -2212,9 +2453,33 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return f"ctrader:deal:{deal_id}"
         return f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
 
+    def _requeue_execution_event(self, event: Any) -> bool:
+        key = id(event)
+        attempts = self._execution_retry_counts.get(key, 0)
+        self._reconciliation_required = True
+        self._reconciliation_retry_at = 0.0
+        if attempts < EXECUTION_RETRY_LIMIT:
+            self._execution_retry_counts[key] = attempts + 1
+            try:
+                self._execution_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                if len(self._unresolved_execution_events) >= UNRESOLVED_EXECUTION_EVENT_LIMIT:
+                    self._execution_retry_counts.pop(key, None)
+                    return False
+                self._unresolved_execution_events.append(event)
+            return True
+        if len(self._unresolved_execution_events) < UNRESOLVED_EXECUTION_EVENT_LIMIT:
+            self._unresolved_execution_events.append(event)
+        self._execution_retry_counts.pop(key, None)
+        return False
+
+    def _ack_execution_event(self, event: Any) -> None:
+        self._execution_retry_counts.pop(id(event), None)
+
     async def listen_executions(self) -> None:
         backoff_seconds = 2
         while True:
+            event: Any | None = None
             try:
                 if not self._connected or not self._authenticated:
                     await self.connect()
@@ -2223,15 +2488,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
                 await self._persist_execution_event(event)
+                self._ack_execution_event(event)
                 backoff_seconds = 2
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
                 raise
             except CTraderAuthTerminalError as exc:
+                if event is not None and not self._requeue_execution_event(event):
+                    raise RuntimeError(
+                        "cTrader execution event could not be requeued after "
+                        "terminal authentication failure; broker reconciliation "
+                        "is required."
+                    ) from exc
                 self._log_listener_terminal_auth_failure(exc)
                 return
             except Exception as exc:
+                if event is not None and not self._requeue_execution_event(event):
+                    raise RuntimeError(
+                        "cTrader execution event exhausted its retry budget; "
+                        "broker reconciliation is required before acknowledging "
+                        "the fill."
+                    ) from exc
                 logger.warning(
                     "cTrader listener loop error, retrying",
                     extra={
@@ -2268,6 +2546,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
         else:
+            unresolved = list(self._unresolved_execution_events)
+            self._unresolved_execution_events.clear()
+            still_unresolved: list[Any] = []
+            for pending_event in unresolved:
+                requeued = self._requeue_execution_event(pending_event)
+                if not requeued or any(
+                    id(pending_event) == id(stored_event)
+                    for stored_event in self._unresolved_execution_events
+                ):
+                    still_unresolved.append(pending_event)
+            self._unresolved_execution_events.clear()
+            if still_unresolved:
+                self._unresolved_execution_events.extend(
+                    still_unresolved[:UNRESOLVED_EXECUTION_EVENT_LIMIT]
+                )
+                self._reconciliation_required = True
+                self._reconciliation_retry_at = time.monotonic() + backoff_seconds
+                return
             self._reconciliation_required = False
             self._reconciliation_retry_at = 0.0
 

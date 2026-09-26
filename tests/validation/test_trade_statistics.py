@@ -41,6 +41,25 @@ def test_empty_list_returns_defaults() -> None:
     assert stats.net_profit == 0.0
 
 
+def test_initial_capital_is_validated_even_without_trades() -> None:
+    with pytest.raises(ValueError, match="initial_capital"):
+        compute_trade_statistics([], initial_capital=0.0)
+
+
+def test_empty_result_persists_risk_free_rate() -> None:
+    stats = compute_trade_statistics([], risk_free_rate=0.0375)
+
+    assert stats.risk_free_rate == pytest.approx(0.0375)
+    assert isinstance(stats.risk_free_rate, float)
+
+
+def test_nonempty_result_persists_risk_free_rate() -> None:
+    stats = compute_trade_statistics([_make_trade(1, [10.0])], risk_free_rate=0.0375)
+
+    assert stats.risk_free_rate == pytest.approx(0.0375)
+    assert isinstance(stats.risk_free_rate, float)
+
+
 # ── 2. Single trade scenarios ──────────────────────────────────────────────
 
 
@@ -196,12 +215,18 @@ def test_max_drawdown_pct() -> None:
     assert stats.max_drawdown_pct == pytest.approx(0.7)
 
 
-def test_max_drawdown_never_positive_equity() -> None:
-    # Always losing — peak stays at 0, so pct DD stays 0 to avoid /0
+def test_max_drawdown_without_initial_capital_keeps_legacy_pnl_basis() -> None:
     trades = [_make_trade(i, [-10.0]) for i in range(3)]
     stats = compute_trade_statistics(trades)
     assert stats.max_drawdown == pytest.approx(30.0)
     assert stats.max_drawdown_pct == pytest.approx(0.0)
+
+
+def test_max_drawdown_pct_uses_initial_account_equity() -> None:
+    trades = [_make_trade(i, [-10.0]) for i in range(3)]
+    stats = compute_trade_statistics(trades, initial_capital=100.0)
+    assert stats.max_drawdown == pytest.approx(30.0)
+    assert stats.max_drawdown_pct == pytest.approx(0.3)
 
 
 def test_max_drawdown_new_higher_peak() -> None:
@@ -417,7 +442,9 @@ def test_break_even_trade_not_counted_as_winner_or_loser() -> None:
 # ── 17. Fees / net PnL (DV-B46) ────────────────────────────────────────────
 
 
-def _make_fee_trade(trade_id: int, exit_pnl: float, fees: float | None, net_pnl: float | None = None) -> Trade:
+def _make_fee_trade(
+    trade_id: int, exit_pnl: float, fees: float | None, net_pnl: float | None = None
+) -> Trade:
     exits = [TradeExit(time="2024-01-01T00:00:00Z", price=100.0, quantity=1.0, pnl=exit_pnl)]
     total = exit_pnl
     return Trade(
@@ -453,7 +480,21 @@ def test_fees_subtracted_from_gross_when_no_net() -> None:
     assert stats.gross_profit == pytest.approx(100.0)
 
 
-def test_fees_alone_do_not_make_a_winner_a_loser() -> None:
+def test_net_aggregates_follow_net_winner_classification() -> None:
+    trades = [
+        _make_fee_trade(1, 1.0, fees=5.0),
+        _make_fee_trade(2, 10.0, fees=1.0),
+    ]
+    stats = compute_trade_statistics(trades)
+    assert stats.winning_trades == 1
+    assert stats.losing_trades == 1
+    assert stats.profit_factor == pytest.approx(9.0 / 4.0)
+    assert stats.avg_winner == pytest.approx(9.0)
+    assert stats.avg_loser == pytest.approx(-4.0)
+    assert stats.gross_profit == pytest.approx(11.0)
+    assert stats.gross_loss == pytest.approx(0.0)
+
+
     trades = [_make_fee_trade(1, 10.0, fees=1.0)]
     stats = compute_trade_statistics(trades)
     assert stats.winning_trades == 1

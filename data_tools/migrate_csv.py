@@ -14,15 +14,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-import os
 import re
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+from data_tools.path_safety import build_dataset_path, ensure_dataset_path_within
+from shared.atomic_io import write_parquet_atomically, write_text_atomically
 from shared.constants import DATA_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -42,7 +43,9 @@ def migrate_dukascopy_xauusd(dry_run: bool, force: bool = False) -> int:
     }
     for pattern, tf in patterns.items():
         for csv_path in LEAN_DATA.glob(pattern):
-            dest = DATA_DIR / "ohlcv" / "dukascopy" / "forex" / "XAUUSD" / f"{tf}.parquet"
+            dest = build_dataset_path(
+                DATA_DIR, "ohlcv", "dukascopy", "forex", "XAUUSD", f"{tf}.parquet"
+            )
             count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
@@ -52,7 +55,9 @@ def migrate_lean_equities_h1(dry_run: bool, force: bool = False) -> int:
     count = 0
     for csv_path in LEAN_DATA.glob("*_H1_730d.csv"):
         symbol = csv_path.name.split("_")[0]
-        dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "1h.parquet"
+        dest = build_dataset_path(
+            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "1h.parquet"
+        )
         count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
@@ -65,7 +70,9 @@ def migrate_lean_equities_m15(dry_run: bool, force: bool = False) -> int:
         if name.startswith("XAUUSD"):
             continue  # handled by dukascopy migration
         symbol = name.split("_")[0]
-        dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "15m.parquet"
+        dest = build_dataset_path(
+            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "15m.parquet"
+        )
         count += _convert_ohlcv(csv_path, dest, dry_run, force=force, timestamp_col="timestamp")
     return count
 
@@ -78,7 +85,9 @@ def migrate_lean_equities_daily(dry_run: bool, force: bool = False) -> int:
         return 0
     for csv_path in equity_dir.glob("*_daily.csv"):
         symbol = csv_path.name.replace("_daily.csv", "")
-        dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "1d.parquet"
+        dest = build_dataset_path(
+            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "1d.parquet"
+        )
         count += _convert_ohlcv(csv_path, dest, dry_run, force=force)
     return count
 
@@ -93,7 +102,9 @@ def migrate_stockkit_5m(dry_run: bool, force: bool = False) -> int:
         symbol = csv_path.stem
         if not re.match(r"^[A-Z]{1,5}$", symbol):
             continue
-        dest = DATA_DIR / "ohlcv" / "yfinance" / "equity" / "US" / symbol / "5m.parquet"
+        dest = build_dataset_path(
+            DATA_DIR, "ohlcv", "yfinance", "equity", "US", symbol, "5m.parquet"
+        )
         count += _convert_ohlcv(csv_path, dest, dry_run, force=force, datetime_col="Datetime")
     return count
 
@@ -102,7 +113,7 @@ def migrate_universe(dry_run: bool, force: bool = False) -> int:
     """Copy SP500 universe file."""
     if not LEAN_UNIVERSE.exists():
         return 0
-    dest = DATA_DIR / "universes" / "sp500_changes.txt"
+    dest = build_dataset_path(DATA_DIR, "universes", "sp500_changes.txt")
     if dest.exists() and not force:
         logger.info("[SKIP] %s (already exists)", dest)
         return 0
@@ -114,7 +125,7 @@ def migrate_universe(dry_run: bool, force: bool = False) -> int:
 
     if dest.exists() and force:
         backup = dest.with_name(
-            f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}{dest.suffix}"
+            f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}{dest.suffix}"
         )
         shutil.copy2(dest, backup)
         logger.info("Backed up %s → %s", dest, backup)
@@ -145,6 +156,41 @@ def _source_fingerprint(csv_path: Path) -> str:
     return f"sha256:{digest.hexdigest()[:16]} rows~{max(rows, 0)}"
 
 
+def _migration_metadata_path(dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.migration.json")
+
+
+def _read_migration_metadata(dest: Path) -> dict:
+    metadata_path = _migration_metadata_path(dest)
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_migration_metadata(
+    dest: Path,
+    *,
+    csv_path: Path,
+    source_fingerprint: str,
+    rows: int,
+) -> None:
+    write_text_atomically(
+        _migration_metadata_path(dest),
+        json.dumps(
+            {
+                "source": str(csv_path),
+                "source_fingerprint": source_fingerprint,
+                "rows": rows,
+                "migrated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+    )
+
+
 def _convert_ohlcv(
     csv_path: Path,
     dest: Path,
@@ -154,7 +200,23 @@ def _convert_ohlcv(
     force: bool = False,
 ) -> int:
     """Convert a single OHLCV CSV to Parquet."""
+    dest = ensure_dataset_path_within(dest.parent, dest.name)
     if dest.exists() and not force:
+        metadata = _read_migration_metadata(dest)
+        current_fingerprint = _source_fingerprint(csv_path)
+        recorded_fingerprint = str(metadata.get("source_fingerprint") or "")
+        if not recorded_fingerprint:
+            raise RuntimeError(
+                f"Migration artifact {dest} has no source fingerprint; refusing "
+                "to skip an unverifiable legacy artifact. Re-run with --force "
+                "to replace it after reviewing the source."
+            )
+        if recorded_fingerprint != current_fingerprint:
+            raise RuntimeError(
+                f"Migration artifact {dest} was created from a different source "
+                "fingerprint; refusing to skip stale data. Re-run with --force "
+                "to replace it after reviewing the source change."
+            )
         logger.info("[SKIP] %s (already exists)", dest)
         return 0
 
@@ -225,19 +287,26 @@ def _convert_ohlcv(
             # B3: --force overwrites back up the previous artifact with a
             # timestamped backup instead of destroying it.
             backup = dest.with_name(
-                f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}{dest.suffix}"
+                f"{dest.stem}.bak.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}{dest.suffix}"
             )
             import shutil
 
             shutil.copy2(dest, backup)
             logger.info("Backed up %s → %s", dest, backup)
-        df.to_parquet(dest, index=False, engine="pyarrow")
+        source_fingerprint = _source_fingerprint(csv_path)
+        write_parquet_atomically(dest, df)
+        _write_migration_metadata(
+            dest,
+            csv_path=csv_path,
+            source_fingerprint=source_fingerprint,
+            rows=len(df),
+        )
         logger.info(
             "Converted %s → %s (%d rows, source %s)",
             csv_path.name,
             dest,
             len(df),
-            _source_fingerprint(csv_path),
+            source_fingerprint,
         )
         return 1
 

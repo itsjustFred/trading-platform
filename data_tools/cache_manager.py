@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from data_tools.catalog_builder import build_catalog, merge_ohlcv_entries
+from data_tools.catalog_builder import build_catalog, merge_ohlcv_entries, parse_ohlcv_path
+from data_tools.file_fingerprint import fingerprint_matches
+from data_tools.path_safety import ensure_dataset_path_within
 from shared.constants import DATA_DIR
 from shared.logging import get_logger
 
@@ -133,7 +135,9 @@ def _normalize_catalog_payload(payload: dict[str, Any], data_dir: Path) -> dict[
         else []
     )
 
-    symbol_count = len({str(entry.get("symbol") or "") for entry in merged_ohlcv if entry.get("symbol")})
+    symbol_count = len(
+        {str(entry.get("symbol") or "") for entry in merged_ohlcv if entry.get("symbol")}
+    )
     source_values: set[str] = set()
     for entry in merged_ohlcv:
         source_values.update(_collect_sources(entry))
@@ -163,6 +167,95 @@ def _normalize_catalog_payload(payload: dict[str, Any], data_dir: Path) -> dict[
     normalized["universes"] = universes
     normalized["summary"] = summary_payload
     return normalized
+
+
+def _catalog_path(data_dir: Path, value: object) -> Path:
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else data_dir / path
+
+
+def _catalog_entry_fingerprints(entry: dict[str, Any]) -> dict[str, Any] | None:
+    raw = entry.get("file_fingerprints")
+    if isinstance(raw, dict) and raw:
+        return {str(path): value for path, value in raw.items()}
+
+    fingerprints: dict[str, Any] = {}
+    candidates: list[dict[str, Any]] = []
+    segments = entry.get("segments")
+    if isinstance(segments, list):
+        candidates.extend(segment for segment in segments if isinstance(segment, dict))
+    if not candidates:
+        candidates = [entry]
+    for candidate in candidates:
+        path = str(candidate.get("path") or "").strip()
+        if not path:
+            continue
+        if candidate.get("mtime_ns") is not None and candidate.get("size_bytes") is not None:
+            fingerprints[path] = {
+                "mtime_ns": candidate.get("mtime_ns"),
+                "size_bytes": candidate.get("size_bytes"),
+            }
+    return fingerprints or None
+
+
+def _catalog_matches_disk(payload: dict[str, Any], data_dir: Path) -> bool:
+    entries = payload.get("ohlcv")
+    if not isinstance(entries, list):
+        return True
+
+    ohlcv_root = data_dir / "ohlcv"
+    expected_paths: set[str] = set()
+    has_fingerprint_metadata = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        fingerprints = _catalog_entry_fingerprints(entry)
+        if fingerprints is None:
+            continue
+        has_fingerprint_metadata = True
+        for path, expected in fingerprints.items():
+            resolved = _catalog_path(data_dir, path)
+            try:
+                resolved = ensure_dataset_path_within(ohlcv_root, resolved)
+            except ValueError:
+                return False
+            expected_paths.add(str(resolved.resolve(strict=False)))
+            if not fingerprint_matches(resolved, expected):
+                return False
+
+    if not has_fingerprint_metadata:
+        return True
+
+    actual_paths: set[str] = set()
+    if ohlcv_root.exists():
+        for path in ohlcv_root.rglob("*.parquet"):
+            try:
+                ensure_dataset_path_within(ohlcv_root, path)
+            except ValueError:
+                continue
+            if parse_ohlcv_path(path, ohlcv_root) is None or not path.is_file():
+                continue
+            actual_paths.add(str(path.resolve(strict=False)))
+    return actual_paths == expected_paths
+
+
+def _fresh_cached_catalog(key: CacheKey, data_dir: Path) -> dict[str, Any] | None:
+    while True:
+        with _CACHE_LOCK:
+            cached_catalog = _CATALOG_CACHE.get(key)
+        if cached_catalog is None:
+            return None
+
+        matches_disk = _catalog_matches_disk(cached_catalog, data_dir)
+        with _CACHE_LOCK:
+            if _CATALOG_CACHE.get(key) is not cached_catalog:
+                continue
+            if not matches_disk:
+                _CATALOG_CACHE.pop(key, None)
+                _OVERVIEW_CACHE.pop(key, None)
+                return None
+            _CACHE_STATS["hits"] += 1
+            return cached_catalog
 
 
 def _load_catalog_from_disk(
@@ -199,6 +292,12 @@ def _load_catalog_from_disk(
     payload.setdefault("fundamentals", [])
     payload.setdefault("universes", [])
     payload.setdefault("summary", {})
+    if not _catalog_matches_disk(payload, data_dir):
+        logger.info(
+            "Catalog cache fingerprints are stale",
+            extra={"data": {"path": str(catalog_path)}},
+        )
+        return None
     return payload
 
 
@@ -236,23 +335,26 @@ def get_catalog(
 ) -> dict[str, Any]:
     """Return cached catalog payload, lazily building on first read."""
     key = _cache_key(data_dir, include_validation)
+    root = Path(key[0])
 
-    with _CACHE_LOCK:
-        cached_catalog = _CATALOG_CACHE.get(key)
+    while True:
+        cached_catalog = _fresh_cached_catalog(key, root)
         if cached_catalog is not None:
-            _CACHE_STATS["hits"] += 1
             return deepcopy(cached_catalog)
 
-        _CACHE_STATS["misses"] += 1
-        root = Path(key[0])
-        catalog = _load_catalog_from_disk(root, include_validation=include_validation)
-        if catalog is None:
-            catalog = build_catalog(root, include_validation=include_validation)
-        catalog = _normalize_catalog_payload(catalog, root)
-        _CATALOG_CACHE[key] = catalog
-        _OVERVIEW_CACHE[key] = _build_overview_metadata(catalog)
-        _CACHE_STATS["builds"] += 1
-        _CACHE_STATS["last_build_at"] = _utc_now_iso()
+        with _CACHE_LOCK:
+            if key in _CATALOG_CACHE:
+                continue
+            _CACHE_STATS["misses"] += 1
+            catalog = _load_catalog_from_disk(root, include_validation=include_validation)
+            if catalog is None:
+                catalog = build_catalog(root, include_validation=include_validation)
+            catalog = _normalize_catalog_payload(catalog, root)
+            _CATALOG_CACHE[key] = catalog
+            _OVERVIEW_CACHE[key] = _build_overview_metadata(catalog)
+            _CACHE_STATS["builds"] += 1
+            _CACHE_STATS["last_build_at"] = _utc_now_iso()
+            break
 
     logger.debug(
         "Catalog cache populated",
@@ -270,13 +372,11 @@ def get_catalog_ohlcv_entries(
     """Return cached catalog OHLCV entries."""
     if unsafe_no_copy:
         key = _cache_key(data_dir, include_validation)
-        with _CACHE_LOCK:
-            cached_catalog = _CATALOG_CACHE.get(key)
-            if cached_catalog is not None:
-                _CACHE_STATS["hits"] += 1
-                entries = cached_catalog.get("ohlcv", [])
-                if isinstance(entries, list):
-                    return entries
+        cached_catalog = _fresh_cached_catalog(key, Path(key[0]))
+        if cached_catalog is not None:
+            entries = cached_catalog.get("ohlcv", [])
+            if isinstance(entries, list):
+                return entries
 
     catalog = get_catalog(data_dir=data_dir, include_validation=include_validation)
     entries = catalog.get("ohlcv", [])
@@ -292,11 +392,22 @@ def get_overview_metadata(
 ) -> dict[str, Any]:
     """Return cached overview metadata derived from the catalog."""
     key = _cache_key(data_dir, include_validation)
-    with _CACHE_LOCK:
-        cached_overview = _OVERVIEW_CACHE.get(key)
+    while True:
+        with _CACHE_LOCK:
+            cached_overview = _OVERVIEW_CACHE.get(key)
+        if cached_overview is None:
+            break
+        cached_catalog = _fresh_cached_catalog(key, Path(key[0]))
+        if cached_catalog is None:
+            with _CACHE_LOCK:
+                if key not in _CATALOG_CACHE:
+                    _OVERVIEW_CACHE.pop(key, None)
+            break
+        with _CACHE_LOCK:
+            cached_overview = _OVERVIEW_CACHE.get(key)
         if cached_overview is not None:
-            _CACHE_STATS["hits"] += 1
             return deepcopy(cached_overview)
+        break
 
     catalog = get_catalog(data_dir=data_dir, include_validation=include_validation)
     overview = _build_overview_metadata(catalog)

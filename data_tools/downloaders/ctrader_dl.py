@@ -19,13 +19,13 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
+from data_tools.path_safety import validate_dataset_component
 from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,7 @@ class CTraderDownloader(Downloader):
         **kwargs,
     ) -> DownloadResult:
         symbol = symbol.upper()
+        validate_dataset_component(symbol, name="symbol")
 
         if timeframe not in RESAMPLE_MAP and timeframe != "tick":
             raise ValueError(f"Unsupported timeframe: {timeframe}")
@@ -181,8 +182,16 @@ class CTraderDownloader(Downloader):
             asset_class=asset_class,
             path=out_path,
             rows=len(combined),
-            start=str(combined["timestamp"].iloc[0]) if "timestamp" in combined.columns and len(combined) > 0 else "",
-            end=str(combined["timestamp"].iloc[-1]) if "timestamp" in combined.columns and len(combined) > 0 else "",
+            start=(
+                str(combined["timestamp"].iloc[0])
+                if "timestamp" in combined.columns and len(combined) > 0
+                else ""
+            ),
+            end=(
+                str(combined["timestamp"].iloc[-1])
+                if "timestamp" in combined.columns and len(combined) > 0
+                else ""
+            ),
             size_bytes=out_path.stat().st_size,
         )
 

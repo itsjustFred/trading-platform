@@ -13,7 +13,6 @@ PyneCore branch was test-blind) plus the P2 fixes:
 """
 
 from __future__ import annotations
-from tests.helpers import with_zero_fees
 
 from pathlib import Path
 from typing import Any
@@ -21,20 +20,24 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import (
     _apply_fill_parity,
     _apply_risk_sizing,
+    _enrich_trades_with_context,
     _gate_warmup_trades,
+    _normalize_trade_exits,
     _pyne_cli_end_bound,
     _pyne_cli_start_bound,
 )
-from runner.engines._shared import resolve_max_leverage as _resolve_max_leverage
 from shared.models import Trade, TradeExit
+from tests.helpers import with_zero_fees
 
 
 def _trade(
     *,
+    trade_id: int = 1,
     entry_price: float = 100.0,
     sl_price: float | None = 99.0,
     exit_price: float = 101.0,
@@ -48,7 +51,7 @@ def _trade(
     if sl_price is not None:
         meta["sl_price"] = sl_price
     return Trade(
-        id=1,
+        id=trade_id,
         symbol="T",
         direction=direction,
         entry_time=entry_time,
@@ -68,6 +71,112 @@ def _trade(
     )
 
 
+def test_shared_equity_sizes_later_trades_after_realized_pnl(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.5,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-03T00:00:00+00:00",
+        entry_price=100.0,
+        sl_price=99.0,
+        exit_price=110.0,
+    )
+    second = _trade(
+        trade_id=2,
+        entry_time="2024-01-04T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+        entry_price=100.0,
+        sl_price=99.0,
+        exit_price=101.0,
+    )
+
+    _apply_risk_sizing([first, second], config, "equities")
+
+    assert first.quantity == pytest.approx(500.0)
+    assert first.meta["risk_math"]["equity_at_entry"] == pytest.approx(100_000.0)
+    assert second.meta["risk_math"]["equity_at_entry"] == pytest.approx(105_000.0)
+    assert second.quantity == pytest.approx(525.0)
+
+
+def test_overlapping_pyne_trades_share_aggregate_leverage_cap(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    second = _trade(
+        trade_id=2,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+
+    _apply_risk_sizing([first, second], config, "equities")
+
+    assert first.quantity == pytest.approx(750.0)
+    assert second.quantity == pytest.approx(250.0)
+    assert second.meta["risk_math"]["open_notional_pct"] == pytest.approx(1.0)
+
+
+def test_enrich_trades_with_context_materializes_canonical_levels() -> None:
+    trade = _trade()
+    trade.meta = {"sl_price": 99.0, "tp_price": 102.0}
+    context = {"rsi": (pd.Series([50.0, 51.0]), "entry")}
+    _enrich_trades_with_context([trade], context, _frame())
+    assert trade.stop_loss == pytest.approx(99.0)
+    assert trade.take_profit == pytest.approx(102.0)
+
+
+def test_final_exit_levels_and_reason_do_not_rewrite_earlier_legs() -> None:
+    trade = _trade()
+    trade.exits = [
+        TradeExit(
+            time="2024-01-02T00:00:00+00:00",
+            price=97.0,
+            quantity=0.5,
+            pnl=-150.0,
+            reason="partial",
+        ),
+        TradeExit(
+            time="2024-01-03T00:00:00+00:00",
+            price=102.0,
+            quantity=0.5,
+            pnl=100.0,
+            reason=None,
+        ),
+    ]
+    context = {
+        "initial_sl": (pd.Series([99.0, 98.0]), "exit"),
+        "initial_tp": (pd.Series([105.0, 101.0]), "exit"),
+        "exit_reason": (pd.Series([None, "take_profit"]), "exit"),
+    }
+
+    _enrich_trades_with_context([trade], context, _frame())
+    _normalize_trade_exits([trade])
+
+    assert trade.exits[0].price == pytest.approx(97.0)
+    assert trade.exits[0].reason == "partial"
+    assert trade.exits[1].price == pytest.approx(101.0)
+    assert trade.exits[1].reason == "take_profit"
+
+
+def test_context_rejects_exit_before_entry() -> None:
+    trade = _trade(entry_time="2024-01-03T00:00:00+00:00")
+    trade.exits[0].time = "2024-01-02T00:00:00+00:00"
+    context = {"exit_reason": (pd.Series([None, "signal"]), "exit")}
+
+    with pytest.raises(ValueError, match="before entry"):
+        _enrich_trades_with_context([trade], context, _frame())
+
+
 def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
     payload: dict[str, Any] = {
         "strategy_name": "pyne_sizing",
@@ -82,6 +191,110 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
     }
     payload.update(overrides)
     return BacktestConfig(**with_zero_fees(payload))
+
+
+def test_colliding_trade_ids_keep_independent_open_ledger_entries(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    second = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    trades = [first, second]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert len(trades) == 2
+    assert first.quantity == pytest.approx(750.0)
+    assert second.quantity == pytest.approx(250.0)
+
+
+def test_colliding_trade_ids_do_not_reject_each_other(tmp_path: Path) -> None:
+    config = _config(tmp_path, reject_missing_stop=True)
+    accepted = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        sl_price=99.0,
+    )
+    rejected = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        sl_price=None,
+    )
+    trades = [accepted, rejected]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert trades == [accepted]
+
+
+def test_colliding_trade_ids_release_realized_pnl_before_later_entry(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    first = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-03T00:00:00+00:00",
+        exit_price=110.0,
+    )
+    second = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-04T00:00:00+00:00",
+        exit_price=111.0,
+    )
+    observer = _trade(
+        trade_id=2,
+        entry_time="2024-01-03T01:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+    )
+    trades = [second, first, observer]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert observer.meta["risk_math"]["equity_at_entry"] == pytest.approx(107_500.0)
+
+
+def test_release_order_follows_exit_order_when_entry_order_differs(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        max_position_exposure_pct=0.75,
+        max_leverage=1.0,
+    )
+    long_open = _trade(
+        trade_id=1,
+        entry_time="2024-01-02T00:00:00+00:00",
+        exit_time="2024-01-05T00:00:00+00:00",
+        exit_price=110.0,
+    )
+    early_close = _trade(
+        trade_id=2,
+        entry_time="2024-01-02T01:00:00+00:00",
+        exit_time="2024-01-02T02:00:00+00:00",
+        exit_price=111.0,
+    )
+    observer = _trade(
+        trade_id=3,
+        entry_time="2024-01-02T03:00:00+00:00",
+        exit_time="2024-01-04T00:00:00+00:00",
+    )
+    trades = [long_open, early_close, observer]
+
+    _apply_risk_sizing(trades, config, "equities")
+
+    assert observer.meta["risk_math"]["equity_at_entry"] == pytest.approx(102_750.0)
 
 
 def _frame() -> pd.DataFrame:

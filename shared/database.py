@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
 import subprocess
 import threading
-import contextlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,19 +40,23 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    LiveSignal,
     Service,
     ServiceStatus,
     ServiceType,
-    VerificationEvidenceRecord,
-    VerificationEvidenceStatus,
-    Portfolio as PortfolioModel,
-    PortfolioComponent as PortfolioComponentModel,
-    LiveSignal,
     Trade,
     TradeExit,
+    VerificationEvidenceRecord,
+    VerificationEvidenceStatus,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
+)
+from shared.models import (
+    Portfolio as PortfolioModel,
+)
+from shared.models import (
+    PortfolioComponent as PortfolioComponentModel,
 )
 
 logger = get_logger("database")
@@ -1496,6 +1500,12 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
+    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
+        logger.warning(
+            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
+            existing.id,
+        )
+        return
     else:
         logger.info(
             "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
@@ -1677,9 +1687,6 @@ def save_live_execution_up_to_cumulative(
                 session.rollback()
                 return 0.0
             return persisted_qty
-        except IntegrityError:
-            session.rollback()
-            return 0.0
         except Exception:
             session.rollback()
             raise
@@ -1708,9 +1715,15 @@ def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> boo
         return False
     init_db()
     with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         record = session.get(LiveSignalModel, normalized_signal_id)
         if record is None:
             return False
+        existing_order_id = str(record.broker_order_id or "").strip()
+        if existing_order_id and existing_order_id != normalized_order_id:
+            return False
+        if existing_order_id == normalized_order_id:
+            return True
         record.broker_order_id = normalized_order_id
         metadata = dict(record.metadata_json or {})
         metadata["broker_order_id"] = normalized_order_id
@@ -1732,6 +1745,19 @@ def get_live_signal_broker_order_id(signal_id: str) -> str | None:
             return None
         broker_order_id = str(record.broker_order_id or "").strip()
     return broker_order_id or None
+
+
+def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return None
+        metadata = dict(record.metadata_json or {})
+    return metadata
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -2588,13 +2614,24 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
         session.exec(delete(DrawingRecord).where(DrawingRecord.backtest_id == backtest_id))
         session.exec(delete(IndicatorRecord).where(IndicatorRecord.backtest_id == backtest_id))
 
+        stored_data = dict(result.meta.data or {})
+        stored_data["_backtest_config"] = {
+            "risk_per_trade_pct": result.meta.risk_per_trade_pct,
+            "max_position_exposure_pct": result.meta.max_position_exposure_pct,
+            "max_leverage": result.meta.max_leverage,
+            "modeling_resolution": result.meta.modeling_resolution,
+            "signal_exit_fill": result.meta.signal_exit_fill,
+            "allow_fallback_stop": result.meta.allow_fallback_stop,
+            "reject_missing_stop": result.meta.reject_missing_stop,
+            "require_explicit_column_roles": result.meta.require_explicit_column_roles,
+        }
         backtest_record = BacktestRecord(
             id=backtest_id,
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,
             backtest_end=result.meta.backtest_end,
-            data=result.meta.data,
+            data=stored_data,
             initial_capital=result.meta.initial_capital,
             parameters=result.meta.parameters,
             tags_json=result.meta.tags or [],
@@ -3855,6 +3892,8 @@ def _build_backtest_equity_curve(equity_rows: list[Any]) -> list[EquityPointMode
 
 
 def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
+    data = backtest.data or {}
+    runtime = data.get("_backtest_config", {}) if isinstance(data, dict) else {}
     return BacktestMeta(
         id=backtest.id,
         created_at=backtest.created_at,
@@ -3862,8 +3901,16 @@ def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
         strategies=backtest.strategies or [],
         backtest_start=backtest.backtest_start,
         backtest_end=backtest.backtest_end,
-        data=backtest.data or {},
+        data=data,
         initial_capital=backtest.initial_capital,
+        risk_per_trade_pct=runtime.get("risk_per_trade_pct"),
+        max_position_exposure_pct=runtime.get("max_position_exposure_pct"),
+        max_leverage=runtime.get("max_leverage"),
+        modeling_resolution=runtime.get("modeling_resolution", "main_timeframe"),
+        signal_exit_fill=runtime.get("signal_exit_fill", "close"),
+        allow_fallback_stop=runtime.get("allow_fallback_stop", True),
+        reject_missing_stop=runtime.get("reject_missing_stop", False),
+        require_explicit_column_roles=runtime.get("require_explicit_column_roles", False),
         parameters=backtest.parameters or {},
         tags=backtest.tags_json or [],
         notes=backtest.notes or "",

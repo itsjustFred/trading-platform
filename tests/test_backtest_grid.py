@@ -1,6 +1,5 @@
 import json
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -127,6 +126,48 @@ def test_subprocess_timeout_is_isolated_to_cell(monkeypatch, tmp_path):
     assert result["status"] == "failed"
     assert result["error_class"] == "timeout"
     assert "timed out" in result["error"]
+
+
+def test_subprocess_child_uses_filtered_environment(monkeypatch, tmp_path):
+    strategy = tmp_path / "trend_following.py"
+    strategy.write_text("STRATEGY_META = {'name': 'trend_following'}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args=args[0], returncode=1, stdout="failed", stderr="")
+
+    monkeypatch.setattr("runner.backtest_grid.subprocess.run", fake_run)
+    monkeypatch.setenv("NIM_API_KEY", "secret-key")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    result = run_one_backtest(
+        strategy=str(strategy),
+        symbol="SP500",
+        timeframe="1h",
+        start="2025-01-01",
+        end="2025-12-31",
+        engine="vectorbt",
+        capital=10000.0,
+        risk_pct=0.01,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=tmp_path / "out",
+        data_dir="/tmp/data",
+        timeout_seconds=5,
+        skip_existing=False,
+        use_subprocess=True,
+    )
+
+    env = captured["env"]
+    assert result["status"] == "failed"
+    assert "NIM_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["PYTHONUNBUFFERED"] == "1"
 
 
 def test_subprocess_launch_failure_is_isolated_to_cell(monkeypatch, tmp_path):

@@ -1,8 +1,9 @@
 """Tests for shared.models — universal trade format."""
 
-import json
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from shared.models import (
     BacktestMeta,
@@ -23,7 +24,13 @@ def _make_simple_trade() -> Trade:
         entry_price=121.50,
         quantity=82,
         exits=[
-            TradeExit(time="2021-03-18T15:45:00Z", price=124.80, quantity=82, reason="rsi_target", fees=1.64)
+            TradeExit(
+                time="2021-03-18T15:45:00Z",
+                price=124.80,
+                quantity=82,
+                reason="rsi_target",
+                fees=1.64,
+            )
         ],
         pnl=270.60,
         pnl_pct=2.72,
@@ -41,8 +48,23 @@ def _make_partial_exit_trade() -> Trade:
         entry_price=376.37,
         quantity=138,
         exits=[
-            TradeExit(time="2026-02-23T15:20:00Z", price=387.22, quantity=69, reason="tp1", fees=0.82, tags=["tp1"]),
-            TradeExit(time="2026-02-23T16:45:00Z", price=382.10, quantity=69, reason="supertrend_flip", fees=0.82, tags=["runner"]),
+                TradeExit(
+                    time="2026-02-23T15:20:00Z",
+                    price=387.22,
+                    quantity=69,
+                    reason="tp1",
+                    fees=0.82,
+                    tags=["tp1"],
+                ),
+                TradeExit(
+                    time="2026-02-23T16:45:00Z",
+                    price=382.10,
+                    quantity=69,
+                    reason="supertrend_flip",
+                    fees=0.82,
+                    tags=["runner"],
+                ),
+
         ],
         pnl=1143.67,
         pnl_pct=2.20,
@@ -100,7 +122,13 @@ def _make_result() -> BacktestResult:
 
 class TestTradeExit:
     def test_roundtrip(self):
-        e = TradeExit(time="2021-03-18T15:45:00Z", price=124.80, quantity=82, reason="tp1", fees=1.0)
+        e = TradeExit(
+            time="2021-03-18T15:45:00Z",
+            price=124.80,
+            quantity=82,
+            reason="tp1",
+            fees=1.0,
+        )
         d = e.to_dict()
         e2 = TradeExit.from_dict(d)
         assert e2.time == e.time
@@ -127,6 +155,26 @@ class TestTrade:
         assert t2.pnl == t.pnl
         assert len(t2.exits) == 1
         assert t2.exits[0].reason == "rsi_target"
+
+    def test_stop_levels_roundtrip(self):
+        trade = Trade(
+            id=1,
+            symbol="X",
+            direction="LONG",
+            entry_time="2024-01-01T00:00:00Z",
+            entry_price=100.0,
+            quantity=1.0,
+            exits=[TradeExit(time="2024-01-02T00:00:00Z", price=105.0, quantity=1.0)],
+            pnl=5.0,
+            stop_loss=95.0,
+            take_profit=110.0,
+        )
+        payload = trade.to_dict()
+        restored = Trade.from_dict(payload)
+        assert payload["stop_loss"] == 95.0
+        assert payload["take_profit"] == 110.0
+        assert restored.stop_loss == 95.0
+        assert restored.take_profit == 110.0
 
     def test_partial_exit_roundtrip(self):
         t = _make_partial_exit_trade()
@@ -181,6 +229,7 @@ class TestBacktestResult:
         assert len(r2.equity_curve) == 2
         assert r2.stats["total_trades"] == 2
         assert len(r2.drawings) == 2
+        assert r2.equity_evidence_status == "available"
 
     def test_file_roundtrip(self):
         r = _make_result()
@@ -190,6 +239,20 @@ class TestBacktestResult:
             r2 = BacktestResult.load(path)
             assert r2.meta.id == r.meta.id
             assert len(r2.trades) == 2
+
+    def test_save_preserves_existing_file_when_serialization_fails(self, tmp_path, monkeypatch):
+        result = _make_result()
+        path = tmp_path / "result.json"
+        path.write_text("previous", encoding="utf-8")
+
+        def fail_serialization():
+            raise ValueError("serialization failed")
+
+        monkeypatch.setattr(result, "to_json", fail_serialization)
+        with pytest.raises(ValueError, match="serialization failed"):
+            result.save(path)
+
+        assert path.read_text(encoding="utf-8") == "previous"
 
     def test_filename_generation(self):
         r = _make_result()

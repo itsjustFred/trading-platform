@@ -17,12 +17,14 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
+from runner.agent_process import build_backtest_child_env
+from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
 from runner.engines.base import BacktestConfig, EngineAdapter, ProgressCallback
+from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
 logger = logging.getLogger(__name__)
@@ -54,17 +56,17 @@ class LeanAdapter(EngineAdapter):
         """
         Run a LEAN backtest.
 
-        strategy_path should point to a LEAN algorithm file or a config JSON
-        in the custom_lean_integration project.
+        strategy_path must point to a LEAN algorithm source file. Existing
+        result JSON is imported through :meth:`import_result`.
         """
-        # For Phase 1: if strategy_path points to an existing LEAN result JSON,
-        # just convert it (no actual LEAN execution yet)
         sp = Path(strategy_path)
-        if sp.suffix == ".json" and sp.exists():
-            logger.info("Converting existing LEAN result: %s", sp)
-            return convert_lean_result(sp, strategy_name=config.strategy_name)
+        if sp.suffix.lower() == ".json":
+            raise ValueError(
+                "LEAN result JSON cannot be used as strategy_path; call "
+                "import_result() with the result path instead."
+            )
+        require_generated_strategy_approval(strategy_path)
 
-        # Otherwise, try to run LEAN
         lean_config = self._write_config(config, strategy_path)
         output_dir = self._run_lean(lean_config)
         result_file = self._find_result(output_dir)
@@ -72,7 +74,23 @@ class LeanAdapter(EngineAdapter):
         if result_file is None:
             raise RuntimeError(f"No LEAN result found in {output_dir}")
 
-        return convert_lean_result(result_file, strategy_name=config.strategy_name)
+        return self.import_result(result_file, config=config)
+
+    def import_result(
+        self,
+        result_path: str | Path,
+        *,
+        config: BacktestConfig | None = None,
+        strategy_name: str | None = None,
+    ) -> BacktestResult:
+        path = Path(result_path)
+        if path.suffix.lower() != ".json":
+            raise ValueError("LEAN import_result requires a JSON result path")
+        if not path.is_file():
+            raise FileNotFoundError(f"LEAN result file not found: {path}")
+        resolved_name = strategy_name or (config.strategy_name if config is not None else None)
+        logger.info("Converting existing LEAN result: %s", path)
+        return convert_lean_result(path, strategy_name=resolved_name)
 
     def _write_config(self, config: BacktestConfig, strategy_path: str) -> Path:
         """Write LEAN backtest config JSON."""
@@ -85,7 +103,7 @@ class LeanAdapter(EngineAdapter):
             "parameters": config.parameters,
         }
         config_path = self.project_dir / "backtest_config.json"
-        config_path.write_text(json.dumps(cfg, indent=2))
+        write_text_atomically(config_path, json.dumps(cfg, indent=2, ensure_ascii=False))
         logger.info("Wrote LEAN config: %s", config_path)
         return config_path
 
@@ -98,7 +116,7 @@ class LeanAdapter(EngineAdapter):
         if not lean_bin:
             raise RuntimeError(
                 "LEAN CLI not found on PATH. Install with: pip install lean\n"
-                "Or pass an existing LEAN result JSON as strategy_path."
+                "Or import an existing LEAN result with import_result()."
             )
 
         cmd = [
@@ -117,6 +135,7 @@ class LeanAdapter(EngineAdapter):
                 text=True,
                 timeout=600,
                 cwd=str(self.project_dir),
+                env=build_backtest_child_env(),
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -125,7 +144,7 @@ class LeanAdapter(EngineAdapter):
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "LEAN CLI not found. Install with: pip install lean\n"
-                "Or pass an existing LEAN result JSON as strategy_path."
+                "Or import an existing LEAN result with import_result()."
             ) from exc
         if result.returncode != 0:
             logger.error("LEAN failed:\n%s\n%s", result.stdout, result.stderr)

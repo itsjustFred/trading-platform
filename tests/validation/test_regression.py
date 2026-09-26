@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import copy
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import Trade, TradeExit
 from validation.comparison.comparison import TradeComparisonConfig
-from validation.comparison.delta_report import FieldDelta, TradeDelta
-from validation.comparison.matcher import MatchKey
 from validation.importers.mt5_html import MT5HTMLImporter
 from validation.reference import ValidationReference
 from validation.regression.runner import (
@@ -23,7 +19,6 @@ from validation.regression.runner import (
     run_regression,
 )
 from validation.stats.calculator import TradeStatistics, compute_trade_statistics
-
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -86,6 +81,7 @@ class TestPerfectMatch:
         assert result.passed is True
         assert len(result.stats_delta) == len(
             [
+                "risk_free_rate",
                 "win_rate",
                 "profit_factor",
                 "net_profit",
@@ -528,4 +524,5 @@ class TestMatchTolerancePlumbing:
         # tolerance — the within-tolerance pair is neither missing nor
         # failing.
         assert lenient.trade_delta_report.missing_trades == []
+        assert lenient.trade_delta_report.extra_trades == []
         assert lenient.passed is True

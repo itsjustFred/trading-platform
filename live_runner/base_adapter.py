@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 
 from shared.models import LiveSignal
@@ -23,6 +24,18 @@ def is_unbounded_tp(metadata: object) -> bool:
     return str(metadata.get("take_profit_policy") or "") == UNBOUNDED_TP_POLICY
 
 
+def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"{field_name} must be finite and positive")
+    return parsed
+
+
 class BaseLiveAdapter(ABC):
     """Abstract broker adapter for live order routing and fill streaming."""
 
@@ -37,8 +50,7 @@ class BaseLiveAdapter(ABC):
         ``qty`` is the trusted quantity channel: callers that have already run
         risk sizing (the daemon's ``submit_order_with_risk``) pass the sized
         quantity explicitly so adapters never have to trust signal metadata.
-        When ``qty`` is None (direct operator scripts), the adapter falls back
-        to sizing the signal with the shared default risk configuration.
+        Live submissions must provide a finite, positive quantity.
         """
 
     @abstractmethod

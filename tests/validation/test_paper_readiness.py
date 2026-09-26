@@ -2,26 +2,21 @@
 
 from __future__ import annotations
 
-import pytest
-
 from shared.models import Trade, TradeExit
-from validation.comparison.delta_report import FieldDelta, TradeDelta, TradeDeltaReport
 from validation.comparison.comparison import FieldComparisonResult
+from validation.comparison.delta_report import FieldDelta, TradeDelta, TradeDeltaReport
 from validation.readiness.models import (
     PaperReadinessLevel,
-    ReadinessCheck,
     ReadinessConfig,
-    ReadinessReport,
 )
 from validation.readiness.validator import ReadinessValidator
-from validation.regression.runner import RegressionResult
 from validation.reference import ValidationReference
+from validation.regression.runner import RegressionResult
 from validation.risk.comparison import (
     RiskComparisonReport,
     RiskComparisonResult,
 )
 from validation.stats.calculator import TradeStatistics
-
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -151,6 +146,7 @@ def _make_risk_report(
 def _make_stats(
     win_rate: float = 0.5,
     net_profit: float = 1000.0,
+    risk_free_rate: float = 0.0,
 ) -> TradeStatistics:
     return TradeStatistics(
         total_trades=10,
@@ -158,6 +154,7 @@ def _make_stats(
         losing_trades=5,
         win_rate=win_rate,
         net_profit=net_profit,
+        risk_free_rate=risk_free_rate,
     )
 
 
@@ -259,8 +256,8 @@ class TestMissingTrades:
         missing_check = next(c for c in result.checks if c.name == "missing_trades")
         assert missing_check.passed is True
         assert missing_check.severity == "warning"
-        assert result.level == PaperReadinessLevel.READY_WITH_WARNINGS
-        assert result.warnings > 0
+        assert result.level == PaperReadinessLevel.READY
+        assert result.warnings == 0
 
     def test_not_ready_on_missing_trade_above_threshold(self) -> None:
         """Missing trades above threshold are an error → NOT_READY."""
@@ -336,13 +333,17 @@ class TestRegression:
 
 class TestReadyWithWarnings:
     def test_ready_with_warnings(self) -> None:
-        """Warnings but no errors → READY_WITH_WARNINGS."""
-        missing = _make_trade_delta(severity="warning", anomaly_type="missing")
-        report = _make_delta_report(missing=[missing])
+        """A failed warning check yields READY_WITH_WARNINGS."""
+        mismatch = _make_trade_delta(
+            severity="warning",
+            anomaly_type="mismatch",
+            field_deltas=[FieldDelta(field="entry_price", expected=1.0, actual=1.1, passed=False)],
+        )
+        report = _make_delta_report(matched=[mismatch])
         regression = _make_regression_result(passed=True)
         risk = _make_risk_report()
         stats = (_make_stats(), _make_stats())
-        config = ReadinessConfig(max_missing_trades=5)
+        config = ReadinessConfig(max_error_count=1)
         result = ReadinessValidator.validate(
             report=report,
             regression=regression,
@@ -354,7 +355,7 @@ class TestReadyWithWarnings:
         assert result.level == PaperReadinessLevel.READY_WITH_WARNINGS
         assert result.passed is True
         assert result.errors == 0
-        assert result.warnings > 0
+        assert result.warnings == 1
 
 
 class TestRiskConsistency:
@@ -426,6 +427,17 @@ class TestStatsConsistency:
         assert np_check.passed is True
         assert result.level == PaperReadinessLevel.READY
 
+    def test_noncanonical_risk_free_rate_fails_closed(self) -> None:
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=_make_risk_report(),
+            stats=(_make_stats(risk_free_rate=0.04), _make_stats()),
+        )
+        check = next(c for c in result.checks if c.name == "stats_risk_free_rate")
+        assert check.passed is False
+        assert result.level == PaperReadinessLevel.NOT_READY
+
     def test_stats_win_rate_mismatch(self) -> None:
         """Win-rate mismatch exceeding tolerance → NOT_READY."""
         expected = _make_stats(win_rate=0.5)
@@ -486,9 +498,13 @@ class TestReportMeta:
         assert err_result.level == PaperReadinessLevel.NOT_READY
 
         # Warning path
-        warn_delta = _make_trade_delta(severity="warning", anomaly_type="missing")
-        warn_report = _make_delta_report(missing=[warn_delta])
-        warn_config = ReadinessConfig(max_missing_trades=5)
+        warn_delta = _make_trade_delta(
+            severity="warning",
+            anomaly_type="mismatch",
+            field_deltas=[FieldDelta(field="entry_price", expected=1.0, actual=1.1, passed=False)],
+        )
+        warn_report = _make_delta_report(matched=[warn_delta])
+        warn_config = ReadinessConfig(max_error_count=1)
         warn_result = ReadinessValidator.validate(
             report=warn_report,
             regression=regression,
@@ -596,8 +612,8 @@ class TestRiskGateStructuralFailures:
 
         assert result.level == PaperReadinessLevel.NOT_READY
 
-    def test_empty_report_marked_passed_stays_informational(self) -> None:
-        """An empty report the producer marked as passed stays a pass."""
+    def test_empty_report_marked_passed_fails_closed(self) -> None:
+        """An empty report the producer marked as passed is not evidence."""
         risk = RiskComparisonReport(trade_results=[], passed=True, explanation="")
         result = ReadinessValidator.validate(
             report=_make_delta_report(),
@@ -606,7 +622,30 @@ class TestRiskGateStructuralFailures:
             stats=(_make_stats(), _make_stats()),
         )
 
-        assert result.level == PaperReadinessLevel.READY
+        assert result.level == PaperReadinessLevel.NOT_READY
+
+    def test_failed_info_result_cannot_pass(self) -> None:
+        risk_result = RiskComparisonResult(
+            expected_trade=_make_trade(trade_id=1),
+            actual_trade=_make_trade(trade_id=2),
+            field_results={},
+            passed=False,
+            severity="info",
+            explanation="failed result without field evidence",
+        )
+        risk = RiskComparisonReport(
+            trade_results=[risk_result],
+            passed=True,
+            explanation="inconsistent producer verdict",
+        )
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=_make_regression_result(passed=True),
+            risk_report=risk,
+            stats=(_make_stats(), _make_stats()),
+        )
+
+        assert result.level == PaperReadinessLevel.NOT_READY
 
 
 class TestIssue83Gates:

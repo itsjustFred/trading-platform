@@ -8,10 +8,11 @@ dedupe script.
 from __future__ import annotations
 
 import asyncio
+import io
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -202,6 +203,34 @@ def test_persisted_accounts_file_has_0600_permissions(tmp_path: Path) -> None:
     assert pairs == {"CTRADER_ACCESS_TOKEN": "a", "CTRADER_REFRESH_TOKEN": "r"}
 
 
+def test_env_file_lock_uses_windows_primitives(monkeypatch) -> None:
+    import live_runner.ctrader_adapter as module
+
+    calls: list[tuple[int, int, int]] = []
+
+    class _Msvcrt(ModuleType):
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(descriptor: int, mode: int, size: int) -> None:
+            calls.append((descriptor, mode, size))
+
+    class _Handle(io.StringIO):
+        def fileno(self) -> int:
+            return 17
+
+    monkeypatch.setattr(module.os, "name", "nt")
+    monkeypatch.setitem(sys.modules, "msvcrt", _Msvcrt("msvcrt"))
+    handle = _Handle()
+
+    with module._exclusive_file_lock(handle):
+        pass
+
+    assert handle.getvalue() == "\0"
+    assert calls == [(17, _Msvcrt.LK_NBLCK, 1), (17, _Msvcrt.LK_UNLCK, 1)]
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="cross-process flock locking is POSIX-only (fcntl)",
@@ -266,17 +295,17 @@ def _make_reconcile_adapter(tmp_path: Path, response):
     ``response`` is the ProtoOAReconcileRes payload the fake transport
     returns; build it with :func:`_reconcile_response`.
     """
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
-
     # The module-level importorskip guarantees the protobuf package is here.
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-        ProtoOAPositionStatus,
-        ProtoOATradeSide,
-    )
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAReconcileReq,
         ProtoOAReconcileRes,
     )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="123",
@@ -308,7 +337,9 @@ def _reconcile_response(positions: list) -> Any:
     return response
 
 
-def _reconcile_position(*, status: int, trade_side: int, symbol_id: int, volume: int):
+def _reconcile_position(
+    *, status: int, trade_side: int, symbol_id: int, volume: int, position_id: int = 0
+):
     """Build a real ProtoOAPosition payload for the reconcile response."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition, ProtoOATradeData
 
@@ -317,6 +348,7 @@ def _reconcile_position(*, status: int, trade_side: int, symbol_id: int, volume:
     trade_data.volume = volume
     trade_data.tradeSide = trade_side
     position = ProtoOAPosition()
+    position.positionId = position_id
     position.positionStatus = status
     position.tradeData.CopyFrom(trade_data)
     position.price = 0.0
@@ -455,6 +487,34 @@ def test_get_positions_maps_symbol_ids_to_names(tmp_path: Path):
     assert positions[0]["qty"] == 4.0
 
 
+def test_get_positions_preserves_broker_position_id(tmp_path: Path):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAPositionStatus,
+        ProtoOATradeSide,
+    )
+
+    adapter = _make_reconcile_adapter(
+        tmp_path,
+        _reconcile_response(
+            [
+                _reconcile_position(
+                    status=ProtoOAPositionStatus.POSITION_STATUS_OPEN,
+                    trade_side=ProtoOATradeSide.BUY,
+                    symbol_id=1,
+                    volume=5000,
+                    position_id=77,
+                )
+            ]
+        ),
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    positions = _run_get_positions(adapter)
+
+    assert positions[0]["position_id"] == 77
+    assert adapter._position_ids_by_symbol["EURUSD"] == (77,)
+
+
 def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
     """#80: an unmapped symbol id fails closed — guessing FX would misstate
     XAU/index exposure by 10-1000x."""
@@ -480,6 +540,47 @@ def test_get_positions_falls_back_to_raw_id_for_unknown_symbol(tmp_path: Path):
 
     with pytest.raises(ValueError, match="not in the symbols cache"):
         _run_get_positions(adapter)
+
+
+def test_position_scoped_close_order_recovery_uses_durable_position_id(tmp_path: Path) -> None:
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAOrderListByPositionIdReq,
+        ProtoOAOrderListByPositionIdRes,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    adapter = _make_refresh_ready_adapter(tmp_path)
+    adapter._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
+    adapter._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
+    response = ProtoOAOrderListByPositionIdRes(
+        order=[
+            ProtoOAOrder(
+                orderId=901,
+                positionId=77,
+                closingOrder=True,
+            )
+        ],
+        hasMore=False,
+    )
+    requests: list[ProtoOAOrderListByPositionIdReq] = []
+
+    async def fake_send(request, *, timeout_seconds: int = 15):
+        requests.append(request)
+        return response
+
+    adapter._send_request_with_refresh_retry = fake_send  # type: ignore[assignment]
+    recovered = asyncio.run(
+        adapter._recover_broker_order_id(
+            str(uuid4()),
+            datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+            position_id=77,
+        )
+    )
+
+    assert recovered == "901"
+    assert len(requests) == 1
+    assert requests[0].positionId == 77
+    assert requests[0].fromTimestamp < requests[0].toTimestamp
 
 
 # ─── Broker order ID roundtrip ────────────────────────────────────────────────
@@ -510,6 +611,35 @@ def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
     # Retrieve
     assert database.get_live_signal_broker_order_id(str(signal.id)) == "bo-123"
     assert database.find_live_signal_id_by_broker_order_id("acc-1", "bo-123") == str(signal.id)
+
+
+def test_get_live_signal_metadata_roundtrip(isolated_db):
+    database = isolated_db
+    database.ensure_live_account("acc-1", "ctrader")
+    deployment = LiveDeploymentConfig(
+        id=uuid4(),
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="internal",
+    )
+    database.create_live_deployment(deployment)
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"risk_sizing_mode": "exit_only", "position_id": 77},
+    )
+    database.save_live_signal(signal)
+
+    assert database.get_live_signal_metadata(str(signal.id)) == {
+        "risk_sizing_mode": "exit_only",
+        "position_id": 77,
+    }
 
 
 def test_get_live_signal_broker_order_id_missing(isolated_db):

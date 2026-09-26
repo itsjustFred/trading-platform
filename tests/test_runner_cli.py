@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import contextlib
-import io
-
 import json
-import pytest
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 import runner.cli as runner_cli
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -28,7 +26,11 @@ class _DummyEngine:
                 backtest_start=config.start_date,
                 backtest_end=config.end_date,
                 initial_capital=config.initial_capital,
-                data={"symbols": config.symbols, "timeframes": [config.timeframe], "source": "test"},
+                data={
+                    "symbols": config.symbols,
+                    "timeframes": [config.timeframe],
+                    "source": "test",
+                },
                 parameters=config.parameters,
             ),
             trades=[
@@ -54,7 +56,7 @@ class _DummyEngine:
                 EquityPoint(time="2024-01-01T00:00:00+00:00", equity=config.initial_capital),
                 EquityPoint(time="2024-02-01T00:00:00+00:00", equity=config.initial_capital * 1.05),
             ],
-            stats={"engine_metric": 99},
+            stats={"engine_metric": 99, "total_pnl": -1.0},
         )
 
 
@@ -86,8 +88,45 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["meta"]["parameters"] == {"window": 20}
     assert payload["stats"]["engine_metric"] == 99
+    assert payload["stats"]["total_pnl"] == 5000.0
     assert payload["stats"]["cagr"] > 0
     assert payload["stats"]["total_return"] == 0.05
+
+
+def test_cmd_run_refuses_unapproved_generated_strategy(monkeypatch, tmp_path: Path):
+    from runner.approval_gate import StrategyNotApprovedError, mark_generated_strategy
+
+    strategy = tmp_path / "generated.py"
+    strategy.write_text("def generate_signals(df, params):\n    return df, df\n", encoding="utf-8")
+    mark_generated_strategy(strategy, strategies_root=tmp_path)
+    engine_called = False
+
+    def fake_get_engine(_name):
+        nonlocal engine_called
+        engine_called = True
+        return _DummyEngine()
+
+    monkeypatch.setattr(runner_cli, "get_engine", fake_get_engine)
+    args = SimpleNamespace(
+        engine="vectorbt",
+        strategy=str(strategy),
+        symbols=["AAPL"],
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params="{}",
+        name="generated",
+        output=str(tmp_path / "out.json"),
+    )
+
+    with pytest.raises(StrategyNotApprovedError):
+        runner_cli.cmd_run(args)
+    assert engine_called is False
 
 
 def test_cmd_run_normalizes_timeframe_alias(monkeypatch, tmp_path: Path):

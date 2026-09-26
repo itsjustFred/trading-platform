@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from data_tools.path_safety import build_dataset_path
 from shared.atomic_io import atomic_replace
 
 logger = logging.getLogger(__name__)
@@ -143,8 +144,13 @@ class Downloader(ABC):
 
         Layout: {output_dir}/ohlcv/{source}/{asset_class}/{symbol}/{tf}.parquet
         """
-        path = (
-            output_dir / "ohlcv" / self.source_name / asset_class / symbol / f"{timeframe}.parquet"
+        path = build_dataset_path(
+            output_dir,
+            "ohlcv",
+            self.source_name,
+            asset_class,
+            symbol,
+            f"{timeframe}.parquet",
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         return path

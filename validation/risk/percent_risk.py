@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from validation.risk.models import (
     RiskSizingInput,
@@ -24,6 +24,28 @@ class PercentRiskConfig(BaseModel):
     max_position_size: float | None = None
     round_lots: bool = True
     lot_size: float = 1.0
+
+    @model_validator(mode="after")
+    def _validate_finite_config(self) -> "PercentRiskConfig":
+        values = {
+            "risk_percent": self.risk_percent,
+            "min_position_size": self.min_position_size,
+            "lot_size": self.lot_size,
+            "max_position_size": self.max_position_size,
+        }
+        for name, value in values.items():
+            if value is not None and not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 <= float(self.risk_percent) <= 1.0:
+            raise ValueError("risk_percent must be between 0 and 1")
+        if self.min_position_size < 0:
+            raise ValueError("min_position_size must be >= 0")
+        if self.lot_size < 0:
+            raise ValueError("lot_size must be >= 0")
+        if self.max_position_size is not None and self.max_position_size <= 0:
+            raise ValueError("max_position_size must be > 0")
+        return self
+
 
 
 class PercentRiskModel:
@@ -47,8 +69,23 @@ class PercentRiskModel:
             ValueError: If ``entry_price``, ``stop_loss``, or
                 ``account_balance`` are missing or otherwise invalid.
         """
-        if not math.isfinite(input.entry_price):
-            raise ValueError("entry_price is required and must be finite")
+        if not math.isfinite(self.config.risk_percent):
+            raise ValueError("risk_percent must be finite")
+        if self.config.risk_percent <= 0:
+            raise ValueError("risk_percent must be > 0")
+        if self.config.risk_percent > 1:
+            raise ValueError("risk_percent must be between 0 and 1")
+        if not math.isfinite(self.config.min_position_size) or self.config.min_position_size < 0:
+            raise ValueError("min_position_size must be finite and >= 0")
+        if not math.isfinite(self.config.lot_size) or self.config.lot_size < 0:
+            raise ValueError("lot_size must be finite and >= 0")
+        if self.config.max_position_size is not None and (
+            not math.isfinite(self.config.max_position_size)
+            or self.config.max_position_size <= 0
+        ):
+            raise ValueError("max_position_size must be finite and > 0")
+        if not math.isfinite(input.entry_price) or input.entry_price <= 0:
+            raise ValueError("entry_price is required and must be finite and > 0")
 
         stop_loss = input.stop_loss
         if stop_loss is None and input.trade is not None:
@@ -59,8 +96,13 @@ class PercentRiskModel:
             raise ValueError("stop_loss is required")
 
         stop_loss = float(stop_loss)
-        if not math.isfinite(stop_loss):
-            raise ValueError("stop_loss must be finite")
+        if not math.isfinite(stop_loss) or stop_loss <= 0:
+            raise ValueError("stop_loss must be finite and > 0")
+
+        if input.take_profit is not None and (
+            not math.isfinite(input.take_profit) or input.take_profit <= 0
+        ):
+            raise ValueError("take_profit must be finite and > 0")
 
         input.stop_loss = stop_loss
 

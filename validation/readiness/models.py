@@ -10,7 +10,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from validation.comparison.tolerances import finite_tolerance
 
 
 class PaperReadinessLevel(str, Enum):
@@ -81,3 +83,18 @@ class ReadinessConfig(BaseModel):
     stats_sharpe_tolerance_abs: float = 0.1
     # #83: max-drawdown gate — 2pp absolute on max_drawdown_pct.
     stats_max_drawdown_tolerance_pp: float = 0.02
+
+    @model_validator(mode="after")
+    def _validate_tolerances(self) -> "ReadinessConfig":
+        for name in (
+            "max_position_size_diff_pct",
+            "max_stop_distance_diff_pct",
+            "stats_win_rate_tolerance_pct",
+            "stats_net_profit_tolerance_pct",
+            "stats_sharpe_tolerance_pct",
+            "stats_sharpe_tolerance_abs",
+            "stats_max_drawdown_tolerance_pp",
+        ):
+            value = finite_tolerance(getattr(self, name), name)
+            setattr(self, name, value)
+        return self

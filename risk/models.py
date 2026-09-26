@@ -3,12 +3,37 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from uuid import uuid4
 
 
 def _finite_float(value: Any, field_name: str) -> float:
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
     if not math.isfinite(numeric):
         raise ValueError(f"{field_name} must be finite")
+    return numeric
+
+
+def _finite_positive(value: Any, field_name: str) -> float:
+    numeric = _finite_float(value, field_name)
+    if numeric <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return numeric
+
+
+def _finite_nonnegative(value: Any, field_name: str) -> float:
+    numeric = _finite_float(value, field_name)
+    if numeric < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return numeric
+
+
+def _finite_fraction(value: Any, field_name: str) -> float:
+    numeric = _finite_float(value, field_name)
+    if not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{field_name} must be between 0 and 1")
     return numeric
 
 
@@ -16,6 +41,12 @@ def _optional_finite_float(value: Any, field_name: str) -> float | None:
     if value is None:
         return None
     return _finite_float(value, field_name)
+
+
+def _optional_finite_positive(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    return _finite_positive(value, field_name)
 
 
 def _parse_bool(value: Any, field_name: str) -> bool:
@@ -41,6 +72,7 @@ class TradeSignal:
     take_profit: float | None
     timeframe: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    identity: str = field(default_factory=lambda: uuid4().hex, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         normalized = str(self.action).strip().lower()
@@ -50,14 +82,21 @@ class TradeSignal:
         self.symbol = str(self.symbol).strip().upper()
         if not self.symbol:
             raise ValueError("symbol is required")
-        self.entry_price = float(self.entry_price)
-        if self.entry_price <= 0:
-            raise ValueError("entry_price must be > 0")
-        self.stop_loss = float(self.stop_loss) if self.stop_loss is not None else None
-        self.take_profit = float(self.take_profit) if self.take_profit is not None else None
+        self.entry_price = _finite_positive(self.entry_price, "entry_price")
+        self.stop_loss = (
+            _optional_finite_positive(self.stop_loss, "stop_loss")
+        )
+        self.take_profit = (
+            _optional_finite_positive(self.take_profit, "take_profit")
+        )
         self.timeframe = str(self.timeframe).strip()
         if not self.timeframe:
             raise ValueError("timeframe is required")
+        if self.identity is None:
+            raise ValueError("identity must be non-empty")
+        self.identity = str(self.identity).strip()
+        if not self.identity:
+            raise ValueError("identity must be non-empty")
         self.metadata = dict(self.metadata or {})
 
 
@@ -79,15 +118,19 @@ class RiskDecision:
             raise ValueError("signal_id must be a non-empty string")
         self.signal_id = self.signal_id.strip()
         self.accepted = _parse_bool(self.accepted, "accepted")
-        self.quantity = _finite_float(self.quantity, "quantity")
-        self.risk_amount = _finite_float(self.risk_amount, "risk_amount")
-        self.risk_percent = _finite_float(self.risk_percent, "risk_percent")
-        self.risk_distance = _optional_finite_float(self.risk_distance, "risk_distance")
-        self.stop_price_used = _optional_finite_float(
+        self.quantity = _finite_nonnegative(self.quantity, "quantity")
+        self.risk_amount = _finite_nonnegative(self.risk_amount, "risk_amount")
+        self.risk_percent = _finite_fraction(self.risk_percent, "risk_percent")
+        self.risk_distance = (
+            None
+            if self.risk_distance is None
+            else _optional_finite_positive(self.risk_distance, "risk_distance")
+        )
+        self.stop_price_used = _optional_finite_positive(
             self.stop_price_used,
             "stop_price_used",
         )
-        self.take_profit_used = _optional_finite_float(
+        self.take_profit_used = _optional_finite_positive(
             self.take_profit_used,
             "take_profit_used",
         )
@@ -107,11 +150,13 @@ class SizedOrder:
     decision: RiskDecision | None = None
 
     def __post_init__(self) -> None:
-        self.position_size = float(self.position_size)
-        self.risk_amount = float(self.risk_amount)
-        self.risk_percent = float(self.risk_percent)
+        self.position_size = _finite_nonnegative(self.position_size, "position_size")
+        self.risk_amount = _finite_nonnegative(self.risk_amount, "risk_amount")
+        self.risk_percent = _finite_fraction(self.risk_percent, "risk_percent")
         self.risk_reward_ratio = (
-            float(self.risk_reward_ratio) if self.risk_reward_ratio is not None else None
+            None
+            if self.risk_reward_ratio is None
+            else _finite_nonnegative(self.risk_reward_ratio, "risk_reward_ratio")
         )
 
 

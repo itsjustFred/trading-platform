@@ -21,11 +21,10 @@ Mathematical conventions (kept explicit so results are reproducible):
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
   fraction (0..1) of the running peak.
 * **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
-  Sortino, drawdown, ``avg_trade`` and the largest winner/loser use the
-  *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus ``fees``,
-  else the exit PnL sum).  ``gross_profit``/``gross_loss``/``avg_winner``/
-  ``avg_loser`` stay gross so they remain comparable with MT5's
-  Bruttogewinn/Bruttoverlust labels.
+  Sortino, drawdown, ``profit_factor``, averages and the largest winner/loser
+  use the *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus
+  ``fees``, else the exit PnL sum). ``gross_profit`` and ``gross_loss`` remain
+  explicit gross fields for source-header reconciliation.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from typing import List
 
 from pydantic import BaseModel
 
-from shared.models import Trade, TradeExit
+from shared.models import Trade
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +54,7 @@ class TradeStatistics(BaseModel):
     """Canonical trade-based performance statistics."""
 
     total_trades: int = 0
+    risk_free_rate: float = 0.0
     winning_trades: int = 0
     losing_trades: int = 0
     win_rate: float = 0.0
@@ -113,17 +113,28 @@ def _net_realized_pnl(trade: Trade) -> float:
     return recomputed
 
 
-def _compute_drawdowns(realized_pnls: List[float]) -> tuple[float, float]:
+def _compute_drawdowns(
+    realized_pnls: List[float], initial_capital: float | None = None
+) -> tuple[float, float]:
     """Return (max_drawdown_absolute, max_drawdown_pct) from trade PnLs."""
-    peak = 0.0
-    running = 0.0
+    if not realized_pnls:
+        return 0.0, 0.0
+    if initial_capital is not None:
+        capital = float(initial_capital)
+        if not math.isfinite(capital) or capital <= 0:
+            raise ValueError("initial_capital must be finite and > 0")
+        running = capital
+        peak = capital
+    else:
+        running = 0.0
+        peak = 0.0
+
     max_dd = 0.0
     max_dd_pct = 0.0
 
     for pnl in realized_pnls:
         running += pnl
-        if running > peak:
-            peak = running
+        peak = max(peak, running)
         dd = peak - running
         if dd > max_dd:
             max_dd = dd
@@ -165,7 +176,9 @@ def _trade_span_years(trades: List[Trade]) -> float | None:
     return span_days / 365.25
 
 
-def _daily_net_series(trades: List[Trade]) -> List[float] | None:
+def _daily_net_series(
+    trades: List[Trade], initial_capital: float | None = None
+) -> List[float] | None:
     """Daily-resampled net PnL series for ratio annualization (#84).
 
     Trades are summed per exit calendar day over the full calendar span
@@ -204,8 +217,18 @@ def _daily_net_series(trades: List[Trade]) -> List[float] | None:
     days = int((end - start).total_seconds() // 86400) + 1
     series: List[float] = []
     cursor = start
+    balance = float(initial_capital) if initial_capital is not None else None
+    if balance is not None and (not math.isfinite(balance) or balance <= 0):
+        raise ValueError("initial_capital must be finite and > 0")
     for _ in range(days):
-        series.append(day_totals.get(cursor.date().isoformat(), 0.0))
+        pnl = day_totals.get(cursor.date().isoformat(), 0.0)
+        if balance is None:
+            series.append(pnl)
+        elif balance > 0:
+            series.append(pnl / balance)
+            balance += pnl
+        else:
+            break
         cursor += pd.Timedelta(days=1)
     return series
 
@@ -221,13 +244,19 @@ def _annualize_factor(trades: List[Trade]) -> float:
     return math.sqrt(252)
 
 
-def _sharpe(returns: List[float], annualize_factor: float | None = None) -> float:
+def _sharpe(
+    returns: List[float],
+    annualize_factor: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> float:
     """Annualized Sharpe ratio (population std, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
         return 0.0
-    mean_return = sum(returns) / n
-    variance = sum((r - mean_return) ** 2 for r in returns) / n
+    daily_rf = float(risk_free_rate) / 252.0
+    excess = [float(value) - daily_rf for value in returns]
+    mean_return = sum(excess) / n
+    variance = sum((r - mean_return) ** 2 for r in excess) / n
     std = math.sqrt(variance) if variance > 0 else 0.0
     if math.isclose(std, 0.0, abs_tol=_ZERO_TOL):
         return 0.0
@@ -235,13 +264,19 @@ def _sharpe(returns: List[float], annualize_factor: float | None = None) -> floa
     return (mean_return / std) * factor
 
 
-def _sortino(returns: List[float], annualize_factor: float | None = None) -> float:
+def _sortino(
+    returns: List[float],
+    annualize_factor: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> float:
     """Annualized Sortino ratio (downside deviation, risk-free rate = 0)."""
     n = len(returns)
     if n < 2:
         return 0.0
-    mean_return = sum(returns) / n
-    downside = [r for r in returns if r < 0]
+    daily_rf = float(risk_free_rate) / 252.0
+    excess = [float(value) - daily_rf for value in returns]
+    mean_return = sum(excess) / n
+    downside = [r for r in excess if r < 0]
     if not downside:
         return 0.0
     downside_var = sum(r**2 for r in downside) / len(downside)
@@ -252,10 +287,19 @@ def _sortino(returns: List[float], annualize_factor: float | None = None) -> flo
     return (mean_return / downside_std) * factor
 
 
-def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
+def compute_trade_statistics(
+    trades: List[Trade],
+    *,
+    initial_capital: float | None = None,
+    risk_free_rate: float = 0.0,
+) -> TradeStatistics:
     """Compute all trade-based statistics from a list of Trade objects."""
+    if initial_capital is not None:
+        capital = float(initial_capital)
+        if not math.isfinite(capital) or capital <= 0:
+            raise ValueError("initial_capital must be finite and > 0")
     if not trades:
-        return TradeStatistics()
+        return TradeStatistics(risk_free_rate=float(risk_free_rate))
 
     realized_pnls = [_net_realized_pnl(t) for t in trades]
     # Gross figures stay gross (fees excluded) so they remain comparable with
@@ -270,29 +314,49 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
     net_profit = sum(realized_pnls)
     gross_profit = sum(p for p in gross_pnls if p > 0)
     gross_loss = sum(p for p in gross_pnls if p < 0)
+    net_profit_series = [p for p in realized_pnls if p > 0]
+    net_loss_series = [p for p in realized_pnls if p < 0]
 
-    if not math.isclose(gross_loss, 0.0, abs_tol=_ZERO_TOL):
-        profit_factor = abs(gross_profit / gross_loss)
+    if not math.isclose(sum(net_loss_series), 0.0, abs_tol=_ZERO_TOL):
+        profit_factor = abs(sum(net_profit_series) / sum(net_loss_series))
     else:
         profit_factor = float("inf")
 
-    max_drawdown, max_drawdown_pct = _compute_drawdowns(realized_pnls)
+    max_drawdown, max_drawdown_pct = _compute_drawdowns(
+        realized_pnls, initial_capital=initial_capital
+    )
 
     # #84: ratio metrics run on the daily-resampled net series with the
     # shared sqrt(252) annualization (same contract as runner/stats.py).
-    daily_series = _daily_net_series(trades)
+    daily_series = _daily_net_series(trades, initial_capital=initial_capital)
     annualize = _annualize_factor(trades)
-    ratio_observations = daily_series if daily_series is not None else realized_pnls
-    sharpe_ratio = _sharpe(ratio_observations, annualize)
-    sortino_ratio = _sortino(ratio_observations, annualize)
+    ratio_observations = (
+        daily_series
+        if daily_series is not None and len(daily_series) >= 2
+        else (
+            [pnl / float(initial_capital) for pnl in realized_pnls]
+            if initial_capital is not None
+            else realized_pnls
+        )
+    )
+    sharpe_ratio = _sharpe(
+        ratio_observations,
+        annualize,
+        risk_free_rate=risk_free_rate,
+    )
+    sortino_ratio = _sortino(
+        ratio_observations,
+        annualize,
+        risk_free_rate=risk_free_rate,
+    )
 
     if not math.isclose(max_drawdown, 0.0, abs_tol=_ZERO_TOL):
         recovery_factor = net_profit / max_drawdown
     else:
         recovery_factor = float("inf")
 
-    avg_winner = gross_profit / winning_trades if winning_trades > 0 else 0.0
-    avg_loser = gross_loss / losing_trades if losing_trades > 0 else 0.0
+    avg_winner = sum(net_profit_series) / winning_trades if winning_trades > 0 else 0.0
+    avg_loser = sum(net_loss_series) / losing_trades if losing_trades > 0 else 0.0
     avg_trade = net_profit / total_trades if total_trades > 0 else 0.0
 
     largest_winner = max((p for p in realized_pnls if p > 0), default=0.0)
@@ -300,6 +364,7 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
 
     return TradeStatistics(
         total_trades=total_trades,
+        risk_free_rate=float(risk_free_rate),
         winning_trades=winning_trades,
         losing_trades=losing_trades,
         win_rate=win_rate,

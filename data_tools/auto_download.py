@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from datetime import date, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
 import pyarrow.parquet as pq
 
+from data_tools.path_safety import ensure_dataset_path_within, validate_dataset_component
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -34,8 +39,6 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 # Thresholds deliberately count calendar days, not business days (the parent
 # record states the fail threshold in calendar days): a regular FX weekend
 # (~2 days) therefore warns, and only holes beyond 3 calendar days fail.
-# Per-source overrides (crypto, holidays) are an explicit open item of the
-# parent issue and are intentionally not implemented here.
 INTERNAL_GAP_FAIL_DAYS = 3
 INTERNAL_GAP_WARN_DAYS = 1
 
@@ -44,8 +47,7 @@ INTERNAL_GAP_WARN_DAYS = 1
 # Sundays excluded — no venue in this repo prints Sat bars, so wall-clock
 # counting would reject every multi-week segment); >=95% of expected bars
 # must be present and no single bar-to-bar gap may exceed 3x the timeframe
-# in trading minutes, regardless of density. Exchange holidays are NOT
-# skipped (no calendar wired) — the gate stays fail-closed there by design.
+# in trading minutes, regardless of density.
 TIMEFRAME_MINUTES: dict[str, float] = {
     "1m": 1.0,
     "5m": 5.0,
@@ -58,6 +60,76 @@ TIMEFRAME_MINUTES: dict[str, float] = {
 }
 SEGMENT_MIN_DENSITY = 0.95
 SEGMENT_MAX_GAP_MULTIPLIER = 3.0
+US_EQUITY_ASSET_CLASSES = frozenset(
+    {"equity", "stock", "stocks", "etf", "index"}
+)
+US_EQUITY_CALENDAR_SOURCES = frozenset(
+    {"alpaca", "dolthub", "huggingface", "test", "yfinance"}
+)
+
+
+@lru_cache(maxsize=None)
+def _nyse_holidays(year: int) -> frozenset[str]:
+    def observed(month: int, day: int) -> date:
+        day_date = date(year, month, day)
+        if day_date.weekday() == 5 and (month, day) != (1, 1):
+            return day_date - timedelta(days=1)
+        if day_date.weekday() == 6:
+            return day_date + timedelta(days=1)
+        return day_date
+
+    def nth_weekday(month: int, weekday: int, occurrence: int) -> date:
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+    def last_weekday(month: int, weekday: int) -> date:
+        probe = (
+            date(year + 1, 1, 1) - timedelta(days=1)
+            if month == 12
+            else date(year, month + 1, 1) - timedelta(days=1)
+        )
+        offset = (probe.weekday() - weekday) % 7
+        return probe - timedelta(days=offset)
+
+    easter = _easter_sunday(year)
+    holidays = {
+        observed(1, 1),
+        nth_weekday(1, 0, 3),
+        nth_weekday(2, 0, 3),
+        last_weekday(5, 0),
+        observed(7, 4),
+        nth_weekday(9, 0, 1),
+        nth_weekday(11, 3, 4),
+        observed(12, 25),
+        date(year, *easter) - timedelta(days=2),
+    }
+    if year >= 2022:
+        holidays.add(observed(6, 19))
+    return frozenset(day.isoformat() for day in holidays)
+
+
+def _easter_sunday(year: int) -> tuple[int, int]:
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    weekday_correction = (32 + 2 * e + 2 * i - h - k) % 7
+    month_adjustment = (a + 11 * h + 22 * weekday_correction) // 451
+    month = (h + weekday_correction - 7 * month_adjustment + 114) // 31
+    day = ((h + weekday_correction - 7 * month_adjustment + 114) % 31) + 1
+    return month, day
+
+
+def is_us_equity_holiday(value: object) -> bool:
+    day = pd.Timestamp(value).date()
+    return any(
+        day.isoformat() in _nyse_holidays(adjacent_year)
+        for adjacent_year in (day.year - 1, day.year, day.year + 1)
+    )
 
 
 def _weekend_overlap_minutes(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
@@ -76,43 +148,214 @@ def _weekend_overlap_minutes(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> fl
     return total
 
 
-def _trading_minutes_between(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> float:
+def _holiday_overlap_minutes(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    holidays: frozenset[date],
+) -> float:
+    if end_ts <= start_ts:
+        return 0.0
+    total = 0.0
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5 and cursor.date() in holidays:
+            day_start = max(start_ts, cursor)
+            day_end = min(end_ts, cursor + pd.Timedelta(days=1))
+            if day_end > day_start:
+                total += (day_end - day_start).total_seconds() / 60.0
+        cursor += pd.Timedelta(days=1)
+    return total
+
+
+def _trading_minutes_between(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    holidays: frozenset[date] = frozenset(),
+) -> float:
     """Wall-clock minutes minus full-weekend overlap (CodeRabbit round)."""
     total = max((end_ts - start_ts).total_seconds() / 60.0, 0.0)
-    return max(total - _weekend_overlap_minutes(start_ts, end_ts), 0.0)
+    weekend = _weekend_overlap_minutes(start_ts, end_ts)
+    holiday = _holiday_overlap_minutes(start_ts, end_ts, holidays)
+    return max(total - weekend - holiday, 0.0)
 
 
-def _is_trading_instant(ts: pd.Timestamp, step_minutes: float) -> bool:
-    """Whether a bar grid instant falls in trading time (pre-mortem R1).
-
-    Weekends print no bars on any venue in this repo; weekly+ grids are
-    sparse by nature and count every grid point.
-    """
+def _is_trading_instant(
+    ts: pd.Timestamp,
+    step_minutes: float,
+    holidays: frozenset[date] = frozenset(),
+) -> bool:
+    """Whether a bar grid instant falls in trading time."""
     if step_minutes >= 10080.0:
         return True
-    return ts.weekday() < 5
+    return ts.weekday() < 5 and ts.date() not in holidays
+
+
+def _parse_session_clock(value: object) -> int:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("session clock must not be empty")
+    if text in {"24:00", "24:00:00"}:
+        return 1440
+    parsed = pd.to_datetime(f"2000-01-01 {text}", errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"invalid session clock: {value!r}")
+    return int(parsed.hour * 60 + parsed.minute)
+
+
+def _explicit_session_window(
+    session: Mapping[str, object] | tuple[str, str] | None,
+    session_start: str | None,
+    session_end: str | None,
+) -> tuple[int, int] | None:
+    start_value: object = session_start
+    end_value: object = session_end
+    if isinstance(session, Mapping):
+        start_value = session.get("start", session.get("session_start", session.get("open")))
+        end_value = session.get("end", session.get("session_end", session.get("close")))
+    elif isinstance(session, (tuple, list)) and len(session) == 2:
+        start_value, end_value = session
+    if start_value is None and end_value is None:
+        return None
+    if start_value is None or end_value is None:
+        raise ValueError("session requires both start and end")
+    start_minutes = _parse_session_clock(start_value)
+    end_minutes = _parse_session_clock(end_value)
+    if end_minutes <= start_minutes:
+        raise ValueError("session end must be after session start")
+    return start_minutes, end_minutes
+
+
+def _observed_session_window(
+    stamps: list[pd.Timestamp],
+    step_minutes: float,
+    *,
+    start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
+) -> tuple[int, int] | None:
+    if step_minutes >= 1440.0 or len(stamps) < 4:
+        return None
+    by_day: dict[pd.Timestamp, list[pd.Timestamp]] = {}
+    for stamp in stamps:
+        by_day.setdefault(stamp.normalize(), []).append(stamp)
+    if len(by_day) < 2 or max(len(rows) for rows in by_day.values()) < 2:
+        return None
+    day_windows = [
+        (
+            day,
+            min(int(stamp.hour * 60 + stamp.minute) for stamp in rows),
+            max(int(stamp.hour * 60 + stamp.minute) for stamp in rows)
+            + int(step_minutes),
+        )
+        for day, rows in sorted(by_day.items())
+    ]
+    windows = {(start, end) for _, start, end in day_windows}
+    if len(windows) == 1:
+        start_minutes, end_minutes = next(iter(windows))
+    else:
+        if start_ts is None or end_ts is None or len(day_windows) < 2:
+            return None
+        first_day = day_windows[0][0]
+        last_day = day_windows[-1][0]
+        interior_windows = {
+            (start, end)
+            for day, start, end in day_windows
+            if first_day < day < last_day
+        }
+        if len(interior_windows) > 1:
+            return None
+        if interior_windows:
+            start_minutes, end_minutes = next(iter(interior_windows))
+        else:
+            start_minutes = day_windows[-1][1]
+            end_minutes = day_windows[0][2]
+        step = pd.Timedelta(minutes=int(step_minutes))
+        for day, window_start, window_end in day_windows:
+            if window_start != start_minutes and not (
+                day == first_day
+                and start_ts.normalize() == first_day
+                and start_ts > day + pd.Timedelta(minutes=start_minutes)
+                and day + pd.Timedelta(minutes=window_start)
+                <= start_ts
+                <= day + pd.Timedelta(minutes=window_start) + step
+            ):
+                return None
+            if window_end != end_minutes and not (
+                day == last_day
+                and end_ts.normalize() == last_day
+                and end_ts < day + pd.Timedelta(minutes=end_minutes)
+                and day + pd.Timedelta(minutes=window_end - int(step_minutes))
+                <= end_ts
+                <= day + pd.Timedelta(minutes=window_end)
+            ):
+                return None
+    if end_minutes - start_minutes < step_minutes * 3:
+        return None
+    return start_minutes, end_minutes
+
+
+def _session_trading_minutes_between(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    session_window: tuple[int, int],
+    holidays: frozenset[date] = frozenset(),
+) -> float:
+    if end_ts <= start_ts:
+        return 0.0
+    start_minutes, end_minutes = session_window
+    total = 0.0
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5 and cursor.date() not in holidays:
+            session_start = cursor + pd.Timedelta(minutes=start_minutes)
+            session_end = cursor + pd.Timedelta(minutes=end_minutes)
+            overlap_start = max(start_ts, session_start)
+            overlap_end = min(end_ts, session_end)
+            if overlap_end > overlap_start:
+                total += (overlap_end - overlap_start).total_seconds() / 60.0
+        cursor += pd.Timedelta(days=1)
+    return total
 
 
 def _expected_trading_bars(
-    start_ts: pd.Timestamp, end_ts: pd.Timestamp, step_minutes: float
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    step_minutes: float,
+    session_window: tuple[int, int] | None = None,
+    holidays: frozenset[date] = frozenset(),
 ) -> int:
-    """Count step-grid points in [start, end] that fall in trading time.
-
-    The old `span // step + 1` overcounted whenever the span end landed on
-    excluded time (e.g. a Mon–Sat daily segment expected 6 bars for 5
-    perfect weekday bars and failed a healthy feed).
-    """
+    """Count expected bars on the venue/session grid when it is known."""
     if step_minutes <= 0:
         return 0
-    span_minutes = (end_ts - start_ts).total_seconds() / 60.0
-    steps = int(span_minutes // step_minutes)
+    if session_window is None:
+        span_minutes = (end_ts - start_ts).total_seconds() / 60.0
+        steps = int(span_minutes // step_minutes)
+        return sum(
+            1
+            for k in range(steps + 1)
+            if _is_trading_instant(
+                start_ts + pd.Timedelta(minutes=k * step_minutes),
+                step_minutes,
+                holidays,
+            )
+        )
+    start_minutes, end_minutes = session_window
     count = 0
-    for k in range(steps + 1):
-        instant = start_ts + pd.Timedelta(minutes=k * step_minutes)
-        if instant > end_ts:
-            break
-        if _is_trading_instant(instant, step_minutes):
-            count += 1
+    cursor = start_ts.normalize()
+    while cursor <= end_ts.normalize():
+        if cursor.weekday() < 5 and cursor.date() not in holidays:
+            day_start = cursor + pd.Timedelta(minutes=start_minutes)
+            day_end = cursor + pd.Timedelta(minutes=end_minutes)
+            first = max(start_ts, day_start)
+            last = min(end_ts, day_end)
+            if last >= first:
+                offset = math.ceil(
+                    (first - day_start).total_seconds() / (step_minutes * 60)
+                )
+                instant = day_start + pd.Timedelta(minutes=offset * step_minutes)
+                while instant <= last and instant < day_end:
+                    count += 1
+                    instant += pd.Timedelta(minutes=step_minutes)
+        cursor += pd.Timedelta(days=1)
     return count
 
 
@@ -505,6 +748,15 @@ def find_internal_gaps(
     return []
 
 
+def _contained_rglob(root: Path, pattern: str) -> Iterator[Path]:
+    for path in root.rglob(pattern):
+        try:
+            ensure_dataset_path_within(root, path)
+        except ValueError:
+            continue
+        yield path
+
+
 def has_ohlcv_bars_in_range(
     *,
     symbol: str,
@@ -530,10 +782,16 @@ def has_ohlcv_bars_in_range(
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
 
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return False
+
     ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
     matches = sorted(
         path
-        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
     return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
@@ -549,10 +807,16 @@ def _segment_timestamps_in_range(
     """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return []
+
     ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
     matches = sorted(
         path
-        for path in ohlcv_root.rglob(f"**/{normalized_timeframe}.parquet")
+        for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
     stamps: set[pd.Timestamp] = set()
@@ -573,6 +837,71 @@ def _segment_timestamps_in_range(
     return sorted(stamps)
 
 
+def _segment_venue_metadata(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+) -> tuple[set[str], set[str]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    matches = _contained_rglob(
+        ohlcv_root,
+        f"**/{normalized_timeframe}.parquet",
+    )
+    asset_classes: set[str] = set()
+    sources: set[str] = set()
+    for path in matches:
+        if path.parent.name.upper() != normalized_symbol:
+            continue
+        parts = path.relative_to(ohlcv_root).parts
+        if len(parts) >= 4:
+            sources.add(parts[0].lower())
+            asset_classes.add(parts[1].lower())
+    return asset_classes, sources
+
+
+def _uses_us_equity_calendar(
+    symbol: str,
+    timeframe: str = "",
+    data_dir: str | Path = "",
+) -> bool:
+    asset_classes, sources = _segment_venue_metadata(symbol, timeframe, data_dir)
+    if asset_classes and sources:
+        return asset_classes.issubset(US_EQUITY_ASSET_CLASSES) and sources.issubset(
+            US_EQUITY_CALENDAR_SOURCES
+        )
+    if asset_classes:
+        return False
+    normalized = str(symbol or "").strip().upper()
+    if _is_forex_symbol(normalized) or _is_dukascopy_symbol(normalized):
+        return False
+    crypto_bases = {"BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "AVAX"}
+    base = normalized.split("-", 1)[0].removesuffix("USD")
+    if base in crypto_bases:
+        return False
+    return _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized) is not None
+
+
+def _expected_us_equity_holidays(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> frozenset[date]:
+    if not _uses_us_equity_calendar(symbol, timeframe, data_dir):
+        return frozenset()
+    values: set[date] = set()
+    for year in range(start_ts.year - 1, end_ts.year + 2):
+        values.update(
+            pd.Timestamp(value).date()
+            for value in _nyse_holidays(year)
+            if start_ts.date() <= pd.Timestamp(value).date() <= end_ts.date()
+        )
+    return frozenset(values)
+
+
 def has_sufficient_segment_coverage(
     *,
     symbol: str,
@@ -582,6 +911,9 @@ def has_sufficient_segment_coverage(
     data_dir: str | Path = "",
     min_density: float = SEGMENT_MIN_DENSITY,
     max_gap_multiplier: float = SEGMENT_MAX_GAP_MULTIPLIER,
+    session: Mapping[str, object] | tuple[str, str] | None = None,
+    session_start: str | None = None,
+    session_end: str | None = None,
 ) -> bool:
     """Return whether ``[start, end]`` has dense, gap-free coverage (#86).
 
@@ -599,20 +931,52 @@ def has_sufficient_segment_coverage(
     end_ts = pd.to_datetime(str(end or ""), utc=True, errors="coerce")
     if pd.isna(start_ts) or pd.isna(end_ts) or start_ts > end_ts:
         return False
-    expected = max(
-        _expected_trading_bars(start_ts, end_ts, step_minutes),
-        1,
-    )
+    try:
+        explicit_session = _explicit_session_window(session, session_start, session_end)
+    except ValueError:
+        return False
     stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
     if not stamps:
         return False
+    if step_minutes >= 1440.0:
+        session_window = None
+    else:
+        session_window = explicit_session or _observed_session_window(
+            stamps,
+            step_minutes,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    holidays = _expected_us_equity_holidays(
+        symbol,
+        normalized_timeframe,
+        data_dir,
+        start_ts,
+        end_ts,
+    )
+    expected = max(
+        _expected_trading_bars(
+            start_ts,
+            end_ts,
+            step_minutes,
+            session_window,
+            holidays,
+        ),
+        1,
+    )
     if len(stamps) / expected < min_density:
         return False
     limit_minutes = step_minutes * max_gap_multiplier
     for prev, cur in zip(stamps, stamps[1:]):
-        gap_trading_minutes = (cur - prev).total_seconds() / 60.0 - _weekend_overlap_minutes(
-            prev, cur
-        )
+        if session_window is None:
+            gap_trading_minutes = _trading_minutes_between(prev, cur, holidays)
+        else:
+            gap_trading_minutes = _session_trading_minutes_between(
+                prev,
+                cur,
+                session_window,
+                holidays,
+            )
         if gap_trading_minutes > limit_minutes:
             return False
     return True
@@ -640,7 +1004,9 @@ def _build_requirements(
         symbol = str(raw_symbol or "").strip().upper()
         if not symbol:
             continue
+        validate_dataset_component(symbol, name="symbol")
         for required_timeframe in timeframes:
+            validate_dataset_component(required_timeframe, name="timeframe")
             requirements.append(
                 DataRequirement(
                     symbol=symbol,
@@ -704,8 +1070,13 @@ def _has_required_coverage(data_root: Path, requirement: DataRequirement) -> boo
 
 
 def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, str] | None:
+    try:
+        validate_dataset_component(symbol, name="symbol")
+        validate_dataset_component(timeframe, name="timeframe")
+    except ValueError:
+        return None
     ohlcv_root = data_root / "ohlcv"
-    matches = sorted(ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"))
+    matches = sorted(_contained_rglob(ohlcv_root, f"**/{symbol}/{timeframe}.parquet"))
     if not matches:
         return None
 
@@ -751,10 +1122,25 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     missing data and significant internal holes both report "failed" (Decision
     Record 2026-08-31), small holes warn.
     """
-    symbol_dir_candidates = sorted((data_root / "ohlcv").rglob(f"**/{requirement.symbol}"))
+    symbol = str(requirement.symbol or "").strip().upper()
     timeframe = normalize_timeframe(str(requirement.timeframe or "").strip())
+    try:
+        validate_dataset_component(symbol, name="symbol")
+        validate_dataset_component(timeframe, name="timeframe")
+    except ValueError as exc:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "status": "failed",
+            "gaps": [],
+            "failed_downloads": [],
+            "error": str(exc),
+        }
+    symbol_dir_candidates = sorted(
+        _contained_rglob(data_root / "ohlcv", f"**/{symbol}")
+    )
     gaps: list[dict[str, object]] = []
-    bounds = _coverage_for(data_root, requirement.symbol, timeframe)
+    bounds = _coverage_for(data_root, symbol, timeframe)
 
     for candidate in symbol_dir_candidates:
         gaps.extend(find_internal_gaps(candidate, timeframe))
@@ -764,7 +1150,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     required_end: str | None = None
     if bounds is None:
         error = (
-            f"No {requirement.symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
+            f"No {symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
         )
     else:
         required_start = _normalize_coverage_date(requirement.start)
@@ -791,7 +1177,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         status = "ok"
 
     report: dict[str, Any] = {
-        "symbol": requirement.symbol,
+        "symbol": symbol,
         "timeframe": timeframe,
         "status": status,
         "gaps": gaps,

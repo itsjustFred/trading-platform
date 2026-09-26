@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from shared.models import Trade, TradeExit
 from validation.comparison.comparison import (
     FieldComparisonResult,
     MatchedTrade,
+    TradeComparator,
     TradeComparisonConfig,
     TradeComparisonResult,
-    TradeComparator,
 )
 from validation.comparison.matcher import MatchKey
 
@@ -436,6 +434,18 @@ class TestConfigCustomization:
         config = TradeComparisonConfig(pnl_pct=0.01, pnl_abs=1.0)
         custom = TradeComparator(config).compare(_make_matched(ref, act))
         assert custom.is_match
+
+
+class TestFiniteTolerances:
+    def test_nonfinite_trade_tolerance_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            TradeComparisonConfig(pnl_abs=float("nan"))
+        with pytest.raises(ValueError, match="finite"):
+            TradeComparisonConfig(entry_price_pct=float("inf"))
+
+    def test_negative_trade_tolerance_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match=">= 0"):
+            TradeComparisonConfig(volume_pct=-0.1)
 
 
 class TestStructure:

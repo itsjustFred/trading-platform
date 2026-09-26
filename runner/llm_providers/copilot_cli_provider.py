@@ -6,6 +6,8 @@ import subprocess
 import time
 from typing import Any
 
+from runner.agent_process import build_backtest_child_env
+
 # The full prompt is piped via stdin (`-p -`) instead of being passed as a
 # single argv element: prompts here routinely exceed platform argv limits
 # (Windows ~32k chars) and would otherwise be readable process-wide via `ps`.
@@ -33,25 +35,73 @@ def _compose_prompt(*, user_prompt: str, system_prompt: str | None) -> str:
     )
 
 
+_COPILOT_CLI_EVENT_TYPES = frozenset(
+    {
+        "session.mcp_servers_loaded",
+        "session.tools_updated",
+        "user.message",
+        "assistant.turn_start",
+        "assistant.message_delta",
+        "assistant.message",
+        "assistant.turn_end",
+        "session.task_complete",
+        "tool.execution_start",
+        "tool.execution_complete",
+        "session.warning",
+        "session.info",
+        "result",
+    }
+)
+
+
 def _extract_content(payload: Any) -> str:
-    if isinstance(payload, str):
-        return payload.strip()
-    if isinstance(payload, dict):
-        for key in ("content", "text", "response", "output", "message"):
-            candidate = payload.get(key)
-            extracted = _extract_content(candidate)
-            if extracted:
-                return extracted
+    if not isinstance(payload, dict) or payload.get("type") != "assistant.message":
         return ""
-    if isinstance(payload, list):
-        for item in payload:
-            extracted = _extract_content(item)
-            if extracted:
-                return extracted
-    return ""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return ""
+    content = data.get("content")
+    return content.strip() if isinstance(content, str) else ""
 
 
-_COPILOT_CLI_EMPTY_RESPONSE_MESSAGE = "copilot_cli provider returned an empty response."
+def _extract_jsonl_content(stdout: str) -> str:
+    content = ""
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CliInvocationError(
+                status="error",
+                message="copilot_cli provider returned an invalid JSON event envelope.",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise CliInvocationError(
+                status="error",
+                message="copilot_cli provider returned a non-object JSON event envelope.",
+            )
+        event_type = payload.get("type")
+        if not isinstance(event_type, str):
+            raise CliInvocationError(
+                status="error",
+                message="copilot_cli provider returned an unknown JSON event envelope.",
+            )
+        if event_type not in _COPILOT_CLI_EVENT_TYPES:
+            continue
+        if event_type == "result":
+            exit_code = payload.get("exitCode")
+            if exit_code is not None and (not isinstance(exit_code, int) or exit_code != 0):
+                raise CliInvocationError(
+                    status="error",
+                    message="copilot_cli provider returned a failed result event.",
+                )
+        extracted = _extract_content(payload)
+        if extracted:
+            content = extracted
+    if not content:
+        raise CliInvocationError(status="error", message=EMPTY_RESPONSE_ERROR)
+    return content
 
 
 class CopilotCLIProvider:
@@ -67,6 +117,8 @@ class CopilotCLIProvider:
         ).strip() or "copilot"
         self._timeout_seconds = float(timeout_seconds)
         self._output_format = str(output_format or "json").strip().lower() or "json"
+        if self._output_format not in {"json", "text"}:
+            raise ValueError("output_format must be 'json' or 'text'.")
 
     def generate(
         self,
@@ -134,6 +186,7 @@ class CopilotCLIProvider:
                 text=True,
                 check=False,
                 timeout=self._timeout_seconds,
+                env=build_backtest_child_env(),
             )
         except FileNotFoundError as exc:
             raise CliInvocationError(
@@ -166,20 +219,13 @@ class CopilotCLIProvider:
                 ),
             )
 
-        content = stdout
         if not stdout:
             raise CliInvocationError(status="error", message=EMPTY_RESPONSE_ERROR)
         if self._output_format == "json":
-            try:
-                payload = json.loads(stdout)
-            except json.JSONDecodeError:
-                content = stdout
-            else:
-                content = _extract_content(payload) or stdout
-
-        if not content.strip():
+            return _extract_jsonl_content(stdout)
+        if not stdout.strip():
             raise CliInvocationError(status="error", message=EMPTY_RESPONSE_ERROR)
-        return content
+        return stdout
 
 
 def _apply_metadata(
