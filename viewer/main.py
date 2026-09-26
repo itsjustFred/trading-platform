@@ -4742,7 +4742,7 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
 def _record_discovered_account_verification(
     account_id: str,
     *,
-    is_demo: bool,
+    is_demo: bool | None,
     ctid: str | None,
     broker_login: str | None,
 ) -> None:
@@ -4753,7 +4753,18 @@ def _record_discovered_account_verification(
     require. Failure is logged and swallowed: discovery must still return the
     account list even when the write fails, and the account simply stays
     unverified (fail-closed) until the next successful discovery.
+
+    ``is_demo`` is tri-state. ``None`` means the source did not report the flag
+    at all, and then there is no verification to record: defaulting it to False
+    would invent a "the broker says this is live" confirmation out of an absent
+    field, and would stamp a live-looking verification onto the account besides.
     """
+    if is_demo is None:
+        logger.warning(
+            "Discovery reported no is_demo flag; recording no demo verification",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
     try:
         record_live_account_demo_verification(
             account_id,
@@ -4784,7 +4795,12 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
             normalized_ctid = (
                 str(account.get("ctid")).strip() if account.get("ctid") else None
             )
-            is_demo = bool(account.get("is_demo", False))
+            # Only a real boolean counts as the source asserting demo-ness. A
+            # missing or non-boolean value leaves the stored flag alone and is
+            # reported to the client as unasserted, instead of being invented
+            # into a False that would demote a verified demo account.
+            raw_is_demo = account.get("is_demo")
+            is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
             _record_discovered_account_verification(
                 account_id,
                 is_demo=is_demo,
@@ -4797,7 +4813,8 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                     "name": str(account.get("name") or account_id),
                     "broker": str(account.get("broker") or "unknown"),
                     "balance": _safe_float(account.get("balance"), 0.0),
-                    "is_demo": is_demo,
+                    "is_demo": bool(is_demo),
+                    "is_demo_asserted": is_demo is not None,
                     "broker_login": normalized_login,
                     "login": normalized_login,
                     "ctid": normalized_ctid,
@@ -4824,6 +4841,10 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 "broker": account.broker,
                 "balance": float(account.balance),
                 "is_demo": is_demo,
+                # A LiveAccount always carries a real boolean, so the source did
+                # assert the flag. Spelled out so the persistence path below has
+                # one rule to read instead of inferring it per branch.
+                "is_demo_asserted": True,
                 "broker_login": normalized_login,
                 "login": normalized_login,
                 "ctid": normalized_ctid,
@@ -11660,12 +11681,21 @@ async def get_live_accounts() -> list[dict[str, Any]]:
     # ACTIVE verification-freshness gate both operate on stored account rows, so
     # an account that was only ever seen in a discovery response cannot be a
     # valid deployment target.
+    #
+    # A read must never demote a safety flag. `is_demo` is only forwarded when
+    # discovery positively asserted it; an unasserted flag becomes None, which
+    # `upsert_live_accounts` treats as "say nothing". Coercing a missing field
+    # to False here is what silently disarmed accounts: the stored flag flipped
+    # to non-demo while `demo_verified_at` stayed fresh, the adapter was torn
+    # down, and no later read could ever put it back.
     persisted: list[LiveAccountConfig] = []
     for item in discovered:
         broker = str(item.get("broker") or "").strip().lower()
         account_id = str(item.get("id") or "").strip()
         if broker not in {"alpaca", "ctrader"} or not account_id:
             continue
+        raw_is_demo = item.get("is_demo")
+        asserted = bool(item.get("is_demo_asserted", isinstance(raw_is_demo, bool)))
         persisted.append(
             LiveAccountConfig(
                 id=account_id,
@@ -11674,7 +11704,7 @@ async def get_live_accounts() -> list[dict[str, Any]]:
                 broker_login=str(item.get("broker_login") or item.get("login") or "").strip()
                 or None,
                 ctid=str(item.get("ctid") or "").strip() or None,
-                is_demo=bool(item.get("is_demo", False)),
+                is_demo=bool(raw_is_demo) if asserted and isinstance(raw_is_demo, bool) else None,
             )
         )
     if persisted:

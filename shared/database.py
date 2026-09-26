@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
 import hashlib
 import math
@@ -493,6 +494,24 @@ def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _coerce_naive_utc(value: Any) -> datetime | None:
+    """Read a naive-UTC timestamp out of a column, or None when unusable.
+
+    Legacy SQLite rows can hold a DATETIME column as text, so a stamp written by
+    an older build is still readable here. Anything else — a bool, a number, a
+    string that is not a timestamp, None — becomes None, which every safety gate
+    treats as "not verified".
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _normalize_optional_id(value: Any) -> str | None:
     """Normalize an optional external id to a real ``None`` or a clean string.
 
@@ -674,6 +693,9 @@ class LiveAccountModel(SQLModel, table=True):
             name=account.name,
             ctid=account.ctid,
             broker_login=account.broker_login,
+            # A brand-new row is never trusted on the strength of a payload: it
+            # has no verification, so `is_demo` only decides what an operator
+            # sees. It cannot be armed until the broker verification is recorded.
             is_demo=bool(account.is_demo),
         )
 
@@ -685,7 +707,19 @@ class LiveAccountModel(SQLModel, table=True):
             ctid=self.ctid or "",
             broker_login=self.broker_login or "",
             is_demo=bool(self.is_demo),
+            demo_verified_at=self.demo_verified_at_as_datetime(),
+            identity_fingerprint=self.identity_fingerprint,
         )
+
+    def demo_verified_at_as_datetime(self) -> datetime | None:
+        """The verification stamp as a datetime, or None when unreadable.
+
+        A legacy row can hold the stamp as text. An unreadable stamp is reported
+        as None ("no verification") rather than guessed at, so every caller that
+        reads it fails closed. Gates that must distinguish "never verified" from
+        "corrupt stamp" read ``demo_verified_at`` off the row directly.
+        """
+        return _coerce_naive_utc(self.demo_verified_at)
 
 
 class ServiceModel(SQLModel, table=True):
@@ -832,6 +866,19 @@ class LiveDeploymentModel(SQLModel, table=True):
 
 class LiveDeploymentSubmissionClaimModel(SQLModel, table=True):
     __tablename__ = "live_deployment_submission_claims"
+    __table_args__ = (
+        # Exactly one live claim per deployment. The claim is what turns
+        # "still ACTIVE" into a single atomic fact taken immediately before the
+        # broker call, and that only holds while no second claimer can hold one
+        # for the same deployment. With a non-unique index a second daemon
+        # process claimed the same ACTIVE deployment and both submitted.
+        # Expired leases are pruned before every claim (see
+        # `claim_live_deployment_submission`), so a claimor that died cannot
+        # deadlock the deployment past the lease TTL.
+        UniqueConstraint(
+            "deployment_id", name="uq_live_deployment_submission_claims_deployment"
+        ),
+    )
 
     token: str = Field(primary_key=True)
     deployment_id: str = Field(index=True)
@@ -1534,6 +1581,104 @@ def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
         )
 
 
+def _has_unique_index_on_column(connection: Connection, table: str, column: str) -> bool:
+    """True when ``table`` already enforces UNIQUE on exactly ``column``.
+
+    Covers both shapes SQLite can hold: a named index and the implicit
+    ``sqlite_autoindex_*`` behind a table-level UNIQUE constraint, which is what
+    ``SQLModel.metadata.create_all`` produces from the model declaration. A
+    database created fresh therefore needs no migration, and one created before
+    the constraint existed gets a named unique index instead.
+    """
+    quoted_table = connection.dialect.identifier_preparer.quote(table)
+    for row in connection.execute(text(f"PRAGMA index_list({quoted_table})")).fetchall():
+        if not bool(row[2]):  # row[2] is the "unique" flag
+            continue
+        index_name = str(row[1])
+        quoted_index = connection.dialect.identifier_preparer.quote(index_name)
+        indexed_columns = [
+            str(info[2])
+            for info in connection.execute(
+                text(f"PRAGMA index_info({quoted_index})")
+            ).fetchall()
+        ]
+        if indexed_columns == [column]:
+            return True
+    return False
+
+
+def _prune_duplicate_submission_claims(connection: Connection) -> int:
+    """Collapse concurrent claims for one deployment down to the newest lease.
+
+    A plain unique index cannot be created while two rows share a deployment, and
+    refusing the migration would take the whole database down for every caller
+    (including the safety gates), which is a worse outcome than collapsing the
+    duplicates. Which rows are redundant is unambiguous here: these are leases
+    with a TTL, not records. The newest lease is the one that is live, every
+    other lease for that deployment is already superseded, so keeping the newest
+    and dropping the rest preserves the invariant and leaves the deployment
+    submittable. Nothing is deleted unless the unique index is about to be
+    created.
+    """
+    duplicated = connection.execute(
+        text(
+            "SELECT deployment_id FROM live_deployment_submission_claims "
+            "GROUP BY deployment_id HAVING COUNT(*) > 1"
+        )
+    ).fetchall()
+    removed = 0
+    for (deployment_id,) in duplicated:
+        keeper = connection.execute(
+            text(
+                "SELECT token FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id "
+                "ORDER BY expires_at DESC, claimed_at DESC, token DESC LIMIT 1"
+            ),
+            {"deployment_id": str(deployment_id)},
+        ).first()
+        if keeper is None:  # pragma: no cover - the group is non-empty by query
+            continue
+        result = connection.execute(
+            text(
+                "DELETE FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id AND token != :token"
+            ),
+            {"deployment_id": str(deployment_id), "token": str(keeper[0])},
+        )
+        dropped = int(result.rowcount or 0)
+        removed += dropped
+        logger.warning(
+            "Collapsed concurrent live deployment submission claims to satisfy the "
+            "one-lease-per-deployment invariant; the extra leases were superseded",
+            extra={"data": {"deployment_id": str(deployment_id), "dropped": dropped}},
+        )
+    return removed
+
+
+def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
+    """Make the live submission claim mutually exclusive per deployment.
+
+    ``deployment_id`` used to carry only a non-unique index, so two dispatchers
+    could both claim the same ACTIVE deployment and both submit. The claim is
+    the only thing standing between a stale "still ACTIVE" snapshot and a real
+    broker order, so the uniqueness is enforced by the database itself.
+    """
+    if not _table_column_names(connection, "live_deployment_submission_claims"):
+        return
+    if _has_unique_index_on_column(
+        connection, "live_deployment_submission_claims", "deployment_id"
+    ):
+        return
+    _prune_duplicate_submission_claims(connection)
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_live_deployment_submission_claims_deployment "
+            "ON live_deployment_submission_claims(deployment_id)"
+        )
+    )
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         _add_live_deployment_columns(
@@ -1549,6 +1694,7 @@ def _migrate_schema() -> None:
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
+        _migrate_live_submission_claim_uniqueness(connection)
 
 
 def _find_existing_live_signal(
@@ -2005,6 +2151,49 @@ def _optional_trimmed(value: str | None) -> str | None:
     return None
 
 
+def _invalidate_verification_for_changed_identity(record: LiveAccountModel) -> bool:
+    """Drop the demo verification when the identity it covered has changed.
+
+    The fingerprint recorded at verification time is the only thing that ties
+    "verified demo" to one specific broker account. A writer that changes
+    broker/ctid/broker_login has just moved that account somewhere the broker
+    never confirmed, so the stamp is deleted rather than kept: the account then
+    fails the gates until discovery re-verifies it, which is the only path that
+    may write a new stamp. Idempotent — an already-unverified row is a no-op.
+    """
+    if not str(record.identity_fingerprint or "").strip():
+        return False
+    try:
+        current = live_account_identity_fingerprint(
+            str(record.broker or ""),
+            ctid=record.ctid,
+            broker_login=record.broker_login,
+        )
+    except Exception as exc:  # pragma: no cover - hash of a string cannot fail
+        logger.error(
+            "Could not recompute the live account identity while updating it; "
+            "dropping the demo verification",
+            extra={"data": {"account_id": record.id, "error": repr(exc)}},
+        )
+    else:
+        if hmac.compare_digest(str(record.identity_fingerprint), current):
+            return False
+    logger.warning(
+        "Live account broker identity changed; dropping its demo verification",
+        extra={
+            "data": {
+                "account_id": record.id,
+                "broker": record.broker,
+                "ctid": record.ctid,
+                "broker_login": record.broker_login,
+            }
+        },
+    )
+    record.demo_verified_at = None
+    record.identity_fingerprint = None
+    return True
+
+
 def _create_live_account_record(
     session: Session,
     account_id: str,
@@ -2040,26 +2229,39 @@ def _apply_live_account_updates(
     broker_login: str | None,
     is_demo: bool | None,
 ) -> bool:
-    """Overwrite non-empty fields on an existing live account row."""
+    """Overwrite non-empty fields on an existing live account row.
+
+    Re-pointing the broker identity (broker/ctid/broker_login) is a local
+    configuration change, not a broker conversation, so it also drops any demo
+    verification the previous identity carried. Leaving the stamp in place is
+    how a re-pointed credential used to keep trading as a verified demo.
+    """
     changed = False
+    identity_changed = False
     if broker and current.broker != broker:
         current.broker = broker
-        changed = True
+        identity_changed = True
     if name and current.name != name:
         current.name = name
         changed = True
     normalized_ctid = _optional_trimmed(ctid)
     if ctid is not None and current.ctid != normalized_ctid:
         current.ctid = normalized_ctid
-        changed = True
+        identity_changed = True
     normalized_broker_login = _optional_trimmed(broker_login)
     if broker_login is not None and current.broker_login != normalized_broker_login:
         current.broker_login = normalized_broker_login
-        changed = True
+        identity_changed = True
     if is_demo is not None and bool(current.is_demo) != bool(is_demo):
         current.is_demo = bool(is_demo)
         changed = True
-    if changed:
+        if not is_demo:
+            # A demotion cannot keep the verification it was based on.
+            current.demo_verified_at = None
+            current.identity_fingerprint = None
+    if identity_changed and _invalidate_verification_for_changed_identity(current):
+        changed = True
+    if changed or identity_changed:
         session.add(current)
         session.commit()
         session.refresh(current)
@@ -2102,6 +2304,20 @@ def ensure_live_account(
 
 
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
+    """Refresh stored account rows from a discovery payload.
+
+    Only values the payload positively asserts are written. ``is_demo`` is
+    tri-state on ``LiveAccountConfig`` and the broker identity fields are only
+    replaced when the payload carries one, so a payload that omits a value
+    (which a read-only page view can produce) cannot overwrite a
+    broker-verified ``True`` with ``False``, nor blank the identity a
+    verification was taken from.
+
+    The old unconditional write is what silently disarmed accounts: the stored
+    flag flipped to non-demo while ``demo_verified_at`` stayed fresh, the
+    adapter was torn down, and no later read could ever put it back, because a
+    non-demo account never gets an adapter again.
+    """
     init_db()
     with get_session() as session:
         for account in accounts:
@@ -2111,9 +2327,19 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
                 continue
             current.broker = account.broker
             current.name = account.name
-            current.ctid = account.ctid
-            current.broker_login = account.broker_login
-            current.is_demo = bool(account.is_demo)
+            if _optional_trimmed(account.ctid) is not None:
+                current.ctid = _optional_trimmed(account.ctid)
+            if _optional_trimmed(account.broker_login) is not None:
+                current.broker_login = _optional_trimmed(account.broker_login)
+            if account.is_demo is not None and bool(current.is_demo) != bool(account.is_demo):
+                current.is_demo = bool(account.is_demo)
+                if not current.is_demo:
+                    # An explicit demotion invalidates the verification behind it.
+                    current.demo_verified_at = None
+                    current.identity_fingerprint = None
+            # Whatever wrote the identity above, it can only be trusted once the
+            # broker has confirmed the new one.
+            _invalidate_verification_for_changed_identity(current)
             session.add(current)
         session.commit()
 
@@ -2339,6 +2565,22 @@ def claim_live_deployment_submission(
     *,
     ttl_seconds: float = 30.0,
 ) -> bool:
+    """Take the single submission lease for one deployment, or refuse.
+
+    Two independent facts have to hold, and both are decided by the database
+    rather than by a status snapshot taken earlier in the dispatch:
+
+    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
+      live row, so a PAUSE that committed first wins the race);
+    * no other process holds a lease for it (``UNIQUE(deployment_id)``, see
+      :class:`LiveDeploymentSubmissionClaimModel`).
+
+    A lease that has outlived its TTL is deleted first, in its own committed
+    transaction, so a claimor that died mid-submission cannot wedge the
+    deployment forever. That cleanup is committed separately on purpose: it must
+    survive a refused claim, otherwise a permanently-busy deployment would also
+    stop reaping its own dead leases.
+    """
     normalized_id = str(deployment_id or "").strip()
     normalized_token = str(token or "").strip()
     if not normalized_id or not normalized_token:
@@ -2353,22 +2595,40 @@ def claim_live_deployment_submission(
                 & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
             )
         )
-        result = session.execute(
-            text(
-                "INSERT INTO live_deployment_submission_claims "
-                "(token, deployment_id, claimed_at, expires_at) "
-                "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
-            ),
-            {
-                "token": normalized_token,
-                "claimed_at": now,
-                "expires_at": expires_at,
-                "deployment_id": normalized_id,
-            },
-        )
         session.commit()
-        return int(result.rowcount or 0) == 1
+    with get_session() as session:
+        try:
+            result = session.execute(
+                text(
+                    "INSERT INTO live_deployment_submission_claims "
+                    "(token, deployment_id, claimed_at, expires_at) "
+                    "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
+                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                ),
+                {
+                    "token": normalized_token,
+                    "claimed_at": now,
+                    "expires_at": expires_at,
+                    "deployment_id": normalized_id,
+                },
+            )
+            session.commit()
+            return int(result.rowcount or 0) == 1
+        except IntegrityError:
+            # The UNIQUE(deployment_id) lease is held: another dispatcher is
+            # already submitting for this deployment. Refusing is the whole
+            # point, so this is not an error - but it is a race the operator
+            # should be able to see, so say which deployment lost it.
+            session.rollback()
+            logger.warning(
+                "Live deployment submission already claimed by another "
+                "dispatcher; refusing the second claim",
+                extra={"data": {"deployment_id": normalized_id, "token": normalized_token}},
+            )
+            return False
+        except Exception:
+            session.rollback()
+            raise
 
 
 def release_live_deployment_submission(token: str) -> bool:
@@ -2425,9 +2685,10 @@ def live_account_identity_fingerprint(
 ) -> str:
     """Stable hash of the broker-reported identity of an account.
 
-    Persisted at verification time and re-checked before activation, so a
-    credential that is silently re-pointed at a different (or live) account
-    cannot inherit an old, trusted verification.
+    Persisted at verification time and re-checked by
+    :func:`live_account_verification_block_reason` on both the arm path and the
+    per-dispatch path, so a credential that is silently re-pointed at a
+    different (or live) account cannot inherit an old, trusted verification.
     """
     payload = "|".join(
         (
@@ -2439,9 +2700,44 @@ def live_account_identity_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _live_account_fingerprint_mismatch_reason(account: LiveAccountModel) -> str | None:
+    """Return why the account's current identity is not the verified one.
+
+    Fails closed on every uncertainty: no stored fingerprint, a fingerprint that
+    cannot be recomputed, or a recomputed value that differs from the stored
+    one. The recomputation reads the live row, so any writer that changes the
+    broker identity without re-verifying is caught here.
+    """
+    stored = str(account.identity_fingerprint or "").strip()
+    if not stored:
+        return "account has no broker identity fingerprint on record; re-verify with the broker"
+    try:
+        current = live_account_identity_fingerprint(
+            str(account.broker or ""),
+            ctid=account.ctid,
+            broker_login=account.broker_login,
+        )
+    except Exception as exc:  # pragma: no cover - hash of a string cannot fail
+        logger.error(
+            "Could not recompute the live account identity fingerprint; refusing",
+            extra={"data": {"account_id": account.id, "error": repr(exc)}},
+        )
+        return "account identity fingerprint could not be recomputed; re-verify with the broker"
+    if not current:
+        return "account identity fingerprint is empty; re-verify with the broker"
+    if not hmac.compare_digest(stored, current):
+        return (
+            "account broker identity changed since it was verified as demo; "
+            "re-verify with the broker"
+        )
+    return None
+
+
 # How long a broker demo verification stays trustworthy. Short enough that a
 # re-pointed credential cannot keep trading on a stale confirmation, long
-# enough that an operator does not have to re-verify every click.
+# enough that an operator does not have to re-verify every click. Enforced on
+# every gate below: activation AND every individual submission, so a deployment
+# that was armed long ago cannot keep trading on an expired confirmation.
 DEMO_VERIFICATION_TTL_SECONDS = 900
 
 
@@ -2455,7 +2751,9 @@ def record_live_account_demo_verification(
     """Stamp an account as freshly broker-verified (or explicitly not demo).
 
     Only call this from a path that has just talked to the broker. It is the
-    single writer of ``demo_verified_at``/``identity_fingerprint``.
+    single writer of ``demo_verified_at``/``identity_fingerprint``, and the
+    fingerprint it writes is what the gates compare against, so a re-pointed
+    credential that never re-verifies cannot keep the old stamp.
     """
     normalized_id = str(account_id or "").strip()
     if not normalized_id:
@@ -2481,11 +2779,22 @@ def record_live_account_demo_verification(
         return record.to_live_account()
 
 
-def _activation_block_reason(account: LiveAccountModel | None) -> str | None:
-    """Return why activation must be refused, or None when it may proceed.
+def live_account_verification_block_reason(
+    account: LiveAccountModel | None,
+) -> str | None:
+    """Return why the account must not trade right now, or None when it may.
 
-    Fail-closed on every uncertainty: unknown account, not verified demo, no
-    verification on record, or a verification that has aged out.
+    The single fail-closed verdict shared by every path that can put an order on
+    a broker: arming a deployment (``create_live_deployment``,
+    ``update_live_deployment_status``, ``update_live_deployment_account``) and the
+    daemon's per-dispatch gate. Uncertainties that could hide a live account all
+    refuse:
+
+    * unknown account, or one the broker did not confirm as demo;
+    * no verification on record, or one that is unreadable or aged out past
+      ``DEMO_VERIFICATION_TTL_SECONDS``;
+    * a broker identity that no longer matches the one that was verified, or a
+      fingerprint that is missing or cannot be recomputed.
     """
     if account is None:
         return "account is unknown"
@@ -2494,19 +2803,45 @@ def _activation_block_reason(account: LiveAccountModel | None) -> str | None:
     verified_at = account.demo_verified_at
     if verified_at is None:
         return "account has no broker demo verification on record"
-    if isinstance(verified_at, datetime):
-        age = (_utcnow_naive() - verified_at).total_seconds()
-    else:
+    if not isinstance(verified_at, datetime):
         try:
-            age = (_utcnow_naive() - datetime.fromisoformat(str(verified_at))).total_seconds()
+            verified_at = datetime.fromisoformat(str(verified_at))
         except ValueError:
             return "account demo verification timestamp is unreadable"
+    age = (_utcnow_naive() - verified_at).total_seconds()
     if age > DEMO_VERIFICATION_TTL_SECONDS:
         return (
             "account demo verification is older than "
             f"{DEMO_VERIFICATION_TTL_SECONDS}s; re-verify with the broker"
         )
-    return None
+    # Identity is checked after freshness so a long-idle account reports the
+    # re-verify it actually needs, but it is still checked on every gate: a
+    # fingerprint is only trustworthy for the identity it was taken from.
+    return _live_account_fingerprint_mismatch_reason(account)
+
+
+def live_account_submission_block_reason(account_id: str) -> str | None:
+    """Per-dispatch verdict for one account, or None when a submission may go.
+
+    This is the gate the live daemon calls immediately before every broker
+    submission. It re-reads the account row so it sees the demo flag, the
+    verification age and the broker identity as they are *now*, not as they were
+    when the deployment was armed. Any failure to reach that verdict — database
+    error, unmigrated schema, uncomputable fingerprint — propagates, and the
+    caller's except-path refuses the dispatch.
+    """
+    normalized_id = str(account_id or "").strip()
+    if not normalized_id:
+        return "account id is required"
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveAccountModel, normalized_id)
+        return live_account_verification_block_reason(record)
+
+
+def _activation_block_reason(account: LiveAccountModel | None) -> str | None:
+    """Return why activation must be refused, or None when it may proceed."""
+    return live_account_verification_block_reason(account)
 
 
 def update_live_deployment_status(

@@ -54,6 +54,7 @@ from shared.database import (
     list_live_accounts,
     list_live_deployments,
     list_services,
+    live_account_submission_block_reason,
     release_live_deployment_submission,
     save_live_balance,
     update_service_status,
@@ -1431,21 +1432,60 @@ def _resolve_discord_service_trusted_author_ids(
 
 
 def _deployment_account_is_demo(account_id: str) -> bool:
+    """Per-dispatch gate: may this deployment's account take an order right now?
+
+    Deliberately re-reads the account row on every dispatch instead of trusting
+    the flag captured when the adapter was built. It asks the database for the
+    full verdict — demo flag, verification age against
+    ``DEMO_VERIFICATION_TTL_SECONDS``, and whether the broker identity still
+    matches the one that was verified — so a deployment armed long ago cannot
+    outlive its verification, and a credential re-pointed at a live account
+    cannot inherit the old stamp.
+
+    Fails closed on every uncertainty. Any error reaching the verdict, and any
+    verdict that is not a clean pass, refuses the submission.
+    """
     try:
-        account = get_live_account(str(account_id))
+        block_reason = live_account_submission_block_reason(str(account_id))
     except Exception as exc:
         logger.error(
             "Account demo-mode verification failed; refusing live dispatch",
-            extra={"data": {"account_id": account_id, "error": str(exc)}},
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
         )
         return False
-    if account is None or not bool(account.is_demo):
+    if block_reason is not None:
         logger.error(
-            "Account is missing or not verified demo; refusing live dispatch",
-            extra={"data": {"account_id": account_id}},
+            "Account is not verified for live dispatch; refusing: %s",
+            block_reason,
+            extra={"data": {"account_id": account_id, "reason": block_reason}},
         )
         return False
     return True
+
+
+def _adapter_never_available_reason(
+    account_lookup: Mapping[str, LiveAccountConfig] | None,
+    account_id: str,
+) -> str | None:
+    """Why this account will never get an adapter, or None while it still may.
+
+    ``_ensure_adapter_for_active_account`` permanently refuses to build an
+    adapter for an account that is absent from the account lookup or not
+    verified as demo, and nothing the daemon does afterwards can change that.
+    Callers use this to tell "not connected yet" (retryable, INFO) apart from
+    "can never connect" (terminal, ERROR).
+
+    A lookup that was not supplied counts as terminal: absence of evidence is
+    not evidence of a retryable condition.
+    """
+    if account_lookup is None:
+        return "account state was not available to this check"
+    account = account_lookup.get(str(account_id))
+    if account is None:
+        return "account is not in the account lookup, so no adapter is ever built for it"
+    if not bool(account.is_demo):
+        return "account is non-demo, so no adapter is ever built for it"
+    return None
 
 
 def _warn_on_active_non_demo_deployments(
@@ -2983,6 +3023,7 @@ async def _enforce_stopped_deployments(
     active_adapters: dict[str, BaseLiveAdapter],
     *,
     already_enforced: set[str],
+    account_lookup: Mapping[str, LiveAccountConfig] | None = None,
 ) -> None:
     """Make STOPPED mean what an operator expects: nothing open, nothing resting.
 
@@ -3048,15 +3089,38 @@ async def _enforce_stopped_deployments(
             # still has positions. Leaving it out of the ledger makes the next
             # sync retry once a connection exists. The retry is bounded because a
             # STOPPED deployment cannot submit anything in the meantime.
-            logger.info(
-                "Stopped deployment has no active adapter yet; will retry cancel/flatten",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
+            #
+            # Except when the account itself can never produce an adapter: a
+            # non-demo account is refused by `_ensure_adapter_for_active_account`
+            # forever, so "will retry" is a lie. That is a terminal state and has
+            # to be logged as the error it is, naming the account, or the
+            # positions on it are never flattened and nobody is told.
+            account_block_reason = _adapter_never_available_reason(
+                account_lookup, deployment.account_id
             )
+            if account_block_reason is not None:
+                logger.error(
+                    "Stopped deployment's account can never get an adapter, so the "
+                    "cancel/flatten can never run; flatten it at the broker by hand. "
+                    "Reason: %s",
+                    account_block_reason,
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+            else:
+                logger.info(
+                    "Stopped deployment has no active adapter yet; will retry cancel/flatten",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
             continue
 
         try:
@@ -3459,6 +3523,7 @@ async def sync_deployments_loop(
                 deployments,
                 active_adapters,
                 already_enforced=enforced_stopped_deployments,
+                account_lookup=account_lookup,
             )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(

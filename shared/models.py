@@ -163,7 +163,17 @@ class LiveAccountConfig(BaseModel):
     name: str = ""
     broker_login: str | None = None
     ctid: str | None = None
-    is_demo: bool = False
+    # Tri-state on purpose. ``None`` means "this source did not assert whether the
+    # account is a demo". Collapsing that to ``False`` would let a payload which
+    # never spoke to the broker demote a broker-verified demo account, which is
+    # unrecoverable (a non-demo account can never be armed again).
+    is_demo: bool | None = None
+    # The broker identity captured when the account was last verified, and when
+    # that happened. Both must travel with the row: the per-dispatch gate has to
+    # re-check freshness and identity on every submission, not only at
+    # activation, so continued operation cannot outlive the verification.
+    demo_verified_at: datetime | None = None
+    identity_fingerprint: str | None = None
 
 
 class LiveAccount(BaseModel):

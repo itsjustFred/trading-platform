@@ -9,6 +9,7 @@ import pytest
 
 import live_runner.daemon as daemon
 import live_runner.signal_sources.discord_source as discord_source_module
+import shared.database as database
 from live_runner.ctrader_adapter import CTraderAuthTerminalError
 from live_runner.signal_sources.discord_source import (
     DiscordAuthenticationError,
@@ -1870,53 +1871,143 @@ def _live_account(*, is_demo: bool) -> LiveAccountConfig:
     )
 
 
-def _raise_account_lookup(_account_id: str) -> LiveAccountConfig:
+def _live_account_row(
+    *,
+    is_demo: bool,
+    broker_login: str | None = None,
+    ctid: str | None = None,
+    verified_ago_seconds: float | None = 0.0,
+    verified_as_broker_login: str | None = None,
+    stored_fingerprint: str | None = None,
+):
+    """A stored account row, exactly as the database hands it to the gate.
+
+    Built as a real ``LiveAccountModel`` and run through the real verdict
+    function, so these tests exercise the production decision (demo flag,
+    verification age, broker identity) instead of replacing it.
+    """
+    from datetime import timedelta
+
+    import shared.database as database
+
+    row = database.LiveAccountModel(
+        id="acc-live",
+        broker="ctrader",
+        name="Live",
+        is_demo=is_demo,
+        broker_login=broker_login,
+        ctid=ctid,
+    )
+    if verified_ago_seconds is not None:
+        row.demo_verified_at = database._utcnow_naive() - timedelta(
+            seconds=verified_ago_seconds
+        )
+        row.identity_fingerprint = database.live_account_identity_fingerprint(
+            "ctrader",
+            ctid=ctid,
+            # What the broker confirmed at verification time, which is not
+            # necessarily what the row says now.
+            broker_login=(
+                broker_login if verified_as_broker_login is None else verified_as_broker_login
+            ),
+        )
+    if stored_fingerprint is not None:
+        row.identity_fingerprint = stored_fingerprint
+    return row
+
+
+def _raise_account_lookup(_account_id: str) -> str:
     raise RuntimeError("database is unreachable")
 
 
 @pytest.mark.parametrize(
-    ("account_lookup", "expected_message"),
+    ("account_row", "expected_message"),
     [
         pytest.param(
-            lambda _account_id: None,
-            "missing or not verified demo",
+            lambda: None,
+            "account is unknown",
             id="account-row-missing",
         ),
         pytest.param(
-            lambda _account_id: _live_account(is_demo=False),
-            "missing or not verified demo",
+            lambda: _live_account_row(is_demo=False),
+            "account is non-demo and not verified as demo",
             id="account-is-not-demo",
         ),
         pytest.param(
-            _raise_account_lookup,
-            "verification failed",
-            id="account-lookup-raises",
+            lambda: _live_account_row(is_demo=True, verified_ago_seconds=None),
+            "account has no broker demo verification on record",
+            id="never-verified-against-the-broker",
+        ),
+        pytest.param(
+            lambda: _live_account_row(
+                is_demo=True,
+                verified_ago_seconds=database.DEMO_VERIFICATION_TTL_SECONDS + 60,
+            ),
+            "account demo verification is older than",
+            id="verification-aged-out",
+        ),
+        pytest.param(
+            lambda: _live_account_row(
+                is_demo=True,
+                broker_login="PA-LIVE-9",
+                verified_as_broker_login="PA-DEMO-1",
+            ),
+            "account broker identity changed since it was verified as demo",
+            id="credential-re-pointed-at-a-live-account",
+        ),
+        pytest.param(
+            lambda: _live_account_row(is_demo=True, stored_fingerprint=""),
+            "account has no broker identity fingerprint on record",
+            id="fingerprint-missing",
         ),
     ],
 )
 def test_demo_gate_refuses_anything_it_cannot_verify_as_demo(
-    monkeypatch, account_lookup, expected_message
+    monkeypatch, account_row, expected_message
 ) -> None:
     """Every unverifiable account is refused, and every refusal is logged.
 
     "I could not check" is not "it is fine": a missing row, an account the
-    operator never marked as demo, and a database error all have to fail
-    closed, otherwise a real order routes to a live-money account.
+    operator never marked as demo, a verification that has aged out, a
+    credential re-pointed at another account, and a database error all have to
+    fail closed, otherwise a real order routes to a live-money account.
     """
+    from shared.database import live_account_verification_block_reason
+
     looked_up: list[str] = []
 
-    def _get_live_account(account_id: str) -> LiveAccountConfig:
+    def _account_verdict(account_id: str) -> str | None:
         looked_up.append(account_id)
-        return account_lookup(account_id)
+        return live_account_verification_block_reason(account_row())
 
-    monkeypatch.setattr(daemon, "get_live_account", _get_live_account)
+    monkeypatch.setattr(daemon, "live_account_submission_block_reason", _account_verdict)
 
     with _daemon_log_records() as records:
         assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is False
 
     assert looked_up == ["acc-live"], "the verdict must come from the stored row"
     assert records, "a refused dispatch must be logged, not silently dropped"
-    assert any(expected_message in record.getMessage() for record in records)
+    assert any(expected_message in record.getMessage() for record in records), (
+        f"the refusal must say why: {[r.getMessage() for r in records]}"
+    )
+    named = [getattr(record, "data", {}).get("account_id") for record in records]
+    assert named == ["acc-live"], f"every refusal must name the account, got {named}"
+
+
+def test_demo_gate_refuses_when_the_verdict_cannot_be_reached(monkeypatch) -> None:
+    """An unreadable database is a refusal, not a pass.
+
+    The gate must not treat "I could not check" as "it is fine": that is the
+    difference between a missing row and a database that is down, and both have
+    to stop the order.
+    """
+    monkeypatch.setattr(daemon, "live_account_submission_block_reason", _raise_account_lookup)
+
+    with _daemon_log_records() as records:
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is False
+
+    assert records, "an unreachable database must be logged, not silently dropped"
+    assert any("verification failed" in record.getMessage() for record in records)
     named = [getattr(record, "data", {}).get("account_id") for record in records]
     assert named == ["acc-live"], f"every refusal must name the account, got {named}"
 
@@ -1926,7 +2017,14 @@ def test_demo_gate_allows_a_verified_demo_account(monkeypatch) -> None:
 
     Without this, a gate hard-wired to refuse everything would pass them.
     """
-    monkeypatch.setattr(daemon, "get_live_account", lambda _id: _live_account(is_demo=True))
+    from shared.database import live_account_verification_block_reason
+
+    def _account_verdict(account_id: str) -> str | None:
+        return live_account_verification_block_reason(
+            _live_account_row(is_demo=True, broker_login="PA-DEMO-1")
+        )
+
+    monkeypatch.setattr(daemon, "live_account_submission_block_reason", _account_verdict)
 
     with _daemon_log_records() as records:
         assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is True
@@ -1974,8 +2072,14 @@ def test_submission_path_runs_the_real_demo_gate_and_refuses_a_live_account(
     monkeypatch.setattr(
         daemon, "_deployment_account_is_demo", _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO
     )
+    # The storage seam the real gate reads, not the gate itself: a live-money row
+    # and the production verdict computed from it.
     monkeypatch.setattr(
-        daemon, "get_live_account", lambda account_id: _live_account(is_demo=False)
+        daemon,
+        "live_account_submission_block_reason",
+        lambda account_id: database.live_account_verification_block_reason(
+            _live_account_row(is_demo=False)
+        ),
     )
     monkeypatch.setattr(
         daemon, "release_live_deployment_submission", lambda token: released.append(token)
@@ -2002,3 +2106,123 @@ def test_submission_path_runs_the_real_demo_gate_and_refuses_a_live_account(
         "the refusal happens before the submission claim is taken, so nothing "
         f"is released: {released}"
     )
+
+
+# ─── The gate and the stop-enforcement log, against a real database ───────────
+#
+# The tests above drive the gate through a stubbed storage seam. These drive it
+# through the real one, because the properties that matter here are properties
+# of the stored row: an aged-out verification, a fingerprint that no longer
+# matches, and an account that can never be given an adapter at all.
+
+
+def test_dispatch_gate_refuses_against_the_real_stored_row(isolated_db, monkeypatch) -> None:
+    """The real gate, the real verdict function, a real sandboxed row.
+
+    Nothing is stubbed below `daemon._deployment_account_is_demo`, so this is the
+    wiring that decides whether a real order reaches a real account.
+    """
+    database_module, _engine, _data_dir = isolated_db
+    database_module.ensure_live_account(
+        "acc-live", "alpaca", is_demo=True, broker_login="PA-DEMO-1"
+    )
+    database_module.record_live_account_demo_verification(
+        "acc-live", is_demo=True, broker_login="PA-DEMO-1"
+    )
+    monkeypatch.setattr(
+        daemon, "_deployment_account_is_demo", _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO
+    )
+
+    assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is True
+
+    # Move the credential to a live-money account behind the gate's back, the
+    # way a rotated secret does: the row changes, the verification does not.
+    with database_module.get_session() as session:
+        row = session.get(database_module.LiveAccountModel, "acc-live")
+        row.broker_login = "PA-LIVE-9"
+        session.add(row)
+        session.commit()
+
+    with _daemon_log_records() as records:
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("acc-live") is False
+    assert any("identity changed" in record.getMessage() for record in records), (
+        f"the refusal must name the reason: {[r.getMessage() for r in records]}"
+    )
+
+
+def test_dispatch_gate_refuses_an_unknown_account_against_the_real_database(
+    isolated_db, monkeypatch
+) -> None:
+    """No row at all is a refusal, not a pass."""
+    database_module, _engine, _data_dir = isolated_db
+    monkeypatch.setattr(
+        daemon, "_deployment_account_is_demo", _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO
+    )
+    with _daemon_log_records() as records:
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO("never-configured") is False
+    assert any("account is unknown" in record.getMessage() for record in records)
+
+
+def test_stopped_deployment_on_a_non_demo_account_logs_a_terminal_error(
+    isolated_db,
+) -> None:
+    """"Will retry" is a lie for an account that can never get an adapter.
+
+    `_ensure_adapter_for_active_account` permanently refuses to build one for a
+    non-demo account, so the cancel/flatten for a STOPPED deployment can never
+    run. That is an operator-action state — the positions have to be closed by
+    hand at the broker — and it was being logged at INFO as a retry.
+    """
+    database_module, _engine, _data_dir = isolated_db
+    database_module.ensure_live_account("acc-1", "alpaca", is_demo=False)
+    enforced: set[str] = set()
+
+    with _daemon_log_records(level=logging.INFO) as records:
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_stopped_deployment()],
+                {},
+                already_enforced=enforced,
+                account_lookup={
+                    "acc-1": LiveAccountConfig(id="acc-1", broker="alpaca", is_demo=False)
+                },
+            )
+        )
+
+    terminal = [r for r in records if "can never get an adapter" in r.getMessage()]
+    assert terminal, f"expected a terminal error, got {[r.getMessage() for r in records]}"
+    assert all(record.levelno == logging.ERROR for record in terminal)
+    assert "non-demo" in terminal[0].getMessage()
+    # Still not recorded as enforced: it was not actually flattened.
+    assert "44444444-4444-4444-8444-444444444444" not in enforced
+
+
+def test_stopped_deployment_without_an_adapter_stays_an_info_retry(
+    isolated_db,
+) -> None:
+    """The control: a merely-unconnected account is still a retry, not terminal.
+
+    `active_adapters` is empty for every account right after a restart, so this
+    must not be escalated to an error or the log would cry wolf on every boot.
+    """
+    database_module, _engine, _data_dir = isolated_db
+    database_module.ensure_live_account("acc-1", "alpaca", is_demo=True)
+    database_module.record_live_account_demo_verification("acc-1", is_demo=True)
+    enforced: set[str] = set()
+
+    with _daemon_log_records(level=logging.INFO) as records:
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_stopped_deployment()],
+                {},
+                already_enforced=enforced,
+                account_lookup={
+                    "acc-1": LiveAccountConfig(id="acc-1", broker="alpaca", is_demo=True)
+                },
+            )
+        )
+
+    retries = [r for r in records if "will retry cancel/flatten" in r.getMessage()]
+    assert retries, f"expected a retry, got {[r.getMessage() for r in records]}"
+    assert all(record.levelno == logging.INFO for record in retries)
+    assert not [r for r in records if "can never get an adapter" in r.getMessage()]

@@ -5810,3 +5810,213 @@ def test_returned_bars_are_sorted_ascending_regardless_of_request_order():
     out = asyncio.run(adapter.get_market_data("AAPL", timeframe="1h", limit=5))
     timestamps = pd.to_datetime(out["timestamp"], utc=True)
     assert timestamps.is_monotonic_increasing, "bars must be returned oldest first"
+
+
+# ─── The broker identity behind a demo verification ────────────────────────────
+#
+# `identity_fingerprint` records which broker account a demo verification was
+# taken from. Without comparing it back, a credential that is re-pointed at a
+# live account keeps the old verification and the platform places a real order on
+# a real account. These tests pin the comparison on both gates, and the pin is
+# the comparison itself: a mutation that stops comparing is caught here.
+
+
+def test_repointed_credential_cannot_keep_its_demo_verification(isolated_db):
+    """The proven sequence, end to end: verify, re-point, and be refused.
+
+    `ensure_live_account(..., is_demo=None)` is a local configuration change: it
+    overwrites the broker identity without talking to the broker. It must not
+    leave the previous identity's verification attached to the new identity.
+    """
+    database = isolated_db
+    database.ensure_live_account("acc-1", "alpaca", is_demo=True, broker_login="PA-DEMO-1")
+    database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, broker_login="PA-DEMO-1"
+    )
+
+    deployment = _deployment()
+    created = database.create_live_deployment(deployment)
+    database.update_live_deployment_status(created.id, "PAUSED")
+    assert database.live_account_submission_block_reason("acc-1") is None
+
+    # Re-point at a live-money account, the way a rotated credential would be.
+    database.ensure_live_account("acc-1", "alpaca", broker_login="PA-LIVE-9", is_demo=None)
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-1")
+        # The demo flag itself is not this gate's business, but the verification
+        # behind it must not survive the identity change.
+        assert row.demo_verified_at is None, (
+            "a re-pointed credential must not keep the old identity's verification"
+        )
+        assert row.identity_fingerprint is None
+
+    # Refused on the arm path...
+    with pytest.raises(ValueError, match="Refusing to activate"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+    # ...and on the per-dispatch path, which is the one that reaches a broker.
+    assert database.live_account_submission_block_reason("acc-1") is not None
+
+    # Re-verifying against the broker is what makes it tradeable again.
+    database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, broker_login="PA-LIVE-9"
+    )
+    assert database.live_account_submission_block_reason("acc-1") is None
+    assert database.update_live_deployment_status(created.id, "ACTIVE") is not None
+
+
+def test_identity_change_outside_the_account_writers_is_still_caught(isolated_db):
+    """The fingerprint comparison is the gate; the writers are only a shortcut.
+
+    A stored fingerprint that no longer matches the row's identity must be
+    refused even when nothing went through `ensure_live_account` — a direct
+    write, a restored backup, or a future writer must not be able to move the
+    identity out from under the verification.
+    """
+    database = isolated_db
+    database.ensure_live_account("acc-1", "alpaca", is_demo=True, broker_login="PA-DEMO-1")
+    database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, broker_login="PA-DEMO-1"
+    )
+    created = database.create_live_deployment(_deployment())
+    assert database.live_account_submission_block_reason("acc-1") is None
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-1")
+        row.broker_login = "PA-LIVE-9"
+        session.add(row)
+        session.commit()
+
+    reason = database.live_account_submission_block_reason("acc-1")
+    assert reason is not None, "a changed identity must be refused"
+    assert "identity changed" in reason
+
+    database.update_live_deployment_status(created.id, "PAUSED")
+    with pytest.raises(ValueError, match="identity changed"):
+        database.update_live_deployment_status(created.id, "ACTIVE")
+
+
+def test_verification_without_a_fingerprint_is_refused(isolated_db):
+    """A fresh stamp with no fingerprint is an unverifiable verification.
+
+    Fail closed: if the fingerprint that ties "verified demo" to one broker
+    account cannot be read, the account is not demonstrably a demo.
+    """
+    database = isolated_db
+    database.ensure_live_account("acc-1", "alpaca", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-1")
+        row.identity_fingerprint = None
+        session.add(row)
+        session.commit()
+
+    reason = database.live_account_submission_block_reason("acc-1")
+    assert reason is not None
+    assert "no broker identity fingerprint" in reason
+
+
+def test_unreadable_verification_timestamp_is_refused(isolated_db):
+    """A stamp that cannot be parsed is not a fresh stamp.
+
+    SQLite will happily hold text in a DATETIME column, so a stamp written by
+    some other tool can come back as a string. That must be reported as "no
+    verification" and must never raise on the way out of the DB layer, because
+    the callers are safety gates, not validators.
+    """
+    database = isolated_db
+    row = database.LiveAccountModel(
+        id="acc-1",
+        broker="alpaca",
+        name="acc-1",
+        is_demo=True,
+        demo_verified_at="not-a-timestamp",
+        identity_fingerprint=database.live_account_identity_fingerprint(
+            "alpaca", ctid=None, broker_login=None
+        ),
+    )
+    assert row.to_live_account().demo_verified_at is None
+    reason = database.live_account_verification_block_reason(row)
+    assert reason is not None
+    assert "unreadable" in reason
+
+
+def test_dispatch_refuses_once_the_verification_ages_out(isolated_db):
+    """The TTL is enforced on the dispatch path, not only on the arm path.
+
+    Arming is a one-off decision; a deployment that trades for longer than the
+    TTL must stop submitting even though nothing about it changed.
+    """
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "alpaca")
+    # Armed while the verification is fresh, which is the only way this state
+    # can ever be reached.
+    database.create_live_deployment(_deployment())
+    assert database.live_account_submission_block_reason("acc-1") is None
+
+    with database.get_session() as session:
+        account = session.get(database.LiveAccountModel, "acc-1")
+        account.demo_verified_at = account.demo_verified_at - timedelta(
+            seconds=database.DEMO_VERIFICATION_TTL_SECONDS + 60
+        )
+        session.add(account)
+        session.commit()
+
+    reason = database.live_account_submission_block_reason("acc-1")
+    assert reason is not None, "an expired verification must stop submissions"
+    assert "older than" in reason
+
+
+# ─── Mutual exclusion for the live submission claim ────────────────────────────
+
+
+def test_submission_claim_is_mutually_exclusive_per_deployment(isolated_db):
+    """Two dispatchers, one deployment, one order.
+
+    The claim is the only thing that turns "still ACTIVE" into an atomic fact
+    taken immediately before the broker call, so a second claimer for the same
+    ACTIVE deployment has to be refused. Every caller mints a fresh token, so
+    uniqueness has to come from the deployment, not the token.
+    """
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    assert database.claim_live_deployment_submission(deployment_id, "token-1") is True
+    assert database.claim_live_deployment_submission(deployment_id, "token-2") is False
+    assert database.count_live_deployment_submissions(deployment_id) == 1
+
+    # A different deployment is unaffected: the exclusion is per deployment.
+    other = database.create_live_deployment(_deployment())
+    assert database.claim_live_deployment_submission(str(other.id), "token-3") is True
+
+    # Releasing hands the deployment over cleanly.
+    assert database.release_live_deployment_submission("token-1") is True
+    assert database.claim_live_deployment_submission(deployment_id, "token-4") is True
+
+
+def test_a_dead_claimor_does_not_wedge_a_deployment(isolated_db):
+    """Mutual exclusion must not become mutual deadlock.
+
+    A claimor that dies mid-submission leaves its lease behind. The lease has a
+    TTL, and the next claimer reaps it — otherwise a crashed process would stop
+    that deployment from ever trading again.
+    """
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    assert database.claim_live_deployment_submission(
+        deployment_id, "crashed-token", ttl_seconds=0.01
+    ) is True
+    # Still inside the lease: refused, because the other claimor may be live.
+    assert database.claim_live_deployment_submission(deployment_id, "too-soon") is False
+    time.sleep(0.05)
+    # Past the TTL the stale lease is reaped and the deployment trades again.
+    assert database.claim_live_deployment_submission(deployment_id, "after-ttl") is True
+    assert database.count_live_deployment_submissions(deployment_id) == 1
+    assert database.release_live_deployment_submission("crashed-token") is False

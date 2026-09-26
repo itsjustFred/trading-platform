@@ -1376,3 +1376,157 @@ def test_live_accounts_websocket_ping_pong(monkeypatch):
 
     assert pong["type"] == "pong"
     assert pong["topic"] == "live.accounts"
+
+
+# ─── A read must not disarm an account ─────────────────────────────────────────
+#
+# GET /api/live/accounts persists what discovery learned. It used to derive
+# `is_demo` with `bool(item.get("is_demo", False))`, so a discovery response
+# that simply did not mention the flag overwrote a broker-verified True with
+# False while leaving `demo_verified_at` fresh. The account was then unfixably
+# non-demo: no adapter is ever built for it, so its open positions were never
+# flattened and no later read could put the flag back.
+
+
+def _verified_demo_account(database, account_id: str = "acc-1") -> None:
+    database.ensure_live_account(account_id, "alpaca", is_demo=True, broker_login="PA-DEMO-1")
+    database.record_live_account_demo_verification(
+        account_id, is_demo=True, broker_login="PA-DEMO-1"
+    )
+
+
+def _call_get_live_accounts(monkeypatch, discovered: list[dict]) -> list[dict]:
+    import asyncio
+
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(
+        viewer_main_module, "_cached_live_accounts_payload", lambda *a, **k: discovered
+    )
+    return asyncio.run(viewer_main_module.get_live_accounts())
+
+
+def test_get_live_accounts_does_not_demote_a_verified_demo_account(
+    isolated_db, monkeypatch
+) -> None:
+    """The proven sequence: a GET whose payload omits is_demo changes nothing.
+
+    Not even for one request. A page view is a read; it has no business
+    disarming an account that has positions open at the broker.
+    """
+    database = isolated_db[0]
+    _verified_demo_account(database)
+
+    _call_get_live_accounts(monkeypatch, [{"id": "acc-1", "broker": "alpaca", "name": "acc-1"}])
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-1")
+        assert row.is_demo is True, "a read must not demote a verified demo account"
+    assert database.live_account_submission_block_reason("acc-1") is None, (
+        "and the account must still be submittable afterwards"
+    )
+
+
+def test_get_live_accounts_keeps_reporting_a_non_boolean_is_demo_as_unasserted(
+    isolated_db, monkeypatch
+) -> None:
+    """A payload that asserts nothing must not become a False.
+
+    `is_demo="yes"` is not a broker confirmation, so it is treated exactly like
+    an absent field rather than coerced into a demotion.
+    """
+    database = isolated_db[0]
+    _verified_demo_account(database)
+
+    _call_get_live_accounts(
+        monkeypatch,
+        [{"id": "acc-1", "broker": "alpaca", "name": "acc-1", "is_demo": "yes"}],
+    )
+
+    with database.get_session() as session:
+        assert session.get(database.LiveAccountModel, "acc-1").is_demo is True
+
+
+def test_get_live_accounts_still_applies_an_explicitly_asserted_flag(
+    isolated_db, monkeypatch
+) -> None:
+    """The control: a real broker assertion still reaches the stored row.
+
+    Without this, "ignore the payload" would pass the demotion test while
+    quietly breaking every account that the broker reports as non-demo.
+    """
+    database = isolated_db[0]
+    _verified_demo_account(database)
+
+    _call_get_live_accounts(
+        monkeypatch,
+        [
+            {
+                "id": "acc-1",
+                "broker": "alpaca",
+                "name": "acc-1",
+                "is_demo": False,
+                "is_demo_asserted": True,
+            }
+        ],
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-1")
+        assert row.is_demo is False
+        # A demotion drops the verification it was based on, so the row never
+        # reads as "verified as a non-demo account".
+        assert row.demo_verified_at is None
+        assert row.identity_fingerprint is None
+
+
+def test_get_live_accounts_still_creates_unknown_accounts(isolated_db, monkeypatch) -> None:
+    """The control for the other direction: new accounts still get a row.
+
+    Persistence exists so an account seen in discovery can be picked as a
+    deployment target once verified. A new row is unverified, so it cannot be
+    armed until discovery confirms it.
+    """
+    database = isolated_db[0]
+
+    _call_get_live_accounts(
+        monkeypatch,
+        [{"id": "acc-new", "broker": "alpaca", "name": "new", "is_demo": True}],
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-new")
+        assert row is not None
+        assert row.demo_verified_at is None
+    assert database.live_account_submission_block_reason("acc-new") is not None
+
+
+def test_discovered_payload_without_is_demo_records_no_verification(
+    isolated_db, monkeypatch
+) -> None:
+    """Discovery that does not report the flag must not stamp a verification.
+
+    Recording `is_demo=False` for a source that never said so would invent a
+    "the broker confirms this is live" answer, and stamp a fresh verification
+    onto it besides. No assertion means no verification.
+    """
+    import viewer.main as viewer_main_module
+
+    unasserted_source = [{"id": "acc-1", "broker": "ctrader", "name": "One"}]
+    monkeypatch.setattr(
+        viewer_main_module, "_run_coroutine_sync", lambda _coro: list(unasserted_source)
+    )
+
+    payload = viewer_main_module._discover_live_accounts_payload()
+
+    # Reported to the client as not asserted, not as a False the broker never gave.
+    assert payload[0]["is_demo_asserted"] is False
+    # And nothing recorded against the account row.
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_record_discovered_account_verification",
+        lambda account_id, **kwargs: recorded.append(f"{account_id}:{kwargs['is_demo']}"),
+    )
+    viewer_main_module._discover_live_accounts_payload()
+    assert recorded == ["acc-1:None"], "nothing asserted means nothing recorded"

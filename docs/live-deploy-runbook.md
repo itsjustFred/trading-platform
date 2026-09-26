@@ -64,8 +64,25 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 - Das Persistieren von `ACTIVE` ist nur erlaubt, wenn das persistierte Konto
   explizit als Demo verifiziert wurde (`live_accounts.is_demo = true`).
   Migrationen setzen bestehende, unbekannte Konten fail-closed auf `false`.
+- Eine Demo-Verifizierung ist mehr als das Flag: Sie braucht einen frischen Zeitstempel
+  (`demo_verified_at`, TTL `DEMO_VERIFICATION_TTL_SECONDS`) **und** einen
+  Identity-Fingerprint, der zur aktuellen Broker-Identität passt. Der Fingerprint wird
+  bei der Verifizierung aus (`broker`, `ctid`, `broker_login`) gebildet und bei jedem
+  Gate neu berechnet. Fehlt er, ist er nicht lesbar oder passt er nicht, wird verweigert.
+- Die TTL gilt auch **während** des Betriebs: der Daemon prüft vor *jeder* Signal-Dispatch
+  erneut das vollständige Verdikt (Flag + Alter + Identity). Eine einmal armierte
+  Deployment kann ihre Verifizierung also nicht überleben.
+- Wer die Broker-Identität eines Kontos ändert (`ensure_live_account` mit neuem
+  `broker_login`/`ctid`/`broker`), verwirft die zugehörige Verifizierung. Ein
+  umgepointertes Credential erbt damit keine alte Demo-Bestätigung; es muss neu
+  verifiziert werden.
 - `GET /api/live/accounts` persistiert die zuletzt erkannten Broker-Identitäten
-  (`ctid`, `broker_login`, `is_demo`) aus der Discovery-Antwort.
+  (`ctid`, `broker_login`, `is_demo`) aus der Discovery-Antwort — aber nur die
+  Werte, die die Discovery **positiv** behauptet hat. Eine Antwort ohne `is_demo`
+  (oder mit einem Nicht-Boolean) setzt das gespeicherte Flag nicht herunter: ein
+  Read demotiert niemals ein verifiziertes Demokonto. Ohne Behauptung wird auch
+  keine Verifizierung geschrieben; die bestehende bleibt bis zur nächsten
+  Broker-Bestätigung stehen.
 - Der Daemon verweigert Adapter-Construction und jede Signal-Dispatch-Ausführung,
   wenn das DB-Konto nicht als Demo verifiziert ist. Alpaca-Adapter müssen
   zusätzlich `paper=True` sein.
@@ -76,6 +93,13 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 - Ein Claim beendet eine bereits laufende Broker-Submission nicht abrupt. Die
   PAUSE-Antwort garantiert deshalb erst nach erfolgreichem Drain, dass keine
   Submission mehr im Flug ist.
+- Es gibt **genau einen** Submission-Claim pro Deployment: `deployment_id` ist in
+  `live_deployment_submission_claims` UNIQUE, durchgesetzt von der Datenbank. Ein
+  zweiter Dispatcher (z. B. ein zweiter Daemon-Prozess) bekommt den Claim nicht und
+  sendet nichts ab. Abgelaufene Claims (TTL) werden vor jedem Claim-Versuch
+  gelöscht und committed, damit ein abgestürzter Claimor eine Deployment nicht
+  dauerhaft blockiert. Die Migration auf UNIQUE behält bei mehreren gleichzeitigen
+  Claims den neuesten und verwirft die überholten (mit Warn-Log).
 
 ## Status-Semantik: PAUSE vs. STOP
 
@@ -100,6 +124,12 @@ Keep the daemon running long enough to verify Discord connection, paper order su
   Fehler und markiert die Deployment **nicht** als erzwungen. Sie wird im nächsten Sync erneut versucht. Eine
   Deployment wird also nie als "gestoppt/flat" gemeldet, wenn der Broker nicht
   tatsächlich flach gestellt wurde.
+- "Kein Adapter" heißt nicht "nichts offen": direkt nach einem Restart ist
+  `active_adapters` für jedes Konto leer, deshalb bleibt eine solche Deployment
+  bewusst außerhalb des Enforcement-LEDGER und wird erneut versucht. Ausnahme: ein
+  Konto, das **nie** einen Adapter bekommen kann (fehlend oder nicht-Demo), ist ein
+  terminaler Zustand. Der Daemon loggt das als ERROR — mit dem Hinweis, die Positionen
+  manuell beim Broker zu schließen — statt als INFO-Retry, der nie aufhört.
 
 Beide Broker implementieren die Kontrollen inzwischen:
 

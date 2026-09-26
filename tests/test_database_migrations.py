@@ -575,3 +575,151 @@ def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> N
     summary2 = migrate_json_to_sqlite(skip_existing=True)
     assert summary2["migrated"] == 0
     assert summary2["skipped"] == 1
+
+
+# ─── One submission claim per live deployment ──────────────────────────────────
+#
+# `deployment_id` on live_deployment_submission_claims used to carry only a
+# non-unique index, so two dispatchers could both claim the same ACTIVE
+# deployment. The uniqueness is enforced by the database, which means it has to
+# be migrated onto databases that already have the table. These tests build that
+# legacy shape by hand — including the duplicate rows the migration has to cope
+# with — and run the real `init_db()` migration path over it.
+
+
+def _build_legacy_claim_table(engine) -> None:
+    """Recreate the pre-constraint table: non-unique index, no UNIQUE at all."""
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE live_deployment_submission_claims ("
+                "token VARCHAR NOT NULL PRIMARY KEY, "
+                "deployment_id VARCHAR NOT NULL, "
+                "claimed_at DATETIME NOT NULL, "
+                "expires_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_live_deployment_submission_claims_deployment_id "
+                "ON live_deployment_submission_claims (deployment_id)"
+            )
+        )
+
+
+def _index_names(engine, table: str) -> set[str]:
+    with engine.begin() as connection:
+        return {
+            str(row[0])
+            for row in connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = :t"),
+                {"t": table},
+            ).fetchall()
+        }
+
+
+def _is_unique_on_deployment_id(engine) -> bool:
+    import shared.database as database
+
+    with engine.begin() as connection:
+        return database._has_unique_index_on_column(
+            connection, "live_deployment_submission_claims", "deployment_id"
+        )
+
+
+def test_migration_makes_submission_claims_unique_per_deployment(
+    isolated_db_no_schema,
+) -> None:
+    """A legacy claim table comes out of the migration mutually exclusive.
+
+    Runs the real `init_db()` path, so this is the migration as production runs
+    it, over a table built the way the old schema built it. Never the
+    production database: the engine is the sandbox one.
+    """
+    database, engine, _data_dir = isolated_db_no_schema
+    _build_legacy_claim_table(engine)
+    assert not _is_unique_on_deployment_id(engine), "precondition: no UNIQUE yet"
+
+    database.init_db()
+
+    assert _is_unique_on_deployment_id(engine), (
+        "the migration must leave a UNIQUE on deployment_id behind"
+    )
+    assert "uq_live_deployment_submission_claims_deployment" in _index_names(
+        engine, "live_deployment_submission_claims"
+    )
+
+    # Idempotent: a second init (every process start) changes nothing.
+    database.init_db()
+    assert _is_unique_on_deployment_id(engine)
+
+
+def test_migration_collapses_concurrent_claims_instead_of_failing(isolated_db_no_schema) -> None:
+    """Duplicate leases must not take the database down with them.
+
+    A unique index cannot be created while two rows share a deployment, and
+    refusing the migration would break every caller including the safety gates.
+    These rows are leases with a TTL, so the newest is the live one and the rest
+    are already superseded: keeping the newest both satisfies the index and
+    leaves the deployment submittable.
+    """
+    database, engine, _data_dir = isolated_db_no_schema
+    _build_legacy_claim_table(engine)
+    now = datetime(2026, 7, 15, 12, 0, 0)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO live_deployment_submission_claims "
+                "(token, deployment_id, claimed_at, expires_at) VALUES "
+                "('stale-token', 'dep-a', :old, :old_plus), "
+                "('live-token', 'dep-a', :new, :new_plus), "
+                "('other-token', 'dep-b', :new, :new_plus)"
+            ),
+            {
+                "old": now,
+                "old_plus": now.replace(minute=1),
+                "new": now.replace(minute=5),
+                "new_plus": now.replace(minute=6),
+            },
+        )
+    # 'stale-token' has the earlier expires_at, so it is the superseded lease.
+    with engine.begin() as connection:
+        rows = {
+            str(row[0])
+            for row in connection.execute(
+                text(
+                    "SELECT token FROM live_deployment_submission_claims "
+                    "WHERE deployment_id = 'dep-a'"
+                )
+            ).fetchall()
+        }
+    assert rows == {"stale-token", "live-token"}, "precondition: two leases, one deployment"
+
+    database.init_db()
+
+    with engine.begin() as connection:
+        kept = {
+            str(row[0]): str(row[1])
+            for row in connection.execute(
+                text(
+                    "SELECT token, deployment_id "
+                    "FROM live_deployment_submission_claims ORDER BY token"
+                )
+            ).fetchall()
+        }
+    assert kept == {"live-token": "dep-a", "other-token": "dep-b"}, (
+        "the newest lease is kept and the superseded one is dropped; the "
+        "unrelated deployment is untouched"
+    )
+    assert _is_unique_on_deployment_id(engine)
+
+
+def test_fresh_database_already_has_claim_uniqueness(isolated_db_no_schema) -> None:
+    """A database created from the models needs no migration to be exclusive.
+
+    The invariant must hold on a brand-new install too, not only after the
+    migration has run, so `create_all` has to produce the UNIQUE as well.
+    """
+    database, engine, _data_dir = isolated_db_no_schema
+    database.init_db()
+    assert _is_unique_on_deployment_id(engine)
