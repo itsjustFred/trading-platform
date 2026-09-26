@@ -240,42 +240,22 @@ def _load_platform_stats(
     result = BacktestResult.from_dict(payload)
     from runner.stats import compute_stats_for_result
 
-    if _prefers_stored_platform_stats(result):
-        stats = dict(result.stats or {})
-    else:
-        stats = {
-            **dict(result.stats or {}),
-            **compute_stats_for_result(result, risk_free_rate=risk_free_rate),
-        }
+    # #84: the audit matrix always recomputes canonical stats — preferring
+    # stored/curated numbers for qc-parity tags compared curated, not
+    # canonical, numbers across platforms. The canonical dict publishes
+    # net total as total_pnl; map it onto the audit's net_profit key so a
+    # stale stored net_profit can never survive the merge.
+    canonical = compute_stats_for_result(result, risk_free_rate=risk_free_rate)
+    stats = {
+        **dict(result.stats or {}),
+        **canonical,
+    }
+    if "total_pnl" in canonical:
+        stats["net_profit"] = canonical["total_pnl"]
     normalized = _normalize_reference_stats(stats)
-    attribution_win_rate = _safe_float(stats.get("rebalance_attribution_win_rate"))
-    attribution_net_profit = _safe_float(stats.get("rebalance_attribution_net_profit"))
-    if _prefers_rebalance_attribution_stats(result, attribution_win_rate, attribution_net_profit):
-        normalized["win_rate"] = attribution_win_rate
-        normalized["net_profit"] = attribution_net_profit
     if normalized["net_profit"] is None:
         normalized["net_profit"] = _safe_float(stats.get("total_pnl"))
     return normalized
-
-
-
-def _prefers_stored_platform_stats(result: BacktestResult) -> bool:
-    tags = {str(tag).lower() for tag in (result.meta.tags or [])}
-    engine = str(result.meta.engine or "").strip().lower()
-    return "qc-parity" in tags or engine == "python-reimplementation"
-
-
-def _prefers_rebalance_attribution_stats(
-    result: BacktestResult,
-    attribution_win_rate: float | None,
-    attribution_net_profit: float | None,
-) -> bool:
-    tags = {str(tag).lower() for tag in (result.meta.tags or [])}
-    return (
-        "qc-parity" in tags
-        and attribution_net_profit is not None
-        and attribution_win_rate is not None
-    )
 
 
 def _extract_mt5_period(path: Path) -> tuple[datetime, datetime] | None:

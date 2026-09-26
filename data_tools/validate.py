@@ -160,14 +160,19 @@ def validate_parquet(path: Path) -> ValidationResult:
     # ─── Gap detection ─────────────────────────────────────────────────
 
     if len(ts) > 1:
+        # #86: reset to a positional RangeIndex before diff — after dropna()
+        # the labels are non-contiguous, so using a label as .iloc position
+        # reports wrong gap boundaries.
+        ts = ts.reset_index(drop=True)
         diffs = ts.diff().dropna()
         threshold = pd.Timedelta(minutes=GAP_THRESHOLD_MINUTES.get(timeframe, 180))
 
         large_gaps = diffs[diffs > threshold]
-        for idx in large_gaps.index[:20]:  # limit to 20 gaps
+        for pos in range(min(20, len(large_gaps))):
+            idx = large_gaps.index[pos]
             gap_start = ts.iloc[idx - 1] if idx > 0 else ts.iloc[0]
-            gap_end = ts.iloc[idx]
-            gap_minutes = diffs.iloc[idx].total_seconds() / 60
+            gap_end = ts.loc[idx]
+            gap_minutes = large_gaps.iloc[pos].total_seconds() / 60
 
             # Skip weekends for non-forex
             if gap_start.weekday() == 4 and gap_end.weekday() == 0:

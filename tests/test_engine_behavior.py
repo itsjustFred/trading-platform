@@ -15,6 +15,7 @@ Covers Cleanup 16-D1 findings on ``runner/engine.py``:
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 from pathlib import Path
 
@@ -41,7 +42,7 @@ def _config(tmp_path: Path, **overrides) -> BacktestConfig:
         "parameters": {},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 def _linear_frame(n: int = 5, start: float = 100.0) -> pd.DataFrame:

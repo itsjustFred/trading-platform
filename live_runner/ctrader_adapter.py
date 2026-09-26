@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import fcntl
 import math
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from risk.live import size_live_signal
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -103,28 +104,173 @@ def _first_metadata_float(
 #
 # ONE unit contract for every quantity in the cTrader path:
 #
-#   * Signal metadata 'qty' is in ACCOUNT-CURRENCY UNITS of the symbol, i.e.
-#     broker_volume / QTY_VOLUME_SCALE. The risk engine sizes in these units
-#     (position_size = risk_amount / (risk_distance * pip_value)); with the
-#     pip_value=1.0 quantity convention used by this daemon, one qty unit is
-#     one contract unit and cTrader counts 1000 of them per broker volume
-#     unit (FX: 1 lot == 100_000 == 100 volume units of 1_000).
+#   * Signal metadata 'qty' is in 0.01-LOT units of the symbol, i.e.
+#     broker_volume / volume_per_qty. The risk engine sizes in these units
+#     (position_size = risk_amount / (risk_distance * pip_value)).
+#     volume_per_qty = lotSize / 100 from the broker symbol properties
+#     (FX: 100000/100 = 1000, pinned by contract tests), else the static
+#     fallback table per symbol class (FX/JPY/XAU/XAG/index).
 #   * Raw cTrader protocol fields (ProtoOANewOrderReq.volume,
 #     tradeData.volume, deal.filledVolume, order.executedVolume) are in
-#     BROKER VOLUME UNITS: broker_volume == qty * QTY_VOLUME_SCALE.
+#     BROKER VOLUME UNITS: broker_volume == qty * volume_per_qty.
 #
 # Every crossing of that boundary goes through _qty_to_broker_volume /
-# _broker_volume_to_qty. Signal metadata 'ctrader_volume' / 'volume' are raw
-# broker units coming from the (untrusted) signal payload; per the parent
-# Decision Record they must not pick the traded size and are NOT read.
+# _broker_volume_to_qty with the symbol's scale (adapter._scale_for, #80:
+# broker props first, fallback table second, unknown symbols raise).
+# Signal metadata 'ctrader_volume' / 'volume' are raw
+# broker units coming from the (untrusted) signal payload; they must not pick
+# the traded size on entries — they are read ONLY for exit-only flatten
+# orders (risk_sizing_mode == "exit_only"), where the daemon resolved the
+# exact broker-observed quantity (#79).
 
 
+#: Legacy FX scale, kept as the pinned default for the module-level helpers
+#: and the FX fallback entry below (qty 5.0 -> volume 5000).
 QTY_VOLUME_SCALE = 1000.0
 
 
-def _qty_to_broker_volume(qty: float) -> int:
+@dataclasses.dataclass(frozen=True)
+class SymbolScale:
+    """Per-symbol broker scaling (#80).
+
+    ``volume_per_qty``: broker volume units per risk-engine qty unit.
+    The qty unit is 0.01 lots, so ``volume_per_qty = lotSize / 100``
+    (FX: 100000/100 = 1000, pinned by contract tests).
+    ``price_digits``: symbol price decimals — the relative SL/TP scale is
+    ``10 ** price_digits`` (FX: 5 -> 100_000).
+    ``min_volume``: broker minimum order volume (fail-closed floor).
+    ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
+    """
+
+    volume_per_qty: float
+    price_digits: int
+    min_volume: int
+    lot_size: float
+    source: str = "fallback"
+
+
+@dataclasses.dataclass(frozen=True)
+class _FallbackScaleEntry:
+    lot_size: float
+    price_digits: int
+    min_volume: int
+
+
+#: Static per-symbol-class fallback table (#80, version 1). Used ONLY when the
+#: broker exposes no symbol properties (offline/tests) — the broker-API
+#: symbol properties (digits/lotSize/minVolume via ProtoOASymbolById) are the
+#: source of truth whenever reachable. Values are cTrader conventions:
+#: FX/JPY 1 lot = 100_000 base units; XAU 1 lot = 100 oz; XAG 1 lot = 5000 oz;
+#: indices vary per symbol (lotSize=100 estimate, broker wins when reachable).
+_FALLBACK_SCALES: dict[str, _FallbackScaleEntry] = {
+    "fx": _FallbackScaleEntry(lot_size=100_000.0, price_digits=5, min_volume=1000),
+    "jpy": _FallbackScaleEntry(lot_size=100_000.0, price_digits=3, min_volume=1000),
+    "xau": _FallbackScaleEntry(lot_size=100.0, price_digits=2, min_volume=1),
+    "xag": _FallbackScaleEntry(lot_size=5000.0, price_digits=3, min_volume=1),
+    "index": _FallbackScaleEntry(lot_size=100.0, price_digits=2, min_volume=1),
+}
+
+#: Known index CFD symbols for fallback classification. Anything outside the
+#: FX/JPY/XAU/XAG/index classes is UNKNOWN and fails closed (no trade instead
+#: of a wrong size) — the broker props cover real symbols in production.
+_INDEX_SYMBOLS = frozenset(
+    {
+        "US30", "NAS100", "SP500", "US500", "GER40", "DE40", "UK100",
+        "FRA40", "JPN225", "AUS200", "EU50", "STOXX50", "HK50", "CN50",
+        "IND50", "ES35", "IT40",
+    }
+)
+
+#: Crypto bases that form 6-letter pairs (BTCUSD, ETHUSD, ...). Their lotSize
+#: varies per coin and broker (BTC 1, altcoins differ), so no static fallback
+#: is safe — they are UNKNOWN by design (broker props or no trade). Without
+#: this guard they would fall into the 6-alpha FX branch at up to 100000x the
+#: intended size.
+_CRYPTO_BASES = frozenset(
+    {
+        "BTC", "ETH", "XRP", "LTC", "BCH", "DOT", "LINK", "XLM", "ADA",
+        "DOGE", "SOL", "AVAX", "MATIC", "TRX", "ETC", "FIL", "ATOM",
+        "NEAR", "ARB", "OP", "INJ", "SUI", "UNI", "APT", "HBAR", "VET",
+        "ALGO", "SAND", "MANA", "XTZ", "EOS", "AAVE", "SNX", "ZEC",
+        "DASH", "XMR", "BNB",
+    }
+)
+
+
+def _fallback_scale_class(symbol: str) -> str | None:
+    """Classify *symbol* into a fallback scale class, or None when unknown."""
+    upper = str(symbol or "").strip().upper()
+    if not upper:
+        return None
+    if upper.startswith("XAU"):
+        return "xau"
+    if upper.startswith("XAG"):
+        return "xag"
+    if len(upper) == 6 and upper.isalpha():
+        if upper.endswith("JPY"):
+            return "jpy"
+        if upper[:3] in _CRYPTO_BASES:
+            # Crypto lotSizes are per-coin: fail closed, never FX.
+            return None
+        return "fx"
+    if upper in _INDEX_SYMBOLS:
+        return "index"
+    return None
+
+
+def _fallback_symbol_scale(symbol: str) -> SymbolScale:
+    """Return the static fallback scale for *symbol*, failing closed (#80)."""
+    cls = _fallback_scale_class(symbol)
+    if cls is None:
+        raise ValueError(
+            f"Unknown cTrader symbol {symbol!r}: no broker properties cached and "
+            "no fallback scale class (FX/JPY/XAU/XAG/index); refusing to guess "
+            "a size or SL/TP scale."
+        )
+    entry = _FALLBACK_SCALES[cls]
+    return SymbolScale(
+        volume_per_qty=entry.lot_size / 100.0,
+        price_digits=entry.price_digits,
+        min_volume=entry.min_volume,
+        lot_size=entry.lot_size,
+        source="fallback",
+    )
+
+
+def _symbol_scale_from_broker_props(
+    *, digits: int, lot_size: float | None, min_volume: int | None, fallback: SymbolScale
+) -> SymbolScale:
+    """Build a broker-authoritative scale, falling back per-field (#80)."""
+    try:
+        digit_count = int(digits)
+    except (TypeError, ValueError):
+        digit_count = fallback.price_digits
+    if digit_count < 0 or digit_count > 10:
+        digit_count = fallback.price_digits
+    try:
+        lots = float(lot_size) if lot_size is not None else fallback.lot_size
+    except (TypeError, ValueError):
+        lots = fallback.lot_size
+    if not math.isfinite(lots) or lots <= 0:
+        lots = fallback.lot_size
+    try:
+        minimum = int(min_volume) if min_volume is not None else fallback.min_volume
+    except (TypeError, ValueError):
+        minimum = fallback.min_volume
+    if minimum <= 0:
+        minimum = fallback.min_volume
+    return SymbolScale(
+        volume_per_qty=lots / 100.0,
+        price_digits=digit_count,
+        min_volume=minimum,
+        lot_size=lots,
+        source="broker",
+    )
+
+
+def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> int:
     """Convert qty units (risk-engine units) into broker volume units."""
-    volume = int(round(float(qty) * QTY_VOLUME_SCALE))
+    volume = int(round(float(qty) * float(volume_per_qty)))
     if volume <= 0:
         raise ValueError(
             "Signal has no positive quantity ('qty'); "
@@ -133,9 +279,9 @@ def _qty_to_broker_volume(qty: float) -> int:
     return volume
 
 
-def _broker_volume_to_qty(volume: float) -> float:
+def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
     """Convert broker volume units into qty units (risk-engine units)."""
-    return _to_float(volume, default=0.0) / QTY_VOLUME_SCALE
+    return _to_float(volume, default=0.0) / float(volume_per_qty)
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -328,7 +474,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._symbol_name_to_id: dict[str, int] = {}
+        # #80: broker-authoritative per-symbol scales (digits/lotSize), keyed
+        # by upper symbol name. Tests/fallbacks use _fallback_symbol_scale.
+        self._symbol_props: dict[str, SymbolScale] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
+        # #80: order id -> upper symbol name (for order-only fills whose
+        # payload carries no symbolId).
+        self._order_id_to_symbol: dict[int, str] = {}
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
         self._already_logged_in_notified = False
@@ -788,6 +940,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"{type(account_auth_res).__name__}"
             )
 
+    def _scale_for(self, symbol: str) -> SymbolScale:
+        """Return the per-symbol broker scale, failing closed (#80).
+
+        Broker-cached properties win; otherwise the static fallback table
+        applies; unknown symbols raise instead of trading a wrong size.
+        """
+        upper = str(symbol or "").strip().upper()
+        cached = self._symbol_props.get(upper)
+        if cached is not None:
+            return cached
+        return _fallback_symbol_scale(upper)
+
+    def _symbol_name_for_id(self, symbol_id: int) -> str:
+        """Resolve a broker symbol id to its upper name, failing closed (#80).
+
+        A fill/position for an unmapped id cannot be scaled — guessing FX
+        would misstate exposure by 10-1000x on XAU/indices.
+        """
+        for name, sid in self._symbol_name_to_id.items():
+            if sid == int(symbol_id):
+                return name
+        raise ValueError(
+            f"cTrader symbol id {symbol_id!r} is not in the symbols cache; "
+            "refusing to scale its volume with a guessed symbol."
+        )
+
     async def _load_symbols_into_cache(self) -> None:
         symbols_req = self._ProtoOASymbolsListReq()
         symbols_req.ctidTraderAccountId = self.ctid_trader_account_id
@@ -800,7 +978,63 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         for symbol in symbols_res.symbol:
             symbol_name_to_id[str(symbol.symbolName).upper()] = int(symbol.symbolId)
         self._symbol_name_to_id = symbol_name_to_id
+        # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
+        # source of truth for per-symbol scales. Best-effort: the light list
+        # above stays authoritative for ids when the detail fetch fails.
+        await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
+
+    async def _load_symbol_props_into_cache(self, symbol_name_to_id: dict[str, int]) -> None:
+        """Fetch full ProtoOASymbol properties per symbol id (#80).
+
+        ProtoOALightSymbol (SymbolsList) exposes no digits/lotSize — those
+        live on ProtoOASymbol via ProtoOASymbolByIdReq. Verified against the
+        installed ctrader_open_api descriptors before touching this path:
+        digits/pipPosition required, lotSize/min/max/stepVolume optional.
+        """
+        try:
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOASymbolByIdReq,
+                ProtoOASymbolByIdRes,
+            )
+        except (ModuleNotFoundError, ImportError):
+            return
+        if not symbol_name_to_id:
+            return
+        id_to_name = {sid: name for name, sid in symbol_name_to_id.items()}
+        try:
+            detail_req = ProtoOASymbolByIdReq()
+            detail_req.ctidTraderAccountId = self.ctid_trader_account_id
+            detail_req.symbolId.extend(sorted(id_to_name))
+            detail_res = await self._send_request_with_refresh_retry(
+                detail_req, timeout_seconds=15
+            )
+        except Exception:
+            logger.warning(
+                "cTrader symbol-props fetch failed; using fallback scales",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            return
+        if not isinstance(detail_res, ProtoOASymbolByIdRes):
+            return
+        # Archived entries first so live properties always win on collision.
+        for detail in list(getattr(detail_res, "archivedSymbol", [])) + list(detail_res.symbol):
+            try:
+                sid = int(detail.symbolId)
+            except (TypeError, ValueError):
+                continue
+            name = id_to_name.get(sid)
+            if name is None:
+                continue
+            fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
+            if fallback is None:
+                continue
+            self._symbol_props[name] = _symbol_scale_from_broker_props(
+                digits=getattr(detail, "digits", fallback.price_digits),
+                lot_size=getattr(detail, "lotSize", None) or None,
+                min_volume=getattr(detail, "minVolume", None) or None,
+                fallback=fallback,
+            )
 
     def _extract_order_id_from_payload(self, payload: Any) -> int | None:
         if isinstance(payload, self._ProtoOAExecutionEvent):
@@ -815,25 +1049,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve the broker volume for an order from signal metadata 'qty'.
 
-        Unit contract: 'qty' is in risk-engine quantity units; broker volume is
-        qty * QTY_VOLUME_SCALE (see module docstring). The raw broker-unit keys
-        ('ctrader_volume', 'volume') are operator-supplied overrides from the
-        (untrusted) signal payload; per the Main contract they stay readable so
-        exit-only flatten payloads keep their explicit broker volume.
+        Unit contract: 'qty' is in risk-engine quantity units (0.01 lots);
+        broker volume is qty * the per-symbol scale (FX: QTY_VOLUME_SCALE,
+        #80: lotSize/100 from broker props or the fallback table). The raw
+        broker-unit keys ('ctrader_volume', 'volume') are overrides from the
+        (untrusted) signal payload; they are honored ONLY for exit-only
+        flatten orders (``risk_sizing_mode == "exit_only"``), where the
+        daemon has already resolved the exact broker-observed quantity. On
+        entries they are rejected: an upstream path setting 'volume' must
+        never trade an arbitrary size with zero risk checks (#79).
         """
+        scale = self._scale_for(signal.symbol)
         metadata = signal.metadata or {}
         explicit = _explicit_metadata_volume(metadata)
         if explicit is not None:
+            if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+                raise ValueError(
+                    "Explicit metadata volume ('ctrader_volume'/'volume') is only "
+                    "allowed for exit-only flatten orders; entries must use the "
+                    "risk-sized 'qty'."
+                )
             return explicit
 
         if "qty" in metadata:
             qty = _to_float(metadata.get("qty"), default=0.0)
             if math.isfinite(qty) and qty > 0:
-                volume = _qty_to_broker_volume(qty)
-                if volume < 1000:
+                volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+                if volume < scale.min_volume:
                     raise ValueError(
-                        f"Risk-sized volume {volume} is below the broker minimum (1000); "
-                        "order rejected instead of silently upsizing beyond the risk limit."
+                        f"Risk-sized volume {volume} for {signal.symbol} is below "
+                        f"the broker minimum ({scale.min_volume}); order rejected "
+                        "instead of silently upsizing beyond the risk limit."
                     )
                 return volume
 
@@ -1289,9 +1535,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             filled_volume = _to_float(getattr(deal, "volume", 0))
         if filled_volume <= 0:
             return None
-        # Unit contract: persist filled_qty in qty units (broker volume / 1000),
-        # the same unit the risk engine sized and the viewer consumes.
-        filled_qty = _broker_volume_to_qty(filled_volume)
+        # Unit contract: persist filled_qty in qty units (broker volume per
+        # the symbol scale, #80), the same unit the risk engine sized and
+        # the viewer consumes.
+        deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
+        deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
+        if deal_symbol is None:
+            raise ValueError(
+                "cTrader deal carries no symbolId; refusing to scale its "
+                "volume with a guessed symbol."
+            )
+        filled_qty = _broker_volume_to_qty(
+            filled_volume, self._scale_for(deal_symbol).volume_per_qty
+        )
 
         timestamp_ms = 0
         if int(getattr(deal, "executionTimestamp", 0) or 0) > 0:
@@ -1350,6 +1606,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._already_logged_in_notified = False
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
+        # #80: props and order-symbol mappings are session state — a
+        # reconnect must re-fetch broker props, never trade on stale scales,
+        # and the order map must not grow unboundedly across sessions.
+        self._symbol_props.clear()
+        self._order_id_to_symbol.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._terminal_auth_failure_reason = ""
         self._terminal_auth_failure_code = ""
@@ -1438,16 +1699,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
 
-        broker_order_id = ""
         order_id = self._extract_order_id_from_payload(response)
-        if order_id is not None:
-            broker_order_id = str(order_id)
-            persisted = await asyncio.to_thread(
-                set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+        if order_id is None:
+            # Fail closed (#77): an order without a usable broker id must not
+            # surface as success-shaped "" — downstream would skip retry and
+            # persistence, silently losing the order.
+            raise RuntimeError(
+                "cTrader order response carried no usable order id "
+                f"(signal_id={signal.id}, symbol={signal.symbol}); the order "
+                "cannot be tracked or retried safely."
             )
-            if not persisted:
-                raise RuntimeError("Failed to persist cTrader broker order id.")
-            self._order_id_to_signal_id[order_id] = canonical_signal_id
+        broker_order_id = str(order_id)
+        persisted = await asyncio.to_thread(
+            set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+        )
+        if not persisted:
+            raise RuntimeError("Failed to persist cTrader broker order id.")
+        self._order_id_to_signal_id[order_id] = canonical_signal_id
+        # #80: remember the symbol for order-only fills (no symbolId).
+        self._order_id_to_symbol[order_id] = str(signal.symbol).strip().upper()
 
         logger.info(
             "Submitted cTrader live order",
@@ -1542,7 +1812,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
         )
         take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
-        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+        )
         if stop_loss is None or take_profit is None:
             if exit_only:
                 # Exit-only orders close an existing position; they reduce
@@ -1581,9 +1853,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         stopLoss/takeProfit fields are "Not supported for MARKET orders" — this
         adapter submits MARKET/IMMEDIATE_OR_CANCEL orders, so the distances are
         sent via relativeStopLoss/relativeTakeProfit instead: int64 in
-        1/100000 of a price unit (123000 means 1.23), where for BUY
-        stopLoss = entryPrice - relativeStopLoss and takeProfit =
-        entryPrice + relativeTakeProfit (reversed for SELL).
+        1/(10**digits) of a price unit (FX digits=5: 123000 means 1.23),
+        where for BUY stopLoss = entryPrice - relativeStopLoss and takeProfit
+        = entryPrice + relativeTakeProfit (reversed for SELL).
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -1591,7 +1863,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        scale = 100_000
+        # #80: per-symbol digit scale (FX 5 -> 100_000, JPY 3 -> 1000,
+        # XAU 2 -> 100) from broker props or the fallback table.
+        scale = 10 ** self._scale_for(signal.symbol).price_digits
 
         def _distance(price: float) -> int:
             if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -1610,10 +1884,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if not math.isfinite(raw) or raw < 1:
                 raise ValueError(
                     f"SL/TP distance for {signal.symbol} resolves to {raw!r} "
-                    "(below one 1/100000 price unit); refusing to submit."
+                    f"(below one 1/{scale} price unit); refusing to submit."
                 )
             # Distance is signed by direction at the protocol level; the value
-            # sent is always the positive magnitude in 1/100000 units.
+            # sent is always the positive magnitude in 1/scale price units.
             return int(round(raw))
 
         buy = signal.action == "buy"
@@ -1672,7 +1946,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """Return open positions with signed qty for exposure limits and exit-only sizing.
 
         qty uses the same unit convention as signal metadata 'qty'
-        (inverse of _resolve_order_volume: qty == broker volume / 1000).
+        (inverse of _resolve_order_volume: qty == broker volume / the
+        symbol's volume_per_qty, #80).
         current_price/unrealized_pnl are not available without a spot
         subscription and are reported as 0.0.
         """
@@ -1708,9 +1983,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if trade_data is None:
                 continue
             symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
-            symbol = symbol_id_to_name.get(symbol_id, str(symbol_id))
+            # #80: unmapped ids fail closed (no guessed FX scale).
+            symbol = symbol_id_to_name.get(symbol_id)
+            if symbol is None:
+                raise ValueError(
+                    f"cTrader symbol id {symbol_id!r} is not in the symbols "
+                    "cache; refusing to scale its position with a guess."
+                )
             volume = _to_float(getattr(trade_data, "volume", 0))
-            qty = _broker_volume_to_qty(volume)
+            qty = _broker_volume_to_qty(
+                volume, self._scale_for(symbol).volume_per_qty
+            )
             if int(getattr(trade_data, "tradeSide", 0) or 0) == self._ProtoOATradeSide.SELL:
                 qty = -qty
             payload.append(
@@ -1754,8 +2037,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         timestamp_ms = self._resolve_execution_timestamp_ms(order=order, deal=deal)
         filled_volume = self._resolve_filled_volume(order=order, deal=deal)
-        # Unit contract: persist filled_qty in qty units (broker volume / 1000).
-        filled_qty = _broker_volume_to_qty(filled_volume)
+        # Unit contract (#80): persist filled_qty in qty units per the fill's
+        # symbol scale — deal symbolId first, then the submit-time order map.
+        fill_symbol: str | None = None
+        if deal is not None and int(getattr(deal, "symbolId", 0) or 0):
+            fill_symbol = self._symbol_name_for_id(int(getattr(deal, "symbolId", 0)))
+        elif order_id is not None:
+            fill_symbol = self._order_id_to_symbol.get(int(order_id))
+        if fill_symbol is None:
+            raise ValueError(
+                "cTrader fill carries no resolvable symbol; refusing to scale "
+                "its volume with a guessed symbol."
+            )
+        filled_qty = _broker_volume_to_qty(
+            filled_volume, self._scale_for(fill_symbol).volume_per_qty
+        )
         execution = LiveExecution(
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),

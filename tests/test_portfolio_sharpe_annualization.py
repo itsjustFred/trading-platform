@@ -76,7 +76,7 @@ class TestReplaySizingEquity:
         now marked at 90.0 → unrealized −10_000. The next sizing call must see
         an account balance of 90_000, not the realized-only 100_000.
         """
-        adapter = SignalReplayAdapter(
+        adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, 
             risk_config=RiskConfig(max_risk_per_trade=0.01, max_total_exposure=1.0),
             initial_capital=100_000.0,
         )
@@ -221,7 +221,7 @@ class TestMultiSymbolSettlement:
         −20_000; the open position is removed, so sizing for a GOLD1 signal
         sees capital − 20k realized and no PROBE MTM leg.
         """
-        adapter = SignalReplayAdapter(
+        adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, 
             risk_config=RiskConfig(max_risk_per_trade=0.01, max_total_exposure=1.0),
             initial_capital=100_000.0,
         )

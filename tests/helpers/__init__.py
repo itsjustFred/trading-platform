@@ -84,3 +84,17 @@ def write_ohlcv(
     symbol_dir = data_dir / "ohlcv" / source / asset_class / symbol
     symbol_dir.mkdir(parents=True, exist_ok=True)
     frame.to_parquet(symbol_dir / f"{timeframe}.parquet", index=False)
+
+
+def with_zero_fees(payload: dict) -> dict:
+    """Merge an explicit no-cost fee declaration into engine-test params (#84).
+
+    Shared by engine contract/parity tests whose fixtures assert
+    gross-equivalent numbers: declaring ``fees="zero"`` keeps the numbers
+    identical while satisfying the mandatory fee-config gate.
+    """
+    merged = dict(payload)
+    params = dict(merged.get("parameters") or {})
+    params.setdefault("fees", "zero")
+    merged["parameters"] = params
+    return merged

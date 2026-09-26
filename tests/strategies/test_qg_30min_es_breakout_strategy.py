@@ -47,7 +47,7 @@ EXPECTED_NET_PROFIT = 369.39
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="qg_30min_es_breakout_strategy",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

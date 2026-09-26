@@ -717,9 +717,10 @@ def test_exit_only_target_qty_sums_all_matching_positions():
     assert _resolve_exit_only_target_qty(iter(positions), "EURUSD") == pytest.approx(6.0)
 
 
-def test_exit_only_target_qty_ignores_opposite_side_residual():
-    """Signed quantities: a residual short lot is not part of the long exposure
-    the exit-only close is meant to flatten."""
+def test_exit_only_target_qty_counts_short_positions():
+    """Signed quantities: a short row is an OPEN position that an exit-only
+    close must buy back — its magnitude counts toward the flatten size
+    (#76: `max(qty, 0)` clamped shorts to 0 and left them open forever)."""
     from live_runner.daemon import _resolve_exit_only_target_qty
 
     positions = [
@@ -727,7 +728,57 @@ def test_exit_only_target_qty_ignores_opposite_side_residual():
         {"symbol": "EURUSD", "qty": -0.5},
     ]
 
-    assert _resolve_exit_only_target_qty(iter(positions), "EURUSD") == pytest.approx(2.0)
+    assert _resolve_exit_only_target_qty(iter(positions), "EURUSD") == pytest.approx(2.5)
+
+
+def test_exit_only_close_action_follows_net_book_side():
+    """A net-short book must be closed with a BUY (the short is bought back);
+    a net-long book closes with a SELL."""
+    from live_runner.daemon import _exit_only_close_action
+
+    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": -2.0}]), "EURUSD") == "buy"
+    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": 2.0}]), "EURUSD") == "sell"
+    # Mixed book resolves by the NET side.
+    assert (
+        _exit_only_close_action(
+            iter([{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -3.0}]),
+            "EURUSD",
+        )
+        == "buy"
+    )
+    assert (
+        _exit_only_close_action(
+            iter([{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -1.0}]),
+            "EURUSD",
+        )
+        == "sell"
+    )
+
+
+def test_exit_only_metadata_restamps_action_for_short_book():
+    """#76: the submitted signal's action must follow the broker book so the
+    adapter closes a short with a buy."""
+    from live_runner.daemon import _metadata_for_exit_only_order
+
+    class _Adapter:
+        async def get_positions(self):
+            return [{"symbol": "EURUSD", "qty": -2.0}]
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+
+    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+
+    assert metadata["explicit_qty"] == pytest.approx(2.0)
+    assert metadata["risk_sizing_mode"] == "exit_only"
+    assert metadata["action"] == "buy"
+    assert metadata["signal_action"] == "sell"
 
 
 def test_exit_only_target_qty_skips_unparseable_rows():
@@ -851,8 +902,9 @@ def test_submit_order_with_risk_zeroes_size_when_budget_exhausted_by_positions()
 def test_ctrader_volume_contract_uses_qty_units_only():
     """The one contract: signal metadata 'qty' is in broker volume / 1000
     (account-currency lots for FX). 'ctrader_volume' and 'volume' are raw
-    broker-unit operator overrides — they stay readable (Main contract) but
-    map 1:1 to broker volume, never through the qty scale."""
+    broker-unit overrides — honored ONLY for exit-only flatten orders; on
+    entries they are rejected so an untrusted payload can never trade an
+    arbitrary size with zero risk checks (#79)."""
     _module, adapter = _make_ctrader_adapter()
 
     def _signal(metadata: dict[str, Any]) -> LiveSignal:
@@ -866,9 +918,20 @@ def test_ctrader_volume_contract_uses_qty_units_only():
         )
 
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
-    # Operator overrides pass through in raw broker units (Main contract).
-    assert adapter._resolve_order_volume(_signal({"ctrader_volume": 100000})) == 100000
-    assert adapter._resolve_order_volume(_signal({"volume": 100000})) == 100000
+    # Entry + explicit volume: rejected, never honored.
+    with pytest.raises(ValueError, match="exit-only"):
+        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000}))
+    with pytest.raises(ValueError, match="exit-only"):
+        adapter._resolve_order_volume(_signal({"volume": 100000}))
+    # Exit-only flatten: the daemon-resolved explicit volume passes through.
+    assert (
+        adapter._resolve_order_volume(_signal({"ctrader_volume": 100000, "risk_sizing_mode": "exit_only"}))
+        == 100000
+    )
+    assert (
+        adapter._resolve_order_volume(_signal({"volume": 100000, "risk_sizing_mode": "exit_only"}))
+        == 100000
+    )
     empty = _signal({})
     with pytest.raises(ValueError, match="no positive quantity"):
         adapter._resolve_order_volume(empty)
@@ -909,6 +972,8 @@ def test_ctrader_fill_quantities_are_persisted_in_qty_units(monkeypatch):
     position reconstruction and the cumulative cap compare like with like."""
     module, adapter = _make_ctrader_adapter()
     adapter.account_config_id = "local-account-123"
+    # #80: fills scale per symbol — the fake deal carries its symbolId.
+    adapter._symbol_name_to_id = {"EURUSD": 1}
     adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
     monkeypatch.setattr(
         module,
@@ -924,6 +989,7 @@ def test_ctrader_fill_quantities_are_persisted_in_qty_units(monkeypatch):
         deal=SimpleNamespace(
             dealId=777,
             orderId=45678,
+            symbolId=1,
             filledVolume=5_000_000,  # raw broker units
             executionPrice=1.2345,
             executionTimestamp=1700000000000,
@@ -954,9 +1020,12 @@ def test_ctrader_reconciled_deals_are_persisted_in_qty_units(monkeypatch):
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
 
+    # #80: fills scale per symbol — the fake deal carries its symbolId.
+    adapter._symbol_name_to_id = {"EURUSD": 1}
     deal = SimpleNamespace(
         dealId=999,
         dealStatus=1,  # FILLED
+        symbolId=1,
         filledVolume=2_500_000,
         executionPrice=1.2345,
         executionTimestamp=1700000000000,
@@ -2231,9 +2300,12 @@ def test_ctrader_reconcile_backfills_missing_fill(monkeypatch):
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
 
     # Mock _send_request to return a reconciled order with deals
+    # #80: fills scale per symbol — the fake deal carries its symbolId.
+    adapter._symbol_name_to_id = {"EURUSD": 1}
     deal = SimpleNamespace(
         dealId=999,
         dealStatus=1,  # FILLED
+        symbolId=1,
         filledVolume=5_000_000,
         executionPrice=1.2345,
         executionTimestamp=1700000000000,
@@ -2371,9 +2443,12 @@ def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(m
             self.order = [SimpleNamespace(orderId=45678, clientOrderId=signal_id)]
             self.hasMore = False
 
+    # #80: fills scale per symbol — the fake deal carries its symbolId.
+    adapter._symbol_name_to_id = {"EURUSD": 1}
     deal = SimpleNamespace(
         dealId=999,
         dealStatus=1,
+        symbolId=1,
         filledVolume=5000,
         executionPrice=1.2345,
         executionTimestamp=1700000000000,
@@ -2566,6 +2641,138 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     adapter._ProtoOAOrderListReq = _OrderListReq
     adapter._ProtoOAOrderListRes = _OrderListRes
     adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderErrorEvent = type("_OrderError", (), {})
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    broker_order_id = asyncio.run(adapter.submit_order(signal))
+
+    assert broker_order_id == "45678"
+    assert persisted_order_ids == [(str(signal.id), "45678")]
+    assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
+
+
+def test_ctrader_submit_order_fails_closed_when_broker_id_is_missing(monkeypatch):
+    """#77: an order response without a usable order id must raise, not
+    return the success-shaped "" that downstream treats as accepted."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.15},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    class _IdLessResponse:
+        orderId = 0  # absent/unusable id
+
+    async def _send(request, *, timeout_seconds=20, _depth=0):
+        assert isinstance(request, _NewOrderReq)
+        return _IdLessResponse()
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAExecutionEvent = type("_ExecutionEvent", (), {})
+    adapter._ProtoOAOrderErrorEvent = type("_OrderError", (), {})
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    with pytest.raises(RuntimeError, match="no usable order id"):
+        asyncio.run(adapter.submit_order(signal))
+
+    assert adapter._order_id_to_signal_id == {}
+
+
+def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
+    """#77 companion: an order WITH an id still persists and returns it."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._client = object()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1.05, "take_profit": 1.15},
+    )
+
+    async def _balance() -> tuple[float, float]:
+        return 10_000.0, 10_000.0
+
+    adapter.get_balance = _balance
+    monkeypatch.setattr(
+        module,
+        "size_live_signal",
+        lambda _signal, *, account_balance: SimpleNamespace(position_size=1.0, risk_percent=0.01),
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    persisted_order_ids: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+    )
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.stopLoss = 0
+            self.takeProfit = 0
+
+    class _AcceptedOrderRes:
+        orderId = 45678
+
+    async def _send(request, *, timeout_seconds=20, _depth=0):
+        assert isinstance(request, _NewOrderReq)
+        return _AcceptedOrderRes()
+
+    adapter._send_request_with_refresh_retry = _send
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAExecutionEvent = type("_ExecutionEvent", (), {})
     adapter._ProtoOAOrderErrorEvent = type("_OrderError", (), {})
     adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
     adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
@@ -2800,9 +3007,27 @@ def _live_signal_with_action(action: str) -> LiveSignal:
     return signal
 
 
+def _seed_ctrader_fixture_scale(adapter, symbol: str = "AAPL") -> None:
+    """Seed an FX-equivalent fixture scale for synthetic test symbols (#80).
+
+    Fixture symbols like AAPL match no fallback class; seeding declares the
+    test scale explicitly instead of relying on a guessed default.
+    """
+    from live_runner import ctrader_adapter as module
+
+    adapter._symbol_props[str(symbol).upper()] = module.SymbolScale(
+        volume_per_qty=1000.0,
+        price_digits=5,
+        min_volume=1000,
+        lot_size=100_000.0,
+        source="test",
+    )
+
+
 def _make_ctrader_request_builder_adapter():
     """Return (module, adapter) with cTrader proto stubs for _build_new_order_request."""
     module, adapter = _make_ctrader_adapter()
+    _seed_ctrader_fixture_scale(adapter)
 
     class _NewOrderReq:
         def __init__(self) -> None:
@@ -3084,6 +3309,34 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal is not None
     assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
     assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
+    # Net-long book: the close stays a SELL.
+    assert adapter.submitted_signal.action == "sell"
+
+
+def test_exit_only_orders_close_short_positions_with_a_buy():
+    """#76: an exit-only signal on a net-short book must submit a BUY that
+    flattens the short magnitude instead of raising 'no long position'."""
+    from live_runner.daemon import submit_order_with_risk
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(
+        positions=[{"symbol": "EURUSD", "qty": -3.0}]
+    )
+    signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+
+    asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is not None
+    assert adapter.submitted_signal.action == "buy"
+    assert adapter.submitted_signal.metadata["explicit_qty"] == pytest.approx(3.0)
+    assert adapter.submitted_signal.metadata["risk_sizing_mode"] == "exit_only"
 
 
 def test_trade_signal_conversion_rejects_unknown_action_instead_of_selling():
@@ -3229,3 +3482,237 @@ def test_submit_order_with_risk_resolves_fallback_sl_tp_into_metadata():
     assert stop_loss == pytest.approx(98.0)  # fallback: entry * (1 - 0.02)
     # risk_reward_ratio of the fallback geometry is 1.0 -> TP mirrors the stop distance
     assert take_profit == pytest.approx(102.0)
+
+
+# ── #78: Alpaca stream subscribe-once + no reconnect spin ─────────────────────
+
+class _FakeAlpacaStream:
+    """Minimal TradingStream double: records subscriptions, scripted run."""
+
+    instances: list["_FakeAlpacaStream"] = []
+
+    def __init__(self, behaviours: list[str | BaseException | None]):
+        self.behaviours = list(behaviours)
+        self.subscribe_calls = 0
+        self.stop_calls = 0
+        self.handler = None
+        _FakeAlpacaStream.instances.append(self)
+
+    def subscribe_trade_updates(self, handler):
+        self.subscribe_calls += 1
+        self.handler = handler
+
+    def run(self):
+        if not self.behaviours:
+            raise asyncio.CancelledError()
+        behaviour = self.behaviours.pop(0)
+        if isinstance(behaviour, BaseException):
+            raise behaviour
+        return behaviour
+
+    def stop_ws(self):
+        self.stop_calls += 1
+
+
+def _patch_alpaca_listen_env(monkeypatch, module):
+    """Make listen_executions deterministic: inline to_thread, recording sleep."""
+    real_sleep = module.asyncio.sleep
+    sleeps: list[float] = []
+
+    async def _sleep(seconds):
+        sleeps.append(float(seconds))
+        await real_sleep(0)
+
+    async def _inline_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", _inline_to_thread)
+    monkeypatch.setattr(module.asyncio, "sleep", _sleep)
+    return sleeps
+
+
+def test_alpaca_listen_subscribes_once_across_reconnects(monkeypatch):
+    """#78: reconnect must not duplicate subscribe_trade_updates callbacks."""
+    import alpaca.trading.stream as alpaca_stream_module
+    from live_runner import alpaca_adapter as module
+
+    _FakeAlpacaStream.instances.clear()
+    first = _FakeAlpacaStream([RuntimeError("boom")])
+    second = _FakeAlpacaStream([asyncio.CancelledError()])
+    monkeypatch.setattr(alpaca_stream_module, "TradingStream", lambda *a, **k: second)
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._trading_stream = first
+    sleeps = _patch_alpaca_listen_env(monkeypatch, module)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.listen_executions())
+
+    assert first.subscribe_calls == 1
+    assert first.stop_calls == 1
+    assert second.subscribe_calls == 1
+    # First retry backs off 2s; the CancelledError propagates without sleep.
+    assert sleeps == [2]
+
+
+def test_alpaca_listen_clean_return_backs_off_instead_of_spinning(monkeypatch):
+    """#78: a clean run() return must sleep before re-subscribing."""
+    from live_runner import alpaca_adapter as module
+
+    _FakeAlpacaStream.instances.clear()
+    stream = _FakeAlpacaStream([None, asyncio.CancelledError()])
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    adapter._trading_stream = stream
+    sleeps = _patch_alpaca_listen_env(monkeypatch, module)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter.listen_executions())
+
+    assert stream.subscribe_calls == 1
+    assert sleeps and sleeps[0] == 2
+
+
+# ── #80: per-symbol cTrader volume + SL/TP scales ─────────────────────────────
+
+def _ctrader_signal(symbol: str, metadata: dict) -> "LiveSignal":
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol=symbol,
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+
+
+def test_ctrader_fx_and_jpy_volume_scales_match_lots() -> None:
+    """FX/JPY: 1 lot = 100_000 broker units = 100 qty units (0.01 lots)."""
+    from live_runner import ctrader_adapter as module
+
+    assert module._fallback_symbol_scale("EURUSD").volume_per_qty == 1000.0
+    assert module._fallback_symbol_scale("USDJPY").volume_per_qty == 1000.0
+    assert module._fallback_symbol_scale("EURUSD").price_digits == 5
+    assert module._fallback_symbol_scale("USDJPY").price_digits == 3
+
+
+def test_ctrader_xau_volume_scale_is_ounces() -> None:
+    """XAU: 1 lot = 100 oz; one qty unit (0.01 lots) = 1 broker unit."""
+    from live_runner import ctrader_adapter as module
+
+    scale = module._fallback_symbol_scale("XAUUSD")
+    assert scale.volume_per_qty == 1.0
+    assert scale.price_digits == 2
+
+
+def test_ctrader_index_fallback_class() -> None:
+    from live_runner import ctrader_adapter as module
+
+    scale = module._fallback_symbol_scale("US30")
+    assert scale.price_digits == 2
+    assert scale.source == "fallback"
+
+
+def test_ctrader_unknown_symbol_fails_closed() -> None:
+    """No broker props + no fallback class = no trade, never a guessed size."""
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter = _make_ctrader_adapter()
+    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+        adapter._resolve_order_volume(_ctrader_signal("NOTASYMBOLXYZ", {"qty": 5.0}))
+
+
+def test_ctrader_broker_props_win_over_fallback() -> None:
+    """Broker digits/lotSize are the source of truth when cached."""
+    from live_runner import ctrader_adapter as module
+
+    _module, adapter = _make_ctrader_adapter()
+    adapter._symbol_props["XAUUSD"] = module.SymbolScale(
+        volume_per_qty=2.0,
+        price_digits=3,
+        min_volume=2,
+        lot_size=200.0,
+        source="broker",
+    )
+    assert adapter._scale_for("XAUUSD").source == "broker"
+    assert adapter._resolve_order_volume(_ctrader_signal("XAUUSD", {"qty": 5.0})) == 10
+
+
+def test_ctrader_jpy_relative_sl_tp_uses_three_digits() -> None:
+    """JPY digit scale: a 0.05 distance is 50 relative units, not 5000."""
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="USDJPY",
+        action="buy",
+        theoretical_price=150.00,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 149.95, "take_profit": 150.10},
+    )
+    adapter._symbol_name_to_id = {"USDJPY": 9}
+    request = adapter._build_new_order_request(signal, symbol_id=9)
+    assert request.relativeStopLoss == 50
+    assert request.relativeTakeProfit == 100
+
+
+def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:
+    """XAU qty 5.0 (0.05 lots = 5 oz) resolves to volume 5, not 5000."""
+    _module, adapter = _make_ctrader_adapter()
+    assert adapter._resolve_order_volume(_ctrader_signal("XAUUSD", {"qty": 5.0})) == 5
+
+
+def test_ctrader_crypto_symbols_fail_closed_not_fx() -> None:
+    """6-letter crypto pairs (BTCUSD) must not fall into the FX branch —
+    their lotSizes are per-coin and an FX scale would oversize ~100000x."""
+    from live_runner import ctrader_adapter as module
+
+    assert module._fallback_scale_class("BTCUSD") is None
+    assert module._fallback_scale_class("ETHUSD") is None
+    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+        module._fallback_symbol_scale("BTCUSD")
+
+
+def test_ctrader_disconnect_clears_symbol_session_state() -> None:
+    """Reconnects re-fetch broker props; order-symbol map stays bounded."""
+    _module, adapter = _make_ctrader_adapter()
+    adapter._symbol_props["EURUSD"] = adapter._scale_for("EURUSD")
+    adapter._order_id_to_symbol[123] = "EURUSD"
+    asyncio.run(adapter.disconnect())
+    assert adapter._symbol_props == {}
+    assert adapter._order_id_to_symbol == {}
+
+
+def test_exit_only_metadata_flows_through_adapter_volume_gate() -> None:
+    """Pre-mortem PM1: daemon exit-only metadata must satisfy the adapter's
+    volume gate — producer and consumer share one constant, not two
+    spellings."""
+    import asyncio
+
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+    from live_runner.daemon import _metadata_for_exit_only_order
+
+    assert EXIT_ONLY_RISK_SIZING_MODE == "exit_only"
+
+    class _Adapter:
+        async def get_positions(self):
+            return [{"symbol": "EURUSD", "qty": 2.0}]
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True},
+    )
+    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    assert metadata["risk_sizing_mode"] == EXIT_ONLY_RISK_SIZING_MODE
+
+    _module, adapter = _make_ctrader_adapter()
+    explicit_volume = int(2.0 * 1000)
+    gated = signal.model_copy(
+        update={"metadata": {**metadata, "ctrader_volume": explicit_volume}}
+    )
+    assert adapter._resolve_order_volume(gated) == explicit_volume

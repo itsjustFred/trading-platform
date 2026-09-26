@@ -18,7 +18,7 @@ from live_runner.account_routing import (
     validate_live_account_routes,
 )
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from live_runner.credential_env import accounts_env_mtime, load_accounts_env_values
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import discover_discord_bots_from_env
@@ -29,6 +29,7 @@ from live_runner.stockkit_routing import (
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
+from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
     create_service,
@@ -574,8 +575,10 @@ def size_live_signal_for_submission(
 
     metadata["qty"] = float(sized_order.position_size)
     metadata["explicit_qty"] = float(sized_order.position_size)
-    metadata["risk_amount"] = float(sized_order.risk_amount)
-    metadata["risk_percent"] = float(sized_order.risk_percent)
+    # #84: live metadata carries the realized stop-loss amount (differs from
+    # the policy figure on notional-cap).
+    metadata["risk_amount"] = float(realized_risk_amount(sized_order))
+    metadata["risk_percent"] = float(realized_risk_percent(sized_order, account_balance))
     metadata["risk_reward_ratio"] = (
         float(sized_order.risk_reward_ratio)
         if sized_order.risk_reward_ratio is not None
@@ -591,14 +594,16 @@ def _resolve_exit_only_target_qty(
     positions: Iterable[Mapping[str, object]],
     symbol: str,
 ) -> float:
-    """Return the total long quantity to flatten for ``symbol``.
+    """Return the total quantity to flatten for ``symbol``.
 
     Hedging accounts (cTrader default) can hold several lots of the same
     symbol as separate positions; netting accounts fold them into one row.
-    Both shapes must flatten the whole long exposure, so matching quantities
-    are summed. Rows that cannot be parsed are skipped (fail-closed: the
-    close then covers less, and a residual row is still visible on the
-    broker), never crash the close.
+    Both shapes must flatten the whole exposure, so the magnitudes of all
+    matching rows are summed — shorts count too (a negative qty is an open
+    short that an exit-only close must buy back, not a residual to ignore).
+    Rows that cannot be parsed are skipped (fail-closed: the close then
+    covers less, and a residual row is still visible on the broker), never
+    crash the close.
     """
     target_qty = 0.0
     for position in positions:
@@ -609,8 +614,29 @@ def _resolve_exit_only_target_qty(
             resolved_qty = _coerce_live_float(position.get("qty"), field_name="qty")
         except ValueError:
             continue
-        target_qty += max(resolved_qty, 0.0)
+        target_qty += abs(resolved_qty)
     return target_qty
+
+
+def _exit_only_close_action(positions: Iterable[Mapping[str, object]], symbol: str) -> str:
+    """Return the order side that flattens ``symbol``'s net exposure.
+
+    A net-long book closes with ``sell``; a net-short book closes with
+    ``buy`` (the short must be bought back). A flat book (or rows that all
+    fail to parse) returns ``sell`` — the caller rejects the order on a
+    zero target quantity anyway, and ``sell`` keeps the historical default
+    for the rows that do parse.
+    """
+    net_qty = 0.0
+    for position in positions:
+        position_symbol = str(position.get("symbol") or "").strip().upper()
+        if position_symbol != symbol.upper():
+            continue
+        try:
+            net_qty += _coerce_live_float(position.get("qty"), field_name="qty")
+        except ValueError:
+            continue
+    return "buy" if net_qty < 0 else "sell"
 
 
 async def _metadata_for_exit_only_order(
@@ -625,10 +651,17 @@ async def _metadata_for_exit_only_order(
     target_qty = _resolve_exit_only_target_qty(positions, signal.symbol)
     if target_qty <= 0:
         raise ValueError(
-            f"Exit-only signal received for {signal.symbol} but no long position is open"
+            f"Exit-only signal received for {signal.symbol} but no position is open"
         )
     metadata["explicit_qty"] = float(target_qty)
-    metadata["risk_sizing_mode"] = "exit_only"
+    metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
+    # A short position must be closed with a BUY; keep the close side derived
+    # from the broker book instead of trusting the signal's action. The
+    # adapters read signal.action (not metadata), so the signal itself is
+    # re-stamped below by the caller's model_copy.
+    close_action = _exit_only_close_action(positions, signal.symbol)
+    metadata["action"] = close_action
+    metadata["signal_action"] = signal.action
     return metadata
 
 
@@ -698,9 +731,13 @@ async def submit_order_with_risk(
         # quantity. They bypass risk sizing and the entry fail-closed SL/TP
         # guard: they reduce exposure instead of opening a new position.
         metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
-        return await adapter.submit_order(
-            signal.model_copy(update={"metadata": metadata})
-        )
+        # The close side is derived from the broker book (a short must be
+        # bought back), so the stamped action wins over the signal's.
+        update: dict[str, object] = {"metadata": metadata}
+        close_action = metadata.get("action")
+        if close_action in {"buy", "sell"} and close_action != signal.action:
+            update["action"] = close_action
+        return await adapter.submit_order(signal.model_copy(update=update))
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -765,6 +802,10 @@ async def submit_order_with_risk(
         "risk_reward_ratio",
         "risk_timeframe",
         "current_positions",
+        # Raw broker-unit overrides from the (untrusted) payload: on entries
+        # the risk-sized 'qty' must reach the adapter unshadowed (#79).
+        "volume",
+        "ctrader_volume",
     })
     preserved_metadata = {
         key: value for key, value in metadata.items() if key not in sizing_keys
@@ -787,7 +828,7 @@ def _trade_signal_to_live_signal(
     metadata["source"] = str(metadata.get("source") or "discord")
     if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
-        metadata["risk_sizing_mode"] = "exit_only"
+        metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     # Whitelist at the conversion site itself (B-2): never default an unmapped
     # action to SELL. The TradeSignal Literal gates construction today, but a
     # future loosening (e.g. adding "close") must not silently become a live
@@ -894,6 +935,22 @@ def _group_discord_deployments_by_channel(
             logger.warning(
                 "Discord deployment missing channel id",
                 extra={"data": {"deployment_id": str(deployment.id), "account_id": account_id}},
+            )
+            continue
+        # #81: a literal "${...}" channel id never matches a real channel —
+        # warn loudly (startup-grade error surfaced per deployment) instead
+        # of staying silently mute.
+        if "${" in configured_channel:
+            logger.warning(
+                "Discord deployment has unexpanded channel id; set the "
+                "referenced environment variable instead of shipping '${...}'",
+                extra={
+                    "data": {
+                        "deployment_id": str(deployment.id),
+                        "account_id": account_id,
+                        "channel_id": configured_channel,
+                    }
+                },
             )
             continue
         channel_to_deployments.setdefault(configured_channel, []).append(deployment)
@@ -1111,20 +1168,69 @@ def _trusted_author_ids_from_config(value: object) -> set[str]:
     return set()
 
 
-def _deployment_trusted_author_ids(deployment: LiveDeploymentConfig) -> set[str]:
-    """Return this deployment's configured trusted-author allowlist (may be empty).
+def _deployment_trusted_author_ids(
+    deployment: LiveDeploymentConfig,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Return this deployment's trusted-author allowlist (may be empty).
 
     Only `trusted_author_ids` is documented (docs/signal_bots.md); the other
     spellings are accepted for operator convenience but are not advertised.
+
+    #81: IDs stay out of git — per-deployment env
+    ``DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`` (service name canonicalized
+    like the token key), fallback ``DISCORD_TRUSTED_AUTHOR_IDS``.
     """
     configured = deployment.signal_config or {}
     settings = deployment.settings or {}
-    return _trusted_author_ids_from_config(
+    direct = _trusted_author_ids_from_config(
         configured.get("trusted_author_ids")
         or configured.get("trusted_bot_ids")
         or settings.get("trusted_author_ids")
         or settings.get("trusted_bot_ids")
     )
+    if direct:
+        return direct
+    if accounts_env_values is not None:
+        env_source: Mapping[str, str] = accounts_env_values
+    else:
+        env_source = os.environ
+    service_name = _deployment_service_name(deployment)
+    if service_name:
+        canonical = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
+        per_service_key = f"DISCORD_BOT_{canonical}_TRUSTED_AUTHOR_IDS"
+        per_service = _trusted_author_ids_from_config(
+            _split_env_id_list(env_source.get(per_service_key, ""))
+        )
+        if per_service:
+            return per_service
+    return _trusted_author_ids_from_config(
+        _split_env_id_list(env_source.get("DISCORD_TRUSTED_AUTHOR_IDS", ""))
+    )
+
+
+def _split_env_id_list(raw: object) -> set[str]:
+    """Split a comma/whitespace-separated env ID list into an ID set."""
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+
+
+def _deployment_discord_auth_scheme(deployment: LiveDeploymentConfig) -> str:
+    """Return this deployment's discord auth scheme (#81: raw|bot, default raw)."""
+    configured = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
+    settings = deployment.settings if isinstance(deployment.settings, dict) else {}
+    raw = str(
+        configured.get("discord_auth_scheme")
+        or settings.get("discord_auth_scheme")
+        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
+    ).strip().lower()
+    if raw not in ("raw", "bot"):
+        raise ValueError(
+            f"Unknown discord_auth_scheme {raw!r}; expected 'raw' or 'bot'."
+        )
+    return raw
 
 
 async def _dispatch_discord_trade_signal(
@@ -1235,7 +1341,9 @@ async def _run_discord_signal_listener_for_account(
     merged_trusted_author_ids: set[str] = set()
     for deployment in channel_to_deployments.values():
         for channel_deployment in deployment:
-            merged_trusted_author_ids |= _deployment_trusted_author_ids(channel_deployment)
+            merged_trusted_author_ids |= _deployment_trusted_author_ids(
+                channel_deployment, accounts_env_values=accounts_env_values
+            )
     if not merged_trusted_author_ids:
         logger.warning(
             "Discord listener not started: no trusted_author_ids configured "
@@ -1258,6 +1366,7 @@ async def _run_discord_signal_listener_for_account(
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
+        auth_scheme=_deployment_discord_auth_scheme(primary_deployment),
     )
     await source.connect()
     try:
@@ -1689,11 +1798,18 @@ async def _ensure_discord_bot_source(
     *,
     active_discord_bots: dict[str, DiscordSignalSource],
     active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    trusted_author_ids: set[str] | None = None,
+    auth_scheme: str = "raw",
 ) -> None:
     service_id = str(service.id)
     source = active_discord_bots.get(service_id)
     expected_channel_ids = {channel_id}
-    if source is None or source.token != token or source.channel_ids != expected_channel_ids:
+    if (
+        source is None
+        or source.token != token
+        or source.channel_ids != expected_channel_ids
+        or getattr(source, "auth_scheme", "raw") != auth_scheme
+    ):
         _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
         _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
         if source is not None:
@@ -1702,11 +1818,20 @@ async def _ensure_discord_bot_source(
                 active_discord_bots=active_discord_bots,
                 active_discord_bot_tasks=active_discord_bot_tasks,
             )
+        # #81: the source gate requires a non-empty allowlist — fail closed
+        # here instead of constructing a muted source.
+        if not trusted_author_ids:
+            raise ValueError(
+                f"Discord service {service.name!r} has no trusted_author_ids; "
+                "refusing to ingest signals from unverified authors."
+            )
         source = DiscordSignalSource(
             bot_name=service.name,
             token=token,
             channel_id=channel_id,
             service_id=service_id,
+            trusted_author_ids=trusted_author_ids,
+            auth_scheme=auth_scheme,
         )
         active_discord_bots[service_id] = source
 
@@ -1756,12 +1881,37 @@ async def _sync_running_discord_bot(
         await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
         return
 
+    trusted_author_ids = _resolve_discord_service_trusted_author_ids(
+        service, accounts_env_values=accounts_env_values
+    )
+    if not trusted_author_ids:
+        logger.warning(
+            "Discord service missing trusted_author_ids; refusing open gate",
+            extra={"data": {"service_id": service_id, "service_name": service.name}},
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        return
+    service_config = service.config if isinstance(service.config, dict) else {}
+    auth_scheme = str(
+        service_config.get("discord_auth_scheme")
+        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
+    ).strip().lower()
+    if auth_scheme not in ("raw", "bot"):
+        logger.warning(
+            "Discord service has unknown discord_auth_scheme",
+            extra={"data": {"service_id": service_id, "auth_scheme": auth_scheme}},
+        )
+        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        return
+
     await _ensure_discord_bot_source(
         service,
         token,
         channel_id,
         active_discord_bots=active_discord_bots,
         active_discord_bot_tasks=active_discord_bot_tasks,
+        trusted_author_ids=trusted_author_ids,
+        auth_scheme=auth_scheme,
     )
 
 
@@ -1792,12 +1942,29 @@ async def _sync_discord_bot_services(
             continue
         if str(service.id) in _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
             continue
-        await _sync_running_discord_bot(
-            service,
-            active_discord_bots=active_discord_bots,
-            active_discord_bot_tasks=active_discord_bot_tasks,
-            accounts_env_values=accounts_env_values,
-        )
+        try:
+            await _sync_running_discord_bot(
+                service,
+                active_discord_bots=active_discord_bots,
+                active_discord_bot_tasks=active_discord_bot_tasks,
+                accounts_env_values=accounts_env_values,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # One misconfigured service (e.g. missing allowlist) must not
+            # starve its siblings for the rest of the tick.
+            logger.warning(
+                "Discord service sync failed; continuing with siblings",
+                extra={
+                    "data": {
+                        "service_id": str(service.id),
+                        "service_name": service.name,
+                        "error": str(exc),
+                    }
+                },
+            )
+            continue
 
 
 async def sync_services_loop(

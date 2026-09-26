@@ -180,6 +180,9 @@ def cmd_run(args):
     if not isinstance(parameter_overrides, dict):
         raise ValueError("--params must decode to a JSON object")
     resolved_parameters = resolve_strategy_parameters(args.strategy, parameter_overrides)
+    # #84: explicit fee declaration rides into engine params (hard error
+    # downstream when absent).
+    resolved_parameters = {**resolved_parameters, **_fee_params_from_args(args)}
 
     normalized_timeframe = normalize_timeframe(args.timeframe)
 
@@ -302,6 +305,7 @@ def cmd_walkforward(args):
     """Run walk-forward validation for a strategy."""
     symbols = parse_csv_list(args.symbols)
     params = parse_params(args.params)
+    params = {**params, **_fee_params_from_args(args)}
     result = run_walkforward(
         strategy=args.strategy,
         engine=get_engine(args.engine),
@@ -339,7 +343,7 @@ def cmd_grid(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params=parse_params(args.params),
+        params={**parse_params(args.params), **_fee_params_from_args(args)},
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -368,7 +372,7 @@ def cmd_matrix(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params=parse_params(args.params),
+        params={**parse_params(args.params), **_fee_params_from_args(args)},
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -430,6 +434,41 @@ def _add_sizing_flags(parser: argparse.ArgumentParser, *, risk_default: float | 
     )
 
 
+def _add_fee_flags(parser: argparse.ArgumentParser) -> None:
+    """Explicit fee/slippage declaration flags (#84: no silent gross)."""
+    parser.add_argument(
+        "--fee-rate",
+        type=float,
+        default=None,
+        help="Fee as fraction of notional per side, e.g. 0.0005",
+    )
+    parser.add_argument(
+        "--fee-flat-per-trade",
+        type=float,
+        default=None,
+        help="Flat fee surcharge per closed trade",
+    )
+    parser.add_argument(
+        "--fees-zero",
+        action="store_true",
+        help="Explicitly declare a no-cost run (conscious opt-in, not an omission)",
+    )
+
+
+def _fee_params_from_args(args) -> dict:
+    """Merge CLI fee flags into engine params, failing closed (#84)."""
+    params: dict = {}
+    if getattr(args, "fee_rate", None) is not None:
+        params["fee_rate"] = float(args.fee_rate)
+    if getattr(args, "fee_flat_per_trade", None) is not None:
+        params["fee_flat_per_trade"] = float(args.fee_flat_per_trade)
+    if getattr(args, "fees_zero", False):
+        if "fee_rate" in params or "fee_flat_per_trade" in params:
+            raise ValueError("--fees-zero conflicts with --fee-rate/--fee-flat-per-trade")
+        params["fees"] = "zero"
+    return params
+
+
 class _SizingAliasAction(argparse.Action):
     """Store the sizing value; warn when the deprecated spelling was used.
 
@@ -483,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--end", default="", help="End date (empty = auto from data)")
     run_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(run_p, risk_default=None)
+    _add_fee_flags(run_p)
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
@@ -524,6 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument("--step-months", type=int, default=1, help="Rolling step in months")
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
     _add_sizing_flags(wf_p, risk_default=None)
+    _add_fee_flags(wf_p)
     wf_p.add_argument("--intrabar-resolution", default="open_close")
     wf_p.add_argument("--params", default="", help="Strategy params JSON")
     wf_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
@@ -539,6 +580,7 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--engine", default="vectorbt", help="Backtest engine")
     grid_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(grid_p, risk_default=0.01)
+    _add_fee_flags(grid_p)
     grid_p.add_argument("--intrabar-resolution", default="open_close")
     grid_p.add_argument("--params", default="", help='Strategy params JSON')
     grid_p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -562,6 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p.add_argument("--engine", default="", help="Override engine. Empty uses each strategy's detected engine.")
     matrix_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(matrix_p, risk_default=0.01)
+    _add_fee_flags(matrix_p)
     matrix_p.add_argument("--intrabar-resolution", default="open_close")
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)

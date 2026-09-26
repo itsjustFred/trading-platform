@@ -31,6 +31,7 @@ from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines.base import BacktestConfig
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
+from runner.fees import resolve_fee_model
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
 logger = logging.getLogger(__name__)
@@ -562,21 +563,24 @@ class TradeEngine:
 
         self._trade_counter += 1
         pnl = sum(float(item.pnl or 0.0) for item in position.exits)
-        # A-L1: fees are an explicit engine cost model instead of hardcoded
-        # 0.0. ``fee_rate`` is a fraction of notional charged per side
-        # (entry + each exit leg), ``fee_flat_per_trade`` a flat per-trade
-        # surcharge. Both default to 0.0 (legacy behavior unchanged).
-        fee_rate = max(0.0, float(self.config.parameters.get("fee_rate", 0.0) or 0.0))
-        fee_flat = max(
-            0.0, float(self.config.parameters.get("fee_flat_per_trade", 0.0) or 0.0)
-        )
-        entry_notional = float(position.entry_price) * float(position.quantity)
+        # #84: explicit pluggable fee model — missing fee/slippage config is
+        # a hard error, never silent gross. Partial exits are priced at the
+        # quantity-weighted average exit price (exact for the notional
+        # model, one call for any model).
+        fee_model = resolve_fee_model(self.config.parameters)
+        total_exit_qty = sum(float(item.quantity or 0.0) for item in position.exits)
         exit_notional = sum(
             float(item.price or 0.0) * float(item.quantity or 0.0)
             for item in position.exits
         )
-        fees = (entry_notional + exit_notional) * fee_rate + fee_flat
+        avg_exit_price = exit_notional / total_exit_qty if total_exit_qty > 0 else 0.0
+        fees = fee_model.fee_for_trade(
+            float(position.entry_price), avg_exit_price, float(position.quantity)
+        )
         net_pnl = pnl - fees
+        # #84: exit legs accumulated gross into _realized_pnl — back the
+        # costs out here so the equity path is net.
+        self._realized_pnl -= fees
         risk_per_share = abs(
             position.entry_price - (position.stop_loss or position.entry_price * 0.98)
         )

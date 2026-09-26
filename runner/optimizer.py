@@ -12,7 +12,7 @@ import optuna
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from data_tools.auto_download import ensure_backtest_data, has_ohlcv_bars_in_range
+from data_tools.auto_download import ensure_backtest_data, has_sufficient_segment_coverage
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
@@ -23,6 +23,8 @@ from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[float, str], None]
 
 # Optuna param name for the internal symbol-universe selection. Namespaced so it
 # can never collide with (and be filtered away alongside) a real strategy
@@ -36,9 +38,11 @@ MAX_CANDIDATE_SYMBOL_UNIVERSES = 256
 
 # No-trade trials must rank below every honest trial (including losing ones),
 # otherwise Optuna is steered toward parameter regions that avoid trading.
-# A finite, very negative floor keeps the study maximizable while making the
-# trial strictly worse than any real metric value.
+# A finite, very negative floor keeps maximize-studies steerable while making
+# the trial strictly worse than any real metric value; minimize-studies
+# (p_value) use the mirrored ceiling NO_TRADE_PENALTY_MINIMIZE.
 NO_TRADE_PENALTY = -1_000_000.0
+NO_TRADE_PENALTY_MINIMIZE = 1_000_000.0
 
 BACKTESTS_DIR = DATA_DIR / "backtests"
 TARGET_METRIC_ALIASES = {
@@ -58,7 +62,14 @@ TARGET_METRIC_ALIASES = {
     "total_return": "total_return",
 }
 
-ProgressCallback = Callable[[float, str], None]
+#: Per-metric study direction. Everything ranks higher-is-better EXCEPT
+#: ``p_value`` (a statistical significance p-value: smaller = more
+#: significant). Maximizing it would select the most INSIGNIFICANT trials
+#: (#82); the frontend already treats it as lower-is-favorable.
+METRIC_DIRECTIONS: dict[str, str] = {
+    metric: ("minimize" if metric == "p_value" else "maximize")
+    for metric in set(TARGET_METRIC_ALIASES.values())
+}
 
 #: Marker value recorded on no-trade trials. Purely informational (the trial
 #: objective returns the dynamic penalty from :func:`_no_trade_penalty_value`);
@@ -66,23 +77,57 @@ ProgressCallback = Callable[[float, str], None]
 #: explicitly non-competitive value instead of a plausible-looking 0.0.
 _NO_TRADE_PENALTY = -1e9
 
+#: For minimize-direction metrics the penalty must sit strictly ABOVE every
+#: plausible metric value, not below (p-values are in [0, 1]).
+_NO_TRADE_PENALTY_MAXIMIZE_METRICS = 1e9
 
-def _no_trade_penalty_value(completed_trading_values: list[float]) -> float:
+
+def _study_direction(target_metric: str) -> str:
+    """Return the Optuna study direction for ``target_metric`` (#82).
+
+    ``p_value`` is minimized (smaller = more significant); every other
+    registered target metric is maximized. Unknown metrics fail loudly
+    instead of silently defaulting to maximize.
+    """
+    canonical = TARGET_METRIC_ALIASES.get(target_metric, target_metric)
+    direction = METRIC_DIRECTIONS.get(canonical)
+    if direction is None:
+        raise ValueError(
+            f"Unknown target metric {target_metric!r}: no study direction is "
+            "defined. Extend TARGET_METRIC_ALIASES/METRIC_DIRECTIONS explicitly."
+        )
+    return direction
+
+
+def _no_trade_penalty_value(
+    completed_trading_values: list[float],
+    *,
+    direction: str = "maximize",
+) -> float:
     """Return a no-trade trial value that can never win the study.
 
-    The penalty sits strictly below the worst value of the trading trials
+    The penalty sits strictly beyond the worst value of the trading trials
     completed so far (with a safety margin). For the very first trial there
-    is nothing to undercut yet, so a large finite negative constant is used —
-    it is still strictly below any plausible metric value (Sharpe, Sortino,
+    is nothing to undercut yet, so a large finite constant is used — it is
+    still strictly beyond any plausible metric value (Sharpe, Sortino,
     Calmar, profit factor and total return are all above −1e6 for real
-    backtests), so an honest trial can never lose against it.
+    backtests; p-values are in [0, 1]), so an honest trial can never lose
+    against it.
     """
+    if direction == "minimize":
+        if not completed_trading_values:
+            return _NO_TRADE_PENALTY_MAXIMIZE_METRICS
+        return max(float(value) for value in completed_trading_values) + 1.0
     if not completed_trading_values:
         return _NO_TRADE_PENALTY
     return min(float(value) for value in completed_trading_values) - 1.0
 
 
-def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
+def _best_trial_or_raise(
+    study: optuna.Study,
+    *,
+    direction: str = "maximize",
+) -> optuna.trial.FrozenTrial:
     """Return the best completed TRADING trial, raising when none exist.
 
     ``study.best_trial`` raises an opaque Optuna ValueError when every trial
@@ -92,6 +137,9 @@ def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
     No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
     AC 2): a study whose completed trials are ALL no-trade trials must not
     hand back a no-trade parameter set as "best".
+
+    ``direction`` must match the study's direction (#82): minimize-studies
+    (p_value) rank lower-is-better, so the best trading trial is the MINIMUM.
     """
     completed = study.get_trials(
         deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)
@@ -112,6 +160,8 @@ def _best_trial_or_raise(study: optuna.Study) -> optuna.trial.FrozenTrial:
             "parameter region produced trades. Widen parameter_ranges or "
             "relax position-sizing constraints before retrying."
         )
+    if direction == "minimize":
+        return min(trading_trials, key=lambda trial: float(trial.value or 0.0))
     return max(trading_trials, key=lambda trial: float(trial.value or 0.0))
 
 
@@ -290,7 +340,8 @@ def run_optimization(
     )
     for segment_name, period in (("train", train_period), ("test", test_period)):
         for symbol in required_symbols:
-            if not has_ohlcv_bars_in_range(
+            # #86: density + max-gap gate — a 1-bar month must not pass.
+            if not has_sufficient_segment_coverage(
                 symbol=symbol,
                 timeframe=timeframe,
                 start=period["start"],
@@ -298,8 +349,10 @@ def run_optimization(
                 data_dir=data_dir,
             ):
                 raise ValueError(
-                    f"Optimization {segment_name} segment has no OHLCV bars for "
-                    f"{symbol} {timeframe} ({period['start']} -> {period['end']})"
+                    f"Optimization {segment_name} segment has insufficient OHLCV "
+                    f"coverage for {symbol} {timeframe} ({period['start']} -> "
+                    f"{period['end']}: need >=95% of expected bars, no gap >3x "
+                    "timeframe)"
                 )
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
@@ -312,7 +365,7 @@ def run_optimization(
         trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {exc}")
         raise exc
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction=_study_direction(config.target_metric))
 
     def objective(trial: optuna.Trial) -> float:
         completed_trading_values = [
@@ -359,7 +412,10 @@ def run_optimization(
             # for downstream validation.
             trial.set_user_attr("penalty_applied", True)
             trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            penalty = _no_trade_penalty_value(completed_trading_values)
+            penalty = _no_trade_penalty_value(
+                completed_trading_values,
+                direction=_study_direction(config.target_metric),
+            )
             trial.set_user_attr("metric_value", float(penalty))
             return penalty
 
@@ -368,7 +424,21 @@ def run_optimization(
         # honest metric value ranks above it. A metric that reaches the floor
         # (e.g. a raw-PnL target on a large account) would silently invert the
         # no-trade steering, so record the failure loudly instead.
-        if metric_value <= NO_TRADE_PENALTY:
+        if _study_direction(config.target_metric) == "minimize":
+            # p_value and friends: the penalty is a CEILING above every
+            # plausible metric value, so a metric at/above it would invert
+            # the steering the same way the floor would for maximize.
+            if metric_value >= NO_TRADE_PENALTY_MINIMIZE:
+                _record_failure(
+                    trial,
+                    ValueError(
+                        f"{config.target_metric}={metric_value} is at or above the "
+                        f"no-trade penalty ceiling ({NO_TRADE_PENALTY_MINIMIZE}); the "
+                        "ceiling only holds for metrics bounded below it. Choose a "
+                        "different target_metric or raise the ceiling's magnitude."
+                    ),
+                )
+        elif metric_value <= NO_TRADE_PENALTY:
             _record_failure(
                 trial,
                 ValueError(
@@ -418,7 +488,7 @@ def run_optimization(
             f"parameter set from failed backtests. Last trials: {failure_summary}"
         ) from last_trial_exception
 
-    best_trial = _best_trial_or_raise(study)
+    best_trial = _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
     best_params = {
         key: value
         for key, value in dict(best_trial.params).items()
@@ -475,7 +545,11 @@ def run_optimization(
         "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
         "test_stats": _json_safe(test_stats),
-        "top_trials": _top_trials_payload(study.trials, limit=10),
+        "top_trials": _top_trials_payload(
+            study.trials,
+            limit=10,
+            direction=_study_direction(config.target_metric),
+        ),
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -854,13 +928,20 @@ def _top_trials_payload(
     trials: list[optuna.trial.FrozenTrial],
     *,
     limit: int,
+    direction: str = "maximize",
 ) -> list[dict[str, Any]]:
     completed_trials = [
         trial
         for trial in trials
         if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
     ]
-    ordered_trials = sorted(completed_trials, key=lambda trial: float(trial.value), reverse=True)
+    # Rank in the study's direction (#82): minimize-metrics (p_value) list
+    # their BEST (lowest) trials first.
+    ordered_trials = sorted(
+        completed_trials,
+        key=lambda trial: float(trial.value),
+        reverse=(direction != "minimize"),
+    )
     payload: list[dict[str, Any]] = []
     for trial in ordered_trials[:limit]:
         payload.append(

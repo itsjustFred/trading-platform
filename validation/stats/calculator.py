@@ -165,23 +165,60 @@ def _trade_span_years(trades: List[Trade]) -> float | None:
     return span_days / 365.25
 
 
-def _annualize_factor(trades: List[Trade]) -> float:
-    """Trades-per-year annualization factor (A-L4).
+def _daily_net_series(trades: List[Trade]) -> List[float] | None:
+    """Daily-resampled net PnL series for ratio annualization (#84).
 
-    ``sqrt(n_trades / span_years)`` — the trade-based analogue of the
-    ``sqrt(252)`` daily annualization in ``runner/stats.py``. Falls back to
-    ``sqrt(252)`` when the timestamps cannot support it (undatable, zero
-    span, or denser than one trade per day — the per-trade Sharpe has no
-    defined annualization there, so the legacy daily-trade assumption
-    applies).
+    Trades are summed per exit calendar day over the full calendar span
+    (flat days contribute 0.0), mirroring the daily-resampled equity
+    definition in ``runner/stats.py``. Returns None when no trade carries
+    a parseable exit timestamp (the caller falls back to per-trade
+    observations with the same sqrt(252) annualization).
     """
-    span_years = _trade_span_years(trades)
-    if span_years is None or span_years <= 0:
-        return math.sqrt(252)
-    periods_per_year = len(trades) / span_years
-    if not 1.0 <= periods_per_year <= 252.0:
-        return math.sqrt(252)
-    return math.sqrt(periods_per_year)
+    try:
+        import pandas as pd
+    except ImportError:  # pragma: no cover
+        return None
+    day_totals: dict[str, float] = {}
+    span: list[pd.Timestamp] = []
+    for trade in trades:
+        for raw in (trade.entry_time, trade.last_exit_time):
+            if raw is None:
+                continue
+            ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
+            if not pd.isna(ts):
+                span.append(pd.Timestamp(ts))
+    if len(span) < 2:
+        return None
+    start = min(span).normalize()
+    end = max(span).normalize()
+    if end <= start:
+        return None
+    for trade in trades:
+        exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
+        if pd.isna(exit_ts):
+            return None
+        day_totals[pd.Timestamp(exit_ts).normalize().date().isoformat()] = (
+            day_totals.get(pd.Timestamp(exit_ts).normalize().date().isoformat(), 0.0)
+            + _net_realized_pnl(trade)
+        )
+    days = int((end - start).total_seconds() // 86400) + 1
+    series: List[float] = []
+    cursor = start
+    for _ in range(days):
+        series.append(day_totals.get(cursor.date().isoformat(), 0.0))
+        cursor += pd.Timedelta(days=1)
+    return series
+
+
+def _annualize_factor(trades: List[Trade]) -> float:
+    """Daily annualization factor (#84).
+
+    Annualization contract shared with ``runner/stats.py``: daily-resampled
+    observations annualized with sqrt(252). The old trades-per-year factor
+    (A-L4) made the same strategy's Sharpe depend on trade count instead of
+    calendar time.
+    """
+    return math.sqrt(252)
 
 
 def _sharpe(returns: List[float], annualize_factor: float | None = None) -> float:
@@ -241,9 +278,13 @@ def compute_trade_statistics(trades: List[Trade]) -> TradeStatistics:
 
     max_drawdown, max_drawdown_pct = _compute_drawdowns(realized_pnls)
 
+    # #84: ratio metrics run on the daily-resampled net series with the
+    # shared sqrt(252) annualization (same contract as runner/stats.py).
+    daily_series = _daily_net_series(trades)
     annualize = _annualize_factor(trades)
-    sharpe_ratio = _sharpe(realized_pnls, annualize)
-    sortino_ratio = _sortino(realized_pnls, annualize)
+    ratio_observations = daily_series if daily_series is not None else realized_pnls
+    sharpe_ratio = _sharpe(ratio_observations, annualize)
+    sortino_ratio = _sortino(ratio_observations, annualize)
 
     if not math.isclose(max_drawdown, 0.0, abs_tol=_ZERO_TOL):
         recovery_factor = net_profit / max_drawdown

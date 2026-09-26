@@ -1,6 +1,7 @@
 """Tests for portfolio optimizer OOS (Out-of-Sample) validation feature."""
 
 import numpy as np
+import pytest
 
 from runner.portfolio_optimizer import (
     StrategyEquityPoint,
@@ -319,13 +320,13 @@ def test_align_equity_curves_no_overlap_returns_empty() -> None:
 
 
 def test_normalize_weights_all_zero_falls_back_to_equal() -> None:
-    """All-zero weights must not produce nan/inf — fall back to equal weight."""
+    """#87: degenerate trials are pruned, never promoted to equal-weight."""
     from runner.portfolio_optimizer import _normalize_weights
 
-    weights = _normalize_weights(np.zeros(4))
-    assert np.all(np.isfinite(weights))
-    assert np.isclose(weights.sum(), 1.0)
-    assert np.allclose(weights, 0.25)
+    with pytest.raises(ValueError, match="pruned"):
+        _normalize_weights(np.zeros(4))
+    with pytest.raises(ValueError, match="pruned"):
+        _normalize_weights(np.array([np.nan, 1.0]))
 
 
 def test_normalize_weights_normal_case() -> None:
@@ -584,3 +585,31 @@ def test_load_strategy_equity_reads_sqlite_first(isolated_db_sandbox) -> None:
 
     assert [point.equity for point in points] == [100000.0, 101000.0]
     assert points[0].time == 1704067200
+
+
+class TestIssue87Guards:
+    """#87: per-trial penalty differentiates weights; OOS status persists."""
+
+    def test_weighted_penalty_differentiates_concentration(self) -> None:
+        from runner.portfolio_optimizer import _weighted_correlation_penalty
+
+        corr = np.array([[1.0, 0.9], [0.9, 1.0]])
+        concentrated = _weighted_correlation_penalty(np.array([1.0, 0.0]), corr)
+        diversified = _weighted_correlation_penalty(np.array([0.5, 0.5]), corr)
+        # Concentrated on one leg: no off-diagonal mass. Split across two
+        # highly correlated legs: positive penalty.
+        assert concentrated == 0.0
+        assert diversified > 0.0
+
+    def test_oos_status_present_without_request(self, tmp_path, monkeypatch) -> None:
+        import runner.portfolio_optimizer as module
+
+        curves = {
+            "a": [StrategyEquityPoint(time=t, equity=100000.0 + t * 10.0) for t in range(20)],
+            "b": [StrategyEquityPoint(time=t, equity=100000.0 + t * 5.0) for t in range(20)],
+        }
+        monkeypatch.setattr(module, "_load_strategy_equity", lambda bt_id: curves[bt_id])
+        monkeypatch.setattr(module, "OPTIMIZATIONS_DIR", tmp_path)
+        result = module.optimize_portfolio_allocation(["a", "b"], n_trials=2)
+        assert result["oos_status"] == "no_oos_requested"
+        assert "oos_sharpe" not in result

@@ -22,7 +22,7 @@ import pytest
 
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_max_leverage
-from tests.helpers import sma_crossover_strategy_text
+from tests.helpers import sma_crossover_strategy_text, with_zero_fees
 
 
 from tests.helpers import deterministic_ohlcv_frame, write_ohlcv as _write_shared_ohlcv
@@ -51,7 +51,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "parameters": {"fast_length": 3, "slow_length": 10},
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 @pytest.fixture

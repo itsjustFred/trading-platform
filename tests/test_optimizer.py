@@ -176,7 +176,7 @@ def _forbid_call(message: str, exc_type: type[Exception] = AssertionError):
 
 def _allow_bar_coverage_preflight(monkeypatch) -> None:
     monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: [])
-    monkeypatch.setattr(optimizer_module, "has_ohlcv_bars_in_range", lambda **kwargs: True)
+    monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True)
 
 
 def _write_risk_parity_base_backtest(backtests_dir: Path, *, data_dir: Path | None = None) -> None:
@@ -288,7 +288,13 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    _write_ohlcv_bars(data_dir, "AAPL", ["2024-01-02T00:00:00+00:00"])
+    # #86: dense train coverage (01-01..01-07 daily) so the TRAIN gate
+    # passes and the TEST gate (01-07..01-10, empty) is the one that fails.
+    _write_ohlcv_bars(
+        data_dir,
+        "AAPL",
+        [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)],
+    )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
     monkeypatch.setattr(
@@ -368,12 +374,16 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
+    # #86: AAPL dense across the full window (passes both gates);
+    # MSFT dense in train only (01-01..01-07) so the TEST gate names MSFT.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
-        ["2024-01-02T00:00:00+00:00", "2024-01-09T00:00:00+00:00"],
+        [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 11)],
     )
-    _write_ohlcv_bars(data_dir, "MSFT", ["2024-01-02T00:00:00+00:00"])
+    _write_ohlcv_bars(
+        data_dir, "MSFT", [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)]
+    )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
     monkeypatch.setattr(

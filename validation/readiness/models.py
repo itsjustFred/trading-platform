@@ -72,3 +72,12 @@ class ReadinessConfig(BaseModel):
 
     stats_win_rate_tolerance_pct: float = 0.01
     stats_net_profit_tolerance_pct: float = 0.01
+    # #83: Sharpe gate — inputs must be canonical rf=0 stats on BOTH sides
+    # (as produced by validation/stats/calculator.py); the gate compares
+    # stored fields and cannot re-derive the risk-free rate. Runner-produced
+    # stats must be recomputed with risk_free_rate=0.0 before validation.
+    # Pass when the absolute drift fits max(10% relative, 0.1 absolute).
+    stats_sharpe_tolerance_pct: float = 0.10
+    stats_sharpe_tolerance_abs: float = 0.1
+    # #83: max-drawdown gate — 2pp absolute on max_drawdown_pct.
+    stats_max_drawdown_tolerance_pp: float = 0.02

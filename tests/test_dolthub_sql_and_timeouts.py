@@ -42,13 +42,13 @@ class TestSqlQuotingHelpers:
 
 
 class TestSqlBuilders:
-    def test_build_symbol_select_quotes_table_and_symbol(self) -> None:
-        sql = build_symbol_select("ohlcv", "AAPL")
-        assert sql == "SELECT DISTINCT act_symbol FROM `ohlcv` WHERE act_symbol = 'AAPL'"
+    def test_build_symbol_select_quotes_table(self) -> None:
+        sql = build_symbol_select("ohlcv")
+        assert sql == "SELECT DISTINCT act_symbol FROM `ohlcv`"
 
-    def test_build_symbol_select_rejects_injection(self) -> None:
-        with pytest.raises(ValueError):
-            build_symbol_select("ohlcv", "x'; DROP TABLE ohlcv; --")
+    def test_build_symbol_select_escapes_table_identifier(self) -> None:
+        sql = build_symbol_select("we`ird")
+        assert sql == "SELECT DISTINCT act_symbol FROM `we``ird`"
 
     def test_build_ohlcv_select_shape(self) -> None:
         sql = build_ohlcv_select("ohlcv", "AAPL")
@@ -60,6 +60,27 @@ class TestSqlBuilders:
     def test_build_ohlcv_select_rejects_bad_symbol(self) -> None:
         with pytest.raises(ValueError):
             build_ohlcv_select("ohlcv", "AAPL'--")
+
+    def test_list_symbols_queries_every_symbol_without_filter(
+        self, monkeypatch
+    ) -> None:
+        """Regression: _list_symbols must not pass a symbol filter.
+
+        Routing a wildcard through :func:`shared.sql.quote_literal` raised
+        ``ValueError`` before the ``dolt`` call and broke stock export.
+        """
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="act_symbol\nAAPL\nMSFT\n", stderr=""
+            )
+
+        monkeypatch.setattr(dm.subprocess, "run", fake_run)
+        assert dm._list_symbols("/tmp/repo", "ohlcv") == ["AAPL", "MSFT"]
+        query = captured["cmd"][captured["cmd"].index("-q") + 1]
+        assert query == "SELECT DISTINCT act_symbol FROM `ohlcv`"
 
     def test_no_raw_interpolated_sql_in_manager_source(self) -> None:
         """Guard against regression to f-string SQL in dolthub_manager."""

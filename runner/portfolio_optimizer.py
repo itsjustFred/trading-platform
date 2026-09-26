@@ -164,15 +164,26 @@ def _load_strategy_equity(backtest_id: str) -> list[StrategyEquityPoint]:
 
 
 def _normalize_weights(weights: np.ndarray) -> np.ndarray:
-    """Normalize weights to sum to one with a finite equal-weight fallback."""
+    """Normalize weights to sum to one, pruning degenerate trials (#87).
+
+    An all-zero / non-finite weight vector carries no allocation information;
+    silently promoting it to equal-weight let a degenerate trial become the
+    best trial. Raise so the Optuna objective fails (and is caught) instead.
+    """
     weights = np.asarray(weights, dtype=float)
     if weights.size == 0:
         return weights
 
     total = weights.sum()
     if not np.isfinite(total) or total <= 0:
-        return np.ones(weights.size) / weights.size
-    return weights / total
+        raise ValueError(
+            "Degenerate weight vector (zero or non-finite sum) — trial pruned "
+            "instead of falling back to equal-weight."
+        )
+    normalized = weights / total
+    if not bool(np.all(np.isfinite(normalized))):
+        raise ValueError("Non-finite normalized weights — trial pruned.")
+    return normalized
 
 
 def _common_timestamps(
@@ -341,13 +352,28 @@ def _portfolio_sharpe_from_weights(
     return sharpe, max_dd
 
 
+def _weighted_correlation_penalty(weights: np.ndarray, correlation_matrix: np.ndarray) -> float:
+    """Per-trial diversification penalty (#87).
+
+    The old constant (mean off-diagonal of the unweighted IS returns,
+    subtracted from every trial) was invisible to the optimization. This is
+    the weight-weighted off-diagonal mass ``w @ (C - I) @ w``: concentrated
+    bets on correlated pairs pay more than diversified ones.
+    """
+    weights = np.asarray(weights, dtype=float)
+    if weights.size == 0 or correlation_matrix.size == 0:
+        return 0.0
+    centered = np.asarray(correlation_matrix, dtype=float) - np.eye(weights.size)
+    return float(weights @ centered @ weights)
+
+
 def _build_objective(
     backtest_ids: list[str],
     equity_matrix: np.ndarray,
     returns: np.ndarray,
 ) -> Callable[[optuna.Trial], float]:
     """Build the Optuna objective for the prepared in-sample data."""
-    correlation_penalty = _average_off_diagonal(_compute_correlation_matrix(returns))
+    correlation_matrix = _compute_correlation_matrix(returns)
 
     def objective(trial: optuna.Trial) -> float:
         weights_raw = [
@@ -356,7 +382,10 @@ def _build_objective(
         ]
         weights = _normalize_weights(np.array(weights_raw))
         sharpe, max_drawdown = _portfolio_sharpe_from_weights(weights, equity_matrix)
-        score = sharpe - (5.0 * correlation_penalty) - (
+        # #87: per-trial weighted penalty — weight-dependent, so the
+        # optimizer can actually see diversification.
+        penalty = _weighted_correlation_penalty(weights, correlation_matrix)
+        score = sharpe - (5.0 * penalty) - (
             3.0 * max(0, max_drawdown - 0.3)
         )
 
@@ -449,6 +478,15 @@ def _build_optimization_result(
     }
 
     oos_sharpe, oos_max_drawdown = oos_metrics
+    # #87: oos_status is always persisted — missing OOS must be
+    # distinguishable from "not requested".
+    if oos_sharpe is not None:
+        oos_status = "available"
+    elif test_months is not None:
+        oos_status = "insufficient_overlap"
+    else:
+        oos_status = "no_oos_requested"
+    result["oos_status"] = oos_status
     if oos_sharpe is not None:
         result["oos_sharpe"] = oos_sharpe
         result["oos_max_drawdown"] = oos_max_drawdown

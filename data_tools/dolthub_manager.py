@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -84,16 +85,14 @@ def run_dolt(
         ) from exc
 
 
-def build_symbol_select(table_name: str, symbol: str) -> str:
-    """Build the distinct-symbol query without raw interpolation (DV-B27).
+def build_symbol_select(table_name: str) -> str:
+    """Build the distinct-symbol listing query without raw interpolation (DV-B27).
 
-    The symbol filter goes through :func:`shared.sql.quote_literal`, which
-    validates the symbol and raises ``ValueError`` on unsafe input.
+    The table name goes through :func:`shared.sql.quote_identifier`, which
+    escapes backticks and rejects empty names. The listing query must not
+    filter on ``act_symbol`` — every symbol is requested.
     """
-    return (
-        "SELECT DISTINCT act_symbol FROM "
-        f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)}"
-    )
+    return f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}"
 
 
 def build_ohlcv_select(table_name: str, symbol: str) -> str:
@@ -214,7 +213,7 @@ def _export_stocks() -> None:
 
 def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
     result = subprocess.run(
-        ["dolt", "sql", "-q", f"SELECT DISTINCT act_symbol FROM {table_name}", "-r", "csv"],
+        ["dolt", "sql", "-q", build_symbol_select(table_name), "-r", "csv"],
         cwd=stocks_repo,
         capture_output=True,
         text=True,
@@ -241,7 +240,7 @@ def _export_symbol_csv(
                     "dolt",
                     "sql",
                     "-q",
-                    f"SELECT date, open, high, low, close, volume FROM {table_name} WHERE act_symbol='{symbol}' ORDER BY date",
+                    build_ohlcv_select(table_name, symbol),
                     "-r",
                     "csv",
                 ],

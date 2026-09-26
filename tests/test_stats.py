@@ -118,6 +118,8 @@ class TestComputeStats:
         assert stats["total_return"] == 0.1
 
     def test_cagr_annualizes_with_trade_period_bounds(self):
+        # #84: calendar-window CAGR — the equity endpoints (2020→2022),
+        # not the clustered trade span (2021→2023).
         equity = [
             EquityPoint(time="2020-01-01T00:00:00+00:00", equity=100000.0),
             EquityPoint(time="2022-01-01T00:00:00+00:00", equity=121000.0),
@@ -144,10 +146,12 @@ class TestComputeStats:
 
         stats = compute_stats(trades, equity_curve=equity)
 
-        expected = (121000.0 / 100000.0) ** (365.25 / 730) - 1
+        expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
 
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
+        # #84: calendar window — 2024 is a leap year (366 days), not the
+        # 365.75-day trade span.
         equity = [
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
             EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
@@ -174,9 +178,24 @@ class TestComputeStats:
 
         stats = compute_stats(trades, equity_curve=equity)
 
-        fractional_days = 365.75
-        expected = (110000.0 / 100000.0) ** (365.25 / fractional_days) - 1
+        expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
+    def test_trade_stats_are_net_of_fees(self):
+        # #84: gross pnl flatters win-rate/profit-factor/total.
+        def _net_trade(gross: float, fees: float) -> Trade:
+            trade = _trade(gross)
+            trade.fees = fees
+            trade.net_pnl = gross - fees
+            return trade
+
+        trades = [_net_trade(100, 5), _net_trade(-50, 5), _net_trade(8, 10)]
+        stats = compute_stats(trades)
+        # Net: +95, -55, -2 → 1 winner, 2 losers, total +38.
+        assert stats["winners"] == 1
+        assert stats["losers"] == 2
+        assert stats["total_pnl"] == 38.0
+        assert stats["profit_factor"] == pytest.approx(95.0 / 57.0, abs=1e-3)
 
     def test_calmar_ratio_zeroed_for_tiny_drawdown(self):
         equity = _equity_curve_from_returns([0.0200, -0.0005, 0.0150, 0.0100])

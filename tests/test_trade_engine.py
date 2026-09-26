@@ -98,7 +98,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         end_date="2024-01-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
-        parameters={},
+        parameters={"fees": "zero"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -152,7 +152,7 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={},
+        parameters={"fees": "zero"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -197,7 +197,7 @@ def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={},
+        parameters={"fees": "zero"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -242,7 +242,7 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
         risk_per_trade_pct=0.01,
         max_leverage=10.0,
         modeling_resolution="main_timeframe",
-        parameters={},
+        parameters={"fees": "zero"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -263,9 +263,17 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
     without intrabar data the stop wins the same-bar ambiguity, and the
     configured-but-unsupported request stays visible in the audit metadata as
     ``stop_first``.
+
+    The ambiguity bar must NOT be the fill bar, and neither level may sit
+    inside the fill bar's default range: since A-H1 the scoped fill-bar
+    recheck exits a just-opened position on the fill bar itself (bar 11
+    here has high 112), which would preempt the same-bar ambiguity this
+    test pins. TP is 113 so the fill bar cannot trigger it; the ambiguity
+    bar (12, high 114 / low 109) then hits both levels and F8 stop-first
+    decides.
     """
     data = _synthetic_ohlcv(100)
-    data.loc[12, "high"] = 113.0
+    data.loc[12, "high"] = 114.0
     data.loc[12, "low"] = 109.0
 
     def strategy_fn(df: pd.DataFrame, params: dict):
@@ -278,7 +286,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
             "take_profit": pd.Series(pd.NA, index=df.index),
         }
         indicators["stop_loss"].iloc[10] = 109.0
-        indicators["take_profit"].iloc[10] = 112.0
+        indicators["take_profit"].iloc[10] = 113.0
         return entries, exits, indicators, []
 
     cfg = BacktestConfig(
@@ -291,7 +299,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"same_bar_order": "take_profit_first"},
+        parameters={"fees": "zero", "same_bar_order": "take_profit_first"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -347,7 +355,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         end_date="2025-12-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
-        parameters={},
+        parameters={"fees": "zero"},
     )
 
     native_result = NativeAdapter().run(cfg, str(strategy_path))

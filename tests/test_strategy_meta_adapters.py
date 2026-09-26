@@ -88,7 +88,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     adapter = VectorbtAdapter()
     result = adapter.run(
-        BacktestConfig(
+        BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="tuple_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -154,7 +154,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(
+        BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="supertrend_strategy",
             symbols=["AAPL"],
             timeframe="1d",
@@ -248,12 +248,13 @@ def generate_signals(df: pd.DataFrame, params: dict):
             end_date="2024-01-03",
             initial_capital=1000.0,
             data_dir=str(data_root),
-            parameters={"slow": 6},
+            parameters={"fees": "zero", "slow": 6},
         ),
         str(strategy_path),
     )
 
-    assert result.meta.parameters == {"fast": 2, "slow": 6}
+    # #84: the fixture declares explicit zero fees; merge semantics unchanged.
+    assert result.meta.parameters == {"fast": 2, "slow": 6, "fees": "zero"}
     assert result.trades[0].meta["configured_fast"] == 2
     assert result.trades[0].meta["configured_slow"] == 6
 
@@ -311,7 +312,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(symbol_dir / "1m.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(
+        BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="intrabar_strategy",
             symbols=["AAPL"],
             timeframe="1h",
@@ -383,7 +384,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     ).to_parquet(parquet_dir / "1d.parquet", index=False)
 
     result = VectorbtAdapter().run(
-        BacktestConfig(
+        BacktestConfig(parameters={"fees": "zero"}, 
             strategy_name="drawing_strategy",
             symbols=["AAPL"],
             timeframe="1d",

@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import optuna
 import pandas as pd
 import pytest
 
@@ -135,11 +136,11 @@ class TestNoTradeTrialsCannotWin:
                 {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
             ),
         )
-        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("/tmp/s.py"), "s"))
+        monkeypatch.setattr(optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s"))
         monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
         monkeypatch.setattr(
             optimizer_module,
-            "has_ohlcv_bars_in_range",
+            "has_sufficient_segment_coverage",
             lambda **kwargs: True,
         )
 
@@ -150,8 +151,16 @@ class TestNoTradeTrialsCannotWin:
             def get_trials(self, deepcopy: bool = True, states=None):
                 return list(self.trials)
 
-            def optimize(self, objective, n_trials, callbacks=None):
+            def optimize(self, objective, n_trials, callbacks=None, catch=None):
                 class _Trial:
+                    number = 0
+                    state = optuna.trial.TrialState.COMPLETE
+                    params = {"fast_length": 2}
+                    value = None
+
+                    def __init__(self):
+                        self.user_attrs: dict = {}
+
                     def suggest_int(self, name, low, high, step=1):
                         return low
 
@@ -162,10 +171,15 @@ class TestNoTradeTrialsCannotWin:
                         return choices[0]
 
                     def set_user_attr(self, key, value):
-                        setattr(self, key, value)
+                        self.user_attrs[key] = value
 
                 trial = _Trial()
                 captured["no_trade_value"] = float(objective(trial))
+                trial.value = captured["no_trade_value"]
+                # Record the trial as COMPLETE (the real study would) so the
+                # post-optimize completed-trials gate passes and the
+                # no-trade exclusion in _best_trial_or_raise is what fires.
+                self.trials.append(trial)
 
             @property
             def best_trial(self):
@@ -313,3 +327,118 @@ class TestBestTrialExcludesNoTrade:
         )
         best = optimizer_module._best_trial_or_raise(study)
         assert best.value == pytest.approx(0.5)
+
+
+# ─── #82: per-metric study direction (p_value minimizes) ─────────────────────
+
+
+class TestMetricDirection:
+    """The study direction must match metric semantics (#82).
+
+    ``p_value`` is a significance p-value: smaller = more significant.
+    Maximizing it selected the most INSIGNIFICANT trials; the frontend
+    already treats it as lower-is-favorable.
+    """
+
+    def test_study_direction_matches_metric_semantics(self):
+        assert optimizer_module._study_direction("p_value") == "minimize"
+        assert optimizer_module._study_direction("sharpe_ratio") == "maximize"
+        assert optimizer_module._study_direction("sharpe") == "maximize"
+        assert optimizer_module._study_direction("total_pnl") == "maximize"
+        assert optimizer_module._study_direction("net_profit") == "maximize"
+
+    def test_unknown_metric_fails_loudly(self):
+        with pytest.raises(ValueError, match="Unknown target metric"):
+            optimizer_module._study_direction("not_a_metric")
+
+    def test_run_optimization_creates_minimize_study_for_p_value(self, monkeypatch, tmp_path):
+        """The created study's direction must follow the metric (#82)."""
+        captured: dict[str, str] = {}
+
+        real_create_study = optimizer_module.optuna.create_study
+
+        def spy_create_study(**kwargs):
+            captured["direction"] = kwargs.get("direction", "")
+            return real_create_study(**kwargs)
+
+        monkeypatch.setattr(optimizer_module.optuna, "create_study", spy_create_study)
+        monkeypatch.setattr(
+            optimizer_module, "_run_vectorbt_backtest", lambda *a, **k: _empty_vectorbt_result(a[0])
+        )
+        monkeypatch.setattr(optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path))
+        monkeypatch.setattr(
+            optimizer_module,
+            "_asset_returns_frame_from_base_result",
+            lambda result: pd.DataFrame(),
+        )
+        monkeypatch.setattr(
+            optimizer_module,
+            "_asset_returns_frame_from_market_data",
+            lambda **kwargs: pd.DataFrame({"GOLD1": [0.01], "GOLD2": [0.02]}),
+        )
+        monkeypatch.setattr(
+            optimizer_module,
+            "_split_backtest_period",
+            lambda s, e, pct: (
+                {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
+                {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
+            ),
+        )
+        monkeypatch.setattr(
+            optimizer_module, "_resolve_strategy_reference", lambda r: ("s", Path("mock_strategy.py"), "s")
+        )
+        monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
+        monkeypatch.setattr(optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True)
+
+        config = OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="p_value",
+            n_trials=1,
+            parameter_ranges={"fast_length": {"type": "int", "min": 2, "max": 10}},
+        )
+        with pytest.raises(RuntimeError):
+            run_optimization(config, progress_callback=None)
+
+        assert captured["direction"] == "minimize"
+
+    def test_minimize_direction_selects_lowest_trading_trial(self):
+        """A minimize-study's best trading trial is the MINIMUM (#82)."""
+        study = self._minimize_study_with_trials([(0.5, False), (0.01, False), (0.2, True)])
+        best = optimizer_module._best_trial_or_raise(study, direction="minimize")
+        assert best.value == pytest.approx(0.01)
+
+    @staticmethod
+    def _minimize_study_with_trials(completed_values_and_penalties):
+        import optuna
+
+        study = optuna.create_study(direction="minimize")
+        for value, penalized in completed_values_and_penalties:
+            trial = study.ask()
+            trial.suggest_float("x", 0.0, 1.0)
+            if penalized:
+                trial.set_user_attr("penalty_applied", True)
+            study.tell(trial, value)
+        return study
+
+    def test_no_trade_penalty_is_a_ceiling_for_minimize(self):
+        """For minimize-metrics the no-trade penalty must sit ABOVE every
+        plausible value (p-values live in [0, 1]), not below."""
+        penalty = optimizer_module._no_trade_penalty_value([0.4, 0.6], direction="minimize")
+        assert penalty == pytest.approx(1.6)
+        assert optimizer_module._no_trade_penalty_value([], direction="minimize") == pytest.approx(
+            optimizer_module._NO_TRADE_PENALTY_MAXIMIZE_METRICS
+        )
+
+    def test_top_trials_rank_lowest_first_for_minimize(self):
+        """The top-trials payload lists a minimize-study's BEST (lowest) first."""
+        import optuna
+
+        study = optuna.create_study(direction="minimize")
+        for value in (0.5, 0.01, 0.2):
+            trial = study.ask()
+            trial.suggest_float("x", 0.0, 1.0)
+            study.tell(trial, value)
+        payload = optimizer_module._top_trials_payload(study.trials, limit=10, direction="minimize")
+        values = [trial["value"] for trial in payload]
+        assert values == sorted(values)
+        assert values[0] == pytest.approx(0.01)

@@ -180,7 +180,10 @@ class TestMissingTrade:
 
 
 class TestExtraTrade:
-    def test_extra_trade_is_info(self) -> None:
+    def test_extra_trade_fails_by_default(self) -> None:
+        """#85: a phantom actual trade (no expected counterpart) must FAIL the
+        comparison — the old `passed=True/info` certified agreement that was
+        never checked."""
         t1 = _make_trade(trade_id=1, entry_price=100.0, stop_loss=90.0)
         ref1 = _make_reference([])
         ref2 = _make_reference([t1])
@@ -188,15 +191,42 @@ class TestExtraTrade:
         comparator = RiskComparator(config)
         report = comparator.compare(ref1, ref2)
 
-        assert report.passed is True
+        assert report.passed is False
         assert len(report.trade_results) == 1
         result = report.trade_results[0]
-        assert result.severity == "info"
-        assert result.passed is True
+        assert result.severity == "error"
+        assert result.passed is False
         assert result.expected_trade is None
         assert result.actual_trade is not None
         assert result.expected_risk_profile is None
         assert result.actual_risk_profile is not None
+
+    def test_extra_trade_passes_only_with_explicit_threshold(self) -> None:
+        """#85: a strict count threshold is explicit opt-in (mirrors
+        ReadinessConfig.max_extra_trades, default 0)."""
+        t1 = _make_trade(trade_id=1, entry_price=100.0, stop_loss=90.0)
+        ref1 = _make_reference([])
+        ref2 = _make_reference([t1])
+        config = _make_config(max_extra_trades=1)
+        comparator = RiskComparator(config)
+        report = comparator.compare(ref1, ref2)
+
+        assert report.passed is True
+        result = report.trade_results[0]
+        assert result.severity == "info"
+        assert result.passed is True
+
+    def test_extra_trades_above_threshold_fail(self) -> None:
+        t1 = _make_trade(trade_id=1, entry_price=100.0, stop_loss=90.0)
+        t2 = _make_trade(trade_id=2, entry_price=100.0, stop_loss=90.0)
+        ref1 = _make_reference([])
+        ref2 = _make_reference([t1, t2])
+        config = _make_config(max_extra_trades=1)
+        comparator = RiskComparator(config)
+        report = comparator.compare(ref1, ref2)
+
+        assert report.passed is False
+        assert all(result.passed is False for result in report.trade_results)
 
 
 class TestReportSummary:
@@ -222,10 +252,12 @@ class TestReportSummary:
 
         summary = report.summary
         assert summary["total_trades"] == 3
-        assert summary["passed"] == 2
-        assert summary["failed"] == 1
-        assert summary["severity_counts"]["info"] == 2
+        # t3 (the extra/phantom trade) fails by default since #85.
+        assert summary["passed"] == 1
+        assert summary["failed"] == 2
+        assert summary["severity_counts"]["info"] == 1
         assert summary["severity_counts"]["warning"] == 1
+        assert summary["severity_counts"]["error"] == 1
         assert report.passed is False
 
 
@@ -277,7 +309,8 @@ class TestRiskReportBuilderDelta:
         assert delta.missing_trades[0].severity == "warning"
         assert len(delta.extra_trades) == 1
         assert delta.extra_trades[0].anomaly_type == "extra"
-        assert delta.extra_trades[0].severity == "info"
+        # #85: phantom trades are errors, not informational.
+        assert delta.extra_trades[0].severity == "error"
         assert len(delta.matched_trades) == 0
 
     def test_perfect_match_delta(self) -> None:

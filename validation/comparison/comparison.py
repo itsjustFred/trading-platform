@@ -6,6 +6,7 @@ tolerances for prices, times, volumes, PnL, stop-loss and take-profit levels.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -152,16 +153,20 @@ class TradeComparator:
             ref.pnl, act.pnl, self.config.pnl_pct, self.config.pnl_abs
         )
 
-        # stop_loss
-        sl_ref = ref.meta.get("stop_loss") if ref.meta else None
-        sl_act = act.meta.get("stop_loss") if act.meta else None
+        # stop_loss / take_profit (#85): resolve from Position-level fields
+        # first, with meta.* only as fallback. Native trades carry their stops
+        # in Position.* (the engine path), so a meta-only read saw None on BOTH
+        # sides and certified "both None (match)" without ever comparing a stop.
+        # None vs a real stop is a mismatch, never a match.
+        sl_ref = self._resolve_stop_level(ref, "stop_loss", ("stop_loss", "sl_price", "stop_price"))
+        sl_act = self._resolve_stop_level(act, "stop_loss", ("stop_loss", "sl_price", "stop_price"))
         field_results["stop_loss"] = self._compare_optional_pct(
             sl_ref, sl_act, self.config.sl_price_pct, "stop_loss"
         )
 
         # take_profit
-        tp_ref = ref.meta.get("take_profit") if ref.meta else None
-        tp_act = act.meta.get("take_profit") if act.meta else None
+        tp_ref = self._resolve_stop_level(ref, "take_profit", ("take_profit", "tp_price"))
+        tp_act = self._resolve_stop_level(act, "take_profit", ("take_profit", "tp_price"))
         field_results["take_profit"] = self._compare_optional_pct(
             tp_ref, tp_act, self.config.tp_price_pct, "take_profit"
         )
@@ -217,6 +222,37 @@ class TradeComparator:
             message=f"{field_name} relative difference is {diff:.6f} (tolerance {tolerance:.6f})"
             + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
+
+    def _resolve_stop_level(self, trade: Trade, attr: str, keys: tuple[str, ...]) -> float | None:
+        """Resolve a stop level (SL or TP) from a trade (#85).
+
+        Precedence: Position-level attribute *attr* (``stop_loss`` or
+        ``take_profit``) first — the native engine carries its stops there —
+        then the meta keys in *keys* order. Returns ``None`` only when no
+        source carries a finite value; a missing level is a mismatch against
+        a present one, never a "both None (match)".
+        """
+        value = getattr(trade, attr, None)
+        if value is not None:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(numeric):
+                    return numeric
+        if trade.meta:
+            for key in keys:
+                value = trade.meta.get(key)
+                if value is None:
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric):
+                    return numeric
+        return None
 
     def _compare_optional_pct(
         self,

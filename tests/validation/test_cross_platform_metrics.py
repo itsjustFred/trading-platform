@@ -39,7 +39,11 @@ def test_cross_platform_matrix_includes_reference_metrics():
     assert rows["intraday_volatility_breakout_nas100_m15"]["platform_path"].endswith(
         "data/backtests/intraday_volatility_breakout_nas100_m15.json"
     )
-    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.544687
+    # The reference was regenerated with the LEAN-convention stats
+    # (A-H3/A-L3/A-L4: calendar-day returns, risk-free-rate subtraction —
+    # see the raw_metadata note in risk_parity_reference.json); this pins
+    # the regenerated value, not the pre-A-M6 0.544687.
+    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.213296
     assert rows["risk_parity_quantconnect"]["platform_path"].endswith(
         "data/backtests/risk_parity_quantconnect_reimplementation.json"
     )
@@ -128,7 +132,9 @@ def test_cross_platform_matrix_loads_mt5_reference_timestamps_in_report_timezone
     assert first_reference_entry == first_platform_entry == "2018-01-16T14:45:00Z"
 
 
-def test_cross_platform_matrix_uses_qc_rebalance_attribution_stats(tmp_path):
+def test_cross_platform_matrix_always_recomputes_canonical_stats(tmp_path):
+    """#84: the audit matrix recomputes canonical stats — stored/curated
+    numbers (and qc-parity attribution overrides) never win."""
     result = BacktestResult(
         meta=BacktestMeta(
             id="risk_parity_quantconnect_reimplementation",
@@ -160,13 +166,14 @@ def test_cross_platform_matrix_uses_qc_rebalance_attribution_stats(tmp_path):
 
     rows = {row["case_id"]: row for row in matrix["rows"]}
     platform = rows["risk_parity_quantconnect"]["platform"]
-    assert platform["win_rate"] == pytest.approx(0.75)
-    assert platform["net_profit"] == pytest.approx(123.45)
-    assert platform["cagr"] == pytest.approx(0.2)
-    assert platform["sharpe_ratio"] == pytest.approx(0.3)
+    # Empty trades/equity recompute to canonical zeros — neither the stored
+    # 0.1/999.0 nor the attribution 0.75/123.45 survive.
+    assert platform["win_rate"] == pytest.approx(0.0)
+    assert platform["net_profit"] == pytest.approx(0.0)
 
 
 def test_cross_platform_matrix_ignores_malformed_qc_attribution_stats(tmp_path):
+    """#84: malformed attribution stats are irrelevant — canonical wins."""
     result = BacktestResult(
         meta=BacktestMeta(
             id="risk_parity_quantconnect_reimplementation",
@@ -198,8 +205,8 @@ def test_cross_platform_matrix_ignores_malformed_qc_attribution_stats(tmp_path):
 
     rows = {row["case_id"]: row for row in matrix["rows"]}
     platform = rows["risk_parity_quantconnect"]["platform"]
-    assert platform["win_rate"] == pytest.approx(0.1)
-    assert platform["net_profit"] == pytest.approx(999.0)
+    assert platform["win_rate"] == pytest.approx(0.0)
+    assert platform["net_profit"] == pytest.approx(0.0)
 
 
 def test_regenerator_outputs_match_cross_platform_matrix_paths():

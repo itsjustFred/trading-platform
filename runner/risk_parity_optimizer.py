@@ -136,7 +136,10 @@ def score_risk_parity_universe(
     portfolio_returns = returns @ weights_array
     mean_return = float(np.mean(portfolio_returns)) if len(portfolio_returns) else 0.0
     volatility = float(np.std(portfolio_returns) + 1e-12)
-    sharpe = float(mean_return / volatility) if volatility > 0 else 0.0
+    # #87: annualized Sharpe on the daily convention (sqrt(252)), consistent
+    # with runner/stats.py and runner/portfolio_optimizer.py — the previous
+    # raw mean/std was not comparable under the same "sharpe" name.
+    sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
 
     asset_vols = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     weighted_asset_vol = float(weights_array @ asset_vols)
@@ -150,6 +153,11 @@ def score_risk_parity_universe(
         avg_abs_corr = 0.0
     rc = risk_contributions(weights_array, cov)
     rc_error = float(np.sum((rc - (1.0 / len(symbols))) ** 2))
+    # #87: heuristic universe-score weights (documented, not normalized):
+    # 0.35 rewards diversification (ratio is ~1-2 scale), 0.5 penalizes
+    # average absolute correlation (0-1 scale), 2.0 penalizes squared
+    # risk-budget deviation (small scale, needs the larger multiplier to
+    # bind). Tune explicitly if the selection over/under-weights one axis.
     score = sharpe + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
     weights = {symbol: float(weight) for symbol, weight in zip(symbols, weights_array)}
     risk = {symbol: float(value) for symbol, value in zip(symbols, rc)}

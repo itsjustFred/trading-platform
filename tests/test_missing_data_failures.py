@@ -26,7 +26,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(
+    return BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="sma_demo",
         symbols=symbols,
         timeframe="1d",

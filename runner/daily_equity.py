@@ -132,9 +132,12 @@ def build_daily_equity_curve(result: BacktestResult) -> tuple[list[EquityPoint],
     initial_capital = result.meta.initial_capital
     equity_by_day: dict[str, float] = defaultdict(float)
 
-    # Aggregate PnL per day from trades
+    # Aggregate NET PnL per day from trades (#84: gross flatters the curve).
     for trade in result.trades:
-        pnl = trade.pnl or 0.0
+        if trade.net_pnl is not None:
+            pnl = float(trade.net_pnl)
+        else:
+            pnl = float(trade.pnl or 0.0) - float(trade.fees or 0.0)
         # Skip non-finite PnL values (nan, inf, -inf)
         if not math.isfinite(pnl):
             continue

@@ -32,7 +32,7 @@ EXPECTED_NET_PROFIT = 4491.05
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(
+    config = BacktestConfig(parameters={"fees": "zero"}, 
         strategy_name="pine_superosc_vumanchu",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

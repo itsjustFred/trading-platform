@@ -13,6 +13,7 @@ PyneCore branch was test-blind) plus the P2 fixes:
 """
 
 from __future__ import annotations
+from tests.helpers import with_zero_fees
 
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,7 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "data_dir": str(tmp_path),
     }
     payload.update(overrides)
-    return BacktestConfig(**payload)
+    return BacktestConfig(**with_zero_fees(payload))
 
 
 def _frame() -> pd.DataFrame:

@@ -10,8 +10,10 @@ import pandas as pd
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
+from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
+from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -131,6 +133,13 @@ class _OpenPosition:
     mfe: float = 0.0
 
 
+def _net_pnl_of(trade: Trade) -> float:
+    """Net realized PnL of a closed trade (#84: never silently gross)."""
+    if trade.net_pnl is not None:
+        return float(trade.net_pnl)
+    return float(trade.pnl) - float(trade.fees or 0.0)
+
+
 class SignalReplayAdapter:
     def __init__(
         self,
@@ -140,11 +149,17 @@ class SignalReplayAdapter:
         default_timeframe: str = "1h",
         signal_processor_name: str | None = None,
         signal_processor_config: dict[str, Any] | None = None,
+        fee_model: Any | None = None,
+        fee_params: dict[str, Any] | None = None,
     ) -> None:
         self.risk_config = risk_config or RiskConfig()
         self.risk_engine = RiskEngine(self.risk_config)
         self.initial_capital = float(initial_capital)
         self.default_timeframe = normalize_timeframe(default_timeframe) or default_timeframe
+        # #84: explicit fee model (no silent gross); resolved at run() so
+        # per-run metadata can also declare costs.
+        self._fee_model = fee_model
+        self._fee_params = dict(fee_params or {})
         self.signal_processor_name = str(signal_processor_name or "").strip().lower()
         self.signal_processor = (
             get_signal_processor(self.signal_processor_name, signal_processor_config)
@@ -292,6 +307,21 @@ class SignalReplayAdapter:
         if position.source:
             tags.append(str(position.source))
 
+        # #84: price the fill through the active fee model (set in run();
+        # direct _close_position callers in tests must set _active_fee_model).
+        fee_model = getattr(self, "_active_fee_model", None)
+        if fee_model is None:
+            fee_model = resolve_fee_model(dict(self._fee_params))
+            self._active_fee_model = fee_model
+        fees = round(
+            float(
+                fee_model.fee_for_trade(
+                    float(position.entry_price), float(exit_price), float(position.quantity)
+                )
+            ),
+            2,
+        )
+
         return Trade(
             id=0,
             symbol=position.symbol,
@@ -316,8 +346,8 @@ class SignalReplayAdapter:
             ),
             exit_reason=exit_reason,
             pnl_pct=float(pnl_pct),
-            fees=0.0,
-            net_pnl=float(pnl),
+            fees=fees,
+            net_pnl=round(float(pnl) - fees, 2),
             r_multiple=float(r_multiple) if r_multiple is not None else None,
             mae=float(position.mae),
             mfe=float(position.mfe),
@@ -474,6 +504,14 @@ class SignalReplayAdapter:
             progress_callback(round(bounded, 2), message)
 
         emit(5.0, "Preparing replay inputs...")
+        # #84: missing fee/slippage config is a hard error, never silent gross.
+        fee_model = self._fee_model
+        if fee_model is None:
+            merged_fee_params = dict(self._fee_params)
+            if metadata and isinstance(metadata.get("fee_params"), dict):
+                merged_fee_params.update(metadata["fee_params"])
+            fee_model = resolve_fee_model(merged_fee_params)
+        self._active_fee_model = fee_model
         normalized_timeframe = normalize_timeframe(timeframe) or self.default_timeframe
         frames = self._prepare_replay_frames(ohlcv_by_symbol)
         if not frames:
@@ -511,7 +549,7 @@ class SignalReplayAdapter:
                 )
                 if protected_exit is not None:
                     closed_trades.append(protected_exit)
-                    realized_pnl += float(protected_exit.pnl)
+                    realized_pnl += _net_pnl_of(protected_exit)
                     settled_symbols.append(symbol)
             for symbol in settled_symbols:
                 open_positions.pop(symbol, None)
@@ -525,7 +563,7 @@ class SignalReplayAdapter:
                 )
                 if protected_exit is not None:
                     closed_trades.append(protected_exit)
-                    realized_pnl += float(protected_exit.pnl)
+                    realized_pnl += _net_pnl_of(protected_exit)
                     open_positions.pop(signal.symbol, None)
                     current_position = None
 
@@ -551,7 +589,7 @@ class SignalReplayAdapter:
                     exit_bar_index=int(fill_index),
                 )
                 closed_trades.append(flip_trade)
-                realized_pnl += float(flip_trade.pnl)
+                realized_pnl += _net_pnl_of(flip_trade)
                 open_positions.pop(signal.symbol, None)
                 current_position = None
                 if exit_only:
@@ -603,8 +641,10 @@ class SignalReplayAdapter:
                 take_profit=risk_signal.take_profit,
                 initial_stop_loss=risk_signal.stop_loss,
                 initial_take_profit=risk_signal.take_profit,
-                risk_amount=float(sized.risk_amount),
-                risk_percent=float(sized.risk_percent),
+                # #84: store the realized stop-loss amount, not the policy
+                # figure (they differ on notional-cap).
+                risk_amount=float(realized_risk_amount(sized)),
+                risk_percent=float(realized_risk_percent(sized, account_balance)),
                 timeframe=risk_signal.timeframe,
                 source=effective_signal.source,
                 signal_time=effective_signal.timestamp,
@@ -624,7 +664,7 @@ class SignalReplayAdapter:
             )
             if protected_exit is not None:
                 closed_trades.append(protected_exit)
-                realized_pnl += float(protected_exit.pnl)
+                realized_pnl += _net_pnl_of(protected_exit)
                 continue
             last_index = len(frame) - 1
             last_bar = frame.iloc[last_index]
@@ -637,7 +677,7 @@ class SignalReplayAdapter:
                 exit_bar_index=last_index,
             )
             closed_trades.append(closed)
-            realized_pnl += float(closed.pnl)
+            realized_pnl += _net_pnl_of(closed)
 
         closed_trades.sort(
             key=lambda trade: (trade.last_exit_time, trade.entry_time, trade.symbol),
@@ -648,7 +688,8 @@ class SignalReplayAdapter:
         running_equity = float(self.initial_capital)
         equity_curve: list[EquityPoint] = []
         for trade in closed_trades:
-            running_equity += float(trade.pnl)
+            # #84: the equity path accumulates NET pnl.
+            running_equity += _net_pnl_of(trade)
             equity_curve.append(
                 EquityPoint(time=trade.last_exit_time, equity=round(running_equity, 2))
             )
@@ -774,8 +815,9 @@ class SignalReplayAdapter:
             take_profit=risk_signal.take_profit,
             initial_stop_loss=risk_signal.stop_loss,
             initial_take_profit=risk_signal.take_profit,
-            risk_amount=float(sized.risk_amount),
-            risk_percent=float(sized.risk_percent),
+            # #84: store the realized stop-loss amount, not the policy figure.
+            risk_amount=float(realized_risk_amount(sized)),
+            risk_percent=float(realized_risk_percent(sized, account_balance)),
             timeframe=risk_signal.timeframe,
             source=effective_signal.source,
             signal_time=effective_signal.timestamp,
@@ -807,11 +849,16 @@ class SignalReplayEngine:
         risk_config: RiskConfig | None = None,
         default_timeframe: str = "1h",
         signal_processor_name: str | None = None,
+        fee_model: Any | None = None,
+        fee_params: dict[str, Any] | None = None,
     ) -> None:
         self.data_dir = Path(data_dir or DATA_DIR).expanduser().resolve()
         self.risk_config = risk_config or RiskConfig()
         self.default_timeframe = normalize_timeframe(default_timeframe) or "1h"
         self.signal_processor_name = str(signal_processor_name or "").strip().lower()
+        # #84: explicit fee declaration, forwarded to the inner adapter.
+        self._fee_model = fee_model
+        self._fee_params = dict(fee_params or {})
 
     @staticmethod
     def _infer_replay_timeframe(
@@ -916,6 +963,8 @@ class SignalReplayEngine:
         timeframe: str | None = None,
         auto_download: bool = True,
         progress_callback: ProgressCallback | None = None,
+        fee_model: Any | None = None,
+        fee_params: dict[str, Any] | None = None,
     ) -> BacktestResult:
         if not signals:
             raise ValueError("signals must not be empty")
@@ -964,11 +1013,16 @@ class SignalReplayEngine:
             ohlcv_by_symbol[symbol] = frame
 
         processor_name = str(signal_processor or self.signal_processor_name or "").strip().lower()
+        merged_fee_params = dict(self._fee_params)
+        if fee_params:
+            merged_fee_params.update(fee_params)
         adapter = SignalReplayAdapter(
             risk_config=self.risk_config,
             initial_capital=float(initial_capital),
             default_timeframe=resolved_timeframe,
             signal_processor_name=processor_name or None,
+            fee_model=fee_model if fee_model is not None else self._fee_model,
+            fee_params=merged_fee_params,
         )
         result = adapter.run(
             signals=replay_signals,

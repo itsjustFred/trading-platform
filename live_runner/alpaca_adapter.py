@@ -14,7 +14,7 @@ from uuid import UUID
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE, BaseLiveAdapter
 from live_runner.credential_env import parse_bool_env
 from risk.live import size_live_signal
 from shared.database import (
@@ -290,6 +290,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self.account_id = account_id
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
+        # #78: subscribe exactly once per stream instance. Re-subscribing
+        # the same (or a reconnected) stream duplicates callbacks. The
+        # subscribed stream object itself is tracked (not its id(): CPython
+        # reuses addresses after GC, so a stale id could skip subscribing a
+        # NEW stream — a silent mute after disconnect/reconnect).
+        self._subscribed_stream: Any | None = None
         self._connected = False
 
         if not self.api_key or not self.secret_key:
@@ -426,6 +432,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def disconnect(self) -> None:
         stream = self._trading_stream
         self._trading_stream = None
+        self._subscribed_stream = None
         self._trading_client = None
         self._connected = False
         if stream is None:
@@ -516,7 +523,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         metadata = signal.metadata or {}
         stop_loss = _resolve_optional_float(metadata, _SL_METADATA_KEYS)
         take_profit = _resolve_optional_float(metadata, _TP_METADATA_KEYS)
-        exit_only = str(metadata.get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+        )
         missing = [
             name
             for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit))
@@ -558,7 +567,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             side = order_side.BUY
         else:
             side = order_side.SELL
-        exit_only = str((signal.metadata or {}).get("risk_sizing_mode") or "") == "exit_only"
+        exit_only = (
+            str((signal.metadata or {}).get("risk_sizing_mode") or "")
+            == EXIT_ONLY_RISK_SIZING_MODE
+        )
         if extended_hours and not exit_only:
             # The broker rejects bracket orders with extended_hours enabled
             # ("bracket order has non-zero extended_hours value", HTTP 422), and
@@ -844,7 +856,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     self._trading_stream = TradingStream(
                         self.api_key, self.secret_key, paper=self.paper
                     )
-                self._trading_stream.subscribe_trade_updates(self._on_trade_update)
+                # #78: subscribe exactly once per stream instance —
+                # re-subscribing on every reconnect fires duplicate fill
+                # callbacks (double-counted PnL/exposure).
+                if self._subscribed_stream is not self._trading_stream:
+                    self._trading_stream.subscribe_trade_updates(self._on_trade_update)
+                    self._subscribed_stream = self._trading_stream
+                # NOTE: TradingStream.run is blocking sync; it occupies one
+                # executor thread for the stream lifetime (no asyncio-native
+                # alternative in alpaca-py). The thread is released when run
+                # returns/raises; on error the stream is stopped below before
+                # discard so a healthy stream never leaks a thread per retry.
                 await asyncio.to_thread(self._trading_stream.run)
             except asyncio.CancelledError:
                 raise
@@ -859,8 +881,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         }
                     },
                 )
+                stream = self._trading_stream
                 self._trading_stream = None
+                if self._subscribed_stream is stream:
+                    self._subscribed_stream = None
+                if stream is not None:
+                    stop_ws = getattr(stream, "stop_ws", None)
+                    stop = getattr(stream, "stop", None)
+                    try:
+                        if callable(stop_ws):
+                            result = stop_ws()
+                            if inspect.isawaitable(result):
+                                await result
+                        elif callable(stop):
+                            result = stop()
+                            if inspect.isawaitable(result):
+                                await result
+                    except Exception:
+                        pass
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)
             else:
+                # #78: a clean run() return must not spin — back off before
+                # re-subscribing (reconnect storm) and reset the backoff.
+                await asyncio.sleep(backoff_seconds)
                 backoff_seconds = 2

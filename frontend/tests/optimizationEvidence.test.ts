@@ -83,3 +83,34 @@ test("finite target-metric OOS evidence is available without a universal negativ
     "available",
   );
 });
+
+test("#87: Sharpe 2.0 -> 0.01 is decayed, not green", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  const evidence = classifyOptimizationOosEvidence("sharpe", 2.0, { sharpe_ratio: 0.01 });
+
+  assert.equal(evidence.state, "decayed");
+  assert.match(evidence.message, /less than 50%/i);
+});
+
+test("#87: mild OOS dip stays available", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  assert.equal(
+    classifyOptimizationOosEvidence("sharpe", 2.0, { sharpe_ratio: 1.5 }).state,
+    "available",
+  );
+});
+
+test("#87: p_value losing significance is degraded, doubling is decayed", async () => {
+  const { classifyOptimizationOosEvidence } = await import("../src/lib/optimizationEvidence.ts");
+
+  assert.equal(
+    classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 0.5 }).state,
+    "degraded",
+  );
+  assert.equal(
+    classifyOptimizationOosEvidence("p_value", 0.01, { p_value: 0.03 }).state,
+    "decayed",
+  );
+});

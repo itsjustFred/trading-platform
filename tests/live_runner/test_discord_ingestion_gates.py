@@ -979,3 +979,120 @@ def test_transient_reconnect_failure_is_retried_on_next_sync(monkeypatch) -> Non
     daemon._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(str(service.id), None)
     asyncio.run(_reconnect())
     assert len(attempts) == 2
+
+
+# ── #81: auth scheme, env expansion, env allowlist ────────────────────────────
+
+class TestIssue81AuthScheme:
+    def test_raw_scheme_sends_token_as_is(self) -> None:
+        source = _source(token="user-token-abc", auth_scheme="raw")
+        assert source._auth_header() == "user-token-abc"
+
+    def test_default_scheme_is_raw(self) -> None:
+        source = _source(token="user-token-abc")
+        assert source.auth_scheme == "raw"
+        assert source._auth_header() == "user-token-abc"
+
+    def test_bot_scheme_prefixes_bot(self) -> None:
+        source = _source(token="bot-token-abc", auth_scheme="bot")
+        assert source._auth_header() == "Bot bot-token-abc"
+
+    def test_bot_scheme_does_not_double_prefix(self) -> None:
+        source = _source(token="Bot bot-token-abc", auth_scheme="bot")
+        assert source._auth_header() == "Bot bot-token-abc"
+
+    def test_unknown_scheme_raises(self) -> None:
+        with pytest.raises(ValueError, match="discord_auth_scheme"):
+            _source(auth_scheme="bearer")
+
+
+class TestIssue81ConfigExpansion:
+    def test_channel_id_env_expansion_at_parse_time(self, tmp_path) -> None:
+        from live_runner.config_parser import parse_live_deployments_config
+
+        config = tmp_path / "live.yaml"
+        config.write_text(
+            "accounts:\n"
+            "  - id: acc-1\n"
+            "    broker: alpaca\n"
+            "deployments:\n"
+            "  - strategy_name: s\n"
+            "    account_id: acc-1\n"
+            "    symbols: [AAPL]\n"
+            "    timeframe: 1h\n"
+            "    signal_config:\n"
+            "      source: discord\n"
+            "      channel_id: '${TEST_DISCORD_CHANNEL_XYZ}'\n",
+            encoding="utf-8",
+        )
+        _, deployments = parse_live_deployments_config(
+            config, env_values={"TEST_DISCORD_CHANNEL_XYZ": "12345"}
+        )
+        assert deployments[0].signal_config["channel_id"] == "12345"
+
+    def test_unexpanded_channel_id_is_startup_error(self, tmp_path) -> None:
+        import os
+
+        from live_runner.config_parser import parse_live_deployments_config
+
+        os.environ.pop("TEST_DISCORD_CHANNEL_MISSING_XYZ", None)
+        config = tmp_path / "live.yaml"
+        config.write_text(
+            "accounts:\n"
+            "  - id: acc-1\n"
+            "    broker: alpaca\n"
+            "deployments:\n"
+            "  - strategy_name: s\n"
+            "    account_id: acc-1\n"
+            "    symbols: [AAPL]\n"
+            "    timeframe: 1h\n"
+            "    signal_config:\n"
+            "      source: discord\n"
+            "      channel_id: '${TEST_DISCORD_CHANNEL_MISSING_XYZ}'\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Unexpanded environment"):
+            parse_live_deployments_config(config, env_values={})
+
+
+class TestIssue81EnvAllowlist:
+    def test_per_service_env_allowlist(self) -> None:
+        from live_runner.daemon import _deployment_trusted_author_ids
+        from types import SimpleNamespace as NS
+
+        deployment = NS(
+            signal_config={"source": "discord"},
+            settings={},
+            signal_source_id="nitro",
+        )
+        resolved = _deployment_trusted_author_ids(
+            deployment,
+            accounts_env_values={"DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "Bot-1, bot-2"},
+        )
+        assert resolved == {"bot-1", "bot-2"}
+
+    def test_global_env_allowlist_fallback(self) -> None:
+        from live_runner.daemon import _deployment_trusted_author_ids
+        from types import SimpleNamespace as NS
+
+        deployment = NS(signal_config={}, settings={}, signal_source_id="nitro")
+        resolved = _deployment_trusted_author_ids(
+            deployment,
+            accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "bot-9"},
+        )
+        assert resolved == {"bot-9"}
+
+    def test_config_allowlist_wins_over_env(self) -> None:
+        from live_runner.daemon import _deployment_trusted_author_ids
+        from types import SimpleNamespace as NS
+
+        deployment = NS(
+            signal_config={"trusted_author_ids": ["cfg-1"]},
+            settings={},
+            signal_source_id="nitro",
+        )
+        resolved = _deployment_trusted_author_ids(
+            deployment,
+            accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "env-1"},
+        )
+        assert resolved == {"cfg-1"}
