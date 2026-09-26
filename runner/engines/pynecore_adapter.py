@@ -12,6 +12,11 @@ import ast
 import csv
 import inspect
 import logging
+
+# Merge resolution: main's `import math` (7 call sites added by its fill-parity
+# and validation work) is kept. The merge base's `import os` had no remaining
+# user on either side — the branch deleted it, main replaced it — so it stays
+# deleted rather than being resurrected as an unused import.
 import math
 import shutil
 import subprocess
@@ -263,6 +268,7 @@ class PyneCoreAdapter(EngineAdapter):
         # Fail before any per-symbol work when the CLI is absent.
         _resolve_pyne_bin()
         all_trades: list[Trade] = []
+        all_data_paths: list[str] = []
         all_stats: dict[str, Any] = {}
         all_drawings: list[dict[str, Any]] = []
         asset_classes: dict[str, str] = {}
@@ -278,7 +284,12 @@ class PyneCoreAdapter(EngineAdapter):
             # after parsing.
             load_start = _effective_load_start(config)
             df = _load_ohlcv(
-                data_root, symbol, config.timeframe, load_start, config.end_date
+                data_root,
+                symbol,
+                config.timeframe,
+                load_start,
+                config.end_date,
+                data_source=config.data_source,
             )
             if df is None or df.empty:
                 # Same rule as the native/vectorbt adapters (F24): a symbol with
@@ -289,6 +300,9 @@ class PyneCoreAdapter(EngineAdapter):
                     "refusing to run a silent empty PyneCore backtest"
                 )
 
+            source_path = str(df.attrs.get("ohlcv_source_path") or "")
+            if source_path:
+                all_data_paths.append(source_path)
             total_bars += len(df)
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
@@ -297,6 +311,12 @@ class PyneCoreAdapter(EngineAdapter):
                 Path(config.data_dir) if config.data_dir else DATA_DIR,
                 symbol,
                 config.timeframe,
+                # Merge resolution: the branch resolved the asset class against
+                # the REQUESTED feed. Without this the inference would rank
+                # every candidate for the symbol and could classify a run that
+                # explicitly asked for one source by another source's asset
+                # class, which then feeds the sizing cap.
+                data_source=config.data_source,
             )
             asset_classes[str(symbol).upper()] = asset_class
             trade_counter += len(trades)
@@ -328,6 +348,16 @@ class PyneCoreAdapter(EngineAdapter):
             stats=all_stats,
             drawings=all_drawings,
         )
+        path_metadata = [contract.ohlcv_path_metadata(path) for path in all_data_paths]
+        result.meta.data = result.meta.data or {}
+        result.meta.data["source"] = ",".join(
+            sorted({item["source"] for item in path_metadata if item["source"]})
+        ) or "ohlcv"
+        result.meta.data["asset_classes"] = sorted(
+            {item["asset_class"] for item in path_metadata if item["asset_class"]}
+        )
+        result.meta.data["data_files"] = all_data_paths
+        result.meta.data["requested_data_source"] = config.data_source
         # Conformance (Cleanup 16-A): every engine exposes the canonical
         # BacktestStats key set; the engine-specific strategy stats are merged
         # on top of the derived ones. Contract §6: engine keys may add, never
@@ -349,6 +379,23 @@ class PyneCoreAdapter(EngineAdapter):
         """Run the pyne CLI for one symbol and parse its trade/stats output."""
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         trade_context = _build_trade_context(context_builder, df, resolved_parameters)
+        # Merge resolution: the branch inferred the asset class HERE and sized
+        # this symbol's trades in isolation, via a per-symbol
+        # `_apply_risk_sizing(trades, config, asset_class)` call. main instead
+        # runs ONE chronological sizing pass over the merged trade list after
+        # the symbol loop, fed a per-symbol `asset_class_by_symbol` map (and the
+        # resolved fee model). That is the architecture the cross-engine
+        # contract documents for PyneCore ("entries are processed in timestamp
+        # order against one realized-equity ledger, and the aggregate open
+        # notional is capped by shared max_leverage"), and it is the only one
+        # of the two that can enforce a shared ledger across symbols — a
+        # per-symbol pass sizes every symbol from full capital, which is the
+        # N x risk_pct problem D5/A-M4 exists to fix. Reinstating the in-loop
+        # call on top of the post-loop pass would size every trade twice, so
+        # main's single pass stands. The branch's asset-class awareness is not
+        # lost: the caller infers the class per symbol and hands the map to
+        # that pass, and the `asset_class` parameter below still serves
+        # single-symbol callers.
         trades: list[Trade] = []
         stats: dict[str, Any] = {}
 
@@ -389,7 +436,6 @@ class PyneCoreAdapter(EngineAdapter):
                 # resized quantities/pnl build on parity prices.
                 trades = _gate_warmup_trades(trades, config)
                 _apply_fill_parity(trades, df, config, resolved_parameters)
-
 
             if stats_csv.exists():
                 stats.update(_parse_stats_csv(stats_csv))
@@ -511,6 +557,15 @@ def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
 
 def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
     """Build a net, exit-timed equity curve from merged trades."""
+    # Merge resolution: main's per-exit-leg net event ledger wins. The branch's
+    # version credited one point per trade at ENTRY time from `trade.pnl`/
+    # `net_pnl`; main distributes the same net total across the real exit legs
+    # (fee_delta spread in proportion to each leg's gross), which is what D11
+    # requires of the PyneCore curve ("aligned to exit time for cross-engine
+    # comparability") and what makes a partial-exit trade's intermediate
+    # equity visible. The branch's intent — credit NET, never gross — is
+    # preserved: `net_total` is the authority and the gross-only path
+    # (no `net_pnl` recorded) still backs fees out of it.
     equity = float(config.initial_capital)
     events: list[tuple[str, float]] = []
     for trade in all_trades:
@@ -1038,17 +1093,26 @@ def _load_ohlcv(
     timeframe: str,
     start_date: str,
     end_date: str,
+    *,
+    data_source: str = "",
 ) -> pd.DataFrame | None:
     """Find and load OHLCV parquet for a symbol."""
-    ohlcv_root = data_root / "ohlcv"
-    matches = sorted(
-        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+    # Merge resolution: the branch's data-source-aware selection is the
+    # superset — it routes to a named feed, it records the resolved path for
+    # provenance, and it derives from the SAME helper the adapters share.
+    # main's determinism intent is preserved because
+    # `contract.select_ohlcv_path` returns `min(candidates, key=rank)` with
+    # `str(path)` as the final tiebreaker (a total order, not filesystem
+    # order), and because the asset class is now read off the file that was
+    # actually loaded instead of a second, independent glob.
+    selected_path, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    if not matches:
+    if selected_path is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = pd.read_parquet(selected_path)
+    df.attrs["ohlcv_source_path"] = str(selected_path)
     df.columns = [c.lower() for c in df.columns]
     df = contract.normalize_ohlcv_frame(df)
 
@@ -1061,19 +1125,22 @@ def _load_ohlcv(
     return df.reset_index(drop=True)
 
 
-def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
-    matches = sorted(
-        (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+# Merge resolution: the branch's signature wins. It classifies the file that
+# `_load_ohlcv` actually selected (same helper, same total order) instead of
+# re-globbing, it honours the requested feed, and it reuses the shared
+# `ohlcv_path_metadata` parser rather than main's inline `parts.index("ohlcv")`
+# arithmetic — which, note, also differed from that parser: it read
+# `parts[idx + 2]` unconditionally and swallowed a short path as "unknown",
+# where the parser checks the tail length and returns "" for a missing part.
+def _infer_asset_class(
+    data_root: Path, symbol: str, timeframe: str, *, data_source: str = ""
+) -> str:
+    selected, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    if not matches:
+    if selected is None:
         return "unknown"
-    parts = matches[0].parts
-    try:
-        ohlcv_idx = parts.index("ohlcv")
-        return parts[ohlcv_idx + 2].lower()
-    except (ValueError, IndexError):
-        return "unknown"
+    return contract.ohlcv_path_metadata(selected)["asset_class"] or "unknown"
 
 
 def _normalize_trade_exits(trades: list[Trade]) -> None:

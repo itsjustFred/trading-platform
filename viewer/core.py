@@ -21,7 +21,6 @@ import subprocess
 import threading
 import time
 import traceback
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -384,7 +383,15 @@ def _backtest_info_payload(result: BacktestResult) -> dict:
         if meta.data.get("timeframes")
         else "1h",
         "timeframes": meta.data.get("timeframes", []),
+        "data_source": meta.data.get("source", ""),
+        "requested_data_source": meta.data.get("requested_data_source", ""),
+        "asset_classes": meta.data.get("asset_classes", []),
+        "data_files": meta.data.get("data_files", []),
+        "pnl_basis": meta.data.get("pnl_basis", {}),
+        "risk_config": meta.data.get("risk_config", {}),
         "initial_capital": meta.initial_capital,
+        "duration_days": meta.duration_days,
+        "total_bars": meta.total_bars,
         "created_at": meta.created_at,
         "trade_count": len(result.trades),
         "parameters": meta.parameters,
@@ -1187,6 +1194,7 @@ def _quick_stats_and_equity(
             "max_drawdown_pct": 0,
             "net_profit": 0,
             "net_profit_pct": 0,
+            "total_return": 0,
             "p_value": 1.0,
             "psr": None,
             "equity_mini": [],
@@ -1278,6 +1286,10 @@ def _quick_stats_and_equity(
         "max_drawdown_pct": max_drawdown_pct,
         "net_profit": round(total_pnl, 2),
         "net_profit_pct": net_profit_pct,
+        # Percent points, matching net_profit_pct and the frontend's "points"
+        # scale. The frontend reads both keys, so a payload without this one
+        # renders the total-return tile as unavailable.
+        "total_return": net_profit_pct,
         "psr": psr_val,
         "p_value": p_value,
         "equity_mini": equity_mini,
@@ -1351,6 +1363,16 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         else None
     )
 
+    # Persisted runner stats carry total_return as a FRACTION; the payload is in
+    # percent points to match the frontend's "points" scale and net_profit_pct.
+    # Fall back to the net figure when the engine did not record it.
+    _total_return_fraction = _safe_float(raw.get("total_return"), float("nan"))
+    if not math.isfinite(_total_return_fraction):
+        _total_return_fraction = (
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / (result.meta.initial_capital or 100000)
+        )
+
     stats = {
         "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
         "net_profit_pct": round(
@@ -1383,6 +1405,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
+        "total_return": round(_total_return_fraction * 100, 2),
         "expectancy": 0,  # computed below
     }
     # Expectancy
@@ -1855,8 +1878,20 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
     }
 
 
+#: Per-repo cap for `dolt pull`. Four repos at 30s each is two minutes of
+#: waiting, and this runs per backtest request, so a slow or unreachable remote
+#: used to pile up threads that kept the process alive long after the work was
+#: done.
+_DOLTHUB_PULL_TIMEOUT_SECONDS = 10
+
+
 def _dolthub_pull():
-    """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
+    """Best-effort dolthub pull. Logs warnings on failure.
+
+    A pull that misses its deadline is killed and logged rather than retried: the
+    data is refreshed on the next request anyway, and blocking here only delays
+    the request that triggered it.
+    """
     dolthub_repos = DATA_DIR / "dolthub"
     if not dolthub_repos.is_dir():
         return
@@ -1873,7 +1908,13 @@ def _dolthub_pull():
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=_DOLTHUB_PULL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "dolt pull %s exceeded %ss and was abandoned",
+                repo,
+                _DOLTHUB_PULL_TIMEOUT_SECONDS,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             logger.warning("dolt pull %s failed: %s", repo, exc)

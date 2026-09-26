@@ -273,10 +273,20 @@ def test_iter_alpaca_credentials_safe_keeps_valid_sibling_blocks(monkeypatch):
 
 
 def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatch):
-    monkeypatch.setenv("CTRADER_APP_ID", "app")
-    monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
-    monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
-    monkeypatch.setattr(account_discovery, "_iter_alpaca_credentials", lambda _env: [])
+    """The shared (non-indexed) cTrader credentials must be the ones used.
+
+    Hermetic by construction: discovery reads the accounts-env FILE with
+    file-first precedence and deliberately ignores ``os.environ``, so the test
+    must pass an explicit tmp env file. Relying on ``monkeypatch.setenv`` here
+    used to fall through to the real gitignored ``.accounts.env`` and print
+    live cTrader credentials into the pytest assertion diff.
+    """
+    env_path = _tmp_accounts_env(
+        "CTRADER_APP_ID=app\n"
+        "CTRADER_APP_SECRET=secret\n"
+        "CTRADER_ACCESS_TOKEN=token\n"
+    )
+    monkeypatch.setattr(account_discovery, "_iter_alpaca_credentials_safe", lambda _env: [])
     captured: list[tuple[str, str, str]] = []
 
     async def _discover(app_id, app_secret, access_token):
@@ -293,7 +303,15 @@ def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatc
 
     monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
 
-    accounts = asyncio.run(account_discovery.discover_configured_accounts())
+    accounts = asyncio.run(
+        account_discovery.discover_configured_accounts(accounts_env=env_path)
+    )
 
-    assert captured == [("app", "secret", "token")]
+    # Assert identity of the credentials, never their values: comparing raw
+    # secrets would echo them into CI logs on failure.
+    assert len(captured) == 1, "expected exactly one cTrader discovery call"
+    used_app_id, used_app_secret, used_access_token = captured[0]
+    assert used_app_id == "app"
+    assert used_app_secret == "secret"
+    assert used_access_token == "token"
     assert [account.id for account in accounts] == ["47644617"]

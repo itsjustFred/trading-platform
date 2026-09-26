@@ -11,6 +11,7 @@ from typing import Any
 
 import requests
 
+from live_runner.credential_env import discord_bot_env_key
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
@@ -51,6 +52,22 @@ class DiscordChannelForbiddenError(RuntimeError):
 #: POLL_LIMIT and 429-windows must not lose signals incl. exits).
 MAX_BACKFILL_PAGES = 5
 
+#: ``auth_scheme`` values that mean "a Developer Portal BOT token" — sent with
+#: the ``Bot `` prefix.
+DISCORD_BOT_AUTH_SCHEMES = frozenset({"bot"})
+#: ``auth_scheme`` values that mean "a USER/ACCOUNT (self-bot) token" — sent
+#: exactly as supplied. ``raw`` is the historical operator spelling (#81: tokens
+#: copied out of Discord devtools), ``account`` the explicit one; they are the
+#: same credential kind and are both accepted.
+DISCORD_ACCOUNT_AUTH_SCHEMES = frozenset({"raw", "account"})
+#: Every accepted ``auth_scheme``. Anything else raises instead of being guessed.
+DISCORD_AUTH_SCHEMES = DISCORD_BOT_AUTH_SCHEMES | DISCORD_ACCOUNT_AUTH_SCHEMES
+#: Last-resort scheme when nothing is configured anywhere. "raw" is the
+#: recorded owner decision for the existing operator deployment; a mismatch
+#: with the actual token is NOT silently corrected — Discord answers 401 and
+#: :class:`DiscordAuthenticationError` fails the source closed.
+DEFAULT_DISCORD_AUTH_SCHEME = "raw"
+
 
 class DiscordRateLimitError(RuntimeError):
     """Raised when Discord returns a 429 rate limit response."""
@@ -77,7 +94,15 @@ _MOMENTUM_REVERSAL_RE = re.compile(r"momentum\s*reversal", re.IGNORECASE)
 _GOLDEN_CROSS_RE = re.compile(r"golden\s*cross", re.IGNORECASE)
 _DEATH_CROSS_RE = re.compile(r"death\s*cross", re.IGNORECASE)
 _OVERBOUGHT_RE = re.compile(r"overbought", re.IGNORECASE)
-_OVERSOLD_RE = re.compile(r"oversold|rsi\s*<?\s*30|rocket\s*fuel\s*buy\s*signal", re.IGNORECASE)
+_OVERSOLD_RE = re.compile(
+    r"oversold"
+    r"|rsi\s*<?\s*30"
+    r"|rsi\s+(?:has\s+)?crossed\s+(?:below|under)\s*30"
+    r"|\bis\s+down\s+significantly\b"
+    r"|rocket\s*fuel\s*buy\s*signal"
+    r"|nitro\s+watchlist\s*[\u2014\-]\s*buy\s+signal",
+    re.IGNORECASE,
+)
 _SKIP_WORDS = {
     "RSI",
     "DMA",
@@ -173,7 +198,15 @@ def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
 
 
 def _extract_bold_symbol(content: str) -> str | None:
-    return _first_normalized_symbol(re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content))
+    # Accept both "** $TICKER**" and "**TICKER**". The signal bots are not
+    # consistent about the space, and requiring one silently dropped every
+    # Nitro alert, which formats its ticker as "**BE** is down significantly".
+    # The capture is letters-only and immediately followed by "**", so a
+    # multi-word bold header such as "**NITRO WATCHLIST — BUY SIGNAL**" cannot
+    # match.
+    return _first_normalized_symbol(
+        re.findall(r"\*\*\s*\$?([A-Za-z]{1,10})\s*\*\*", content)
+    )
 
 
 def _extract_labeled_symbol(content: str) -> str | None:
@@ -410,16 +443,43 @@ class DiscordSignalSource(BaseSignalSource):
         self.service_id = str(service_id or "").strip() or None
         self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
-        # #81: operator tokens are account/user tokens copied from Discord
-        # devtools — sent RAW (no "Bot " prefix) like the Stockkit reference
-        # (headers = {"authorization": token}, api v9). Real bot tokens stay
-        # possible via auth_scheme="bot". Default "raw" (owner decision).
-        scheme = str(auth_scheme or os.environ.get("DISCORD_AUTH_SCHEME", "raw")).strip().lower()
-        if scheme not in ("raw", "bot"):
+        # Discord accepts two different credentials and they are NOT
+        # interchangeable: an application/bot token needs the "Bot " prefix, while
+        # a user (account) token must be sent raw. Either mismatch is answered
+        # with HTTP 401, so the scheme is explicit and never guessed, and a
+        # wrong scheme fails the source closed rather than polling as anonymous.
+        #
+        # Vocabulary (union of both sides, same two credential kinds):
+        #   "bot"             -> Developer Portal bot token, sent "Bot <token>"
+        #   "raw" / "account" -> user (account/self-bot) token, sent verbatim.
+        # "raw" is the operator spelling from #81 (tokens copied out of Discord
+        # devtools), "account" the explicit one; both name the same credential.
+        # Precedence: explicit argument -> per-bot env -> global env -> default,
+        # so a per-bot scheme can never be shadowed by a global one.
+        per_bot_scheme_key = discord_bot_env_key(self.bot_name, "AUTH_SCHEME")
+        scheme = str(
+            auth_scheme
+            or os.environ.get(per_bot_scheme_key, "")
+            or os.environ.get("DISCORD_AUTH_SCHEME", "")
+            or DEFAULT_DISCORD_AUTH_SCHEME
+        ).strip().lower()
+        if scheme not in DISCORD_AUTH_SCHEMES:
+            # Raise: an unrecognised scheme must never fall through to "raw"
+            # or "bot" and poll with the wrong credential.
             raise ValueError(
-                f"Unknown discord_auth_scheme {auth_scheme!r}; expected 'raw' or 'bot'."
+                f"Unsupported Discord auth_scheme '{scheme}': unknown "
+                f"discord_auth_scheme; expected one of "
+                f"{sorted(DISCORD_AUTH_SCHEMES)}"
             )
         self.auth_scheme = scheme
+        if scheme in DISCORD_ACCOUNT_AUTH_SCHEMES:
+            logger.warning(
+                "Discord source configured with an ACCOUNT (user) token. That is a "
+                "self-bot: it violates Discord's Terms of Service and can get the "
+                "account terminated. Use a Developer Portal bot token for unattended "
+                "trading.",
+                extra={"data": {"bot_name": self.bot_name, "auth_scheme": scheme}},
+            )
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
         if fallback_channel_id:
@@ -485,12 +545,26 @@ class DiscordSignalSource(BaseSignalSource):
             )
 
     def _auth_header(self) -> str:
-        """Build the Authorization header per configured scheme (#81)."""
-        if self.auth_scheme == "bot":
-            if self.token.lower().startswith("bot "):
-                return self.token
-            return f"Bot {self.token}"
-        return self.token
+        """Build the Authorization header for the configured credential type.
+
+        A token that already carries a scheme prefix is left alone so operators
+        can paste a fully-formed header value. A credential/scheme mismatch is
+        NOT auto-corrected: Discord answers 401 and
+        :class:`DiscordAuthenticationError` stops the source.
+        """
+        token = str(self.token or "").strip()
+        if self.auth_scheme in DISCORD_BOT_AUTH_SCHEMES:
+            if token.lower().startswith("bot "):
+                return token
+            return f"Bot {token}"
+        # Account (self-bot) token, both spellings: sent exactly as supplied.
+        return token
+
+    #: Branch-side spelling of :meth:`_auth_header`; both names are kept so
+    #: either call site keeps working.
+    def _authorization_header(self) -> str:
+        """Alias of :meth:`_auth_header`."""
+        return self._auth_header()
 
     async def _fetch_messages(
         self,

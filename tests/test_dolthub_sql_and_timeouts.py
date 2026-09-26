@@ -45,6 +45,16 @@ class TestSqlBuilders:
     def test_build_symbol_select_quotes_table(self) -> None:
         sql = build_symbol_select("ohlcv")
         assert sql == "SELECT DISTINCT act_symbol FROM `ohlcv`"
+    def test_build_distinct_symbol_select_quotes_table(self) -> None:
+        assert dm.build_distinct_symbol_select("ohlcv") == "SELECT DISTINCT act_symbol FROM `ohlcv`"
+
+    def test_build_distinct_symbol_select_rejects_empty_table(self) -> None:
+        with pytest.raises(ValueError):
+            dm.build_distinct_symbol_select("")
+
+    def test_build_symbol_select_quotes_table_and_symbol(self) -> None:
+        sql = build_symbol_select("ohlcv", "AAPL")
+        assert sql == "SELECT DISTINCT act_symbol FROM `ohlcv` WHERE act_symbol = 'AAPL'"
 
     def test_build_symbol_select_escapes_table_identifier(self) -> None:
         sql = build_symbol_select("we`ird")
@@ -89,6 +99,57 @@ class TestSqlBuilders:
         source = inspect.getsource(dm)
         assert "FROM {table_name}" not in source
         assert "act_symbol='" not in source
+
+
+class TestStocksExportHelpersSql:
+    """The extracted ``_export_stocks`` helpers must use the safe builders."""
+
+    def test_list_symbols_quotes_table_and_runs_under_timeout(self, monkeypatch, tmp_path) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen.update(kwargs)
+            return subprocess.CompletedProcess(cmd, 0, stdout="act_symbol\nAAPL\nMSFT\n", stderr="")
+
+        monkeypatch.setattr(dm.subprocess, "run", fake_run)
+
+        assert dm._list_symbols(tmp_path, "ohlcv") == ["AAPL", "MSFT"]
+        assert seen["cmd"] == [
+            "dolt",
+            "sql",
+            "-q",
+            "SELECT DISTINCT act_symbol FROM `ohlcv`",
+            "-r",
+            "csv",
+        ]
+        assert seen["timeout"] == dm.DEFAULT_DOLT_TIMEOUT_SECONDS
+
+    def test_list_symbols_timeout_is_not_fatal(self, monkeypatch, tmp_path) -> None:
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+        monkeypatch.setattr(dm.subprocess, "run", fake_run)
+        assert dm._list_symbols(tmp_path, "ohlcv") == []
+
+    def test_export_symbol_csv_quotes_table_and_symbol(self, monkeypatch, tmp_path) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["timeout"] = kwargs["timeout"]
+            if kwargs.get("stdout") is not None:
+                kwargs["stdout"].write("date,open,high,low,close,volume\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(dm.subprocess, "run", fake_run)
+        dm._export_symbol_csv(tmp_path, "ohlcv", "AAPL", tmp_path, tmp_path / "AAPL" / "1d.parquet")
+
+        assert seen["cmd"][3] == (
+            "SELECT date, open, high, low, close, volume FROM `ohlcv` "
+            "WHERE act_symbol = 'AAPL' ORDER BY date"
+        )
+        assert seen["timeout"] == dm.DEFAULT_DOLT_TIMEOUT_SECONDS
 
 
 class TestDolthubDownloaderSql:

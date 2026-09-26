@@ -2651,6 +2651,142 @@ def test_data_tasks_list_and_controls(viewer_client, tmp_path):
     assert cancel_resp.json()["status"] == "cancelled"
 
 
+def _seed_controllable_task(viewer_app_module, task_id, log_file, tmp_path):
+    """Register a paused-capable task so control transitions can be driven."""
+    log_path = log_file / f"task_{task_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+    viewer_app_module.DATA_TASKS[task_id] = viewer_app_module._create_task_record(
+        task_id,
+        name="Resample EURUSD 1h",
+        description="Resample EURUSD 1h bars from tick data.",
+        kind="data",
+        source="dukascopy",
+        total_items=4,
+        log_file=log_path,
+        control_mode="thread",
+        supports_control=True,
+    )
+    assert tmp_path is not None
+    return log_path
+
+
+def test_task_control_flags_track_the_pause_resume_cycle(viewer_client, tmp_path):
+    """`can_pause`/`can_resume` must describe what the endpoints will accept.
+
+    These flags are the contract the UI renders its buttons from, so a task
+    that advertises `can_resume: false` while the endpoint still flips it to
+    `running` is a lie the operator cannot see.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "control-flags-task"
+    _seed_controllable_task(viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path)
+    viewer_app_module._set_task_status(task_id, "running")
+
+    def controls():
+        listed = next(
+            item
+            for item in viewer_client.get("/api/data/tasks").json()["tasks"]
+            if item["id"] == task_id
+        )
+        return listed["can_pause"], listed["can_resume"]
+
+    assert controls() == (True, False)
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/pause").status_code == 200
+    assert controls() == (False, True)
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/resume").status_code == 200
+    assert controls() == (True, False)
+
+    viewer_app_module._mark_task_finished(task_id, status="completed", returncode=0)
+    assert controls() == (False, False)
+
+
+def test_task_resume_requires_a_paused_task(viewer_client, tmp_path):
+    """Resume must refuse a task that was never paused.
+
+    Before this guard the endpoint only short-circuited on final statuses, so
+    POSTing resume against a `starting` task silently promoted it to `running`:
+    a task that had not begun work yet would be reported as executing, and its
+    elapsed/ETA figures would be wrong.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "resume-not-paused-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    # `_create_task_record` starts every task in `starting`.
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+    resp = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
+    assert resp.status_code == 409
+    assert "paused" in (resp.json().get("error") or resp.json().get("detail", ""))
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+
+def test_task_pause_requires_a_runnable_task(viewer_client, tmp_path):
+    """Pause must refuse a task that is not queued/starting/running.
+
+    Mirror of the resume guard: `can_pause` is advertised as false once a task
+    is paused or finished, so the endpoint has to agree instead of re-pausing
+    a finished task or flipping `queued` straight to `paused`.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "pause-not-runnable-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "starting"
+
+    assert viewer_client.post(f"/api/data/tasks/{task_id}/pause").status_code == 200
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "paused"
+
+    resp = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
+    assert resp.status_code == 409
+    assert viewer_app_module.DATA_TASKS[task_id]["status"] == "paused"
+
+
+def test_paused_task_resumes_and_runs_to_completion(viewer_client, tmp_path):
+    """The full operator journey: running -> paused -> running -> completed.
+
+    Regression cover for the missing resume control: `resumeDataTask` and
+    `can_resume` existed in the API but nothing ever drove them, so a paused
+    task could only be abandoned or cancelled.
+    """
+    import viewer.main as viewer_app_module
+
+    task_id = "pause-resume-complete-task"
+    _seed_controllable_task(
+        viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+    )
+    viewer_app_module._set_task_status(task_id, "running")
+
+    paused = viewer_client.post(f"/api/data/tasks/{task_id}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["can_resume"] is True
+    assert viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+
+    resumed = viewer_client.post(f"/api/data/tasks/{task_id}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "running"
+    assert resumed.json()["can_pause"] is True
+    assert not viewer_app_module.DATA_TASKS[task_id]["pause_event"].is_set()
+
+    viewer_app_module._mark_task_finished(task_id, status="completed", returncode=0)
+
+    detail = viewer_client.get(f"/api/data/tasks/{task_id}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "completed"
+    assert detail.json()["can_pause"] is False
+    assert detail.json()["can_resume"] is False
+    assert detail.json()["can_cancel"] is False
+
+
 def test_tasks_alias_returns_enriched_fields(viewer_client, tmp_path):
     import viewer.main as viewer_app_module
 
@@ -2793,6 +2929,78 @@ def test_failed_jforex_task_restart_marks_interrupted(viewer_client, tmp_path):
     assert payload["status"] == "manual_required"
     assert payload["can_restart"] is False
     assert payload["progress"]["failed"] >= 1
+
+
+def test_resume_interrupted_backtest_uses_persisted_restart_config(monkeypatch):
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+    record = {
+        "id": "recovered-backtest",
+        "type": "backtest",
+        "name": "Backtest demo",
+        "description": "Recovered",
+        "source": "native",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "config_json": {
+            "task_spec": {
+                "version": 1,
+                "kind": "backtest",
+                "operation": "run",
+                "parameters": {
+                    "strategy": "demo_strategy.py",
+                    "engine": "native",
+                    "symbols": ["AAPL"],
+                    "timeframe": "1h",
+                    "data_source": "metals",
+                    "start": "2024-01-01",
+                    "end": "2024-02-01",
+                    "capital": 50000,
+                    "risk_per_trade_pct": 0.005,
+                    "max_position_pct": 0.05,
+                    "max_leverage": 1.0,
+                    "modeling_resolution": "open_close",
+                    "parameters": {"window": 10},
+                },
+            }
+        },
+    }
+
+    monkeypatch.setattr(viewer_app_module, "_LEGACY_HOOKS_INSTALLED", True)
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_background_task_records",
+        lambda **_kwargs: [record],
+    )
+
+    def fake_run_backtest_sync(runner, payload):
+        captured["runner"] = runner
+        captured["payload"] = payload
+        return {"task_id": "replacement-task"}
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_run_backtest_sync",
+        fake_run_backtest_sync,
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "upsert_background_task_record",
+        lambda **kwargs: captured.update({"upsert": kwargs}),
+    )
+
+    viewer_app_module._resume_interrupted_tasks()
+
+    payload = captured["payload"]
+    assert payload.strategy == "demo_strategy.py"
+    assert payload.symbols == ["AAPL"]
+    assert payload.timeframe == "1h"
+    assert payload.data_source == "metals"
+    assert payload.capital == 50000
+    assert payload.risk_per_trade_pct == 0.005
+    assert payload.max_position_pct == 0.05
+    assert payload.parameters == {"window": 10}
+    assert captured["upsert"]["progress_message"] == "Auto-restarted as task replacement-task"
 
 
 def test_data_task_delete_removes_finished_task(viewer_client, tmp_path):
@@ -3150,6 +3358,85 @@ def test_optimization_run_rejects_train_split_above_max_before_queueing(viewer_c
     assert response.json()["detail"]["error"] == "Invalid optimization payload"
     assert response.json()["detail"]["details"][0]["loc"] == ["train_split_pct"]
     assert viewer_app_module.DATA_TASKS == {}
+
+
+def test_live_deployment_pause_drain_waits_for_in_flight_submission(monkeypatch):
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    counts = iter([2, 1, 0])
+    monkeypatch.setattr(
+        viewer_app_module,
+        "count_live_deployment_submissions",
+        lambda _deployment_id: next(counts),
+    )
+
+    drained, remaining = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            "dep-1", timeout_seconds=1.0
+        )
+    )
+
+    assert drained is True
+    assert remaining == 0
+
+
+def test_live_pause_returns_conflict_when_submission_drain_times_out(viewer_client, monkeypatch):
+    from shared.models import LiveDeploymentConfig
+    import viewer.main as viewer_app_module
+
+    deployment = LiveDeploymentConfig(
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "update_live_deployment_status",
+        lambda _deployment_id, _status: deployment,
+    )
+
+    async def _incomplete_drain(_deployment_id, *, timeout_seconds=10.0):
+        return False, 2
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_drain_live_deployment_submissions",
+        _incomplete_drain,
+    )
+
+    resp = viewer_client.put(
+        f"/api/live/deployments/{deployment.id}/status",
+        json={"status": "PAUSED"},
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["in_flight_submissions"] == 2
+
+
+def test_backtest_run_rejects_out_of_range_sizing_fractions(viewer_client):
+    base_payload = {
+        "strategy": "demo_strategy.py",
+        "engine": "native",
+        "symbols": ["AAPL"],
+        "timeframe": "1d",
+        "capital": 100000,
+    }
+
+    risk_resp = viewer_client.post(
+        "/api/backtests/run",
+        json={**base_payload, "risk_per_trade_pct": 1.0},
+    )
+    position_resp = viewer_client.post(
+        "/api/backtests/run",
+        json={**base_payload, "max_position_pct": 5.0},
+    )
+
+    assert risk_resp.status_code == 422
+    assert position_resp.status_code == 422
 
 
 def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch, tmp_path):
@@ -3623,6 +3910,7 @@ def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
             backtest_end="2024-01-31",
             initial_capital=100000.0,
             duration_days=30,
+            total_bars=31,
             data={"symbols": ["AAPL"], "timeframes": ["1d"], "source": "test_source"},
         ),
         trades=[],
@@ -3632,10 +3920,14 @@ def test_backtest_stats_endpoint_includes_p_value(viewer_client, tmp_path):
     )
     result.save(backtests_dir / "pvalue-demo.trades.json")
 
-    resp = viewer_client.get("/api/backtest/pvalue-demo/stats")
+    info_resp = viewer_client.get("/api/backtest/pvalue-demo/info")
+    stats_resp = viewer_client.get("/api/backtest/pvalue-demo/stats")
 
-    assert resp.status_code == 200
-    payload = resp.json()
+    assert info_resp.status_code == 200
+    assert info_resp.json()["duration_days"] == 30
+    assert info_resp.json()["total_bars"] == 31
+    assert stats_resp.status_code == 200
+    payload = stats_resp.json()
     assert 0.0 <= payload["p_value"] <= 1.0
     assert payload["p_value"] < 0.05
 
@@ -3764,6 +4056,8 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
                 "timeframe": "1d",
                 "start_date": "2024-01-01",
                 "end_date": "2024-01-31",
+                "initial_capital": 100000.0,
+                "total_pnl": 1234.5,
                 "total_return": 0.012345,
                 "cagr": 0.0345,
                 "sharpe_ratio": 7.777,
@@ -3802,7 +4096,7 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
     assert item["sharpe_ratio"] == 7.777
     assert item["cagr"] == 3.45
     assert item["max_drawdown_pct"] == 23.45
-    assert item["net_profit"] == 0.0
+    assert item["net_profit"] == 1234.5
     assert item["net_profit_pct"] == 1.23
     assert item["psr"] == pytest.approx(0.8123, abs=1e-4)
     assert item["p_value"] == pytest.approx(0.012345, abs=1e-6)
@@ -6353,3 +6647,210 @@ def test_live_websocket_payload_redacts_nested_secrets_and_unknown_objects():
     assert safe["data"]["opaque"] == "[Filtered]"
     assert safe["data"]["unknown"] == "gateway api_key=[Filtered] status=ok"
     assert safe["data"]["safe"] == "visible"
+
+
+# ─── Broker re-verification and account re-point guards ──────────────────────
+
+
+def test_activation_refuses_when_broker_cannot_confirm_demo(
+    viewer_client, monkeypatch
+):
+    """ACTIVE must fail closed when the broker cannot positively confirm demo."""
+    from shared.models import LiveDeploymentConfig
+    import viewer.main as viewer_app_module
+
+    deployment = LiveDeploymentConfig(
+        id="11111111-1111-4111-8111-111111111111",
+        strategy_name="demo",
+        account_id="acc-live",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "get_live_deployment", lambda _deployment_id: deployment
+    )
+
+    async def _not_demo(_account_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        viewer_app_module, "_reverify_account_against_broker", _not_demo
+    )
+
+    def _should_not_run(*_args, **_kwargs):
+        raise AssertionError("status must not be persisted when re-verify fails")
+
+    monkeypatch.setattr(viewer_app_module, "update_live_deployment_status", _should_not_run)
+
+    resp = viewer_client.put(
+        "/api/live/deployments/11111111-1111-4111-8111-111111111111/status", json={"status": "ACTIVE"}
+    )
+
+    assert resp.status_code == 409
+    assert "demo" in resp.json()["detail"].lower()
+
+
+def test_activation_refreshes_verification_before_persisting(
+    viewer_client, monkeypatch
+):
+    """A successful broker re-verification must happen before the DB transition."""
+    from shared.models import LiveDeploymentConfig
+    import viewer.main as viewer_app_module
+
+    deployment = LiveDeploymentConfig(
+        id="22222222-2222-4222-8222-222222222222",
+        strategy_name="demo",
+        account_id="acc-demo",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    armed = deployment.model_copy(update={"status": "ACTIVE"})
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        viewer_app_module, "get_live_deployment", lambda _deployment_id: deployment
+    )
+
+    async def _verified(account_id: str) -> bool:
+        calls.append(f"verify:{account_id}")
+        return True
+
+    def _persist(deployment_id, status):
+        calls.append(f"persist:{status}")
+        assert calls == ["verify:acc-demo", "persist:ACTIVE"], (
+            "the broker re-verification must precede the ACTIVE write"
+        )
+        return armed
+
+    monkeypatch.setattr(
+        viewer_app_module, "_reverify_account_against_broker", _verified
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "update_live_deployment_status", _persist
+    )
+
+    resp = viewer_client.put(
+        "/api/live/deployments/22222222-2222-4222-8222-222222222222/status", json={"status": "ACTIVE"}
+    )
+
+    assert resp.status_code == 200
+    assert calls == ["verify:acc-demo", "persist:ACTIVE"]
+
+
+def test_pause_does_not_call_broker_reverification(viewer_client, monkeypatch):
+    """Only ACTIVE may talk to the broker; PAUSE must stay a pure local write."""
+    from shared.models import LiveDeploymentConfig
+    import viewer.main as viewer_app_module
+
+    deployment = LiveDeploymentConfig(
+        id="33333333-3333-4333-8333-333333333333",
+        strategy_name="demo",
+        account_id="acc-demo",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
+    paused = deployment.model_copy(update={"status": "PAUSED"})
+
+    async def _must_not_verify(_account_id: str) -> bool:
+        raise AssertionError("PAUSE must not trigger a broker round trip")
+
+    async def _drained(_deployment_id, *, timeout_seconds=10.0):
+        return True, 0
+
+    monkeypatch.setattr(
+        viewer_app_module, "_reverify_account_against_broker", _must_not_verify
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "update_live_deployment_status", lambda *_a, **_k: paused
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _drained
+    )
+
+    resp = viewer_client.put(
+        "/api/live/deployments/33333333-3333-4333-8333-333333333333/status", json={"status": "PAUSED"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "PAUSED"
+
+
+def test_repoint_endpoint_surfaces_safety_refusals(viewer_client, monkeypatch):
+    """The re-point endpoint must translate DB refusals into 400, not 500."""
+    import viewer.main as viewer_app_module
+
+    def _refuse(*_args, **_kwargs):
+        raise ValueError("Refusing to re-point an ACTIVE deployment; pause it first")
+
+    monkeypatch.setattr(
+        viewer_app_module, "update_live_deployment_account", _refuse
+    )
+
+    resp = viewer_client.put(
+        "/api/live/deployments/dep-1/account",
+        json={"account_id": "acc-2"},
+    )
+
+    assert resp.status_code == 400
+    assert "ACTIVE" in resp.json()["detail"]
+
+
+def test_repoint_endpoint_returns_404_for_unknown_deployment(
+    viewer_client, monkeypatch
+):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module, "update_live_deployment_account", lambda *_a, **_k: None
+    )
+
+    resp = viewer_client.put(
+        "/api/live/deployments/missing/account", json={"account_id": "acc-2"}
+    )
+
+    assert resp.status_code == 404
+
+
+def test_task_control_flags_agree_with_endpoint_acceptance(viewer_client, tmp_path):
+    """`can_pause`/`can_resume` are the contract the UI renders from.
+
+    The endpoint must accept exactly the statuses the flags advertise. A status
+    the endpoint accepts but the flag hides leaves the operator unable to act; a
+    status the flag offers but the endpoint refuses produces a button that only
+    errors.
+    """
+    import viewer.main as viewer_app_module
+    from viewer.core import _task_controls_payload
+
+    for status in ("starting", "running", "paused", "queued", "completed", "failed"):
+        # Separate task per probe: calling pause mutates the status, so probing
+        # both controls on one task would test a status nobody actually sees.
+        pause_id = f"agreement-pause-{status}"
+        resume_id = f"agreement-resume-{status}"
+        for task_id in (pause_id, resume_id):
+            _seed_controllable_task(
+                viewer_app_module, task_id, tmp_path / "logs" / "tasks", tmp_path
+            )
+            viewer_app_module._set_task_status(task_id, status)
+
+        tasks = {
+            item["id"]: item
+            for item in viewer_client.get("/api/data/tasks").json()["tasks"]
+        }
+        pause_code = viewer_client.post(f"/api/data/tasks/{pause_id}/pause").status_code
+        resume_code = viewer_client.post(f"/api/data/tasks/{resume_id}/resume").status_code
+        listed = tasks[pause_id]
+        resume_listed = tasks[resume_id]
+
+        assert pause_code == (200 if listed["can_pause"] else 409), (
+            f"status={status!r}: flag can_pause={listed['can_pause']} but the "
+            f"endpoint answered {pause_code}"
+        )
+        assert resume_code == (200 if resume_listed["can_resume"] else 409), (
+            f"status={status!r}: flag can_resume={resume_listed['can_resume']} but the "
+            f"endpoint answered {resume_code}"
+        )
+    assert _task_controls_payload  # the shared helper under test

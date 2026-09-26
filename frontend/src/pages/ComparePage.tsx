@@ -85,6 +85,14 @@ function formatMetricRaw(
   return value.toFixed(3);
 }
 
+/** Ids come from the query string; the key is what the effect and state key on. */
+function parseCompareIds(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
 function formatChartTime(unixSeconds: number): string {
   if (!Number.isFinite(unixSeconds)) return "";
   return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
@@ -93,36 +101,53 @@ function formatChartTime(unixSeconds: number): string {
 export function ComparePage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const [data, setData] = useState<BacktestsCompareResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  // Results and failures are stored with the ids they belong to, so the
+  // loading/error/data shown for the current selection is derived rather than
+  // mirrored into state by the fetch effect.
+  const [result, setResult] = useState<{
+    key: string;
+    data: BacktestsCompareResponse;
+  } | null>(null);
+  const [failure, setFailure] = useState<{ key: string; message: string } | null>(
+    null,
+  );
 
-  const ids = (params.get("ids") || "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  const idsKey = params.get("ids") || "";
+  const ids = useMemo(() => parseCompareIds(idsKey), [idsKey]);
+  const selectionValid = ids.length === 2;
+  const selectionError = selectionValid
+    ? ""
+    : "Select exactly 2 backtests to compare.";
+  const data = result?.key === idsKey ? result.data : null;
+  const fetchError = failure?.key === idsKey ? failure.message : "";
+  const error = selectionError || fetchError;
+  const loading = selectionValid && data === null && fetchError === "";
 
   useEffect(() => {
-    if (ids.length !== 2) {
-      setLoading(false);
-      setError("Select exactly 2 backtests to compare.");
+    if (!selectionValid) {
       return;
     }
-    setLoading(true);
-    setError("");
+    let cancelled = false;
     compareBacktests(ids)
       .then((payload) => {
-        setData(payload);
+        if (cancelled) return;
+        setResult({ key: idsKey, data: payload });
+        setFailure(null);
       })
       .catch((error_: unknown) => {
-        const message =
-          error_ instanceof Error
-            ? error_.message
-            : "Could not load comparison data";
-        setError(message);
-      })
-      .finally(() => setLoading(false));
-  }, [ids.join(",")]);
+        if (cancelled) return;
+        setFailure({
+          key: idsKey,
+          message:
+            error_ instanceof Error
+              ? error_.message
+              : "Could not load comparison data",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ids, idsKey, selectionValid]);
 
   const equityOverlayData = useMemo(() => {
     if (!data) return [];

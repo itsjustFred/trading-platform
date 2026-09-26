@@ -15,6 +15,12 @@ MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
 MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
 MIN_PRESERVED_DAY_COVERAGE = 0.5
 
+#: An engine curve may replace the calendar fill only when it carries a path,
+#: i.e. when it is not endpoint-only. Two points (start + end) describe the
+#: same total return the calendar fill already describes, and adopting them
+#: would publish a 2-point "daily" curve that hides every intermediate day.
+MIN_RECONCILING_ENGINE_CURVE_POINTS = 3
+
 
 def _parse_ts(value: str | None) -> datetime | None:
     """Parse an ISO-ish timestamp; None when it cannot be understood."""
@@ -202,6 +208,88 @@ def _curve_frequency(points: list[EquityPoint]) -> str:
     return "intraday"
 
 
+def _trade_net_value(trade: Trade) -> float:
+    value = (
+        float(trade.net_pnl)
+        if trade.net_pnl is not None
+        else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
+    )
+    return value if math.isfinite(value) else 0.0
+
+
+def _daily_points_from_engine_curve(
+    result: BacktestResult,
+    *,
+    start: datetime | None = None,
+) -> tuple[list[EquityPoint], list[dict[str, Any]]] | None:
+    """Compact a reconciling engine curve to one point per observed day.
+
+    The calendar fill can only see CLOSED trades, so an open position's
+    mark-to-market drawdown is invisible to it. When the engine's own curve
+    reconciles with the realized trades (final equity ==
+    initial_capital + net PnL) it is the more faithful daily series and is
+    preferred. Returns None when the curve does not reconcile, is not
+    parseable, or is endpoint-only (fewer than
+    ``MIN_RECONCILING_ENGINE_CURVE_POINTS`` points carry no path).
+    """
+    if not result.trades:
+        return None
+
+    curve: list[tuple[datetime, float]] = []
+    for point in result.equity_curve or []:
+        parsed = _parse_ts(point.time)
+        try:
+            equity = float(point.equity)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if parsed is None or not math.isfinite(equity):
+            continue
+        curve.append((parsed.astimezone(timezone.utc), equity))
+    if len(curve) < MIN_RECONCILING_ENGINE_CURVE_POINTS:
+        return None
+    curve.sort(key=lambda item: item[0])
+
+    initial_capital = float(result.meta.initial_capital)
+    tolerance = max(0.05, abs(initial_capital) * 1e-9)
+    expected_final = initial_capital + sum(
+        _trade_net_value(trade) for trade in result.trades
+    )
+    if abs(curve[-1][1] - expected_final) > tolerance:
+        return None
+
+    baseline_ts = start or _parse_ts(result.meta.backtest_start) or curve[0][0]
+    baseline = baseline_ts.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    points = [EquityPoint(time=baseline.isoformat(), equity=round(initial_capital, 2))]
+    daily_returns: list[dict[str, Any]] = []
+    previous_equity = initial_capital
+
+    start_index = 0
+    if (
+        curve[0][0].date() == baseline.date()
+        and abs(curve[0][1] - initial_capital) <= tolerance
+    ):
+        start_index = 1
+
+    last_by_day: dict[str, tuple[datetime, float]] = {}
+    for timestamp, equity in curve[start_index:]:
+        last_by_day[timestamp.date().isoformat()] = (timestamp, equity)
+
+    for day in sorted(last_by_day):
+        timestamp, equity = last_by_day[day]
+        points.append(EquityPoint(time=timestamp.isoformat(), equity=round(equity, 2)))
+        daily_return = (
+            (equity - previous_equity) / previous_equity if previous_equity > 0 else 0.0
+        )
+        daily_returns.append({"date": day, "return": daily_return, "equity": equity})
+        previous_equity = equity
+
+    if len(points) < 2:
+        return None
+    return points, daily_returns
+
+
 def _attach_daily_stats(
     result: BacktestResult,
     daily_returns: list[dict[str, Any]],
@@ -364,6 +452,20 @@ def attach_daily_equity(
             daily_returns,
             equity_frequency=_curve_frequency(preserved_curve),
         )
+        return result
+
+    # The engine curve may still be worth adopting even when it is too sparse
+    # to pass the density gate above: a reconciling curve carries the
+    # mark-to-market path of open positions, which the calendar fill (built
+    # from closed trades only) cannot see. Gated on being non-endpoint-only.
+    engine_daily = _daily_points_from_engine_curve(scoped_result, start=start_bound)
+    if engine_daily is not None:
+        engine_points, engine_returns = engine_daily
+        result.equity_curve = engine_points
+        result.meta.data["daily_equity_curve"] = [
+            point.to_dict() for point in engine_points
+        ]
+        _attach_daily_stats(result, engine_returns, equity_frequency="daily")
         return result
 
     result.equity_curve = daily_points

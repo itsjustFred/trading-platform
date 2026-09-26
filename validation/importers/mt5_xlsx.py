@@ -628,6 +628,7 @@ class MT5XLSXImporter(BaseImporter):
         col_direction = MT5XLSXImporter._find_col(trades_df, ["Richtung"])
         col_volume = MT5XLSXImporter._find_col(trades_df, ["Volumen"])
         col_price = MT5XLSXImporter._find_col(trades_df, ["Preis"])
+        col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
         col_order_id = MT5XLSXImporter._find_col(trades_df, ["Auftrag"])
         col_commission = MT5XLSXImporter._find_col(trades_df, ["Kommission"])
         col_swap = MT5XLSXImporter._find_col(trades_df, ["Swap"])
@@ -652,6 +653,16 @@ class MT5XLSXImporter(BaseImporter):
                 "Trades table is missing required columns "
                 "(Zeit / Typ / Richtung / Symbol / Volumen / Preis / Gewinn): "
                 + ", ".join(missing_columns)
+            )
+
+        # The Trade column drives position reconstruction. Without it every deal
+        # id resolves to "", so every row looks like a deal of the same position
+        # and the whole report is imported as one giant position. Refuse rather
+        # than silently produce that.
+        if col_trade_id is None:
+            raise ValueError(
+                "Trades table is missing required column (Trade): position "
+                "reconstruction would collapse every trade into one position."
             )
 
         # DV-B43: reconstruct one Trade per position with one TradeExit per

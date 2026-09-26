@@ -14,15 +14,20 @@ spread/ask) and A-H2 (entry_stop), plus the unified D4 exit convention
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import select_ohlcv_path
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.engines.native_adapter import NativeAdapter
 from tests.helpers import write_ohlcv as _write_ohlcv, with_zero_fees
+
+if TYPE_CHECKING:
+    from shared.models import Trade
 
 
 def _frame(*, spread: float = 0.0) -> pd.DataFrame:
@@ -445,3 +450,85 @@ class TestSharedEquityReplayMath:
         replayed, _, _ = replay_shared_equity([a, b, d], 100_000.0)
         by_id = {t.id: t for t in replayed}
         assert by_id[1].quantity == pytest.approx(100.0)
+
+
+def test_ohlcv_selector_prefers_symbol_asset_class(tmp_path: Path):
+    metals = tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "1h.parquet"
+    forex = tmp_path / "ohlcv" / "dukascopy" / "forex" / "XAUUSD" / "1h.parquet"
+    metals.parent.mkdir(parents=True)
+    forex.parent.mkdir(parents=True)
+    metals.touch()
+    forex.touch()
+
+    selected, candidates = select_ohlcv_path(tmp_path, "XAUUSD", "1h")
+
+    assert selected == metals
+    assert candidates == [forex, metals]
+
+
+def test_ohlcv_selector_honors_explicit_source(tmp_path: Path):
+    metals = tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "1h.parquet"
+    forex = tmp_path / "ohlcv" / "dukascopy" / "forex" / "XAUUSD" / "1h.parquet"
+    metals.parent.mkdir(parents=True)
+    forex.parent.mkdir(parents=True)
+    metals.touch()
+    forex.touch()
+
+    selected, _ = select_ohlcv_path(
+        tmp_path, "XAUUSD", "1h", data_source="forex"
+    )
+
+    assert selected == forex
+
+
+def test_ohlcv_selector_rejects_unknown_explicit_source(tmp_path: Path):
+    path = tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    path.touch()
+
+    with pytest.raises(ValueError, match="matches data_source"):
+        select_ohlcv_path(tmp_path, "XAUUSD", "1h", data_source="unknown")
+
+
+@pytest.mark.parametrize("adapter_type", [NativeAdapter, VectorbtAdapter])
+def test_engines_record_selected_data_file(tmp_path: Path, adapter_type):
+    data_root = tmp_path / "data"
+    metals = data_root / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "1h.parquet"
+    _write_ohlcv(
+        data_root,
+        "XAUUSD",
+        _frame(),
+        source="dukascopy",
+        asset_class="metals",
+    )
+    _write_ohlcv(
+        data_root,
+        "XAUUSD",
+        _frame(),
+        source="dukascopy",
+        asset_class="forex",
+    )
+    strategy_path = _write_strategy(tmp_path, "data_source", _strategy_text())
+    config = BacktestConfig(
+        # Merge resolution: this fixture asserts data-file provenance, not
+        # sizing, but the engine fails closed unless the caller declares both a
+        # sizing basis and a cost model (C1 refuses the full-equity default;
+        # #84 refuses a silent zero-cost run). Every other config in this file
+        # already states both, via the shared `with_zero_fees` helper.
+        risk_per_trade_pct=0.01,
+        strategy_name="data_source",
+        symbols=["XAUUSD"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000.0,
+        modeling_resolution="main_timeframe",
+        data_dir=str(data_root),
+        parameters={"fees": "zero"},
+    )
+
+    result = adapter_type().run(config, strategy_path)
+
+    assert result.meta.data["data_files"] == [str(metals)]
+    assert result.meta.data["asset_classes"] == ["metals"]
+    assert result.meta.data["source"] == "dukascopy"

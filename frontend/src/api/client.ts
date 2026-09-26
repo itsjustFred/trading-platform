@@ -68,6 +68,8 @@ import type {
   BacktestsQueryParams,
   BacktestReplayResponse,
   PortfoliosBulkDeleteResponse,
+  BacktestStats,
+  BenchmarkResponse,
 } from "./types";
 
 const BASE_URL = "/api";
@@ -244,7 +246,7 @@ export const getBacktestEquityPreviews = (ids: string[], limit = 48) => {
 export const getBacktestInfo = (id: string) =>
   fetchJSON<BacktestInfo>(`/backtest/${id}/info`);
 export const getBacktestStats = (id: string) =>
-  fetchJSON<any>(`/backtest/${id}/stats`);
+  fetchJSON<BacktestStats>(`/backtest/${id}/stats`);
 export const getBacktestTrades = (
   id: string,
   params?: { offset?: number; limit?: number },
@@ -277,7 +279,9 @@ export const getBacktestEquity = (
     query.set("sampling", params.sampling);
   }
   const queryString = query.toString();
-  return fetchJSON<any>(withQuery(`/backtest/${id}/equity`, queryString));
+  return fetchJSON<Record<string, number>[]>(
+    withQuery(`/backtest/${id}/equity`, queryString),
+  );
 };
 export const getBacktestCapm = (id: string, benchmark?: string) => {
   const params = new URLSearchParams();
@@ -288,9 +292,9 @@ export const getBacktestCapm = (id: string, benchmark?: string) => {
   );
 };
 export const getBacktestOHLCV = (id: string) =>
-  fetchJSON<any>(`/backtest/${id}/ohlcv`);
+  fetchJSON<unknown>(`/backtest/${id}/ohlcv`);
 export const renameBacktest = (id: string, title: string) =>
-  fetchJSON<any>(`/backtests/${encodeURIComponent(id)}/name`, {
+  fetchJSON<unknown>(`/backtests/${encodeURIComponent(id)}/name`, {
     method: "PUT",
     body: JSON.stringify({ name: title }),
   });
@@ -618,7 +622,7 @@ export const getBenchmark = (symbol: string, start?: string, end?: string) => {
   const params = new URLSearchParams();
   if (start) params.set("start", start);
   if (end) params.set("end", end);
-  return fetchJSON<any>(`/benchmark/${symbol}?${params}`);
+  return fetchJSON<BenchmarkResponse>(`/benchmark/${symbol}?${params}`);
 };
 
 export const getSymbols = () =>
@@ -632,7 +636,7 @@ export const getDataOverview = () =>
 export const getDataCategory = (name: string) =>
   fetchJSON<DataCategoryResponse>(`/data/category/${encodeURIComponent(name)}`);
 export const deleteDataSymbol = (path: string) =>
-  fetchJSON<any>(`/data/symbol?path=${encodeURIComponent(path)}`, {
+  fetchJSON<unknown>(`/data/symbol?path=${encodeURIComponent(path)}`, {
     method: "DELETE",
   });
 export const getDukascopyGenesis = (

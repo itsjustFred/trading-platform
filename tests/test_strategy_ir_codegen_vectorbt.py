@@ -79,16 +79,16 @@ def test_generate_vectorbt_strategy_code_emits_valid_contract():
 
     output = namespace["generate_signals"](df, {"fast": 5, "slow": 12})
     assert isinstance(output, tuple)
-    assert len(output) in {3, 4}
+    # The platform contract is exactly 4 elements; a len-3 output is silently
+    # repaired by both engine adapters, so it must never be generated.
+    assert len(output) == 4
 
-    entries, exits, indicators = output[:3]
+    entries, exits, indicators, drawings = output
     assert len(pd.Series(entries)) == len(df)
     assert len(pd.Series(exits)) == len(df)
     assert isinstance(indicators, dict)
     assert set(indicators) >= {"Fast EMA", "Slow EMA"}
-
-    if len(output) == 4:
-        assert isinstance(output[3], list)
+    assert isinstance(drawings, list)
 
 
 def test_generate_vectorbt_strategy_code_handles_ir_without_indicators():

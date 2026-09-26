@@ -8,6 +8,15 @@
 
 export type StatCardFormat = "currency" | "percent" | "number" | "none";
 
+/**
+ * Rendered when a metric is genuinely unavailable.
+ *
+ * A missing metric must never be shown as `0`, `$0` or `0.00%`: a real zero
+ * return, a flat equity curve and "we could not compute this" are different
+ * facts, and collapsing them misleads whoever reads the tile.
+ */
+export const UNAVAILABLE_STAT_TEXT = "—";
+
 const CURRENCY_DIGITS = {
   minimumFractionDigits: 0,
   maximumFractionDigits: 0,
@@ -17,21 +26,46 @@ function toNumber(value: string | number): number {
   return typeof value === "number" ? value : Number.parseFloat(String(value));
 }
 
-/** Renders a stat value for the requested display format, falling back to `String(value)`. */
+/**
+ * True when a value carries no number AND no meaningful text: null, undefined,
+ * an empty/whitespace string, or a non-finite number.
+ *
+ * A non-empty non-numeric string such as "n/a" is deliberate labelling by the
+ * caller and is passed through unchanged; it is not an unavailable metric.
+ */
+export function isUnavailableStatValue(
+  value: string | number | null | undefined,
+): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === "number") return !Number.isFinite(value);
+  if (typeof value === "string") {
+    return value.trim() === "";
+  }
+  return true;
+}
+
+/** Renders a stat value for the requested display format. */
 export function formatStatCardValue(
-  value: string | number,
+  value: string | number | null | undefined,
   format: StatCardFormat,
 ): string {
-  const numVal = toNumber(value);
+  if (isUnavailableStatValue(value)) {
+    return UNAVAILABLE_STAT_TEXT;
+  }
+  if (typeof value === "string" && !Number.isFinite(toNumber(value))) {
+    // Deliberate non-numeric label such as "n/a": show it verbatim.
+    return value;
+  }
+  const numVal = toNumber(value as string | number);
 
-  if (format === "currency" && Number.isFinite(numVal)) {
+  if (format === "currency") {
     const magnitude = Math.abs(numVal).toLocaleString("en-US", CURRENCY_DIGITS);
     return numVal >= 0 ? `$${magnitude}` : `-$${magnitude}`;
   }
-  if (format === "percent" && Number.isFinite(numVal)) {
+  if (format === "percent") {
     return `${numVal.toFixed(2)}%`;
   }
-  if (format === "number" && Number.isFinite(numVal)) {
+  if (format === "number") {
     return numVal.toLocaleString("en-US", { maximumFractionDigits: 2 });
   }
   return String(value);
@@ -46,7 +80,7 @@ const SIGN_COLORS = {
 /** Auto-detects a sign-based color for numeric currency/percent values. */
 export function resolveStatCardColor(
   color: string | undefined,
-  value: string | number,
+  value: string | number | null | undefined,
   format: StatCardFormat,
 ): string {
   if (color) {
@@ -55,7 +89,10 @@ export function resolveStatCardColor(
   if (format !== "currency" && format !== "percent") {
     return SIGN_COLORS.neutral;
   }
-  const numVal = toNumber(value);
+  if (isUnavailableStatValue(value)) {
+    return SIGN_COLORS.neutral;
+  }
+  const numVal = toNumber(value as string | number);
   if (!Number.isFinite(numVal)) {
     return SIGN_COLORS.neutral;
   }

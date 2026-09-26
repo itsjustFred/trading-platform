@@ -19,17 +19,18 @@ import pytest
 from data_tools.downloaders.base import Downloader, DownloadResult
 
 
-def _merged_tick_call_site(native_module) -> ast.Call:
-    """Return the AST call node of the merged bid+ask tick download in download()."""
+def _merged_tick_call_sites(native_module) -> list[ast.Call]:
+    """Return the AST call nodes of every merged bid+ask tick download."""
     source_path = Path(inspect.getfile(native_module))
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    calls = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
             func = node.value.func
             name = getattr(func, "id", None) or getattr(func, "attr", None)
             if name == "_download_and_assemble_merged_ticks":
-                return node.value
-    raise AssertionError("merged tick call site not found")
+                calls.append(node.value)
+    return calls
 
 
 class _BareDownloader(Downloader):
@@ -245,10 +246,16 @@ class TestHuggingfaceFailureVisibility:
 
 class TestDukascopyMergedTickContract:
     def test_merged_tick_call_passes_pipeline_batches_without_duplication(self):
-        """Regression DV-C1 / Sonar S5549: the merged bid+ask tick call must
+        """Regression DV-C1 / Sonar S5549: every merged bid+ask tick call must
         pass pipeline_batches exactly once. The pre-fix call passed six
         positional args plus pipeline_batches as keyword, which raises
-        TypeError at download time (never covered by a test until now)."""
+        TypeError at download time (never covered by a test until now).
+
+        ``_download_and_assemble_merged_ticks`` declares pipeline_batches,
+        pause_ms and max_retries keyword-only, so a call site that also passes
+        them positionally raises TypeError the moment a merged tick download
+        runs. Every call site is checked, not just the first one.
+        """
         import data_tools.downloaders.dukascopy_native as native
 
         signature = inspect.signature(native._download_and_assemble_merged_ticks)
@@ -262,19 +269,25 @@ class TestDukascopyMergedTickContract:
             name for name in signature.parameters if name not in positional
         }
 
-        call = _merged_tick_call_site(native)
-        passed_positional = [ast.unparse(arg) for arg in call.args]
-        passed_keyword = {keyword.arg for keyword in call.keywords}
+        calls = _merged_tick_call_sites(native)
+        assert calls, "merged tick call site not found"
+        for call in calls:
+            passed_positional = [ast.unparse(arg) for arg in call.args]
+            passed_keyword = {keyword.arg for keyword in call.keywords}
 
-        assert len(passed_positional) == len(positional), (
-            f"call passes {len(passed_positional)} positional args, "
-            f"function defines {len(positional)}: {passed_positional} vs {positional}"
-        )
-        overlap = passed_keyword & set(positional)
-        assert not overlap, f"positional params re-passed as keywords: {sorted(overlap)}"
-        unknown = passed_keyword - set(signature.parameters)
-        assert not unknown, f"call passes unknown keywords: {sorted(unknown)}"
-        assert "pipeline_batches" in keyword_names | passed_keyword
+            assert len(passed_positional) == len(positional), (
+                f"line {call.lineno}: call passes {len(passed_positional)} positional args, "
+                f"function defines {len(positional)}: {passed_positional} vs {positional}"
+            )
+            overlap = passed_keyword & set(positional)
+            assert not overlap, (
+                f"line {call.lineno}: positional params re-passed as keywords: {sorted(overlap)}"
+            )
+            unknown = passed_keyword - set(signature.parameters)
+            assert not unknown, (
+                f"line {call.lineno}: call passes unknown keywords: {sorted(unknown)}"
+            )
+            assert "pipeline_batches" in keyword_names | passed_keyword
 
     def test_merged_tick_call_is_executable(self, tmp_path, monkeypatch):
         """The merged tick path must not raise TypeError when invoked with the
@@ -283,10 +296,27 @@ class TestDukascopyMergedTickContract:
 
         captured: dict[str, object] = {}
 
-        async def fake_merged(instrument, start_dt, end_dt, batch_size, **kwargs):
-            captured["pipeline_batches"] = kwargs["pipeline_batches"]
-            captured["pause_ms"] = kwargs["pause_ms"]
-            captured["max_retries"] = kwargs["max_retries"]
+        async def fake_merged(
+            instrument,
+            start_dt,
+            end_dt,
+            batch_size,
+            *,
+            pipeline_batches=1,
+            pause_ms=1000,
+            max_retries=3,
+            report_progress=None,
+            stop_event=None,
+            pause_event=None,
+            log_callback=None,
+        ):
+            # Mirrors the real keyword-only signature: a call site that passed
+            # these positionally must raise TypeError here too.
+            captured["batch_size"] = batch_size
+            captured["pipeline_batches"] = pipeline_batches
+            captured["pause_ms"] = pause_ms
+            captured["max_retries"] = max_retries
+            captured["report_progress"] = report_progress
             return pd.DataFrame({"timestamp": pd.to_datetime(["2024-01-01T00:00:00Z"], utc=True)})
 
         monkeypatch.setattr(native, "_download_and_assemble_merged_ticks", fake_merged)
@@ -323,7 +353,13 @@ class TestDukascopyMergedTickContract:
         assert not thread.is_alive(), "merged tick download timed out"
 
         result = result_box["result"]
-        assert captured == {"pipeline_batches": 3, "pause_ms": 11, "max_retries": 5}
+        assert captured == {
+            "batch_size": 7,
+            "pipeline_batches": 3,
+            "pause_ms": 11,
+            "max_retries": 5,
+            "report_progress": None,
+        }
         assert result.rows >= 0
 
 

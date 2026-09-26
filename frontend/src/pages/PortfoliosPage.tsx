@@ -24,7 +24,9 @@ import {
 import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
-import { useToast } from "../components/ToastProvider";
+// `useToast` lives in the context module so this page and the provider do not
+// have to import each other (react-refresh/only-export-components).
+import { useToast } from "../components/toastContext";
 import {
   formatMaintenanceDeletionResult,
   reconcileMaintenanceSelection,

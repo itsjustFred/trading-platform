@@ -18,6 +18,9 @@ from uuid import uuid4
 
 import pytest
 
+import ctrader_open_api.messages.OpenApiMessages_pb2 as _real
+import ctrader_open_api.messages.OpenApiModelMessages_pb2 as _real_model
+
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
 # The reconcile-payload helpers below build real protobuf messages; without
@@ -589,7 +592,10 @@ def test_position_scoped_close_order_recovery_uses_durable_position_id(tmp_path:
 def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
     """Saving and reading broker_order_id must be symmetric."""
     database = isolated_db
-    database.ensure_live_account("acc-1", "ctrader")
+    # ACTIVE deployments require a fresh broker demo verification in addition
+    # to the is_demo flag, mirroring what account discovery records.
+    database.ensure_live_account("acc-1", "ctrader", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
         symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
@@ -615,7 +621,10 @@ def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
 
 def test_get_live_signal_metadata_roundtrip(isolated_db):
     database = isolated_db
-    database.ensure_live_account("acc-1", "ctrader")
+    # ACTIVE deployments require a fresh broker demo verification in addition
+    # to the is_demo flag, mirroring what account discovery records.
+    database.ensure_live_account("acc-1", "ctrader", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(),
         strategy_name="demo",
@@ -645,7 +654,10 @@ def test_get_live_signal_metadata_roundtrip(isolated_db):
 def test_get_live_signal_broker_order_id_missing(isolated_db):
     """Missing broker_order_id must return None or empty."""
     database = isolated_db
-    database.ensure_live_account("acc-1", "ctrader")
+    # ACTIVE deployments require a fresh broker demo verification in addition
+    # to the is_demo flag, mirroring what account discovery records.
+    database.ensure_live_account("acc-1", "ctrader", is_demo=True)
+    database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
         symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
@@ -812,3 +824,331 @@ def test_dedupe_executions_idempotent_on_clean_table(isolated_db):
     with database.get_session() as session:
         rows = session.exec(database.select(database.LiveExecutionModel)).all()
     assert len(rows) == 2
+
+
+# ─── cTrader cancel / flatten (STOPPED semantics) ───────────────────────────
+
+
+class _FakeCTraderAdapter:
+    """Exercises the cTrader cancel/flatten logic without a broker connection."""
+
+    def __init__(self, orders, positions):
+        self._orders = orders
+        self._positions = positions
+        self.sent = []
+        self.ctid_trader_account_id = 10105151
+        self._connected = True
+        self._authenticated = True
+
+    def _raise_if_terminal_auth_failed(self):
+        return None
+
+    def _raise_terminal_auth_from_api_error(self, exc):
+        return None
+
+    # Use the REAL protobuf message classes. Hand-rolled stand-ins accepted
+    # whatever the adapter assigned to them, so a str being assigned to an
+    # int64 field (which raises TypeError on the wire) passed these tests.
+    _ProtoOACancelOrderReq = _real.ProtoOACancelOrderReq
+    _ProtoOAClosePositionReq = _real.ProtoOAClosePositionReq
+    _ProtoOAOrderType = _real_model.ProtoOAOrderType
+    _ProtoOAOrderStatus = _real_model.ProtoOAOrderStatus
+    _ProtoOAReconcileReq = _real.ProtoOAReconcileReq
+    _ProtoOAReconcileRes = _real.ProtoOAReconcileRes
+    _ProtoOAPositionStatus = _real_model.ProtoOAPositionStatus
+
+    async def connect(self):
+        return None
+
+    async def _send_request_with_refresh_retry(self, request, timeout_seconds=None):
+        """Answer reconcile with the real repeated `order` field.
+
+        The field is named `order`, not `orders`, and the response is built from
+        the real ProtoOAReconcileRes so a wrong field name fails here.
+        """
+        self.sent.append(request)
+        if isinstance(request, self._ProtoOAReconcileReq):
+            response = self._ProtoOAReconcileRes()
+            for order in self._orders:
+                response.order.add().CopyFrom(order)
+            for position in self._positions:
+                response.position.add().CopyFrom(position)
+            return response
+        return object()
+
+    async def cancel_open_orders(self):
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+        source = CTraderLiveAdapter.cancel_open_orders
+        return await source(self)
+
+
+def _order(order_id: int, order_type: int):
+    """A real ProtoOAOrder: ids are int64, so a string id would be rejected."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.orderId = order_id
+    order.orderType = order_type
+    return order
+
+
+async def _cancel(orders):
+    adapter = _FakeCTraderAdapter(orders, [])
+    cancelled = await adapter.cancel_open_orders()
+    return adapter, cancelled
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_cancel_skips_market_orders_and_cancels_resting_ones():
+    adapter, cancelled = _run(
+        _cancel(
+            [
+                _order(101, 1),  # MARKET
+                _order(102, 2),  # LIMIT
+                _order(103, 4),  # STOP_LOSS_TAKE_PROFIT
+                _order(104, 6),  # STOP_LIMIT
+            ]
+        )
+    )
+    assert cancelled == 3, "market orders fill immediately and cannot be cancelled"
+    ids = [int(getattr(r, "orderId", 0) or 0) for r in adapter.sent if getattr(r, "orderId", 0)]
+    assert 101 not in ids, "market orders fill immediately and cannot be cancelled"
+    assert {102, 103, 104} <= set(ids)
+
+
+def test_cancel_with_no_orders_is_a_no_op():
+    adapter, cancelled = _run(_cancel([]))
+    assert cancelled == 0
+    # The order-list request is still sent; only the cancel requests are absent.
+    assert all(not getattr(r, "orderId", "") for r in adapter.sent)
+
+
+def test_cancel_rejects_an_unexpected_response_type():
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _bad(request, timeout_seconds=None):
+        return "not-a-reconcile-response"
+
+    adapter._send_request_with_refresh_retry = _bad
+    with pytest.raises(RuntimeError, match="Unexpected reconcile response"):
+        _run(adapter.cancel_open_orders())
+
+
+def test_flatten_closes_every_open_position():
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [_real_position(201, 1000), _real_position(202, 2000)]
+    adapter = _FakeCTraderAdapter([], positions)
+
+    class _ReconcileRes:
+        pass
+
+    async def _reconcile(request, timeout_seconds=None):
+        return _ReconcileRes()
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+    closed = _run(CTraderLiveAdapter.close_all_positions(adapter))
+    assert closed == 2
+    closed_ids = [int(r.positionId) for r in adapter.sent]
+    assert closed_ids == [201, 202]
+    # A full close must carry the position volume; cTrader rejects volume 0.
+    assert all(int(r.volume) > 0 for r in adapter.sent)
+
+
+def test_flatten_skips_positions_without_an_id():
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    positions = [_real_position(0, 0)]
+    adapter = _FakeCTraderAdapter([], positions)
+
+    async def _positions():
+        return positions
+
+    adapter._fetch_open_positions = _positions
+    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert adapter.sent == []
+
+
+def test_both_brokers_now_advertise_the_controls():
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+    from live_runner.base_adapter import BaseLiveAdapter
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    for adapter_cls in (AlpacaLiveAdapter, CTraderLiveAdapter):
+        assert adapter_cls.supports_cancel_orders.fget(object()) is True
+        assert adapter_cls.supports_flatten.fget(object()) is True
+
+    # A base adapter that implements neither must not claim support.
+    class _Bare(BaseLiveAdapter):
+        async def connect(self): ...
+        async def submit_order(self, signal, *, qty=None): return ""
+        async def listen_executions(self): ...
+        async def get_balance(self): return (0.0, 0.0)
+
+    bare = _Bare()
+    assert bare.supports_cancel_orders is False
+    assert bare.supports_flatten is False
+
+
+def _real_position(position_id: int, volume: int):
+    """A real ProtoOAPosition with the fields the adapter reads."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition
+
+    position = ProtoOAPosition()
+    position.positionId = position_id
+    position.positionStatus = 1  # POSITION_STATUS_OPEN
+    trade_data = position.tradeData
+    trade_data.symbolId = 1
+    trade_data.volume = volume
+    return position
+
+
+# ─── only working orders may be cancelled ───────────────────────────────────
+
+
+def _make_cancel_adapter(tmp_path: Path, orders):
+    """Adapter whose transport answers the reconcile, then records cancels."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOACancelOrderReq,
+        ProtoOAReconcileReq,
+        ProtoOAReconcileRes,
+    )
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAReconcileReq = ProtoOAReconcileReq
+    adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
+    adapter._ProtoOACancelOrderReq = ProtoOACancelOrderReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+
+    # Real ProtoOAReconcileRes, so the repeated `order` field is the real one.
+    response = ProtoOAReconcileRes()
+    for order in orders:
+        response.order.add().CopyFrom(order)
+
+    cancelled: list[int] = []
+
+    async def _fake_send(request, **_kwargs):
+        if isinstance(request, ProtoOAReconcileReq):
+            return response
+        if isinstance(request, ProtoOACancelOrderReq):
+            cancelled.append(int(request.orderId))
+            return ProtoOAReconcileRes()
+        raise AssertionError(f"unexpected request {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    adapter.cancelled_ids = cancelled
+    return adapter
+
+
+def test_cancel_open_orders_skips_filled_and_cancelled_orders(tmp_path):
+    """A terminal order must not be sent for cancellation.
+
+    cTrader rejects it, and the rejection propagates out of the loop, so the
+    remaining working orders would stay resting after a STOP.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    def _order(order_id: int, status: int) -> "ProtoOAOrder":
+        order = ProtoOAOrder()
+        order.orderId = order_id
+        order.orderType = ProtoOAOrderType.LIMIT
+        order.orderStatus = status
+        return order
+
+    adapter = _make_cancel_adapter(
+        tmp_path,
+        [
+            _order(11, ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED),
+            _order(22, ProtoOAOrderStatus.ORDER_STATUS_FILLED),
+            _order(33, ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
+            _order(44, ProtoOAOrderStatus.ORDER_STATUS_REJECTED),
+            _order(55, ProtoOAOrderStatus.ORDER_STATUS_EXPIRED),
+        ],
+    )
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [11], (
+        f"only the accepted order may be cancelled, got {adapter.cancelled_ids}"
+    )
+    assert count == 1
+
+
+def test_cancel_open_orders_still_cancels_working_orders_of_every_type(tmp_path):
+    """Status filtering must not narrow the cancellable-type set."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    orders = []
+    for index, order_type in enumerate(
+        (
+            ProtoOAOrderType.LIMIT,
+            ProtoOAOrderType.STOP,
+            ProtoOAOrderType.STOP_LIMIT,
+        ),
+        start=1,
+    ):
+        order = ProtoOAOrder()
+        order.orderId = index
+        order.orderType = order_type
+        order.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+        orders.append(order)
+
+    # MARKET orders fill immediately and cannot be cancelled.
+    market = ProtoOAOrder()
+    market.orderId = 99
+    market.orderType = ProtoOAOrderType.MARKET
+    market.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    orders.append(market)
+
+    adapter = _make_cancel_adapter(tmp_path, orders)
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [1, 2, 3]
+    assert count == 3
+
+
+def test_cancel_open_orders_treats_a_missing_status_as_working(tmp_path):
+    """An unrecognised response shape must not silently leave orders resting."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderType,
+    )
+
+    order = ProtoOAOrder()  # orderStatus left at its default (unset)
+    order.orderId = 77
+    order.orderType = ProtoOAOrderType.LIMIT
+
+    adapter = _make_cancel_adapter(tmp_path, [order])
+    count = asyncio.run(adapter.cancel_open_orders())
+
+    assert adapter.cancelled_ids == [77], (
+        f"a missing status must still be cancelled, got {adapter.cancelled_ids}"
+    )
+    assert count == 1

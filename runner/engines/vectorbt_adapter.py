@@ -15,6 +15,12 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import logging
+
+# Merge resolution: main's `math`, `traceback` and `Mapping` are all used by
+# its per-symbol error containment and column-role work, and are kept. The merge
+# base's `os` and `warnings` have no remaining user on either side — the branch
+# deleted them, main replaced them — so they stay deleted rather than being
+# resurrected as unused imports.
 import math
 import traceback
 from collections.abc import Mapping
@@ -315,13 +321,19 @@ def _process_symbol(
     strategy_path: str,
     resolved_parameters: dict[str, Any],
     data_root: Path,
+    # Merge resolution: both sides changed the same signature in different
+    # directions and both are kept. main added `warning_keys`, the cross-process
+    # channel its per-symbol warning de-duplication needs (a multiprocessing
+    # worker cannot report into the parent's set directly). The branch added
+    # the resolved `data_path` as a 7th return value so the caller can record
+    # which file each symbol's trades actually came from.
     warning_keys: set[tuple[str, str, str]] | None = None,
-) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries], int]:
+) -> tuple[list[Trade], list[str], DrawingList, list[IndicatorSeries], int, int, Path]:
     """Process a single symbol: load data, generate signals, extract trades.
 
     Returns (trades_with_temp_ids, used_intrabar_timeframes, drawings,
-    indicator_series, loaded_bar_count, inverted_stop_drops). Runs in its
-    own process when parallelized.
+    indicator_series, loaded_bar_count, inverted_stop_drops, data_path). Runs
+    in its own process when parallelized.
     """
     strategy_mod = _load_strategy_module(strategy_path)
     # A-H4 (D3): warmup_start extends the loaded window backwards for
@@ -330,7 +342,12 @@ def _process_symbol(
     warmup_raw = str(getattr(config, "warmup_start", "") or "").strip()
     load_start = warmup_raw or config.start_date
     df, data_path = _load_ohlcv(
-        data_root, symbol, config.timeframe, load_start, config.end_date
+        data_root,
+        symbol,
+        config.timeframe,
+        load_start,
+        config.end_date,
+        data_source=config.data_source,
     )
     if df is None or df.empty:
         raise RuntimeError(
@@ -358,6 +375,7 @@ def _process_symbol(
         config.modeling_resolution,
         load_start,
         config.end_date,
+        data_source=config.data_source,
     )
     extra_timeframes = [intrabar_timeframe] if intrabar_timeframe else []
 
@@ -642,9 +660,20 @@ def _process_symbol(
             )
             trades.append(trade)
             # #84: the equity path accumulates NET pnl (fees are real costs).
+            # The merge base credited gross `pnl`; the branch fixed this to
+            # `pnl - fees` and main's comment records why. Same code, so the
+            # branch's line is kept with main's rationale.
             equity += pnl - fees
 
-    return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
+    return (
+        trades,
+        extra_timeframes,
+        drawings,
+        indicator_series,
+        len(df),
+        inverted_stop_drops,
+        data_path,
+    )
 
 
 @dataclass
@@ -671,6 +700,7 @@ class VectorbtAdapter(EngineAdapter):
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         all_trades: list[Trade] = []
+        all_data_paths: list[Path] = []
         all_drawings: DrawingList = []
         all_indicators: list[IndicatorSeries] = []
         used_timeframes = [config.timeframe]
@@ -738,9 +768,11 @@ class VectorbtAdapter(EngineAdapter):
                             indicator_series,
                             loaded_bars,
                             inverted_drops,
+                            data_path,
                         ) = future.result()
                         total_loaded_bars += loaded_bars
                         total_inverted_drops += inverted_drops
+                        all_data_paths.append(data_path)
                         all_trades.extend(trades)
                         all_drawings.extend(drawings)
                         all_indicators.extend(indicator_series)
@@ -754,6 +786,13 @@ class VectorbtAdapter(EngineAdapter):
 
         else:
             for symbol in config.symbols:
+                # Merge resolution: main's per-symbol error containment and
+                # keyword pass-through are kept — the serial path must fail the
+                # run through the same `_raise_symbol_errors()` funnel as the
+                # parallel one, and must forward `warning_keys` when the
+                # installed worker accepts it. The branch's 7th unpacking slot
+                # (`data_path`) is added so both paths feed `all_data_paths`
+                # identically, matching the parallel branch above.
                 try:
                     (
                         trades,
@@ -762,6 +801,7 @@ class VectorbtAdapter(EngineAdapter):
                         indicator_series,
                         loaded_bars,
                         inverted_drops,
+                        data_path,
                     ) = _process_symbol(
                         symbol,
                         config,
@@ -776,6 +816,7 @@ class VectorbtAdapter(EngineAdapter):
                     continue
                 total_loaded_bars += loaded_bars
                 total_inverted_drops += inverted_drops
+                all_data_paths.append(data_path)
                 all_trades.extend(trades)
                 all_drawings.extend(drawings)
                 all_indicators.extend(indicator_series)
@@ -847,7 +888,11 @@ class VectorbtAdapter(EngineAdapter):
             ]
             equity = config.initial_capital
             for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                # #84: portfolio replay accumulates NET pnl.
+                # #84: portfolio replay accumulates NET pnl. The branch's
+                # `net_pnl if not None else pnl` is kept, widened by main to
+                # subtract recorded fees on the gross-only path — a trade whose
+                # engine never split net from gross would otherwise credit
+                # costs twice over as pure profit here.
                 equity += (
                     float(trade.net_pnl)
                     if trade.net_pnl is not None
@@ -879,6 +924,12 @@ class VectorbtAdapter(EngineAdapter):
         except (ValueError, TypeError):
             pass
 
+        path_metadata = [contract.ohlcv_path_metadata(path) for path in all_data_paths]
+        selected_sources = sorted({item["source"] for item in path_metadata if item["source"]})
+        selected_asset_classes = sorted(
+            {item["asset_class"] for item in path_metadata if item["asset_class"]}
+        )
+
         meta = BacktestMeta(
             id=f"vbt-{config.strategy_name}-{now.strftime('%Y%m%d-%H%M%S')}",
             created_at=now.isoformat(),
@@ -896,7 +947,10 @@ class VectorbtAdapter(EngineAdapter):
                 "timeframes": used_timeframes,
                 "symbols": config.symbols,
                 "universe": "",
-                "source": "yfinance",
+                "source": ",".join(selected_sources) or "ohlcv",
+                "asset_classes": selected_asset_classes,
+                "data_files": [str(path) for path in all_data_paths],
+                "requested_data_source": config.data_source,
                 # A-M7: every inverted-stop drop is counted (warn-once log
                 # only shows the first) — a non-zero count here means the
                 # run silently skipped mispriced trades.
@@ -1451,17 +1505,21 @@ def _load_ohlcv(
     timeframe: str,
     start_date: str,
     end_date: str,
+    *,
+    data_source: str = "",
 ) -> tuple[pd.DataFrame | None, Path | None]:
     """Find and load OHLCV parquet for a symbol."""
-    ohlcv_root = data_root / "ohlcv"
-    matches = sorted(
-        ohlcv_root.rglob(f"**/{symbol}/{timeframe}.parquet"),
-        key=lambda path: path.as_posix(),
+    # Merge resolution: the branch's data-source-aware selection is the superset
+    # — it routes to a named feed and returns the resolved path so the caller can
+    # record which file each symbol's trades came from. main's determinism
+    # intent is preserved because `contract.select_ohlcv_path` returns
+    # `min(candidates, key=rank)` with `str(path)` as the final tiebreaker.
+    selected_path, _ = contract.select_ohlcv_path(
+        data_root, symbol, timeframe, data_source=data_source
     )
-    if not matches:
+    if selected_path is None:
         return None, None
 
-    selected_path = matches[0]
     df = pd.read_parquet(selected_path)
     df.columns = [c.lower() for c in df.columns]
     df = contract.normalize_ohlcv_frame(df)
@@ -1496,12 +1554,21 @@ def _load_intrabar_ohlcv(
     intrabar_resolution: str | None,
     start_date: str,
     end_date: str,
+    *,
+    data_source: str = "",
 ) -> tuple[pd.DataFrame | None, str | None]:
     target_timeframe = _resolve_intrabar_timeframe(base_timeframe, intrabar_resolution)
     if not target_timeframe:
         return None, None
 
-    intrabar_df, _ = _load_ohlcv(data_root, symbol, target_timeframe, start_date, end_date)
+    intrabar_df, _ = _load_ohlcv(
+        data_root,
+        symbol,
+        target_timeframe,
+        start_date,
+        end_date,
+        data_source=data_source,
+    )
     if intrabar_df is None or intrabar_df.empty:
         logger.info(
             "Intrabar data unavailable for %s/%s at %s; falling back to open/close exits",

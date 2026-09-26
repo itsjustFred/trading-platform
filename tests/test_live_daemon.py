@@ -37,12 +37,24 @@ class _TrackingAdapter:
         self.disconnect_calls += 1
 
 
+@pytest.fixture(autouse=True)
+def _stub_submission_claims(monkeypatch):
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(daemon, "_deployment_account_is_demo", lambda _account_id: True)
+
+
 def test_ensure_adapter_for_active_account_keeps_adapter_after_connect_failure(monkeypatch):
     adapter = _FailingAdapter()
     account = LiveAccountConfig(
         id="acc-1",
         broker="ctrader",
         name="Demo",
+        is_demo=True,
         broker_login="",
         ctid="",
     )
@@ -75,6 +87,58 @@ def test_ensure_adapter_for_active_account_keeps_adapter_after_connect_failure(m
     assert active_adapters == {"acc-1": adapter}
 
 
+def test_ensure_adapter_refuses_non_demo_account(monkeypatch):
+    account = LiveAccountConfig(
+        id="acc-live",
+        broker="alpaca",
+        name="Live",
+        is_demo=False,
+    )
+    called = False
+
+    def _factory(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return None
+
+    monkeypatch.setattr(daemon, "_create_adapter_for_account", _factory)
+
+    asyncio.run(
+        daemon._ensure_adapter_for_active_account(
+            "acc-live",
+            {"acc-live": account},
+            {},
+            accounts_env_values={},
+        )
+    )
+
+    assert called is False
+
+
+def test_ensure_adapter_refuses_non_paper_alpaca_adapter(monkeypatch):
+    account = LiveAccountConfig(
+        id="acc-paper",
+        broker="alpaca",
+        name="Paper",
+        is_demo=True,
+    )
+    adapter = SimpleNamespace(paper=False)
+    monkeypatch.setattr(
+        daemon, "_create_adapter_for_account", lambda *_args, **_kwargs: adapter
+    )
+
+    asyncio.run(
+        daemon._ensure_adapter_for_active_account(
+            "acc-paper",
+            {"acc-paper": account},
+            {},
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.paper is False
+
+
 def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypatch):
     daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.clear()
     daemon._CTRADER_AUTH_BLOCKED_REASONS.clear()
@@ -99,6 +163,7 @@ def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypa
         id="acc-ctrader",
         broker="ctrader",
         name="Demo",
+        is_demo=True,
         broker_login="",
         ctid="",
     )
@@ -455,13 +520,20 @@ def test_submit_skips_deployment_with_typo_allow_short(monkeypatch) -> None:
     from risk import TradeSignal
 
     trade_signal = TradeSignal(
-        action="short",
+        # Merge resolution: the fixture used `action="buy"`, but the conversion
+        # site only evaluates `allow_short` for a sell/short, so the typo was
+        # never parsed and the assertion was vacuous. Use the action the check
+        # actually applies to.
+        action="sell",
         symbol="EURUSD",
         entry_price=1.1,
-        stop_loss=None,
-        take_profit=None,
+        stop_loss=1.0,
+        take_profit=1.2,
         timeframe="15m",
-        metadata={},
+        # `signal_is_fresh` is fail-closed on a missing `received_at`, and the
+        # real Discord dispatch path always stamps one at receipt. Without it
+        # this fixture is discarded as stale before any gate below runs.
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
     )
 
     submitted: list[object] = []
@@ -471,6 +543,7 @@ def test_submit_skips_deployment_with_typo_allow_short(monkeypatch) -> None:
         raise AssertionError("submission must never be attempted for a bad config")
 
     monkeypatch.setattr(daemon, "submit_order_with_risk", _fail_submit_with_risk)
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
 
     asyncio.run(
         daemon._submit_normalized_discord_signal(
@@ -484,6 +557,163 @@ def test_submit_skips_deployment_with_typo_allow_short(monkeypatch) -> None:
     )
 
     assert submitted == []
+
+
+def test_submission_claim_blocks_order_after_pause_race(monkeypatch) -> None:
+    deployment = _deployment_with_signal_config({})
+    released: list[str] = []
+
+    class _NoSubmitAdapter:
+        async def get_positions(self):
+            raise AssertionError("must not be reached")
+
+        async def get_balance(self):
+            raise AssertionError("must not be reached")
+
+    from risk import TradeSignal
+
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=1.0,
+        take_profit=1.2,
+        timeframe="15m",
+        # Merge resolution: `signal_is_fresh` is fail-closed on a missing
+        # `received_at`, and the real Discord dispatch path always stamps one at
+        # receipt. Without it these fixtures are discarded as stale before any
+        # gate below runs, which would make the assertions vacuous.
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_args: False)
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda token: released.append(token)
+    )
+
+    async def _unexpected_submit(*_args, **_kwargs):
+        raise AssertionError("order submission must lose the pause race")
+
+    monkeypatch.setattr(daemon, "submit_order_with_risk", _unexpected_submit)
+
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            "acc-1",
+            _NoSubmitAdapter(),
+            deployment,
+            trade_signal,
+            signal_timeframe="15m",
+            wait_enabled=False,
+        )
+    )
+
+    assert released == []
+
+
+def test_submission_path_refuses_non_demo_account(monkeypatch) -> None:
+    deployment = _deployment_with_signal_config({})
+    released: list[str] = []
+
+    class _NoSubmitAdapter:
+        async def get_positions(self):
+            raise AssertionError("must not be reached")
+
+        async def get_balance(self):
+            raise AssertionError("must not be reached")
+
+    from risk import TradeSignal
+
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=1.0,
+        take_profit=1.2,
+        timeframe="15m",
+        # Merge resolution: `signal_is_fresh` is fail-closed on a missing
+        # `received_at`, and the real Discord dispatch path always stamps one at
+        # receipt. Without it these fixtures are discarded as stale before any
+        # gate below runs, which would make the assertions vacuous.
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+    monkeypatch.setattr(daemon, "_deployment_account_is_demo", lambda _account_id: False)
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda token: released.append(token)
+    )
+
+    async def _unexpected_submit(*_args, **_kwargs):
+        raise AssertionError("non-demo account must not submit")
+
+    monkeypatch.setattr(daemon, "submit_order_with_risk", _unexpected_submit)
+
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            "acc-1",
+            _NoSubmitAdapter(),
+            deployment,
+            trade_signal,
+            signal_timeframe="15m",
+            wait_enabled=False,
+        )
+    )
+
+    assert released == []
+
+
+def test_submission_claim_releases_after_submit_failure(monkeypatch) -> None:
+    deployment = _deployment_with_signal_config({})
+    released: list[str] = []
+
+    class _NoSubmitAdapter:
+        async def get_positions(self):
+            raise AssertionError("must not be reached")
+
+        async def get_balance(self):
+            raise AssertionError("must not be reached")
+
+    from risk import TradeSignal
+
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.1,
+        stop_loss=1.0,
+        take_profit=1.2,
+        timeframe="15m",
+        # Merge resolution: `signal_is_fresh` is fail-closed on a missing
+        # `received_at`, and the real Discord dispatch path always stamps one at
+        # receipt. Without it these fixtures are discarded as stale before any
+        # gate below runs, which would make the assertions vacuous.
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+
+    async def _failing_submit(*_args, **_kwargs):
+        raise RuntimeError("broker rejected")
+
+    monkeypatch.setattr(daemon, "submit_order_with_risk", _failing_submit)
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda token: released.append(token) or True,
+    )
+
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            "acc-1",
+            _NoSubmitAdapter(),
+            deployment,
+            trade_signal,
+            signal_timeframe="15m",
+            wait_enabled=False,
+        )
+    )
+
+    assert len(released) == 1
 
 
 def test_ctrader_auth_block_clears_for_all_accounts_when_shared_credentials_change() -> None:
@@ -801,9 +1031,13 @@ def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monke
 
 
 def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
+    # account_id is a local UUID; the Alpaca account number is broker identity
+    # and is supplied separately, because comparing a UUID against an account
+    # number is comparing two different identifier spaces.
+    ramjet_number = "PA3T0MQAGQ51"
     deployment = LiveDeploymentConfig(
         strategy_name="discord::ramjet",
-        account_id="PA3T0MQAGQ51",
+        account_id="59d94c55-f6d3-4c38-ba4d-ec1e22abdbcf",
         symbols=["AAPL"],
         timeframe="1h",
         status="ACTIVE",
@@ -812,14 +1046,27 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
         signal_source_id="RAMJET",
         signal_config={"signal_processor": "ramjet"},
     )
+    route_env = {"ALPACA_ACCOUNT_NAME_ACC2": "RamJet", "ALPACA_ACCOUNT_NUMBER_ACC2": ramjet_number}
 
     assert daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "RAMJET"},
+        account_broker_login=ramjet_number,
+        accounts_env_values=route_env,
     )
     assert not daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "NITRO"},
+        account_broker_login=ramjet_number,
+        accounts_env_values=route_env,
+    )
+    # Correctly routed account, but the deployment sits on the wrong broker
+    # account: must be refused rather than dispatched.
+    assert not daemon._deployment_matches_stockkit_route(
+        deployment,
+        {"discord_bot_name": "RAMJET"},
+        account_broker_login="PA-SOME-OTHER-ACCOUNT",
+        accounts_env_values=route_env,
     )
 
 
@@ -1112,3 +1359,431 @@ def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
     # Gathered: fast completes while slow is still sleeping. Sequential
     # would order slow first (dict order) — or never reach fast at all.
     assert completions and completions[0] == "fast"
+# ─── STOPPED semantics: cancel resting orders and flatten ────────────────────
+
+
+class _RecordingAdapter:
+    """Minimal adapter that records cancel/flatten calls."""
+
+    def __init__(
+        self,
+        *,
+        supports_cancel: bool = True,
+        supports_flat: bool = True,
+        fail_cancel: bool = False,
+    ) -> None:
+        self._supports_cancel = supports_cancel
+        self._supports_flat = supports_flat
+        self._fail_cancel = fail_cancel
+        self.cancel_calls = 0
+        self.flatten_calls = 0
+
+    @property
+    def supports_cancel_orders(self) -> bool:
+        return self._supports_cancel
+
+    @property
+    def supports_flatten(self) -> bool:
+        return self._supports_flat
+
+    async def cancel_open_orders(self) -> int:
+        if not self._supports_cancel:
+            raise NotImplementedError("no cancel support")
+        self.cancel_calls += 1
+        if self._fail_cancel:
+            raise RuntimeError("broker rejected cancel")
+        return 2
+
+    async def close_all_positions(self) -> int:
+        if not self._supports_flat:
+            raise NotImplementedError("no flatten support")
+        self.flatten_calls += 1
+        return 1
+
+
+def _stopped_deployment(
+    deployment_id: str = "44444444-4444-4444-8444-444444444444",
+) -> LiveDeploymentConfig:
+    from shared.models import LiveDeploymentConfig as _Config
+
+    return _Config(
+        id=deployment_id,
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="STOPPED",
+        signal_source="internal",
+    )
+
+
+def test_stopped_deployment_cancels_and_flattens_once(monkeypatch):
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        deployments = [_stopped_deployment()]
+        for _ in range(3):
+            await daemon._enforce_stopped_deployments(
+                deployments, {"acc-1": adapter}, already_enforced=enforced
+            )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 1, "cancel must happen once per stop transition"
+    assert adapter.flatten_calls == 1, "flatten must happen once per stop transition"
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
+def test_stopped_deployment_re_enforces_after_reactivation(monkeypatch):
+    """A second STOPPED transition must enforce the controls again."""
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+        # Re-activated: the deployment is no longer stopped, so the record clears.
+        await daemon._enforce_stopped_deployments(
+            [], {"acc-1": adapter}, already_enforced=enforced
+        )
+        # Stopped again.
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 2
+    assert adapter.flatten_calls == 2
+
+
+def test_stopped_deployment_not_marked_enforced_when_adapter_cannot_flatten(monkeypatch):
+    """An adapter that cannot flatten must NOT be reported as stopped-flat."""
+    adapter = _RecordingAdapter(supports_flat=False)
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert enforced == set(), "must retry next sync instead of claiming success"
+    assert adapter.cancel_calls == 1
+
+
+def test_stopped_deployment_not_marked_enforced_when_cancel_fails(monkeypatch):
+    adapter = _RecordingAdapter(fail_cancel=True)
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert enforced == set()
+    assert adapter.flatten_calls == 0, "must not flatten when cancel failed"
+
+
+def test_stopped_deployment_without_adapter_is_retried_not_marked_enforced(monkeypatch):
+    """No adapter does NOT mean "nothing is open".
+
+    `active_adapters` is empty for every account right after a daemon restart, so
+    recording a stopped deployment as enforced here would permanently skip the
+    cancel/flatten for a deployment that really does still hold positions. It must
+    stay out of the ledger so the next sync retries once a connection exists.
+    """
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert "44444444-4444-4444-8444-444444444444" not in enforced
+
+    # Once an adapter exists, the stop is enforced and only then recorded.
+    adapter = _RecordingAdapter()
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+    )
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
+def test_paused_deployment_is_never_flattened(monkeypatch):
+    """PAUSE must never liquidate: only STOPPED triggers cancel/flatten."""
+    from shared.models import LiveDeploymentConfig as _Config
+
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+    paused = _Config(
+        id="55555555-5555-4555-8555-555555555555",
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="internal",
+    )
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [paused], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 0
+    assert adapter.flatten_calls == 0
+    assert enforced == set()
+
+
+def test_stopped_deployment_refuses_to_flatten_a_shared_active_account():
+    """cancel/flatten are account-wide.
+
+    If another deployment on the same account is still ACTIVE, flattening would
+    liquidate its positions as collateral damage. The stop must be refused and
+    left un-enforced so it is retried, never reported as honoured.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    stopped = _stopped_deployment()
+    other = _Config(
+        id="66666666-6666-4666-8666-666666666666",
+        strategy_name="other",
+        account_id=stopped.account_id,
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="internal",
+    )
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [stopped, other], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 0, "must not cancel orders on a shared account"
+    assert adapter.flatten_calls == 0, "must not flatten another deployment's positions"
+    assert enforced == set(), "a refused stop must be retried, not marked honoured"
+
+
+def test_stopped_deployment_flattens_when_the_account_is_exclusively_stopped():
+    """The guard must not block the ordinary case where the stopped deployment is
+    the only one on its account."""
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+
+    assert adapter.cancel_calls == 1
+    assert adapter.flatten_calls == 1
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
+def test_auth_scheme_is_keyed_like_the_token_for_a_deployment_without_an_id():
+    """Token and auth scheme must resolve against the same service name.
+
+    `_resolve_account_discord_token` falls back to `signal_config["service_name"]`
+    when `signal_source_id` is empty. Keying the scheme off `signal_source_id`
+    alone meant such a deployment found its token but ignored the per-bot
+    `DISCORD_BOT_<NAME>_AUTH_SCHEME` override, sending a `Bot` header for an
+    account token and getting a 401.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    deployment = _Config(
+        id="77777777-7777-4777-8777-777777777777",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_TOKEN": "tok",
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",
+        "DISCORD_AUTH_SCHEME": "bot",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "tok"
+    assert scheme == "account", (
+        "the per-bot auth scheme must win over the global default, as it does for the token"
+    )
+
+
+def test_account_ids_needing_stopped_enforcement_covers_stopped_only_accounts():
+    """A STOPPED-only account must be queued for an adapter.
+
+    The adapter is what performs cancel/flatten, so without this the stop was
+    logged and retried forever and never actually enforced.
+    """
+    stopped = _stopped_deployment()
+    assert daemon._account_ids_needing_stopped_enforcement([stopped], set()) == {
+        stopped.account_id
+    }
+
+
+def test_already_enforced_stopped_accounts_do_not_keep_an_adapter_alive():
+    """Once flattened, the account is released so the adapter is not kept open."""
+    stopped = _stopped_deployment()
+    assert (
+        daemon._account_ids_needing_stopped_enforcement(
+            [stopped], {str(stopped.id)}
+        )
+        == set()
+    )
+
+
+def test_active_deployments_are_never_included_in_enforcement_accounts():
+    """Only STOPPED deployments need enforcement; an ACTIVE one must not be
+    connected on this basis, or it could be flattened by mistake."""
+    from shared.models import LiveDeploymentConfig as _Config
+
+    active = _Config(
+        id="88888888-8888-4888-8888-888888888888",
+        strategy_name="stockkit",
+        account_id="acc-active",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+    )
+    assert daemon._account_ids_needing_stopped_enforcement([active], set()) == set()
+
+
+def test_global_token_fallback_uses_the_global_auth_scheme(monkeypatch):
+    """A global token is configured with the global scheme, not a per-bot one.
+
+    Finding the token under `DISCORD_BOT_TOKEN` while resolving the scheme from
+    the deployment's per-bot key sent an account header for a bot token, which
+    is a 401.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "global-token")
+    monkeypatch.setenv("DISCORD_AUTH_SCHEME", "bot")
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",  # per-bot override
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "global-token", "must fall back to the global token"
+    assert scheme == "bot", (
+        f"a global token must use the global scheme, got {scheme!r}"
+    )
+
+
+def test_per_bot_token_uses_the_per_bot_auth_scheme(monkeypatch):
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "global-token")
+    monkeypatch.setenv("DISCORD_AUTH_SCHEME", "bot")
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "ramjet"},
+    )
+    values = {
+        "DISCORD_BOT_RAMJET_TOKEN": "ramjet-account-token",
+        "DISCORD_BOT_RAMJET_AUTH_SCHEME": "account",
+        "DISCORD_AUTH_SCHEME": "bot",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "ramjet-account-token"
+    assert scheme == "account", f"a per-bot token must use its per-bot scheme, got {scheme!r}"
+
+
+def test_per_bot_scheme_falls_back_to_the_global_scheme(monkeypatch):
+    from shared.models import LiveDeploymentConfig as _Config
+
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    deployment = _Config(
+        id="99999999-9999-4999-8999-999999999999",
+        strategy_name="stockkit",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="discord",
+        signal_source_id="",
+        signal_config={"service_name": "rocketfuel"},
+    )
+    values = {
+        "DISCORD_BOT_ROCKETFUEL_TOKEN": "tok",
+        "DISCORD_AUTH_SCHEME": "account",
+    }
+    token, scheme = daemon._resolve_account_discord_credentials(values, deployment)
+    assert token == "tok"
+    assert scheme == "account", "the global scheme applies when no per-bot override exists"
+
+
+def test_stopped_deployment_refuses_to_flatten_an_account_with_a_paused_sibling():
+    """PAUSED still owns positions, so it must block a wholesale flatten.
+
+    Pausing drains and blocks new entries; it does not liquidate. Treating only
+    ACTIVE as position-owning meant stopping one deployment would have closed a
+    paused sibling's positions as collateral damage.
+    """
+    from shared.models import LiveDeploymentConfig as _Config
+
+    stopped = _stopped_deployment()
+    paused = _Config(
+        id="aaaaaaaa-1111-4111-8111-111111111111",
+        strategy_name="sibling",
+        account_id=stopped.account_id,
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="internal",
+    )
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    async def _run() -> None:
+        await daemon._enforce_stopped_deployments(
+            [stopped, paused], {"acc-1": adapter}, already_enforced=enforced
+        )
+
+    asyncio.run(_run())
+    assert adapter.flatten_calls == 0, "must not flatten a paused sibling's positions"
+    assert enforced == set(), "the stop stays un-enforced and is retried"

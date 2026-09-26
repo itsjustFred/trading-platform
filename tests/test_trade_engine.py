@@ -203,6 +203,57 @@ def test_sizing_only_stop_equal_to_fill_is_skipped():
     assert result.trades == []
 
 
+def test_trade_engine_mae_includes_signal_exit_bar_excursion():
+    records = []
+    for index in range(25):
+        low = 80.0 if index == 10 else 99.0
+        close = 105.0 if index == 10 else 101.0
+        records.append(
+            {
+                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+                "open": 100.0,
+                "high": 110.0,
+                "low": low,
+                "close": close,
+                "volume": 1000,
+            }
+        )
+    data = pd.DataFrame.from_records(records)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[1] = True
+        exits.iloc[10] = True
+        return entries, exits, {}, []
+
+    cfg = BacktestConfig(
+        strategy_name="mae-exit-bar",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000,
+        # Merge resolution: the engine now refuses to size without an explicit
+        # risk setting, so the fixture states one — the same
+        # `risk_per_trade_pct=0.01` every sibling sizing test in this file uses.
+        # The MAE/MFE assertions below are computed from the resulting
+        # `trade.quantity`, so the risk setting does not weaken them.
+        risk_per_trade_pct=0.01,
+        # ...and declares a no-cost run, as the engine now also refuses to size
+        # without an explicit fee/slippage setting. Every sibling sizing test in
+        # this file already uses `fees="zero"`.
+        parameters={"fees": "zero"},
+    )
+
+    result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.mae == pytest.approx((80.0 - trade.entry_price) * trade.quantity)
+    assert trade.mfe == pytest.approx((110.0 - trade.entry_price) * trade.quantity)
+
+
 def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
     data = _synthetic_ohlcv(100)
 
@@ -247,6 +298,9 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
 
     # 1% risk sizing => roughly -1000 PnL for a 2-point stop distance
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+    assert trade.risk_amount == pytest.approx(1000.0, abs=0.5)
+    assert trade.risk_percent == pytest.approx(0.01, abs=1e-6)
+    assert trade.meta["stop_loss"] == pytest.approx(109.0)
 
 
 def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
@@ -382,6 +436,11 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
     decides.
     """
     data = _synthetic_ohlcv(100)
+    # Merge resolution: the ambiguity bar is 12 (high 114 / low 109), as the
+    # docstring above requires. The other side of the merge raised bar 11 to
+    # high 113 as well, which would have put TP 113 inside the fill bar's range
+    # and triggered the very fill-bar recheck (A-H1) this test needs to avoid —
+    # a fixture that contradicts the test's own stated contract.
     data.loc[12, "high"] = 114.0
     data.loc[12, "low"] = 109.0
 

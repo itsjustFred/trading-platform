@@ -649,18 +649,45 @@ def _one_sided_p_value(returns: list[float]) -> float:
         return 1.0
 
 
+def _period_risk_free_rate(
+    risk_free_rate: float,
+    periods: int = DAILY_RETURN_PERIODS_PER_YEAR,
+) -> float:
+    """Convert an annual risk-free rate to a per-period rate.
+
+    The compound conversion ``(1 + rf) ** (1 / periods) - 1`` is what
+    quantstats applies to the annual ``rf`` before differencing, so using it
+    here is what keeps the manual fallback definitionally identical to the
+    quantstats path (ADR D5, docs/cleanup-16d1-money-path-semantics.md).
+    """
+    return math.pow(1.0 + float(risk_free_rate), 1.0 / periods) - 1.0
+
+
 def _sharpe_manual(
     returns: list[float],
     risk_free_rate: float,
-    annualization_factor: float = math.sqrt(252),
+    annualization_factor: float = math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR),
 ) -> float:
-    """Annualized Sharpe ratio (manual)."""
-    if not returns:
+    """Annualized Sharpe ratio, definitionally identical to quantstats.
+
+    Excess returns are ``r - rf_period``; the dispersion is the sample
+    standard deviation (ddof=1, i.e. ``pandas.Series.std()``); the ratio is
+    scaled by ``sqrt(periods)``. ``annualization_factor`` is 1.0 on the
+    raw-period fallback path (equity timestamps unresolvable), where there
+    are no daily periods to annualize and no annual rf to convert.
+
+    The D5 contract is ONE definition per metric on both code paths: a
+    machine with quantstats installed and one without must publish the same
+    Sharpe for the same backtest, so this must stay bit-identical to
+    ``quantstats.stats.sharpe(returns, rf=..., periods=252)``.
+    """
+    if len(returns) < 2:
         return 0.0
-    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
-    excess = [r - period_rf for r in returns]
+    daily_periods = annualization_factor == math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    period_rf = _period_risk_free_rate(risk_free_rate) if daily_periods else 0.0
+    excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
-    variance = sum((r - mean_excess) ** 2 for r in excess) / len(excess)
+    variance = sum((value - mean_excess) ** 2 for value in excess) / (len(excess) - 1)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
@@ -670,22 +697,29 @@ def _sharpe_manual(
 def _sortino_manual(
     returns: list[float],
     risk_free_rate: float,
-    annualization_factor: float = math.sqrt(252),
+    annualization_factor: float = math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR),
 ) -> float:
-    """Annualized Sortino ratio (manual)."""
-    if not returns:
+    """Annualized Sortino ratio, definitionally identical to quantstats.
+
+    Numerator is the mean EXCESS return. Downside deviation is
+    ``sqrt(sum(min(excess, 0) ** 2) / n)`` — every observation counts in the
+    denominator, and only the negative excess returns contribute to the sum
+    (the Red Rock Capital definition quantstats documents). Dividing by the
+    count of losing periods instead, or deviating the raw returns rather than
+    the excess returns, is a different ratio that does not match the
+    quantstats path.
+    """
+    if len(returns) < 2:
         return 0.0
-    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
-    mean_return = sum(returns) / len(returns)
-    downside = [r for r in returns if r < 0]
-    if len(downside) < 2:
-        return 0.0
-    downside_var = sum(r**2 for r in downside) / len(downside)
-    downside_std = math.sqrt(downside_var) if downside_var > 0 else 0
+    daily_periods = annualization_factor == math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    period_rf = _period_risk_free_rate(risk_free_rate) if daily_periods else 0.0
+    excess = [float(value) - period_rf for value in returns]
+    mean_excess = sum(excess) / len(excess)
+    downside_variance = sum(min(value, 0.0) ** 2 for value in excess) / len(excess)
+    downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0
     if downside_std == 0:
         return 0.0
-    excess_mean = mean_return - period_rf
-    return (excess_mean / downside_std) * annualization_factor
+    return (mean_excess / downside_std) * annualization_factor
 
 
 def _probabilistic_sharpe(

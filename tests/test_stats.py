@@ -9,6 +9,9 @@ from runner.stats import (
     _daily_returns_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
+    _period_risk_free_rate,
+    _sharpe_manual,
+    _sortino_manual,
     compute_stats,
     compute_stats_for_result,
 )
@@ -36,6 +39,37 @@ def _equity_curve_from_returns(returns: list[float], initial_capital: float = 10
         equity *= 1 + ret
         points.append(EquityPoint(time=(start + timedelta(days=index)).isoformat(), equity=equity))
     return points
+
+
+class TestQuantStatsManualParity:
+    returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002, -0.003, 0.009]
+
+    def test_period_risk_free_rate_uses_compound_conversion(self):
+        # Merge resolution: the branch's compound per-period conversion is
+        # kept — it is what makes `_sharpe_manual`/`_sortino_manual` bit-identical
+        # to quantstats (ADR D5: one definition per metric on both paths), so
+        # the symbol is imported at module level again.
+        assert _period_risk_free_rate(0.04) == pytest.approx(math.pow(1.04, 1 / 252) - 1)
+
+    def test_manual_sharpe_matches_quantstats_definition(self):
+        import pandas as pd
+
+        qs = pytest.importorskip("quantstats.stats")
+
+        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        expected = float(qs.sharpe(series, rf=0.04, periods=252))
+
+        assert _sharpe_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
+
+    def test_manual_sortino_matches_quantstats_definition(self):
+        import pandas as pd
+
+        qs = pytest.importorskip("quantstats.stats")
+
+        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        expected = float(qs.sortino(series, rf=0.04, periods=252))
+
+        assert _sortino_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
 
 
 class TestComputeStats:
@@ -71,6 +105,23 @@ class TestComputeStats:
         assert stats["avg_loser"] == round(-100 / 3, 2)
         # Profit factor: 300 / 100 = 3.0
         assert stats["profit_factor"] == 3.0
+
+    def test_trade_metrics_use_net_pnl_after_fees(self):
+        winner = _trade(100)
+        winner.fees = 20.0
+        winner.net_pnl = 80.0
+        loser = _trade(-50)
+        loser.fees = 10.0
+        loser.net_pnl = -60.0
+
+        stats = compute_stats([winner, loser])
+
+        assert stats["winners"] == 1
+        assert stats["losers"] == 1
+        assert stats["total_pnl"] == 20.0
+        assert stats["avg_winner"] == 80.0
+        assert stats["avg_loser"] == -60.0
+        assert stats["profit_factor"] == pytest.approx(80.0 / 60.0, rel=1e-4)
 
     def test_holding_bars(self):
         trades = [_trade(10, holding_bars=5), _trade(-5, holding_bars=3)]
@@ -154,9 +205,85 @@ class TestComputeStats:
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
 
+    def test_cagr_prefers_equity_period_over_trade_bounds(self):
+        """Same contract as `test_cagr_annualizes_with_trade_period_bounds`.
+
+        Merge resolution: the two sides of the merge added this scenario under
+        different names. Both keep the shared 731-day equity window, so both are
+        retained as separate tests rather than one shadowing the other.
+        """
+        equity = [
+            EquityPoint(time="2020-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2022-01-01T00:00:00+00:00", equity=121000.0),
+        ]
+        trades = [
+            Trade(
+                id=1,
+                symbol="X",
+                direction="LONG",
+                entry_time="2021-01-01T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2023-01-01T00:00:00+00:00",
+                        price=121.0,
+                        quantity=1,
+                        pnl=21000.0,
+                    )
+                ],
+                pnl=21000.0,
+            )
+        ]
+
+        stats = compute_stats(trades, equity_curve=equity)
+
+        expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the
         # 365.75-day trade span.
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
+        ]
+        trades = [
+            Trade(
+                id=1,
+                symbol="X",
+                direction="LONG",
+                entry_time="2024-01-01T12:00:00+00:00",
+                entry_price=100.0,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2025-01-01T06:00:00+00:00",
+                        price=110.0,
+                        quantity=1,
+                        pnl=10000.0,
+                    )
+                ],
+                pnl=10000.0,
+            )
+        ]
+
+        stats = compute_stats(trades, equity_curve=equity)
+
+        # 2024-01-01T00:00Z -> 2025-01-01T00:00Z is 366 calendar days.
+        expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
+    def test_cagr_uses_equity_period_when_available(self):
+        """The equity window, not the 365.75-day trade span, drives CAGR.
+
+        Merge resolution: the other side of the merge asserted a 365-day year
+        for this window. 2024 is a leap year, so the equity endpoints are 366
+        days apart and the trade span is 365.75 — neither is 365.0, so that
+        literal could not describe any window this fixture produces. The 366-day
+        expectation is kept, and it still proves the equity period is preferred:
+        the trade bounds would give 365.75.
+        """
         equity = [
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
             EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),

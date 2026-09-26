@@ -26,6 +26,23 @@ The catalog builder reads that tree and writes `catalog.json`:
 python -m data_tools.catalog_builder -o "$TRADING_DATA_DIR/catalog.json"
 ```
 
+## Explicit selection and provenance
+
+Backtests must not silently choose between multiple matching datasets. The
+runner, viewer API, and CLI accept an explicit asset-class selector:
+
+```bash
+python -m runner.cli run ... --data-source metals
+```
+
+Engines record the selected `data_files`, `source`, `asset_classes`, requested
+source, `duration_days`, and `total_bars` in `meta.data`. The Viewer `/info`
+endpoint exposes the same values. The CLI additionally persists
+`execution_context` (data directory/source, engine, symbols, timeframe, capital,
+and the complete risk/modeling configuration) plus an explicit `pnl_basis`.
+Optimizers fail closed when this context is missing and fingerprint both the
+context and strategy source before running a study.
+
 ## Source overview
 
 | Source | Primary entrypoint | Current role | Typical asset classes |

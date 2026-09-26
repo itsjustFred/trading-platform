@@ -535,6 +535,83 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     return DATA_DIR
 
 
+# A bar-to-bar hole only means something when it is far larger than the normal
+# spacing of the series. Judging holes by an absolute calendar-day count instead
+# misreports perfectly regular data: weekly bars sit 7 days apart, so every
+# single one looked like a week-long hole and weekly coverage always failed.
+# Sub-daily timeframes keep the fixed floor, because an overnight or weekend
+# closure is legitimately longer than several bars of an intraday series.
+GAP_SPACING_MULTIPLE = 3.0
+MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
+# A single long weekend reaches four calendar days: Friday and Monday both
+# closed, with Saturday and Sunday between. Christmas and Easter routinely
+# produce exactly that, and a 3-day allowance reported them as data holes.
+LONG_WEEKEND_GAP_DAYS = 4.0
+
+
+def timeframe_nominal_days(timeframe: str | None) -> float:
+    """Nominal calendar spacing of one bar in ``timeframe``.
+
+    The numeric prefix is part of the timeframe: ``5m`` bars are five minutes
+    apart and ``4w`` bars are four weeks apart, so ignoring it would size the
+    allowed hole against the wrong spacing.
+    """
+    normalized = str(timeframe or "").strip().lower()
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(mo|[a-z]+)$", normalized)
+    if match is None:
+        return 1.0
+    try:
+        count = float(match.group(1))
+    except ValueError:  # pragma: no cover - guarded by the regex above
+        return 1.0
+    unit = match.group(2)
+    if unit == "mo":
+        return count * 30.0
+    if unit == "w":
+        return count * 7.0
+    if unit == "d":
+        return count
+    if unit == "h":
+        return count / 24.0
+    if unit == "m":
+        return count / 1440.0
+    if unit == "s":
+        return count / 86_400.0
+    return count
+
+
+def scaled_gap_threshold_days(
+    timeframe: str | None,
+    base_days: float,
+    *,
+    allow_long_weekend: bool = False,
+) -> float:
+    """Allowed hole length for ``timeframe``, widened for long-spaced series.
+
+    ``allow_long_weekend`` raises the floor to cover a Friday-and-Monday
+    closure. It is set only for the threshold that *fails* coverage: a long
+    weekend is real market behaviour and must not block a backtest, but it is
+    still worth warning about, so the warning threshold keeps the tighter floor
+    that surfaces genuine intraday holes.
+    """
+    scaled = timeframe_nominal_days(timeframe) * GAP_SPACING_MULTIPLE
+    floor = MIN_INTERNAL_GAP_THRESHOLD_DAYS
+    if allow_long_weekend:
+        floor = max(floor, LONG_WEEKEND_GAP_DAYS)
+    return max(float(base_days), scaled, floor)
+
+
+def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    for requirement in requirements:
+        report = analyze_ohlcv_coverage(data_root, requirement)
+        if report.get("status") == "failed":
+            raise RuntimeError(
+                "OHLCV coverage has internal gaps for "
+                f"{requirement.symbol} {requirement.timeframe}: "
+                f"{report.get('gaps') or report.get('error')}"
+            )
+
+
 def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
     """Return whether the parquet at ``path`` has any timestamp within ``[start_ts, end_ts]``."""
     try:
@@ -689,7 +766,7 @@ def find_internal_gaps(
     symbol_dir: Path,
     timeframe: str | None = None,
     *,
-    threshold_days: float = INTERNAL_GAP_WARN_DAYS,
+    threshold_days: float | None = None,
 ) -> list[dict[str, object]]:
     """Detect holes *inside* the stored timestamp range of one symbol directory.
 
@@ -709,6 +786,15 @@ def find_internal_gaps(
             stem == normalized
             or stem.startswith(f"{normalized}_")
             or stem.startswith(f"{normalized}-")
+        )
+
+    if threshold_days is None:
+        # Without a timeframe there is no nominal spacing to scale against, so
+        # widening would only hide real holes. Keep the fixed floor.
+        threshold_days = (
+            scaled_gap_threshold_days(timeframe, INTERNAL_GAP_WARN_DAYS)
+            if timeframe
+            else INTERNAL_GAP_WARN_DAYS
         )
 
     parquet_paths = sorted(
@@ -1103,7 +1189,8 @@ def _gaps_overlapping_window(
 
     Ancient history outside the required window must not fail a requirement
     that never touches it; boundary-touching holes carry no interior
-    missing bars and are excluded too.
+    missing bars and are excluded too. The list is copied on the pass-through
+    path so the caller never receives an alias of the input.
     """
     if start is None or end is None:
         return list(gaps)
@@ -1146,15 +1233,17 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         gaps.extend(find_internal_gaps(candidate, timeframe))
 
     error: str | None = None
-    required_start: str | None = None
-    required_end: str | None = None
+    # Both the stored-bounds check below and the gap window filter further down
+    # need the requested window, so it is normalized once, unconditionally. The
+    # explicit annotations keep it bound on every path, including the
+    # ``bounds is None`` branch where no bounds comparison happens.
+    required_start: str | None = _normalize_coverage_date(requirement.start)
+    required_end: str | None = _normalize_coverage_date(requirement.end)
     if bounds is None:
         error = (
             f"No {symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
         )
     else:
-        required_start = _normalize_coverage_date(requirement.start)
-        required_end = _normalize_coverage_date(requirement.end)
         if required_start is not None and required_start < bounds[0]:
             error = (
                 f"Requested start {required_start} is before stored coverage start {bounds[0]}"
@@ -1162,11 +1251,24 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         elif required_end is not None and required_end > bounds[1]:
             error = f"Requested end {required_end} is after stored coverage end {bounds[1]}"
 
-    significant_gaps = [
-        gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
-    ]
+    # The fail threshold scales with the timeframe: a weekly series has 7-day
+    # bar spacing, so a fixed 3-day allowance flagged every bar as a hole and no
+    # weekly or monthly backtest could pass the gate. A long weekend
+    # (Friday and Monday both closed) reaches 4 calendar days, so the failing
+    # threshold also allows that; the warning threshold keeps its tight 1-day
+    # floor inside find_internal_gaps, so genuine intraday holes still surface.
     significant_gaps = _gaps_overlapping_window(
-        significant_gaps, required_start, required_end
+        [
+            gap
+            for gap in gaps
+            if float(gap.get("gap_days", 0)) > scaled_gap_threshold_days(
+                requirement.timeframe,
+                INTERNAL_GAP_FAIL_DAYS,
+                allow_long_weekend=True,
+            )
+        ],
+        required_start,
+        required_end,
     )
 
     if error or significant_gaps:

@@ -123,9 +123,13 @@ export function StrategyLabPage() {
       setActiveProvider(provider);
       setActiveModel(selectedModel ?? null);
       setJobStatus(response.status || "running");
-    } catch (err: any) {
+    } catch (err: unknown) {
       setJobStatus("failed");
-      setError(err.message || "The conversion agent could not be started.");
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "The conversion agent could not be started.",
+      );
     } finally {
       setIsSubmitting(false);
     }

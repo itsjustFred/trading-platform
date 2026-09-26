@@ -1418,7 +1418,6 @@ class DukascopyNativeDownloader(Downloader):
             urls,
             options.batch_size,
             options.max_retries,
-            batch_size=options.batch_size,
             pipeline_batches=options.pipeline_batches,
             pause_ms=options.pause_ms,
             report_progress=(

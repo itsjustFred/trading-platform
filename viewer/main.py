@@ -71,6 +71,7 @@ from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
     EquityPoint,
+    LiveAccountConfig,
     Service,
     ServiceStatus,
     ServiceType,
@@ -89,6 +90,7 @@ from shared.database import (
     ensure_live_account,
     get_background_task_record,
     get_live_account,
+    get_live_deployment,
     get_service,
     get_latest_live_balance,
     get_latest_live_balances,
@@ -121,10 +123,14 @@ from shared.database import (
     save_portfolio as save_portfolio_record,
     upsert_verification_evidence,
     upsert_background_task_record,
+    count_live_deployment_submissions,
     create_service,
     delete_service,
+    record_live_account_demo_verification,
+    update_live_deployment_account,
     update_live_deployment_status,
     update_service_status,
+    upsert_live_accounts,
 )
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
@@ -138,6 +144,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
 from shared.models import (
+    LiveDeploymentAccountUpdateRequest,
     LiveDeploymentConfig,
     LiveDeploymentCreateRequest,
     LiveDeploymentStatusUpdateRequest,
@@ -306,6 +313,12 @@ DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
+# A task can only be paused while it is actually pending or executing. This must
+# stay in lockstep with `viewer.core._task_controls_payload`'s `can_pause` set:
+# the flag is the contract the UI renders from, so the endpoint accepting a
+# status the flag hides leaves the operator unable to act, and accepting a status
+# the flag offers but should not is a silent no-op reported as success.
+PAUSABLE_TASK_STATUSES = frozenset({"running", "starting"})
 _running_jobs = legacy_viewer._running_jobs
 _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
@@ -570,6 +583,7 @@ class _BacktestRecoveryParameters(BaseModel):
     engine: str = "native"
     symbols: list[str]
     timeframe: str = "1d"
+    data_source: str = ""
     start: str = ""
     end: str = ""
     capital: float = 100000.0
@@ -758,6 +772,7 @@ def _backtest_request_from_recovery_spec(
         engine=engine,
         symbols=symbols,
         timeframe=timeframe,
+        data_source=str(payload.get("data_source") or ""),
         start=str(payload.get("start") or ""),
         end=str(payload.get("end") or ""),
         capital=capital,
@@ -1226,12 +1241,13 @@ class BacktestRunRequest(SQLModel):
     engine: str = "native"
     symbols: list[str]
     timeframe: str = "1d"
+    data_source: str = ""
     start: str = ""
     end: str = ""
     capital: float = 100000.0
-    risk_per_trade_pct: float | None = None
-    max_position_pct: float | None = None
-    max_leverage: float | None = None
+    risk_per_trade_pct: float | None = PydanticField(default=None, ge=0.0, lt=1.0)
+    max_position_pct: float | None = PydanticField(default=None, gt=0.0, le=1.0)
+    max_leverage: float | None = PydanticField(default=None, gt=0.0)
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
     parameters: dict[str, Any] = {}
@@ -3211,6 +3227,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     start = str(meta.get("start_date") or "")
     end = str(meta.get("end_date") or "")
     total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
+    total_pnl = _safe_float(meta.get("total_pnl"), 0.0)
+    initial_capital = _safe_float(meta.get("initial_capital"), 0.0)
+    net_profit_pct = (
+        total_pnl / initial_capital * 100.0
+        if initial_capital > 0
+        else total_return_decimal * 100.0
+    )
     cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
     sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
     psr = _safe_float(meta.get("psr"), 0.0)
@@ -3240,8 +3263,8 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "sharpe_ratio": sharpe_ratio,
         "cagr": round(cagr_decimal * 100.0, 2),
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
-        "net_profit": 0.0,
-        "net_profit_pct": round(total_return_decimal * 100.0, 2),
+        "net_profit": round(total_pnl, 6),
+        "net_profit_pct": round(net_profit_pct, 2),
         "psr": round(psr, 4),
         "p_value": round(p_value, 6),
         "win_rate": round(win_rate, 6) if win_rate is not None else None,
@@ -4716,6 +4739,35 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
     return safe_payload if isinstance(safe_payload, dict) else {}
 
 
+def _record_discovered_account_verification(
+    account_id: str,
+    *,
+    is_demo: bool,
+    ctid: str | None,
+    broker_login: str | None,
+) -> None:
+    """Persist a broker demo verification for a freshly discovered account.
+
+    Discovery is the only place that has just spoken to the broker, so it is the
+    only legitimate writer of the verification stamp that ACTIVE transitions
+    require. Failure is logged and swallowed: discovery must still return the
+    account list even when the write fails, and the account simply stays
+    unverified (fail-closed) until the next successful discovery.
+    """
+    try:
+        record_live_account_demo_verification(
+            account_id,
+            is_demo=is_demo,
+            ctid=ctid,
+            broker_login=broker_login,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not persist broker demo verification for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+
+
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
     discovered = _run_coroutine_sync(discover_configured_accounts)
     payload: list[dict[str, Any]] = []
@@ -4729,23 +4781,41 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 if account.get("broker_login") or account.get("login")
                 else None
             )
+            normalized_ctid = (
+                str(account.get("ctid")).strip() if account.get("ctid") else None
+            )
+            is_demo = bool(account.get("is_demo", False))
+            _record_discovered_account_verification(
+                account_id,
+                is_demo=is_demo,
+                ctid=normalized_ctid,
+                broker_login=normalized_login,
+            )
             payload.append(
                 {
                     "id": account_id,
                     "name": str(account.get("name") or account_id),
                     "broker": str(account.get("broker") or "unknown"),
                     "balance": _safe_float(account.get("balance"), 0.0),
-                    "is_demo": bool(account.get("is_demo", False)),
+                    "is_demo": is_demo,
                     "broker_login": normalized_login,
                     "login": normalized_login,
-                    "ctid": (
-                        str(account.get("ctid")).strip() if account.get("ctid") else None
-                    ),
+                    "ctid": normalized_ctid,
                 }
             )
             continue
         normalized_login = (
             str(account.broker_login).strip() if getattr(account, "broker_login", None) else None
+        )
+        normalized_ctid = (
+            str(account.ctid).strip() if getattr(account, "ctid", None) else None
+        )
+        is_demo = bool(account.is_demo)
+        _record_discovered_account_verification(
+            account.id,
+            is_demo=is_demo,
+            ctid=normalized_ctid,
+            broker_login=normalized_login,
         )
         payload.append(
             {
@@ -4753,12 +4823,10 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 "name": account.name,
                 "broker": account.broker,
                 "balance": float(account.balance),
-                "is_demo": bool(account.is_demo),
+                "is_demo": is_demo,
                 "broker_login": normalized_login,
                 "login": normalized_login,
-                "ctid": (
-                    str(account.ctid).strip() if getattr(account, "ctid", None) else None
-                ),
+                "ctid": normalized_ctid,
             }
         )
     return payload
@@ -9798,6 +9866,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
     engine = str(payload.engine or "native").strip() or "native"
     timeframe = normalize_timeframe(str(payload.timeframe or "1d"))
+    data_source = str(payload.data_source or "").strip()
     start = str(payload.start or "")
     end = str(payload.end or "")
     capital = float(payload.capital or 100000.0)
@@ -9845,6 +9914,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         "engine": engine,
         "symbols": symbols,
         "timeframe": timeframe,
+        "data_source": data_source,
         "start": start,
         "end": end,
         "capital": capital,
@@ -9884,6 +9954,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             *symbols,
             "--timeframe",
             timeframe,
+            *([] if not data_source else ["--data-source", data_source]),
             "--capital",
             str(capital),
             "--progress-stdout",
@@ -9902,10 +9973,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             cmd.extend(["--max-leverage", str(max_leverage)])
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
-        with DATA_TASKS_LOCK:
-            task = DATA_TASKS.get(task_id)
-            if task is not None:
-                task["command"] = list(cmd)
+        _update_task_fields(task_id, command=list(cmd))
         return cmd
 
     def _run() -> None:
@@ -11587,7 +11655,31 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
 @app.get("/api/live/accounts")
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
-    return await asyncio.to_thread(_cached_live_accounts_payload)
+    discovered = await asyncio.to_thread(_cached_live_accounts_payload)
+    # Persist what discovery just learned. The guarded account re-point and the
+    # ACTIVE verification-freshness gate both operate on stored account rows, so
+    # an account that was only ever seen in a discovery response cannot be a
+    # valid deployment target.
+    persisted: list[LiveAccountConfig] = []
+    for item in discovered:
+        broker = str(item.get("broker") or "").strip().lower()
+        account_id = str(item.get("id") or "").strip()
+        if broker not in {"alpaca", "ctrader"} or not account_id:
+            continue
+        persisted.append(
+            LiveAccountConfig(
+                id=account_id,
+                broker=broker,
+                name=str(item.get("name") or account_id),
+                broker_login=str(item.get("broker_login") or item.get("login") or "").strip()
+                or None,
+                ctid=str(item.get("ctid") or "").strip() or None,
+                is_demo=bool(item.get("is_demo", False)),
+            )
+        )
+    if persisted:
+        await asyncio.to_thread(upsert_live_accounts, persisted)
+    return discovered
 
 
 @app.get("/api/services")
@@ -12085,7 +12177,17 @@ async def create_live_deployment_endpoint(
         settings=payload.settings or {},
     )
     try:
-        validate_stockkit_deployment_route(deployment)
+        validate_stockkit_deployment_route(
+            deployment,
+            # Routing compares BROKER identity, not the local account id. Without
+            # this the validator has nothing to compare against and fails closed,
+            # so every Discord create was rejected.
+            account_broker_login=str(
+                account_payload.get("broker_login")
+                or account_payload.get("ctid")
+                or ""
+            ),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     try:
@@ -12093,6 +12195,57 @@ async def create_live_deployment_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     return _serialize_live_deployment_payload(created)
+
+
+async def _drain_live_deployment_submissions(
+    deployment_id: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> tuple[bool, int]:
+    deadline = asyncio.get_running_loop().time() + max(float(timeout_seconds), 0.0)
+    while True:
+        remaining = await asyncio.to_thread(
+            count_live_deployment_submissions, deployment_id
+        )
+        if remaining <= 0:
+            return True, 0
+        if asyncio.get_running_loop().time() >= deadline:
+            return False, remaining
+        await asyncio.sleep(0.05)
+
+
+async def _reverify_account_against_broker(account_id: str) -> bool:
+    """Ask the broker whether ``account_id`` is still a demo account.
+
+    Returns True only when discovery positively reports the account as demo and
+    the fresh verification is persisted. Any error, missing account, or non-demo
+    answer returns False so the caller fails closed.
+    """
+    try:
+        discovered = await asyncio.to_thread(_discover_live_accounts_payload)
+    except Exception as exc:
+        logger.error(
+            "Broker re-verification failed; refusing activation",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return False
+
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if not bool(account.get("is_demo")):
+            logger.error(
+                "Broker reports account is not a demo account; refusing activation",
+                extra={"data": {"account_id": account_id}},
+            )
+            return False
+        return True
+
+    logger.error(
+        "Broker discovery did not return the account; refusing activation",
+        extra={"data": {"account_id": account_id}},
+    )
+    return False
 
 
 @app.put("/api/live/deployments/{deployment_id}/status")
@@ -12104,9 +12257,80 @@ async def update_live_deployment_status_endpoint(
         deployment_id=deployment_id,
         status=payload.status,
     )
+    requested_status = str(payload.status or "").strip().upper()
+
+    if requested_status == "ACTIVE":
+        # Re-verify the account against the broker immediately before arming.
+        # The DB gate also enforces verification freshness, so a stale
+        # confirmation can never be reused to arm a deployment.
+        deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+        if deployment is None:
+            raise HTTPException(status_code=404, detail="Live deployment not found")
+        if not await _reverify_account_against_broker(deployment.account_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Broker could not confirm the account is a demo account; "
+                    "refusing to activate"
+                ),
+            )
+
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_status, deployment_id, payload.status
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    payload = _serialize_live_deployment_payload(updated)
+    if updated.status != "ACTIVE":
+        drained, remaining = await _drain_live_deployment_submissions(deployment_id)
+        payload["submission_drain_complete"] = drained
+        payload["in_flight_submissions"] = remaining
+        if not drained:
+            logger.error(
+                "Live deployment status persisted but submission drain did not complete",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "status": updated.status,
+                        "in_flight_submissions": remaining,
+                    }
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Deployment status changed but in-flight submissions remain",
+                    "deployment_id": deployment_id,
+                    "status": updated.status,
+                    "in_flight_submissions": remaining,
+                },
+            )
+    return payload
+
+
+@app.put("/api/live/deployments/{deployment_id}/account")
+async def update_live_deployment_account_endpoint(
+    deployment_id: str, payload: LiveDeploymentAccountUpdateRequest
+) -> dict[str, Any]:
+    """Re-point a deployment at a different broker account.
+
+    Guarded on the DB side: the target must be a known, verified demo account,
+    the deployment must not be ACTIVE unless explicitly overridden, and any
+    in-flight submissions must have drained first.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/account",
+        deployment_id=deployment_id,
+    )
+    try:
+        updated = await asyncio.to_thread(
+            update_live_deployment_account,
+            deployment_id,
+            payload.account_id,
+            allow_active=bool(payload.allow_active),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
@@ -12958,7 +13182,20 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+        # Answer honestly: a finished task cannot be paused. Returning 200 here
+        # reported success for a no-op while `can_pause` was already false.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task already finished (status={task.get('status')!r})",
+        )
+    # Only a task that is actually pending or executing can be paused. Without
+    # this guard an already paused task was silently "paused" again, so the UI
+    # advertised can_pause for a task the endpoint would not act on.
+    if _task_status_or_manual(task.get("status")) not in PAUSABLE_TASK_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task cannot be paused from status {task.get('status')!r}",
+        )
 
     task["pause_event"].set()
     if task.get("control_mode") == "process":
@@ -12978,8 +13215,17 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
-    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+    # Only a paused task can be resumed. Previously the endpoint only
+    # short-circuited on final statuses, so POSTing resume against a `starting`
+    # or `queued` task promoted it to `running`: the task was reported as
+    # executing when it had not begun, and its elapsed/ETA figures were wrong.
+    # A finished task cannot be resumed either, so it gets the same honest 409
+    # rather than a 200 for a no-op that `can_resume` already hid.
+    if _task_status_or_manual(task.get("status")) != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is not paused (status={task.get('status')!r})",
+        )
 
     task["pause_event"].clear()
     if task.get("control_mode") == "process":

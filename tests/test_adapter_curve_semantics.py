@@ -1,12 +1,10 @@
 """Adapter-level curve semantics regressions (Cleanup 16-D1 hardening).
 
-Kills the survived mutation-testing mutants on the adapter equity-curve
-builders:
-
-- native/pynecore: the curve must replay trades in last_exit_time order,
-  stamp exit times (not entry times), credit FULL pnl per trade, and carry
-  the loaded bar count in ``meta.total_bars``.
-- trade renumbering must stay deterministic (entry-time sort before ids).
+- native single-symbol curves are per-bar mark-to-market and must reconcile
+  final equity with realized net PnL.
+- multi-symbol curves replay portfolio PnL at exit time.
+- ``meta.total_bars`` carries the loaded bar count, not the trade count.
+- trade renumbering stays deterministic (entry-time sort before ids).
 """
 
 from __future__ import annotations
@@ -51,36 +49,54 @@ def curve_env(tmp_path: Path):
 
 
 class TestNativeCurveSemantics:
-    def test_curve_credits_full_pnl_in_exit_order(self, curve_env):
+    def test_curve_is_mark_to_market_and_reconciles_final_pnl(self, curve_env):
         config, strategy_path = curve_env
         result = NativeAdapter().run(config, str(strategy_path))
         assert result.trades, "the fixture must produce trades"
         assert result.equity_curve, "the fixture must produce an equity curve"
 
-        # Full PnL credited exactly once per trade: the last curve point is
-        # capital plus the realized PnL of every trade.
-        expected_final = config.initial_capital + sum(t.pnl for t in result.trades)
-        assert result.equity_curve[-1].equity == pytest.approx(round(expected_final, 2)), (
-            "the curve must credit the FULL pnl of every trade — half/zero "
-            "credit means the realized replay is broken"
+        expected_final = config.initial_capital + sum(
+            t.net_pnl if t.net_pnl is not None else t.pnl for t in result.trades
         )
+        # Merge resolution — the two sides pinned DIFFERENT and mutually
+        # exclusive single-symbol shapes, so one decision had to be made and
+        # the loser's assertions rewritten rather than kept alongside:
+        #
+        #   * branch: the engine's per-bar mark-to-market curve (one point per
+        #     loaded bar), i.e. open-position risk is represented.
+        #   * main: a realized-PnL replay stamped at entry/exit times only.
+        #
+        # Per-bar mark-to-market wins. Decision Record D2 designates the
+        # engine's `self.equity` (initial + realized + unrealized) as the
+        # mark-to-market REPORTING equity for the curve, and the branch commit
+        # that introduced it states the rule outright: "native keeps per-bar
+        # MTM". A realized-only replay cannot express an intra-trade drawdown,
+        # so every curve-derived statistic (max drawdown, Sharpe, Calmar,
+        # total_return) is understated on exactly the runs that hold risk
+        # between trades. The exit-time shape is still the correct contract for
+        # the MULTI-symbol portfolio curve, where summing per-symbol paths
+        # would multiply capital by the symbol count (D11) — that path is
+        # unchanged and is what `TestMultiSymbolCurveSemantics` covers.
+        assert len(result.equity_curve) >= result.meta.total_bars, (
+            "a single-symbol native curve is per-bar mark-to-market: one point "
+            "per loaded bar, so an open position's drawdown is visible"
+        )
+        # The curve is anchored on the requested window start, and that anchor
+        # collapses into the first bar when the data starts exactly there
+        # (no duplicate stamp).
+        initial_time = f"{config.start_date}T00:00:00+00:00"
+        assert result.equity_curve[0].time == initial_time
+        assert result.equity_curve[0].equity == pytest.approx(config.initial_capital)
+        assert result.equity_curve[-1].equity == pytest.approx(round(expected_final, 2))
 
         timestamps = [pd.Timestamp(point.time) for point in result.equity_curve]
         assert timestamps == sorted(timestamps), (
-            "curve timestamps must be non-decreasing (exit-time order), not "
-            "entry order with exit stamps"
+            "curve timestamps must be non-decreasing (bar order), not entry "
+            "order with exit stamps"
         )
-
-        exit_times = {str(t.last_exit_time) for t in result.trades}
-        entry_times = {str(t.entry_time) for t in result.trades}
-        initial_time = f"{config.start_date}T00:00:00+00:00"
-        assert (
-            set(point.time for point in result.equity_curve)
-            <= exit_times | entry_times | {initial_time}
-        )
-        assert result.equity_curve[0].time == initial_time
-        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
-        assert pd.Timestamp(result.equity_curve[1].time) >= first_exit
+        # Union (both sides): the curve is not a bare per-trade exit list — it
+        # carries a point per bar plus the leading initial-capital anchor.
+        assert set(timestamps) != {pd.Timestamp(t.last_exit_time) for t in result.trades}
 
     def test_meta_total_bars_is_bar_count(self, curve_env):
         config, strategy_path = curve_env
@@ -133,11 +149,7 @@ def generate_signals(df, params):
 
 
 class TestNativeCurveExitOrder:
-    def test_overlapping_trades_replay_in_exit_order(self, tmp_path: Path):
-        # F5: the single-symbol curve credits closed PnL at EXIT time, so
-        # with overlapping trades (entry order A,B vs exit order B,A) the
-        # curve must be stamped B-exit then A-exit — entry order with exit
-        # stamps would run backwards in time.
+    def test_overlapping_trades_keep_mark_to_market_curve(self, tmp_path: Path):
         (tmp_path / "strategies").mkdir()
         strategy_path = tmp_path / "strategies" / "overlap_curve.py"
         strategy_path.write_text(_OVERLAP_STRATEGY)
@@ -156,11 +168,23 @@ class TestNativeCurveExitOrder:
         )
         result = NativeAdapter().run(config, str(strategy_path))
         assert len(result.trades) == 2
-        assert len(result.equity_curve) == 3
-        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
+        # Merge resolution: this fixture is the direct demonstration of WHY the
+        # single-symbol curve is per-bar mark-to-market. Two overlapping trades
+        # (entry order A,B; exit order B,A) on a 6-bar frame: main's exit-time
+        # replay emitted 3 points (anchor + one per exit) and so could not show
+        # the open exposure that existed between the entries and the exits. The
+        # per-bar curve carries one point per bar instead. What the exit-time
+        # test really pinned — that the curve never runs backwards in time when
+        # entry order differs from exit order — is re-pinned here against the
+        # per-bar stamps.
+        assert len(result.equity_curve) == len(_overlap_frame())
         assert result.equity_curve[0].time == f"{config.start_date}T00:00:00+00:00"
-        assert pd.Timestamp(result.equity_curve[1].time) == first_exit
+        assert len(result.equity_curve) > len(result.trades)
         stamps = [pd.Timestamp(p.time) for p in result.equity_curve]
         assert stamps == sorted(stamps)
+        # Every bar the positions were open is represented, including the bars
+        # before the first exit: the excursion is what the exit-time shape hid.
+        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
+        assert pd.Timestamp(result.equity_curve[1].time) < first_exit
         expected = config.initial_capital + sum(t.pnl for t in result.trades)
         assert result.equity_curve[-1].equity == pytest.approx(round(expected, 2))

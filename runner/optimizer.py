@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
@@ -21,7 +22,8 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
 from shared.atomic_io import write_text_atomically
-from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
+from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
+from shared.database import load_backtest_result
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
 
@@ -242,6 +244,12 @@ class OptimizationConfig(BaseModel):
     min_trades_for_full_credit: int = Field(default=30, ge=1)
     drawdown_penalty_weight: float = Field(default=1.0, ge=0.0)
     embargo_days: int = Field(default=1, ge=0)
+    # Fraction of the whole window dropped between train and test, on top of
+    # embargo_days, so the gap scales with the backtest length instead of
+    # being a fixed number of days.
+    embargo_pct: float = Field(default=0.0, ge=0.0, le=0.4)
+    # Number of sequential walk-forward folds reported as a robustness check.
+    walk_forward_splits: int = Field(default=3, ge=1, le=20)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -346,6 +354,126 @@ def _coverage_session_from_result(result: BacktestResult) -> Mapping[str, object
     return None
 
 
+def _execution_context_from_result(result: BacktestResult) -> dict[str, Any]:
+    """Read the base backtest's persisted execution context, or fail closed.
+
+    The optimizer reruns the strategy itself, so it must reproduce the base
+    run's data, risk and modeling settings exactly. A base artifact that
+    predates the context (or one whose context is incomplete) cannot be
+    reproduced, and silently substituting defaults would publish an
+    optimization result for a run that never happened. Both this and
+    ``_runtime_config_from_base_result`` fail closed; they read different
+    snapshots of the same artifact, so a base result must carry both.
+    """
+    raw = result.meta.data.get("execution_context")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(
+            "Base backtest has no persisted execution_context; rerun the base "
+            "backtest before optimizing so data, risk, and modeling settings "
+            "cannot be silently replaced with defaults."
+        )
+    context = dict(raw)
+    risk = context.get("risk_config")
+    if not isinstance(risk, dict):
+        raise ValueError("Base backtest execution_context is missing risk_config")
+    required = {
+        "engine",
+        "data_dir",
+        "data_source",
+        "symbols",
+        "timeframe",
+        "initial_capital",
+    }
+    missing = sorted(key for key in required if key not in context)
+    if missing:
+        raise ValueError(
+            "Base backtest execution_context is missing: " + ", ".join(missing)
+        )
+    if str(context.get("engine")) != str(result.meta.engine):
+        raise ValueError(
+            "Base backtest execution_context engine does not match artifact engine"
+        )
+    context["risk_config"] = dict(risk)
+    return context
+
+
+def _context_fingerprint(context: dict[str, Any], strategy_path: Path) -> str:
+    """Stable hash of the execution context plus the strategy source bytes.
+
+    Recorded on every trial and in the payload so a result can be tied back to
+    the exact code and settings that produced it: a strategy file edited after
+    the fact changes the fingerprint even when no config field changed.
+    """
+    payload = {
+        "context": context,
+        "strategy_sha256": hashlib.sha256(Path(strategy_path).read_bytes()).hexdigest(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+#: Settings the execution context may not carry, taken from the runtime
+#: snapshot (``_runtime_config_from_base_result``) when the context is silent.
+_RUNTIME_ONLY_SETTINGS = (
+    "allow_fallback_stop",
+    "reject_missing_stop",
+    "require_explicit_column_roles",
+)
+
+
+def _optimizer_backtest_config(
+    *,
+    strategy_slug: str,
+    symbols: list[str],
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    initial_capital: float,
+    parameters: dict[str, Any],
+    context: dict[str, Any],
+    runtime: Mapping[str, Any] | None = None,
+) -> BacktestConfig:
+    """Build a trial's BacktestConfig from the base run's own settings.
+
+    The persisted ``execution_context`` is authoritative: it is the snapshot
+    written by ``runner.cli`` at backtest time, so every risk, modeling and
+    data setting is reproduced verbatim. ``runtime`` is the independently
+    validated runtime snapshot; it only fills settings the context does not
+    carry, so a context that omits ``max_leverage`` cannot silently reset it
+    to a default.
+    """
+    risk = dict(context.get("risk_config") or {})
+    extra = dict(runtime or {})
+
+    def setting(name: str, default: Any = None) -> Any:
+        value = risk.get(name)
+        if value is None:
+            value = extra.get(name)
+        return default if value is None else value
+
+    config_kwargs: dict[str, Any] = {
+        "strategy_name": strategy_slug,
+        "symbols": list(symbols),
+        "timeframe": timeframe,
+        "start_date": start_date,
+        "end_date": end_date,
+        "initial_capital": initial_capital,
+        "risk_per_trade_pct": setting("risk_per_trade_pct"),
+        "max_position_exposure_pct": setting("max_position_exposure_pct"),
+        "max_leverage": setting("max_leverage"),
+        "modeling_resolution": str(setting("modeling_resolution", "open_close")),
+        "signal_exit_fill": str(setting("signal_exit_fill", "close")),
+        "warmup_start": str(setting("warmup_start", "")),
+        "data_dir": str(context.get("data_dir") or extra.get("data_dir") or ""),
+        "data_source": str(context.get("data_source") or extra.get("data_source") or ""),
+        "parameters": dict(parameters),
+    }
+    for name in _RUNTIME_ONLY_SETTINGS:
+        if name in extra:
+            config_kwargs[name] = extra[name]
+    return BacktestConfig(**config_kwargs)
+
+
 def run_optimization(
     config: OptimizationConfig,
     progress_callback: ProgressCallback | None = None,
@@ -377,10 +505,13 @@ def run_optimization(
         backtest_end,
         config.train_split_pct,
         embargo_days=config.embargo_days,
+        embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
     )
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
+    execution_context = _execution_context_from_result(base_result)
+    context_fingerprint = _context_fingerprint(execution_context, strategy_path)
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -403,6 +534,8 @@ def run_optimization(
             train_period=train_period,
             test_period=test_period,
             base_parameters=base_parameters,
+            execution_context=execution_context,
+            context_fingerprint=context_fingerprint,
             base_runtime=base_runtime,
             progress_callback=progress_callback,
         )
@@ -414,7 +547,13 @@ def run_optimization(
             for symbol in universe
         )
     )
-    data_dir = str(base_result.meta.data.get("data_dir") or "")
+    # The execution context is the snapshot written at backtest time; the
+    # top-level meta key is the older spelling and only used as a fallback.
+    data_dir = str(
+        execution_context.get("data_dir")
+        or base_result.meta.data.get("data_dir")
+        or ""
+    )
     ensure_backtest_data(
         symbols=required_symbols,
         timeframe=timeframe,
@@ -469,15 +608,16 @@ def run_optimization(
 
         try:
             train_result = _run_vectorbt_backtest(
-                BacktestConfig(
-                    strategy_name=strategy_slug,
+                _optimizer_backtest_config(
+                    strategy_slug=strategy_slug,
                     symbols=trial_symbols,
                     timeframe=timeframe,
                     start_date=train_period["start"],
                     end_date=train_period["end"],
                     initial_capital=initial_capital,
                     parameters=combined_params,
-                    **base_runtime,
+                    context=execution_context,
+                    runtime=base_runtime,
                 ),
                 strategy_path,
             )
@@ -487,6 +627,7 @@ def run_optimization(
         trial.set_user_attr("train_stats", _json_safe(train_stats))
         trial.set_user_attr("effective_parameters", _json_safe(combined_params))
         trial.set_user_attr("symbols", _json_safe(trial_symbols))
+        trial.set_user_attr("execution_context_fingerprint", context_fingerprint)
         trial.set_user_attr("trade_count", len(train_result.trades))
 
         if not train_result.trades:
@@ -616,15 +757,16 @@ def run_optimization(
     )
 
     test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
+        _optimizer_backtest_config(
+            strategy_slug=strategy_slug,
             symbols=best_symbols,
             timeframe=timeframe,
             start_date=test_period["start"],
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
-            **base_runtime,
+            context=execution_context,
+            runtime=base_runtime,
         ),
         strategy_path,
     )
@@ -656,6 +798,9 @@ def run_optimization(
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
+        "execution_context": _json_safe(execution_context),
+        "execution_context_fingerprint": context_fingerprint,
+        "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(best_value),
@@ -677,6 +822,16 @@ def run_optimization(
             limit=10,
             direction=_study_direction(config.target_metric),
         ),
+        "diagnostics": _json_safe(
+            _build_diagnostics_payload(
+                trials=study.trials,
+                config=config,
+                train_period=train_period,
+                test_period=test_period,
+                target_metric=config.target_metric,
+                timeframe=str(execution_context.get("timeframe") or "") or None,
+            )
+        ),
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -686,10 +841,167 @@ def run_optimization(
 
 
 def _load_base_backtest(backtest_id: str) -> BacktestResult:
+    """Load the base backtest from disk, falling back to the SQLite store.
+
+    The JSON artifact under BACKTESTS_DIR is authoritative when present;
+    otherwise the result is read back by id from the database, so an
+    optimization can still run against a backtest that was persisted with
+    ``--skip-sqlite`` inverted (or whose JSON was archived).
+    """
     path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Base backtest {backtest_id!r} not found at {path}")
-    return BacktestResult.load(path)
+    if path.exists():
+        return BacktestResult.load(path)
+    stored = load_backtest_result(str(backtest_id))
+    if stored is not None:
+        return stored
+    raise FileNotFoundError(f"Base backtest {backtest_id!r} not found at {path}")
+
+
+# Canonical platform timeframe labels (as returned by normalize_timeframe) ->
+# bar duration in seconds. Expressed directly rather than via pandas offsets
+# because pd.Timedelta rejects non-fixed frequencies such as "D" and "W".
+#
+# normalize_timeframe passes through both the "5m" and the "m5" spellings, so
+# both families are listed.
+_TIMEFRAME_BAR_SECONDS: dict[str, float] = {
+    "1s": 1.0,
+    "5s": 5.0,
+    "10s": 10.0,
+    "15s": 15.0,
+    "30s": 30.0,
+    "1m": 60.0,
+    "3m": 180.0,
+    "5m": 300.0,
+    "15m": 900.0,
+    "30m": 1800.0,
+    "1h": 3600.0,
+    "2h": 7200.0,
+    "3h": 10800.0,
+    "4h": 14400.0,
+    "6h": 21600.0,
+    "8h": 28800.0,
+    "12h": 43200.0,
+    "1d": 86400.0,
+    "1w": 604800.0,
+    # "<unit><n>" spellings that normalize_timeframe leaves untouched.
+    "s1": 1.0,
+    "s5": 5.0,
+    "s10": 10.0,
+    "s15": 15.0,
+    "s30": 30.0,
+    "m1": 60.0,
+    "m3": 180.0,
+    "m5": 300.0,
+    "m15": 900.0,
+    "m30": 1800.0,
+    "h1": 3600.0,
+    "h2": 7200.0,
+    "h3": 10800.0,
+    "h4": 14400.0,
+    "h6": 21600.0,
+    "h8": 28800.0,
+    "h12": 43200.0,
+    "d1": 86400.0,
+    "w1": 604800.0,
+}
+
+
+def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
+    """Bar duration for a timeframe label, used to express the embargo in bars."""
+    seconds = _TIMEFRAME_BAR_SECONDS.get(normalize_timeframe(timeframe))
+    if seconds is None:
+        return None
+    return pd.Timedelta(seconds=seconds)
+
+
+def _build_diagnostics_payload(
+    *,
+    trials: Sequence[Any],
+    config: OptimizationConfig,
+    train_period: Mapping[str, str],
+    test_period: Mapping[str, str],
+    target_metric: str,
+    timeframe: str | None = None,
+) -> dict[str, Any]:
+    """Attach honesty checks to the optimization result.
+
+    Reports how much the selected parameter should be trusted: whether the
+    optimum sits on a stable plateau, how much of the score is explained by
+    picking the best of many trials, and what the split/embargo actually was.
+    Never changes the selection; only annotates it.
+    """
+    from runner.optimization_diagnostics import (
+        embargo_split,
+        multiple_testing_correction,
+        plateau_analysis,
+        walk_forward_splits,
+    )
+
+    payload: dict[str, Any] = {}
+    bar_duration = _timeframe_bar_duration(timeframe)
+
+    # 1. Split geometry, including the gap between train and test.
+    try:
+        split = embargo_split(
+            train_period["start"],
+            test_period["end"],
+            train_split_pct=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+        payload["split"] = split.as_dict()
+    except (ValueError, KeyError) as exc:
+        payload["split"] = {"error": str(exc)}
+
+    # 2. Walk-forward folds, so the result is not a single lucky split.
+    try:
+        payload["walk_forward"] = walk_forward_splits(
+            train_period["start"],
+            test_period["end"],
+            n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
+            train_fraction=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+    except (ValueError, KeyError) as exc:
+        payload["walk_forward"] = {"error": str(exc)}
+
+    # 3. Plateau stability and selection bias over the evaluated trials.
+    trial_rows: list[dict[str, Any]] = []
+    for trial in trials or []:
+        params = getattr(trial, "params", None)
+        value = getattr(trial, "value", None)
+        if isinstance(params, dict) and isinstance(value, (int, float)):
+            trial_rows.append({**params, "metric": value})
+
+    # A plateau is only meaningful along a parameter that actually varied.
+    varied: dict[str, set[Any]] = {}
+    for row in trial_rows:
+        for key, value in row.items():
+            if key == "metric":
+                continue
+            varied.setdefault(key, set()).add(value)
+    candidates = [name for name, values in varied.items() if len(values) > 1]
+    if candidates:
+        # Pick the parameter explored most broadly: that is where a plateau (or
+        # its absence) says the most about robustness.
+        parameter = max(candidates, key=lambda name: len(varied[name]))
+        plateau = plateau_analysis(trial_rows, parameter=parameter, metric="metric")
+        payload["plateau"] = (
+            {"parameter": parameter, **plateau.as_dict()} if plateau else None
+        )
+    else:
+        payload["plateau"] = None
+
+    # penalty_floor keeps the no-trade sentinel out of the trial distribution:
+    # it is a penalty, not a strategy performance, and would otherwise describe
+    # the mean/spread of the sample (and every comparison below it).
+    payload["multiple_testing"] = multiple_testing_correction(
+        [float(row["metric"]) for row in trial_rows],
+        penalty_floor=_NO_TRADE_PENALTY,
+    )
+    payload["target_metric"] = target_metric
+    return payload
 
 
 def _resolve_strategy_reference(result: BacktestResult) -> tuple[str, Path, str]:
@@ -709,8 +1021,24 @@ def _split_backtest_period(
     start_value: str,
     end_value: str,
     train_split_pct: float,
-    embargo_days: int = 1,
+    embargo_days: int = 0,
+    embargo_pct: float = 0.0,
 ) -> tuple[dict[str, str], dict[str, str]]:
+    """Split into train / embargo-gap / test windows.
+
+    A trade opened just before the split can still be open during the test
+    window, so its label contains test information; without a gap that leaks
+    backwards into training. The gap is ``embargo_days`` PLUS
+    ``embargo_pct`` of the whole window, and it is applied here, to the
+    windows that actually run, rather than only being reported by the
+    diagnostics.
+
+    Both knobs default to 0 so this stays a pure geometry helper: the
+    platform's 1-day embargo policy is ``OptimizationConfig.embargo_days``
+    (default 1) and reaches the call through ``run_optimization``.
+    """
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
     start_ts = _parse_period_boundary(start_value, is_end=False)
     end_ts = _parse_period_boundary(end_value, is_end=True)
     if end_ts <= start_ts:
@@ -728,16 +1056,20 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
-    # C3: embargo gap — the test window starts `embargo_days` after the
-    # split so no bar (and no indicator warmup overlap) is shared. The old
-    # split+1µs boundary leaked the split bar into both segments.
-    embargo = pd.Timedelta(days=max(int(embargo_days), 0))
+    # C3: embargo gap — the test window starts after the split so no bar
+    # (and no indicator warmup overlap) is shared. The old split+1µs
+    # boundary leaked the split bar into both segments. `embargo_pct` scales
+    # the gap with the length of the backtest; `embargo_days` is the fixed
+    # component. Both are applied to the windows that run, not just reported.
+    embargo = pd.Timedelta(days=max(int(embargo_days), 0)) + (
+        (end_ts - start_ts) * float(embargo_pct)
+    )
     test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
     if test_start_ts >= end_ts:
         raise ValueError(
-            "train_split_pct + embargo_days leave an empty test period for "
-            "the base backtest range"
+            "train_split_pct/embargo_days/embargo_pct leave an empty train or "
+            "test period for the base backtest range"
         )
     test_period = {
         "start": test_start_ts.isoformat(),
@@ -918,6 +1250,8 @@ def _run_risk_parity_covariance_optimization(
     train_period: dict[str, str],
     test_period: dict[str, str],
     base_parameters: dict[str, Any],
+    execution_context: dict[str, Any],
+    context_fingerprint: str,
     base_runtime: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
@@ -934,7 +1268,9 @@ def _run_risk_parity_covariance_optimization(
         timeframe=timeframe,
         start=train_period["start"],
         end=train_period["end"],
-        data_dir=str(base_result.meta.data.get("data_dir") or ""),
+        data_dir=str(
+            execution_context.get("data_dir") or base_result.meta.data.get("data_dir") or ""
+        ),
     )
     if returns_frame.empty or len(returns_frame.columns) < 2:
         returns_frame = _asset_returns_frame_from_base_result(base_result)
@@ -957,15 +1293,16 @@ def _run_risk_parity_covariance_optimization(
         progress_callback, 70.0, "Running OOS backtest for selected risk parity universe."
     )
     test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
+        _optimizer_backtest_config(
+            strategy_slug=strategy_slug,
             symbols=best_symbols,
             timeframe=timeframe,
             start_date=test_period["start"],
             end_date=test_period["end"],
             initial_capital=initial_capital,
             parameters=effective_best_params,
-            **base_runtime,
+            context=execution_context,
+            runtime=base_runtime,
         ),
         strategy_path,
     )
@@ -997,6 +1334,9 @@ def _run_risk_parity_covariance_optimization(
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
+        "execution_context": _json_safe(execution_context),
+        "execution_context_fingerprint": context_fingerprint,
+        "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": {},
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(selection["best_score"]),

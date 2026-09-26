@@ -392,9 +392,7 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
             "                }",
             "            )",
             "",
-            "    if drawings:",
-            "        return entries, exits, indicators_dict, drawings",
-            "    return entries, exits, indicators_dict",
+            "    return entries, exits, indicators_dict, drawings",
             "",
         ]
     )

@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from runner.daily_equity import attach_daily_equity, build_daily_equity_curve
+from runner.stats import compute_stats_for_result
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
@@ -88,6 +89,15 @@ class TestBuildDailyEquityCurve:
         assert len(returns) == 32
         january_return = next(item for item in returns if item["date"] == "2024-01-15")
         assert abs(january_return["return"] - 0.005) < 1e-10
+        # Union (branch side): the trade's exit day is exactly one point of the
+        # curve. The branch asserted a 2-point curve with points[1] on the trade
+        # day; the resolved contract fills every calendar day of the backtest
+        # window, so the same property is asserted against the trade-day point
+        # rather than a positional index.
+        assert len(points) == 33
+        trade_day = [point for point in points if point.time.startswith("2024-01-15")]
+        assert len(trade_day) == 1
+        assert trade_day[0].equity == 100500.0
 
     def test_multiple_trades_same_day(self):
         """Test multiple trades aggregated to same day."""
@@ -97,8 +107,12 @@ class TestBuildDailyEquityCurve:
         points, returns = build_daily_equity_curve(result)
 
         assert points[0].time == "2024-01-01T00:00:00+00:00"
+        assert points[0].equity == 100000.0
         assert points[-1].equity == 100800.0
         assert len(returns) == 32
+        # Union (branch side): the two same-day trades aggregate into one
+        # calendar point, so the curve is the filled window, not two points.
+        assert len(points) == 33
 
     def test_trades_different_days(self):
         """Test trades on different days create separate equity points."""
@@ -126,6 +140,10 @@ class TestBuildDailyEquityCurve:
             point.time.startswith("2024-01-16") and point.equity == 100800.0
             for point in points
         )
+        # Union (branch side): this subsumes the branch's positional
+        # points[1]/points[2] checks — the filled curve carries each trade day's
+        # equity on that day, which the two assertions above pin.
+        assert len(points) == 33
 
     def test_trades_sorted_chronologically(self):
         """Test that output is sorted by date regardless of trade order."""
@@ -178,8 +196,12 @@ class TestBuildDailyEquityCurve:
         result = make_result(trades=[trade1, trade2, trade3])
         points, returns = build_daily_equity_curve(result)
 
+        assert points[0].equity == 100000.0
         assert points[-1].equity == 100500.0
         assert len(returns) == 32
+        # Union (branch side): only the valid trade contributes, so the filled
+        # window still starts flat and ends at its net PnL.
+        assert len(points) == 33
 
     def test_skips_trades_without_valid_exit_time(self):
         """Test that trades with invalid exit times are skipped."""
@@ -199,8 +221,12 @@ class TestBuildDailyEquityCurve:
         result = make_result(trades=[trade1, trade2, trade3])
         points, returns = build_daily_equity_curve(result)
 
+        assert points[0].equity == 100000.0
         assert points[-1].equity == 100500.0
         assert len(returns) == 32
+        # Union (branch side): only the valid trade contributes, so the filled
+        # window still starts flat and ends at its net PnL.
+        assert len(points) == 33
 
     def test_daily_return_calculation(self):
         """Test daily return is calculated correctly."""
@@ -212,6 +238,43 @@ class TestBuildDailyEquityCurve:
         january_return = next(item for item in returns if item["date"] == "2024-01-15")
         assert abs(january_return["return"] - 0.05) < 1e-10
         assert january_return["equity"] == 105000.0
+
+
+    def test_daily_equity_uses_net_pnl_after_fees(self):
+        trade = make_trade(pnl=500.0)
+        trade.fees = 25.0
+        trade.net_pnl = 475.0
+
+        points, returns = build_daily_equity_curve(make_result(trades=[trade]))
+
+        assert points[-1].equity == pytest.approx(100475.0)
+        # Union (branch side): this used to read `returns[-1]`, which under the
+        # resolved calendar-filled contract is the last day of the backtest
+        # window (a zero-return day), not the trade day. The 0.00475 return
+        # belongs to 2024-01-15.
+        trade_day_return = next(item for item in returns if item["date"] == "2024-01-15")
+        assert trade_day_return["return"] == pytest.approx(0.00475)
+        assert trade_day_return["equity"] == pytest.approx(100475.0)
+
+    def test_first_trade_loss_is_included_in_return_and_drawdown(self):
+        trade = make_trade(pnl=-1100.0)
+        trade.net_pnl = -1100.0
+        result = make_result(
+            trades=[trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-15T15:00:00Z", equity=98_900.0)
+            ],
+            backtest_start="2024-01-15",
+            backtest_end="2024-01-16",
+        )
+
+        attach_daily_equity(result)
+        stats = compute_stats_for_result(result)
+
+        assert result.equity_curve[0].equity == pytest.approx(100_000.0)
+        assert result.equity_curve[-1].equity == pytest.approx(98_900.0)
+        assert stats["total_return"] == pytest.approx(-0.011)
+        assert stats["max_drawdown_pct"] == pytest.approx(-0.011)
 
 
 class TestAttachDailyEquity:
@@ -234,6 +297,117 @@ class TestAttachDailyEquity:
         assert len(result.equity_curve) == 33
         assert result.equity_curve[0].equity == 100000.0
         assert result.equity_curve[-1].equity == 100500.0
+
+    def test_aggregates_reconciling_engine_curve_to_daily_points(self):
+        """An engine curve that reconciles with the trades is kept, compacted
+        to one point per observed day."""
+        result = make_result(
+            trades=[make_trade(pnl=500.0)],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-10T00:00:00+00:00", equity=100100.0),
+                EquityPoint(time="2024-01-20T00:00:00+00:00", equity=100300.0),
+                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=100500.0),
+            ]
+        )
+        attach_daily_equity(result)
+
+        assert len(result.equity_curve) == 4
+        assert result.equity_curve[0].equity == 100000.0
+        assert result.equity_curve[-1].equity == 100500.0
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 3
+
+    def test_open_position_drawdown_is_kept_from_engine_curve(self):
+        result = make_result(
+            trades=[
+                make_trade(
+                    entry_time="2024-01-10T10:00:00Z",
+                    exit_time="2024-01-10T15:00:00Z",
+                    pnl=500.0,
+                )
+            ],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-05T00:00:00+00:00", equity=99000.0),
+                EquityPoint(time="2024-01-10T00:00:00+00:00", equity=100500.0),
+            ],
+        )
+
+        attach_daily_equity(result)
+        stats = compute_stats_for_result(result)
+
+        assert [point.equity for point in result.equity_curve] == [100000.0, 99000.0, 100500.0]
+        assert result.stats["daily_return_count"] == 2
+        assert stats["total_return"] == pytest.approx(0.005)
+        assert stats["max_drawdown_pct"] == pytest.approx(-0.01)
+
+    def test_rejects_engine_curve_that_does_not_reconcile_with_trades(self):
+        """A curve whose final equity contradicts the trades is thrown away and
+        rebuilt from realized PnL over the full backtest window."""
+        result = make_result(
+            trades=[make_trade(pnl=500.0)],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-20T00:00:00+00:00", equity=105000.0),
+            ],
+        )
+
+        attach_daily_equity(result)
+
+        # Union (branch side): this used to assert a two-point curve and a single
+        # daily return. The resolved contract fills the whole 2024-01-01..2024-02-01
+        # window, so the same intent (the bogus 105000.0 point is gone and the
+        # curve ends at the trade's net PnL) is asserted over the filled curve.
+        equities = [point.equity for point in result.equity_curve]
+        assert len(result.equity_curve) == 33
+        assert equities[0] == 100000.0
+        assert equities[-1] == 100500.0
+        assert set(equities) == {100000.0, 100500.0}
+        assert result.stats["daily_return_count"] == 32
+
+    def test_replaces_equity_curve_when_daily_has_more_points(self):
+        """The daily curve must replace a two-point endpoint-only engine curve.
+
+        Merge resolution: this is the same fixture and the same intent as
+        `test_rejects_endpoint_only_curve_with_matching_endpoints` on the other
+        side of the merge, which already pinned the calendar-filled answer (33
+        points). The branch's literal (4 points) described the older
+        event-day-only curve. Both are kept; both now assert the filled curve.
+
+        NOTE for the source resolution: this fixture's engine curve *reconciles*
+        with the trades (101000.0 == 100000 + 500 + 300 + 200), so any fast path
+        that adopts a reconciling engine curve before the density check in
+        `_preserves_engine_curve` will hand back the 2-point curve and fail both
+        tests. That is the guard working as intended: an endpoint-only curve must
+        not be preserved.
+        """
+        trade1 = make_trade(
+            entry_time="2024-01-10T10:00:00Z", exit_time="2024-01-10T15:00:00Z", pnl=500.0
+        )
+        trade2 = make_trade(
+            entry_time="2024-01-15T10:00:00Z", exit_time="2024-01-15T15:00:00Z", pnl=300.0
+        )
+        trade3 = make_trade(
+            entry_time="2024-01-20T10:00:00Z", exit_time="2024-01-20T15:00:00Z", pnl=200.0
+        )
+        result = make_result(
+            trades=[trade1, trade2, trade3],
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-02-01T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+        attach_daily_equity(result)
+
+        assert len(result.equity_curve) == 33
+        assert result.equity_curve[0].equity == 100000.0
+        assert result.equity_curve[-1].equity == 101000.0
+        # Each trade day carries that day's cumulative net PnL.
+        assert result.equity_curve[10].equity == 100500.0
+        assert result.equity_curve[15].equity == 100800.0
+        assert result.equity_curve[20].equity == 101000.0
+        assert result.stats["daily_return_count"] == 32
 
     def test_does_not_preserve_single_point_engine_curve(self):
         result = make_result(

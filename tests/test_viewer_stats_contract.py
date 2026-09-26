@@ -61,6 +61,34 @@ def _trades() -> list[Trade]:
     ]
 
 
+def test_backtest_info_payload_exposes_period_and_data_provenance():
+    from viewer import core
+
+    result = _result([])
+    result.meta.duration_days = 31
+    result.meta.total_bars = 744
+    result.meta.data = {
+        "timeframes": ["1h"],
+        "source": "dukascopy",
+        "requested_data_source": "metals",
+        "asset_classes": ["metals"],
+        "data_files": ["/tmp/XAUUSD/1h.parquet"],
+        "pnl_basis": {"pnl": "gross", "net_pnl": "net_after_fees"},
+        "risk_config": {"risk_per_trade_pct": 0.01},
+    }
+
+    payload = core._backtest_info_payload(result)
+
+    assert payload["duration_days"] == 31
+    assert payload["total_bars"] == 744
+    assert payload["data_source"] == "dukascopy"
+    assert payload["requested_data_source"] == "metals"
+    assert payload["asset_classes"] == ["metals"]
+    assert payload["data_files"] == ["/tmp/XAUUSD/1h.parquet"]
+    assert payload["pnl_basis"] == {"pnl": "gross", "net_pnl": "net_after_fees"}
+    assert payload["risk_config"] == {"risk_per_trade_pct": 0.01}
+
+
 def test_core_stats_payload_reports_exact_extremes():
     from viewer import core
 
@@ -111,6 +139,38 @@ def test_core_stats_payload_handles_empty_trade_list():
     assert payload["losers"] == 0
 
 
+def test_core_stats_payload_expectancy_equals_average_trade():
+    from viewer import core
+
+    payload = core._stats_payload_from_result(_result(_trades()))
+
+    assert payload["expectancy"] == payload["avg_trade_pnl"]
+    assert payload["expectancy"] == 0.0
+
+
+def test_core_stats_payload_reports_total_return_in_percent_points():
+    from viewer import core
+
+    payload = core._stats_payload_from_result(_result(_trades()))
+
+    assert payload["total_return"] == 0.0
+    assert payload["total_return"] == payload["net_profit_pct"]
+
+
+def test_core_stats_payload_uses_net_trade_values_after_fees():
+    from viewer import core
+
+    trade = _trade(1, 100.0)
+    trade.fees = 10.0
+    trade.net_pnl = 90.0
+
+    payload = core._stats_payload_from_result(_result([trade]))
+
+    assert payload["best_trade"] == 90.0
+    assert payload["net_profit"] == 90.0
+    assert payload["avg_winner"] == 90.0
+
+
 def test_stats_payload_percent_scale_matches_frontend_contract():
     """The frontend `PERCENT_METRIC_SCALES` table claims specific units for each
     percent-like key. This pins the backend half of that contract so a producer
@@ -120,7 +180,7 @@ def test_stats_payload_percent_scale_matches_frontend_contract():
     payload = core._stats_payload_from_result(_result(_trades()))
 
     # "points"-scaled keys in frontend/src/api/metricScale.ts.
-    for key in ("net_profit_pct", "win_rate", "max_drawdown_pct", "cagr"):
+    for key in ("net_profit_pct", "total_return", "win_rate", "max_drawdown_pct", "cagr"):
         value = payload[key]
         assert value is None or -100.0 <= value <= 100.0, (
             f"{key}={value!r} is not in percent points (-100..100); "

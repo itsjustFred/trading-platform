@@ -206,7 +206,7 @@ class _CaptureEngine:
         self.captured["risk_per_trade_pct"] = config.risk_per_trade_pct
         from shared.models import BacktestMeta, BacktestResult
 
-        return BacktestResult(
+        result = BacktestResult(
             meta=BacktestMeta(
                 id="sizing-demo",
                 created_at="2026-03-09T10:00:00Z",
@@ -226,6 +226,8 @@ class _CaptureEngine:
             equity_curve=[],
             stats={},
         )
+        self.captured["meta_data"] = result.meta.data
+        return result
 
 
 class TestCliRunWiring:
@@ -269,6 +271,28 @@ class TestCliRunWiring:
         )
         assert captured["max_position_exposure_pct"] == 0.5
         assert captured["risk_per_trade_pct"] == 0.01
+        assert captured["meta_data"]["pnl_basis"] == {
+            "pnl": "gross",
+            "net_pnl": "net_after_fees",
+        }
+        assert captured["meta_data"]["risk_config"] == {
+            "risk_per_trade_pct": 0.01,
+            "max_position_exposure_pct": 0.5,
+            "max_leverage": None,
+            "modeling_resolution": "open_close",
+            "signal_exit_fill": "close",
+            "warmup_start": "",
+            "max_position_exposure_semantics": "per_position_notional",
+        }
+        assert captured["meta_data"]["execution_context"] == {
+            "engine": "vectorbt",
+            "data_dir": str(tmp_path.resolve()),
+            "data_source": "",
+            "symbols": ["AAPL"],
+            "timeframe": "1h",
+            "initial_capital": 100000.0,
+            "risk_config": captured["meta_data"]["risk_config"],
+        }
 
     def test_deprecated_flag_still_reaches_backtest_config(self, monkeypatch, tmp_path: Path):
         captured = self._run_cmd(monkeypatch, tmp_path, ["--max-position-pct", "0.5"])

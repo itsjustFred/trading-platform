@@ -114,6 +114,27 @@ class TestInternalGapDetection:
         )
         assert report["status"] == "failed"
 
+    def test_gap_outside_required_window_does_not_fail(self, tmp_path):
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [
+                "2019-01-01T00:00:00Z",
+                "2019-01-01T01:00:00Z",
+                "2024-06-01T00:00:00Z",
+                "2024-06-01T01:00:00Z",
+                "2024-06-01T02:00:00Z",
+            ],
+        )
+
+        report = analyze_ohlcv_coverage(
+            tmp_path,
+            DataRequirement(
+                symbol="EURUSD", timeframe="1h", start="2024-06-01", end="2024-06-01"
+            ),
+        )
+
+        assert report["status"] != "failed"
+
 
 class TestFailedDownloadVisibility:
     def test_ensure_backtest_data_raises_when_download_produces_nothing(
@@ -248,6 +269,40 @@ class TestValidateGapBounds:
 
         with pytest.raises(ValueError, match="escapes its root"):
             validate_module.validate_parquet(outside)
+
+
+class TestEnsureBacktestDataGapGateViaModuleImport:
+    """The same internal-gap scenario, driven through the module-level import.
+
+    Merge resolution: both sides of the merge added this scenario in a class
+    called ``TestEnsureBacktestDataGapGate``, so the later definition silently
+    shadowed the earlier one and half the gap-gate coverage stopped running.
+    The classes are renamed apart so both are collected. The only real
+    difference between them is the import binding under test: this one resolves
+    ``auto_download`` from module scope, so it also guards that binding.
+    """
+
+    def test_internal_gap_fails_coverage(self, tmp_path, monkeypatch):
+        early = pd.date_range("2024-01-01", "2024-01-05", freq="1h", tz="UTC")
+        late = pd.date_range("2024-01-15", "2024-01-20", freq="1h", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in [*early, *late]],
+        )
+        monkeypatch.setattr(
+            auto_download,
+            "_download_missing_ohlcv_data",
+            lambda **kwargs: None,
+        )
+
+        with pytest.raises(RuntimeError, match="internal gaps"):
+            auto_download.ensure_backtest_data(
+                symbols=["EURUSD"],
+                timeframe="1h",
+                start="2024-01-01",
+                end="2024-01-20",
+                data_dir=tmp_path,
+            )
 
 
 class TestGapDetectionSingleFile:
@@ -822,3 +877,208 @@ def test_observed_session_uses_an_interior_window_at_boundary_cuts() -> None:
         start_ts=pd.Timestamp("2024-01-02T10:30:00Z"),
         end_ts=pd.Timestamp("2024-01-04T13:00:00Z"),
     ) == (540, 900)
+# ─── the allowed hole length must scale with the timeframe ──────────────────
+
+
+def _write_series(directory, filename, timestamps):
+    import pandas as pd
+
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        }
+    ).to_parquet(directory / filename)
+    return directory
+
+
+def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
+    """Weekly bars sit 7 days apart, so a 1-day threshold flagged every bar.
+
+    The reported hole made weekly coverage always fail, blocking any backtest
+    that used a weekly timeframe.
+    """
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1w.parquet",
+        pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1w") == []
+
+
+def test_regular_monthly_data_is_not_reported_as_a_gap(tmp_path):
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1mo.parquet",
+        pd.date_range("2024-01-01", periods=36, freq="30D", tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1mo") == []
+
+
+def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    # Business-day cadence leaves 2-day weekend holes.
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1d.parquet",
+        pd.bdate_range("2024-01-01", periods=60, tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1d") == []
+
+
+def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    ts = list(pd.date_range("2024-01-01", periods=20, freq="1D", tz="UTC"))
+    ts += list(pd.date_range("2024-03-01", periods=20, freq="1D", tz="UTC"))
+    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1d.parquet", ts)
+    gaps = find_internal_gaps(symbol_dir, "1d")
+    assert gaps and gaps[0]["gap_days"] > 30, f"a six-week hole must still fail: {gaps}"
+
+
+def test_gap_threshold_scales_with_timeframe_but_keeps_an_intraday_floor():
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    # The warning threshold keeps a tight 1-day floor for sub-daily timeframes,
+    # so a genuine intraday hole is still surfaced rather than accepted.
+    assert scaled_gap_threshold_days("1m", 1) == 1.0
+    assert scaled_gap_threshold_days("1h", 1) == 1.0
+    # The threshold that fails coverage additionally tolerates a long weekend,
+    # which reaches four calendar days when Friday and Monday are both closed.
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) == 4.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) == 4.0
+    # Longer-spaced series widen proportionally.
+    assert scaled_gap_threshold_days("1d", 1) == 3.0
+    assert scaled_gap_threshold_days("1w", 1) == 21.0
+    assert scaled_gap_threshold_days("1mo", 1) == 90.0
+    # The fail threshold never becomes stricter than before.
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) >= 3.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) >= 3.0
+
+
+def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
+    """`analyze_ohlcv_coverage` is the gate that actually blocks a backtest.
+
+    With a fixed 3-day fail threshold, regular weekly data (7-day spacing) was
+    reported as `failed` for internal gaps, so no weekly backtest could start.
+    """
+    import pandas as pd
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    symbol_dir = root / "ohlcv" / "GOLD1"
+    ts = pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC")
+    _write_series(symbol_dir, "1w.parquet", ts)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="GOLD1",
+            timeframe="1w",
+            # Inside the stored range: an out-of-range request fails for an
+            # unrelated boundary reason and would not exercise the gap check.
+            start="2024-01-05",
+            end="2025-02-20",
+        ),
+    )
+    assert report["status"] != "failed", f"regular weekly data must not fail: {report}"
+    assert not report["gaps"], f"regular weekly data must report no gaps: {report}"
+
+
+def test_nominal_days_scales_by_the_numeric_prefix():
+    """`4w` bars are four weeks apart and `5m` bars are five minutes apart.
+
+    Ignoring the prefix sized the allowed hole against the wrong spacing, so a
+    4-week series would be judged against a 3-day threshold.
+    """
+    from data_tools.auto_download import timeframe_nominal_days
+
+    assert timeframe_nominal_days("4w") == 28.0
+    assert timeframe_nominal_days("1w") == 7.0
+    assert timeframe_nominal_days("3mo") == 90.0
+    assert timeframe_nominal_days("1mo") == 30.0
+    assert timeframe_nominal_days("5m") == pytest.approx(5 / 1440)
+    assert timeframe_nominal_days("4h") == pytest.approx(4 / 24)
+    assert timeframe_nominal_days("2d") == 2.0
+    # Unparseable input falls back to daily rather than raising.
+    assert timeframe_nominal_days("nonsense") == 1.0
+    assert timeframe_nominal_days("") == 1.0
+
+
+def test_multi_week_timeframes_get_a_wider_gap_threshold():
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    assert scaled_gap_threshold_days("4w", 1) == 84.0
+    assert scaled_gap_threshold_days("2w", 1) == 42.0
+
+
+def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
+    """With no timeframe there is no spacing to scale against.
+
+    Widening anyway would only hide real holes, so the floor is kept.
+    """
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    # 2 days apart with no timeframe given: must still be reported. Scaling
+    # would raise the bar to 3 days and hide it.
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "custom.parquet",
+        pd.date_range("2024-01-01", periods=12, freq="2D", tz="UTC"),
+    )
+    gaps = find_internal_gaps(symbol_dir, None)
+    assert gaps and gaps[0]["gap_days"] == pytest.approx(2.0), (
+        f"a 2-day hole must be reported when no timeframe is known: {gaps}"
+    )
+
+
+def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
+    """Friday close to Monday open is about three days even for hourly bars.
+
+    With a fixed 3-day fail threshold that escalated to `failed` and blocked the
+    backtest. It must stay a warning: the closure is real market behaviour, and a
+    warning is still surfaced rather than silently accepted.
+    """
+    import pandas as pd
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    stamps = list(
+        pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC")
+    ) + [pd.Timestamp("2024-03-11 22:00", tz="UTC")]
+    _write_series(root / "ohlcv" / "GOLD1", "1h.parquet", stamps)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="GOLD1", timeframe="1h",
+            start="2024-03-06", end="2024-03-11",
+        ),
+    )
+    assert report["status"] != "failed", f"a long weekend must not fail coverage: {report}"
+    assert report["gaps"], "the closure should still be reported as a gap"
+
+
+def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
+    import pandas as pd
+    from data_tools.auto_download import find_internal_gaps
+
+    stamps = list(pd.date_range("2024-03-01", periods=5, freq="1h", tz="UTC")) + list(
+        pd.date_range("2024-03-09", periods=5, freq="1h", tz="UTC")
+    )
+    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1h.parquet", stamps)
+    gaps = find_internal_gaps(symbol_dir, "1h")
+    assert gaps and gaps[0]["gap_days"] > 4, f"an 8-day hole must be reported: {gaps}"

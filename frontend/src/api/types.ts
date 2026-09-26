@@ -1,5 +1,18 @@
 export type StrategyParameterValue = number | string | boolean | null;
 
+/**
+ * Free-form tag bag a strategy file declares. The keys the UI reads are typed;
+ * anything else is allowed but must be narrowed before use.
+ */
+export interface StrategyTags {
+  type?: string[];
+  source?: string;
+  asset_class?: string[];
+  complexity?: string;
+  link?: string;
+  [key: string]: unknown;
+}
+
 export interface StrategyMeta {
   slug: string;
   name: string;
@@ -8,7 +21,7 @@ export interface StrategyMeta {
   created_at: string;
   source_url: string;
   notes: string;
-  tags: Record<string, any>;
+  tags: StrategyTags;
   type: string[];
   source: string;
   asset_class: string[];
@@ -111,6 +124,8 @@ export interface BacktestSummary {
   total_pnl: number;
   win_rate: number;
   created_at: string;
+  psr?: number;
+  p_value?: number;
 }
 
 export interface BacktestMeta {
@@ -130,7 +145,7 @@ export interface BacktestMeta {
     universe: string;
     source: string;
   };
-  parameters: Record<string, any>;
+  parameters: Record<string, StrategyParameterValue>;
   tags: string[];
   notes: string;
 }
@@ -408,7 +423,7 @@ export interface BacktestStats {
   expectancy: number;
   psr?: number;
   p_value?: number;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 export interface CapmScatterPoint {
@@ -434,6 +449,12 @@ export interface BacktestCapmResponse {
 export interface EquityPoint {
   time: number;
   equity: number;
+}
+
+export interface BenchmarkResponse {
+  symbol: string;
+  timeframe: string;
+  equity: Record<string, number>[];
 }
 
 export interface LiveAccount {
@@ -1221,7 +1242,7 @@ export interface PortfolioDetail {
     net_profit: number;
     psr?: number;
     p_value?: number;
-    correlation_matrix: Record<string, any>;
+    correlation_matrix: Record<string, Record<string, number>>;
   };
   combined_equity: { time: string; equity: number }[];
   strategy_contributions: {

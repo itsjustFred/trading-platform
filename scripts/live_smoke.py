@@ -1155,7 +1155,12 @@ def _stockkit_deployment_and_signal(
 
     from live_runner.daemon import _trade_signal_to_live_signal
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
-    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from live_runner.stockkit_routing import (
+        expected_account_number_for_route,
+        validate_stockkit_deployment_route,
+    )
+    from live_runner.credential_env import load_accounts_env_values
+    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from shared.models import LiveDeploymentConfig, LiveSignal
 
     message = SimpleNamespace(
@@ -1185,7 +1190,14 @@ def _stockkit_deployment_and_signal(
             "max_positions": 20,
         },
     )
-    validate_stockkit_deployment_route(deployment)
+    # Validate routing against the configured broker account number for this
+    # route, resolved from the same accounts-env the smoke run uses.
+    smoke_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    validate_stockkit_deployment_route(
+        deployment,
+        account_broker_login=expected_account_number_for_route(route, smoke_env),
+        accounts_env_values=smoke_env,
+    )
     live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
     live_signal.metadata.update({"entry_price": float(trade_signal.entry_price)})
     if extended_hours:

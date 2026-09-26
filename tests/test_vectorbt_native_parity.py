@@ -349,6 +349,10 @@ class TestFeeModelParity:
             assert trade.fees > 0
             assert trade.fees == pytest.approx(expected, abs=0.02)
             assert trade.net_pnl == pytest.approx(trade.pnl - trade.fees, abs=0.02)
+            assert result.equity_curve[-1].equity == pytest.approx(
+                config.initial_capital + trade.net_pnl,
+                abs=0.02,
+            )
 
 
 class TestExplicitColumnRoles:
@@ -384,3 +388,23 @@ class TestExplicitColumnRoles:
         assert _infer_indicator_when("plain", "exit") == "exit"
         assert _infer_indicator_when("exit_trigger", "") == "exit"
         assert _infer_indicator_when("plain", "") == "entry"
+
+
+def test_open_position_is_finalized_at_end_of_data(parity_env):
+    strategy = (
+        "import pandas as pd\n"
+        "STRATEGY_META = {'name': 'vbt_end_of_data', 'version': '1.0'}\n"
+        "def generate_signals(df, params):\n"
+        "    entries = pd.Series([True, False, False], index=df.index)\n"
+        "    exits = pd.Series([False, False, False], index=df.index)\n"
+        "    direction = pd.Series('LONG', index=df.index)\n"
+        "    return entries, exits, {'direction': direction}\n"
+    )
+    path = _write_strategy(parity_env, "s_open", strategy)
+
+    result = VectorbtAdapter().run(_config(parity_env, path), path)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].exits[0].reason == "end_of_data"
+    assert result.trades[0].exits[0].price == pytest.approx(102.2)
+    assert result.trades[0].entry_time.startswith("2024-01-01 01:00")

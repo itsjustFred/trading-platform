@@ -6,8 +6,8 @@ import {
 } from "../api/client";
 import { SymbolInput } from "./SymbolInput";
 import { Play, Loader2 } from "lucide-react";
-import { useToast } from "./ToastProvider";
-import { useStrategiesCache } from "./StrategiesProvider";
+import { useToast } from "./toastContext";
+import { useStrategiesCache } from "./strategiesContext";
 import { useStrategyDetail } from "../api/queries";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
@@ -32,7 +32,6 @@ const TIMEFRAME_LABELS: Record<string, string> = {
   "1d": "1 Day",
   "1w": "1 Week",
 };
-
 function getModelingTimeframes(mainTf: string): string[] {
   const idx = TIMEFRAME_ORDER.indexOf(mainTf as (typeof TIMEFRAME_ORDER)[number]);
   if (idx < 0) return [];
