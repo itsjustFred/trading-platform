@@ -1142,29 +1142,6 @@ class DukascopyNativeDownloader(Downloader):
         )
         _report_progress(report_progress, 0.0, "Preparing download")
 
-        request = _TickRequest(
-            instrument=instrument,
-            sym=sym,
-            normalized_tf=normalized_tf,
-            price_type=price_type,
-            offer_side=offer_side,
-            decimal_factor=decimal_factor,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            requested_start=requested_start,
-            requested_end=requested_end,
-        )
-        options = _TickDownloadOptions(
-            batch_size=batch_size,
-            pipeline_batches=pipeline_batches,
-            pause_ms=pause_ms,
-            max_retries=max_retries,
-            stop_event=stop_event,
-            pause_event=pause_event,
-            report_progress=report_progress,
-            log_callback=log_callback,
-        )
-
         if strategy == "tick":
             if merge_bid_ask:
                 _emit_log_message("Downloading merged hourly tick files...", log_callback=log_callback)

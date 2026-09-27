@@ -34,7 +34,6 @@ class TestPortfolioSharpeAnnualized:
     def test_daily_curve_sharpe_is_annualized(self):
         """252 daily points of constant per-day drift must give sqrt(252) * sr_obs."""
         rng_values = [1 + 0.001 * math.sin(i) + 0.0002 * i for i in range(253)]
-        times = list(range(1_700_000_000, 1_700_000_000 + 253 * 86_400, 86_400))
         equity = np.array([100_000.0 * v for v in rng_values])
         matrix = equity.reshape(-1, 1)
         weights = np.array([1.0])
@@ -99,13 +98,7 @@ class TestReplaySizingEquity:
                 "volume": [1000.0] * 3,
             }
         )
-        signal = ReplaySignal(
-            timestamp=timestamps[2],
-            symbol="PROBE",
-            action="buy",
-            entry_price=90.0,
-        )
-        # Open position from the earlier signal, now marked at 90 → −10k.
+        # An open position entered at 100, now marked at 90 → −10k unrealized.
         adapter._open_probe_position = None
         open_positions = {
             "PROBE": _OpenPosition(

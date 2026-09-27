@@ -194,7 +194,6 @@ def _qg_fade_frame(side: str, days: int = 30) -> pd.DataFrame:
     yields exactly one entry on its first bar.
     """
     bars_per_day = 6
-    rows = days * bars_per_day
     recs: list[dict] = []
     base_ts = pd.Timestamp("2024-01-02", tz="US/Eastern").normalize().tz_convert("UTC")
     for day in range(days):

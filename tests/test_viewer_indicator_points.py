@@ -62,11 +62,6 @@ def test_slice_replay_ohlcv_resets_index_for_downstream_consumers():
     from viewer import main as viewer_main
 
     df = _frame()
-    # Trades only near the first and last bars: a non-contiguous keep mask.
-    trade_payloads = [
-        {"entry_time": df["timestamp"].iloc[0].isoformat(), "exit_time": df["timestamp"].iloc[0].isoformat()},
-        {"entry_time": df["timestamp"].iloc[5].isoformat(), "exit_time": df["timestamp"].iloc[5].isoformat()},
-    ]
     # Force the keep path (default logic keeps everything for short frames).
     import numpy as np
 

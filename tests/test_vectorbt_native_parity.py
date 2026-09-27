@@ -292,18 +292,8 @@ class TestAskSideStops:
         """The window ends at the trigger bar's close: a stop touched only in
         the NEXT bar's sub-bars must NOT fire (the scheduled exit already
         ended at the trigger bar)."""
-        sub = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz="UTC")
-        intrabar = pd.DataFrame(
-            {
-                "timestamp": sub,
-                "open": [100.0] * 8,
-                "high": [100.5] * 8,
-                "low": [100.0] * 7 + [98.8],  # only the 10:45 sub-bar? no: 8 bars end 09:45
-                "close": [100.0] * 8,
-            }
-        )
-        # 8 x 15min from 08:00 ends at 09:45 — inside the trigger bar. For a
-        # next-bar-only hit, extend past the trigger bar's close (10:00+).
+        # The touch must sit past the trigger bar's close (10:00+), so 12 x 15min
+        # from 08:00 puts the only sub-bar low at 10:45 — the next bar.
         sub2 = pd.date_range("2024-01-01 08:00", periods=12, freq="15min", tz="UTC")
         intrabar2 = pd.DataFrame(
             {

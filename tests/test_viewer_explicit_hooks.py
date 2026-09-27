@@ -54,7 +54,6 @@ def test_legacy_hook_injection_is_explicit_not_import_time():
     # And installing the hooks wires the wrappers into the legacy module.
     import viewer.core as legacy
 
-    before = legacy._create_task_record
     viewer_main.install_legacy_task_hooks()
     assert legacy._create_task_record is viewer_main._create_task_record
     assert legacy._get_task is viewer_main._get_task

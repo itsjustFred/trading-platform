@@ -319,13 +319,6 @@ def test_validate_prefers_direct_stop_loss_over_meta() -> None:
 def test_validate_extracts_take_profit_for_risk_reward() -> None:
     model = PercentRiskModel(PercentRiskConfig(risk_percent=0.01))
     trade = _make_trade(entry_price=100.0, stop_loss=99.0, take_profit=102.0)
-    inp = RiskSizingInput(
-        entry_price=100.0,
-        stop_loss=99.0,
-        take_profit=None,
-        trade=trade,
-        account_balance=10_000.0,
-    )
     # The model uses input.take_profit directly; meta extraction is for stop_loss only.
     # But if we pass take_profit=None and want it from meta, that's adapter-level.
     # Here we verify that when take_profit is provided directly, RR is calculated.

@@ -19,7 +19,13 @@ import numpy as np
 import pandas as pd
 import quantstats as qs
 
-from runner.stats import _daily_returns, _max_drawdown_pct, _sharpe, _sortino, compute_stats
+from runner.stats import (
+    _daily_returns,
+    _max_drawdown_pct_manual,
+    _sharpe_manual,
+    _sortino_manual,
+    compute_stats,
+)
 from shared.models import EquityPoint, Trade, TradeExit
 
 RISK_FREE_RATE = 0.04  # annual
@@ -89,14 +95,13 @@ SCENARIOS["D_textbook_simple"] = [100.0, 102.0, 101.0, 105.0, 103.0, 108.0]
 # ─── Compute and compare ──────────────────────────────────────────────────────
 
 def compare_scenario(name: str, equities: list[float]) -> dict:
-    daily_rf = RISK_FREE_RATE / 252
     returns_list = _daily_returns(equities)
     returns_series = equity_to_returns_series(equities)
 
     # ── Our implementation ────────────────────────────────────────────────────
-    our_sharpe = _sharpe(returns_list, RISK_FREE_RATE)
-    our_sortino = _sortino(returns_list, RISK_FREE_RATE)
-    our_mdd = _max_drawdown_pct(equities)   # returns fraction 0-1
+    our_sharpe = _sharpe_manual(returns_list, RISK_FREE_RATE)
+    our_sortino = _sortino_manual(returns_list, RISK_FREE_RATE)
+    our_mdd = _max_drawdown_pct_manual(equities)   # returns fraction 0-1
 
     # Calmar as computed in compute_stats()
     total_return = (equities[-1] / equities[0]) - 1 if equities[0] > 0 else 0
@@ -273,7 +278,7 @@ if __name__ == "__main__":
         s = equity_to_returns_series(equities)
         qs_s = float(qs.stats.sortino(s, rf=daily_rf, periods=252, annualize=True))
 
-        our_s = _sortino(rl, RISK_FREE_RATE)
+        our_s = _sortino_manual(rl, RISK_FREE_RATE)
 
         print(f"\n  {scenario_name}:")
         print(f"    Our Sortino (r<0):     {our_s:.6f}  ← our implementation")
