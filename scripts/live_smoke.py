@@ -9,7 +9,8 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, timezone
+from datetime import time as datetime_time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -706,8 +707,8 @@ async def _alpaca_roundtrip_check(
     notional: float,
     timeout_seconds: int,
 ) -> SmokeCheck:
-    from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
 
     order_id = ""
     close_status = "not_started"
@@ -788,6 +789,7 @@ async def _run_alpaca_crypto_iteration(
     timeout_seconds: int,
 ) -> SmokeCheck:
     from alpaca.trading.client import TradingClient
+
     from live_runner.alpaca_adapter import resolve_alpaca_credentials
 
     account_name = env.get(f"ALPACA_ACCOUNT_NAME_ACC{index}", f"ACC{index}")
@@ -890,8 +892,7 @@ class _DiscordSmokeAdapter:
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace
 
-    from live_runner.daemon import _trade_signal_to_live_signal
-    from live_runner.daemon import submit_order_with_risk
+    from live_runner.daemon import _trade_signal_to_live_signal, submit_order_with_risk
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from shared.models import LiveDeploymentConfig
 
@@ -1079,8 +1080,10 @@ async def _wait_for_alpaca_position_qty(
 
 def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, tuple[str, str, bool]]:
     from live_runner.alpaca_adapter import resolve_alpaca_credentials
-    from live_runner.stockkit_routing import STOCKKIT_ACCOUNT_ROUTES
-    from live_runner.stockkit_routing import expected_account_for_stockkit_route
+    from live_runner.stockkit_routing import (
+        STOCKKIT_ACCOUNT_ROUTES,
+        expected_account_for_stockkit_route,
+    )
 
     for route in STOCKKIT_ACCOUNT_ROUTES:
         expected_account = expected_account_for_stockkit_route(route)
@@ -1153,14 +1156,14 @@ def _stockkit_deployment_and_signal(
 ) -> tuple[Any, Any, Any]:
     from types import SimpleNamespace
 
+    from live_runner.credential_env import load_accounts_env_values
     from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from live_runner.stockkit_routing import (
         expected_account_number_for_route,
         validate_stockkit_deployment_route,
     )
-    from live_runner.credential_env import load_accounts_env_values
-    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from shared.models import LiveDeploymentConfig, LiveSignal
 
     message = SimpleNamespace(

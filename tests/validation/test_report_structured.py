@@ -39,7 +39,6 @@ from validation.reporting.json_report import (
     generate_json_report as _generate_json_report,
 )
 
-
 # ---------------------------------------------------------------------------
 # Basic JSON output tests
 # ---------------------------------------------------------------------------

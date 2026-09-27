@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "stat_arb_pairs" / "stat_arb_pairs.py")
 TEST_START = "2021-01-01"
 TEST_END = "2024-12-31"
@@ -37,7 +36,7 @@ EXPECTED_NET_PROFIT = 12224.60
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="stat_arb_pairs",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

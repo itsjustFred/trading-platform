@@ -16,10 +16,9 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-import pytest
-
 import ctrader_open_api.messages.OpenApiMessages_pb2 as _real
 import ctrader_open_api.messages.OpenApiModelMessages_pb2 as _real_model
+import pytest
 
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
 
@@ -965,6 +964,7 @@ def test_cancel_never_disarms_an_open_positions_stop_or_target():
         ProtoOAOrderStatus,
         ProtoOAOrderType,
     )
+
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     limit = _order(102, ProtoOAOrderType.LIMIT)
@@ -1025,6 +1025,7 @@ def test_orphan_sweep_leaves_a_live_protection_alone_when_nothing_closed():
 def test_orphan_sweep_ignores_a_terminal_protection():
     """A filled or cancelled orphan is already gone; cTrader rejects the cancel."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderStatus
+
     from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     filled = _protection(
@@ -1147,17 +1148,17 @@ def _real_position(position_id: int, volume: int):
 
 def _make_cancel_adapter(tmp_path: Path, orders):
     """Adapter whose transport answers the reconcile, then records cancels."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
-
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-        ProtoOAOrderStatus,
-        ProtoOAOrderType,
-    )
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOACancelOrderReq,
         ProtoOAReconcileReq,
         ProtoOAReconcileRes,
     )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     adapter = CTraderLiveAdapter(
         app_id="app", app_secret="secret", access_token="token", account_id="123",
@@ -1200,11 +1201,10 @@ def test_cancel_open_orders_skips_filled_and_cancelled_orders(tmp_path):
     remaining working orders would stay resting after a STOP.
     """
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
         ProtoOAOrderStatus,
         ProtoOAOrderType,
     )
-
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
 
     def _order(order_id: int, status: int) -> "ProtoOAOrder":
         order = ProtoOAOrder()

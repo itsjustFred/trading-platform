@@ -3,12 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from validation.statistics.cross_platform import build_comparison_matrix
-from validation.importers.mt5_xlsx import MT5XLSXImporter
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES
 from scripts.regenerate_qc_risk_parity_artifact import DEFAULT_OUTPUT as QC_RISK_PARITY_OUTPUT
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
-
+from validation.importers.mt5_xlsx import MT5XLSXImporter
+from validation.statistics.cross_platform import build_comparison_matrix
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 

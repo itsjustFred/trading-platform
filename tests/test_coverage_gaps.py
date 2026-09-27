@@ -904,6 +904,7 @@ def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
     that used a weekly timeframe.
     """
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     symbol_dir = _write_series(
@@ -916,6 +917,7 @@ def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
 
 def test_regular_monthly_data_is_not_reported_as_a_gap(tmp_path):
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     symbol_dir = _write_series(
@@ -928,6 +930,7 @@ def test_regular_monthly_data_is_not_reported_as_a_gap(tmp_path):
 
 def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     # Business-day cadence leaves 2-day weekend holes.
@@ -941,6 +944,7 @@ def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
 
 def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     ts = list(pd.date_range("2024-01-01", periods=20, freq="1D", tz="UTC"))
@@ -992,6 +996,7 @@ def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
     reported as `failed` for internal gaps, so no weekly backtest could start.
     """
     import pandas as pd
+
     from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
 
     root = tmp_path / "data"
@@ -1046,6 +1051,7 @@ def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
     Widening anyway would only hide real holes, so the floor is kept.
     """
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     # 2 days apart with no timeframe given: must still be reported. Scaling
@@ -1069,6 +1075,7 @@ def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
     warning is still surfaced rather than silently accepted.
     """
     import pandas as pd
+
     from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
 
     root = tmp_path / "data"
@@ -1089,6 +1096,7 @@ def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
 
 def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
     import pandas as pd
+
     from data_tools.auto_download import find_internal_gaps
 
     stamps = list(pd.date_range("2024-03-01", periods=5, freq="1h", tz="UTC")) + list(

@@ -5,8 +5,7 @@ Einfache Trend-Following Strategie basierend auf Moving Average Crossover.
 """
 
 from pynecore import Series
-from pynecore.lib import script, input, strategy, ta, plot, color
-
+from pynecore.lib import color, input, plot, script, strategy, ta
 
 STRATEGY_META = {
     "name": "SMA Crossover (PyneCore)",

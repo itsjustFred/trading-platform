@@ -7,8 +7,6 @@ functions that are consumed by the FastAPI routes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import ast
 import json
 import logging
@@ -21,6 +19,7 @@ import subprocess
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable

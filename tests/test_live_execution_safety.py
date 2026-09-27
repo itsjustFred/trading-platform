@@ -5478,8 +5478,9 @@ def test_market_data_start_scales_past_weekends_for_intraday_bars():
     bars over 62 calendar days yields only ~434 trading hours, so the adapter
     silently shipped a shorter series than requested.
     """
-    from live_runner.alpaca_adapter import _alpaca_market_data_start
     from datetime import datetime, timezone
+
+    from live_runner.alpaca_adapter import _alpaca_market_data_start
 
     start = _alpaca_market_data_start("1h", 500)
     span_hours = (datetime.now(timezone.utc) - start).total_seconds() / 3600
@@ -5490,8 +5491,9 @@ def test_market_data_start_scales_past_weekends_for_intraday_bars():
 
 
 def test_market_data_start_scales_past_holidays_for_daily_bars():
-    from live_runner.alpaca_adapter import _alpaca_market_data_start
     from datetime import datetime, timezone
+
+    from live_runner.alpaca_adapter import _alpaca_market_data_start
 
     start = _alpaca_market_data_start("1d", 300)
     span_days = (datetime.now(timezone.utc) - start).days
@@ -5510,6 +5512,7 @@ def test_market_data_start_honours_a_widening_multiplier():
 def test_short_market_data_history_is_refused_not_truncated():
     """A short history silently shifts every lookback-dependent indicator."""
     import pandas as pd
+
     from live_runner import alpaca_adapter as mod
 
     frame = pd.DataFrame(
@@ -5548,6 +5551,7 @@ def test_cancel_open_orders_raises_when_the_broker_reports_a_failure():
     a failure would report the deployment as stopped while its order is live.
     """
     import asyncio
+
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
 
     class _Resp:
@@ -5576,6 +5580,7 @@ def test_cancel_open_orders_raises_when_the_broker_reports_a_failure():
 
 def test_close_all_positions_raises_when_the_broker_reports_a_failure():
     import asyncio
+
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
 
     class _Order:
@@ -5597,6 +5602,7 @@ def test_close_all_positions_raises_when_the_broker_reports_a_failure():
 
 def test_successful_operations_still_return_their_count():
     import asyncio
+
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
 
     class _Order:
@@ -5804,8 +5810,10 @@ def test_widened_market_data_request_asks_for_the_newest_bars():
     staler data than the first attempt.
     """
     import asyncio
-    from live_runner import alpaca_adapter as mod
+
     from alpaca.common.enums import Sort
+
+    from live_runner import alpaca_adapter as mod
 
     seen_sorts = []
     # Recent timestamps: the adapter rejects stale data, which is itself correct.
@@ -5838,6 +5846,7 @@ def test_widened_market_data_request_asks_for_the_newest_bars():
 def test_returned_bars_are_sorted_ascending_regardless_of_request_order():
     """Callers index chronologically, so the descending response is re-sorted."""
     import asyncio
+
     from live_runner import alpaca_adapter as mod
 
     recent = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=10, freq="1h", tz="UTC")

@@ -12,13 +12,13 @@ import pytest
 from sqlalchemy import text
 
 from shared.database import (
-    get_engine,
     BacktestRecord,
     EquityPointModel,
-    save_result_to_sqlite,
+    _table_column_names,
+    get_engine,
     get_session,
     load_backtest_result,
-    _table_column_names,
+    save_result_to_sqlite,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 

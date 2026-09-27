@@ -1,5 +1,7 @@
 """Strategy IR package."""
 
+from runner.strategy_ir.builder import build_strategy_ir
+from runner.strategy_ir.codegen_vectorbt import generate_vectorbt_strategy_code
 from runner.strategy_ir.models import (
     Condition,
     ConditionSide,
@@ -20,8 +22,6 @@ from runner.strategy_ir.models import (
     StateTransition,
     StrategyIR,
 )
-from runner.strategy_ir.builder import build_strategy_ir
-from runner.strategy_ir.codegen_vectorbt import generate_vectorbt_strategy_code
 from runner.strategy_ir.normalizer import normalize_strategy_meta_payload
 from runner.strategy_ir.routing import CodegenRoute, resolve_codegen_route
 

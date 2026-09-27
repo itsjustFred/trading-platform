@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, text
+from sqlmodel import select
 
 from shared.database import (
     BacktestRecord,
@@ -19,12 +20,13 @@ from shared.database import (
 from shared.models import (
     BacktestMeta,
     BacktestResult,
-    EquityPoint as EquityPointModel,
     LiveSignal,
     Trade,
     TradeExit,
 )
-from sqlmodel import select
+from shared.models import (
+    EquityPoint as EquityPointModel,
+)
 
 
 def test_backtest_record_equity_curve_persistence(isolated_db) -> None:

@@ -6,11 +6,11 @@ import json
 import logging
 import os
 import sys
-from io import StringIO
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3409,8 +3409,8 @@ def test_live_pause_reports_the_truth_when_the_submission_drain_times_out(
     verification. The response must therefore be 200, carrying the new status and
     an explicit non-clean drain outcome.
     """
-    from shared.models import LiveDeploymentConfig
     import viewer.main as viewer_app_module
+    from shared.models import LiveDeploymentConfig
 
     deployment = LiveDeploymentConfig(
         strategy_name="demo",
@@ -6692,8 +6692,8 @@ def test_activation_refuses_when_broker_cannot_confirm_demo(
     viewer_client, monkeypatch
 ):
     """ACTIVE must fail closed when the broker cannot positively confirm demo."""
-    from shared.models import LiveDeploymentConfig
     import viewer.main as viewer_app_module
+    from shared.models import LiveDeploymentConfig
 
     deployment = LiveDeploymentConfig(
         id="11111111-1111-4111-8111-111111111111",
@@ -6731,8 +6731,8 @@ def test_activation_refreshes_verification_before_persisting(
     viewer_client, monkeypatch
 ):
     """A successful broker re-verification must happen before the DB transition."""
-    from shared.models import LiveDeploymentConfig
     import viewer.main as viewer_app_module
+    from shared.models import LiveDeploymentConfig
 
     deployment = LiveDeploymentConfig(
         id="22222222-2222-4222-8222-222222222222",
@@ -6777,8 +6777,8 @@ def test_activation_refreshes_verification_before_persisting(
 
 def test_pause_does_not_call_broker_reverification(viewer_client, monkeypatch):
     """Only ACTIVE may talk to the broker; PAUSE must stay a pure local write."""
-    from shared.models import LiveDeploymentConfig
     import viewer.main as viewer_app_module
+    from shared.models import LiveDeploymentConfig
 
     deployment = LiveDeploymentConfig(
         id="33333333-3333-4333-8333-333333333333",

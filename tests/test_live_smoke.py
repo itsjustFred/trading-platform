@@ -5,11 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from scripts.live_smoke import SmokeCheck
-from scripts.live_smoke import SmokeReport
-from scripts.live_smoke import main
-from scripts.live_smoke import _position_qty_for_symbol
-from scripts.live_smoke import run_smoke
+from scripts.live_smoke import SmokeCheck, SmokeReport, _position_qty_for_symbol, main, run_smoke
 
 
 def test_position_qty_for_symbol_matches_crypto_slash_alias() -> None:

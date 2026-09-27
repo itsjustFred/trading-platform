@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(
     Path(__file__).parent.parent.parent
     / "strategies"
@@ -41,7 +40,7 @@ EXPECTED_NET_PROFIT = -2197.47
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="custom_swings_supertrend",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -71,8 +70,8 @@ class TestStrategyRegression:
         """generate_signals muss exakt 4 Elemente zurückgeben (entries, exits, indicators_dict, drawings)."""
         import importlib.util
 
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         spec = importlib.util.spec_from_file_location("s", STRATEGY_PATH)
         mod = importlib.util.module_from_spec(spec)
@@ -147,8 +146,8 @@ class TestStrategyRegression:
         """indicators_dict muss stop_loss, atr und direction enthalten."""
         import importlib.util
 
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         spec = importlib.util.spec_from_file_location("s", STRATEGY_PATH)
         mod = importlib.util.module_from_spec(spec)

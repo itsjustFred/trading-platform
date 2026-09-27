@@ -148,8 +148,8 @@ def test_detect_strategy_type_is_static(tmp_path: Path) -> None:
 
 def test_strategy_reads_are_contained_to_strategies_dir(tmp_path: Path) -> None:
     """Path traversal / outside files are never read by listing-time lookups (S8707)."""
-    from shared.strategy_registry import detect_strategy_type, load_strategy_meta
     from shared.models import StrategyType
+    from shared.strategy_registry import detect_strategy_type, load_strategy_meta
 
     strategy_dir = tmp_path / "strategies"
     strategy_dir.mkdir()

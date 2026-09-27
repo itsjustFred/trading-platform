@@ -9,7 +9,6 @@ import pytest
 from validation.importers import BaseImporter, MT5HTMLImporter, MT5XLSXImporter
 from validation.reference import ValidationReference
 
-
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "validation"
 
 

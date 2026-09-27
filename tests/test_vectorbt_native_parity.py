@@ -26,7 +26,8 @@ from runner.engines.vectorbt_adapter import (
     _vbt_ask_bar,
     _vbt_bar_spread,
 )
-from tests.helpers import write_ohlcv as _write_shared_ohlcv, with_zero_fees
+from tests.helpers import with_zero_fees
+from tests.helpers import write_ohlcv as _write_shared_ohlcv
 
 
 def _frame() -> pd.DataFrame:
@@ -171,7 +172,7 @@ class TestWarmupGate:
         )
         path = parity_env / "warmup_strat.py"
         path.write_text(text)
-        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="vbt_warmup",
             symbols=["VBW"],
             timeframe="1h",

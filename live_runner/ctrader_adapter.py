@@ -623,8 +623,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
                 ProtoOAExecutionType,
-                ProtoOAOrderType,
                 ProtoOAOrderStatus,
+                ProtoOAOrderType,
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
                 ProtoOATradeSide,

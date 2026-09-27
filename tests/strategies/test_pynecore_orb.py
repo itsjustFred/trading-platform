@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_orb" / "pynecore_orb.py")
 CONTEXT_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_orb" / "pynecore_orb_context.py")
 TEST_START = "2024-01-02"
@@ -45,7 +44,7 @@ def _load_context_module():
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = PyneCoreAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="pynecore_orb",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

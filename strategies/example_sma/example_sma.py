@@ -5,6 +5,7 @@ STRATEGY_META = {'name': 'example_sma',
 
 import pandas as pd
 
+
 def generate_signals(df, params):
     fast_length = params.get('fast_length', 9)
     slow_length = params.get('slow_length', 21)

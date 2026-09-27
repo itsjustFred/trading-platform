@@ -10,8 +10,8 @@ import pytest
 
 from live_runner.preflight import (
     LivePreflightResult,
-    run_live_preflight,
     _validate_deployments,
+    run_live_preflight,
 )
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -193,8 +193,7 @@ class TestPreflightResultSerialization:
     """Tests that preflight results serialize to JSON correctly."""
 
     def test_result_to_jsonable(self):
-        from live_runner.preflight import _result_to_jsonable
-        from live_runner.preflight import LivePreflightAccountResult
+        from live_runner.preflight import LivePreflightAccountResult, _result_to_jsonable
 
         account_result = LivePreflightAccountResult(
             account_id="acc1",

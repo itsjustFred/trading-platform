@@ -24,7 +24,6 @@ from validation.risk.adapter import RiskAdapter
 from validation.risk.models import RiskSizingInput, SizingModel
 from validation.risk.percent_risk import PercentRiskConfig, PercentRiskModel
 
-
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
 

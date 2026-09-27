@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from data_tools.resample import resample_ohlcv, resample_file
+from data_tools.resample import resample_file, resample_ohlcv
 
 
 @pytest.fixture
