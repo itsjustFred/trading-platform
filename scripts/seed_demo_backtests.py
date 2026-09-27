@@ -26,9 +26,9 @@ def mk_ohlcv(symbol: str, base: float, source: str, asset_class: str, timeframe:
     for i, t in enumerate(ts):
         o = base + i * 0.2
         c = o + (0.4 if i % 2 == 0 else -0.3)
-        h = max(o, c) + 0.3
-        l = min(o, c) - 0.3
-        rows.append({"timestamp": t, "open": o, "high": h, "low": l, "close": c, "volume": 1000 + i})
+        high = max(o, c) + 0.3
+        low = min(o, c) - 0.3
+        rows.append({"timestamp": t, "open": o, "high": high, "low": low, "close": c, "volume": 1000 + i})
     df = pd.DataFrame(rows)
     path = DATA_DIR / "ohlcv" / source / asset_class / symbol / f"{timeframe}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)

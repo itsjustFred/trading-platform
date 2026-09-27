@@ -200,7 +200,7 @@ def run_strategy_grid(
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     """Run a strategy across all symbol/timeframe combinations.
-    
+
     Returns a grid matrix showing which combinations work best.
     """
     entry = find_strategy_entry(strategy_slug)
