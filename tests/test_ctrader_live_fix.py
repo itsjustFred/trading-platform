@@ -965,7 +965,6 @@ def test_cancel_never_disarms_an_open_positions_stop_or_target():
         ProtoOAOrderType,
     )
 
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     limit = _order(102, ProtoOAOrderType.LIMIT)
     limit.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
@@ -991,7 +990,6 @@ def test_cancel_never_disarms_an_open_positions_stop_or_target():
 
 def test_orphan_sweep_cancels_only_protections_whose_position_is_gone():
     """The flatten detaches the protection; the sweep cleans up exactly those."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     live_protection = _protection(201, position_id=900)
     orphan = _protection(202, position_id=901)
@@ -1013,7 +1011,6 @@ def test_orphan_sweep_cancels_only_protections_whose_position_is_gone():
 
 
 def test_orphan_sweep_leaves_a_live_protection_alone_when_nothing_closed():
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     protection = _protection(301, position_id=900)
     adapter = _FakeCTraderAdapter([protection], [_real_position(900, 1000)])
@@ -1026,7 +1023,6 @@ def test_orphan_sweep_ignores_a_terminal_protection():
     """A filled or cancelled orphan is already gone; cTrader rejects the cancel."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderStatus
 
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     filled = _protection(
         401, position_id=901, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED
@@ -1039,7 +1035,6 @@ def test_orphan_sweep_ignores_a_terminal_protection():
 
 def test_orphan_sweep_raises_instead_of_reporting_a_clean_zero():
     """An unreadable reconcile response is UNKNOWN, not "there was nothing to do"."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     adapter = _FakeCTraderAdapter([], [])
 
@@ -1070,7 +1065,6 @@ def test_cancel_rejects_an_unexpected_response_type():
 
 
 def test_flatten_closes_every_open_position():
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     positions = [_real_position(201, 1000), _real_position(202, 2000)]
     adapter = _FakeCTraderAdapter([], positions)
@@ -1096,7 +1090,6 @@ def test_flatten_closes_every_open_position():
 
 
 def test_flatten_skips_positions_without_an_id():
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     positions = [_real_position(0, 0)]
     adapter = _FakeCTraderAdapter([], positions)
@@ -1610,7 +1603,6 @@ def test_flatten_skips_a_position_whose_id_is_not_an_int():
     Without the coercion the loop raises out of `close_all_positions` and the
     remaining positions stay open.
     """
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     positions = [
         SimpleNamespace(
@@ -1631,7 +1623,6 @@ def test_flatten_skips_a_position_whose_id_is_not_an_int():
 
 def test_flatten_skips_a_string_zero_position_id():
     """"0" is not a position: cTrader rejects it instead of closing anything."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     positions = [
         SimpleNamespace(positionId="0", tradeData=SimpleNamespace(volume=1000))
@@ -1649,7 +1640,6 @@ def test_flatten_skips_a_string_zero_position_id():
 
 def test_flatten_closes_the_other_positions_after_an_unusable_id():
     """A skipped position must not abort the loop over the positions behind it."""
-    from live_runner.ctrader_adapter import CTraderLiveAdapter
 
     positions = [
         SimpleNamespace(

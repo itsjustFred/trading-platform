@@ -10,8 +10,6 @@ Seams under test:
 
 from __future__ import annotations
 
-import pytest
-
 from runner.codegen_safety import screen_strategy_source
 
 

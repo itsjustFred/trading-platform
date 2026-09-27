@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 import sys
-import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

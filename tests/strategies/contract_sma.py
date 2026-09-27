@@ -11,7 +11,6 @@ STRATEGY_META = {
     "tags": {"type": ["sma", "crossover", "trend", "moving_average"]},
 }
 
-import pandas as pd
 
 
 def generate_signals(df, params):

@@ -1,6 +1,5 @@
 """Tests for data_tools/resample.py."""
 
-import tempfile
 from pathlib import Path
 
 import pandas as pd

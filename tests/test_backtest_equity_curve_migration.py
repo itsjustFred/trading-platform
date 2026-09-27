@@ -8,14 +8,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
 from sqlalchemy import text
 
 from shared.database import (
     BacktestRecord,
-    EquityPointModel,
     _table_column_names,
-    get_engine,
     get_session,
     load_backtest_result,
     save_result_to_sqlite,

@@ -24,7 +24,6 @@ from runner.stats import (
     _max_drawdown_pct_manual,
     _sharpe_manual,
     _sortino_manual,
-    compute_stats,
 )
 from shared.models import EquityPoint, Trade, TradeExit
 

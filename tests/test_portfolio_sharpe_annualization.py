@@ -21,7 +21,6 @@ import pytest
 from risk.config import RiskConfig
 from runner import portfolio_optimizer
 from runner.engines.signal_replay_adapter import (
-    ReplaySignal,
     SignalReplayAdapter,
     _OpenPosition,
 )

@@ -11,8 +11,6 @@ from __future__ import annotations
 
 import math
 
-import pytest
-
 from viewer.main import LIVE_POSITION_FLAT_THRESHOLD, _calculate_realized_live_pnl
 
 

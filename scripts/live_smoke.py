@@ -1164,7 +1164,7 @@ def _stockkit_deployment_and_signal(
         expected_account_number_for_route,
         validate_stockkit_deployment_route,
     )
-    from shared.models import LiveDeploymentConfig, LiveSignal
+    from shared.models import LiveDeploymentConfig
 
     message = SimpleNamespace(
         content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",

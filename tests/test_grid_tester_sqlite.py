@@ -8,8 +8,6 @@ import types
 import uuid
 from datetime import datetime, timezone
 
-import pytest
-
 from shared.database import (
     GridRecord,
     get_grid_results,

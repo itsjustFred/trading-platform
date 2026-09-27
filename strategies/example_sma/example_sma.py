@@ -3,7 +3,6 @@ STRATEGY_META = {'name': 'example_sma',
  'parameters': {'fast_length': 9, 'slow_length': 21},
  'tags': {'type': ['ema', 'crossover', 'trend', 'moving_average']}}
 
-import pandas as pd
 
 
 def generate_signals(df, params):

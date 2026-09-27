@@ -125,7 +125,6 @@ def test_core_stats_payload_exposes_whole_backtest_winners_and_losers():
 
 
 def test_main_stats_endpoint_serves_exact_extremes(viewer_client, tmp_path):
-    import viewer.main as viewer_app_module
 
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)

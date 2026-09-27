@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import pytest
-
 from shared.models import Trade, TradeExit
 from validation.comparison.delta_report import TradeDeltaReport
 from validation.reference import ValidationReference
 from validation.risk.comparison import (
     RiskComparator,
     RiskComparisonConfig,
-    RiskComparisonReport,
-    RiskComparisonResult,
     RiskReportBuilder,
 )
 from validation.risk.fixed_risk import FixedRiskConfig
-from validation.risk.models import SizingModel, TradeRiskProfile
+from validation.risk.models import SizingModel
 
 
 def _make_trade(

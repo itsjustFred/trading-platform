@@ -17,7 +17,6 @@ These cover the three silent-skip defects of Cleanup 17-B:
 from __future__ import annotations
 
 import importlib.util
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest

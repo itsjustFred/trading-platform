@@ -31,10 +31,21 @@ import pyarrow.parquet as pq
 
 from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
-from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
-from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
-from runner.optimizer import OptimizationConfig
-from runner.optimizer import run_optimization as execute_optimization
+from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    DEFAULT_MODEL_NAME,
+    SUPPORTED_MODEL_NAMES,
+    run_auto_agent,
+)
+from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    DEFAULT_LLM_PROVIDER_NAME,
+    SUPPORTED_LLM_PROVIDER_NAMES,
+)
+from runner.optimizer import (
+    OptimizationConfig,  # noqa: F401 - re-exported for viewer/main.py and the API surface
+)
+from runner.optimizer import (
+    run_optimization as execute_optimization,  # noqa: F401 - re-exported for viewer/main.py and the API surface
+)
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.constants import (
     DATA_DIR,
@@ -44,7 +55,12 @@ from shared.constants import (
     normalize_timeframe,
 )
 from shared.logging import get_logger, redact_text, redact_value
-from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
+from shared.models import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    BacktestResult,
+    EquityPoint,
+    PortfolioStats,
+    Trade,
+)
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
@@ -55,9 +71,12 @@ from shared.strategy_registry import (
     strategy_documentation_path,
     strategy_relative_file,
     strategy_slug_for_path,
-    update_strategy_display_name,
+    update_strategy_display_name,  # noqa: F401 - re-exported for viewer/main.py and the API surface
 )
-from viewer.comparison import compare_backtests, compute_drawdown_pct
+from viewer.comparison import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    compare_backtests,
+    compute_drawdown_pct,
+)
 
 logger = get_logger("viewer")
 

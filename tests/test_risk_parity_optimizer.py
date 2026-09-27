@@ -6,7 +6,6 @@ from runner.risk_parity_optimizer import (
     candidate_universes,
     risk_contributions,
     select_best_risk_parity_universe,
-    shrink_covariance,
     solve_risk_parity_weights,
 )
 

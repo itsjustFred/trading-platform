@@ -12,7 +12,7 @@ import pytest
 
 fastapi_testclient = pytest.importorskip("fastapi.testclient")
 
-from viewer.main import STRATEGIES_DIR, app  # noqa: E402
+from viewer.main import app  # noqa: E402
 
 
 @pytest.fixture

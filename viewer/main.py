@@ -93,7 +93,6 @@ from shared.database import (
     delete_service,
     ensure_live_account,
     get_background_task_record,
-    get_latest_live_balance,
     get_latest_live_balances,
     get_live_account,
     get_live_deployment,
@@ -101,7 +100,7 @@ from shared.database import (
     init_db,
     list_background_task_records,
     list_backtest_fingerprint_rows,
-    list_backtest_ids,
+    list_backtest_ids,  # noqa: F401 - monkeypatch target for the shared viewer_client fixture
     list_backtest_metadata_rows,
     list_live_accounts,
     list_live_balances,

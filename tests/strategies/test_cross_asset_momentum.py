@@ -131,7 +131,6 @@ class TestSourceFidelity:
         import importlib.util
         from pathlib import Path
 
-        import pandas as pd
 
         spec = importlib.util.spec_from_file_location(
             "xam", str(Path(STRATEGY_PATH))

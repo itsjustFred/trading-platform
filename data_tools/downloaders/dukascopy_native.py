@@ -25,7 +25,7 @@ import lzma
 import struct
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable

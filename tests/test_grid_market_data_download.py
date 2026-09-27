@@ -5,7 +5,6 @@ import pandas as pd
 import data_tools.download_grid_market_data as dl
 from data_tools.download_grid_market_data import (
     DEFAULT_SYMBOLS,
-    DEFAULT_TIMEFRAMES,
     _timeframe_sort_key,
     normalize_ohlcv_columns,
     normalize_symbol,

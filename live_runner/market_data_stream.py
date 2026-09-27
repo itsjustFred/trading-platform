@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.alpaca_adapter import resolve_alpaca_credentials
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
