@@ -1595,3 +1595,144 @@ def test_untrusted_author_is_rejected_even_for_a_valid_nitro_alert():
         )
         is None
     )
+
+
+# ── The pre-wait age gate must fail closed on a signal with no producer stamp ──
+#
+# `daemon._validate_signal_age_before_wait` decided whether a missing
+# `received_at` was fatal by comparing `metadata["source"]` to the literal
+# string "discord". It decided that by inspecting metadata, and the producer
+# overwrites that key: `_emit_polled_message` replaces the parser's
+# `metadata["source"] = "discord"` with `f"discord_{bot_name.lower()}"`. The
+# value the gate compared against therefore never arrived, the fail-closed
+# branch was dead, and a signal with no producer timestamp walked through the
+# gate and on to `submit_order`.
+#
+# These tests build the signal from a real poll so `metadata["source"]` is
+# whatever production actually writes. `signal_is_fresh` catches the common
+# case upstream, so the gate is the only defence for the timeframes that gate
+# cannot parse at all -- which is why those are exercised explicitly.
+
+
+def _polled_signal(*, timestamp: str = "2026-09-01T12:00:00Z", **source_kwargs):
+    """A TradeSignal that came out of a real DiscordSignalSource poll."""
+    import asyncio
+
+    source = _source(**source_kwargs)
+
+    async def _fetch(_channel_id):
+        return [
+            {
+                "id": "m-stamped",
+                "channel_id": "channel-1",
+                "timestamp": timestamp,
+                "content": "RAM JET BUY AAPL @ 100.05",
+                "author": {"id": "bot-1", "bot": True},
+            }
+        ]
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+    assert source._queue.qsize() == 1, "the poll must have emitted one signal"
+    return source._queue.get_nowait()
+
+
+def test_polled_discord_source_value_is_not_the_literal_the_age_gate_compared() -> None:
+    """Pin the premise the dead branch rested on.
+
+    If this ever stops holding, the exact-match comparison the gate used is
+    doubly dead and the source of truth for "is this a Discord signal" is
+    unambiguous: it is the call site, not the metadata.
+    """
+    signal = _polled_signal(bot_name="Nitro")
+
+    assert signal.metadata["source"] == "discord_nitro"
+    assert signal.metadata["source"] != "discord"
+    # The gate must not be able to recover the source by lowercasing either.
+    assert signal.metadata["source"].strip().lower() != "discord"
+
+
+def test_polled_discord_signal_without_a_producer_stamp_is_refused() -> None:
+    """The whole defect, end to end from a real poll.
+
+    `signal_is_fresh` refuses a missing `received_at` for every timeframe it
+    can size a budget for, so the age gate is only reachable for the rest. With
+    a `received_at` of None the gate refused nothing at all.
+    """
+    from live_runner.daemon import _validate_signal_age_before_wait
+    from live_runner.signal_sources.execution_timing import (
+        max_signal_age_seconds,
+        signal_is_fresh,
+    )
+
+    unparseable_timeframes = [
+        timeframe
+        for timeframe in ("tick", "daily", "m5", "5min", "")
+        if max_signal_age_seconds(timeframe) is None
+    ]
+    assert unparseable_timeframes, "expected timeframes the freshness gate cannot size"
+
+    signal = _polled_signal(bot_name="Nitro")
+    signal.metadata.pop("received_at")
+
+    for timeframe in unparseable_timeframes:
+        assert signal_is_fresh(signal, timeframe) is True, (
+            f"{timeframe!r} is exactly the case this gate exists for: the "
+            "upstream freshness gate has no budget and so reports fresh"
+        )
+        with pytest.raises(ValueError, match="missing received_at"):
+            _validate_signal_age_before_wait(
+                signal, _gate_deployment(), timeframe=timeframe or "1h",
+                require_producer_timestamp=True,
+            )
+
+
+def _gate_deployment():
+    from uuid import uuid4
+
+    from shared.models import LiveDeploymentConfig
+
+    return LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="demo",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_config={},
+        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+    )
+
+
+def test_unreadable_producer_timestamp_is_not_replaced_by_now() -> None:
+    """`_parse_timestamp` used to return `datetime.now(timezone.utc)` for both a
+    missing and an unparseable value, so `received_at` was always populated and
+    an unreadable timestamp looked brand new -- defeating every age check that
+    reads it. Fail closed: an age that cannot be read is unknown, not zero.
+    """
+    from live_runner.signal_sources.discord_source import _parse_timestamp
+
+    assert _parse_timestamp(None) is None
+    assert _parse_timestamp("") is None
+    assert _parse_timestamp("not-a-timestamp") is None
+    assert _parse_timestamp("2026-01-02T03:04:05+00:00") == datetime(
+        2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+    )
+    # A naive stamp is still read, and stamped as UTC rather than discarded.
+    assert _parse_timestamp("2026-01-02T03:04:05") == datetime(
+        2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+    )
+
+
+def test_message_with_an_unreadable_timestamp_yields_no_received_at() -> None:
+    """A polled message whose timestamp cannot be read is still emitted -- it is
+    not silently dropped, because a dropped message leaves no operator-visible
+    trace -- but it carries no fabricated `received_at`, so the daemon's gate
+    refuses it with a warning naming the real reason.
+    """
+    signal = _polled_signal(bot_name="Nitro", timestamp="garbage")
+
+    assert "received_at" not in signal.metadata
+    assert signal.metadata["discord_received_at_unreadable"] is True
+    assert signal.metadata["source"] == "discord_nitro"

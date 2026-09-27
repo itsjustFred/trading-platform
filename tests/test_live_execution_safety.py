@@ -1495,7 +1495,9 @@ def test_signal_age_validation_rejects_stale_discord_signal():
     )
 
     with pytest.raises(ValueError, match="stale"):
-        _validate_signal_age_before_wait(stale, deployment, timeframe="5m")
+        _validate_signal_age_before_wait(
+            stale, deployment, timeframe="5m", require_producer_timestamp=True
+        )
 
 
 def test_signal_age_budget_scales_with_signal_timeframe():
@@ -1517,12 +1519,29 @@ def test_signal_age_budget_scales_with_signal_timeframe():
         },
     )
 
-    _validate_signal_age_before_wait(recent, deployment, timeframe="1h")
+    _validate_signal_age_before_wait(
+        recent, deployment, timeframe="1h", require_producer_timestamp=True
+    )
 
-    recent.metadata["source"] = "discord"
+    # REWRITTEN. This used to set `metadata["source"] = "discord"` and then drop
+    # `received_at`, pinning the premise that the literal string "discord"
+    # reaches this gate. It never did: `DiscordSignalSource` overwrites that
+    # value with `f"discord_{bot_name.lower()}"` on every polled message, so
+    # the exact-match comparison the test appeared to cover was dead code. The
+    # refusal is now unconditional on the Discord path and the source value does
+    # not enter the decision, so the assertion below is strictly stronger: it
+    # refuses for the value production actually writes, and it refuses even with
+    # no `source` key at all.
     recent.metadata.pop("received_at")
-    with pytest.raises(ValueError, match="missing received_at"):
-        _validate_signal_age_before_wait(recent, deployment, timeframe="1h")
+    for source in ("discord_nitro", "discord", None):
+        if source is None:
+            recent.metadata.pop("source", None)
+        else:
+            recent.metadata["source"] = source
+        with pytest.raises(ValueError, match="missing received_at"):
+            _validate_signal_age_before_wait(
+                recent, deployment, timeframe="1h", require_producer_timestamp=True
+            )
 
 
 def test_signal_processor_uses_broker_market_data():

@@ -22,6 +22,7 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from shared import market_calendar
 from shared.database import (
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
@@ -74,6 +75,76 @@ def _alpaca_timeframe(value: str):
         raise ValueError(f"Unsupported Alpaca market-data timeframe: {value!r}")
     amount, unit = units[normalized]
     return TimeFrame(amount=amount, unit=unit), normalized
+
+
+# Nominal calendar span of one Alpaca bar, in days, keyed by the *wire* value
+# of the timeframe unit (`TimeFrameUnit.Minute.value == "Min"`), not by its
+# Python `name`, which is "Minute". Derived from the resolved TimeFrame rather
+# than from a second string parser so it cannot drift from `_alpaca_timeframe`.
+_ALPACA_UNIT_NOMINAL_DAYS = {
+    "Min": 1.0 / 1440.0,
+    "Hour": 1.0 / 24.0,
+    "Day": 1.0,
+    "Week": 7.0,
+    "Month": 30.0,
+}
+
+
+def _now_utc() -> pd.Timestamp:
+    """The clock the staleness budget is measured against.
+
+    A named seam rather than an inline ``pd.Timestamp.now(tz="UTC")`` so a test
+    can pin it: the budget's whole job is to be right *around* a market closure,
+    which is not a state a test can reach by waiting for the right day.
+    """
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _alpaca_timeframe_nominal_days(resolved_timeframe: Any) -> float:
+    """Calendar days one bar of ``resolved_timeframe`` covers."""
+    unit = getattr(getattr(resolved_timeframe, "unit_value", None), "value", None)
+    span = _ALPACA_UNIT_NOMINAL_DAYS.get(str(unit))
+    if span is None:
+        raise ValueError(
+            f"Cannot size a staleness budget for Alpaca time unit {unit!r}"
+        )
+    return float(getattr(resolved_timeframe, "amount", 1)) * span
+
+
+def _market_data_staleness_reason(
+    newest: pd.Timestamp, now: pd.Timestamp, *, resolved_timeframe: Any
+) -> str | None:
+    """Why ``newest`` is too old to compute indicators on, or ``None`` if it is fine.
+
+    Measured in **scheduled exchange sessions**, not elapsed hours. The budget
+    this replaces was a flat 72 hours for intraday and 7 days for daily, and a
+    flat number cannot be right for both: the US exchanges shut for a single
+    weekday plus the weekend (three closed days, so the newest intraday bar is
+    89.5 hours old) and for two weekdays at Thanksgiving, which pushes the flat
+    budget over. It therefore raised for *every* symbol from the Thursday close
+    until Tuesday of any single-holiday week, and the ``ValueError`` was
+    swallowed as a rejected signal while the deployment still reported ACTIVE. A
+    session count is the same answer in every week of the year, so no length
+    budget is needed at all.
+
+    ``AD_HOC_CLOSURE_TOLERANCE_SESSIONS`` covers the two things the calendar
+    cannot know: a broker publishing a session's daily bar only after that
+    session closed, and a closure nobody publishes in advance (a National Day
+    of Mourning). See ``shared.market_calendar`` for both justifications.
+    """
+    behind, bar_session, expected = market_calendar.bar_staleness_sessions(
+        newest.to_pydatetime(),
+        now.to_pydatetime(),
+        nominal_days=_alpaca_timeframe_nominal_days(resolved_timeframe),
+    )
+    if behind <= market_calendar.AD_HOC_CLOSURE_TOLERANCE_SESSIONS:
+        return None
+    return (
+        f"newest bar {newest.isoformat()} belongs to session {bar_session.isoformat()} "
+        f"but {expected.isoformat()} should have printed by {now.isoformat()}: "
+        f"{behind} scheduled sessions behind, tolerance is "
+        f"{market_calendar.AD_HOC_CLOSURE_TOLERANCE_SESSIONS}"
+    )
 
 
 # Markets are closed for most of the calendar: weekends alone remove two days in
@@ -945,16 +1016,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"Alpaca returned no usable {timeframe} bars for {normalized_symbol}"
             )
         newest = pd.Timestamp(frame["timestamp"].iloc[-1])
-        now = pd.Timestamp.now(tz="UTC")
-        max_age = (
-            timedelta(days=7)
-            if str(timeframe).strip().lower() == "1d"
-            else timedelta(hours=72)
+        now = _now_utc()
+        reason = _market_data_staleness_reason(
+            newest, now, resolved_timeframe=resolved_timeframe
         )
-        if newest < now - max_age:
+        if reason is not None:
             raise ValueError(
-                f"Alpaca market data is stale for {normalized_symbol}: "
-                f"newest bar {newest.isoformat()} exceeds {max_age}"
+                f"Alpaca market data is stale for {normalized_symbol}: {reason}"
             )
         return frame
 

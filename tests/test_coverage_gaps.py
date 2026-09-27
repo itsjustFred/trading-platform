@@ -957,17 +957,32 @@ def test_gap_threshold_scales_with_timeframe_but_keeps_an_intraday_floor():
     # so a genuine intraday hole is still surfaced rather than accepted.
     assert scaled_gap_threshold_days("1m", 1) == 1.0
     assert scaled_gap_threshold_days("1h", 1) == 1.0
-    # The threshold that fails coverage additionally tolerates a long weekend,
-    # which reaches four calendar days when Friday and Monday are both closed.
-    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) == 4.0
-    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) == 4.0
-    # Longer-spaced series widen proportionally.
+    # REWRITTEN. These two lines used to assert that the failing threshold is
+    # 4.0 days, pinning the premise that a long weekend *is* four calendar days
+    # and that the 4.0-day floor belongs in the length budget. Neither is true.
+    # On the US equity grid an ordinary long weekend runs from Friday's close to
+    # Monday's open, which is 2.73 days -- already inside the 3-day base. And the
+    # 4.0-day floor was a *minimum* over that base, so it overrode it for every
+    # timeframe and let 1-minute data with a 3.6-day hole through the gate. The
+    # long-weekend allowance is now applied per hole against the exchange
+    # calendar (see test_long_weekend_closure_does_not_fail_coverage and
+    # test_calendar_distinguishes_a_weekend_from_a_downloader_outage), so the
+    # length budget is the base again.
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) == 3.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) == 3.0
+    # The long-weekend flag no longer changes the length budget at all, for any
+    # timeframe: the two shapes must be impossible to confuse.
+    for timeframe in ("1m", "5m", "1h", "4h", "1d", "1w", "1mo", "3mo"):
+        assert scaled_gap_threshold_days(
+            timeframe, 3, allow_long_weekend=True
+        ) == scaled_gap_threshold_days(timeframe, 3), timeframe
+    # Longer-spaced series widen proportionally, from the timeframe's own nominal
+    # spacing, and are not loosened by the closure allowance on top.
     assert scaled_gap_threshold_days("1d", 1) == 3.0
     assert scaled_gap_threshold_days("1w", 1) == 21.0
     assert scaled_gap_threshold_days("1mo", 1) == 90.0
-    # The fail threshold never becomes stricter than before.
-    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) >= 3.0
-    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) >= 3.0
+    assert scaled_gap_threshold_days("1w", 3, allow_long_weekend=True) == 21.0
+    assert scaled_gap_threshold_days("1mo", 3, allow_long_weekend=True) == 90.0
 
 
 def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
@@ -1082,3 +1097,179 @@ def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
     symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1h.parquet", stamps)
     gaps = find_internal_gaps(symbol_dir, "1h")
     assert gaps and gaps[0]["gap_days"] > 4, f"an 8-day hole must be reported: {gaps}"
+
+# ── The long-weekend allowance must be a calendar term, not a flat floor ──────
+#
+# `LONG_WEEKEND_GAP_DAYS = 4.0` was applied as a *minimum* over the failing
+# threshold, so it replaced the 3.0-day base for every timeframe instead of
+# adding to it. The length budget went to 4.00 days for 1m, 4h and 1d alike, so
+# 1-minute data with a 3.6-day hole -- a downloader that silently failed for
+# most of a week -- passed the gate, the backtest ran over forward-filled prices
+# and reported a Sharpe. It bought nothing real either: an ordinary long weekend
+# is 65.5 hours on the US equity grid, already inside the 3.0-day base, and the
+# 4.0-day floor sat in the gap between the two closure shapes that do occur.
+#
+# No single length budget can fix this, and that is the point of the tests
+# below. A long weekend and a downloader outage are both about three days long,
+# so the allowance has to be decided per hole against the calendar.
+
+
+def _around(before: str, after: str, *, minutes: int = 20) -> list:
+    """1-minute bars clustered either side of a hole, so only the hole is wide.
+
+    The last bar before the hole lands exactly on ``before`` and the first after
+    it exactly on ``after``, so the measured hole is precisely ``after - before``.
+    """
+    lead = pd.Timestamp(before) - pd.Timedelta(minutes=minutes)
+    trail = pd.Timestamp(after) + pd.Timedelta(minutes=minutes)
+    return list(pd.date_range(lead, before, freq="1min", tz="UTC")) + list(
+        pd.date_range(after, trail, freq="1min", tz="UTC")
+    )
+
+
+def _one_minute_report(tmp_path, before: str, after: str, start: str, end: str):
+    root = tmp_path / "data"
+    _write_series(root / "ohlcv" / "AAPL", "1m.parquet", _around(before, after))
+    return analyze_ohlcv_coverage(
+        root,
+        DataRequirement(symbol="AAPL", timeframe="1m", start=start, end=end),
+    )
+
+
+def test_a_3_6_day_hole_in_1m_data_still_fails_coverage(tmp_path):
+    """The defect, as a length. 3.6 days is just under the old 4.0-day floor and
+    spans two ordinary sessions, so nothing about it is market behaviour."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-09-17 20:00",   # Thursday 17 September's close
+        after="2026-09-21 11:36",    # Monday mid-morning: 87.6 hours later
+        start="2026-09-17",
+        end="2026-09-21",
+    )
+
+    assert report["status"] == "failed", (
+        f"a 3.6-day hole in 1m data is a dead downloader, not a closure: {report}"
+    )
+    assert report["failed_downloads"], f"the hole must be named: {report}"
+    assert report["failed_downloads"][0]["gap_days"] == pytest.approx(3.65, abs=0.01)
+
+
+def test_a_closure_shaped_hole_wider_than_the_closure_is_not_excused(tmp_path):
+    """The dates look exactly like Good Friday 2026 -- Thursday to Monday, with
+    no session in between -- but the hole runs from Thursday midnight to Monday
+    midnight, five days against a 64.5-hour closure. The extended-hours tail
+    exists for a venue that resumes a few hours late, not for 56 extra hours of
+    missing session time."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-04-02 00:00",   # Thursday, before Good Friday
+        after="2026-04-06 23:59",    # Monday: five days later
+        start="2026-04-02",
+        end="2026-04-06",
+    )
+
+    assert report["gaps"] and report["gaps"][0]["gap_days"] == pytest.approx(5.0, abs=0.01)
+    assert report["status"] == "failed", report
+
+
+# Table-driven on real 2026 US closure dates, in 1-minute data, which is the
+# case the flat floor hurt most. Every `after` is 10:00 Eastern on the reopening
+# session, i.e. a live series that resumed trading.
+LONG_WEEKEND_CASES = [
+    pytest.param(
+        "ordinary long weekend: Fri 11 Sep close, Mon 14 Sep open",
+        "2026-09-11 20:00", "2026-09-14 13:30", "2026-09-11", "2026-09-14",
+        id="ordinary-long-weekend",
+    ),
+    pytest.param(
+        "Independence Day 2026, observed Friday 3 July: 89.5 hours",
+        "2026-07-02 20:00", "2026-07-06 13:30", "2026-07-02", "2026-07-06",
+        id="independence-day-2026",
+    ),
+    pytest.param(
+        "Labor Day 2026 on Monday 7 September: 89.5 hours",
+        "2026-09-04 20:00", "2026-09-08 13:30", "2026-09-04", "2026-09-08",
+        id="labor-day-2026",
+    ),
+    pytest.param(
+        "Martin Luther King Jr Day 2026 on Monday 19 January",
+        "2026-01-16 21:00", "2026-01-20 14:30", "2026-01-16", "2026-01-20",
+        id="mlk-day-2026",
+    ),
+    pytest.param(
+        "Memorial Day 2026 on Monday 25 May",
+        "2026-05-22 20:00", "2026-05-26 13:30", "2026-05-22", "2026-05-26",
+        id="memorial-day-2026",
+    ),
+    pytest.param(
+        "Juneteenth 2026 on Friday 19 June",
+        "2026-06-18 20:00", "2026-06-22 13:30", "2026-06-18", "2026-06-22",
+        id="juneteenth-2026",
+    ),
+    pytest.param(
+        "Good Friday 2026 on Friday 3 April (Maundy Thursday trades)",
+        "2026-04-02 20:00", "2026-04-06 13:30", "2026-04-02", "2026-04-06",
+        id="good-friday-2026",
+    ),
+    pytest.param(
+        "Christmas 2026 on a Friday",
+        "2026-12-24 21:00", "2026-12-28 14:30", "2026-12-24", "2026-12-28",
+        id="christmas-2026",
+    ),
+    pytest.param(
+        "New Year 2027 on a Friday, closing out the 2026 regular week",
+        "2026-12-31 21:00", "2027-01-04 14:30", "2026-12-31", "2027-01-04",
+        id="new-year-2027",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "before", "after", "start", "end"), LONG_WEEKEND_CASES
+)
+def test_a_genuine_long_weekend_in_1m_data_still_passes(
+    tmp_path, label, before, after, start, end
+):
+    report = _one_minute_report(tmp_path, before, after, start, end)
+
+    assert report["status"] != "failed", f"{label} must not fail coverage: {report}"
+    assert report["gaps"], f"{label} should still be reported, not silently hidden"
+
+
+def test_the_closure_allowance_is_calendar_derived_not_declared():
+    """It must move with the calendar, not sit in a comment."""
+    from data_tools.auto_download import long_weekend_gap_days
+    from shared import market_calendar
+
+    assert long_weekend_gap_days() == market_calendar.longest_scheduled_closure_days()
+    # 89.5 hours: the Thursday-to-Tuesday gap of a three-closed-weekday week.
+    assert long_weekend_gap_days() == pytest.approx(89.5 / 24.0)
+
+
+def test_weekly_and_monthly_thresholds_are_unchanged_by_the_allowance():
+    """`GAP_SPACING_MULTIPLE` still sizes those from the bar spacing, and the
+    closure allowance no longer touches them."""
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    assert scaled_gap_threshold_days("1w", 1) == 21.0
+    assert scaled_gap_threshold_days("1mo", 1) == 90.0
+    assert scaled_gap_threshold_days("1w", 3, allow_long_weekend=True) == 21.0
+    assert scaled_gap_threshold_days("1mo", 3, allow_long_weekend=True) == 90.0
+
+
+def test_a_gap_with_unreadable_endpoints_is_never_excused():
+    """Fails closed: a gap report this function cannot read is a bug, and
+    excusing it would hide that bug behind a closure."""
+    from data_tools.auto_download import _gap_is_market_closure
+
+    weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
+    assert _gap_is_market_closure(weekend, timeframe="1m")
+
+    assert not _gap_is_market_closure({**weekend, "start": ""}, timeframe="1m")
+    assert not _gap_is_market_closure({**weekend, "end": "not-a-date"}, timeframe="1m")
+    # A report with no exact width is not guessed at from the rounded
+    # `gap_days`, which cannot resolve a one-minute bar.
+    assert not _gap_is_market_closure(
+        {"start": "2026-09-11", "end": "2026-09-14", "gap_days": 2.73},
+        timeframe="1m",
+    )

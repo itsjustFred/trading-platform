@@ -574,6 +574,7 @@ def _validate_signal_age_before_wait(
     deployment: LiveDeploymentConfig,
     *,
     timeframe: str,
+    require_producer_timestamp: bool,
 ) -> None:
     """Fail closed on a signal that is already too old to trade.
 
@@ -582,12 +583,24 @@ def _validate_signal_age_before_wait(
     candle-close price on information that is no longer valid. The budget scales
     with the deployment's signal timeframe unless the operator pinned
     ``max_signal_age_seconds``.
+
+    ``require_producer_timestamp`` is a required keyword, not a default, so a
+    new caller has to state its policy instead of inheriting one. It is passed
+    by :func:`_submit_normalized_discord_signal`, which is already *the*
+    Discord path -- the source is known at the call site, so the gate must not
+    re-derive it from ``metadata["source"]``. It used to: the Discord producer
+    writes ``"discord"`` at parse time and then overwrites it with
+    ``f"discord_{bot_name.lower()}"`` (``discord_nitro``), so an exact
+    comparison against ``"discord"`` never matched production and the
+    fail-closed branch was dead code. A signal whose age cannot be established
+    was then passed on to the processor and to ``submit_order`` unvalidated for
+    every timeframe :func:`signal_is_fresh` cannot parse (``tick``, ``daily``,
+    ``m5``), because that gate returns "fresh" when it has no budget at all.
     """
     metadata = signal.metadata or {}
     received_raw = str(metadata.get("received_at") or "").strip()
-    is_discord = str(metadata.get("source") or "").strip().lower() == "discord"
     if not received_raw:
-        if is_discord:
+        if require_producer_timestamp:
             raise ValueError("Discord signal is missing received_at")
         return
     try:
@@ -1555,6 +1568,9 @@ async def _submit_normalized_discord_signal(
             normalized_signal,
             deployment,
             timeframe=signal_timeframe,
+            # This function is the Discord dispatch path; the source is known
+            # here, so the gate is told rather than made to sniff metadata.
+            require_producer_timestamp=True,
         )
         normalized_signal = await _apply_signal_processor(
             normalized_signal,

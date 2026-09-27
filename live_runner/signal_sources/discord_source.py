@@ -328,13 +328,25 @@ def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
     return None
 
 
-def _parse_timestamp(raw_timestamp: str | None) -> datetime:
+def _parse_timestamp(raw_timestamp: str | None) -> datetime | None:
+    """Read a Discord timestamp, or ``None`` when it cannot be read.
+
+    Fail closed. This used to return ``datetime.now(timezone.utc)`` for both a
+    missing *and* an unparseable value, which silently stamped every signal as
+    "received just now": an unparseable timestamp therefore made a message
+    look brand new, defeating every age check downstream
+    (``signal_is_fresh`` and the daemon's pre-wait age gate both read
+    ``received_at``). An age that cannot be established is unknown, not zero,
+    so the caller must decide what to do -- and the callers omit
+    ``received_at`` entirely so the gate refuses visibly instead of trading on
+    an assumed age.
+    """
     if not raw_timestamp:
-        return datetime.now(timezone.utc)
+        return None
     try:
         parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
     except ValueError:
-        return datetime.now(timezone.utc)
+        return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
@@ -397,9 +409,16 @@ def _parse_trade_signal_from_message(
         "discord_channel_id": str(getattr(getattr(message, "channel", None), "id", "")),
         "discord_author_id": str(getattr(getattr(message, "author", None), "id", "")),
         "discord_content": content,
-        "received_at": timestamp.isoformat(),
         "timeframe": normalize_timeframe(default_timeframe) or default_timeframe,
     }
+    if timestamp is not None:
+        metadata["received_at"] = timestamp.isoformat()
+    else:
+        # No fabricated receipt time. The key is left absent so the daemon's
+        # pre-wait age gate -- which knows it is on the Discord path and so
+        # requires the key -- refuses with an operator-visible warning rather
+        # than trading a message whose age nobody can establish.
+        metadata["discord_received_at_unreadable"] = True
     return TradeSignal(
         action=action,
         symbol=symbol,
@@ -412,7 +431,12 @@ def _parse_trade_signal_from_message(
 
 
 class _DiscordMessageAdapter:
-    """Minimal adapter exposing the attributes the parser relies on."""
+    """Minimal adapter exposing the attributes the parser relies on.
+
+    ``created_at`` is ``None`` when the message carries no readable timestamp;
+    the parser turns that into a signal with no ``received_at`` rather than a
+    fabricated one.
+    """
 
     __slots__ = ("content", "id", "created_at", "channel", "author")
 
