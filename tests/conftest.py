@@ -114,8 +114,18 @@ def _playwright_browser_launchable(browser_name: str) -> tuple[bool, str]:
 
 
 @pytest.fixture
-def viewer_client(monkeypatch, tmp_path):
-    """Shared viewer TestClient with DATA_DIR-scoped storage paths."""
+def viewer_client(monkeypatch, tmp_path, isolated_db_sandbox):
+    """Shared viewer TestClient with DATA_DIR-scoped storage paths.
+
+    Depends on ``isolated_db_sandbox`` because the task machinery persists through
+    ``shared.database``, which is a process-wide engine that nothing else here
+    redirects. Without it a viewer's background-task records land in the real
+    database and outlive the test that wrote them, which caused two real problems:
+    a later TestClient's startup recovery found a leftover ``source="dolthub"``
+    download record and resumed it for real, cloning ~15 GB from the internet; and
+    test runs could write to the live database at all, which is how 219 stray
+    backtest rows once landed in production.
+    """
     from fastapi.testclient import TestClient as _TestClient
 
     import viewer.main as viewer_app_module
