@@ -90,6 +90,19 @@ packages = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Not Python, or deliberately broken. These are inputs to other tools, not
+# source we own:
+#   tests/fixtures/sample_strategy.py is Pine Script (//@version=5, strategy()),
+#   tests/fixtures/invalid_strategies/syntax_error.py is an explicit negative
+#     control -- "deliberately unparseable" -- for the invalid-strategy path, so
+#     repairing it would destroy the thing it exists to test.
+#   strategy-comparisons/ holds QuantConnect algorithms, which the QC platform
+#     requires to use `from AlgorithmImports import *`; rewriting that import
+#     would break them on the platform.
+extend-exclude = [
+    "tests/fixtures",
+    "strategy-comparisons",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

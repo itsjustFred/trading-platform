@@ -37,16 +37,17 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from sqlmodel import SQLModel
 from starlette.middleware.gzip import GZipMiddleware
 
-from data_tools.catalog_builder import merge_ohlcv_entries
-from data_tools import cache_manager
 from data_tools import auto_download as _auto_download_config
+from data_tools import cache_manager
 from data_tools.auto_download import reload_coverage_windows
+from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools.signal_import import load_signals_from_csv
 from shared.atomic_io import write_text_atomically
 
@@ -57,7 +58,11 @@ os.environ.setdefault("PYNE_SAVE_SCRIPT_TOML", "0")
 
 from shared.constants import (
     DATA_DIR as RESOLVED_DATA_DIR,
+)
+from shared.constants import (
     LOG_DIR as RESOLVED_LOG_DIR,
+)
+from shared.constants import (
     normalize_timeframe,
 )
 
@@ -68,8 +73,78 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
+from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.stockkit_routing import validate_stockkit_deployment_route
+from risk.config import RiskConfig
+from runner.agent_process import build_backtest_child_env
+from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from runner.grid_identity import data_staleness_reason, read_identity
+from shared.database import (
+    DB_PATH as BACKTEST_DB_PATH,
+)
+from shared.database import (
+    LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    LiveDeploymentSubmissionClaim,
+    create_live_deployment,
+    create_service,
+    delete_background_task_record,
+    delete_backtest,
+    delete_live_deployment,
+    delete_service,
+    ensure_live_account,
+    get_background_task_record,
+    get_latest_live_balance,
+    get_latest_live_balances,
+    get_live_account,
+    get_live_deployment,
+    get_service,
+    init_db,
+    list_background_task_records,
+    list_backtest_fingerprint_rows,
+    list_backtest_ids,
+    list_backtest_metadata_rows,
+    list_live_accounts,
+    list_live_balances,
+    list_live_deployment_submission_claims,
+    list_live_deployments,
+    list_live_deployments_for_account,
+    list_live_signal_executions_for_deployments,
+    list_live_signals_for_deployments,
+    list_live_signals_for_replay,
+    list_services,
+    list_verification_evidence_records,
+    list_verification_evidence_summary,
+    load_backtest_equity_preview_map,
+    load_backtest_equity_preview_points,
+    load_backtest_metadata_row,
+    load_backtest_result,
+    load_live_account_stats_inputs,
+    mark_background_tasks_interrupted,
+    migrate_json_to_sqlite,
+    normalize_task_status,
+    record_live_account_demo_verification,
+    save_result_to_sqlite,
+    update_live_deployment_account,
+    update_live_deployment_status,
+    update_service_status,
+    upsert_background_task_record,
+    upsert_live_accounts,
+    upsert_verification_evidence,
+    utcnow_naive,
+)
+from shared.database import (
+    delete_portfolio as delete_portfolio_record,
+)
+from shared.database import (
+    list_portfolios as list_portfolio_records,
+)
+from shared.database import (
+    load_portfolio as load_portfolio_record,
+)
+from shared.database import (
+    save_portfolio as save_portfolio_record,
+)
 from shared.logging import get_logger, redact_text, redact_value
-from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
     EquityPoint,
@@ -79,96 +154,41 @@ from shared.models import (
     ServiceType,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+)
+from shared.models import (
     Portfolio as PortfolioModel,
+)
+from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
-from shared.database import (
-    DB_PATH as BACKTEST_DB_PATH,
-    create_live_deployment,
-    delete_background_task_record,
-    delete_backtest,
-    delete_portfolio as delete_portfolio_record,
-    delete_live_deployment,
-    ensure_live_account,
-    get_background_task_record,
-    get_live_account,
-    get_live_deployment,
-    get_service,
-    get_latest_live_balance,
-    get_latest_live_balances,
-    init_db,
-    list_backtest_ids,
-    list_backtest_fingerprint_rows,
-    list_backtest_metadata_rows,
-    list_portfolios as list_portfolio_records,
-    list_verification_evidence_records,
-    list_verification_evidence_summary,
-    list_background_task_records,
-    list_live_accounts,
-    list_live_balances,
-    list_live_deployments,
-    list_live_deployments_for_account,
-    list_services,
-    list_live_signals_for_replay,
-    list_live_signals_for_deployments,
-    list_live_signal_executions_for_deployments,
-    load_backtest_metadata_row,
-    load_backtest_equity_preview_points,
-    load_backtest_equity_preview_map,
-    load_live_account_stats_inputs,
-    load_backtest_result,
-    load_portfolio as load_portfolio_record,
-    mark_background_tasks_interrupted,
-    migrate_json_to_sqlite,
-    normalize_task_status,
-    save_result_to_sqlite,
-    save_portfolio as save_portfolio_record,
-    upsert_verification_evidence,
-    upsert_background_task_record,
-    list_live_deployment_submission_claims,
-    LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
-    LiveDeploymentSubmissionClaim,
-    utcnow_naive,
-    create_service,
-    delete_service,
-    record_live_account_demo_verification,
-    update_live_deployment_account,
-    update_live_deployment_status,
-    update_service_status,
-    upsert_live_accounts,
-)
-from runner.agent_process import build_backtest_child_env
-from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
-from runner.grid_identity import data_staleness_reason, read_identity
-from risk.config import RiskConfig
+from shared.sentry import initialize_sentry
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
-from live_runner.ctrader_deployment import build_ctrader_deployment_plan
-from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
 try:
     from live_runner.account_discovery import discover_configured_accounts
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
+from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.market_data_stream import LiveMarketDataStreamService
+from runner.capm import align_return_series, calculate_capm
 from shared.models import (
     LiveDeploymentAccountUpdateRequest,
     LiveDeploymentConfig,
     LiveDeploymentCreateRequest,
     LiveDeploymentStatusUpdateRequest,
 )
-from runner.capm import align_return_series, calculate_capm
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
     iter_strategy_files,
     load_strategy_meta,
     matches_strategy_identifier,
-    strategy_identifier_aliases,
     strategy_documentation_path,
+    strategy_identifier_aliases,
     strategy_relative_file,
     strategy_slug_for_path,
 )
-from live_runner.market_data_stream import LiveMarketDataStreamService
-from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from viewer import core as legacy_viewer
 
 initialize_sentry(
@@ -5054,12 +5074,12 @@ def _resolve_signal_replay_timeframe(
 
     intraday_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h"}
     has_intraday = False
-    for signal in normalized_signals:
-        signal_timeframe = normalize_timeframe(str(signal.get("timeframe") or "").strip())
+    for candidate in normalized_signals:
+        signal_timeframe = normalize_timeframe(str(candidate.get("timeframe") or "").strip())
         if signal_timeframe in intraday_timeframes:
             has_intraday = True
             break
-        if _signal_has_intraday_timestamp(signal):
+        if _signal_has_intraday_timestamp(candidate):
             has_intraday = True
             break
 
@@ -10820,21 +10840,21 @@ async def _load_and_filter_csv_signals(
     source_label = f"csv:{Path(file_path).name}"
     filtered_signals: list[dict[str, Any]] = []
     signal_inputs: list[SignalReplayInput] = []
-    for signal in loaded_signals:
-        signal_time = pd.to_datetime(signal.get("timestamp"), utc=True, errors="coerce")
+    for row in loaded_signals:
+        signal_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
         if pd.isna(signal_time):
             continue
         signal_dt = pd.Timestamp(signal_time).to_pydatetime()
         if signal_dt < start_dt or signal_dt > end_dt:
             continue
 
-        action = str(signal.get("action") or "").strip().lower()
+        action = str(row.get("action") or "").strip().lower()
         if action not in {"buy", "sell", "long", "short"}:
             continue
-        if _safe_float(signal.get("entry_price"), 0.0) <= 0:
+        if _safe_float(row.get("entry_price"), 0.0) <= 0:
             continue
 
-        signal_payload = _replay_signal_payload(signal, signal_time, source_label, file_path)
+        signal_payload = _replay_signal_payload(row, signal_time, source_label, file_path)
         filtered_signals.append(signal_payload)
         signal_inputs.append(
             SignalReplayInput(

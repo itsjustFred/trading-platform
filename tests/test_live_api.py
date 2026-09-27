@@ -57,10 +57,8 @@ def test_live_endpoints_return_expected_payloads(monkeypatch):
     monkeypatch.setattr(
         viewer_main_module,
         "get_live_account",
-        lambda requested: (
-            _ACCOUNT_ROW
-            if str(requested) == account_id
-            else None
+        lambda requested: next(
+            (account for account in accounts if str(account.id) == str(requested)), None
         ),
     )
     async def _discover_accounts_stub():
