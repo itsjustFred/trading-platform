@@ -252,10 +252,36 @@ because several readers format it as `value.toFixed(1) + "%"` with no
 conversion. The two keys are therefore always a hundred to one apart, which
 makes them a free cross-check on each other.
 
+**The unit of every other percent-like key is a property of the PAYLOAD, not
+of the key name.** `win_rate` is percent points in `/api/backtest/{id}/stats`
+(the producer multiplies the engine fraction by 100), a fraction in
+`/api/backtests/all` (served straight from the canonical stats), and points
+again in the portfolio summary while the portfolio's `combined_stats` serves a
+fraction. The same split applies to `cagr` and `max_drawdown`/`max_drawdown_pct`,
+and `psr` is the mirror image: a fraction everywhere except
+`/api/backtests/compare`, which rescales it.
+
+`frontend/src/api/metricScale.ts` therefore declares the unit per
+`(payload, key)` cell. Rules that make the table impossible to under-fill:
+
+- every payload declares **every** key, as a unit or explicitly as
+  `"not-applicable"` when that payload does not emit it. The `satisfies
+  Record<MetricPayload, Record<PercentMetricKey, PercentScaleEntry>>` clause
+  makes a missing cell a compile error.
+- every accessor (`requireMetricScale`, `toPercentPointsForKey`) **requires the
+  caller to name the payload**. A page that reads the wrong payload gets a
+  thrown error, not a silently wrong 100x.
+- a reader that finds `"not-applicable"` for the key it is about to render is
+  bound to a payload that never sends it, which is a wiring bug either way.
+
 **Pinned by:** `tests/test_metric_scale_contract.py`, which parses
-`frontend/src/api/metricScale.ts` and asserts per key that the backend producer
-emits the declared unit, plus a dedicated test that every `total_return`
-producer serves the canonical fraction.
+`frontend/src/api/metricScale.ts` and asserts per `(payload, key)` cell that the
+matching backend producer emits the declared unit; that every cell is a
+decision; that every served cell has a producer probe; and that the keys whose
+unit genuinely differs across payloads still differ, so collapsing the table
+back to one unit per key fails the suite instead of rendering three metrics
+100x off. A dedicated test pins every `total_return` producer to the canonical
+fraction.
 
 ## 7. `total_bars`
 

@@ -339,6 +339,7 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "max_drawdown_pct",
         "win_rate",
         "daily_return_count",
+        "grid_identity",
         "output",
         "error",
     ]

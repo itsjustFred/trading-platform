@@ -21,7 +21,7 @@ import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
-from runner.engines.contract import select_ohlcv_path
+from runner.engines.contract import ohlcv_path_metadata, select_ohlcv_path
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.engines.native_adapter import NativeAdapter
 from tests.helpers import write_ohlcv as _write_ohlcv, with_zero_fees
@@ -488,6 +488,51 @@ def test_ohlcv_selector_rejects_unknown_explicit_source(tmp_path: Path):
 
     with pytest.raises(ValueError, match="matches data_source"):
         select_ohlcv_path(tmp_path, "XAUUSD", "1h", data_source="unknown")
+
+
+def test_ohlcv_path_metadata_reads_the_region_only_from_the_five_element_layout():
+    """`ohlcv/{source}/{asset_class}/[{region}/]{symbol}/{timeframe}.parquet`.
+
+    The region is the optional element, so only the five-element form carries
+    one. The four-element form has the SYMBOL in that slot, and reporting it
+    as a region mislabels the data set (and, via the selector's data_source
+    match below, lets a symbol string select data).
+    """
+    with_region = ohlcv_path_metadata("data/ohlcv/yfinance/equity/US/AAPL/1d.parquet")
+    assert with_region == {
+        "source": "yfinance",
+        "asset_class": "equity",
+        "region": "us",
+    }
+
+    for path in (
+        "data/ohlcv/huggingface/crypto/BTCUSD/1h.parquet",
+        "data/ohlcv/dukascopy/forex/EURUSD/1h.parquet",
+        "data/ohlcv/histdata/forex/EURUSD/1h.parquet",
+    ):
+        meta = ohlcv_path_metadata(path)
+        assert meta["region"] == "", (
+            f"{path} has no region element, so the symbol it reports as one "
+            f"({meta['region']!r}) is a mislabel"
+        )
+        assert meta["source"] and meta["asset_class"]
+
+
+def test_ohlcv_selector_does_not_match_a_data_source_against_the_symbol(
+    tmp_path: Path,
+):
+    """The consequence of the mislabel: a symbol is not a data source.
+
+    The selector matches a requested `data_source` against every metadata
+    value, so with the symbol reported as a region, `data_source="XAUUSD"`
+    quietly selected the very file it was filtering on.
+    """
+    path = tmp_path / "ohlcv" / "dukascopy" / "metals" / "XAUUSD" / "1h.parquet"
+    path.parent.mkdir(parents=True)
+    path.touch()
+
+    with pytest.raises(ValueError, match="matches data_source"):
+        select_ohlcv_path(tmp_path, "XAUUSD", "1h", data_source="XAUUSD")
 
 
 @pytest.mark.parametrize("adapter_type", [NativeAdapter, VectorbtAdapter])

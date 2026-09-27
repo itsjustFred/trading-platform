@@ -829,8 +829,19 @@ def test_dedupe_executions_idempotent_on_clean_table(isolated_db):
 # ─── cTrader cancel / flatten (STOPPED semantics) ───────────────────────────
 
 
-class _FakeCTraderAdapter:
-    """Exercises the cTrader cancel/flatten logic without a broker connection."""
+from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+
+class _FakeCTraderAdapter(CTraderLiveAdapter):
+    """A real adapter with only the transport stubbed.
+
+    It subclasses ``CTraderLiveAdapter`` on purpose. The cancel/flatten logic
+    lives in several helpers, and a stand-in class that re-declared only
+    ``cancel_open_orders`` silently dropped every helper it did not know about,
+    so a change to those helpers would not have been exercised here at all.
+    ``__init__`` is bypassed (it loads protobuf and dials nothing); the message
+    classes it would have bound are attached below.
+    """
 
     def __init__(self, orders, positions):
         self._orders = orders
@@ -876,21 +887,36 @@ class _FakeCTraderAdapter:
             return response
         return object()
 
-    async def cancel_open_orders(self):
-        from live_runner.ctrader_adapter import CTraderLiveAdapter
 
-        source = CTraderLiveAdapter.cancel_open_orders
-        return await source(self)
-
-
-def _order(order_id: int, order_type: int):
+def _order(order_id: int, order_type: int, *, position_id: int = 0, status: int | None = None):
     """A real ProtoOAOrder: ids are int64, so a string id would be rejected."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
 
     order = ProtoOAOrder()
     order.orderId = order_id
     order.orderType = order_type
+    if position_id:
+        order.positionId = position_id
+    if status is not None:
+        order.orderStatus = status
     return order
+
+
+def _protection(order_id: int, position_id: int, *, status: int | None = None):
+    """A STOP_LOSS_TAKE_PROFIT order: an open position's stop + target."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    return _order(
+        order_id,
+        ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
+        position_id=position_id,
+        status=ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+        if status is None
+        else status,
+    )
 
 
 async def _cancel(orders):
@@ -903,13 +929,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _cancelled_ids(adapter) -> set[int]:
+    """Order ids the adapter actually sent a cancel request for."""
+    return {int(r.orderId) for r in adapter.sent if getattr(r, "orderId", 0)}
+
+
 def test_cancel_skips_market_orders_and_cancels_resting_ones():
     adapter, cancelled = _run(
         _cancel(
             [
                 _order(101, 1),  # MARKET
                 _order(102, 2),  # LIMIT
-                _order(103, 4),  # STOP_LOSS_TAKE_PROFIT
+                _order(103, 3),  # STOP
                 _order(104, 6),  # STOP_LIMIT
             ]
         )
@@ -917,9 +948,106 @@ def test_cancel_skips_market_orders_and_cancels_resting_ones():
     assert cancelled == 3, "market orders fill immediately and cannot be cancelled"
     # `orderId` is an int64 field, so the real request always reads back an
     # int. Coercing here would hide a string that reached the wire.
-    ids = [r.orderId for r in adapter.sent if getattr(r, "orderId", 0)]
+    ids = _cancelled_ids(adapter)
     assert 101 not in ids, "market orders fill immediately and cannot be cancelled"
-    assert {102, 103, 104} <= set(ids)
+    assert {102, 103, 104} <= ids
+
+
+def test_cancel_never_disarms_an_open_positions_stop_or_target():
+    """A STOP_LOSS_TAKE_PROFIT order is a position's stop and target, not an entry.
+
+    Cancelling it in the blanket sweep left the position open with no stop and
+    no target, on an account the sweep is not necessarily about to flatten (and
+    it runs before the flatten, so a flatten that then fails leaves the position
+    permanently naked). The type must be excluded from the cancellable set.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    limit = _order(102, ProtoOAOrderType.LIMIT)
+    limit.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    stop = _order(103, ProtoOAOrderType.STOP)
+    stop.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    stop_limit = _order(104, ProtoOAOrderType.STOP_LIMIT)
+    stop_limit.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    protection = _protection(105, position_id=900)
+
+    adapter = _FakeCTraderAdapter([limit, stop, stop_limit, protection], [])
+    cancelled = _run(adapter.cancel_open_orders())
+
+    assert _cancelled_ids(adapter) == {102, 103, 104}, (
+        "every detached working order must still be cancelled, and the "
+        "attached protection must not be"
+    )
+    assert cancelled == 3, (
+        "the protection is not a cancelled order, so it must not be counted as "
+        "one either: a count that includes it reports orders cancelled while a "
+        "live stop was disarmed"
+    )
+
+
+def test_orphan_sweep_cancels_only_protections_whose_position_is_gone():
+    """The flatten detaches the protection; the sweep cleans up exactly those."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    live_protection = _protection(201, position_id=900)
+    orphan = _protection(202, position_id=901)
+    unattached = _protection(203, position_id=0)
+    limit = _order(204, 2)
+
+    adapter = _FakeCTraderAdapter(
+        [live_protection, orphan, unattached, limit],
+        [_real_position(900, 1000)],
+    )
+    cancelled = _run(adapter.cancel_orphaned_protections())
+
+    assert _cancelled_ids(adapter) == {202}, (
+        "only the protection whose position is gone may be cancelled: the live "
+        "position's stop is the one thing this must never touch, and a "
+        "protection with no positionId cannot be attributed to anything"
+    )
+    assert cancelled == 1
+
+
+def test_orphan_sweep_leaves_a_live_protection_alone_when_nothing_closed():
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    protection = _protection(301, position_id=900)
+    adapter = _FakeCTraderAdapter([protection], [_real_position(900, 1000)])
+
+    assert _run(adapter.cancel_orphaned_protections()) == 0
+    assert _cancelled_ids(adapter) == set()
+
+
+def test_orphan_sweep_ignores_a_terminal_protection():
+    """A filled or cancelled orphan is already gone; cTrader rejects the cancel."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderStatus
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    filled = _protection(
+        401, position_id=901, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED
+    )
+    adapter = _FakeCTraderAdapter([filled], [])
+
+    assert _run(adapter.cancel_orphaned_protections()) == 0
+    assert _cancelled_ids(adapter) == set()
+
+
+def test_orphan_sweep_raises_instead_of_reporting_a_clean_zero():
+    """An unreadable reconcile response is UNKNOWN, not "there was nothing to do"."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = _FakeCTraderAdapter([], [])
+
+    async def _bad(request, timeout_seconds=None):
+        return "not-a-reconcile-response"
+
+    adapter._send_request_with_refresh_retry = _bad
+    with pytest.raises(RuntimeError, match="Unexpected reconcile response"):
+        _run(adapter.cancel_orphaned_protections())
 
 
 def test_cancel_with_no_orders_is_a_no_op():
@@ -956,7 +1084,7 @@ def test_flatten_closes_every_open_position():
         return positions
 
     adapter._fetch_open_positions = _positions
-    closed = _run(CTraderLiveAdapter.close_all_positions(adapter))
+    closed = _run(adapter.close_all_positions())
     assert closed == 2
     # `positionId`/`volume` are int64 fields, so the real request always reads
     # back ints. Coercing here would hide a string that reached the wire.
@@ -976,7 +1104,7 @@ def test_flatten_skips_positions_without_an_id():
         return positions
 
     adapter._fetch_open_positions = _positions
-    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert _run(adapter.close_all_positions()) == 0
     assert adapter.sent == []
 
 
@@ -1497,7 +1625,7 @@ def test_flatten_skips_a_position_whose_id_is_not_an_int():
 
     adapter._fetch_open_positions = _positions
 
-    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert _run(adapter.close_all_positions()) == 0
     assert adapter.sent == []
 
 
@@ -1515,7 +1643,7 @@ def test_flatten_skips_a_string_zero_position_id():
 
     adapter._fetch_open_positions = _positions
 
-    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 0
+    assert _run(adapter.close_all_positions()) == 0
     assert adapter.sent == []
 
 
@@ -1538,5 +1666,5 @@ def test_flatten_closes_the_other_positions_after_an_unusable_id():
 
     adapter._fetch_open_positions = _positions
 
-    assert _run(CTraderLiveAdapter.close_all_positions(adapter)) == 2
+    assert _run(adapter.close_all_positions()) == 2
     assert [request.positionId for request in adapter.sent] == [201, 202]

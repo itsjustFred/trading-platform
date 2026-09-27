@@ -4,6 +4,7 @@ import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
 import { getOptimizations } from "../api/client";
 import type { OptimizationSummary } from "../api/types";
+import { toPercentPointsForKey } from "../api/metricScale";
 import {
   classifyOptimizationOosEvidence,
   resolveCompatibleInSampleValue,
@@ -14,7 +15,9 @@ function formatMetricValue(metric: string, value: number | string | boolean | nu
     return value == null ? "—" : String(value);
   }
   if (["cagr", "win_rate", "max_drawdown_pct"].includes(metric)) {
-    return `${(value * 100).toFixed(2)}%`;
+    return `${(
+      toPercentPointsForKey("optimization_panel_stats", metric as "cagr", value) ?? 0
+    ).toFixed(2)}%`;
   }
   if (metric === "total_pnl") {
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;

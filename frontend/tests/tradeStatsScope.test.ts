@@ -33,12 +33,13 @@ test("PSR renders as a fraction per the backend contract", async () => {
   const { toPercentPoints } = await import("../src/api/metricScale.ts");
   const source = await pageSource;
 
-  // The backend serves psr as a probability (0..1); the card must convert it,
-  // not render 0.95 as "0.95%".
-  assert.equal(metricScale("psr"), "fraction");
+  // The stats payload serves psr as a probability (0..1); the card must convert
+  // it, not render 0.95 as "0.95%". The unit is declared per payload, and this
+  // page reads `backtest_stats`, so the call has to name that payload.
+  assert.equal(metricScale("backtest_stats", "psr"), "fraction");
   assert.equal(toPercentPoints(0.95, "fraction"), 95);
   assert.match(
     source,
-    /label="PSR \(higher = better\)"[\s\S]{0,200}percentScale="fraction"/,
+    /label="PSR \(higher = better\)"[\s\S]{0,200}requireMetricScale\("backtest_stats", "psr"\)/,
   );
 });

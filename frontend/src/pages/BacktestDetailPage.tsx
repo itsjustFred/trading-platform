@@ -41,6 +41,7 @@ import type {
   EquityPoint,
   Trade,
 } from "../api/types";
+import { requireMetricScale } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
 import { useToast } from "../components/toastContext";
 
@@ -666,13 +667,13 @@ export function BacktestDetailPage() {
             label="Net Profit %"
             value={stats.net_profit_pct}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "net_profit_pct")}
           />
           <StatCard
             label="CAGR (higher = better)"
             value={stats.cagr}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "cagr")}
           />
           <StatCard
             label="Sharpe (higher = better)"
@@ -688,14 +689,14 @@ export function BacktestDetailPage() {
             label="Max DD (lower = better)"
             value={stats.max_drawdown_pct}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "max_drawdown_pct")}
             color="#f85149"
           />
           <StatCard
             label="Win Rate (higher = better)"
             value={stats.win_rate}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "win_rate")}
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
           />
           <StatCard
@@ -712,7 +713,7 @@ export function BacktestDetailPage() {
             label="PSR (higher = better)"
             value={stats.psr}
             format="percent"
-            percentScale="fraction"
+            percentScale={requireMetricScale("backtest_stats", "psr")}
             color={
               (stats.psr ?? 0) > 0.95
                 ? "#3fb950"

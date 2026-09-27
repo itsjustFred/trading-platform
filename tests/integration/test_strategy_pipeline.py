@@ -10,7 +10,32 @@ import pytest
 
 from tests.validators.backtest_validator import BacktestExpectation, BacktestResultValidator
 
-API_BASE_URL = os.getenv("BASE_URL", "http://localhost:5556")
+#: This suite drives a RUNNING viewer over HTTP, which means whatever DATA_DIR
+#: that viewer was started with. The default used to be the production viewer on
+#: :5556, whose DATA_DIR is the live ``/mnt/block-volume-data`` volume -- so a
+#: plain ``pytest tests/`` silently wrote its backtest artifacts into the
+#: production database. 219 rows landed there that way.
+#:
+#: There is no way to tell an isolated dev viewer apart from the production one
+#: by URL alone, so the suite now refuses to guess: BASE_URL must be set
+#: explicitly, and opt-in is required before it will write anything at all.
+API_BASE_URL = os.getenv("BASE_URL", "").strip()
+_REQUIRE_OPT_IN = os.getenv("PERMA_ALLOW_LIVE_VIEWER_WRITES", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+_REQUIRES_ISOLATED_VIEWER = pytest.mark.skipif(
+    not (API_BASE_URL and _REQUIRE_OPT_IN),
+    reason=(
+        "Drives a live viewer over HTTP and writes backtest artifacts into its "
+        "DATA_DIR. Set BASE_URL to an isolated viewer and "
+        "PERMA_ALLOW_LIVE_VIEWER_WRITES=1 to run it. Refusing to guess, because "
+        "the default previously targeted the production viewer on :5556."
+    ),
+)
+
 POLL_INTERVAL_SECONDS = 2.0
 POLL_TIMEOUT_SECONDS = 120.0
 MIN_STRATEGIES = 5
@@ -101,12 +126,22 @@ def _poll_task_completion(client: httpx.Client, task_id: str) -> dict[str, Any]:
     )
 
 
-_DISCOVERY = _discover_strategy_matrix()
-STRATEGY_TEST_MATRIX = _DISCOVERY.matrix
+if not (API_BASE_URL and _REQUIRE_OPT_IN):
+    # Import-time discovery already performs HTTP. The skipif above has not been
+    # evaluated yet at this point, so short-circuit here as well; otherwise the
+    # module reaches the viewer during collection no matter what the marks say.
+    _DISCOVERY = None
+else:
+    _DISCOVERY = _discover_strategy_matrix()
+STRATEGY_TEST_MATRIX = _DISCOVERY.matrix if _DISCOVERY is not None else []
 
-pytestmark = [pytest.mark.integration, pytest.mark.slow]
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.slow,
+    _REQUIRES_ISOLATED_VIEWER,
+]
 
-if _DISCOVERY.error:
+if _DISCOVERY is not None and _DISCOVERY.error:
     pytest.skip(_DISCOVERY.error, allow_module_level=True)
 
 

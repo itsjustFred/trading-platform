@@ -36,7 +36,7 @@ import { RenameModal } from "../components/RenameModal";
 import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
 import { useToast } from "../components/toastContext";
-import { requireMetricScale } from "../api/metricScale";
+import { requireMetricScale, toPercentPointsForKey } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
@@ -503,7 +503,7 @@ export function PortfolioDetailPage() {
           label="Total Return"
           value={stats.total_return ?? 0}
           format="percent"
-          percentScale={requireMetricScale("total_return")}
+          percentScale={requireMetricScale("portfolio_combined_stats", "total_return")}
         />
         <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
         <StatCard
@@ -516,13 +516,13 @@ export function PortfolioDetailPage() {
           label="CAGR (higher = better)"
           value={stats.cagr ?? 0}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "cagr")}
         />
         <StatCard
           label="PSR (higher = better)"
           value={stats.psr}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "psr")}
           color={Number(stats.psr) > 0.95 ? "#3fb950" : Number(stats.psr) > 0.5 ? "#d29922" : "#f85149"}
         />
         <StatCard
@@ -534,14 +534,14 @@ export function PortfolioDetailPage() {
           label="Max DD (lower = better)"
           value={stats.max_drawdown ?? 0}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "max_drawdown")}
           color="#f85149"
         />
         <StatCard
           label="Win Rate (higher = better)"
           value={stats.win_rate}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "win_rate")}
           color={(stats.win_rate || 0) >= 0.5 ? "#3fb950" : "#f85149"}
         />
       </div>
@@ -892,7 +892,7 @@ function ContributionTable({
               </td>
               <td style={tdStyle}>
                 {row.psr != null
-                  ? `${(Number(row.psr) * 100).toFixed(1)}%`
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "psr", Number(row.psr)) ?? 0).toFixed(1)}%`
                   : "—"}
               </td>
               <td style={tdStyle}>
@@ -900,7 +900,7 @@ function ContributionTable({
               </td>
               <td style={{ ...tdStyle, color: "#f85149" }}>
                 {row.max_drawdown != null
-                  ? `-${(Number(row.max_drawdown) * 100).toFixed(2)}%`
+                  ? `-${(toPercentPointsForKey("portfolio_contributions", "max_drawdown", Number(row.max_drawdown)) ?? 0).toFixed(2)}%`
                   : "—"}
               </td>
               <td
@@ -910,10 +910,16 @@ function ContributionTable({
                 }}
               >
                 {row.cagr != null
-                  ? `${(Number(row.cagr) * 100).toFixed(2)}%`
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "cagr", Number(row.cagr)) ?? 0).toFixed(2)}%`
                   : "—"}
               </td>
-              <td style={tdStyle}>{row.win_rate.toFixed(2)}%</td>
+              {/* This payload rescales win_rate to percent points while the
+                  portfolio's combined_stats serves a fraction: the flat
+                  `* 100` this cell used to hard-code is what made the two
+                  disagree. */}
+              <td style={tdStyle}>
+                {(toPercentPointsForKey("portfolio_contributions", "win_rate", row.win_rate) ?? 0).toFixed(2)}%
+              </td>
               <td style={tdStyle}>{row.trade_count}</td>
               <td
                 style={{

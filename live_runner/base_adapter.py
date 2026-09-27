@@ -122,6 +122,19 @@ class BaseLiveAdapter(ABC):
             f"{type(self).__name__} cannot close positions"
         )
 
+    async def cancel_orphaned_protections(self) -> int:
+        """Cancel position-protection orders whose position no longer exists.
+
+        A cleanliness control, not a safety one: an orphaned protection cannot
+        fill, it only holds an order slot and misleads an operator reading the
+        account. Adapters raise NotImplementedError when they cannot tell an
+        orphan from a live position's stop, so the caller reports the account
+        as unswept instead of claiming a clean zero.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot identify orphaned protections"
+        )
+
     @abstractmethod
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""

@@ -6894,3 +6894,232 @@ def test_task_control_flags_agree_with_endpoint_acceptance(viewer_client, tmp_pa
             f"endpoint answered {resume_code}"
         )
     assert _task_controls_payload  # the shared helper under test
+
+
+# ─── grid results are served only while they still match their data ─────────
+
+
+def _write_frame(path: Path, *, periods: int = 5) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=periods, freq="D", tz="UTC"),
+            "close": [float(index + 1) for index in range(periods)],
+        }
+    ).to_parquet(path, index=False)
+
+
+def _grid_artifact(path: Path, *, data_dir: str, symbol: str = "SPY", stamp: bool = True) -> Path:
+    """A cell artifact carrying (or deliberately not carrying) a grid identity."""
+    from runner.grid_identity import cell_identity
+
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id="grid_demo_spy_1d",
+            created_at="2026-06-23T00:00:00+00:00",
+            engine="native",
+            strategies=["example_sma"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-05",
+            data={"symbols": [symbol], "timeframes": ["1d"]},
+        ),
+        trades=[],
+        equity_curve=[],
+        stats={},
+    )
+    if stamp:
+        identity = cell_identity(
+            engine="native",
+            strategy="example_sma.py",
+            symbol=symbol,
+            timeframe="1d",
+            start="2024-01-01",
+            end="2024-01-05",
+            capital=100_000.0,
+            risk_pct=0.01,
+            data_dir=data_dir,
+        )
+        result.meta.data = {**result.meta.data, "grid_identity": identity}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result.save(path)
+    return path
+
+
+def _overview_with_row(artifact: Path) -> dict:
+    return {
+        "generated_at": "2026-06-23T00:00:00Z",
+        "source": "test",
+        "counts": {"strategies_done": 1, "strategies_blocked": 0, "rows": 1, "ok_rows": 1,
+                   "failed_rows": 0, "symbols": ["SPY"]},
+        "strategy_summaries": [{"strategy": "example_sma", "ok": 1, "requested": 1}],
+        "blocked_strategies": [],
+        "rows": [
+            {
+                "strategy": "example_sma",
+                "status": "ok",
+                "symbol": "SPY",
+                "timeframe": "1d",
+                "run_id": "grid_example_sma_spy_1d",
+                "backtest_id": "grid_demo_spy_1d",
+                "output": str(artifact),
+                "total_trades": 1,
+                "sharpe": 1.25,
+            }
+        ],
+    }
+
+
+def test_grid_endpoint_serves_a_row_whose_data_still_matches(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    data_dir = tmp_path / "data"
+    _write_frame(data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "SPY" / "1d.parquet")
+    artifact = _grid_artifact(tmp_path / "grid_demo_spy_1d.trades.json", data_dir=str(data_dir))
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(json.dumps(_overview_with_row(artifact)), encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+
+    resp = viewer_client.get("/api/grid/example_sma")
+
+    assert resp.status_code == 200
+    assert resp.json()["rows"][0]["sharpe"] == 1.25
+
+
+def test_grid_endpoint_refuses_a_row_whose_data_changed(
+    viewer_client, monkeypatch, tmp_path
+):
+    """A re-downloaded frame makes the stored Sharpe a historical fact.
+
+    Serving it anyway is the whole defect: the operator sees a ranking with no
+    indication that it describes data that no longer exists.
+    """
+    import viewer.main as viewer_app_module
+
+    data_dir = tmp_path / "data"
+    parquet = data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "SPY" / "1d.parquet"
+    _write_frame(parquet)
+    artifact = _grid_artifact(tmp_path / "grid_demo_spy_1d.trades.json", data_dir=str(data_dir))
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(json.dumps(_overview_with_row(artifact)), encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+    # The frame is re-downloaded with a different length after the run.
+    _write_frame(parquet, periods=9)
+
+    resp = viewer_client.get("/api/grid/example_sma")
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "stale_grid_results"
+    assert detail["stale_row_count"] == 1
+    assert "changed" in detail["stale_rows"][0]["reason"]
+
+
+def test_grid_endpoint_refuses_a_row_whose_artifact_vanished(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+
+    data_dir = tmp_path / "data"
+    _write_frame(data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "SPY" / "1d.parquet")
+    artifact = _grid_artifact(tmp_path / "grid_demo_spy_1d.trades.json", data_dir=str(data_dir))
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(json.dumps(_overview_with_row(artifact)), encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+    artifact.unlink()
+
+    resp = viewer_client.get("/api/grid/example_sma")
+
+    assert resp.status_code == 409
+    assert "gone" in resp.json()["detail"]["stale_rows"][0]["reason"]
+
+
+def test_grid_endpoint_refuses_a_row_that_never_carried_an_identity(
+    viewer_client, monkeypatch, tmp_path
+):
+    """No identity means nothing was ever promised about the data behind it."""
+    import viewer.main as viewer_app_module
+
+    data_dir = tmp_path / "data"
+    _write_frame(data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "SPY" / "1d.parquet")
+    artifact = _grid_artifact(
+        tmp_path / "grid_demo_spy_1d.trades.json", data_dir=str(data_dir), stamp=False
+    )
+    overview_path = tmp_path / "matrix-grid-overview.json"
+    overview_path.write_text(json.dumps(_overview_with_row(artifact)), encoding="utf-8")
+    monkeypatch.setattr(viewer_app_module, "MATRIX_GRID_OVERVIEW_PATH", overview_path)
+
+    resp = viewer_client.get("/api/grid/example_sma")
+
+    assert resp.status_code == 409
+    assert "no grid identity" in resp.json()["detail"]["stale_rows"][0]["reason"]
+
+
+def test_matrix_summary_refuses_a_row_whose_data_changed(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    data_dir = tmp_path / "data"
+    parquet = data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "SPY" / "1d.parquet"
+    _write_frame(parquet)
+    artifact = _grid_artifact(tmp_path / "grid_demo_spy_1d.trades.json", data_dir=str(data_dir))
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    (matrix_dir / "matrix_summary.json").write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "strategy": "example_sma",
+                        "status": "ok",
+                        "symbol": "SPY",
+                        "timeframe": "1d",
+                        "output": str(artifact),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", matrix_dir)
+
+    assert viewer_client.get("/api/backtests/matrix/summary").status_code == 200
+
+    _write_frame(parquet, periods=9)
+
+    resp = viewer_client.get("/api/backtests/matrix/summary")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "stale_grid_results"
+
+
+def test_matrix_summary_ignores_failed_cells(viewer_client, monkeypatch, tmp_path):
+    """A failed cell names an artifact that was never written.
+
+    There is nothing stale about it, and refusing the whole payload over it
+    would turn a loud failure into an outage.
+    """
+    import viewer.main as viewer_app_module
+
+    matrix_dir = tmp_path / "matrix"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    (matrix_dir / "matrix_summary.json").write_text(
+        json.dumps(
+            {
+                "runs": [
+                    {
+                        "strategy": "example_sma",
+                        "status": "failed",
+                        "symbol": "SPY",
+                        "timeframe": "1d",
+                        "output": str(tmp_path / "never-written.trades.json"),
+                        "error": "no data",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", matrix_dir)
+
+    assert viewer_client.get("/api/backtests/matrix/summary").status_code == 200

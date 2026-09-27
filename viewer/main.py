@@ -139,6 +139,7 @@ from shared.database import (
 )
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from runner.grid_identity import data_staleness_reason, read_identity
 from risk.config import RiskConfig
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
@@ -8323,6 +8324,85 @@ def _matrix_result_path(filename: str) -> Path:
     return MATRIX_RESULTS_DIR / normalized
 
 
+def _stale_grid_findings(
+    rows: list[dict[str, Any]], *, source: str
+) -> list[dict[str, Any]]:
+    """Re-verify every served grid row against the data its numbers came from.
+
+    A grid/matrix result is a cached artifact, and its numbers are only
+    meaningful for the data that produced them. Each cell records a grid
+    identity (config fingerprint + the fingerprint of every parquet it could
+    have read, see ``runner/grid_identity.py``); this re-stats those files, so
+    a re-downloaded or rewritten frame -- or a cell whose identity was never
+    stamped, which is equally unknowable -- is reported instead of served as
+    current.
+    """
+    findings: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # Only a row that claims a RESULT is verifiable. A failed cell carries
+        # an `output` path for an artifact that was never written, and there is
+        # nothing to be stale about; refusing the whole payload over it would
+        # turn a loud failure into an outage.
+        if str(row.get("status") or "") not in {"ok", "skipped_existing"}:
+            continue
+        output = str(row.get("output") or "").strip()
+        if not output:
+            continue
+        label = ":".join(
+            str(row.get(key) or "")
+            for key in ("strategy", "symbol", "timeframe")
+        ).strip(":")
+        artifact = Path(output)
+        if not artifact.exists():
+            findings.append(
+                {"row": label or output, "output": output, "reason": "artifact is gone"}
+            )
+            continue
+        reason = data_staleness_reason(read_identity(output))
+        if reason:
+            findings.append(
+                {"row": label or output, "output": output, "reason": reason}
+            )
+    if findings:
+        logger.warning(
+            "Refusing to serve %s: %d grid row(s) no longer match the data they "
+            "were computed from.",
+            source,
+            len(findings),
+            extra={"data": {"findings": findings[:20]}},
+        )
+    return findings
+
+
+def _refuse_stale_grid_rows(
+    rows: list[dict[str, Any]], *, source: str
+) -> None:
+    """409 on a stale grid instead of a table that looks current.
+
+    A warning would leave the trap armed: the operator still sees a Sharpe
+    ranking and no reason to doubt it. The refusal names the rows and the
+    reason so the fix ("re-run the grid") is obvious.
+    """
+    findings = _stale_grid_findings(rows, source=source)
+    if not findings:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "stale_grid_results",
+            "message": (
+                f"{source} contains grid results that no longer match the data "
+                "they were computed from; refusing to serve them as current. "
+                "Re-run the grid/matrix to refresh them."
+            ),
+            "stale_rows": findings[:50],
+            "stale_row_count": len(findings),
+        },
+    )
+
+
 def _matrix_summary_payload() -> dict[str, Any]:
     summary_path = MATRIX_RESULTS_DIR / "matrix_summary.json"
     if not summary_path.exists():
@@ -8331,6 +8411,8 @@ def _matrix_summary_payload() -> dict[str, Any]:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
+    runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
+    _refuse_stale_grid_rows(runs, source="matrix summary")
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -8361,6 +8443,8 @@ def _load_matrix_grid_overview_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix grid overview")) from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="Invalid matrix grid overview payload")
+    rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+    _refuse_stale_grid_rows(rows, source="matrix grid overview")
     payload["api_source"] = str(path)
     return payload
 

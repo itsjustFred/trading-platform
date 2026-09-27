@@ -36,15 +36,15 @@ type MetricConfig = {
 // /api/backtests/compare is NOT unit-homogeneous: total_return stays in the
 // engine's fraction, the rest are normalized to percent points (see
 // _backtest_compare_payload in viewer/main.py). Every percent row therefore
-// states its own scale, resolved from the shared contract table so the page
-// cannot drift from the payload.
+// states its own scale, resolved from the per-payload contract table so the
+// page cannot drift from the payload it reads.
 const METRICS: MetricConfig[] = [
   {
     key: "total_return",
     label: "Total Return",
     better: "higher",
     format: "percent",
-    scale: requireMetricScale("total_return"),
+    scale: requireMetricScale("backtest_compare", "total_return"),
   },
   { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },
   { key: "sharpe_ratio", label: "Sharpe (higher = better)", better: "higher", format: "number" },
@@ -53,7 +53,8 @@ const METRICS: MetricConfig[] = [
     label: "PSR (higher = better)",
     better: "higher",
     format: "percent",
-    scale: "points",
+    // This payload rescales psr by 100; the other payloads serve the fraction.
+    scale: requireMetricScale("backtest_compare", "psr"),
   },
   { key: "p_value", label: "p-Value (lower = better)", better: "lower", format: "number" },
   {
@@ -61,21 +62,21 @@ const METRICS: MetricConfig[] = [
     label: "CAGR (higher = better)",
     better: "higher",
     format: "percent",
-    scale: "points",
+    scale: requireMetricScale("backtest_compare", "cagr"),
   },
   {
     key: "max_drawdown",
     label: "Max DD (lower = better)",
     better: "lower",
     format: "percent",
-    scale: "points",
+    scale: requireMetricScale("backtest_compare", "max_drawdown"),
   },
   {
     key: "win_rate",
     label: "Win Rate (higher = better)",
     better: "higher",
     format: "percent",
-    scale: "points",
+    scale: requireMetricScale("backtest_compare", "win_rate"),
   },
   { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];

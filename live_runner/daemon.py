@@ -3192,6 +3192,43 @@ async def _enforce_stopped_deployments(
             )
             continue
 
+        # The flatten detached every protection that was attached to a closed
+        # position, and cancel_open_orders deliberately left those alone (it
+        # must never disarm a position that is still open). Sweep the orphans
+        # now that the account is flat. A failure here is a cleanliness
+        # problem, not a safety one -- the positions are already gone -- so it
+        # is reported but never blocks the deployment from being recorded as
+        # enforced; the next STOPPED transition retries it.
+        try:
+            orphaned = await adapter.cancel_orphaned_protections()
+        except NotImplementedError:
+            orphaned = None
+        except Exception as exc:
+            logger.warning(
+                "Failed to sweep protections orphaned by the flatten; the "
+                "account is flat but may still list resting protection orders",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            orphaned = None
+        if orphaned is None:
+            logger.warning(
+                "Adapter cannot identify orphaned protections; the account is "
+                "flat but protection orders may still be listed by the broker",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+
         already_enforced.add(deployment_id)
         logger.warning(
             "Enforced STOPPED deployment: orders cancelled and positions flattened",
@@ -3201,6 +3238,7 @@ async def _enforce_stopped_deployments(
                     "account_id": deployment.account_id,
                     "cancelled_orders": cancelled,
                     "closed_positions": closed,
+                    "cancelled_orphaned_protections": orphaned,
                 }
             },
         )

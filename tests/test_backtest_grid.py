@@ -444,3 +444,293 @@ def test_grid_tasks_carry_keep_indicators(tmp_path, monkeypatch):
 
     assert captured
     assert all(cell["keep_indicators"] is True for cell in captured)
+
+
+# ─── grid cell identity: a stale artifact is refused, never reused ───────────
+
+
+def _write_frame(path, *, periods: int = 5) -> None:
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=periods, freq="D", tz="UTC"),
+            "close": [float(index + 1) for index in range(periods)],
+        }
+    ).to_parquet(path, index=False)
+
+
+def _identity_fixture(tmp_path, *, periods: int = 5, stamp: bool = True):
+    """A data dir, a strategy file and a persisted cell artifact for one cell.
+
+    Returns ``(request, artifact, parquet)``. When ``stamp`` is set the artifact
+    carries the identity a real run would have written, so the reuse decision
+    has something legitimate to accept.
+    """
+    from shared.models import BacktestMeta, BacktestResult
+
+    data_dir = tmp_path / "data"
+    parquet = data_dir / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
+    _write_frame(parquet, periods=periods)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    strategy = tmp_path / "demo.py"
+    strategy.write_text("STRATEGY_META = {'name': 'demo'}\n", encoding="utf-8")
+
+    request = bg.CellRequest(
+        strategy=str(strategy),
+        symbol="AAPL",
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-01-05",
+        engine="native",
+        capital=10_000.0,
+        risk_pct=0.01,
+        params=None,
+        output_dir=output_dir,
+        data_dir=str(data_dir),
+        skip_existing=True,
+        save_sqlite=False,
+    )
+    result = BacktestResult(
+        meta=BacktestMeta(
+            id=bg.build_run_id(str(strategy), "AAPL", "1d"),
+            created_at="2024-01-06T00:00:00+00:00",
+            engine="native",
+            strategies=["demo"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-05",
+            initial_capital=10_000.0,
+            data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+        ),
+        trades=[],
+        equity_curve=[],
+        stats={},
+    )
+    if stamp:
+        identity = bg._cell_identity(request, "2024-01-01", "2024-01-05")
+        result.meta.data = {**result.meta.data, "grid_identity": identity}
+    artifact = output_dir / f"{bg.build_run_id(str(strategy), 'AAPL', '1d')}.trades.json"
+    result.save(artifact)
+    return request, artifact, parquet
+
+
+def _cell_record(request) -> dict:
+    record = bg._init_cell_result(request)
+    return record
+
+
+def test_resume_recomputes_when_the_underlying_frame_changed(tmp_path):
+    """A re-downloaded parquet is the defect this identity exists for.
+
+    Every field the artifact records -- engine, symbol, window, capital, params
+    -- is unchanged by a re-download, so the artifact metadata check passes and
+    the data fingerprint is the only thing that can catch it. Reusing here
+    reports numbers from five bars as the answer for nine.
+    """
+    request, _artifact, parquet = _identity_fixture(tmp_path)
+    # A different length, so this is not a mere mtime touch.
+    _write_frame(parquet, periods=9)
+
+    record = _cell_record(request)
+
+    assert record["status"] == "pending", (
+        "the cell must recompute: the data it was computed from no longer exists"
+    )
+
+
+def test_resume_recomputes_when_the_strategy_source_changed(tmp_path):
+    request, _artifact, _parquet = _identity_fixture(tmp_path)
+    strategy_path = bg.Path(request.strategy)
+    strategy_path.write_text(
+        "STRATEGY_META = {'name': 'demo'}\n# edited after the run\n",
+        encoding="utf-8",
+    )
+
+    assert _cell_record(request)["status"] == "pending"
+
+
+def test_resume_recomputes_when_a_risk_knob_changed(tmp_path):
+    """risk_per_trade_pct/max_leverage are not in the artifact schema.
+
+    The identity carries them, so changing one invalidates the cell instead of
+    silently returning a run sized with the old knob.
+    """
+    from dataclasses import replace
+
+    request, _artifact, _parquet = _identity_fixture(tmp_path)
+
+    assert _cell_record(replace(request, risk_pct=0.05))["status"] == "pending"
+    assert _cell_record(replace(request, max_leverage=3.0))["status"] == "pending"
+
+
+def test_resume_refuses_an_artifact_that_never_carried_an_identity(tmp_path):
+    """A legacy artifact promises nothing about what it was computed from.
+
+    Refusing it costs one recompute; serving it is how a stale artifact gets
+    reported as current.
+    """
+    request, _artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+
+    assert _cell_record(request)["status"] == "pending"
+
+
+def test_resume_reuses_an_artifact_whose_identity_still_holds(tmp_path):
+    """The gate has to accept a genuinely current cell, or --resume is useless."""
+    request, _artifact, _parquet = _identity_fixture(tmp_path)
+
+    record = _cell_record(request)
+
+    assert record["status"] == "skipped_existing"
+    assert record["grid_identity"], "a reused cell must report the identity it matched"
+
+
+def test_in_process_cell_stamps_its_identity(monkeypatch, tmp_path):
+    """A finished cell must be resumable: no stamp, no reuse next time."""
+    from shared.models import BacktestMeta, BacktestResult
+
+    request, artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+    artifact.unlink()
+    monkeypatch.setattr(bg, "require_generated_strategy_approval", lambda strategy: None)
+    monkeypatch.setattr(bg, "detect_strategy_type", lambda path: bg.StrategyType.MARKET_DATA)
+    monkeypatch.setattr(
+        bg, "resolve_strategy_parameters", lambda strategy, params: dict(params or {})
+    )
+    monkeypatch.setattr(bg, "ensure_backtest_data", lambda **kwargs: [])
+    monkeypatch.setattr(bg, "attach_daily_equity", lambda result, **kwargs: result)
+    monkeypatch.setattr(bg, "merge_canonical_stats", lambda result: None)
+
+    class FakeEngine:
+        def validate_config(self, config):
+            return []
+
+        def run(self, config, strategy):
+            return BacktestResult(
+                meta=BacktestMeta(
+                    id=bg.build_run_id(strategy, "AAPL", "1d"),
+                    created_at="2024-01-06T00:00:00+00:00",
+                    engine="native",
+                    strategies=["demo"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-01-05",
+                    initial_capital=10_000.0,
+                    data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+                ),
+                trades=[],
+                equity_curve=[],
+                stats={},
+            )
+
+    monkeypatch.setattr(bg, "get_engine", lambda engine: FakeEngine())
+
+    result = bg.run_one_backtest_in_process(request)
+
+    assert result["status"] == "ok"
+    stamped = json.loads(artifact.read_text(encoding="utf-8"))["meta"]["data"]["grid_identity"]
+    assert stamped["fingerprint"] == result["grid_identity"]
+    assert stamped["data"] is not None, "the stamp must record the data it read"
+    # The point of the stamp: the very next resume accepts it.
+    assert _cell_record(request)["status"] == "skipped_existing"
+
+
+def test_subprocess_cell_stamps_its_identity(monkeypatch, tmp_path):
+    """`runner.cli` knows nothing about grid identity, so the parent writes it.
+
+    An unstamped artifact is one the next --resume must refuse, so a cell that
+    could not be stamped is a failed cell rather than a slower one.
+    """
+    from shared.models import BacktestMeta, BacktestResult
+
+    request, artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+    artifact.unlink()
+    monkeypatch.setattr(bg, "require_generated_strategy_approval", lambda strategy: None)
+
+    def fake_run(cmd, **kwargs):
+        BacktestResult(
+            meta=BacktestMeta(
+                id="grid_demo_aapl_1d",
+                created_at="2024-01-06T00:00:00+00:00",
+                engine="native",
+                strategies=["demo"],
+                backtest_start="2024-01-01",
+                backtest_end="2024-01-05",
+                initial_capital=10_000.0,
+                data={"symbols": ["AAPL"], "timeframes": ["1d"]},
+            ),
+            trades=[],
+            equity_curve=[],
+            stats={},
+        ).save(artifact)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok")
+
+    monkeypatch.setattr(bg.subprocess, "run", fake_run)
+
+    result = run_one_backtest(
+        strategy=request.strategy,
+        symbol="AAPL",
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-01-05",
+        engine="native",
+        capital=10_000.0,
+        risk_pct=0.01,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=request.output_dir,
+        data_dir=request.data_dir,
+        timeout_seconds=10,
+        skip_existing=True,
+        use_subprocess=True,
+        save_sqlite=False,
+    )
+
+    assert result["status"] == "ok"
+    assert json.loads(artifact.read_text(encoding="utf-8"))["meta"]["data"]["grid_identity"]
+
+    assert _cell_record(request)["status"] == "skipped_existing"
+
+
+def test_subprocess_cell_that_cannot_be_stamped_is_a_failed_cell(monkeypatch, tmp_path):
+    """The subprocess exits 0 but leaves an artifact that cannot carry an identity.
+
+    Reporting that cell as finished would hand the operator numbers from a
+    result the next --resume is obliged to throw away.
+    """
+    request, artifact, _parquet = _identity_fixture(tmp_path, stamp=False)
+    monkeypatch.setattr(bg, "require_generated_strategy_approval", lambda strategy: None)
+
+    def fake_run(cmd, **kwargs):
+        artifact.write_text("{not json", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok")
+
+    monkeypatch.setattr(bg.subprocess, "run", fake_run)
+
+    result = run_one_backtest(
+        strategy=request.strategy,
+        symbol="AAPL",
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-01-05",
+        engine="native",
+        capital=10_000.0,
+        risk_pct=0.01,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params=None,
+        output_dir=request.output_dir,
+        data_dir=request.data_dir,
+        timeout_seconds=10,
+        skip_existing=True,
+        use_subprocess=True,
+        save_sqlite=False,
+    )
+
+    assert result["status"] == "failed", (
+        "an unstamped cell would be reported as a finished result that the next "
+        "resume is obliged to throw away"
+    )
+    assert "identity" in result["error"]

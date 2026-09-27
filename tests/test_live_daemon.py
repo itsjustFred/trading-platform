@@ -1374,12 +1374,16 @@ class _RecordingAdapter:
         supports_cancel: bool = True,
         supports_flat: bool = True,
         fail_cancel: bool = False,
+        orphan_sweep: int | None = 0,
     ) -> None:
         self._supports_cancel = supports_cancel
         self._supports_flat = supports_flat
         self._fail_cancel = fail_cancel
+        self._orphan_sweep = orphan_sweep
         self.cancel_calls = 0
         self.flatten_calls = 0
+        self.orphan_calls = 0
+        self.call_order: list[str] = []
 
     @property
     def supports_cancel_orders(self) -> bool:
@@ -1393,6 +1397,7 @@ class _RecordingAdapter:
         if not self._supports_cancel:
             raise NotImplementedError("no cancel support")
         self.cancel_calls += 1
+        self.call_order.append("cancel")
         if self._fail_cancel:
             raise RuntimeError("broker rejected cancel")
         return 2
@@ -1401,7 +1406,15 @@ class _RecordingAdapter:
         if not self._supports_flat:
             raise NotImplementedError("no flatten support")
         self.flatten_calls += 1
+        self.call_order.append("flatten")
         return 1
+
+    async def cancel_orphaned_protections(self) -> int:
+        self.orphan_calls += 1
+        self.call_order.append("orphan_sweep")
+        if self._orphan_sweep is None:
+            raise NotImplementedError("cannot identify orphans")
+        return self._orphan_sweep
 
 
 def _stopped_deployment(
@@ -1435,6 +1448,47 @@ def test_stopped_deployment_cancels_and_flattens_once(monkeypatch):
 
     assert adapter.cancel_calls == 1, "cancel must happen once per stop transition"
     assert adapter.flatten_calls == 1, "flatten must happen once per stop transition"
+    assert "44444444-4444-4444-8444-444444444444" in enforced
+
+
+def test_stopped_deployment_sweeps_protections_orphaned_by_the_flatten():
+    """The blanket cancel leaves a live position's stop alone, so the flatten is
+    what orphans it. Nothing else re-cancels afterwards, so the protection would
+    rest on a flat account forever unless the sweep runs -- and it must run AFTER
+    the flatten, while the position is already gone."""
+    adapter = _RecordingAdapter(orphan_sweep=3)
+    enforced: set[str] = set()
+
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+    )
+
+    assert adapter.orphan_calls == 1, (
+        "the protection detached by the flatten is never removed by any other "
+        "call, so the account keeps a resting order nobody can explain"
+    )
+    assert adapter.call_order.index("orphan_sweep") > adapter.call_order.index(
+        "flatten"
+    ), "sweeping before the flatten would only re-cancel live protections"
+    assert "44444444-4444-4444-8444-444444444444" in enforced, (
+        "an unswept orphan is a cleanliness problem, not a safety one: the "
+        "positions are already closed, so it must not block the record"
+    )
+
+
+def test_stopped_deployment_is_still_enforced_when_the_orphan_sweep_is_unsupported():
+    adapter = _RecordingAdapter(orphan_sweep=None)
+    enforced: set[str] = set()
+
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+    )
+
+    assert adapter.orphan_calls == 1
     assert "44444444-4444-4444-8444-444444444444" in enforced
 
 

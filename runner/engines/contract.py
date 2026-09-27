@@ -189,6 +189,17 @@ def apply_date_filter(
 
 
 def ohlcv_path_metadata(path: str | Path) -> dict[str, str]:
+    """Split the documented OHLCV layout into source / asset class / region.
+
+    The layout is ``ohlcv/{source}/{asset_class}/[{region}/]{symbol}/
+    {timeframe}.parquet`` (docs/DATA_SOURCES.md), so the region is the
+    *optional* third element and only exists in the five-element form. The
+    four-element form has the symbol in that slot, so requiring five elements
+    is what keeps a symbol from being reported as a region -- which mattered
+    because :func:`select_ohlcv_path` matches a requested ``data_source``
+    against every value here, so a mislabelled region let a symbol string
+    select data.
+    """
     resolved = Path(path)
     parts = list(resolved.parts)
     try:
@@ -200,7 +211,9 @@ def ohlcv_path_metadata(path: str | Path) -> dict[str, str]:
     tail = parts[root_index + 1 :]
     source = tail[0].lower() if len(tail) >= 1 else ""
     asset_class = tail[1].lower() if len(tail) >= 2 else ""
-    region = tail[2].lower() if len(tail) >= 4 else ""
+    # 5 = source/asset_class/region/symbol/timeframe.parquet. Anything shorter
+    # has no region, and tail[2] is the symbol or the timeframe file itself.
+    region = tail[2].lower() if len(tail) >= 5 else ""
     return {"source": source, "asset_class": asset_class, "region": region}
 
 

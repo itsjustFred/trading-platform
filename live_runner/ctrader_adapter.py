@@ -2242,24 +2242,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             open_positions.append(position)
         return open_positions
 
-    async def cancel_open_orders(self) -> int:
-        """Cancel every working order for this cTrader account.
+    async def _reconcile_state(self) -> Any:
+        """Return the current account state (orders + positions) from one call.
 
-        Used by the STOPPED path so a resting entry cannot fire after an
-        operator asked to stop. Orders that are already filled or cancelled are
-        skipped; only cancellable ones are counted.
+        Reconcile, not OrderList. OrderList is a historical query bounded by
+        from/toTimestamp; 0/0 does not mean "now", so it can answer with
+        nothing (and a cancel that finds nothing reports success while leaving
+        the order resting) or with unrelated history. Reconcile takes no time
+        bounds and is by definition current state, which is the same call
+        _fetch_open_positions already makes for positions.
+
+        Shared by the blanket cancel and the orphan sweep so both see one
+        consistent snapshot: a sweep that read positions and orders from two
+        different snapshots could cancel a protection for a position that had
+        just been closed *and* re-opened.
         """
         self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
         self._raise_if_terminal_auth_failed()
 
-        # Reconcile, not OrderList. OrderList is a historical query bounded by
-        # from/toTimestamp; 0/0 does not mean "now", so it can answer with
-        # nothing (and a cancel that finds nothing reports success while leaving
-        # the order resting) or with unrelated history. Reconcile takes no time
-        # bounds and is by definition current state, which is the same call
-        # _fetch_open_positions already makes for positions.
         reconcile_req = self._ProtoOAReconcileReq()
         reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
         try:
@@ -2273,7 +2275,66 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 f"Unexpected reconcile response: {type(reconcile_res).__name__}"
             )
-        order_list_res = reconcile_res
+        return reconcile_res
+
+    def _is_working_order(self, order: Any) -> bool:
+        """Whether an order is still ACCEPTED, i.e. a cancel would be legal.
+
+        A filled or already-cancelled order must not be sent for cancellation:
+        cTrader rejects it, and because that rejection propagates it would
+        abort the loop and leave the *other* orders resting. Only ACCEPTED
+        orders are working; anything else is already terminal.
+
+        If the status enum is unavailable we cannot tell, and for an order we
+        are about to cancel the unsafe direction is leaving it resting, so the
+        caller cancels on type alone.
+        """
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        if status_enum is None:
+            return True
+        working_statuses = {int(status_enum.ORDER_STATUS_ACCEPTED)}
+        # Newer protos expose `orderStatus`; older ones only `status`.
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            return True
+        try:
+            return int(raw_status) in working_statuses
+        except (TypeError, ValueError):
+            return False
+
+    async def _cancel_order_id(self, order_id: int) -> None:
+        """Send one cancel for a validated positive order id."""
+        cancel_req = self._ProtoOACancelOrderReq()
+        cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
+        cancel_req.orderId = order_id
+        try:
+            await self._send_request_with_refresh_retry(
+                cancel_req, timeout_seconds=10
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+
+    async def cancel_open_orders(self) -> int:
+        """Cancel every working *detached* order for this cTrader account.
+
+        Used by the STOPPED path so a resting entry cannot fire after an
+        operator asked to stop. Orders that are already filled or cancelled are
+        skipped; only cancellable ones are counted.
+
+        STOP_LOSS_TAKE_PROFIT is deliberately NOT cancellable here. That order
+        type is not a resting entry: it is the stop and target *attached to an
+        open position*, and cancelling it leaves that position with no stop and
+        no target. A blanket cancel runs on accounts that hold positions this
+        control is not about to close, and it runs before the flatten, so the
+        naked-position window is not a formality: if the flatten then fails the
+        position survives with every risk control removed and the deployment is
+        merely logged as not-flattened. Protections that outlive their position
+        are removed by :meth:`cancel_orphaned_protections` instead.
+        """
+        reconcile_res = await self._reconcile_state()
 
         # Market and market-range orders fill immediately and cannot be
         # cancelled; everything else can still be resting.
@@ -2281,35 +2342,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._ProtoOAOrderType.LIMIT,
             self._ProtoOAOrderType.STOP,
             self._ProtoOAOrderType.STOP_LIMIT,
-            self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT,
         }
-        # A filled or already-cancelled order must not be sent for cancellation:
-        # cTrader rejects it, and because that rejection propagates it would
-        # abort the loop and leave the *other* orders resting. Only ACCEPTED
-        # orders are working; anything else is already terminal.
-        #
-        # If the status enum is unavailable we cannot tell, and the unsafe
-        # direction is leaving an order resting, so we cancel on type alone.
-        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
-        working_statuses: set[int] | None = None
-        if status_enum is not None:
-            working_statuses = {int(status_enum.ORDER_STATUS_ACCEPTED)}
         cancelled = 0
         # ProtoOAOrderListRes names the repeated field `order`, not `orders`.
-        for order in getattr(order_list_res, "order", []) or []:
+        for order in getattr(reconcile_res, "order", []) or []:
             order_type = int(getattr(order, "orderType", 0) or 0)
             if order_type not in cancellable:
                 continue
-            # Newer protos expose `orderStatus`; older ones only `status`.
-            raw_status = getattr(order, "orderStatus", None)
-            if raw_status is None:
-                raw_status = getattr(order, "status", None)
-            if working_statuses is not None and raw_status is not None:
-                try:
-                    if int(raw_status) not in working_statuses:
-                        continue
-                except (TypeError, ValueError):
-                    continue
+            if not self._is_working_order(order):
+                continue
             # orderId is a protobuf int64: assigning the string form raises
             # TypeError on the wire, so coerce and skip anything unparseable.
             try:
@@ -2318,16 +2359,66 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 continue
             if order_id <= 0:
                 continue
-            cancel_req = self._ProtoOACancelOrderReq()
-            cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
-            cancel_req.orderId = order_id
+            await self._cancel_order_id(order_id)
+            cancelled += 1
+        return cancelled
+
+    async def cancel_orphaned_protections(self) -> int:
+        """Cancel attached SL/TP orders whose position no longer exists.
+
+        :meth:`cancel_open_orders` never disarms a live position, so closing a
+        position leaves its protection behind: the order can no longer fill, it
+        holds one of the account's order slots, and it makes a flattened
+        account look like it still has something resting. This removes exactly
+        those and nothing else:
+
+        - the order type must be STOP_LOSS_TAKE_PROFIT (no other type is
+          attached to a position);
+        - its ``positionId`` must be a positive integer that is *absent* from
+          the open-position set of the same snapshot. An unset or unreadable
+          ``positionId`` is left alone: "I cannot tell which position this
+          belongs to" must never resolve to "cancel the stop on a position that
+          is still open";
+        - it must be ACCEPTED, exactly like the blanket cancel.
+
+        Anything unreadable raises, so the caller learns the account was not
+        swept instead of being told a clean zero.
+        """
+        reconcile_res = await self._reconcile_state()
+        open_position_ids: set[int] = set()
+        for position in getattr(reconcile_res, "position", []) or []:
+            status = int(getattr(position, "positionStatus", 0) or 0)
+            if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                continue
             try:
-                await self._send_request_with_refresh_retry(
-                    cancel_req, timeout_seconds=10
-                )
-            except CTraderApiError as exc:
-                self._raise_terminal_auth_from_api_error(exc)
-                raise
+                position_id = int(getattr(position, "positionId", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if position_id > 0:
+                open_position_ids.add(position_id)
+
+        cancelled = 0
+        for order in getattr(reconcile_res, "order", []) or []:
+            if int(getattr(order, "orderType", 0) or 0) != (
+                self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT
+            ):
+                continue
+            try:
+                position_id = int(getattr(order, "positionId", 0) or 0)
+            except (TypeError, ValueError):
+                # Unknown attachment: skip rather than guess.
+                continue
+            if position_id <= 0 or position_id in open_position_ids:
+                continue
+            if not self._is_working_order(order):
+                continue
+            try:
+                order_id = int(getattr(order, "orderId", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if order_id <= 0:
+                continue
+            await self._cancel_order_id(order_id)
             cancelled += 1
         return cancelled
 

@@ -10,6 +10,7 @@ import {
   resolveCompatibleInSampleValue,
 } from "../lib/optimizationEvidence";
 import { stringifyUnknownValue } from "../lib/unknownValue";
+import { toPercentPointsForKey } from "../api/metricScale";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -36,7 +37,9 @@ function formatComparisonValue(
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   }
   if (["cagr", "win_rate", "max_drawdown_pct"].includes(key)) {
-    return `${(value * 100).toFixed(2)}%`;
+    return `${(
+      toPercentPointsForKey("optimization_panel_stats", key as "cagr", value) ?? 0
+    ).toFixed(2)}%`;
   }
   if (key === "total_trades") {
     return value.toFixed(0);
