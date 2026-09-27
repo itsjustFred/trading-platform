@@ -765,6 +765,13 @@ def test_spellings_pinned_against_one_shared_table():
     # Both adapters expose the SAME table object (no private copies).
     assert native_module.ONE_LOWER_SPELLINGS is contract.ONE_LOWER_SPELLINGS
     assert native_module.TIMEFRAME_ORDER is contract.TIMEFRAME_ORDER
+    # The vectorbt adapter is the one that used to keep a private literal copy of
+    # TIMEFRAME_ORDER, and this test imported it without ever asserting on it, so
+    # the divergence was invisible. Identity, not equality: a private copy with
+    # the same values would pass an == check and still drift later.
+    assert vbt_module.TIMEFRAME_ORDER is contract.TIMEFRAME_ORDER
+    assert vbt_module._normalize_intrabar_resolution("m1") == contract.normalize_intrabar_resolution("m1")
+    assert vbt_module._resolve_intrabar_timeframe("1h", "m1") == contract.resolve_intrabar_timeframe("1h", "m1")
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
     cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
