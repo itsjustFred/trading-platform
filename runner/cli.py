@@ -31,6 +31,14 @@ from runner.daily_equity import attach_daily_equity
 from runner.engines import contract
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.stats import merge_canonical_stats
+from runner.universe_provenance import (
+    DEFAULT_UNIVERSE_PROVIDER,
+    MEMBERSHIP_CURRENT,
+    MEMBERSHIP_POINT_IN_TIME,
+    MEMBERSHIP_UNDECLARED,
+    UNIVERSE_PROVENANCE_KEY,
+    universe_provenance,
+)
 from runner.walkforward import run_walkforward
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -174,6 +182,21 @@ def _detect_date_range(
     return detected_start, detected_end
 
 
+def _declared_membership_basis(args) -> str:
+    """The membership basis the operator declared for this run's symbol list.
+
+    The default is deliberately ``undeclared``: a symbol list resolved at run
+    time says nothing about when its membership was determined, and recording
+    that as ``point_in_time`` (or as ``current``) would assert a fact nobody
+    made. Declaring either basis is an operator statement, and the flags make
+    it explicit.
+    """
+    declared = str(getattr(args, "universe_membership", "") or "").strip().lower()
+    if declared:
+        return declared
+    return MEMBERSHIP_UNDECLARED
+
+
 def cmd_run(args):
     """Run a backtest."""
     strategy_type = _resolve_strategy_type(args.strategy)
@@ -305,6 +328,24 @@ def cmd_run(args):
         "initial_capital": float(config.initial_capital),
         "risk_config": dict(result.meta.data["risk_config"]),
     }
+    # Universe provenance (#70): who decided the symbol list, and when. The
+    # artifact records the membership fact even when nobody declared one, so a
+    # reader can tell "current list" from "point-in-time list" from "unknown"
+    # instead of having to assume the best case. The disclosure is logged too —
+    # a run that cannot rule out survivorship bias should say so out loud.
+    provenance = universe_provenance(
+        symbols=list(config.symbols),
+        provider=str(getattr(args, "universe_source", "") or "").strip()
+        or DEFAULT_UNIVERSE_PROVIDER,
+        as_of=str(getattr(args, "universe_as_of", "") or "").strip() or None,
+        membership=_declared_membership_basis(args),
+        point_in_time_source=str(getattr(args, "universe_source_name", "") or "").strip(),
+        resolved_at=datetime.now(timezone.utc),
+        window_start=start,
+        window_end=end,
+    )
+    result.meta.data[UNIVERSE_PROVENANCE_KEY] = provenance
+    logger.info("Universe provenance: %s", provenance["disclosure"])
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)
@@ -594,6 +635,42 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help=HELP_OVERRIDE_DATA_DIR)
     run_p.add_argument("--data-source", default="", help="Preferred provider or asset class")
+    # Universe provenance (#70). Nothing here changes what is traded; the flags
+    # exist so the artifact can state HOW the symbol list was determined and
+    # WHEN its membership was fixed, which is what a survivorship-bias claim
+    # rests on.
+    run_p.add_argument(
+        "--universe-source",
+        default="",
+        help=(
+            "Where the symbol list came from (e.g. 'sp500-constituents-2026-09'). "
+            "Recorded on the artifact as universe provenance; defaults to the "
+            f"run's own --symbols argument ({DEFAULT_UNIVERSE_PROVIDER!r})"
+        ),
+    )
+    run_p.add_argument(
+        "--universe-as-of",
+        default="",
+        help="Date the symbol list's membership was determined (YYYY-MM-DD)",
+    )
+    run_p.add_argument(
+        "--universe-membership",
+        default="",
+        choices=["", MEMBERSHIP_UNDECLARED, MEMBERSHIP_CURRENT, MEMBERSHIP_POINT_IN_TIME],
+        help=(
+            "Declare whether the symbol list is a current membership snapshot or "
+            "a point-in-time one. Undeclared is recorded as unknown, not as "
+            "point-in-time"
+        ),
+    )
+    run_p.add_argument(
+        "--universe-source-name",
+        default="",
+        help=(
+            "Name of the point-in-time membership source behind --symbols "
+            "(required to claim --universe-membership point_in_time)"
+        ),
+    )
     run_p.add_argument(
         "--keep-indicators",
         action="store_true",

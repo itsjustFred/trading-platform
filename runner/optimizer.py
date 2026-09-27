@@ -21,6 +21,13 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
+from runner.universe_provenance import (
+    UNIVERSE_PROVENANCE_KEY,
+    observe_symbol_coverage,
+    read_universe_provenance,
+    survivorship_bias_diagnostic,
+    unknown_universe_provenance,
+)
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 from shared.database import load_backtest_result
@@ -519,6 +526,14 @@ def run_optimization(
     base_parameters = dict(base_result.meta.parameters or {})
     execution_context = _execution_context_from_result(base_result)
     context_fingerprint = _context_fingerprint(execution_context, strategy_path)
+    # Universe provenance: how this run's symbol list was determined, and when.
+    # A base artifact that predates the recording is reported as unknown rather
+    # than assumed point-in-time — the whole point of the field is that a reader
+    # can tell "we know" from "nobody said".
+    universe_provenance = read_universe_provenance(base_result.meta) or unknown_universe_provenance(
+        f"base backtest {config.base_backtest_id!r} carries no "
+        f"{UNIVERSE_PROVENANCE_KEY!r} record"
+    )
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -589,6 +604,18 @@ def run_optimization(
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
+    # Sub-periods of the train window, for the per-period stability view, and
+    # the per-symbol data coverage the survivorship diagnostic reports on. Both
+    # are read AFTER the data has been ensured, so what they see is the data
+    # this study actually trades.
+    stability_subperiods = _stability_subperiods(train_period, config, timeframe)
+    universe_coverage = observe_symbol_coverage(
+        required_symbols,
+        timeframe=timeframe,
+        data_dir=data_dir,
+        data_source=str(execution_context.get("data_source") or ""),
+    )
+
     last_trial_exception: BaseException | None = None
 
     def _record_failure(trial: optuna.Trial, exc: BaseException) -> NoReturn:
@@ -636,6 +663,10 @@ def run_optimization(
         trial.set_user_attr("symbols", _json_safe(trial_symbols))
         trial.set_user_attr("execution_context_fingerprint", context_fingerprint)
         trial.set_user_attr("trade_count", len(train_result.trades))
+        trial.set_user_attr(
+            SUBPERIOD_PNL_ATTR,
+            _json_safe(_trial_subperiod_pnl(train_result, stability_subperiods)),
+        )
 
         if not train_result.trades:
             # No-trade trials (Cleanup 16-D1, AC 2): a trial that never trades
@@ -807,6 +838,7 @@ def run_optimization(
         "base_parameters": _json_safe(base_parameters),
         "execution_context": _json_safe(execution_context),
         "execution_context_fingerprint": context_fingerprint,
+        "universe_provenance": _json_safe(universe_provenance),
         "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
@@ -837,6 +869,13 @@ def run_optimization(
                 test_period=test_period,
                 target_metric=config.target_metric,
                 timeframe=str(execution_context.get("timeframe") or "") or None,
+                symbols=required_symbols,
+                universe_provenance=universe_provenance,
+                universe_coverage=universe_coverage,
+                subperiods=stability_subperiods,
+                selected_parameters=best_params,
+                backtest_start=backtest_start,
+                backtest_end=backtest_end,
             )
         ),
     }
@@ -921,6 +960,94 @@ def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
     return pd.Timedelta(seconds=seconds)
 
 
+#: Optuna user attr holding each trial's realized result per stability
+#: sub-period. A dedicated attr (rather than a derived field of train_stats)
+#: because the sub-period split is a reporting decision: it must not change what
+#: the study optimises, only what can be said about the choice afterwards.
+SUBPERIOD_PNL_ATTR = "subperiod_pnl"
+
+
+def _stability_subperiods(
+    train_period: Mapping[str, str],
+    config: OptimizationConfig,
+    timeframe: str | None,
+) -> list[dict[str, Any]]:
+    """The sub-periods a parameter's stability is measured over.
+
+    Taken from the walk-forward folds of the TRAIN window — the window the
+    trials were actually scored on — so the comparison is like-for-like. The
+    reported walk-forward folds cover train+test, so the sub-periods here are
+    deliberately a different, narrower set; both are reported, and each carries
+    its own bounds.
+
+    Returns [] when the window is too short for a fold. That is a reportable
+    absence, not a failure: the stability view then says "unknown".
+    """
+    from runner.optimization_diagnostics import (
+        subperiods_from_walk_forward,
+        walk_forward_splits,
+    )
+
+    try:
+        folds = walk_forward_splits(
+            train_period["start"],
+            train_period["end"],
+            n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
+            train_fraction=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=_timeframe_bar_duration(timeframe),
+        )
+        return subperiods_from_walk_forward(folds)
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.info("No stability sub-periods available: %s", exc)
+        return []
+
+
+def _trade_realization_time(trade: Any) -> str:
+    """When a trade's result was realized: its last exit, else its entry.
+
+    Attribution follows the exit, not the entry: a sub-period must be charged
+    with the result it actually produced, and a trade opened in one sub-period
+    and closed in the next belongs to the second.
+    """
+    exits = list(getattr(trade, "exits", None) or [])
+    for exit_ in reversed(exits):
+        stamp = str(getattr(exit_, "time", "") or "").strip()
+        if stamp:
+            return stamp
+    return str(getattr(trade, "entry_time", "") or "").strip()
+
+
+def _trade_net_pnl(trade: Any) -> float:
+    """Net PnL of a trade, using the same gross-minus-fees convention as the CLI.
+
+    An unreadable PnL becomes NaN rather than 0.0: 0.0 would be charged to a
+    sub-period as a real result, while NaN is dropped by the attribution, so an
+    unreadable number cannot quietly become a flat performance.
+    """
+    net_pnl = getattr(trade, "net_pnl", None)
+    try:
+        if net_pnl is not None:
+            return float(net_pnl)
+        pnl = float(getattr(trade, "pnl", 0.0) or 0.0)
+        fees = getattr(trade, "fees", None)
+        return pnl - (float(fees) if fees is not None else 0.0)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]]) -> dict[str, float]:
+    """Realized net PnL of one trial, per stability sub-period."""
+    if not subperiods:
+        return {}
+    from runner.optimization_diagnostics import realized_pnl_by_subperiod
+
+    return realized_pnl_by_subperiod(
+        ((_trade_realization_time(trade), _trade_net_pnl(trade)) for trade in result.trades),
+        subperiods,
+    )
+
+
 def _build_diagnostics_payload(
     *,
     trials: Sequence[Any],
@@ -929,18 +1056,32 @@ def _build_diagnostics_payload(
     test_period: Mapping[str, str],
     target_metric: str,
     timeframe: str | None = None,
+    symbols: Sequence[str] | None = None,
+    universe_provenance: Mapping[str, Any] | None = None,
+    universe_coverage: Mapping[str, Any] | None = None,
+    subperiods: Sequence[Mapping[str, Any]] | None = None,
+    selected_parameters: Mapping[str, Any] | None = None,
+    backtest_start: str = "",
+    backtest_end: str = "",
 ) -> dict[str, Any]:
     """Attach honesty checks to the optimization result.
 
     Reports how much the selected parameter should be trusted: whether the
     optimum sits on a stable plateau, how much of the score is explained by
-    picking the best of many trials, and what the split/embargo actually was.
-    Never changes the selection; only annotates it.
+    picking the best of many trials, what the split/embargo actually was, and —
+    because a universe that is not point-in-time makes all of the above read
+    better than it should — what the symbol universe was and how far its
+    membership can be trusted. Never changes the selection; only annotates it.
+
+    The universe arguments are optional so a caller with no coverage
+    information still gets a payload that says so (the survivorship view
+    reports "unknown" rather than silently disappearing).
     """
     from runner.optimization_diagnostics import (
         embargo_split,
         multiple_testing_correction,
         plateau_analysis,
+        subperiod_parameter_stability,
         walk_forward_splits,
     )
 
@@ -989,6 +1130,7 @@ def _build_diagnostics_payload(
     #    as the plateau axis, and a row carrying nothing but internal params is
     #    not a trial at all.
     trial_rows: list[dict[str, Any]] = []
+    stability_rows: list[dict[str, Any]] = []
     excluded_no_trade_trials = 0
     for trial in trials or []:
         if bool(getattr(trial, "user_attrs", {}).get("penalty_applied", False)):
@@ -1007,6 +1149,12 @@ def _build_diagnostics_payload(
             continue
         row["metric"] = value
         trial_rows.append(row)
+        # Same row filter for the stability view: a no-trade trial's realized
+        # PnL is a flat 0.0 in every sub-period, and including it would let a
+        # parameter value that never traded "win" a sub-period.
+        subperiod_pnl = getattr(trial, "user_attrs", {}).get(SUBPERIOD_PNL_ATTR)
+        if isinstance(subperiod_pnl, dict) and subperiod_pnl:
+            stability_rows.append({"params": row, "subperiod_pnl": subperiod_pnl})
 
     # A plateau is only meaningful along a parameter that actually varied.
     varied: dict[str, set[Any]] = {}
@@ -1016,10 +1164,12 @@ def _build_diagnostics_payload(
                 continue
             varied.setdefault(key, set()).add(value)
     candidates = [name for name, values in varied.items() if len(values) > 1]
-    if candidates:
-        # Pick the parameter explored most broadly: that is where a plateau (or
-        # its absence) says the most about robustness.
-        parameter = max(candidates, key=lambda name: len(varied[name]))
+    # Pick the parameter explored most broadly: that is where a plateau (or its
+    # absence) says the most about robustness — and the same axis the sub-period
+    # stability view ranks on, so the two views cannot disagree about which
+    # parameter they are talking about.
+    parameter = max(candidates, key=lambda name: len(varied[name])) if candidates else None
+    if parameter is not None:
         plateau = plateau_analysis(trial_rows, parameter=parameter, metric="metric")
         payload["plateau"] = (
             {"parameter": parameter, **plateau.as_dict()} if plateau else None
@@ -1042,6 +1192,41 @@ def _build_diagnostics_payload(
     # Never let the sample shrink silently: a reader has to be able to see that
     # the reported statistics describe fewer rows than the study ran.
     payload["n_no_trade_trials_excluded"] = excluded_no_trade_trials
+
+    # 4. Survivorship bias: what the stored data says about a universe that
+    #    may not be point-in-time, and the direction/magnitude of the bias.
+    payload["survivorship"] = survivorship_bias_diagnostic(
+        symbols=list(symbols or []),
+        coverage=universe_coverage,
+        window_start=backtest_start or train_period.get("start", ""),
+        window_end=backtest_end or test_period.get("end", ""),
+        provenance=universe_provenance,
+    )
+
+    # 5. Per-sub-period parameter stability: does the value that won the study
+    #    also win in each sub-period of the window it was scored on? Reported
+    #    against the same axis as the plateau, and "unknown" (never a guess)
+    #    when no trial carries sub-period results.
+    if parameter is not None and stability_rows:
+        observations = [
+            {"period": period, "params": row["params"], "metric": period_pnl}
+            for row in stability_rows
+            for period, period_pnl in row["subperiod_pnl"].items()
+        ]
+        payload["subperiod_stability"] = subperiod_parameter_stability(
+            observations,
+            parameter=parameter,
+            metric_name="realized_net_pnl_per_subperiod",
+            selected_parameters=selected_parameters,
+            subperiods=list(subperiods or []),
+        )
+    else:
+        payload["subperiod_stability"] = subperiod_parameter_stability(
+            [],
+            parameter=parameter or "",
+            metric_name="realized_net_pnl_per_subperiod",
+            subperiods=list(subperiods or []),
+        )
     payload["target_metric"] = target_metric
     return payload
 
@@ -1299,6 +1484,16 @@ def _run_risk_parity_covariance_optimization(
 ) -> dict[str, Any]:
     base_runtime = base_runtime or _runtime_config_from_base_result(base_result)
     _emit_progress(progress_callback, 5.0, "Loading asset return history for risk parity.")
+    risk_parity_data_dir = str(
+        execution_context.get("data_dir") or base_result.meta.data.get("data_dir") or ""
+    )
+    # Universe provenance and the survivorship read apply to this mode too: it
+    # *chooses* a subset of the recorded universe, so a list that is not
+    # point-in-time biases the selection itself, not just the performance.
+    universe_provenance = read_universe_provenance(base_result.meta) or unknown_universe_provenance(
+        f"base backtest {base_result.meta.id!r} carries no "
+        f"{UNIVERSE_PROVENANCE_KEY!r} record"
+    )
     # Covariance input precedence (Cleanup 16-D1, F30): risk-parity weights
     # express ASSET co-movement, so the returns frame must come from market
     # data (asset prices). The trade-PnL pseudo-equity frame measures
@@ -1310,9 +1505,7 @@ def _run_risk_parity_covariance_optimization(
         timeframe=timeframe,
         start=train_period["start"],
         end=train_period["end"],
-        data_dir=str(
-            execution_context.get("data_dir") or base_result.meta.data.get("data_dir") or ""
-        ),
+        data_dir=risk_parity_data_dir,
     )
     if returns_frame.empty or len(returns_frame.columns) < 2:
         returns_frame = _asset_returns_frame_from_base_result(base_result)
@@ -1320,6 +1513,27 @@ def _run_risk_parity_covariance_optimization(
         raise ValueError(
             "Risk parity covariance optimization requires at least two asset return series"
         )
+
+    # Read AFTER the market data has been ensured, so the coverage below is the
+    # data this selection was actually made on.
+    survivorship = survivorship_bias_diagnostic(
+        symbols=list(
+            dict.fromkeys(
+                symbol
+                for universe in [symbols, *candidate_universes]
+                for symbol in universe
+            )
+        ),
+        coverage=observe_symbol_coverage(
+            symbols,
+            timeframe=timeframe,
+            data_dir=risk_parity_data_dir,
+            data_source=str(execution_context.get("data_source") or ""),
+        ),
+        window_start=train_period["start"],
+        window_end=test_period["end"],
+        provenance=universe_provenance,
+    )
 
     _emit_progress(progress_callback, 35.0, "Solving covariance risk parity weights.")
     selection = select_best_risk_parity_universe(
@@ -1378,6 +1592,7 @@ def _run_risk_parity_covariance_optimization(
         "base_parameters": _json_safe(base_parameters),
         "execution_context": _json_safe(execution_context),
         "execution_context_fingerprint": context_fingerprint,
+        "universe_provenance": _json_safe(universe_provenance),
         "data_files": _json_safe(base_result.meta.data.get("data_files") or []),
         "best_params": {},
         "effective_best_parameters": _json_safe(effective_best_params),
@@ -1394,6 +1609,7 @@ def _run_risk_parity_covariance_optimization(
         "test_stats": _json_safe(test_stats),
         "oos_status": "available",
         "risk_parity": _json_safe(selection),
+        "survivorship": _json_safe(survivorship),
         "top_trials": [],
     }
 

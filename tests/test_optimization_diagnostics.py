@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 import pytest
 
@@ -9,6 +11,9 @@ from runner.optimization_diagnostics import (
     embargo_split,
     multiple_testing_correction,
     plateau_analysis,
+    realized_pnl_by_subperiod,
+    subperiod_parameter_stability,
+    subperiods_from_walk_forward,
     walk_forward_splits,
 )
 
@@ -495,3 +500,357 @@ def test_all_no_trade_trials_leave_the_statistics_empty_not_wrong():
     assert payload["multiple_testing"]["n_trials"] == 0
     assert payload["multiple_testing"]["survives_selection_bias"] is None
     assert payload["n_no_trade_trials_excluded"] == 3
+
+
+# ─── per-sub-period parameter stability ──────────────────────────────────────
+
+
+def _observation(period: str, value: int, metric: float) -> dict:
+    return {"period": period, "params": {"window": value}, "metric": metric}
+
+
+def test_subperiods_are_the_walk_forward_test_windows():
+    """The stability view reuses the folds already reported next to it, so the
+    two can never describe different slices of the window."""
+    folds = walk_forward_splits(
+        "2024-01-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+        n_splits=3,
+        train_fraction=0.7,
+    )
+
+    subperiods = subperiods_from_walk_forward(folds)
+
+    assert [subperiod["label"] for subperiod in subperiods] == ["fold_0", "fold_1", "fold_2"]
+    for subperiod, fold in zip(subperiods, folds):
+        assert subperiod["start"] == fold["test"]["start"]
+        assert subperiod["end"] == fold["test"]["end"]
+        assert subperiod["fold"] == fold["fold"]
+
+
+def test_subperiods_reject_a_fold_without_a_test_window():
+    """Silently dropping a fold would shorten the measured coverage while still
+    reporting a confident result."""
+    with pytest.raises(ValueError, match="no test window"):
+        subperiods_from_walk_forward([{"fold": 0}])
+    with pytest.raises(ValueError, match="not a mapping"):
+        subperiods_from_walk_forward(["fold_0"])
+
+
+def test_realized_pnl_is_attributed_to_the_subperiod_that_produced_it():
+    """A trade opened in one sub-period and closed in the next belongs to the
+    second: the result is what the period actually produced."""
+    subperiods = [
+        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
+        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+    ]
+
+    realized = realized_pnl_by_subperiod(
+        [
+            ("2024-01-05T00:00:00+00:00", 100.0),   # in fold_0
+            ("2024-02-10T00:00:00+00:00", -40.0),  # in fold_1
+            ("2024-01-06T00:00:00+00:00", 5.0),    # also in fold_0
+            ("2024-06-01T00:00:00+00:00", 999.0),  # outside every sub-period
+            ("not-a-date", 777.0),                 # unreadable
+            ("2024-02-10T00:00:00+00:00", float("nan")),
+        ],
+        subperiods,
+    )
+
+    assert realized == {"fold_0": 105.0, "fold_1": -40.0}
+
+
+def test_realized_pnl_reports_every_subperiod_even_with_no_events():
+    """"Nothing was realized here" and "this sub-period was never measured"
+    must not look the same to a reader."""
+    subperiods = [
+        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-02-01T00:00:00+00:00"},
+        {"label": "fold_1", "start": "2024-02-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+    ]
+
+    assert realized_pnl_by_subperiod([], subperiods) == {"fold_0": 0.0, "fold_1": 0.0}
+
+
+def test_realized_pnl_is_never_counted_twice_when_subperiods_overlap():
+    """Overlapping windows are a caller's choice, and one result cannot inflate
+    two periods: it is attributed to the first period that contains it."""
+    subperiods = [
+        {"label": "wide", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        {"label": "narrow", "start": "2024-02-01T00:00:00+00:00", "end": "2024-02-15T00:00:00+00:00"},
+    ]
+
+    realized = realized_pnl_by_subperiod(
+        [("2024-02-05T00:00:00+00:00", 100.0), ("2024-01-10T00:00:00+00:00", 7.0)],
+        subperiods,
+    )
+
+    # The 100.0 event falls inside both windows and is charged once, to the
+    # first; the 7.0 event belongs to "wide" alone.
+    assert realized == {"wide": 107.0, "narrow": 0.0}
+
+
+def test_the_winning_parameter_that_also_wins_every_subperiod_is_stable():
+    observations = [
+        _observation("fold_0", 3, 100.0),
+        _observation("fold_0", 2, 50.0),
+        _observation("fold_1", 3, 80.0),
+        _observation("fold_1", 2, 10.0),
+        _observation("fold_2", 3, 60.0),
+        _observation("fold_2", 2, 20.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=3, metric_name="realized_net_pnl"
+    )
+
+    assert result["status"] == "ok"
+    assert result["selected_value"] == 3
+    assert result["selected_wins_n_periods"] == 3
+    assert result["selected_win_rate"] == pytest.approx(1.0)
+    assert result["selected_mean_rank"] == pytest.approx(1.0)
+    assert result["distinct_period_winners"] == 1
+    assert result["winner_agreement"] == "stable"
+    assert [row["period"] for row in result["per_period"]] == ["fold_0", "fold_1", "fold_2"]
+
+
+def test_a_winner_that_only_wins_the_first_half_is_reported_unstable():
+    """The case a current-membership universe produces: the parameters that
+    win early do not win later, because the membership behind them changed."""
+    observations = [
+        _observation("fold_0", 3, 100.0),
+        _observation("fold_0", 2, 50.0),
+        _observation("fold_1", 3, 10.0),
+        _observation("fold_1", 2, 80.0),
+        _observation("fold_2", 3, 5.0),
+        _observation("fold_2", 2, 90.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=3, metric_name="realized_net_pnl"
+    )
+
+    assert result["winner_agreement"] == "unstable"
+    assert result["selected_wins_n_periods"] == 1
+    assert result["selected_win_rate"] == pytest.approx(1 / 3, abs=1e-3)
+    assert result["selected_worst_rank"] == 2
+    assert result["distinct_period_winners"] == 2
+    by_value = {row["value"]: row for row in result["per_parameter_value"]}
+    assert by_value[3]["best_in_n_periods"] == 1
+    assert by_value[2]["best_in_n_periods"] == 2
+
+
+def test_subperiod_ranking_uses_the_mean_so_sampling_count_cannot_win():
+    """A value sampled four times must not beat one sampled once on the mean,
+    and the per-value detail must expose the imbalance."""
+    observations = [
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_0", 2, 4.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=3, metric_name="realized_net_pnl"
+    )
+
+    assert result["per_period"][0]["best_metric"] == pytest.approx(10.0)
+    assert result["per_period"][0]["best_value"] == 3
+    by_value = {row["value"]: row for row in result["per_parameter_value"]}
+    assert by_value[3]["periods_observed"] == 1
+    assert by_value[3]["mean_metric"] == pytest.approx(10.0)
+
+
+def test_stability_reports_unknown_when_a_subperiod_never_sampled_the_winner():
+    """A rank for a sub-period in which the selected value never ran would be
+    invented, so the sub-period is reported as unobserved and the win rate is
+    computed over the sub-periods that can speak."""
+    observations = [
+        _observation("fold_0", 3, 100.0),
+        _observation("fold_0", 2, 50.0),
+        _observation("fold_1", 2, 80.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=3, metric_name="realized_net_pnl"
+    )
+
+    assert result["n_periods"] == 2
+    assert result["n_periods_selected_observed"] == 1
+    unobserved = [row for row in result["per_period"] if not row["selected_observed"]]
+    assert len(unobserved) == 1
+    assert unobserved[0]["selected_metric"] is None
+    assert unobserved[0]["selected_rank"] is None
+    assert result["selected_win_rate"] == pytest.approx(1.0)
+    assert "selected_value_rank_in_every_subperiod" in result["undefined_metrics"]
+
+
+def test_stability_without_observations_is_unknown_not_a_pass():
+    result = subperiod_parameter_stability(
+        [], parameter="window", metric_name="realized_net_pnl"
+    )
+
+    assert result["status"] == "unknown"
+    assert result["selected_win_rate"] is None
+    assert result["selected_wins_n_periods"] is None
+    assert result["winner_agreement"] == "unknown"
+    assert result["undefined_metrics"] == ["subperiod_parameter_stability"]
+
+
+def test_stability_ignores_unreadable_observations_rather_than_guessing():
+    observations = [
+        _observation("fold_0", 3, 100.0),
+        _observation("fold_0", 2, float("nan")),
+        {"period": "fold_1", "params": {}, "metric": 1.0},          # no axis
+        {"period": "fold_1", "metric": 1.0},                        # no params
+        {"period": "", "params": {"window": 2}, "metric": 1.0},     # no period
+        {"period": "fold_1", "params": {"window": None}, "metric": 1.0},
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=3, metric_name="realized_net_pnl"
+    )
+
+    assert result["n_parameter_values"] == 1
+    assert [row["period"] for row in result["per_period"]] == ["fold_0"]
+
+
+def test_stability_falls_back_to_the_pooled_best_value_when_none_is_selected():
+    observations = [
+        _observation("fold_0", 2, 90.0),
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_1", 2, 90.0),
+        _observation("fold_1", 3, 10.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", metric_name="realized_net_pnl"
+    )
+
+    assert result["selected_value"] == 2
+    assert result["selected_value_source"] == "best_mean_across_subperiods"
+
+
+def test_stability_takes_the_selected_axis_value_from_the_chosen_parameters():
+    observations = [
+        _observation("fold_0", 3, 10.0),
+        _observation("fold_0", 2, 90.0),
+        _observation("fold_1", 3, 10.0),
+        _observation("fold_1", 2, 90.0),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations,
+        parameter="window",
+        selected_parameters={"window": 3, "other": 7},
+        metric_name="realized_net_pnl",
+    )
+
+    assert result["selected_value"] == 3
+    assert result["selected_value_source"] == "declared"
+    assert result["winner_agreement"] == "unstable"
+
+
+def test_stability_is_unknown_when_the_selected_value_never_ran():
+    observations = [_observation("fold_0", 2, 5.0)]
+
+    result = subperiod_parameter_stability(
+        observations, parameter="window", selected_value=9, metric_name="realized_net_pnl"
+    )
+
+    assert result["status"] == "unknown"
+    assert "never observed" in result["reason"]
+
+
+def test_stability_supports_a_minimized_metric():
+    observations = [
+        _observation("fold_0", 3, 0.01),
+        _observation("fold_0", 2, 0.40),
+        _observation("fold_1", 3, 0.02),
+        _observation("fold_1", 2, 0.30),
+    ]
+
+    result = subperiod_parameter_stability(
+        observations,
+        parameter="window",
+        direction="minimize",
+        selected_value=3,
+        metric_name="p_value",
+    )
+
+    assert result["per_period"][0]["best_value"] == 3
+    assert result["winner_agreement"] == "stable"
+
+    with pytest.raises(ValueError, match="maximize"):
+        subperiod_parameter_stability(
+            observations, parameter="window", direction="sideways"
+        )
+
+
+# ─── trial → sub-period adapters ────────────────────────────────────────────
+
+
+def _trade(**kwargs):
+    from shared.models import Trade, TradeExit
+
+    exits = [
+        TradeExit(time=when, price=100.0, quantity=1.0, pnl=1.0)
+        for when in kwargs.pop("exit_times", ["2024-01-05T00:00:00+00:00"])
+    ]
+    return Trade(
+        id=1,
+        symbol="AAPL",
+        direction="LONG",
+        entry_time="2024-01-01T00:00:00+00:00",
+        entry_price=100.0,
+        quantity=1.0,
+        exits=exits,
+        pnl=kwargs.pop("pnl", 10.0),
+        **kwargs,
+    )
+
+
+def test_a_result_is_attributed_to_its_last_exit():
+    """Partial exits: the result the sub-period produced is the one the final
+    exit realized, not the first one."""
+    from runner.optimizer import _trade_realization_time
+
+    assert _trade_realization_time(
+        _trade(exit_times=["2024-01-05T00:00:00+00:00", "2024-02-20T00:00:00+00:00"])
+    ) == "2024-02-20T00:00:00+00:00"
+
+
+def test_a_trade_without_an_exit_falls_back_to_its_entry():
+    from runner.optimizer import _trade_realization_time
+
+    assert _trade_realization_time(_trade(exit_times=[])) == "2024-01-01T00:00:00+00:00"
+    assert _trade_realization_time(_trade(exit_times=[""])) == "2024-01-01T00:00:00+00:00"
+
+
+def test_net_pnl_is_after_fees_and_an_unreadable_one_is_never_a_flat_zero():
+    """Fees are part of the realized result, and an unreadable PnL must not be
+    charged to a sub-period as a real (zero) performance."""
+    from runner.optimizer import _trade_net_pnl
+
+    assert _trade_net_pnl(_trade(pnl=10.0, net_pnl=7.0, fees=3.0)) == pytest.approx(7.0)
+    assert _trade_net_pnl(_trade(pnl=10.0, fees=3.0)) == pytest.approx(7.0)
+    assert _trade_net_pnl(_trade(pnl=10.0)) == pytest.approx(10.0)
+    assert math.isnan(_trade_net_pnl(_trade(pnl="not-a-number")))
+    assert math.isnan(_trade_net_pnl(_trade(pnl=10.0, net_pnl="not-a-number")))
+
+
+def test_an_unreadable_pnl_is_dropped_rather_than_charged_to_a_subperiod():
+    from runner.optimizer import _trade_net_pnl
+
+    subperiods = [
+        {"label": "fold_0", "start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"}
+    ]
+
+    realized = realized_pnl_by_subperiod(
+        [("2024-01-05T00:00:00+00:00", _trade_net_pnl(_trade(pnl="not-a-number")))],
+        subperiods,
+    )
+
+    # The sub-period is still reported (measured, not skipped) and carries no
+    # invented result.
+    assert realized == {"fold_0": 0.0}

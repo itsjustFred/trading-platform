@@ -43,6 +43,60 @@ and the complete risk/modeling configuration) plus an explicit `pnl_basis`.
 Optimizers fail closed when this context is missing and fingerprint both the
 context and strategy source before running a study.
 
+## Universe provenance (point-in-time / survivorship bias)
+
+A symbol list resolved at run time says nothing about *when* its membership was
+determined. A backtest over "the S&P 500 constituents" built from today's list
+omits every name removed from (or delisted out of) the index before the run, and
+the omission is invisible: those tickers cannot be downloaded from a current
+list, so the artifact looks complete.
+
+Every `runner.cli run` therefore persists `universe_provenance` in `meta.data`
+(next to `execution_context`) with the provider, the as-of date, the symbol
+count and a digest of the list, the membership basis, and a plain-language
+`disclosure`. The operator can declare what the list actually is:
+
+```bash
+python -m runner.cli run ... \
+  --universe-source sp500-constituents.csv \
+  --universe-as-of 2026-09-01 \
+  --universe-membership current
+```
+
+* `membership_basis` is `undeclared` (the default), `current`, or
+  `point_in_time`. Undeclared stays unknown — it is never promoted to
+  point-in-time, because nothing in this platform can re-derive a past
+  membership (`PLATFORM_MEMBERSHIP_SOURCES` is empty).
+* Declaring `point_in_time` requires `--universe-as-of`, and an as-of date after
+  the backtest window end is rejected: membership known only *after* the
+  history it is applied to is look-ahead, which is a worse failure than
+  survivorship bias because it is silent.
+
+Optimizations carry the base artifact's record onto their own payload and add
+two diagnostics (`diagnostics.survivorship` and
+`diagnostics.subperiod_stability`, see `runner/universe_provenance.py` and
+`runner/optimization_diagnostics.py`):
+
+* **survivorship** counts what the stored OHLCV supports — symbols with no data
+  covering the window start (with the size of their first-bar gap), symbols that
+  only appear later, symbols whose data stops before the window closes — and
+  states the bias *direction* from the declared membership basis. The
+  *magnitude* is always `None`: the symbols carrying the bias are the ones
+  missing from the universe, so nothing over the present universe can bound it.
+  `undefined_metrics` names every quantity that stays unknown.
+* **subperiod_stability** reports whether the parameter value the study chose
+  also wins in each walk-forward sub-period of the window it was scored on.
+  Index-membership drift shows up here as a winner that changes over time.
+
+Both are reported diagnostics, not gates: a run is never blocked for having an
+unknown membership, it is only labelled.
+
+Only `runner.cli run` records the provenance today; the grid/matrix runners
+produce cell artifacts without it. Such an artifact is not treated as
+point-in-time — `read_universe_provenance` returns the explicit "not recorded"
+shape and the optimizer's `survivorship` view reports `bias_direction:
+"unknown"`.
+
 ## Source overview
 
 | Source | Primary entrypoint | Current role | Typical asset classes |
