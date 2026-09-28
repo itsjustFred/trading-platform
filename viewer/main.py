@@ -155,6 +155,7 @@ from shared.models import (
     ServiceType,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+    resolve_defined_stat,
 )
 from shared.models import (
     Portfolio as PortfolioModel,
@@ -11529,14 +11530,18 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
         "account_capital": account_capital,
         "components": components,
         "combined_stats": legacy_viewer.PortfolioStats(
-            sharpe=stats_result.get("sharpe_ratio", 0),
-            sortino=stats_result.get("sortino_ratio", 0),
-            cagr=stats_result.get("cagr", 0),
-            max_drawdown=stats_result.get("max_drawdown_pct", 0),
+            # resolve_defined_stat, not .get(key, 0): compute_stats omits a metric
+            # it could not compute and names it in undefined_metrics, so a plain 0
+            # default reports "measured as zero" for a number that was never
+            # measured. psr below already worked this way; the rest did not.
+            sharpe=resolve_defined_stat(stats_result, "sharpe_ratio", 0),
+            sortino=resolve_defined_stat(stats_result, "sortino_ratio", 0),
+            cagr=resolve_defined_stat(stats_result, "cagr", 0),
+            max_drawdown=resolve_defined_stat(stats_result, "max_drawdown_pct", 0),
             net_profit=stats_result.get("total_pnl", 0),
             win_rate=stats_result.get("win_rate", 0),
             profit_factor=stats_result.get("profit_factor", 0),
-            calmar=stats_result.get("calmar_ratio", 0),
+            calmar=resolve_defined_stat(stats_result, "calmar_ratio", 0),
             total_return=stats_result.get("total_return", 0),
             max_drawdown_duration=stats_result.get("max_drawdown_duration", 0),
             psr=stats_result.get("psr"),

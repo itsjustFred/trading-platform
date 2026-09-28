@@ -52,6 +52,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    resolve_defined_stat,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -3762,26 +3763,17 @@ def _safe_stat_number(value: Any, default: float = 0.0) -> float:
 def _stat_number_or_undefined(
     stats: dict[str, Any], key: str, default: float
 ) -> float | None:
-    """Resolve a stat, honouring the producer's own ``undefined_metrics`` list.
+    """Resolve a stat, honouring the producer's ``undefined_metrics`` list.
 
-    ``runner/stats.py`` already follows the documented convention: it names every
-    quantity it could not compute in ``undefined_metrics`` and omits the value
-    (``shared/models.py`` then leaves the key out of the dict entirely). Reading
-    the missing key back with a numeric default quietly undid that: an undefined
-    PSR became ``0.0``, which is the *worst* attainable PSR, so a backtest with no
-    trades was listed as "PSR (higher = better) 0.0%" and read as a measured
-    result. A default p_value of 1.0 has the same problem -- it reads as maximum
-    confidence in the null.
+    Delegates to :func:`shared.models.resolve_defined_stat`, which owns the
+    convention. Substituting a numeric default here used to turn an undefined PSR
+    into 0.0 - the *worst* attainable value - so a backtest with no trades was
+    listed as a measured 0.0% PSR. A default p_value of 1.0 has the same shape.
 
-    The producer is the only party that knows whether a number is missing or
-    genuinely zero, so it is asked rather than guessed. A stat the producer did
-    not name still falls back to the historical default, so artifacts written
-    before the convention keep their previous values.
+    The default is only applied to a metric the producer did not name, so
+    artifacts written before the convention keep their previous values.
     """
-    undefined = stats.get("undefined_metrics")
-    if isinstance(undefined, (list, tuple, set)) and key in undefined:
-        return None
-    return _safe_stat_number(stats.get(key), default)
+    return resolve_defined_stat(stats, key, default)
 
 
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:

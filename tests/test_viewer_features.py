@@ -5110,6 +5110,53 @@ def test_create_portfolio_allows_empty_components(viewer_client):
     assert payload["combined_stats"]["total_return"] == pytest.approx(0.0, abs=1e-9)
 
 
+def test_create_portfolio_keeps_an_undefined_metric_absent(
+    viewer_client, monkeypatch
+):
+    """The portfolio builder applied `.get(key, 0)` to compute_stats output.
+
+    compute_stats omits a metric it could not compute and names it in
+    `undefined_metrics`, so a plain 0 default reported a *measured* zero Sharpe
+    for a portfolio that was never scored. `psr` on the same call already used
+    the omission correctly, which is what made the inconsistency visible.
+
+    Driven through the endpoint rather than the helper, because an audit of this
+    kind is applied at a call site: testing `resolve_defined_stat` alone passed
+    even with this line reverted to `.get(key, 0)`.
+    """
+    import viewer.main as viewer_app_module
+
+    real = viewer_app_module._portfolio_combined_metrics
+
+    def _synthetic(*_args, **_kwargs):
+        correlation, points, stats = real(*_args, **_kwargs)
+        # Sharpe could not be computed for this portfolio.
+        stats = dict(stats)
+        stats.pop("sharpe_ratio", None)
+        stats["undefined_metrics"] = sorted(
+            set(stats.get("undefined_metrics") or []) | {"sharpe_ratio"}
+        )
+        return correlation, points, stats
+
+    monkeypatch.setattr(
+        viewer_app_module, "_portfolio_combined_metrics", _synthetic
+    )
+
+    response = viewer_client.post(
+        "/api/portfolios",
+        json={"name": "Unscored", "account_capital": 50000.0, "components": []},
+    )
+
+    assert response.status_code == 201
+    combined = response.json()["combined_stats"]
+    assert combined["sharpe"] is None, (
+        "a Sharpe that was never computed must not be stored as 0.0"
+    )
+    # A genuinely counted quantity still reports its real value.
+    assert combined["total_return"] is not None
+    assert isinstance(combined["net_profit"], (int, float))
+
+
 def test_portfolio_contributions_fallback_to_backtest_metrics(viewer_client, monkeypatch, tmp_path):
     import viewer.main as viewer_app_module
 

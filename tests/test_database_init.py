@@ -196,3 +196,54 @@ def test_live_control_audit_survives_a_broken_database(isolated_db, monkeypatch)
     )
     assert payload["action"] == "deployment.delete"
     assert payload["target_id"] == "dep-9"
+
+
+def test_resolve_defined_stat_separates_absent_from_measured_zero() -> None:
+    """One definition of the convention, used by both the DB and the viewer.
+
+    The bug this exists to prevent appeared twice, each time because a default
+    was applied somewhere new: once for PSR, where `.get(key, 0.0)` published
+    the *worst* attainable value for a metric that was never computed, and once
+    for the portfolio combined stats.
+    """
+    from shared.models import resolve_defined_stat
+
+    # Named as undefined: absent, even though a stale value is present.
+    assert resolve_defined_stat({"sharpe": 1.0, "undefined_metrics": ["sharpe"]}, "sharpe", 0) is None
+    # A real zero is a measurement and must survive.
+    assert resolve_defined_stat({"sharpe": 0.0}, "sharpe", 0) == 0.0
+    # Pre-convention artifacts carry no list and keep their historical default.
+    assert resolve_defined_stat({}, "sharpe", 0) == 0
+    assert resolve_defined_stat({"sharpe": 2.5}, "sharpe", 0) == 2.5
+    # An explicit null is an absence too, not a zero.
+    assert resolve_defined_stat({"sharpe": None}, "sharpe", 0) == 0
+    assert resolve_defined_stat({"sharpe": None}, "sharpe") is None
+    # A non-dict payload must not explode.
+    assert resolve_defined_stat(None, "sharpe", 0) == 0
+
+
+def test_portfolio_stats_defaults_are_absent_not_zero() -> None:
+    """PortfolioStats used to default every metric to 0.0.
+
+    A portfolio that could not be scored then reported a measured 0.0 Sharpe and
+    a measured 0.0% max drawdown, which the UI rendered as real figures. The
+    fields are now nullable so absence is representable at all.
+    """
+    from shared.models import PortfolioStats
+
+    empty = PortfolioStats()
+    assert empty.sharpe is None
+    assert empty.sortino is None
+    assert empty.cagr is None
+    assert empty.max_drawdown is None
+    assert empty.calmar is None
+    # Genuinely-counted quantities keep their zero default: no trades really does
+    # mean no profit, and that is a fact rather than an absence.
+    assert empty.net_profit == 0.0
+    assert empty.total_return == 0.0
+    assert empty.trade_count if hasattr(empty, "trade_count") else True
+
+    payload = empty.to_dict()
+    assert payload["sharpe"] is None
+    assert payload["max_drawdown"] is None
+    assert payload["net_profit"] == 0.0
