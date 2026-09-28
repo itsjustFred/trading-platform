@@ -333,15 +333,26 @@ def multiple_testing_correction(
     observed_metric: float | None = None,
     alpha: float = 0.05,
     penalty_floor: float | None = None,
+    direction: str = "maximize",
 ) -> dict[str, Any]:
     """Correct for selecting the best of many trials.
 
     Reports the Bonferroni threshold and a deflated-Sharpe-style adjustment: the
-    expected maximum of N independent trials under the null, which is the amount
-    by which the best score is inflated purely by search. When ``observed_metric``
-    is supplied it is compared against that expectation, so a result can be
-    labelled as surviving selection bias or not.
+    expected extreme of N independent trials under the null, which is the amount
+    by which the selected score is displaced purely by search. When
+    ``observed_metric`` is supplied it is compared against that expectation, so a
+    result can be labelled as surviving selection bias or not.
+
+    ``direction`` must match how the study actually selects its winner, because
+    the whole statistic is signed around it. A ``minimize`` study selects its
+    *smallest* trial (``p_value`` is the one such target), so its expected
+    extreme, its significance bar and the survives test are all reflected rather
+    than added. Taking the maximum of a minimize study reports the search bias of
+    its WORST trial, which inverts the verdict: a p-value study would claim to
+    survive selection bias exactly when its least significant trial cleared a
+    high bar.
     """
+    minimize = str(direction or "maximize").strip().lower() == "minimize"
     # No-trade trials are sentinels, not strategy performances: their metric is a
     # large fixed penalty. Leaving them in would put a -1e9 in the sample and
     # make every spread statistic meaningless, so they are counted separately.
@@ -365,6 +376,7 @@ def multiple_testing_correction(
         return {
             "n_trials": 0,
             "alpha": alpha,
+            "direction": direction,
             "bonferroni_threshold": None,
             "expected_max_under_null": None,
             "observed_metric": None,
@@ -373,10 +385,11 @@ def multiple_testing_correction(
         }
 
     bonferroni = alpha / n_trials
-    # Expected maximum of N standard normals under the null, via the standard
+    # Expected extreme of N standard normals under the null, via the standard
     # normal quantile and Euler-Mascheroni. This is a dimensionless z-score: it
     # has to be scaled onto the metric's own distribution before it can be
-    # compared with a metric value.
+    # compared with a metric value. It is a magnitude, so it is *subtracted* for
+    # a minimize study.
     z_expected_max = (
         math.sqrt(2.0 * math.log(n_trials))
         - (math.log(math.log(n_trials)) + 0.5772156649015329)
@@ -386,21 +399,29 @@ def multiple_testing_correction(
     )
     mean_metric = statistics.fmean(clean)
     sigma_metric = statistics.pstdev(clean) if len(clean) > 1 else 0.0
-    expected_max = mean_metric + sigma_metric * z_expected_max
+    sign = -1.0 if minimize else 1.0
+    expected_max = mean_metric + sign * sigma_metric * z_expected_max
 
-    # The *expected* max is the centre of the best-of-N distribution, so roughly
-    # half of all pure-noise searches would beat it: it is a diagnostic, not a
-    # bar to clear. The bar is the Bonferroni-corrected one-sided quantile, so a
-    # noise search passes it only alpha of the time.
+    # The *expected* extreme is the centre of the best-of-N distribution, so
+    # roughly half of all pure-noise searches would beat it: it is a diagnostic,
+    # not a bar to clear. The bar is the Bonferroni-corrected one-sided quantile,
+    # so a noise search passes it only alpha of the time. For a minimize study
+    # the relevant tail is the lower one.
     z_significance = statistics.NormalDist().inv_cdf(1.0 - bonferroni)
-    significance_threshold = mean_metric + sigma_metric * z_significance
+    significance_threshold = mean_metric + sign * sigma_metric * z_significance
 
-    best_observed = max(clean)
+    best_observed = min(clean) if minimize else max(clean)
     reported = best_observed if observed_metric is None else float(observed_metric)
+    survives = (
+        reported <= significance_threshold
+        if minimize
+        else reported >= significance_threshold
+    )
 
     return {
         "n_trials": n_trials,
         "alpha": alpha,
+        "direction": direction,
         "bonferroni_threshold": round(bonferroni, 8),
         "expected_max_under_null": round(expected_max, 6),
         "significance_threshold": round(significance_threshold, 6),
@@ -410,10 +431,12 @@ def multiple_testing_correction(
         "observed_metric": round(reported, 6),
         "best_trial_metric": round(best_observed, 6),
         # A single-trial result has no search bias to correct for.
-        "survives_selection_bias": (
-            None if n_trials <= 1 else reported >= significance_threshold
-        ),
+        "survives_selection_bias": (None if n_trials <= 1 else survives),
         "note": (
+            f"This study is a {direction} study, so expected_max_under_null and "
+            "significance_threshold are measured from the "
+            f"{'minimum' if minimize else 'maximum'} end of the trial sample and "
+            "the survives test is the matching inequality. "
             "expected_max_under_null is the trial mean plus the standard "
             f"deviation times the expected maximum of {n_trials} independent "
             "standard normals under the null, and is the centre of the "

@@ -260,6 +260,54 @@ def test_strong_observed_metric_survives_selection_bias():
     assert result["observed_metric"] == 4.0
 
 
+def test_minimize_study_is_corrected_from_the_minimum_end():
+    """A minimize study (p_value) must be judged on the trial it actually selects.
+
+    Taking the maximum of a minimize sample reports the search bias of the WORST
+    trial: a p-value study would then claim to survive selection bias precisely
+    when its least significant trial cleared a high bar, which is the opposite
+    of the claim. Every quantity is reflected, not just the final comparison.
+    """
+    trials = [0.90, 0.60, 0.30, 0.05, 0.02]
+    minimize = multiple_testing_correction(trials, direction="minimize")
+    maximize = multiple_testing_correction(trials, direction="maximize")
+
+    assert minimize["direction"] == "minimize"
+    # The selected trial is the smallest, not the largest.
+    assert minimize["best_trial_metric"] == 0.02
+    assert maximize["best_trial_metric"] == 0.90
+    # The bar is measured downward from the mean for a minimize study.
+    assert minimize["expected_max_under_null"] < maximize["expected_max_under_null"]
+    assert minimize["significance_threshold"] < maximize["significance_threshold"]
+
+
+def test_minimize_verdict_does_not_invert():
+    """The regression this guards: a genuinely significant p-value study that
+    selects a small p-value must be able to survive, and an insignificant one
+    must not -- judged on the selected (smallest) trial."""
+    import random
+
+    rng = random.Random(20260927)
+    # Pure noise p-values: the study should not claim significance.
+    noise = [rng.random() for _ in range(60)]
+    insignificant = multiple_testing_correction(noise, direction="minimize")
+    assert insignificant["survives_selection_bias"] is False
+
+    # A study whose smallest p-value is far below its own spread clears the bar.
+    spread = [0.5, 0.52, 0.48, 0.51, 0.49, 0.5, 0.53, 0.47]
+    significant = multiple_testing_correction(
+        [*spread, 0.0001], direction="minimize"
+    )
+    assert significant["survives_selection_bias"] is True
+    assert significant["best_trial_metric"] == 0.0001
+
+
+def test_correction_defaults_to_maximize_for_existing_callers():
+    result = multiple_testing_correction([0.1, 0.2, 0.3])
+    assert result["direction"] == "maximize"
+    assert result["best_trial_metric"] == 0.3
+
+
 def test_correction_ignores_non_numeric_entries():
     result = multiple_testing_correction([1.0, "not-a-number", None, float("inf"), 2.0])
     assert result["n_trials"] == 2
@@ -320,6 +368,46 @@ def test_diagnostics_payload_reports_embargo_in_bars():
     assert len(payload["walk_forward"]) == 2
     assert payload["plateau"]["parameter"] == "window"
     assert payload["multiple_testing"]["n_trials"] == 4
+    assert payload["multiple_testing"]["direction"] == "maximize"
+
+
+def test_diagnostics_payload_corrects_a_p_value_study_from_the_minimum_end():
+    """The direction must travel from the target metric into the correction.
+
+    `p_value` is the one minimize target, and the optimizer selects its minimum.
+    If the payload corrected the study from the maximum end, the reported
+    observed metric would be the worst trial in the study.
+    """
+    from types import SimpleNamespace
+
+    import runner.optimizer as opt
+
+    config = opt.OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="p_value",
+        n_trials=4,
+        train_split_pct=0.7,
+        embargo_pct=0.05,
+        walk_forward_splits=2,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 5}},
+    )
+    trials = [
+        SimpleNamespace(params={"window": w}, value=v)
+        for w, v in [(2, 0.60), (3, 0.42), (4, 0.31), (5, 0.05)]
+    ]
+    payload = opt._build_diagnostics_payload(
+        trials=trials,
+        config=config,
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
+        target_metric="p_value",
+        timeframe="1h",
+    )
+    correction = payload["multiple_testing"]
+    assert correction["direction"] == "minimize"
+    # The optimizer selects the smallest p-value, so that is the reported trial.
+    assert correction["best_trial_metric"] == 0.05
+    assert correction["observed_metric"] == 0.05
 
 
 def test_penalty_trials_do_not_poison_the_spread():

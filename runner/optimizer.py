@@ -1179,9 +1179,14 @@ def _build_diagnostics_payload(
 
     # penalty_floor is the second line of defence for a sentinel that reached
     # the metrics list without the marker (a caller that synthesised trials).
+    # The direction has to travel with the numbers: `p_value` is a minimize
+    # target, and correcting a minimize study against the maximum end of the
+    # sample reports the search bias of its *worst* trial, which inverts the
+    # verdict rather than merely mis-scaling it.
     multiple_testing = multiple_testing_correction(
         [float(row["metric"]) for row in trial_rows],
         penalty_floor=_NO_TRADE_PENALTY,
+        direction=METRIC_DIRECTIONS.get(str(target_metric or ""), "maximize"),
     )
     # The rows were already filtered above, so the function's own count is zero
     # here; the honest number is how many were kept out.
