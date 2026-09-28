@@ -2076,12 +2076,31 @@ def test_identity_fingerprint_changes_when_broker_identity_changes(isolated_db):
             return session.get(database.LiveAccountModel, account_id).identity_fingerprint
 
     assert _fingerprint("acc-1") not in (None, "")
-    # A different broker-reported identity must produce a different fingerprint,
-    # so the persisted value can be used to detect a silent re-point.
-    database.record_live_account_demo_verification(
+
+    # The actual property: a different broker-reported identity must produce a
+    # different fingerprint. This used to be asserted only as `is not None`, and
+    # the two verifications above were captured but never compared, so the test
+    # passed whether or not the fingerprint depended on the identity at all. It
+    # is the whole basis of the silent re-point check in
+    # _live_account_fingerprint_mismatch_reason, so it has to be compared.
+    assert second.identity_fingerprint is not None
+    assert first.identity_fingerprint != second.identity_fingerprint, (
+        "ctid changed from ctid-a to ctid-b, so the fingerprint must change"
+    )
+
+    # Re-verifying the SAME identity must not change it, otherwise every
+    # re-verification would look like a re-point and block activation forever.
+    same_again = database.record_live_account_demo_verification(
         "acc-1", is_demo=True, ctid="ctid-b", broker_login="login-a"
     )
-    assert _fingerprint("acc-1") is not None
+    assert same_again.identity_fingerprint == second.identity_fingerprint
+
+    # broker_login is part of the identity too, so changing only that must also
+    # change the fingerprint.
+    re_logged_in = database.record_live_account_demo_verification(
+        "acc-1", is_demo=True, ctid="ctid-b", broker_login="login-b"
+    )
+    assert re_logged_in.identity_fingerprint != second.identity_fingerprint
 
 
 def test_repoint_deployment_enforces_safety_guards(isolated_db):
@@ -6204,7 +6223,10 @@ def test_pause_drain_budget_outlives_the_claim_lease_it_waits_on(isolated_db):
     releaser = ThreadPoolExecutor(max_workers=1)
     try:
         releaser.submit(
-            lambda: (time.sleep(0.3), database.release_live_deployment_submission("tok-within-lease"))
+            lambda: (
+                time.sleep(0.3),
+                database.release_live_deployment_submission("tok-within-lease"),
+            )
         )
         outlasted = asyncio.run(
             viewer_app_module._drain_live_deployment_submissions(
