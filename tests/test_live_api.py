@@ -1528,3 +1528,79 @@ def test_discovered_payload_without_is_demo_records_no_verification(
     )
     viewer_main_module._discover_live_accounts_payload()
     assert recorded == ["acc-1:None"], "nothing asserted means nothing recorded"
+
+
+def test_arming_an_internal_source_deployment_is_refused_by_the_api(
+    viewer_client, monkeypatch, isolated_db_sandbox
+):
+    """End-to-end, through the real endpoint.
+
+    The database gate already refuses this, but a refusal the operator sees as a
+    bare 400 after a pointless broker round-trip is not a control they can act
+    on. This asserts the API names the real reason, and that the refusal is
+    audited like every other refused live control.
+
+    Also asserts the broker is never contacted: no account verification can make
+    a deployment without an evaluator capable of trading, so spending a
+    round-trip on it would only hide the actual cause.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-int", "ctrader", is_demo=True)
+    database_module.record_live_account_demo_verification(
+        "acc-int", is_demo=True, ctid="46736452"
+    )
+
+    import viewer.main as viewer_main_module
+
+    broker_calls: list[str] = []
+
+    async def _must_not_reverify(account_id: str) -> bool:
+        broker_calls.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _must_not_reverify
+    )
+
+    import uuid as _uuid
+
+    deployment_id = str(_uuid.uuid4())
+    created = database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-int",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="PAUSED",
+            signal_source_type="internal",
+        )
+    )
+    assert created.status == "PAUSED"
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={"status": "ACTIVE"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "internal" in detail
+    assert "no live evaluator" in detail
+    # The broker was never contacted: the refusal is not a broker problem.
+    assert broker_calls == []
+    # And the row is untouched.
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+
+    # The refusal is on the audit record, so "who tried to arm this" is
+    # answerable after the fact.
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == deployment_id and not entry.get("succeeded")
+    ]
+    assert entries, "the refused arming must be audited"
+    assert "internal" in (entries[0].get("detail") or {}).get("reason", "")

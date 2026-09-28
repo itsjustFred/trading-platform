@@ -3418,6 +3418,10 @@ def test_live_pause_reports_the_truth_when_the_submission_drain_times_out(
         symbols=["AAPL"],
         timeframe="1h",
         status="PAUSED",
+          # Discord, not the `internal` model default: an internal deployment
+          # is refused at the activation gate because it has no live evaluator,
+          # so it could never reach the code under test.
+          signal_source_type="discord",
     )
     monkeypatch.setattr(
         viewer_app_module,
@@ -6802,6 +6806,10 @@ def test_activation_refuses_when_broker_cannot_confirm_demo(
         symbols=["AAPL"],
         timeframe="1h",
         status="PAUSED",
+          # Discord, not the `internal` model default: an internal deployment
+          # is refused at the activation gate because it has no live evaluator,
+          # so it could never reach the code under test.
+          signal_source_type="discord",
     )
     monkeypatch.setattr(
         viewer_app_module, "get_live_deployment", lambda _deployment_id: deployment
@@ -6860,6 +6868,10 @@ def test_successful_activation_is_audited(viewer_client, monkeypatch):
         symbols=["AAPL"],
         timeframe="1h",
         status="PAUSED",
+          # Discord, not the `internal` model default: an internal deployment
+          # is refused at the activation gate because it has no live evaluator,
+          # so it could never reach the code under test.
+          signal_source_type="discord",
     )
     armed = deployment.model_copy(update={"status": "ACTIVE"})
     monkeypatch.setattr(
@@ -6910,6 +6922,10 @@ def test_activation_refreshes_verification_before_persisting(
         symbols=["AAPL"],
         timeframe="1h",
         status="PAUSED",
+          # Discord, not the `internal` model default: an internal deployment
+          # is refused at the activation gate because it has no live evaluator,
+          # so it could never reach the code under test.
+          signal_source_type="discord",
     )
     armed = deployment.model_copy(update={"status": "ACTIVE"})
     calls: list[str] = []

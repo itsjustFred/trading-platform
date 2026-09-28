@@ -181,6 +181,12 @@ class _NoPositionsAdapter(_PositionsAdapter):
 
 
 def _deployment(**settings: Any) -> LiveDeploymentConfig:
+    # A Discord source, deliberately. These tests cover execution mechanics -
+    # fills, reconciliation, risk caps - and all of them presuppose a deployment
+    # that can actually trade. `internal` is the model default and used to be
+    # passed here as filler, but it has no live evaluator, so an ACTIVE internal
+    # deployment is refused at the activation gate. Tests that are about the
+    # internal source itself say so explicitly.
     return LiveDeploymentConfig(
         id=str(uuid4()),
         strategy_name="demo",
@@ -188,7 +194,12 @@ def _deployment(**settings: Any) -> LiveDeploymentConfig:
         symbols=["EURUSD"],
         timeframe="1h",
         status="ACTIVE",
-        signal_source="internal",
+        # A named Discord source would drag in the StockKit routing rules, which
+        # are a separate concern with their own tests. What these tests need is
+        # only a source that is not `internal`, i.e. one that can actually
+        # trade; the specific channel is irrelevant to fills and reconciliation.
+        signal_source="discord",
+        signal_source_type="discord",
         signal_config={},
         settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05, **settings},
     )
@@ -6371,3 +6382,85 @@ def test_pause_stays_indeterminate_when_a_dead_lease_is_reaped_before_the_drain(
     assert result.outcome is viewer_app_module.LiveSubmissionDrainOutcome.INDETERMINATE
     assert result.complete is False
     assert result.expired_unreleased == 1
+
+
+class TestInternalSignalSourceCannotArm:
+    """An ``internal`` deployment can never signal: there is no live evaluator.
+
+    The daemon only turns Discord messages into signals, so an armed internal
+    deployment is not idle, it is permanently incapable of trading while
+    reporting itself healthy - ACTIVE status, a verified demo account, and no
+    possible order. That combination is the worst kind of failure for an
+    operator to discover, because every visible field says healthy.
+    """
+
+    @staticmethod
+    def _internal_deployment(**overrides: Any) -> LiveDeploymentConfig:
+        payload: dict[str, Any] = {
+            "id": uuid4(),
+            "strategy_name": "trend_following/trend_following.py",
+            "account_id": "acc-demo",
+            "symbols": ["EURUSD"],
+            "timeframe": "M15",
+            "status": "PAUSED",
+            "signal_source_type": "discord",
+            "signal_source_id": "rocketfuel",
+        }
+        payload.update(overrides)
+        return LiveDeploymentConfig(**payload)
+
+    def _demo_account(self, database, account_id: str = "acc-demo") -> None:
+        database.ensure_live_account(account_id, "ctrader", is_demo=True)
+        database.record_live_account_demo_verification(
+            account_id, is_demo=True, ctid="46736452"
+        )
+
+    def test_create_refuses_an_active_internal_deployment(self, isolated_db):
+        database = isolated_db
+        self._demo_account(database)
+
+        with pytest.raises(ValueError, match="no live evaluator"):
+            database.create_live_deployment(
+                self._internal_deployment(
+                    status="ACTIVE", signal_source_type="internal"
+                )
+            )
+
+    def test_arming_an_existing_internal_deployment_is_refused(self, isolated_db):
+        """The row already exists (created while PAUSED), so the gate has to
+        hold on the arming path too - that is the path the UI actually uses."""
+        database = isolated_db
+        self._demo_account(database)
+        created = database.create_live_deployment(
+            self._internal_deployment(signal_source_type="internal")
+        )
+
+        with pytest.raises(ValueError, match="no live evaluator"):
+            database.update_live_deployment_status(created.id, "ACTIVE")
+
+        # And the refusal is durable: it did not arm on the way through.
+        assert database.get_live_deployment(str(created.id)).status == "PAUSED"
+
+    def test_discord_source_still_arms_normally(self, isolated_db):
+        """The gate must not be a blanket refusal on the activation path."""
+        database = isolated_db
+        self._demo_account(database)
+        created = database.create_live_deployment(
+            self._internal_deployment()
+        )
+
+        armed = database.update_live_deployment_status(created.id, "ACTIVE")
+
+        assert armed.status == "ACTIVE"
+
+    def test_paused_internal_deployment_can_still_be_created_and_removed(
+        self, isolated_db
+    ):
+        """Only arming is refused. An operator must be able to stage and clean
+        up rows without the gate blocking ordinary management."""
+        database = isolated_db
+        self._demo_account(database)
+        created = database.create_live_deployment(
+            self._internal_deployment(signal_source_type="internal")
+        )
+        assert created.status == "PAUSED"

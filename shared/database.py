@@ -2718,6 +2718,14 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
                 raise ValueError(
                     f"Refusing to create an ACTIVE deployment: {block_reason}"
                 )
+            # Same verdict as the arming path, applied before the row exists so
+            # a deployment cannot be born ACTIVE and incapable of trading.
+            probe = LiveDeploymentModel.from_live_deployment(deployment)
+            source_block = _signal_source_block_reason(probe)
+            if source_block is not None:
+                raise ValueError(
+                    f"Refusing to create an ACTIVE deployment: {source_block}"
+                )
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
         symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
@@ -3055,6 +3063,32 @@ def _activation_block_reason(account: LiveAccountModel | None) -> str | None:
     return live_account_verification_block_reason(account)
 
 
+def _signal_source_block_reason(deployment: LiveDeploymentModel) -> str | None:
+    """Return why this deployment can never signal, or None when it can.
+
+    An ``internal`` deployment names a strategy module and expects the runtime to
+    evaluate it against market data. No such evaluator exists on the live path:
+    the daemon only ever turns a Discord message into a signal, so an armed
+    internal deployment is not merely idle, it is permanently incapable of
+    trading while reporting itself healthy.
+
+    Arming it was previously accepted, which made the failure invisible: the row
+    says ACTIVE, the account clears every demo and identity gate, and no order
+    can ever be placed. Refusing to arm preserves the invariant that an ACTIVE
+    deployment is one that can actually trade.
+    """
+    source_type = str(
+        deployment.signal_source_type or deployment.signal_source or ""
+    ).strip().lower()
+    if source_type != "internal":
+        return None
+    return (
+        "internal signal source has no live evaluator, so this deployment could "
+        "never produce a signal; use a Discord signal source, or build the "
+        "evaluator first"
+    )
+
+
 def update_live_deployment_status(
     deployment_id: str, status: str
 ) -> LiveDeploymentConfig | None:
@@ -3073,6 +3107,11 @@ def update_live_deployment_status(
             if block_reason is not None:
                 raise ValueError(
                     f"Refusing to activate a deployment: {block_reason}"
+                )
+            source_block = _signal_source_block_reason(record)
+            if source_block is not None:
+                raise ValueError(
+                    f"Refusing to activate a deployment: {source_block}"
                 )
         record.status = next_status
         record.updated_at = _utcnow_naive()

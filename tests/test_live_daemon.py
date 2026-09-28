@@ -1657,7 +1657,7 @@ def test_stopped_deployment_refuses_to_flatten_a_shared_active_account():
         symbols=["EURUSD"],
         timeframe="1h",
         status="ACTIVE",
-        signal_source="internal",
+        signal_source="discord",
     )
     adapter = _RecordingAdapter()
     enforced: set[str] = set()

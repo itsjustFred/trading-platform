@@ -12604,12 +12604,40 @@ async def update_live_deployment_status_endpoint(
     pending_claims: list[LiveDeploymentSubmissionClaim] = []
 
     if requested_status == "ACTIVE":
-        # Re-verify the account against the broker immediately before arming.
-        # The DB gate also enforces verification freshness, so a stale
-        # confirmation can never be reused to arm a deployment.
         deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
         if deployment is None:
             raise HTTPException(status_code=404, detail="Live deployment not found")
+
+        # Check what can actually trade before spending a broker round-trip on
+        # it. An internal-source deployment has no live evaluator, so no account
+        # verification can make it capable of trading, and a 409 naming that
+        # reason is far more actionable than a broker error.
+        source_type = str(deployment.signal_source_type or "").strip().lower()
+        if source_type == "internal":
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "internal signal source has no live evaluator",
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment uses the 'internal' signal source, which has "
+                    "no live evaluator, so it can never produce a signal. Arming "
+                    "it would report it as trading while it never can. Use a "
+                    "Discord signal source, or build the evaluator first."
+                ),
+            )
+
+        # Re-verify the account against the broker immediately before arming.
+        # The DB gate also enforces verification freshness, so a stale
+        # confirmation can never be reused to arm a deployment.
         if not await _reverify_account_against_broker(deployment.account_id):
             await _audit_live_control(
                 action="deployment.status",

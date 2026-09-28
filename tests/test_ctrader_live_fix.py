@@ -597,7 +597,7 @@ def test_get_live_signal_broker_order_id_roundtrip(isolated_db):
     database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
-        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
+        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="discord",
     )
     database.create_live_deployment(deployment)
     signal = LiveSignal(
@@ -631,7 +631,7 @@ def test_get_live_signal_metadata_roundtrip(isolated_db):
         symbols=["AAPL"],
         timeframe="1h",
         status="ACTIVE",
-        signal_source="internal",
+        signal_source="discord",
     )
     database.create_live_deployment(deployment)
     signal = LiveSignal(
@@ -659,7 +659,7 @@ def test_get_live_signal_broker_order_id_missing(isolated_db):
     database.record_live_account_demo_verification("acc-1", is_demo=True)
     deployment = LiveDeploymentConfig(
         id=uuid4(), strategy_name="demo", account_id="acc-1",
-        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="internal",
+        symbols=["AAPL"], timeframe="1h", status="ACTIVE", signal_source="discord",
     )
     database.create_live_deployment(deployment)
     signal = LiveSignal(
