@@ -124,6 +124,25 @@ const SHARPE_TONES = {
   negative: "#f85149",
 } as const;
 
+/**
+ * Formats a ratio (Sharpe, Sortino, PSR) to a fixed number of decimals, or
+ * returns null when the value is absent so the caller renders the shared
+ * unavailable marker.
+ *
+ * Ratios need more decimals than StatCard's "number" format provides, so the
+ * precision is applied here -- but only when a value actually exists. Coercing
+ * with `|| 0` first would render a ratio that could not be computed as a genuine
+ * zero, and those are very different facts: one is a measurement, the other is
+ * an absence.
+ */
+export function formatRatioStat(
+  value: number | string | null | undefined,
+  decimals = 3,
+): string | null {
+  if (isUnavailableStatValue(value)) return null;
+  return Number(value).toFixed(decimals);
+}
+
 /** Tier color for Sharpe ratio values. */
 export function sharpeTone(sharpe: number): string {
   if (sharpe > 1) return SHARPE_TONES.strong;

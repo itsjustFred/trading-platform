@@ -26,6 +26,11 @@ import type {
   PortfolioTrade,
 } from "../api/types";
 import {
+  UNAVAILABLE_STAT_TEXT,
+  formatRatioStat,
+  isUnavailableStatValue,
+} from "../lib/statFormat";
+import {
   deletePortfolio,
   getPortfolioContributions,
   getPortfolioDetail,
@@ -48,6 +53,7 @@ type ContributionSort = {
 
 type EquityPoint = { time: string; equity: number };
 type PortfolioStatsView = NonNullable<PortfolioDetail["combined_stats"]>;
+
 type ChartTooltip = {
   x: number;
   y: number;
@@ -501,20 +507,20 @@ export function PortfolioDetailPage() {
       >
         <StatCard
           label="Total Return"
-          value={stats.total_return ?? 0}
+          value={stats.total_return}
           format="percent"
           percentScale={requireMetricScale("portfolio_combined_stats", "total_return")}
         />
-        <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
+        <StatCard label="Net Profit" value={stats.net_profit} format="currency" />
         <StatCard
           label="Sharpe (higher = better)"
-          value={(stats.sharpe || 0).toFixed(3)}
+          value={formatRatioStat(stats.sharpe)}
           color={stats.sharpe > 1 ? "#3fb950" : "#d29922"}
         />
-        <StatCard label="Sortino" value={(stats.sortino || 0).toFixed(3)} color="#58a6ff" />
+        <StatCard label="Sortino" value={formatRatioStat(stats.sortino)} color="#58a6ff" />
         <StatCard
           label="CAGR (higher = better)"
-          value={stats.cagr ?? 0}
+          value={stats.cagr}
           format="percent"
           percentScale={requireMetricScale("portfolio_combined_stats", "cagr")}
         />
@@ -532,7 +538,7 @@ export function PortfolioDetailPage() {
         />
         <StatCard
           label="Max DD (lower = better)"
-          value={stats.max_drawdown ?? 0}
+          value={stats.max_drawdown}
           format="percent"
           percentScale={requireMetricScale("portfolio_combined_stats", "max_drawdown")}
           color="#f85149"
@@ -542,7 +548,13 @@ export function PortfolioDetailPage() {
           value={stats.win_rate}
           format="percent"
           percentScale={requireMetricScale("portfolio_combined_stats", "win_rate")}
-          color={(stats.win_rate || 0) >= 0.5 ? "#3fb950" : "#f85149"}
+          color={
+            isUnavailableStatValue(stats.win_rate)
+              ? undefined
+              : Number(stats.win_rate) >= 0.5
+                ? "#3fb950"
+                : "#f85149"
+          }
         />
       </div>
 
@@ -888,7 +900,7 @@ function ContributionTable({
                 {(row.drawdown_contribution * 100).toFixed(2)}%
               </td>
               <td style={tdStyle}>
-                {Number(row.sharpe_ratio ?? 0).toFixed(3)}
+                {row.sharpe_ratio != null ? Number(row.sharpe_ratio).toFixed(3) : UNAVAILABLE_STAT_TEXT}
               </td>
               <td style={tdStyle}>
                 {row.psr != null

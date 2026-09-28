@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatRatioStat,
   formatStatCardValue,
   isUnavailableStatValue,
   resolveStatCardColor,
@@ -102,4 +103,20 @@ test("no currency or number format can render NaN", () => {
       assert.ok(!out.includes("NaN"), `${format} rendered NaN for ${label}: ${out}`);
     }
   }
+});
+
+test("a ratio that cannot be computed is absent, not zero", () => {
+  // The bug this guards: PortfolioDetailPage rendered these with
+  // `(stats.sharpe || 0).toFixed(3)`, so a Sharpe the backend could not compute
+  // displayed as 0.000 -- indistinguishable from a measured zero.
+  assert.equal(formatRatioStat(null), null);
+  assert.equal(formatRatioStat(undefined), null);
+  assert.equal(formatRatioStat(Number.NaN), null);
+  assert.equal(formatRatioStat(Number.POSITIVE_INFINITY), null);
+  assert.equal(formatRatioStat(""), null);
+  // A real zero is a measurement and must survive as "0.000".
+  assert.equal(formatRatioStat(0), "0.000");
+  assert.equal(formatRatioStat(1.23456), "1.235");
+  assert.equal(formatRatioStat("-2.5"), "-2.500");
+  assert.equal(formatRatioStat("1.5", 2), "1.50");
 });

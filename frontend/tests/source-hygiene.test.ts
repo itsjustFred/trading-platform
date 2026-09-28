@@ -158,3 +158,40 @@ test("a pause that had to wait out submissions is never reported as a failure", 
     "a status change that did land must be reported before the error toast",
   );
 });
+
+test("an absent portfolio metric is never coerced to a numeric zero", async () => {
+  const page = await read("../src/pages/PortfolioDetailPage.tsx");
+
+  // Each of these metrics can come back null from the API when it could not be
+  // computed. Coercing with `?? 0` / `|| 0` before handing the value to StatCard
+  // turns that absence into a measurement: the em-dash path inside StatCard never
+  // fires because it is handed a real number. PSR and Win Rate in the same block
+  // already passed the raw value, so this is an inconsistency, not a convention.
+  for (const metric of [
+    "total_return",
+    "net_profit",
+    "sharpe",
+    "sortino",
+    "cagr",
+    "max_drawdown",
+    "win_rate",
+  ]) {
+    const coerced = new RegExp(
+      `stats\\.${metric}\\s*(\\?\\?|\\|\\|)\\s*0`,
+    );
+    assert.ok(
+      !coerced.test(page),
+      `stats.${metric} must not be coerced to 0: an absent metric has to reach ` +
+        `StatCard as null/undefined so it renders the shared em dash`,
+    );
+  }
+
+  // Ratios keep their conventional 3 decimals through the shared helper, which
+  // returns null (not "0.000") when the value is absent.
+  assert.match(page, /formatRatioStat\(stats\.sharpe\)/);
+  assert.match(page, /formatRatioStat\(stats\.sortino\)/);
+  assert.doesNotMatch(page, /\|\|\s*0\)\.toFixed/);
+
+  // The contribution table cell must use the same marker as its neighbours.
+  assert.match(page, /row\.sharpe_ratio != null[\s\S]{0,120}UNAVAILABLE_STAT_TEXT/);
+});
