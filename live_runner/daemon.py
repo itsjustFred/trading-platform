@@ -2351,13 +2351,26 @@ def _record_discord_service_stopped(service_id: str, *, paused: bool) -> None:
     A PAUSED service stays PAUSED: that is operator intent and must survive, which
     is why this only ever writes STOPPED for services that are not already PAUSED.
     """
+    if paused:
+        return
     service = next(
         (item for item in list_services() if str(item.id) == service_id),
         None,
     )
-    if service is None or service.status == ServiceStatus.PAUSED:
-        return
-    if service.status == ServiceStatus.STOPPED:
+    # Only a service that was RUNNING is now STOPPED.
+    #
+    # Deliberately NOT a general "anything not PAUSED becomes STOPPED". An
+    # earlier version did that, and it broke the startup recovery contract:
+    # `_recover_failed_services` never resurrects PAUSED/STOPPED because those
+    # encode operator intent, so relabelling a FAILED service as STOPPED stopped
+    # it ever being retried on the next daemon start. A service that failed on an
+    # expired token then stayed dead across every restart, forever.
+    #
+    # It also destroyed the evidence: a5a76ad writes FAILED to make a
+    # misconfigured author allowlist visible, and within one 60s sync tick that
+    # FAILED was overwritten with STOPPED - a clean, intentional stop - so the
+    # dashboard never showed the failure at all.
+    if service is None or service.status != ServiceStatus.RUNNING:
         return
     try:
         update_service_status(service_id, ServiceStatus.STOPPED)
@@ -2378,10 +2391,21 @@ async def _stop_discord_bot_service(
     paused: bool = False,
 ) -> None:
     task = active_discord_bot_tasks.pop(service_id, None)
-    if task is not None and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    try:
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    except Exception:
+        # A task that finished with an exception re-raises here, and that used to
+        # skip the cleanup below entirely: the source was never popped, the auth
+        # blocks were never cleared, and the status was never recorded - the exact
+        # stale record this function exists to prevent. The cancel has already
+        # happened, so the rest is bookkeeping and must not be skipped.
+        logger.info(
+            "Discord bot task ended with an exception while stopping",
+            extra={"data": {"service_id": service_id}},
+        )
     source = active_discord_bots.pop(service_id, None)
     if source is not None:
         if paused:

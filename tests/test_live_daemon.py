@@ -2416,7 +2416,51 @@ class TestStoppedDiscordServiceStatus:
     safer than a missing one, because it is what an operator decides by.
     """
 
-    def test_stopping_a_failed_service_records_stopped(self, monkeypatch) -> None:
+    def test_a_failed_service_stays_failed_so_startup_recovery_can_retry_it(
+        self, monkeypatch
+    ) -> None:
+        """A FAILED service must remain FAILED when its listener is cancelled.
+
+        `_recover_failed_services` never resurrects PAUSED/STOPPED, because those
+        encode operator intent, while FAILED is system state that is safe to retry
+        on the next daemon start. So writing STOPPED here silently disabled
+        recovery: a service that failed on an expired token would stay dead across
+        every restart, forever.
+
+        It also hid the failure. a5a76ad writes FAILED to make a misconfigured
+        author allowlist visible, and within one 60s sync tick that FAILED was
+        overwritten with STOPPED - which reads as a clean, intentional stop.
+        """
+        updates: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(
+            daemon,
+            "update_service_status",
+            lambda service_id, status, **_kw: updates.append((service_id, status)),
+        )
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.FAILED,
+                )
+            ],
+        )
+
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+            )
+        )
+
+        assert updates == []
+
+    def test_stopping_a_running_service_records_stopped(self, monkeypatch) -> None:
         updates: list[tuple[str, object]] = []
 
         def _capture_update(service_id: str, status: object, **_kwargs) -> None:
@@ -2430,7 +2474,7 @@ class TestStoppedDiscordServiceStatus:
                 SimpleNamespace(
                     id="service-1",
                     name="TEST_BOT",
-                    status=daemon.ServiceStatus.FAILED,
+                    status=daemon.ServiceStatus.RUNNING,
                 )
             ],
         )
@@ -2497,7 +2541,7 @@ class TestStoppedDiscordServiceStatus:
                 SimpleNamespace(
                     id="service-1",
                     name="TEST_BOT",
-                    status=daemon.ServiceStatus.FAILED,
+                    status=daemon.ServiceStatus.RUNNING,
                 )
             ],
         )
@@ -2510,3 +2554,71 @@ class TestStoppedDiscordServiceStatus:
                 active_discord_bot_tasks={},
             )
         )
+
+    def test_a_task_that_died_with_an_exception_still_completes_the_stop(
+        self, monkeypatch
+    ) -> None:
+        """`await task` re-raises, and that must not skip the cleanup.
+
+        A task can finish with an exception between the cleanup and reconfigure
+        awaits. Awaiting it then re-raises, which used to skip the rest of the
+        function: the source was never popped, the auth blocks were never
+        cleared, and the status was never recorded - exactly the stale record
+        this whole change exists to remove.
+        """
+        updates: list[tuple[str, object]] = []
+
+        class _DiedTask:
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> None:
+                return None
+
+            async def __await__(self):
+                raise RuntimeError("listener died")
+
+            def __iter__(self):
+                return self.__await__()
+
+        class _Source:
+            is_paused = False
+            disconnected = False
+
+            async def disconnect(self, failed: bool = True) -> None:
+                self.disconnected = True
+
+        source = _Source()
+        monkeypatch.setattr(
+            daemon,
+            "update_service_status",
+            lambda service_id, status, **_kw: updates.append((service_id, status)),
+        )
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.RUNNING,
+                )
+            ],
+        )
+        daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS.add("service-1")
+        daemon._DISCORD_SERVICE_AUTH_BLOCKED_REASONS["service-1"] = "auth failed"
+
+        bots = {"service-1": source}
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots=bots,
+                active_discord_bot_tasks={"service-1": _DiedTask()},
+            )
+        )
+
+        # The source is still released, the auth block is cleared, and the status
+        # is recorded - all three, despite the task raising.
+        assert bots == {}
+        assert "service-1" not in daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS
+        assert updates == [("service-1", daemon.ServiceStatus.STOPPED)]

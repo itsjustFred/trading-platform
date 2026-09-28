@@ -123,18 +123,38 @@ _ACTION_BUY_TICKER_RE = re.compile(
 # the market ("sellers are weak", "short covering"). `_explicit_sell_action`
 # below keeps that distinction; requiring "signal" alone would have silently
 # dropped the plain "SELL EURUSD" form, which is a regression, not a tightening.
-_ACTION_SELL_RE = re.compile(
-    r"\b(?:sell|short)\s+signal\b"
-    r"|\bsignal\s*(?:is|:)?\s*\b(?:sell|short)\b"
-    r"|\bmomentum\s*reversal\b"
-    r"|^\s*(?:sell|short)\b",
-    re.IGNORECASE,
+# One definition of the explicit sell forms, and the only one. This rule used to
+# be spelled out twice - here and in _EXPLICIT_SELL_SIGNAL_RE - unguarded in both.
+# That duplication is what let "signal is short of resistance" through while the
+# explicit copy was being tightened: a second, unfixed copy of the same rule.
+#
+# Guards on the "signal is short" alternative, both load-bearing:
+#   `(?![-\w])`  `\bshort\b` matches the "short" inside "short-term", because a
+#     hyphen is a word boundary, so "oversold buy signal. Signal is short-term."
+#     was vetoed as a noun and then let straight back in as an instruction - a
+#     real short opened on a BUY message.
+#   _SELL_PROSE_TAIL  "short of resistance" and "short covering" are prose that
+#     continues past the word, not an instruction that stops at it.
+#
+# The "sell signal" alternative is deliberately unguarded: it is an instruction in
+# every phrasing seen, and guarding it dropped real signals.
+_SELL_PROSE_TAIL = (
+    r"(?!\s+(?:of|term|covering|sellers?|positions?|at|into|near|below|above))"
 )
-# The unambiguous directive forms, kept separate so the noun check below can
-# allow them even when a noun phrase is also present.
 _EXPLICIT_SELL_SIGNAL_RE = re.compile(
     r"\b(?:sell|short)\s+signal\b"
-    r"|\bsignal\s*(?:is|:)?\s*\b(?:sell|short)\b",
+    r"|\bsignal\s*(?:is|:)\s*\b(?:sell|short)(?![-\w])" + _SELL_PROSE_TAIL + r"\b",
+    re.IGNORECASE,
+)
+# A leading "sell"/"short" only counts when the message says what it acts on.
+# Without requiring a target, "short covering underway" is a directive aimed at a
+# ticker called COVERING, because any two-to-ten-letter noun passed as a symbol.
+_LEADING_SELL_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:sell|short)(?![-\w])\b\s*[:\-]?\s*\**\$?(?P<target>[A-Za-z]{2,10})\b",
+    re.IGNORECASE,
+)
+_ACTION_SELL_RE = re.compile(
+    _EXPLICIT_SELL_SIGNAL_RE.pattern + r"|\bmomentum\s*reversal\b",
     re.IGNORECASE,
 )
 # Noun-phrase and participle forms that describe the market rather than issue an
@@ -198,6 +218,11 @@ _SKIP_WORDS = {
     "OPEN",
     "CLOSE",
     "STOP",
+    "COVERING",
+    "SELLERS",
+    "TERM",
+    "UNDERWAY",
+    "STEPPING",
     "LOSS",
     "TAKE",
     "PROFIT",
@@ -245,6 +270,19 @@ def _normalize_symbol_candidate(candidate: str) -> str | None:
     if not normalized or normalized in _SKIP_WORDS:
         return None
     return normalized
+
+
+def _has_leading_sell_directive(content: str) -> bool:
+    """True for "SELL EURUSD", false for "short covering underway".
+
+    The captured word goes through the same normalizer as every other symbol
+    candidate, which is why COVERING and friends are in _SKIP_WORDS. Position
+    alone cannot settle this: "short covering underway" also starts with "short".
+    """
+    match = _LEADING_SELL_DIRECTIVE_RE.match(content)
+    if match is None:
+        return False
+    return _normalize_symbol_candidate(match.group("target")) is not None
 
 
 def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
@@ -402,7 +440,15 @@ def _reads_as_sell_directive(content: str) -> bool:
         # "sell signal" alongside it is still an instruction.
         if _EXPLICIT_SELL_SIGNAL_RE.search(content):
             return True
+        # "SELL EURUSD, sellers stepping in" is a directive: the message opens
+        # with the action and the noun phrases only describe the market
+        # afterwards. Vetoing those dropped real exit signals, which costs as
+        # much as the false positives this guard exists to stop.
+        if _has_leading_sell_directive(content):
+            return True
         return False
+    if _has_leading_sell_directive(content):
+        return True
     return bool(_ACTION_SELL_RE.search(content))
 
 

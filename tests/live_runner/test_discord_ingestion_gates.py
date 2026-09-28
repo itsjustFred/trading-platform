@@ -1859,6 +1859,60 @@ class TestNitroGrammarContract:
             _signal_type, action = self._parse(content)
             assert action == "sell", content
 
+    def test_a_hyphenated_noun_is_not_readmitted_by_the_escape_hatch(self):
+        """The guard that blocks "short-term" was undone by its own escape hatch.
+
+        `_reads_as_sell_directive` vetoes noun phrases, then re-admits anything
+        matching `_EXPLICIT_SELL_SIGNAL_RE` - whose "signal is short" alternative
+        matches the "short" inside "short-term", because a hyphen is a word
+        boundary. So "oversold buy signal. Signal is short-term." was vetoed as a
+        noun and then let straight back in as an instruction, and on RocketFuel
+        (which accepts sells) that is a real short opened on a BUY message.
+
+        Not a regression against pre-f6cb0a4, which also traded it - an unclosed
+        hole in that fix. The existing pin only covered the noun branch, which is
+        why the escape hatch went unnoticed.
+        """
+        for content in (
+            "**EURUSD** oversold buy signal @ 1.0850. Signal is short-term.",
+            "Signal: short-term bottoming in EURUSD",
+            "signal is short of resistance in EURUSD",
+        ):
+            action = self._parse(content)[1]
+            assert action != "sell", f"{content!r} was read as {action!r}"
+
+    def test_a_leading_directive_survives_noun_prose_after_it(self):
+        """The opposite error, and it costs just as much: dropping a real exit.
+
+        The noun guard vetoes the whole message, so "SELL EURUSD, short covering
+        done" stopped resolving - a genuine sell signal, silently lost, which is
+        the trade-off f6cb0a4's own test warns against.
+        """
+        for content in (
+            "Short EURUSD @ 1.0850, sellers stepping in",
+            "SELL EURUSD @ 1.0850, short covering done",
+            "SELL AAPL",
+        ):
+            action = self._parse(content)[1]
+            assert action == "sell", content
+
+    def test_a_leading_directive_must_name_something_plausible(self):
+        """"short covering underway" starts with the letters "short".
+
+        Treating position as decisive made any two-to-ten-letter noun after the
+        word pass as a ticker, so prose became an instruction aimed at a symbol
+        called COVERING. The captured word goes through the same normalizer as
+        every other symbol candidate, which is why those words are in _SKIP_WORDS.
+        """
+        for content in (
+            "short covering underway",
+            "short-term weakness in EURUSD",
+            "sellers are weak",
+            "short sellers stepping in",
+        ):
+            action = self._parse(content)[1]
+            assert action is None, f"{content!r} was read as {action!r}"
+
     def test_bare_directive_sell_forms_still_parse(self):
         """Guards the fix against over-tightening.
 
@@ -1936,6 +1990,7 @@ class TestNitroGrammarContract:
         from live_runner.signal_sources.discord_source import (
             _ACTION_BUY_RE,
             _ACTION_SELL_RE,
+            _LEADING_SELL_DIRECTIVE_RE,
         )
 
         # The buy pre-filter is a cheap "is there a buy word at all" test, so it
@@ -1950,7 +2005,12 @@ class TestNitroGrammarContract:
         # The sell regex is genuinely narrow, because the sell predicate needs a
         # bare-word match to tell an explicit "sell signal" from a noun phrase.
         assert _ACTION_SELL_RE.search("sellers are weak") is None
-        assert _ACTION_SELL_RE.search("SELL AAPL") is not None
+        # The leading directive form is matched by its own regex, not by
+        # _ACTION_SELL_RE: "SELL AAPL" is a directive while "sellers are weak" is
+        # prose, and the noun guard needs to tell them apart before it consults
+        # either.
+        assert _LEADING_SELL_DIRECTIVE_RE.search("SELL AAPL") is not None
+        assert _LEADING_SELL_DIRECTIVE_RE.search("sellers are weak") is None
         assert _ACTION_SELL_RE.search("sell signal") is not None
 
     def test_oversold_buy_signal_still_needs_a_price(self):
