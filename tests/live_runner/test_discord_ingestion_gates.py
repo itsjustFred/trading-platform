@@ -2442,3 +2442,142 @@ class TestRejectionStreakFailsTheService:
 
         failed = [s for s in self.statuses if "FAILED" in s]
         assert len(failed) == 1, f"repeated failure writes: {self.statuses}"
+
+
+class TestObserveChannelAuthors:
+    """Reading the allowlist value instead of guessing it.
+
+    `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS` is operator-set, and nothing in the
+    repository records which author belongs to which bot. Guessing wrong makes a
+    bot refuse its real author and silently stop trading, so the value is
+    *observed* from the channel's own history instead.
+
+    The reporting is read-only by construction - it reuses the message fetch and
+    produces no signal, mutates no state, and submits nothing. That matters
+    because it runs against live credentials on the trading path's own reader.
+    """
+
+    @staticmethod
+    def _source():
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+        return DiscordSignalSource(
+            bot_name="nitro",
+            token="super-secret-token-value",
+            channel_id="channel-1",
+            service_id=None,
+            trusted_author_ids=["*"],
+        )
+
+    @staticmethod
+    def _row(
+        message_id: str,
+        author_id: str,
+        *,
+        bot: bool = True,
+        username: str = "bot",
+    ):
+        return {
+            "id": message_id,
+            "content": "x",
+            "channel": {"id": "channel-1"},
+            "author": {"id": author_id, "bot": bot, "username": username},
+        }
+
+    def test_reports_each_distinct_author_with_a_count(self):
+        source = self._source()
+        page = [
+            self._row("3", "author-b"),
+            self._row("2", "author-a"),
+            self._row("1", "author-a"),
+        ]
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            return page
+
+        source._fetch_messages = _fetch
+
+        rows = asyncio.run(source.observe_channel_authors("channel-1", pages=1))
+
+        assert {r["author_id"] for r in rows} == {"author-a", "author-b"}
+        counts = {r["author_id"]: r["message_count"] for r in rows}
+        assert counts == {"author-a": 2, "author-b": 1}
+        # Most active first, so the loudest author is easy to spot.
+        assert rows[0]["author_id"] == "author-a"
+
+    def test_marks_bots_so_a_human_is_not_trusted_by_accident(self):
+        source = self._source()
+        page = [
+            self._row("2", "human-1", bot=False, username="some_person"),
+            self._row("1", "bot-1", bot=True),
+        ]
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            return page
+
+        source._fetch_messages = _fetch
+        rows = asyncio.run(source.observe_channel_authors("channel-1", pages=1))
+        by_id = {r["author_id"]: r for r in rows}
+
+        assert by_id["bot-1"]["is_bot"] is True
+        assert by_id["human-1"]["is_bot"] is False
+
+    def test_it_produces_no_signal_and_mutates_nothing(self):
+        """The property that makes this safe to run against live credentials."""
+        source = self._source()
+        page = [self._row("1", "author-a")]
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            return page
+
+        source._fetch_messages = _fetch
+
+        before = source.author_rejection_summary()
+        rows = asyncio.run(source.observe_channel_authors("channel-1", pages=1))
+
+        assert rows, "should still report the author it saw"
+        # Reading history must not count as a rejection, and the queue must be
+        # untouched: nothing was ingested.
+        assert source.author_rejection_summary() == before
+        assert source._queue.qsize() == 0
+
+    def test_paginates_backwards_until_exhausted(self):
+        source = self._source()
+        seen_bases: list[str | None] = []
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            seen_bases.append(before)
+            if len(seen_bases) == 1:
+                return [self._row("20", "a"), self._row("19", "b")]
+            return []
+
+        source._fetch_messages = _fetch
+        asyncio.run(source.observe_channel_authors("channel-1", pages=5))
+
+        assert seen_bases[0] is None
+        # Second request resumes from the oldest id of the first page.
+        assert seen_bases[1] == "19"
+        assert len(seen_bases) == 2, "should stop when a page comes back empty"
+
+    def test_an_empty_channel_reports_nothing_rather_than_raising(self):
+        source = self._source()
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            return []
+
+        source._fetch_messages = _fetch
+
+        assert asyncio.run(source.observe_channel_authors("channel-1", pages=2)) == []
+
+    def test_the_token_is_never_part_of_the_report(self):
+        source = self._source()
+        page = [self._row("1", "author-a")]
+
+        async def _fetch(_channel_id, *, before=None, **kwargs):
+            return page
+
+        source._fetch_messages = _fetch
+        rows = asyncio.run(source.observe_channel_authors("channel-1", pages=1))
+
+        rendered = repr(rows)
+        assert "super-secret-token-value" not in rendered

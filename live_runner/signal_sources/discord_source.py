@@ -827,6 +827,65 @@ class DiscordSignalSource(BaseSignalSource):
         """Alias of :meth:`_auth_header`."""
         return self._auth_header()
 
+    async def observe_channel_authors(
+        self,
+        channel_id: str,
+        *,
+        pages: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Read recent messages and report who authored them.
+
+        Read-only, and deliberately outside the trading path: it builds no
+        signal, mutates no state, and submits nothing. It exists because
+        ``DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`` is operator-set and the mapping
+        from author id to bot is not derivable from the repository - guessing it
+        wrong refuses that bot's real messages and silently stops it trading.
+
+        So the value can be *observed* rather than guessed. Note this is a
+        historical message list, not the configured allowlist: a human or an
+        unrelated bot posting in the same channel will appear here too, which is
+        exactly why the allowlist is an operator decision rather than something
+        this should infer and apply by itself.
+
+        Returns one row per distinct author, most active first. ``is_bot`` is
+        included because signal bots post as bots and a human interjection should
+        not be trusted even when it is the loudest voice in the channel.
+        """
+        counts: dict[str, dict[str, Any]] = {}
+        before: str | None = None
+        for _ in range(max(1, int(pages))):
+            messages = await self._fetch_messages(channel_id, before=before)
+            if not messages:
+                break
+            for message in messages:
+                # `_fetch_messages` returns the raw REST dicts; the ingest path
+                # wraps them in _DiscordMessageAdapter, this path does not need
+                # to. Reading them as dicts is what the source actually returned.
+                author = message.get("author") or {}
+                author_id = str(author.get("id") or "").strip().lower()
+                if not author_id:
+                    continue
+                row = counts.setdefault(
+                    author_id,
+                    {
+                        "author_id": author_id,
+                        "username": str(author.get("username", "") or ""),
+                        "is_bot": bool(author.get("bot", False)),
+                        "message_count": 0,
+                    },
+                )
+                row["message_count"] += 1
+            oldest = min(
+                (str(m.get("id", "")) for m in messages if m.get("id")),
+                default="",
+            )
+            before = oldest or None
+            if not before:
+                break
+        return sorted(
+            counts.values(), key=lambda row: (-row["message_count"], row["author_id"])
+        )
+
     async def _fetch_messages(
         self,
         channel_id: str,
