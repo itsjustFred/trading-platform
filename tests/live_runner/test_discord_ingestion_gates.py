@@ -2051,3 +2051,122 @@ class TestRocketFuelSellTypingIsSafetyCritical:
         processor = get_signal_processor("rocketfuel_longandshort", {})
         assert processor.variant == "longandshort"
         assert processor._normalize_action("sell") == "sell"
+
+
+class TestPerBotAuthorAllowlist:
+    """Which Discord author may drive which bot.
+
+    Three bots share one credentials file and each reads its own channel. The
+    author allowlist did not follow that pattern: there was a per-bot token and a
+    per-bot channel, but only a single ``DISCORD_TRUSTED_AUTHOR_IDS``. So all
+    three bots resolved the *same* three authors, and each trusted the other
+    bots' signal bots.
+
+    With per-bot tokens and channels that is not a theoretical overlap. A bot
+    account that also had posting access to another bot's channel could post
+    there, and its message would clear the author gate and trade that
+    deployment. The channel binding did not help: the allowlist is checked
+    against the author, and the same author was trusted everywhere.
+    """
+
+    @staticmethod
+    def _service(name: str, **config):
+        class _Service:
+            pass
+
+        service = _Service()
+        service.name = name
+        service.config = dict(config)
+        return service
+
+    NITRO_AUTHOR = "1484753770645553192"
+    ROCKETFUEL_AUTHOR = "1469353101352767575"
+    RAMJET_AUTHOR = "1433633853091610745"
+
+    def _resolve(self, name: str, env: dict[str, str]):
+        from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+        return _resolve_discord_service_trusted_author_ids(
+            self._service(name), accounts_env_values=env
+        )
+
+    def test_a_per_bot_var_isolates_each_bot_to_its_own_author(self):
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
+            "DISCORD_BOT_ROCKETFUEL_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
+            "DISCORD_BOT_RAMJET_TRUSTED_AUTHOR_IDS": self.RAMJET_AUTHOR,
+        }
+
+        assert self._resolve("nitro", env) == {self.NITRO_AUTHOR}
+        assert self._resolve("rocketfuel", env) == {self.ROCKETFUEL_AUTHOR}
+        assert self._resolve("ramjet", env) == {self.RAMJET_AUTHOR}
+
+    def test_another_bots_author_is_refused_when_a_per_bot_var_exists(self):
+        """The cross-bot case, stated as the property that matters."""
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
+            "DISCORD_BOT_ROCKETFUEL_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
+        }
+
+        nitro = self._resolve("nitro", env)
+
+        assert self.ROCKETFUEL_AUTHOR not in nitro
+        assert self.RAMJET_AUTHOR not in nitro
+
+    def test_the_shared_var_still_works_for_a_single_bot_setup(self):
+        """Backwards compatibility: a one-bot deployment configures the original
+        name, and that must not be broken by adding the per-bot one."""
+        env = {"DISCORD_TRUSTED_AUTHOR_IDS": f"{self.NITRO_AUTHOR},{self.ROCKETFUEL_AUTHOR}"}
+
+        assert self._resolve("nitro", env) == {self.NITRO_AUTHOR, self.ROCKETFUEL_AUTHOR}
+
+    def test_a_per_bot_var_wins_over_the_shared_one(self):
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
+            "DISCORD_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
+        }
+
+        assert self._resolve("nitro", env) == {self.NITRO_AUTHOR}
+
+    def test_an_explicit_service_config_still_wins_over_both(self):
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": self.NITRO_AUTHOR,
+            "DISCORD_TRUSTED_AUTHOR_IDS": self.ROCKETFUEL_AUTHOR,
+        }
+        service = self._service(
+            "nitro", trusted_author_ids=[self.RAMJET_AUTHOR]
+        )
+
+        from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+        assert _resolve_discord_service_trusted_author_ids(
+            service, accounts_env_values=env
+        ) == {self.RAMJET_AUTHOR}
+
+    def test_no_allowlist_anywhere_still_fails_closed(self):
+        """The property the whole gate exists for, re-asserted after the change."""
+        assert self._resolve("nitro", {}) == set()
+
+    def test_the_current_shared_only_config_is_unchanged_by_this(self):
+        """The migration path, and the reason this change is safe to deploy.
+
+        The live credentials file sets only ``DISCORD_TRUSTED_AUTHOR_IDS``, so
+        until an operator adds per-bot variables all three bots resolve the same
+        list exactly as before. That is deliberate: the mapping from author id to
+        bot is not derivable from the repository, and guessing it wrong would
+        refuse that bot's real messages and silently stop it trading. So the
+        operator sets the per-bot variables, and the fallback keeps working until
+        they do.
+        """
+        env = {
+            "DISCORD_TRUSTED_AUTHOR_IDS": (
+                f"{self.RAMJET_AUTHOR},{self.ROCKETFUEL_AUTHOR},{self.NITRO_AUTHOR}"
+            )
+        }
+
+        for bot in ("nitro", "ramjet", "rocketfuel"):
+            assert self._resolve(bot, env) == {
+                self.RAMJET_AUTHOR,
+                self.ROCKETFUEL_AUTHOR,
+                self.NITRO_AUTHOR,
+            }

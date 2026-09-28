@@ -1468,10 +1468,17 @@ def _resolve_discord_service_trusted_author_ids(
     )
     if direct:
         return direct
-    env_key = _service_config_string(config, "trusted_author_ids_env_key") or (
-        "DISCORD_TRUSTED_AUTHOR_IDS"
-    )
+    env_key = _service_config_string(config, "trusted_author_ids_env_key")
+    if not env_key:
+        # Per-bot first, matching DISCORD_BOT_<NAME>_TOKEN / _CHANNEL_ID. Without
+        # it every bot falls back to the single shared DISCORD_TRUSTED_AUTHOR_IDS,
+        # so each one trusts the *other* bots' authors: RocketFuel's bot posting
+        # in Nitro's channel would be accepted and could trade Nitro. The shared
+        # var stays as the fallback for single-bot setups.
+        env_key = f"DISCORD_BOT_{str(service.name or '').strip().upper()}_TRUSTED_AUTHOR_IDS"
     raw_env = resolve_env_value(accounts_env_values, env_key)
+    if not raw_env:
+        raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
     if not raw_env:
         return set()
     return _trusted_author_ids_from_config(

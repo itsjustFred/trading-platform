@@ -92,8 +92,19 @@ Konfiguration:
 - Deployment (`live_deployments.yaml` → `signal_config.trusted_author_ids`,
   Liste oder einzelner String; mehrere Deployments auf einem Kanal werden
   zusammengeführt).
-- Discord-Bot-Service (Service-Config `trusted_author_ids` oder Umgebungsvariable
-  `DISCORD_TRUSTED_AUTHOR_IDS`, kommagetrennt).
+- Discord-Bot-Service, in dieser Reihenfolge:
+  1. Service-Config `trusted_author_ids` (bzw. `trusted_bot_ids`)
+  2. Umgebungsvariable `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`, kommagetrennt —
+     z. B. `DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS`
+  3. Umgebungsvariable `DISCORD_TRUSTED_AUTHOR_IDS`, kommagetrennt (Fallback für
+     Single-Bot-Setups)
+
+  Die Bot-spezifische Variante ist wichtig, wenn mehrere Bots dieselbe
+  `.accounts.env` teilen: ohne sie fällt jeder Bot auf dieselbe gemeinsame Liste
+  zurück und vertraut damit auch den *anderen* Bots. Ein Bot-Account mit
+  Schreibzugriff auf den Kanal eines anderen Bots könnte dort posten und dessen
+  Deployment handeln. Vorherrschaft in dieser Reihenfolge: die spezifischste
+  gewinnt, ein gesetzter Wert fällt nicht auf die allgemeinere zurück.
 
 Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
 
