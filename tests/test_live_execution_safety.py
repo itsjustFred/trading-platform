@@ -1486,6 +1486,52 @@ class _NoMarketDataAdapter:
         raise NotImplementedError
 
 
+def test_the_real_ctrader_adapter_cannot_feed_a_signal_processor():
+    """The refusal above uses a stub, so it proves the daemon's handling but not
+    that the production adapter actually triggers it.
+
+    ``CTraderLiveAdapter`` does not implement ``get_market_data`` at all - broker
+    OHLCV is fetched from Alpaca for the Discord processors, and cTrader was
+    never in scope. That is a deliberate limitation rather than an oversight, but
+    it is a real capability boundary: a cTrader deployment cannot be given a
+    signal processor, ever, because ATR cannot be computed without bars.
+
+    Worth pinning for two reasons. It guards the fail-closed behaviour against a
+    future ``get_market_data`` landing here without a staleness check - the Alpaca
+    path has a calendar-aware one, cTrader would not - and it records the
+    boundary as intentional so it is not mistaken for a bug. The refusal must
+    name the reason, so an operator reading the log knows the deployment cannot
+    trade rather than assuming the broker is down.
+    """
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+    from live_runner.daemon import _build_processor_market_data
+
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="access",
+        refresh_token="refresh",
+        account_id="46736434",
+        demo=True,
+    )
+    signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=1.0850,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="5m",
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="refusing to fabricate"):
+        asyncio.run(
+            _build_processor_market_data(
+                adapter, signal, timeframe="5m", deployment=_deployment()
+            )
+        )
+
+
 def test_signal_age_validation_rejects_stale_discord_signal():
     from live_runner.daemon import _validate_signal_age_before_wait
 
