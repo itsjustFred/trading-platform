@@ -6464,3 +6464,121 @@ class TestInternalSignalSourceCannotArm:
             self._internal_deployment(signal_source_type="internal")
         )
         assert created.status == "PAUSED"
+
+
+class TestPreflightSymbolCoverage:
+    """Arming honesty: a deployment configured with instruments the account
+    cannot trade reports nothing until a signal arrives, and then every order
+    for that symbol is rejected with no explanation.
+
+    This is a warning, not an error. cTrader resolves symbol ids per account,
+    so the deployment is legitimate - it is the *pairing* that is wrong, and
+    the operator can only discover that from a rejection at submit time.
+    """
+
+    @staticmethod
+    def _account():
+        from shared.models import LiveAccountConfig
+
+        return LiveAccountConfig(
+            id="acc-1", broker="ctrader", name="cTrader 46736434"
+        )
+
+    @staticmethod
+    def _deployment(*symbols: str) -> LiveDeploymentConfig:
+        return LiveDeploymentConfig(
+            id=uuid4(),
+            strategy_name="trend_following",
+            account_id="acc-1",
+            symbols=list(symbols),
+            timeframe="M15",
+            status="PAUSED",
+            signal_source_type="discord",
+            signal_config={"channel_id": "123"},
+        )
+
+    def test_warns_when_the_account_cannot_trade_a_configured_symbol(self):
+        from live_runner.preflight import (
+            LivePreflightAccountResult,
+            _validate_deployments,
+        )
+
+        result = LivePreflightAccountResult(
+            account_id="acc-1",
+            broker="ctrader",
+            ok=True,
+            tradeable_symbols={"EURUSD", "GBPUSD"},
+        )
+
+        errors, warnings = _validate_deployments(
+            [self._account()], [self._deployment("EURUSD", "XAUUSD")], [result]
+        )
+
+        assert errors == []
+        assert len(warnings) == 1
+        assert "XAUUSD" in warnings[0]
+        # It names the consequence, so the operator knows this is not cosmetic.
+        assert "refused at submit" in warnings[0]
+
+    def test_quiet_when_every_symbol_is_tradeable(self):
+        from live_runner.preflight import (
+            LivePreflightAccountResult,
+            _validate_deployments,
+        )
+
+        result = LivePreflightAccountResult(
+            account_id="acc-1", broker="ctrader", ok=True,
+            tradeable_symbols={"EURUSD", "GBPUSD"},
+        )
+
+        _errors, warnings = _validate_deployments(
+            [self._account()], [self._deployment("EURUSD", "GBPUSD")], [result]
+        )
+
+        assert warnings == []
+
+    def test_claims_nothing_when_the_broker_was_not_asked(self):
+        """"Not checked" is not "everything is tradeable". Without a broker
+        answer the check must stay silent rather than invent a warning - or,
+        worse, invent a clean bill of health."""
+        from live_runner.preflight import (
+            LivePreflightAccountResult,
+            _validate_deployments,
+        )
+
+        unchecked = LivePreflightAccountResult(
+            account_id="acc-1", broker="ctrader", ok=True, tradeable_symbols=None
+        )
+
+        _errors, warnings = _validate_deployments(
+            [self._account()], [self._deployment("EURUSD", "XAUUSD")], [unchecked]
+        )
+
+        assert warnings == []
+
+    def test_symbol_matching_is_case_insensitive(self):
+        from live_runner.preflight import (
+            LivePreflightAccountResult,
+            _validate_deployments,
+        )
+
+        result = LivePreflightAccountResult(
+            account_id="acc-1", broker="ctrader", ok=True,
+            tradeable_symbols={"EURUSD"},
+        )
+
+        _errors, warnings = _validate_deployments(
+            [self._account()], [self._deployment("eurusd")], [result]
+        )
+
+        assert warnings == []
+
+    def test_back_compatible_when_no_account_results_are_supplied(self):
+        from live_runner.preflight import _validate_deployments
+
+        errors, warnings = _validate_deployments(
+            [self._account()], [self._deployment("EURUSD", "XAUUSD")]
+        )
+
+        assert errors == []
+        assert warnings == []

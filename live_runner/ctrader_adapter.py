@@ -1116,6 +1116,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
 
+    async def tradeable_symbol_names(self) -> set[str]:
+        """Upper-case names of the instruments *this account* can trade.
+
+        The symbols list is broker-returned per cTID, so this is the account's
+        own contract identity rather than a global symbol table: an account
+        without XAUUSD genuinely does not have it, and no amount of local
+        configuration changes that. Used to tell an operator at arming time
+        that a deployment is configured with instruments the account cannot
+        trade, instead of at submit time when the first signal is rejected.
+        """
+        if not self._authenticated or not self._symbol_name_to_id:
+            await self._authenticate()
+        return set(self._symbol_name_to_id)
+
     async def _load_symbol_props_into_cache(self, symbol_name_to_id: dict[str, int]) -> None:
         """Fetch full ProtoOASymbol properties per symbol id (#80).
 

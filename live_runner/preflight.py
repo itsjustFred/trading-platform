@@ -34,6 +34,10 @@ class LivePreflightAccountResult:
     positions_count: int | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Upper-case instrument names the broker reports for this account, when
+    # the broker was asked. None means "not checked" - which is not the
+    # same as "everything is tradeable", and callers must not read it so.
+    tradeable_symbols: set[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,25 @@ def _resolve_ctrader_credentials(
         return None
     demo = _parse_bool_env("CTRADER_DEMO", env_values.get("CTRADER_DEMO"), default=True)
     return app_id, app_secret, access_token, refresh_token, demo
+
+
+def _run_tradeable_symbol_check(adapter: object) -> set[str]:
+    """Ask the broker which instruments this account can trade.
+
+    The adapter has already been disconnected by the connectivity check, so
+    this is a second short round-trip rather than a free read. That is why it
+    is only attempted after the account proved it connects, and why a failure
+    reports "not checked" instead of guessing.
+    """
+
+    async def _read() -> set[str]:
+        try:
+            return await adapter.tradeable_symbol_names()
+        finally:
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
+
+    return asyncio.run(_read())
 
 
 def _run_broker_connectivity_check(
@@ -197,13 +220,16 @@ def _preflight_ctrader_account(
     accounts_env_path: Path,
     errors: list[str],
     warnings: list[str],
-) -> tuple[bool | None, bool | None, float | None, float | None, int | None]:
+) -> tuple[
+    bool | None, bool | None, float | None, float | None, int | None, set[str] | None
+]:
     credentials = _ctrader_preflight_credentials(env_values, errors)
     demo: bool | None = None
     connected: bool | None = None
     balance: float | None = None
     equity: float | None = None
     positions_count: int | None = None
+    tradeable_symbols: set[str] | None = None
     if credentials is None:
         if not errors:
             errors.append(
@@ -244,7 +270,25 @@ def _preflight_ctrader_account(
             broker_label="cTrader",
             errors=errors,
         )
-    return demo, connected, balance, equity, positions_count
+        if connected:
+            try:
+                tradeable_symbols = _run_tradeable_symbol_check(adapter)
+            except Exception as exc:
+                # Best effort on purpose: an unreadable symbols list must not
+                # fail a preflight that already proved the account connects.
+                # None is carried through as "not checked", so the deployment
+                # check below stays quiet rather than guessing.
+                warnings.append(
+                    f"Could not read the account's tradeable symbol list: {exc!r}"
+                )
+    return (
+        demo,
+        connected,
+        balance,
+        equity,
+        positions_count,
+        tradeable_symbols,
+    )
 
 
 def _preflight_account(
@@ -262,6 +306,7 @@ def _preflight_account(
     balance: float | None = None
     equity: float | None = None
     positions_count: int | None = None
+    tradeable_symbols: set[str] | None = None
 
     if account.broker == "alpaca":
         (
@@ -285,6 +330,7 @@ def _preflight_account(
             balance,
             equity,
             positions_count,
+            tradeable_symbols,
         ) = _preflight_ctrader_account(
             account,
             env_values=env_values,
@@ -306,16 +352,23 @@ def _preflight_account(
         positions_count=positions_count,
         errors=errors,
         warnings=warnings,
+        tradeable_symbols=tradeable_symbols,
     )
 
 
 def _validate_deployments(
     accounts: Sequence[LiveAccountConfig],
     deployments: Sequence[LiveDeploymentConfig],
+    account_results: Sequence[LivePreflightAccountResult] = (),
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     account_ids = {account.id for account in accounts}
+    tradeable_by_account = {
+        result.account_id: result.tradeable_symbols
+        for result in account_results
+        if result.tradeable_symbols is not None
+    }
 
     for deployment in deployments:
         label = f"{deployment.strategy_name} ({deployment.account_id})"
@@ -329,6 +382,26 @@ def _validate_deployments(
             channel_id = str(deployment.signal_config.get("channel_id") or "").strip()
             if not channel_id:
                 warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
+        # A symbol the account cannot trade is not an error: cTrader resolves
+        # ids per account and the order is refused at submit time anyway. It
+        # is a warning because the failure is otherwise invisible until a
+        # signal arrives, at which point every order for that symbol is
+        # rejected with nothing to explain why. With no broker answer (None)
+        # nothing is claimed.
+        tradeable = tradeable_by_account.get(deployment.account_id)
+        if tradeable is not None:
+            unavailable = sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in deployment.symbols
+                    if str(symbol).strip().upper() not in tradeable
+                }
+            )
+            if unavailable:
+                warnings.append(
+                    f"{label}: account cannot trade {', '.join(unavailable)}; "
+                    "every order for those symbols would be refused at submit"
+                )
 
     return errors, warnings
 
@@ -379,7 +452,9 @@ def run_live_preflight(
         )
         for account in accounts
     ]
-    deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
+    deployment_errors, deployment_warnings = _validate_deployments(
+        accounts, deployments, account_results
+    )
 
     ok = all(result.ok for result in account_results) and not deployment_errors
     return LivePreflightResult(
