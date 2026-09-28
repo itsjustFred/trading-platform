@@ -82,6 +82,7 @@ jobs:
           tests/frontendResilience.test.ts
           tests/liveTerminal.test.ts
           tests/optimizationEvidence.test.ts
+          tests/liveControlConfirmation.test.ts
       - name: Frontend focused tests
         run: npm run test:focused
       - name: Frontend TypeScript and production build
