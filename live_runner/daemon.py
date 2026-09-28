@@ -2003,6 +2003,31 @@ async def _dispatch_discord_trade_signal(
         )
 
 
+def _service_id_for_discord_deployment(deployment: LiveDeploymentConfig) -> str | None:
+    """The service row a deployment's Discord listener should report through.
+
+    Joins on the deployment's service name, canonicalised the same way service
+    discovery names the rows it creates, so both sides derive the key from one
+    rule instead of two that can drift.
+
+    Returns None when there is no unique match. It deliberately does not create a
+    row, and does not fall back to "the first discord service": two services for
+    one bot, or none, must not silently attach this listener to the wrong bot's
+    status. No observability is recoverable; a wrong status is not.
+    """
+    name = discord_bot_env_canonical_name(_deployment_service_name(deployment))
+    if not name:
+        return None
+    matches = [
+        service
+        for service in list_services(service_type=ServiceType.DISCORD_BOT)
+        if discord_bot_env_canonical_name(service.name) == name
+    ]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].id)
+
+
 async def _run_discord_signal_listener_for_account(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -2068,6 +2093,13 @@ async def _run_discord_signal_listener_for_account(
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
         auth_scheme=discord_auth_scheme,
+        # Without this the deployment path could not report a mis-set allowlist
+        # at all: `_set_service_status` returns immediately when service_id is
+        # empty, so a5a76ad's streak alert had nowhere to write and the wrong
+        # allowlist stayed invisible on the path that all three live deployments
+        # actually use. Resolved, never created - a deployment with no matching
+        # service row simply gets no observability, which is the safe direction.
+        service_id=_service_id_for_discord_deployment(primary_deployment),
     )
     await source.connect()
     try:

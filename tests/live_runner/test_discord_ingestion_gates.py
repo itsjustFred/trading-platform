@@ -2507,6 +2507,114 @@ class TestRejectionStreakFailsTheService:
             "a busy channel would rewrite the status on every message"
         )
 
+    def test_a_corrected_allowlist_clears_the_failure_it_raised(self):
+        """Recovery was only ever possible by restarting the daemon.
+
+        Once the streak alert latched, the service was left FAILED and nothing
+        put it back. `_recover_failed_services` - the only thing that retries a
+        FAILED service - runs on daemon *start*. So an operator who fixed the
+        allowlist watched the service stay red on the dashboard until they
+        restarted something, and there was no record anywhere that it had healed.
+
+        An accepted message is the proof that the allowlist is right, so it is
+        what should clear the failure.
+        """
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+
+        async def _reject_then_accept() -> None:
+            scheduled = [
+                source._record_author_rejection(self.NITRO_AUTHOR)
+                for _ in range(AUTHOR_REJECTION_STREAK_THRESHOLD)
+            ]
+            for coro in scheduled:
+                if coro is not None:
+                    await coro
+            # The real parser calls this for any message from a trusted author.
+            source._record_author_accepted()
+            await asyncio.sleep(0)
+
+        asyncio.run(_reject_then_accept())
+
+        assert any("FAILED" in s for s in self.statuses), "precondition: the alert fired"
+        assert any("RUNNING" in s for s in self.statuses), (
+            "a corrected allowlist left the service FAILED with no way back "
+            f"short of a daemon restart; statuses were {self.statuses}"
+        )
+
+    def test_recovery_never_resumes_a_paused_service(self, monkeypatch) -> None:
+        """A message arriving after a pause must not un-pause it.
+
+        The status write is otherwise unconditional, so the new recovery path
+        would have flipped a PAUSED service back to RUNNING the first time a
+        trusted author posted - quietly undoing an operator's decision from
+        inside a message handler.
+
+        Patches the module-level `get_service` and `update_service_status` and
+        calls the real method. An earlier version stubbed `_set_service_status` on
+        the instance, which meant the guard under test never executed - and the
+        mutation deleting that guard still passed.
+        """
+        from live_runner.signal_sources import discord_source as module
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+        from shared.models import ServiceStatus
+
+        source = DiscordSignalSource(
+            token="t", channel_ids={"c"}, service_id="svc",
+            trusted_author_ids=["bot-1"],
+        )
+        written: list[object] = []
+
+        monkeypatch.setattr(
+            module,
+            "get_service",
+            lambda _sid: SimpleNamespace(status=ServiceStatus.PAUSED),
+        )
+        monkeypatch.setattr(
+            module,
+            "update_service_status",
+            lambda sid, status, **_kw: written.append(status),
+        )
+
+        asyncio.run(source._set_service_status(ServiceStatus.RUNNING))
+
+        assert written == [], (
+            f"a PAUSED service was resumed by a status write: {written}"
+        )
+
+    def test_a_running_service_is_still_writable(self, monkeypatch) -> None:
+        """The PAUSED guard must not block every RUNNING write, or nothing
+        about a live service would ever be recorded again.
+        """
+        from live_runner.signal_sources import discord_source as module
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+        from shared.models import ServiceStatus
+
+        source = DiscordSignalSource(
+            token="t", channel_ids={"c"}, service_id="svc",
+            trusted_author_ids=["bot-1"],
+        )
+        written: list[object] = []
+
+        monkeypatch.setattr(
+            module,
+            "get_service",
+            lambda _sid: SimpleNamespace(status=ServiceStatus.RUNNING),
+        )
+        monkeypatch.setattr(
+            module,
+            "update_service_status",
+            lambda sid, status, **_kw: written.append(status),
+        )
+
+        asyncio.run(source._set_service_status(ServiceStatus.RUNNING))
+
+        # `update_service_status` is called with the enum, not a string.
+        assert written == [ServiceStatus.RUNNING]
+
     def test_a_wrong_allowlist_fails_the_service(self):
         from live_runner.signal_sources.discord_source import (
             AUTHOR_REJECTION_STREAK_THRESHOLD,

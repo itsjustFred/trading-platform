@@ -2678,3 +2678,54 @@ class TestDiscordDispatchIsolation:
             "deployment tearing down the account-wide listener loses the batch "
             "for every other deployment, silently"
         )
+
+    def test_the_deployment_path_reports_through_a_service_row(self, monkeypatch) -> None:
+        """A wrong allowlist was invisible on the path all three deployments use.
+
+        `_set_service_status` returns immediately when `service_id` is empty, so
+        the deployment listener built with no service id could not fail the
+        service however wrong its allowlist was. a5a76ad's streak alert had
+        nowhere to write, and the only trace was a per-message WARNING - the
+        silent shape the whole streak feature exists to remove, on the only path
+        the live deployments actually run.
+        """
+        source = ast.unparse(
+            ast.parse(inspect.cleandoc(inspect.getsource(daemon._run_discord_signal_listener_for_account)))
+        )
+        assert "service_id=_service_id_for_discord_deployment(" in source, (
+            "the deployment listener is still built without a service_id, so it "
+            "cannot report a mis-set author allowlist"
+        )
+
+    def test_a_deployment_with_no_matching_service_reports_nowhere(self, monkeypatch) -> None:
+        """No unique match means no observability, which is the safe direction.
+
+        Attaching this listener to some other bot's status because it happened to
+        be the only discord service would be worse than staying quiet: the wrong
+        row would report a failure that belongs to a different bot.
+        """
+        from types import SimpleNamespace as _SN
+
+        deployment = _SN(signal_config={"service_name": "NITRO"}, signal_source_id="nitro")
+
+        def _two_services(**_kwargs):
+            return [
+                _SN(id="s1", name="NITRO"),
+                _SN(id="s2", name="NITRO"),
+            ]
+
+        monkeypatch.setattr(daemon, "list_services", _two_services)
+        assert daemon._service_id_for_discord_deployment(deployment) is None
+
+        def _one_service(**_kwargs):
+            return [_SN(id="s1", name="nitro")]
+
+        monkeypatch.setattr(daemon, "list_services", _one_service)
+        # Canonicalised both ways, so a lowercase row still matches.
+        assert daemon._service_id_for_discord_deployment(deployment) == "s1"
+
+        def _no_services(**_kwargs):
+            return []
+
+        monkeypatch.setattr(daemon, "list_services", _no_services)
+        assert daemon._service_id_for_discord_deployment(deployment) is None

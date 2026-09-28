@@ -16,7 +16,7 @@ from live_runner.credential_env import discord_bot_env_key
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
-from shared.database import update_service_status
+from shared.database import get_service, update_service_status
 from shared.logging import get_logger
 from shared.models import ServiceStatus
 
@@ -811,11 +811,56 @@ class DiscordSignalSource(BaseSignalSource):
 
         It ends any rejection streak and un-latches the failure alert, so
         scattered impersonation attempts across a day can never accumulate into a
-        false alarm. Latched rather than reported continuously for the same
-        reason the rejection alert is: one write, and a clear state.
+        false alarm.
+
+        When the alert had latched, the service was left FAILED and nothing ever
+        put it back: recovery only happens in `_recover_failed_services`, which
+        runs on daemon *start*. So an operator who fixed the allowlist saw the
+        service stay red on the dashboard until they restarted something, with
+        no record that it had healed. The status write is scheduled for the same
+        reason the rejection write is - the caller is a synchronous parser - and
+        the latch is cleared first, so this fires at most once per streak.
         """
+        was_alerted = self._author_rejection_alerted
         self._consecutive_author_rejections = 0
         self._author_rejection_alerted = False
+        if was_alerted:
+            _schedule(
+                self._record_author_recovery(
+                    rejected_count=self._author_rejection_count,
+                    rejected_author_ids=sorted(self._rejected_author_ids),
+                )
+            )
+            self._author_rejection_count = 0
+            self._rejected_author_ids = set()
+
+    async def _record_author_recovery(
+        self,
+        *,
+        rejected_count: int,
+        rejected_author_ids: list[str],
+    ) -> None:
+        """Clear the failure the wrong-allowlist alert raised.
+
+        Deliberately RUNNING, not just a cleared latch: the service is FAILED in
+        the database and nothing else will change that, so a corrected allowlist
+        would otherwise look broken for another restart cycle. The rejected
+        authors go in the log because they are what the operator needs to check
+        the allowlist against.
+        """
+        logger.info(
+            "Discord bot accepted a message from a trusted author; the author "
+            "allowlist is working and the previous failure is cleared",
+            extra={
+                "data": {
+                    "service_id": str(self.service_id or ""),
+                    "bot_name": str(self.bot_name or ""),
+                    "rejected_before_recovery": rejected_count,
+                    "rejected_author_ids": rejected_author_ids,
+                }
+            },
+        )
+        await self._set_service_status(ServiceStatus.RUNNING)
 
     async def _flag_author_rejection_streak(self, *, consecutive_rejections: int) -> None:
         """Note that a message was dropped because its author is not trusted.
@@ -881,6 +926,14 @@ class DiscordSignalSource(BaseSignalSource):
     ) -> None:
         if not self.service_id:
             return
+        # Never overwrite PAUSED with RUNNING. That is operator intent, and it has
+        # to survive whatever the process last observed - including a message
+        # arriving after the pause. The daemon's stop path guards the same way,
+        # and a status an inbound message can flip is not a record of intent.
+        if str(status) == str(ServiceStatus.RUNNING):
+            current = await asyncio.to_thread(get_service, self.service_id)
+            if current is not None and current.status == ServiceStatus.PAUSED:
+                return
         try:
             await asyncio.to_thread(
                 update_service_status,
