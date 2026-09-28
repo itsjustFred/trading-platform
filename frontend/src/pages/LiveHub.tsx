@@ -756,6 +756,16 @@ export function LiveHubPage() {
 
   const handleDelete = useCallback(async (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
+    // The server refuses an unconfirmed delete regardless - that is the control
+    // that actually holds, since the API is callable directly. This dialog is
+    // here so the operator sees a deliberate step rather than discovering one.
+    if (
+      !window.confirm(
+        `Delete ${card.strategy_name}?\n\nThis removes the deployment and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
     setDeploymentBusy(card.id, true);
     try {
       await deleteLiveDeployment(card.id);

@@ -375,14 +375,21 @@ def test_live_deployments_crud_endpoints(monkeypatch):
 
     update_resp = client.put(
         f"/api/live/deployments/{deployment_id}/status",
-        json={"status": "PAUSED"},
+        # Confirmed as the real client does; the refusal path has its own tests.
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
     )
     assert update_resp.status_code == 200
     updated = update_resp.json()
     assert updated["id"] == deployment_id
     assert updated["status"] == "PAUSED"
 
-    delete_resp = client.delete(f"/api/live/deployments/{deployment_id}")
+    delete_resp = client.delete(
+        f"/api/live/deployments/{deployment_id}"
+        f"?confirm_deployment_id={deployment_id}"
+    )
     assert delete_resp.status_code == 200
     deleted = delete_resp.json()
     assert deleted["status"] == "deleted"
@@ -1581,7 +1588,12 @@ def test_arming_an_internal_source_deployment_is_refused_by_the_api(
     client = TestClient(viewer_main_module.app)
     response = client.put(
         f"/api/live/deployments/{deployment_id}/status",
-        json={"status": "ACTIVE"},
+        # Confirmed, so the 409 below is the internal-source refusal and not the
+        # confirmation precondition.
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
     )
 
     assert response.status_code == 409

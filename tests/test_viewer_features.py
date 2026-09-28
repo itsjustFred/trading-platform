@@ -3444,7 +3444,11 @@ def test_live_pause_reports_the_truth_when_the_submission_drain_times_out(
 
     resp = viewer_client.put(
         f"/api/live/deployments/{deployment.id}/status",
-        json={"status": "PAUSED"},
+        # Confirmed as the real client is; the refusal path has its own tests.
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": str(deployment.id)},
+        },
     )
 
     assert resp.status_code == 200, "a committed status change must not report failure"
@@ -6828,7 +6832,12 @@ def test_activation_refuses_when_broker_cannot_confirm_demo(
     monkeypatch.setattr(viewer_app_module, "update_live_deployment_status", _should_not_run)
 
     resp = viewer_client.put(
-        "/api/live/deployments/11111111-1111-4111-8111-111111111111/status", json={"status": "ACTIVE"}
+        "/api/live/deployments/11111111-1111-4111-8111-111111111111/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": "11111111-1111-4111-8111-111111111111"},
+        },
+
     )
 
     assert resp.status_code == 409
@@ -6895,7 +6904,11 @@ def test_successful_activation_is_audited(viewer_client, monkeypatch):
 
     resp = viewer_client.put(
         "/api/live/deployments/33333333-3333-4333-8333-333333333333/status",
-        json={"status": "ACTIVE"},
+          json={
+              "status": "ACTIVE",
+              "confirmation": {"confirmed_deployment_id": "33333333-3333-4333-8333-333333333333"},
+          },
+
     )
 
     assert resp.status_code == 200
@@ -6953,7 +6966,12 @@ def test_activation_refreshes_verification_before_persisting(
     )
 
     resp = viewer_client.put(
-        "/api/live/deployments/22222222-2222-4222-8222-222222222222/status", json={"status": "ACTIVE"}
+        "/api/live/deployments/22222222-2222-4222-8222-222222222222/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": "22222222-2222-4222-8222-222222222222"},
+        },
+
     )
 
     assert resp.status_code == 200
@@ -6996,7 +7014,12 @@ def test_pause_does_not_call_broker_reverification(viewer_client, monkeypatch):
     )
 
     resp = viewer_client.put(
-        "/api/live/deployments/33333333-3333-4333-8333-333333333333/status", json={"status": "PAUSED"}
+        "/api/live/deployments/33333333-3333-4333-8333-333333333333/status",
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": "33333333-3333-4333-8333-333333333333"},
+        },
+
     )
 
     assert resp.status_code == 200
@@ -7016,7 +7039,10 @@ def test_repoint_endpoint_surfaces_safety_refusals(viewer_client, monkeypatch):
 
     resp = viewer_client.put(
         "/api/live/deployments/dep-1/account",
-        json={"account_id": "acc-2"},
+        json={
+            "account_id": "acc-2",
+            "confirmation": {"confirmed_deployment_id": "dep-1"},
+        },
     )
 
     assert resp.status_code == 400
@@ -7033,7 +7059,13 @@ def test_repoint_endpoint_returns_404_for_unknown_deployment(
     )
 
     resp = viewer_client.put(
-        "/api/live/deployments/missing/account", json={"account_id": "acc-2"}
+        "/api/live/deployments/missing/account",
+        # Confirms "missing", so the 404 is about the deployment, not a
+        # missing confirmation.
+        json={
+            "account_id": "acc-2",
+            "confirmation": {"confirmed_deployment_id": "missing"},
+        },
     )
 
     assert resp.status_code == 404

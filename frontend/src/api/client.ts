@@ -384,6 +384,9 @@ export const createLiveDeployment = (payload: LiveDeploymentCreateRequest) =>
     method: "POST",
     body: JSON.stringify(payload),
   });
+// The confirmation echoes the deployment id back. The server requires it, so
+// this is not decorative: it is what proves the operator confirmed *this* row
+// rather than the similar-looking one directly above it in the list.
 export const updateLiveDeploymentStatus = (
   deploymentId: string,
   status: LiveDeploymentStatus,
@@ -392,12 +395,18 @@ export const updateLiveDeploymentStatus = (
     `/live/deployments/${encodeURIComponent(deploymentId)}/status`,
     {
       method: "PUT",
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({
+        status,
+        confirmation: { confirmed_deployment_id: deploymentId },
+      }),
     },
   );
 export const deleteLiveDeployment = (deploymentId: string) =>
   fetchJSON<{ status: string; id: string }>(
-    `/live/deployments/${encodeURIComponent(deploymentId)}`,
+    // DELETE carries no body by convention, so the confirmation travels as a
+    // query parameter rather than in a JSON payload.
+    `/live/deployments/${encodeURIComponent(deploymentId)}` +
+      `?confirm_deployment_id=${encodeURIComponent(deploymentId)}`,
     { method: "DELETE" },
   );
 

@@ -175,6 +175,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
 from shared.models import (
+    LiveControlConfirmation,
     LiveDeploymentAccountUpdateRequest,
     LiveDeploymentConfig,
     LiveDeploymentCreateRequest,
@@ -5189,6 +5190,68 @@ def _live_control_actor(request: Request | None = None) -> str:
         except Exception:  # pragma: no cover - defensive
             header = None
     return str(header or "local-operator").strip() or "local-operator"
+
+
+async def _require_live_control_confirmation(
+    *,
+    action: str,
+    deployment_id: str,
+    confirmation: LiveControlConfirmation | None,
+    request: Request | None,
+) -> None:
+    """Refuse a state-changing live control that was not explicitly confirmed.
+
+    A confirmation dialog in the UI is not a control. The API is directly
+    callable, by a script, a stale tab, or anything that can reach the port - so
+    the constraint has to live here, on the server, or it constrains nothing but
+    the UI's own politeness.
+
+    Two things are checked, and the second is the one that matters. Presence
+    alone is satisfied by a client that always sends the field; echoing the
+    deployment id back proves the operator confirmed *this* row, which is the
+    mistake that actually happens when several similar deployments are stacked
+    in a list and the wrong one is deleted or re-pointed.
+
+    A missing confirmation is reported as 428 Precondition Required rather than
+    400, so a caller can tell "you did not confirm this" apart from "your
+    payload was malformed" - the first is a deliberate step, not a bug.
+    """
+    if confirmation is None:
+        await _audit_live_control(
+            action=action,
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no confirmation supplied"},
+        )
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                f"'{action}' changes live trading state and must be confirmed. "
+                f"Send confirmation.confirmed_deployment_id='{deployment_id}'."
+            ),
+        )
+    confirmed = str(confirmation.confirmed_deployment_id or "").strip()
+    if confirmed != str(deployment_id).strip():
+        await _audit_live_control(
+            action=action,
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "confirmation named a different deployment",
+                "confirmed_deployment_id": confirmed,
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Confirmation does not match this deployment "
+                f"(confirmed '{confirmed}', requested '{deployment_id}')."
+            ),
+        )
 
 
 async def _audit_live_control(
@@ -12603,6 +12666,13 @@ async def update_live_deployment_status_endpoint(
     requested_status = str(payload.status or "").strip().upper()
     pending_claims: list[LiveDeploymentSubmissionClaim] = []
 
+    await _require_live_control_confirmation(
+        action="deployment.status",
+        deployment_id=deployment_id,
+        confirmation=payload.confirmation,
+        request=None,
+    )
+
     if requested_status == "ACTIVE":
         deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
         if deployment is None:
@@ -12752,6 +12822,14 @@ async def update_live_deployment_account_endpoint(
         "/api/live/deployments/{deployment_id}/account",
         deployment_id=deployment_id,
     )
+    # Re-pointing changes which broker account real orders reach, so it carries
+    # the same confirmation requirement as arming and deleting.
+    await _require_live_control_confirmation(
+        action="deployment.account",
+        deployment_id=deployment_id,
+        confirmation=payload.confirmation,
+        request=None,
+    )
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_account,
@@ -12773,10 +12851,32 @@ async def update_live_deployment_account_endpoint(
 
 
 @app.delete("/api/live/deployments/{deployment_id}")
-async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
+async def delete_live_deployment_endpoint(
+    deployment_id: str,
+    confirm_deployment_id: str | None = Query(
+        default=None,
+        description=(
+            "Must equal deployment_id, so a stray or replayed delete request "
+            "cannot remove a row the operator did not name."
+        ),
+    ),
+) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}",
         deployment_id=deployment_id,
+    )
+    # Taken from the query string, not a body: DELETE carries no body by
+    # convention in most HTTP clients, so requiring one would make the control
+    # callable only from a hand-rolled request.
+    await _require_live_control_confirmation(
+        action="deployment.delete",
+        deployment_id=deployment_id,
+        confirmation=(
+            LiveControlConfirmation(confirmed_deployment_id=confirm_deployment_id)
+            if confirm_deployment_id is not None
+            else None
+        ),
+        request=None,
     )
     deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     if not deleted:

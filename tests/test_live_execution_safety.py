@@ -6162,7 +6162,12 @@ def test_pause_with_an_in_flight_submission_is_applied_and_reported_as_applied(
     )
 
     resp = viewer_client.put(
-        f"/api/live/deployments/{deployment_id}/status", json={"status": "PAUSED"}
+        f"/api/live/deployments/{deployment_id}/status",
+        # Confirmed as the real client is; the refusal path has its own tests.
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
     )
 
     assert resp.status_code == 200, "a committed status change must not report failure"
@@ -6324,7 +6329,12 @@ def test_pause_reports_an_indeterminate_outcome_not_a_clean_stop(
 
     # And the endpoint says so, instead of a clean stop.
     resp = viewer_client.put(
-        f"/api/live/deployments/{deployment_id}/status", json={"status": "PAUSED"}
+        f"/api/live/deployments/{deployment_id}/status",
+        # Confirmed as the real client is; the refusal path has its own tests.
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
     )
     assert resp.status_code == 200
     body = resp.json()
