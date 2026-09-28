@@ -72,7 +72,6 @@ class TestNitroInheritsRamJetWithoutDrift:
 
     @staticmethod
     def _loaded(bot: str):
-        import yaml
         from signal_bots.registry import get_signal_processor
 
         return get_signal_processor(bot, {}).config
