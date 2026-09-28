@@ -1,4 +1,6 @@
+import ast
 import asyncio
+import inspect
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -2622,3 +2624,57 @@ class TestStoppedDiscordServiceStatus:
         assert bots == {}
         assert "service-1" not in daemon._DISCORD_SERVICE_AUTH_BLOCKED_IDS
         assert updates == [("service-1", daemon.ServiceStatus.STOPPED)]
+
+
+
+class TestDiscordDispatchIsolation:
+    def test_one_failing_dispatch_does_not_end_the_batch(self, monkeypatch) -> None:
+        """A raise must skip the deployment, not the listener loop.
+
+        The dispatch was awaited bare inside the `async for` over the source's
+        signals, so any exception it did not catch internally - a broker timeout
+        from `get_market_data` - propagated out, disconnected the source, and sent
+        the outer retry loop round again. That rebuilds the source with empty
+        seen-id sets and priming then marks the window as already-seen, so every
+        *other* deployment on the account permanently lost the rest of that poll
+        batch. Silently, which is the worst part.
+
+        e7a4a40 fixed the same class of bug for a `return`, and the structural test
+        it added only forbids `return` inside the loop. It cannot see a raise, so
+        the invariant was never actually enforced.
+        """
+        source = inspect.getsource(daemon._run_discord_signal_listener_for_account)
+        tree = ast.parse(inspect.cleandoc(source))
+
+        # The dispatch must sit inside a try that catches Exception but
+        # re-raises CancelledError. A bare `try/finally` does not count: that
+        # disconnects the source on the way out and loses the batch, which is the
+        # bug. Nor does a handler that swallows CancelledError - the listener
+        # would never actually stop.
+        guarding = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            calls = [
+                child
+                for stmt in node.body
+                for child in ast.walk(stmt)
+                if isinstance(child, ast.Call)
+                and getattr(child.func, "id", "") == "_dispatch_discord_trade_signal"
+            ]
+            if not calls:
+                continue
+            # `asyncio.CancelledError` parses as an ast.Attribute, not a Name, so
+            # reading only `.id` silently misses the handler it is written in.
+            names = {
+                getattr(h.type, "id", None) or getattr(h.type, "attr", None)
+                for h in node.handlers
+            }
+            guarding.append("Exception" in names and "CancelledError" in names)
+
+        assert guarding, "the dispatch call was not found to inspect"
+        assert any(guarding), (
+            "the dispatch is still awaited without an Exception guard: one "
+            "deployment tearing down the account-wide listener loses the batch "
+            "for every other deployment, silently"
+        )

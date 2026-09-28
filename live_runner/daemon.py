@@ -2081,13 +2081,44 @@ async def _run_discord_signal_listener_for_account(
                 )
                 continue
 
-            await _dispatch_discord_trade_signal(
-                account_id,
-                adapter,
-                deployments_for_channel,
-                trade_signal,
-                accounts_env_values=accounts_env_values,
-            )
+            # One deployment must not be able to end the whole account's
+            # listener. This dispatch was awaited bare inside the `async for`, so
+            # any exception other than the ValueError it catches internally - a
+            # broker timeout from `get_market_data`, say - propagated out, hit the
+            # `finally`, disconnected the source, and sent the outer retry loop
+            # round again. That rebuilds the source with empty seen-id sets, and
+            # priming then marks the current window as already-seen, so every other
+            # deployment on this account, and every other channel it listens to,
+            # permanently loses the rest of that poll batch. It fails silently,
+            # which is the worst part.
+            #
+            # The invariant e7a4a40 recorded - skip the deployment, not the
+            # listener loop or the other deployments on the same account - was
+            # only ever enforced for `return`. It was never true for a raise.
+            try:
+                await _dispatch_discord_trade_signal(
+                    account_id,
+                    adapter,
+                    deployments_for_channel,
+                    trade_signal,
+                    accounts_env_values=accounts_env_values,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Discord signal could not be dispatched; continuing with the "
+                    "rest of the batch",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "discord_channel_id": channel_id,
+                            "deployment_ids": [
+                                str(item.id) for item in deployments_for_channel
+                            ],
+                        }
+                    },
+                )
     finally:
         await source.disconnect()
 
