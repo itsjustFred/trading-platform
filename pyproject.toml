@@ -109,3 +109,6 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "e2e: browser-level tests; need a Playwright browser and launch a real server",
+]
