@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -464,6 +464,7 @@ def _parse_trade_signal_from_message(
     *,
     default_timeframe: str,
     trusted_author_ids: Iterable[str] | None = None,
+    on_author_rejection: Callable[[str], None] | None = None,
 ) -> TradeSignal | None:
     """Parse a Discord message into a trade signal.
 
@@ -480,6 +481,8 @@ def _parse_trade_signal_from_message(
     if trusted is not None:
         author_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
         if not author_id or author_id not in trusted:
+            if on_author_rejection is not None:
+                on_author_rejection(author_id or "<missing>")
             logger.warning(
                 "Discord message rejected: author is not a trusted signal source",
                 extra={
@@ -641,6 +644,41 @@ class DiscordSignalSource(BaseSignalSource):
         self._run_task: asyncio.Task[None] | None = None
         self._seen_ids: dict[str, set[str]] = {}
         self._last_seen_message_ids: dict[str, str] = {}
+        # Author rejections, and the distinct authors that produced them.
+        #
+        # A mis-configured allowlist is otherwise silent: every message is
+        # rejected with a per-message WARNING, the service still reports
+        # connected, and the deployment still reports ACTIVE while never trading.
+        # That is indistinguishable from a strategy that stopped firing - the
+        # same signature as the market-calendar staleness budget and the stray
+        # `return` fixed elsewhere in this branch. Counting them gives an
+        # operator something to check, and lets the daemon log it once instead of
+        # once per message.
+        self._author_rejection_count = 0
+        self._rejected_author_ids: set[str] = set()
+
+    def _record_author_rejection(self, author_id: str) -> None:
+        """Note that a message was dropped because its author is not trusted.
+
+        Deliberately not logging here: the caller already logs each rejection,
+        and a busy channel would drown the log. This exists so the *pattern* -
+        every message rejected - is visible, not so each drop is counted twice.
+        """
+        self._author_rejection_count += 1
+        self._rejected_author_ids.add(str(author_id))
+
+    def author_rejection_summary(self) -> dict[str, Any]:
+        """How many messages were dropped for authorship, and by whom.
+
+        An operator who has just set ``DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS``
+        needs to know whether the value is right. A non-zero count with a single
+        distinct author usually means the allowlist is wrong for that bot, and
+        that bot is currently refusing every signal it receives.
+        """
+        return {
+            "rejected_count": int(self._author_rejection_count),
+            "rejected_author_ids": sorted(self._rejected_author_ids),
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -867,6 +905,7 @@ class DiscordSignalSource(BaseSignalSource):
             wrapped,
             default_timeframe=self.timeframe,
             trusted_author_ids=self.trusted_author_ids,
+            on_author_rejection=self._record_author_rejection,
         )
         if parsed is None:
             return

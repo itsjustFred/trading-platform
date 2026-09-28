@@ -2170,3 +2170,117 @@ class TestPerBotAuthorAllowlist:
                 self.ROCKETFUEL_AUTHOR,
                 self.NITRO_AUTHOR,
             }
+
+
+class TestAuthorRejectionIsCountable:
+    """A mis-configured allowlist is a silent stop, and now it is not silent.
+
+    `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS` is operator-set, and nothing in the
+    repository says which author belongs to which bot. So the realistic failure
+    when it is introduced is a *wrong* value: the bot then refuses every message
+    from its real author, logs one WARNING per message, and keeps reporting
+    connected while never trading.
+
+    That is the same signature as the two other silent-stop bugs on this branch -
+    the holiday-widened staleness budget and the stray `return` - where nothing
+    failed and every field still looked healthy. So the rejections are counted,
+    and the distinct authors recorded, which makes the pattern answerable without
+    reading a log.
+    """
+
+    NITRO_AUTHOR = "1484753770645553192"
+    WRONG_AUTHOR = "1469353101352767575"
+
+    def test_rejections_are_counted_and_the_author_recorded(self):
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        rejections: list[str] = []
+        allowlist = {self.WRONG_AUTHOR}  # the realistic misconfiguration
+
+        for _ in range(3):
+            _parse_trade_signal_from_message(
+                _live_channel_message(NITRO_OVERSOLD_MESSAGE),
+                default_timeframe="1h",
+                trusted_author_ids=allowlist,
+                on_author_rejection=rejections.append,
+            )
+
+        assert len(rejections) == 3
+        # The *real* author is reported, which is what tells the operator which
+        # value to put in the variable.
+        assert set(rejections) == {self.NITRO_AUTHOR}
+
+    def test_an_accepted_message_records_no_rejection(self):
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        rejections: list[str] = []
+        signal = _parse_trade_signal_from_message(
+            _live_channel_message(NITRO_OVERSOLD_MESSAGE),
+            default_timeframe="1h",
+            trusted_author_ids={self.NITRO_AUTHOR},
+            on_author_rejection=rejections.append,
+        )
+
+        assert signal is not None
+        assert rejections == []
+
+    def test_the_observer_is_optional(self):
+        """Backwards compatibility: the existing callers pass no observer."""
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        assert (
+            _parse_trade_signal_from_message(
+                _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=self.WRONG_AUTHOR),
+                default_timeframe="1h",
+                trusted_author_ids={self.NITRO_AUTHOR},
+            )
+            is None
+        )
+
+    def test_the_source_exposes_a_summary_for_operators(self):
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+        source = DiscordSignalSource(
+            bot_name="nitro",
+            token="t",
+            channel_id="c",
+            service_id="svc",
+            trusted_author_ids=[self.WRONG_AUTHOR],
+        )
+        # Nothing seen yet, so nothing to report. Asserted explicitly so a
+        # missing summary is a failure rather than an AttributeError elsewhere.
+        assert source.author_rejection_summary() == {
+            "rejected_count": 0,
+            "rejected_author_ids": [],
+        }
+
+    def test_a_rejected_author_never_reaches_a_deployment(self):
+        """The property that matters: the gate still refuses, whatever the
+        counting does."""
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        signal = _parse_trade_signal_from_message(
+            _live_channel_message(NITRO_OVERSOLD_MESSAGE),
+            default_timeframe="1h",
+            trusted_author_ids={self.NITRO_AUTHOR},
+            on_author_rejection=lambda _a: None,
+        )
+        assert signal is not None
+
+        refused = _parse_trade_signal_from_message(
+            _live_channel_message(
+                NITRO_OVERSOLD_MESSAGE, author_id=self.WRONG_AUTHOR
+            ),
+            default_timeframe="1h",
+            trusted_author_ids={self.NITRO_AUTHOR},
+            on_author_rejection=lambda _a: None,
+        )
+        assert refused is None
