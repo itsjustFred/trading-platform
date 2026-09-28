@@ -6866,8 +6866,8 @@ def test_activation_refuses_when_broker_cannot_confirm_demo(
 def test_successful_activation_is_audited(viewer_client, monkeypatch):
     """The applied change matters as much as the refused one: "what is armed, and
     who armed it" has to be answerable after the fact."""
-    import viewer.main as viewer_app_module
     import shared.database as database
+    import viewer.main as viewer_app_module
     from shared.models import LiveDeploymentConfig
 
     deployment = LiveDeploymentConfig(

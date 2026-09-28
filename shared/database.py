@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import NAMESPACE_URL, uuid4, uuid5 as _uuid5
+from uuid import NAMESPACE_URL, uuid4
+from uuid import uuid5 as _uuid5
 
 from sqlalchemy import (
     JSON,

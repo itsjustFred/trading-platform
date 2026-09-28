@@ -58,10 +58,10 @@ from shared.database import (
     list_live_deployments,
     list_services,
     live_account_submission_block_reason,
+    record_daemon_heartbeat,
     release_live_deployment_submission,
     save_live_balance,
     update_service_status,
-    record_daemon_heartbeat,
 )
 from shared.logging import get_logger
 from shared.models import (

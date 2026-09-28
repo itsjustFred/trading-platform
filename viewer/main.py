@@ -81,8 +81,6 @@ from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapt
 from runner.grid_identity import data_staleness_reason, read_identity
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
-    record_live_control_audit,
-    list_live_control_audit,
 )
 from shared.database import (
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
@@ -106,6 +104,7 @@ from shared.database import (
     list_backtest_metadata_rows,
     list_live_accounts,
     list_live_balances,
+    list_live_control_audit,
     list_live_deployment_submission_claims,
     list_live_deployments,
     list_live_deployments_for_account,
@@ -124,6 +123,7 @@ from shared.database import (
     migrate_json_to_sqlite,
     normalize_task_status,
     record_live_account_demo_verification,
+    record_live_control_audit,
     save_result_to_sqlite,
     update_live_deployment_account,
     update_live_deployment_status,
