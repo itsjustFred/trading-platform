@@ -32,7 +32,10 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
-from live_runner.service_discovery import discover_discord_bots_from_env
+from live_runner.service_discovery import (
+    discover_discord_bots_from_env,
+    validate_discord_channel_grouping,
+)
 from live_runner.signal_sources import (
     DiscordSignalSource,
     signal_is_fresh,
@@ -202,8 +205,39 @@ def _accounts_env_mtime(accounts_env: Path) -> int | None:
     return accounts_env_mtime(accounts_env)
 
 
+def _live_deployment_channel_ids() -> set[str]:
+    """Channel ids the live Discord deployments actually read."""
+    try:
+        rows = list_live_deployments()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not read live deployments for the grouping check: %r", exc)
+        return set()
+    channels: set[str] = set()
+    for row in rows or []:
+        config = getattr(row, "signal_config", None) or {}
+        channel_id = str(config.get("channel_id") or "").strip()
+        if channel_id:
+            channels.add(channel_id)
+    return channels
+
+
 def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
     discovered = discover_discord_bots_from_env()
+    # The (token, channel) grouping is inferred from naming, so it is checked
+    # rather than trusted. Two tokens on one channel would process every message
+    # twice, and a service or deployment on the wrong side of the pairing fails
+    # silently.
+    try:
+        grouping_problems = validate_discord_channel_grouping(
+            discovered,
+            deployment_channels=_live_deployment_channel_ids(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        grouping_problems = []
+        logger.warning("Could not validate the Discord channel grouping: %r", exc)
+    for problem in grouping_problems:
+        logger.error("Discord channel grouping is incoherent: %s", problem)
+
     discovered_names = [str(item.get("name") or "").strip().upper() for item in discovered]
     if log_summary:
         if discovered_names:
