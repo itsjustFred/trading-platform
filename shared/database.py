@@ -2964,9 +2964,18 @@ def update_live_deployment_account(
                 "(or pass allow_active=True once the listener is stopped)"
             )
 
+        # Only an unexpired lease is genuinely in flight. Counting every claim
+        # regardless of expiry meant a lease whose TTL had elapsed still blocked a
+        # re-point with "in-flight submissions; drain them first" -- an error the
+        # operator cannot act on, because there is nothing left to drain. The
+        # same expiry rule claim_live_deployment_submission uses to purge stale
+        # rows (see _utcnow_naive() above it) decides what counts here. This does
+        # not weaken the guard: a live claim's expires_at is in the future and is
+        # still counted.
         in_flight = session.exec(
             select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
-                LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment
+                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment)
+                & (LiveDeploymentSubmissionClaimModel.expires_at > _utcnow_naive())
             )
         ).one()
         if int(in_flight or 0) > 0:

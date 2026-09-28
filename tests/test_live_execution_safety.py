@@ -2138,6 +2138,19 @@ def test_repoint_deployment_enforces_safety_guards(isolated_db):
 
     # Once the submission has drained, the re-point succeeds and persists.
     assert database.release_live_deployment_submission("tok-inflight") is True
+
+    # An EXPIRED lease is not in flight either: its TTL elapsed, so there is
+    # nothing left to drain, and refusing with "drain them first" strands the
+    # operator on an error they cannot act on. The count used to include every
+    # claim regardless of expiry, so a stale row blocked the re-point until some
+    # later claim happened to purge it.
+    assert (
+        database.claim_live_deployment_submission(
+            created.id, "tok-expired", ttl_seconds=0.01
+        )
+        is True
+    )
+    time.sleep(0.05)
     moved = database.update_live_deployment_account(
         created.id, "acc-new", allow_active=True
     )
