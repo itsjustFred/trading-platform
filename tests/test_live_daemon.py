@@ -2404,3 +2404,109 @@ class TestOneDeploymentsConfigErrorDoesNotSilenceTheOthers:
             f"a bare return inside the per-deployment loop skips every later "
             f"deployment: {offenders}"
         )
+
+
+class TestStoppedDiscordServiceStatus:
+    """A cancelled listener must not leave `failed` standing as its status.
+
+    `ServiceStatus.STOPPED` was validated everywhere and written nowhere, so a
+    service that had failed kept claiming failure after the daemon cancelled its
+    listener. That record then described a process that no longer existed - the
+    mirror image of treating a 200 as a healthy service. A stale claim is not
+    safer than a missing one, because it is what an operator decides by.
+    """
+
+    def test_stopping_a_failed_service_records_stopped(self, monkeypatch) -> None:
+        updates: list[tuple[str, object]] = []
+
+        def _capture_update(service_id: str, status: object, **_kwargs) -> None:
+            updates.append((service_id, status))
+
+        monkeypatch.setattr(daemon, "update_service_status", _capture_update)
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.FAILED,
+                )
+            ],
+        )
+
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+            )
+        )
+
+        assert updates == [("service-1", daemon.ServiceStatus.STOPPED)]
+
+    def test_a_paused_service_stays_paused_because_that_is_operator_intent(
+        self, monkeypatch
+    ) -> None:
+        """Pausing is a decision. Overwriting it with STOPPED erases intent."""
+        updates: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(
+            daemon,
+            "update_service_status",
+            lambda service_id, status, **_kw: updates.append((service_id, status)),
+        )
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.PAUSED,
+                )
+            ],
+        )
+
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+                paused=True,
+            )
+        )
+
+        assert updates == []
+
+    def test_a_bookkeeping_failure_never_blocks_the_stop(self, monkeypatch) -> None:
+        """A status write must not be able to leak a cancelled listener task.
+
+        The stop path cancels first and records second on purpose: if recording
+        raised, the task would already be gone but the caller would see an
+        exception, and callers treat that as "the stop did not happen".
+        """
+        def _explode(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("database is down")
+
+        monkeypatch.setattr(daemon, "update_service_status", _explode)
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.FAILED,
+                )
+            ],
+        )
+
+        # Must not raise, even though the database is unreachable.
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+            )
+        )

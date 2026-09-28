@@ -2333,6 +2333,43 @@ def _cleanup_finished_discord_bot_tasks(discord_bot_tasks: dict[str, asyncio.Tas
             )
 
 
+def _record_discord_service_stopped(service_id: str, *, paused: bool) -> None:
+    """Write the status a stopped Discord service should actually show.
+
+    `ServiceStatus.STOPPED` was validated everywhere and written nowhere, so a
+    service that reached `failed` kept claiming failure after its listener had
+    been cancelled. The record then described a process that no longer existed -
+    the mirror image of the bug this repo keeps hitting, where a live answer is
+    read as the wrong kind of fact. A stale claim is not safer than a missing
+    one: it is what an operator decides by.
+
+    Three Discord services have read `failed` since 2026-09-26 while their
+    deployments have been PAUSED the whole time. The failure was real, but the
+    current state is `paused`, and conflating the two hides whether a later
+    re-arm worked.
+
+    A PAUSED service stays PAUSED: that is operator intent and must survive, which
+    is why this only ever writes STOPPED for services that are not already PAUSED.
+    """
+    service = next(
+        (item for item in list_services() if str(item.id) == service_id),
+        None,
+    )
+    if service is None or service.status == ServiceStatus.PAUSED:
+        return
+    if service.status == ServiceStatus.STOPPED:
+        return
+    try:
+        update_service_status(service_id, ServiceStatus.STOPPED)
+    except Exception as exc:  # pragma: no cover - defensive
+        # Bookkeeping only. Failing to record the stop must never stop a
+        # listener from being cancelled, or the daemon leaks tasks.
+        logger.warning(
+            "Could not record that a discord service stopped",
+            extra={"data": {"service_id": service_id, "error": repr(exc)}},
+        )
+
+
 async def _stop_discord_bot_service(
     service_id: str,
     *,
@@ -2353,6 +2390,7 @@ async def _stop_discord_bot_service(
             await source.disconnect(failed=False)
     _DISCORD_SERVICE_AUTH_BLOCKED_IDS.discard(service_id)
     _DISCORD_SERVICE_AUTH_BLOCKED_REASONS.pop(service_id, None)
+    _record_discord_service_stopped(service_id, paused=paused)
 
 
 def _running_discord_service_ids(discord_services: list[Service]) -> set[str]:
