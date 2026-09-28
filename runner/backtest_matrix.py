@@ -432,6 +432,7 @@ def run_backtest_matrix(
     data_dir: str = "",
     max_workers: int = 1,
     strategy_workers: int | None = None,
+    worker_budget: int | None = None,
     timeout_seconds: int = 1800,
     skip_existing: bool = False,
     use_subprocess: bool = False,
@@ -502,6 +503,37 @@ def run_backtest_matrix(
 
     strategy_worker_count = strategy_workers or min(len(entries), max(1, os.cpu_count() or 1))
     strategy_worker_count = max(1, min(strategy_worker_count, len(entries)))
+
+    # The two pools multiply. Each of the `strategy_worker_count` outer tasks
+    # calls run_backtest_grid, which builds its own pool of `max_workers`
+    # threads, and every one of those threads can hold several pandas frames. Both
+    # numbers are independently bounded and nothing related them, so
+    # `--max-workers 8` with four strategies asked for 32 concurrent workers on a
+    # 4-core host. That is the multiplication: it is a property of the request,
+    # not of any one worker, so it is bounded here, once, in the parent.
+    #
+    # A previous attempt at this guarded inside each worker instead. That is both
+    # more expensive and less reliable -- it is per-worker rather than per-run --
+    # and its tests were heavy enough to OOM-kill the host twice, so the work was
+    # discarded. This is O(1) arithmetic and spawns nothing.
+    # With a single strategy there is no second pool, so there is nothing to
+    # multiply and the request is honoured as given -- clamping it here would be a
+    # behaviour change nobody asked for, on a run that was never at risk.
+    worker_budget = max(1, worker_budget if worker_budget is not None else (os.cpu_count() or 1))
+    per_strategy_workers = max_workers
+    if strategy_worker_count > 1:
+        per_strategy_workers = max(1, min(max_workers, worker_budget // strategy_worker_count))
+    if per_strategy_workers < max_workers:
+        logger.info(
+            "Reducing per-strategy workers %d -> %d so the total stays within the "
+            "budget of %d (%d strategies x %d workers would be %d)",
+            max_workers,
+            per_strategy_workers,
+            worker_budget,
+            strategy_worker_count,
+            max_workers,
+            strategy_worker_count * max_workers,
+        )
     strategy_tasks = [
         {
             "entry": entry,
@@ -518,7 +550,7 @@ def run_backtest_matrix(
             "params": params,
             "output_dir": output_dir,
             "data_dir": data_dir,
-            "max_workers": max_workers,
+            "max_workers": per_strategy_workers,
             "timeout_seconds": timeout_seconds,
             "skip_existing": skip_existing,
             "use_subprocess": use_subprocess,
@@ -608,6 +640,9 @@ def run_backtest_matrix(
         "output_dir": str(output_dir),
         "data_dir": data_dir,
         "max_workers": max_workers,
+        "per_strategy_max_workers": per_strategy_workers,
+        "worker_budget": worker_budget,
+        "effective_total_workers": strategy_worker_count * per_strategy_workers,
         "strategy_workers": strategy_worker_count,
         "timeout_seconds": timeout_seconds,
         "skip_existing": skip_existing,
