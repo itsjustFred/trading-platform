@@ -28,6 +28,7 @@ from live_runner.base_adapter import (
 from live_runner.credential_env import (
     accounts_env_mtime,
     discord_bot_env_canonical_name,
+    discord_bot_env_key,
     load_accounts_env_values,
     resolve_env_value,
 )
@@ -1475,10 +1476,30 @@ def _resolve_discord_service_trusted_author_ids(
         # so each one trusts the *other* bots' authors: RocketFuel's bot posting
         # in Nitro's channel would be accepted and could trade Nitro. The shared
         # var stays as the fallback for single-bot setups.
-        env_key = f"DISCORD_BOT_{str(service.name or '').strip().upper()}_TRUSTED_AUTHOR_IDS"
-    raw_env = resolve_env_value(accounts_env_values, env_key)
-    if not raw_env:
-        raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
+        # Through the canonicalisation helper, as `discord_bot_env_canonical_name`
+        # requires of every per-bot key. Building it by hand meant a service named
+        # `NITRO-BOT` looked for a variable the operator could never have set, found
+        # nothing, and silently fell back to the shared list - i.e. it fell open to
+        # exactly the cross-bot trust the per-bot var exists to prevent, with no
+        # log line. The deployment path already did this, so one variable resolved
+        # two different ways in the same file.
+        env_key = discord_bot_env_key(service.name, "TRUSTED_AUTHOR_IDS")
+    # Presence is tested against the mapping directly, not via
+    # `resolve_env_value`, which returns "" for both an absent key and a
+    # present-but-blank one - so a truthiness test cannot tell "this bot trusts
+    # nobody" from "not configured", and the empty case used to fall through to
+    # the shared list. That widened Nitro to all three bots' authors, and
+    # inconsistently: `...,` was truthy and failed closed while `` was falsy and
+    # opened up, so the safe configuration was unreachable.
+    #
+    # Deliberately does not consult os.environ. This is an allowlist, and an
+    # inherited process variable must not silently become one.
+    if accounts_env_values is not None and env_key in accounts_env_values:
+        per_bot = str(accounts_env_values.get(env_key) or "").strip()
+        return _trusted_author_ids_from_config(
+            item.strip() for item in per_bot.split(",") if item.strip()
+        )
+    raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
     if not raw_env:
         return set()
     return _trusted_author_ids_from_config(

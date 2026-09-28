@@ -753,7 +753,18 @@ class DiscordSignalSource(BaseSignalSource):
         self._consecutive_author_rejections += 1
         self._rejected_author_ids.add(str(author_id))
         if self._consecutive_author_rejections >= AUTHOR_REJECTION_STREAK_THRESHOLD:
-            return self._flag_author_rejection_streak()
+            # The decision is made HERE, in the caller's frame, and the streak is
+            # latched here too. The coroutine below runs on a later pass of the
+            # event loop, and by then `_record_author_accepted` may have reset the
+            # latch - so re-testing `_author_rejection_alerted` inside it flagged a
+            # service FAILED for a streak that no longer existed, stopping a bot
+            # that had just accepted a message from its real author. That is the
+            # allowlist proving itself correct and being failed for it.
+            if self._author_rejection_alerted:
+                return None
+            self._author_rejection_alerted = True
+            consecutive = self._consecutive_author_rejections
+            return self._flag_author_rejection_streak(consecutive_rejections=consecutive)
         return None
 
     def _record_author_accepted(self) -> None:
@@ -767,12 +778,12 @@ class DiscordSignalSource(BaseSignalSource):
         self._consecutive_author_rejections = 0
         self._author_rejection_alerted = False
 
-    async def _flag_author_rejection_streak(self) -> None:
+    async def _flag_author_rejection_streak(self, *, consecutive_rejections: int) -> None:
         """Note that a message was dropped because its author is not trusted.
 
-        Deliberately not logging here: the caller already logs each rejection,
-        and a busy channel would drown the log. This exists so the *pattern* -
-        every message rejected - is visible, not so each drop is counted twice.
+        Deliberately not logging each rejection here: the caller already logs
+        every one, and a busy channel would drown the log. This exists so the
+        *pattern* - every message rejected - is visible.
 
         Once a run of consecutive rejections clears the threshold the service is
         marked FAILED. A bot refusing every message it receives is not healthy,
@@ -781,27 +792,26 @@ class DiscordSignalSource(BaseSignalSource):
         than refusing to ingest is the right lever: the operator sees it on the
         dashboard with the rejected author ids attached, and nothing about the
         safety gates changes.
+
+        `consecutive_rejections` is passed in rather than read from self, because
+        by the time this runs the loop may have already accepted a message and
+        reset the streak. The count reported is the one that triggered the alert.
         """
-        if not self._author_rejection_alerted:
-            self._author_rejection_alerted = True
-            logger.error(
-                "Discord bot rejected every recent message for authorship; "
-                "the trusted_author_ids allowlist is probably wrong for this bot",
-                extra={
-                    "data": {
-                        "service_id": str(self.service_id or ""),
-                        "bot_name": str(self.bot_name or ""),
-                        "rejected_count": self._author_rejection_count,
-                        "consecutive_rejections": (
-                            self._consecutive_author_rejections
-                        ),
-                        "rejected_author_ids": sorted(self._rejected_author_ids),
-                        "trusted_author_ids": sorted(self.trusted_author_ids),
-                    }
-                },
-            )
-            await self._set_service_status(ServiceStatus.FAILED)
-        return None
+        logger.error(
+            "Discord bot rejected every recent message for authorship; "
+            "the trusted_author_ids allowlist is probably wrong for this bot",
+            extra={
+                "data": {
+                    "service_id": str(self.service_id or ""),
+                    "bot_name": str(self.bot_name or ""),
+                    "rejected_count": self._author_rejection_count,
+                    "consecutive_rejections": consecutive_rejections,
+                    "rejected_author_ids": sorted(self._rejected_author_ids),
+                    "trusted_author_ids": sorted(self.trusted_author_ids),
+                }
+            },
+        )
+        await self._set_service_status(ServiceStatus.FAILED)
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.

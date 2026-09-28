@@ -2426,6 +2426,87 @@ class TestRejectionStreakFailsTheService:
             )
         await _asyncio.sleep(0)
 
+    def test_the_alert_reports_the_streak_that_triggered_it(self, caplog) -> None:
+        """The log must not contradict itself.
+
+        The alert is a coroutine, so it runs after `_record_author_accepted` has
+        already reset the streak. It used to read the count off `self` at that
+        point and print `consecutive_rejections: 0` in the very line claiming
+        every message was rejected - a record that says both "every message was
+        rejected" and "zero in a row", which is how a correct alert gets
+        dismissed as noise.
+
+        The count is now captured when the threshold is crossed, in the caller's
+        frame, and passed in. Note the alert still fires here, and that is
+        correct: three consecutive messages genuinely were rejected, so the
+        service genuinely is refusing everything it is being sent.
+        """
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+
+        async def _reject_then_accept() -> None:
+            # One poll batch: the parser is synchronous, so every rejection is
+            # scheduled back to back with no await between them, and the
+            # acceptance lands before any of those coroutines has run.
+            scheduled = [
+                source._record_author_rejection(self.NITRO_AUTHOR)
+                for _ in range(AUTHOR_REJECTION_STREAK_THRESHOLD)
+            ]
+            source._record_author_accepted()
+            for coro in scheduled:
+                if coro is not None:
+                    await coro
+
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(_reject_then_accept())
+
+        alerts = [r for r in caplog.records if "rejected every recent message" in r.message]
+        assert alerts, "the streak alert did not fire"
+        reported = alerts[-1].data["consecutive_rejections"]
+        assert reported == AUTHOR_REJECTION_STREAK_THRESHOLD, (
+            f"alert reported {reported} consecutive rejections for a streak of "
+            f"{AUTHOR_REJECTION_STREAK_THRESHOLD}; the log contradicts itself"
+        )
+        # And the accept did land, so the live state is a healthy streak again.
+        assert source._consecutive_author_rejections == 0
+        assert source._author_rejection_alerted is False
+
+    def test_one_alert_per_streak_not_one_per_message(self):
+        """The latch is taken when the threshold is crossed, not when it runs.
+
+        Without the schedule-time latch the coroutine re-tests the flag on a later
+        pass of the loop, so a bot that is still rejecting everything writes
+        FAILED repeatedly - once per message past the threshold. The service
+        status is idempotent so the end state looks the same, which is exactly
+        why this needed a direct count rather than an assertion about status.
+        """
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+        count = AUTHOR_REJECTION_STREAK_THRESHOLD * 3
+
+        async def _reject_all() -> None:
+            scheduled = [
+                source._record_author_rejection(self.NITRO_AUTHOR)
+                for _ in range(count)
+            ]
+            for coro in scheduled:
+                if coro is not None:
+                    await coro
+
+        asyncio.run(_reject_all())
+
+        failures = [s for s in self.statuses if "FAILED" in s]
+        assert len(failures) == 1, (
+            f"{len(failures)} alerts for one continuous streak of {count}; "
+            "a busy channel would rewrite the status on every message"
+        )
+
     def test_a_wrong_allowlist_fails_the_service(self):
         from live_runner.signal_sources.discord_source import (
             AUTHOR_REJECTION_STREAK_THRESHOLD,
@@ -2641,3 +2722,80 @@ class TestObserveChannelAuthors:
 
         rendered = repr(rows)
         assert "super-secret-token-value" not in rendered
+
+def test_per_bot_allowlist_key_is_canonicalised() -> None:
+    """One variable must not resolve two ways in one file.
+
+    `discord_bot_env_canonical_name` documents that every per-bot key has to be
+    built through the helper, or "the keys for two credentials of the same bot
+    silently diverge". The author allowlist built its key by hand, so a service
+    named `NITRO-BOT` looked for a variable no operator could ever set, found
+    nothing, and fell back to the shared list - falling open to exactly the
+    cross-bot trust the per-bot var exists to prevent, with no log line. The
+    deployment path in the same file already used the helper.
+    """
+    from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+    service = SimpleNamespace(
+        id="svc",
+        name="NITRO-BOT",
+        config={},
+        status=daemon.ServiceStatus.RUNNING,
+    )
+    env = {
+        "DISCORD_BOT_NITRO_BOT_TRUSTED_AUTHOR_IDS": "9",
+        "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+    }
+
+    resolved = _resolve_discord_service_trusted_author_ids(
+        service, accounts_env_values=env
+    )
+
+    assert resolved == {"9"}, (
+        f"canonicalised key was not used, so the bot fell back to the shared "
+        f"list: {sorted(resolved)}"
+    )
+
+
+def test_an_empty_per_bot_allowlist_means_trusts_nobody() -> None:
+    """An operator must be able to express the fail-closed state.
+
+    `DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS=` is falsy, so the old `if not raw_env`
+    check fell through to the shared list and widened Nitro to all three bots'
+    authors - while `DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS=,` (also empty) took the
+    other branch and failed closed. The safe configuration was unreachable, and
+    the commit message claimed "a variable that is set never falls back to a
+    broader one".
+    """
+    from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+    service = SimpleNamespace(
+        id="svc", name="NITRO", config={}, status=daemon.ServiceStatus.RUNNING
+    )
+    env = {
+        "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "",
+        "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+    }
+
+    assert _resolve_discord_service_trusted_author_ids(
+        service, accounts_env_values=env
+    ) == set(), "an explicitly empty per-bot allowlist widened to the shared list"
+
+
+def test_an_unset_per_bot_allowlist_still_falls_back_to_shared() -> None:
+    """Absent is not the same as empty, and the shared list stays a real fallback.
+
+    Single-bot setups configure only the shared variable; that must keep working,
+    or the change above would break every deployment that never opted in.
+    """
+    from live_runner.daemon import _resolve_discord_service_trusted_author_ids
+
+    service = SimpleNamespace(
+        id="svc", name="NITRO", config={}, status=daemon.ServiceStatus.RUNNING
+    )
+
+    resolved = _resolve_discord_service_trusted_author_ids(
+        service, accounts_env_values={"DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3"}
+    )
+
+    assert resolved == {"1", "2", "3"}
