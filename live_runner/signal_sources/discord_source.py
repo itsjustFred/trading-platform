@@ -89,7 +89,42 @@ _PRICE_LABEL_RE = re.compile(
 _DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 _AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 _ACTION_BUY_RE = re.compile(r"\bbuy\b|\blong\b", re.IGNORECASE)
-_ACTION_SELL_RE = re.compile(r"\bsell\b|\bshort\b|\bmomentum\s*reversal\b", re.IGNORECASE)
+# An action word only decides direction when the message is actually a signal.
+# Matched bare, "sellers are short-term weak" inside an unambiguous buy message
+# flipped it to a sell - and a sell a bot accepts is a real short position.
+#
+# Two shapes count as an explicit sell signal: the action word next to the word
+# "signal" ("sell signal", "signal: SELL"), or a momentum-reversal phrase. A
+# bare trailing action word after a symbol and price is also a signal, but only
+# when the word is the *directive* ("SELL EURUSD"), not a noun phrase describing
+# the market ("sellers are weak", "short covering"). `_explicit_sell_action`
+# below keeps that distinction; requiring "signal" alone would have silently
+# dropped the plain "SELL EURUSD" form, which is a regression, not a tightening.
+_ACTION_SELL_RE = re.compile(
+    r"\b(?:sell|short)\s+signal\b"
+    r"|\bsignal\s*(?:is|:)?\s*\b(?:sell|short)\b"
+    r"|\bmomentum\s*reversal\b"
+    r"|^\s*(?:sell|short)\b",
+    re.IGNORECASE,
+)
+# The unambiguous directive forms, kept separate so the noun check below can
+# allow them even when a noun phrase is also present.
+_EXPLICIT_SELL_SIGNAL_RE = re.compile(
+    r"\b(?:sell|short)\s+signal\b"
+    r"|\bsignal\s*(?:is|:)?\s*\b(?:sell|short)\b",
+    re.IGNORECASE,
+)
+# Noun-phrase and participle forms that describe the market rather than issue an
+# instruction. Checked before _ACTION_SELL_RE so "sellers", "short-term" and
+# "short covering" cannot be read as a directive.
+_SELL_AS_NOUN_RE = re.compile(
+    r"\bsellers?\b"
+    r"|\bshorts\b"
+    r"|\bshort[-\s]term\b"
+    r"|\bshort\s+covering\b"
+    r"|\bcovering\b",
+    re.IGNORECASE,
+)
 _MOMENTUM_REVERSAL_RE = re.compile(r"momentum\s*reversal", re.IGNORECASE)
 _GOLDEN_CROSS_RE = re.compile(r"golden\s*cross", re.IGNORECASE)
 _DEATH_CROSS_RE = re.compile(r"death\s*cross", re.IGNORECASE)
@@ -296,12 +331,30 @@ def _is_well_formed_price_token(raw_price: str) -> bool:
     return all(len(part) == 3 and part.isdigit() for part in parts[1:])
 
 
+def _reads_as_sell_directive(content: str) -> bool:
+    """True when the message issues a sell, rather than merely mentioning one.
+
+    A noun phrase ("sellers are weak", "short covering") describes the market;
+    only a directive ("SELL EURUSD", "sell signal") is an instruction. Keeping
+    this in one place matters because the detector and the action resolver both
+    need the same verdict - when they disagreed, a buy message with "sellers" in
+    it was typed as a sell.
+    """
+    if _SELL_AS_NOUN_RE.search(content):
+        # The noun form only disqualifies an incidental match. An explicit
+        # "sell signal" alongside it is still an instruction.
+        if _EXPLICIT_SELL_SIGNAL_RE.search(content):
+            return True
+        return False
+    return bool(_ACTION_SELL_RE.search(content))
+
+
 def _is_ramjet_signal(content: str) -> bool:
     return bool(_RAMJET_OVERSOLD_RE.search(content) and _BUY_SIGNAL_RE.search(content))
 
 
 def _detect_rocket_fuel_signal_type(content: str) -> str | None:
-    if _MOMENTUM_REVERSAL_RE.search(content) or _ACTION_SELL_RE.search(content):
+    if _MOMENTUM_REVERSAL_RE.search(content) or _reads_as_sell_directive(content):
         return "momentum_reversal"
     if _GOLDEN_CROSS_RE.search(content):
         return "golden_cross"
@@ -321,7 +374,7 @@ def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
         return "sell"
     if signal_type in {"oversold_buy", "golden_cross"}:
         return "buy"
-    if _ACTION_SELL_RE.search(content):
+    if _reads_as_sell_directive(content):
         return "sell"
     if _ACTION_BUY_RE.search(content):
         return "buy"

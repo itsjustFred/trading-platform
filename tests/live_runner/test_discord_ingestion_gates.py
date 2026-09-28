@@ -1739,3 +1739,148 @@ def test_message_with_an_unreadable_timestamp_yields_no_received_at() -> None:
     assert "received_at" not in signal.metadata
     assert signal.metadata["discord_received_at_unreadable"] is True
     assert signal.metadata["source"] == "discord_nitro"
+
+
+class TestNitroGrammarContract:
+    """Nitro is BUY-only, but the Discord parser is shared across all three bots.
+
+    The backlog framed this as "validate Nitro grammar against a reference
+    implementation and a real message export", both of which are missing. What
+    is actually testable without either is the contract the code *does* encode,
+    and it turns out to have a real gap:
+
+    ``_detect_rocket_fuel_signal_type`` returns ``momentum_reversal`` for a
+    momentum-reversal message, and ``_resolve_action`` maps that to **sell**. The
+    shared parser is not per-bot, so a momentum-reversal message in the Nitro
+    channel produces a sell signal, which Nitro's own processor then refuses.
+
+    That refusal is safe - the daemon catches the ValueError and drops the signal
+    - but it is a *silent* drop: the operator sees no trade and no explanation
+    while the parser logs nothing either, because the parser never knew the
+    deployment was BUY-only.
+
+    These tests pin what the code does today, so the behaviour cannot change
+    unnoticed, and they make the asymmetry explicit rather than leaving it to be
+    rediscovered. The real-message validation still needs an export.
+    """
+
+    @staticmethod
+    def _parse(content: str):
+        from live_runner.signal_sources.discord_source import (
+            _detect_rocket_fuel_signal_type,
+            _resolve_action,
+        )
+
+        signal_type = _detect_rocket_fuel_signal_type(content)
+        return signal_type, _resolve_action(content, signal_type=signal_type)
+
+    def test_nitro_watchlist_buy_signal_is_recognised(self):
+        """The Nitro-specific pattern in the oversold regex."""
+        signal_type, action = self._parse("Nitro watchlist — buy signal EURUSD @ 1.0850")
+
+        assert signal_type == "oversold_buy"
+        assert action == "buy"
+
+    def test_nitro_watchlist_survives_both_dash_spellings(self):
+        """The regex accepts an em dash or a hyphen. Only the em-dash form was
+        ever exercised, so a change to one spelling would have been invisible."""
+        from live_runner.signal_sources.discord_source import _OVERSOLD_RE
+
+        for content in (
+            "Nitro watchlist — buy signal",
+            "Nitro watchlist - buy signal",
+        ):
+            assert _OVERSOLD_RE.search(content), content
+
+    def test_ramjet_shape_also_parses_as_buy(self):
+        signal_type, action = self._parse("EURUSD is now oversold buy signal")
+
+        assert signal_type == "oversold_buy"
+        assert action == "buy"
+
+    def test_momentum_reversal_parses_to_sell_regardless_of_bot(self):
+        """The asymmetry, stated plainly.
+
+        The parser has no per-bot awareness, so a momentum-reversal message
+        yields a sell no matter which deployment consumes it. For RocketFuel that
+        is the intent. For Nitro it is a signal the processor will refuse.
+
+        Documenting it as a test means a future change to the parser - making it
+        bot-aware, say - has to update this deliberately rather than silently
+        altering Nitro's behaviour.
+        """
+        signal_type, action = self._parse("EURUSD momentum reversal, short signal")
+
+        assert signal_type == "momentum_reversal"
+        assert action == "sell"
+
+    def test_nitro_refuses_that_sell_downstream(self):
+        """End of the chain: the BUY-only gate catches what the parser produced.
+
+        This is the reason the asymmetry above is safe rather than dangerous.
+        """
+        from signal_bots.registry import get_signal_processor
+
+        processor = get_signal_processor("nitro", {})
+        with pytest.raises(ValueError, match="BUY|LONG"):
+            processor._normalize_buy_action("sell")
+
+    def test_sell_bearing_words_do_not_flip_a_buy_message(self):
+        """A word in prose must not reverse the direction of a real buy signal.
+
+        This is a regression test for a live-trading bug. ``_ACTION_SELL_RE``
+        used to match the bare words "sell" and "short" anywhere, and
+        ``_detect_rocket_fuel_signal_type`` consults it *before* the oversold
+        check. So an unambiguous RamJet buy message whose commentary mentioned
+        sellers - "EURUSD is now oversold buy signal - sellers short-term weak" -
+        was typed ``momentum_reversal`` and resolved to **sell**.
+
+        RocketFuel accepts sell actions, so that was not a dropped signal: it was
+        a real short position opened on a message that said buy. Nitro refused it
+        as BUY-only, which is the only reason the asymmetry was ever visible.
+        """
+        for content in (
+            "EURUSD is now oversold buy signal - sellers short-term weak",
+            "EURUSD is now oversold buy signal, short covering",
+            "EURUSD is now oversold buy signal; no shorts here",
+        ):
+            signal_type, action = self._parse(content)
+            assert action == "buy", f"{content!r} was typed {signal_type!r}"
+
+    def test_explicit_sell_phrases_are_still_sells(self):
+        """Narrowing the action regex must not lose genuine sell signals."""
+        for content in (
+            "EURUSD sell signal",
+            "EURUSD short signal",
+            "EURUSD momentum reversal",
+            "Signal: SELL EURUSD",
+        ):
+            _signal_type, action = self._parse(content)
+            assert action == "sell", content
+
+    def test_bare_directive_sell_forms_still_parse(self):
+        """Guards the fix against over-tightening.
+
+        An earlier attempt at this fix required the word "signal" next to the
+        action word, which looked safer and was actually a regression: the plain
+        "SELL EURUSD" form stopped resolving entirely, silently. A buy message
+        mentioning sellers was fixed by dropping a real sell signal, which is not
+        a trade-off worth making. These are the forms that must keep working.
+        """
+        for content in ("SELL EURUSD", "short EURUSD", "SELL: EURUSD"):
+            _signal_type, action = self._parse(content)
+            assert action == "sell", content
+
+    def test_prose_noun_forms_are_not_directives(self):
+        for content in (
+            "sellers are weak into the close",
+            "short-term weakness in EURUSD",
+            "short covering underway",
+        ):
+            _signal_type, action = self._parse(content)
+            assert action is None, f"{content!r} was read as {action!r}"
+
+    def test_alert_only_messages_stay_non_trading(self):
+        for content in ("EURUSD is overbought", "death cross warning EURUSD"):
+            _signal_type, action = self._parse(content)
+            assert action is None, content
