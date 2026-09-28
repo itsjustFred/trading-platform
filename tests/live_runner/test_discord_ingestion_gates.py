@@ -3012,8 +3012,6 @@ class TestAuthorDiscoveryRecord:
     """
 
     def _script(self):
-        from live_runner import service_discovery  # noqa: F401
-
         import importlib.util
         from pathlib import Path
 
@@ -3080,7 +3078,6 @@ class TestAuthorDiscoveryRecord:
         location - the same "test something other than the thing" trap, twelfth
         instance.
         """
-        import argparse
         import subprocess
 
         module = self._script()
