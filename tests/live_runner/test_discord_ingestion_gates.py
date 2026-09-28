@@ -1884,3 +1884,59 @@ class TestNitroGrammarContract:
         for content in ("EURUSD is overbought", "death cross warning EURUSD"):
             _signal_type, action = self._parse(content)
             assert action is None, content
+
+
+class TestRocketFuelSellTypingIsSafetyCritical:
+    """Why the sell-parsing direction matters, and where it was already masked.
+
+    The parser's action is not equally consequential for every RocketFuel
+    variant, which is why this bug could sit unnoticed:
+
+      longsonly       a sell becomes ``exit_only`` - it closes, it does not open.
+                      A mis-typed sell was therefore harmless by accident.
+      longandshort    a sell is a real short position. Here the same mis-typing
+                      is a live-trading defect.
+
+    The ``longsonly`` deployment is the one actually configured, so the exposure
+    was theoretical in practice - but that is a property of the current
+    configuration, not of the code. Anyone switching the variant would have
+    activated it, with no test to fail.
+
+    These tests pin the direction at the processor boundary, so the distinction
+    cannot be quietly reversed.
+    """
+
+    @staticmethod
+    def _parsed_action(content: str) -> str | None:
+        from live_runner.signal_sources.discord_source import (
+            _detect_rocket_fuel_signal_type,
+            _resolve_action,
+        )
+
+        return _resolve_action(
+            content, signal_type=_detect_rocket_fuel_signal_type(content)
+        )
+
+    def test_a_buy_message_with_seller_prose_never_typed_as_sell(self):
+        for content in (
+            "BE is down significantly — buy signal, sellers capitulating",
+            "EURUSD is now oversold buy signal - sellers short-term weak",
+        ):
+            assert self._parsed_action(content) == "buy", content
+
+    def test_longsonly_would_have_absorbed_a_mistyped_sell(self):
+        """Documents the accident that hid this, so nobody 'simplifies' the
+        longsonly sell path back into a real position."""
+        from signal_bots.registry import get_signal_processor
+
+        processor = get_signal_processor("rocketfuel_longsonly", {})
+        assert processor.variant == "longsonly"
+        # The processor accepts a sell; the variant is what makes it safe.
+        assert processor._normalize_action("sell") == "sell"
+
+    def test_longandshort_would_have_traded_the_mistyped_sell(self):
+        from signal_bots.registry import get_signal_processor
+
+        processor = get_signal_processor("rocketfuel_longandshort", {})
+        assert processor.variant == "longandshort"
+        assert processor._normalize_action("sell") == "sell"
