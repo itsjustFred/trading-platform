@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import re
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -459,12 +460,40 @@ def _parse_timestamp(raw_timestamp: str | None) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
+# Consecutive author-rejected messages before the service is called unhealthy.
+# Low enough that a single impersonation attempt cannot fail a healthy bot, high
+# enough that a systematically wrong allowlist is caught on the first burst of
+# real messages rather than days later.
+AUTHOR_REJECTION_STREAK_THRESHOLD = 3
+
+# A coroutine produced by a sync caller. The running loop is the daemon's, so the
+# work still happens; with no loop (a synchronous test) it is discarded with a
+# clear message rather than raising "never awaited".
+_observed_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _schedule(coro: Any) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        logger.warning(
+            "Author-rejection observer produced work with no running loop; "
+            "discarded (synchronous caller)"
+        )
+        return
+    task = loop.create_task(coro)
+    _observed_tasks.add(task)
+    task.add_done_callback(_observed_tasks.discard)
+
+
 def _parse_trade_signal_from_message(
     message: Any,
     *,
     default_timeframe: str,
     trusted_author_ids: Iterable[str] | None = None,
-    on_author_rejection: Callable[[str], None] | None = None,
+    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None = None,
+    on_author_accepted: Callable[[], Any] | None = None,
 ) -> TradeSignal | None:
     """Parse a Discord message into a trade signal.
 
@@ -482,7 +511,9 @@ def _parse_trade_signal_from_message(
         author_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
         if not author_id or author_id not in trusted:
             if on_author_rejection is not None:
-                on_author_rejection(author_id or "<missing>")
+                result = on_author_rejection(author_id or "<missing>")
+                if inspect.isawaitable(result):
+                    _schedule(result)
             logger.warning(
                 "Discord message rejected: author is not a trusted signal source",
                 extra={
@@ -495,6 +526,9 @@ def _parse_trade_signal_from_message(
                 },
             )
             return None
+
+    if on_author_accepted is not None:
+        on_author_accepted()
 
     signal_type = None
     if _is_ramjet_signal(content):
@@ -656,16 +690,72 @@ class DiscordSignalSource(BaseSignalSource):
         # once per message.
         self._author_rejection_count = 0
         self._rejected_author_ids: set[str] = set()
+        self._consecutive_author_rejections = 0
+        self._author_rejection_alerted = False
 
     def _record_author_rejection(self, author_id: str) -> None:
+        """Count the rejection synchronously; only the status write is deferred.
+
+        The caller is a synchronous parser, so it can only *schedule* an
+        observer. Doing the counting inside the coroutine made the streak race
+        the loop: three rapid messages all read a streak of zero, because none of
+        the scheduled bodies had run yet. Counting here - in the caller's own
+        frame - makes the state immediately consistent, and only the DB write is
+        allowed to lag.
+        """
+        self._author_rejection_count += 1
+        self._consecutive_author_rejections += 1
+        self._rejected_author_ids.add(str(author_id))
+        if self._consecutive_author_rejections >= AUTHOR_REJECTION_STREAK_THRESHOLD:
+            return self._flag_author_rejection_streak()
+        return None
+
+    def _record_author_accepted(self) -> None:
+        """An accepted message proves the allowlist is right for this bot.
+
+        It ends any rejection streak and un-latches the failure alert, so
+        scattered impersonation attempts across a day can never accumulate into a
+        false alarm. Latched rather than reported continuously for the same
+        reason the rejection alert is: one write, and a clear state.
+        """
+        self._consecutive_author_rejections = 0
+        self._author_rejection_alerted = False
+
+    async def _flag_author_rejection_streak(self) -> None:
         """Note that a message was dropped because its author is not trusted.
 
         Deliberately not logging here: the caller already logs each rejection,
         and a busy channel would drown the log. This exists so the *pattern* -
         every message rejected - is visible, not so each drop is counted twice.
+
+        Once a run of consecutive rejections clears the threshold the service is
+        marked FAILED. A bot refusing every message it receives is not healthy,
+        and leaving it reporting RUNNING is what makes a wrong allowlist look
+        like a strategy that simply stopped firing. Failing the *service* rather
+        than refusing to ingest is the right lever: the operator sees it on the
+        dashboard with the rejected author ids attached, and nothing about the
+        safety gates changes.
         """
-        self._author_rejection_count += 1
-        self._rejected_author_ids.add(str(author_id))
+        if not self._author_rejection_alerted:
+            self._author_rejection_alerted = True
+            logger.error(
+                "Discord bot rejected every recent message for authorship; "
+                "the trusted_author_ids allowlist is probably wrong for this bot",
+                extra={
+                    "data": {
+                        "service_id": str(self.service_id or ""),
+                        "bot_name": str(self.bot_name or ""),
+                        "rejected_count": self._author_rejection_count,
+                        "consecutive_rejections": (
+                            self._consecutive_author_rejections
+                        ),
+                        "rejected_author_ids": sorted(self._rejected_author_ids),
+                        "trusted_author_ids": sorted(self.trusted_author_ids),
+                    }
+                },
+            )
+            await self._set_service_status(ServiceStatus.FAILED)
+        return None
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.
@@ -906,6 +996,7 @@ class DiscordSignalSource(BaseSignalSource):
             default_timeframe=self.timeframe,
             trusted_author_ids=self.trusted_author_ids,
             on_author_rejection=self._record_author_rejection,
+            on_author_accepted=self._record_author_accepted,
         )
         if parsed is None:
             return

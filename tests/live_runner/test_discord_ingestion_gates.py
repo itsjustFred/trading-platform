@@ -5,6 +5,7 @@ campaign Decision Record: ingestion trusts exactly one explicitly configured bot
 ID per source; that check is the source gate.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -2284,3 +2285,160 @@ class TestAuthorRejectionIsCountable:
             on_author_rejection=lambda _a: None,
         )
         assert refused is None
+
+
+class TestRejectionStreakFailsTheService:
+    """Counting rejections is only useful if it reaches the operator.
+
+    The counter alone would sit in memory. What an operator actually sees is the
+    service record on the dashboard, so a bot that has rejected every message it
+    received is marked FAILED there.
+
+    Failing the *service* is the right lever rather than refusing to ingest: the
+    refusal is already correct and unchanged, and the point is to stop the
+    dashboard reporting a healthy bot that is silently not trading.
+    """
+
+    NITRO_AUTHOR = "1484753770645553192"
+    WRONG_AUTHOR = "1469353101352767575"
+
+    def test_the_threshold_is_low_enough_to_catch_a_wrong_allowlist_quickly(self):
+        """The value itself is pinned, not just read from the module.
+
+        The other tests here feed ``AUTHOR_REJECTION_STREAK_THRESHOLD`` messages
+        in, so raising it to an absurd number left them all passing - they were
+        feeding the mutant its own input. This asserts the real number instead,
+        because the operational requirement is "caught on the first burst of real
+        messages", not "caught at some threshold".
+
+        Low enough that a burst of a few real signals trips it, high enough that
+        one impersonation attempt cannot fail a healthy bot.
+        """
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        assert AUTHOR_REJECTION_STREAK_THRESHOLD == 3
+
+    def _source(self, allowed: str):
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+        source = DiscordSignalSource(
+            bot_name="nitro",
+            token="t",
+            channel_id="c",
+            service_id="svc",
+            trusted_author_ids=[allowed],
+        )
+        self.statuses: list[str] = []
+
+        async def _record(status, **_kwargs):
+            self.statuses.append(str(status))
+
+        source._set_service_status = _record
+        return source
+
+    @staticmethod
+    def _message(author: str, message_id: str):
+        return _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=author)
+
+    @staticmethod
+    async def _feed(source, author: str, count: int) -> None:
+        """Feed messages and let the scheduled status write run.
+
+        The parser is synchronous, so the observer's coroutine is scheduled on
+        the running loop rather than awaited. A test that only asserted
+        immediately would see an empty status list and pass for the wrong reason,
+        so the loop is given a turn here explicitly.
+        """
+        import asyncio as _asyncio
+
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        for index in range(count):
+            _parse_trade_signal_from_message(
+                _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=author),
+                default_timeframe="1h",
+                trusted_author_ids=source.trusted_author_ids,
+                on_author_rejection=source._record_author_rejection,
+            )
+        await _asyncio.sleep(0)
+
+    def test_a_wrong_allowlist_fails_the_service(self):
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+        asyncio.run(self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD))
+
+        assert any("FAILED" in status for status in self.statuses), (
+            f"a bot rejecting every message still looked healthy: {self.statuses}"
+        )
+
+    def test_a_correct_allowlist_is_never_failed(self):
+        source = self._source(self.NITRO_AUTHOR)
+        asyncio.run(self._feed(source, self.NITRO_AUTHOR, 10))
+
+        assert self.statuses == []
+        assert source.author_rejection_summary()["rejected_count"] == 0
+
+    def test_a_single_rejection_does_not_fail_a_healthy_bot(self):
+        """One impersonation attempt must not take down a working deployment."""
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        source = self._source(self.NITRO_AUTHOR)
+
+        async def _interleave() -> None:
+            # A rejection then an acceptance, repeatedly: the streak must reset
+            # each time, so scattered impersonation attempts never accumulate
+            # into a failure.
+            for index in range(6):
+                _parse_trade_signal_from_message(
+                    self._message(self.WRONG_AUTHOR, f"bad{index}"),
+                    default_timeframe="1h",
+                    trusted_author_ids=source.trusted_author_ids,
+                    on_author_rejection=source._record_author_rejection,
+                )
+                _parse_trade_signal_from_message(
+                    self._message(self.NITRO_AUTHOR, f"good{index}"),
+                    default_timeframe="1h",
+                    trusted_author_ids=source.trusted_author_ids,
+                    on_author_rejection=source._record_author_rejection,
+                    on_author_accepted=source._record_author_accepted,
+                )
+            await asyncio.sleep(0)
+
+        asyncio.run(_interleave())
+        assert self.statuses == [], (
+            f"interleaved impersonation attempts failed a healthy bot: {self.statuses}"
+        )
+
+    def test_the_summary_names_the_real_author_so_the_value_can_be_fixed(self):
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+        asyncio.run(self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD))
+
+        summary = source.author_rejection_summary()
+        # The *real* author is what the operator needs in the variable - not the
+        # one currently configured.
+        assert summary["rejected_author_ids"] == [self.NITRO_AUTHOR]
+        assert summary["rejected_count"] >= AUTHOR_REJECTION_STREAK_THRESHOLD
+
+    def test_the_alert_fires_once_not_per_message(self):
+        from live_runner.signal_sources.discord_source import (
+            AUTHOR_REJECTION_STREAK_THRESHOLD,
+        )
+
+        source = self._source(self.WRONG_AUTHOR)
+        asyncio.run(self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 4))
+
+        failed = [s for s in self.statuses if "FAILED" in s]
+        assert len(failed) == 1, f"repeated failure writes: {self.statuses}"
