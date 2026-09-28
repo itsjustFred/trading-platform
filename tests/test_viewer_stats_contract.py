@@ -497,3 +497,57 @@ def test_service_payload_distinguishes_idle_from_dead():
         _service(datetime.now(timezone.utc).replace(tzinfo=None))
     )
     assert naive["is_stale"] is False
+
+
+def test_live_control_audit_endpoint_is_read_only(viewer_client, isolated_db):
+    """The audit trail is only worth anything if it cannot be edited.
+
+    There is deliberately no write, update or delete route: a trail that can be
+    rewritten is not a trail.
+    """
+    import shared.database as database
+
+    database.record_live_control_audit(
+        action="deployment.status",
+        target_type="live_deployment",
+        target_id="dep-audit",
+        actor="operator@example",
+        detail={"requested_status": "ACTIVE"},
+    )
+
+    response = viewer_client.get("/api/live/audit?target_id=dep-audit")
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["action"] == "deployment.status"
+    assert rows[0]["actor"] == "operator@example"
+    assert rows[0]["detail"]["requested_status"] == "ACTIVE"
+
+    for method, path in (
+        ("post", "/api/live/audit"),
+        ("put", "/api/live/audit"),
+        ("delete", "/api/live/audit"),
+        ("post", f"/api/live/audit/{rows[0]['id']}"),
+        ("delete", f"/api/live/audit/{rows[0]['id']}"),
+    ):
+        assert viewer_client.request(method, path).status_code in {404, 405}, (
+            f"{method.upper()} {path} must not exist: the audit trail is read-only"
+        )
+
+
+def test_actor_is_attribution_by_claim_not_invented(viewer_client):
+    """No auth on this platform, so the operator is self-declared.
+
+    Recorded rather than left blank: an unattributed change to a live
+    deployment is worse than a self-declared one, and a wrong answer is visible.
+    """
+    from viewer.main import _live_control_actor
+
+    class _Req:
+        def __init__(self, headers):
+            self.headers = headers
+
+    assert _live_control_actor(_Req({"X-Operator": "fred"})) == "fred"
+    assert _live_control_actor(_Req({})) == "local-operator"
+    assert _live_control_actor(_Req({"X-Operator": "   "})) == "local-operator"
+    assert _live_control_actor(None) == "local-operator"

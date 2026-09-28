@@ -6779,6 +6779,75 @@ def test_activation_refuses_when_broker_cannot_confirm_demo(
     assert resp.status_code == 409
     assert "demo" in resp.json()["detail"].lower()
 
+    # The refusal is the most audit-worthy event there is: it means something
+    # tried to arm a live deployment and the demo gate stopped it. Verified here
+    # rather than only in the helper's own unit test, because an audit call that
+    # is present but unreachable is indistinguishable from no audit at all.
+    import shared.database as database
+
+    rows = database.list_live_control_audit(
+        target_id="11111111-1111-4111-8111-111111111111"
+    )
+    assert rows, "a refused activation must leave an audit record"
+    refusal = rows[0]
+    assert refusal["succeeded"] is False
+    assert refusal["action"] == "deployment.status"
+    assert "demo" in refusal["detail"]["reason"]
+    assert refusal["detail"]["requested_status"] == "ACTIVE"
+    # This deployment is deliberately bound to a non-demo account, which is why
+    # the broker re-verification refuses it.
+    assert refusal["detail"]["account_id"] == "acc-live"
+
+
+def test_successful_activation_is_audited(viewer_client, monkeypatch):
+    """The applied change matters as much as the refused one: "what is armed, and
+    who armed it" has to be answerable after the fact."""
+    import viewer.main as viewer_app_module
+    import shared.database as database
+    from shared.models import LiveDeploymentConfig
+
+    deployment = LiveDeploymentConfig(
+        id="33333333-3333-4333-8333-333333333333",
+        strategy_name="demo",
+        account_id="acc-demo",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    armed = deployment.model_copy(update={"status": "ACTIVE"})
+    monkeypatch.setattr(
+        viewer_app_module, "get_live_deployment", lambda _deployment_id: deployment
+    )
+
+    async def _verified(_account_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        viewer_app_module, "_reverify_account_against_broker", _verified
+    )
+    monkeypatch.setattr(
+        viewer_app_module, "update_live_deployment_status", lambda *_a, **_k: armed
+    )
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_live_deployment_submission_claims",
+        lambda _deployment_id: [],
+    )
+
+    resp = viewer_client.put(
+        "/api/live/deployments/33333333-3333-4333-8333-333333333333/status",
+        json={"status": "ACTIVE"},
+    )
+
+    assert resp.status_code == 200
+    rows = database.list_live_control_audit(
+        target_id="33333333-3333-4333-8333-333333333333"
+    )
+    assert rows, "arming a deployment must leave an audit record"
+    assert rows[0]["succeeded"] is True
+    assert rows[0]["detail"]["applied_status"] == "ACTIVE"
+    assert rows[0]["detail"]["requested_status"] == "ACTIVE"
+
 
 def test_activation_refreshes_verification_before_persisting(
     viewer_client, monkeypatch

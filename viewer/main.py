@@ -81,6 +81,8 @@ from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapt
 from runner.grid_identity import data_staleness_reason, read_identity
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
+    record_live_control_audit,
+    list_live_control_audit,
 )
 from shared.database import (
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
@@ -5169,6 +5171,56 @@ def _waiting_countdown(signal_metadata: dict[str, Any], signal_time_unix: float)
     close_unix = ((int(signal_reference) // timeframe_seconds) + 1) * timeframe_seconds
     remaining = int(max(0, math.ceil(close_unix - now)))
     return remaining
+
+
+def _live_control_actor(request: Request | None = None) -> str:
+    """Who to attribute a live control to.
+
+    There is no authentication on this platform, so this is attribution by
+    claim, not proof. It is recorded rather than left blank because an
+    unattributed change to a live deployment is worse than a self-declared one:
+    "who did this" is answerable, and a wrong answer is visible.
+    """
+    header = None
+    if request is not None:
+        try:
+            header = request.headers.get("X-Operator")
+        except Exception:  # pragma: no cover - defensive
+            header = None
+    return str(header or "local-operator").strip() or "local-operator"
+
+
+async def _audit_live_control(
+    *,
+    action: str,
+    target_type: str,
+    target_id: str,
+    request: Request | None = None,
+    succeeded: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Record one state-changing live control, success or refusal alike.
+
+    A refused attempt is the more interesting half: it is how you find out that
+    something was trying to arm a deployment it should not have been able to.
+
+    Never raises. An audit write that could abort the operation it is recording
+    would be a worse failure than the missing record, and
+    ``record_live_control_audit`` already swallows its own database errors; this
+    is the belt to that braces.
+    """
+    try:
+        await asyncio.to_thread(
+            record_live_control_audit,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            actor=_live_control_actor(request),
+            succeeded=succeeded,
+            detail=detail or {},
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not audit a live control: %r", exc)
 
 
 def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
@@ -12554,6 +12606,17 @@ async def update_live_deployment_status_endpoint(
         if deployment is None:
             raise HTTPException(status_code=404, detail="Live deployment not found")
         if not await _reverify_account_against_broker(deployment.account_id):
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "broker could not confirm a demo account",
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -12578,6 +12641,18 @@ async def update_live_deployment_status_endpoint(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
+    # The applied change, not only the refused one: "what is armed, and who armed
+    # it" has to be answerable after the fact.
+    await _audit_live_control(
+        action="deployment.status",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        detail={
+            "requested_status": requested_status,
+            "applied_status": str(updated.status or ""),
+            "account_id": str(updated.account_id or ""),
+        },
+    )
     payload = _serialize_live_deployment_payload(updated)
     if updated.status != "ACTIVE":
         # The status write above has already committed, and it is what stops new
@@ -12655,6 +12730,12 @@ async def update_live_deployment_account_endpoint(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
+    await _audit_live_control(
+        action="deployment.account",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        detail={"account_id": str(updated.account_id or "")},
+    )
     return _serialize_live_deployment_payload(updated)
 
 
@@ -12667,7 +12748,28 @@ async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
     deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
+    await _audit_live_control(
+        action="deployment.delete",
+        target_type="live_deployment",
+        target_id=deployment_id,
+    )
     return {"status": "deleted", "id": deployment_id}
+
+
+@app.get("/api/live/audit")
+async def get_live_control_audit(
+    limit: int = Query(default=100, ge=1, le=1000),
+    target_id: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """Read-only history of state-changing live controls, newest first.
+
+    Refused attempts are included: a gate that stopped something is exactly the
+    event worth seeing. There is no write, update or delete route on purpose --
+    an audit trail that can be edited is not one.
+    """
+    return await asyncio.to_thread(
+        list_live_control_audit, limit=limit, target_id=target_id
+    )
 
 
 @app.get("/api/live/balances/{account_id}")

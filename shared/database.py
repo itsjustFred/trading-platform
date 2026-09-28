@@ -733,6 +733,35 @@ class LiveAccountModel(SQLModel, table=True):
         return _coerce_naive_utc(self.demo_verified_at)
 
 
+class LiveControlAuditModel(SQLModel, table=True):
+    """Durable record of every state-changing live control.
+
+    Arming, stopping, re-pointing and deleting a live deployment are the
+    operations with real consequences, and until now nothing recorded that they
+    happened. The request log is a debug line: it is not queryable, it does not
+    survive a log rotation, and it cannot answer "what changed, and when".
+
+    ``actor`` is attribution by claim, not authentication - this platform has no
+    auth, so the value comes from an operator-supplied header and is only as
+    trustworthy as the operator. It is recorded rather than inferred because an
+    unattributed change is worse than a self-declared one.
+    """
+
+    __tablename__ = "live_control_audit"
+
+    id: str = Field(primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    actor: str = Field(default="unknown", index=True)
+    action: str = Field(index=True)
+    target_type: str = Field(index=True)
+    target_id: str = Field(index=True)
+    succeeded: bool = Field(default=True, index=True)
+    detail_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("detail", JSON, nullable=False),
+    )
+
+
 class ServiceModel(SQLModel, table=True):
     __tablename__ = "services"
     __table_args__ = (UniqueConstraint("name", "type", name="uq_services_name_type"),)
@@ -2376,6 +2405,86 @@ def _normalize_service_status(value: ServiceStatus | str) -> str:
     }:
         raise ValueError(f"Invalid service status '{value}'")
     return normalized
+
+
+def record_live_control_audit(
+    *,
+    action: str,
+    target_type: str,
+    target_id: str,
+    actor: str = "unknown",
+    succeeded: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append one state-changing live control to the audit trail.
+
+    Written on the failure path as well as the success path, and deliberately
+    never raises: an audit write that could abort the operation it is recording
+    would be a worse failure than the missing record, so a failure here is logged
+    and the caller carries on.
+    """
+    payload = {
+        "id": str(uuid4()),
+        "actor": str(actor or "unknown").strip() or "unknown",
+        "action": str(action or "").strip(),
+        "target_type": str(target_type or "").strip(),
+        "target_id": str(target_id or "").strip(),
+        "succeeded": bool(succeeded),
+        "detail": dict(detail or {}),
+    }
+    try:
+        init_db()
+        with get_session() as session:
+            session.add(
+                LiveControlAuditModel(
+                    id=payload["id"],
+                    actor=payload["actor"],
+                    action=payload["action"],
+                    target_type=payload["target_type"],
+                    target_id=payload["target_id"],
+                    succeeded=payload["succeeded"],
+                    detail_json=payload["detail"],
+                )
+            )
+            session.commit()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error(
+            "Could not write the live control audit record; the change itself stands",
+            extra={"data": {"action": payload["action"], "error": repr(exc)}},
+        )
+    return payload
+
+
+def list_live_control_audit(
+    *,
+    limit: int = 100,
+    target_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Most recent first. Read-only; there is no delete path on purpose."""
+    bounded = max(1, min(int(limit or 100), 1000))
+    init_db()
+    with get_session() as session:
+        statement = select(LiveControlAuditModel)
+        if target_id:
+            statement = statement.where(
+                LiveControlAuditModel.target_id == str(target_id).strip()
+            )
+        rows = session.exec(
+            statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)
+        ).all()
+    return [
+        {
+            "id": row.id,
+            "created_at": row.created_at.isoformat(),
+            "actor": row.actor,
+            "action": row.action,
+            "target_type": row.target_type,
+            "target_id": row.target_id,
+            "succeeded": row.succeeded,
+            "detail": row.detail_json or {},
+        }
+        for row in rows
+    ]
 
 
 #: The daemon registers itself under this name, so its liveness is a service row
