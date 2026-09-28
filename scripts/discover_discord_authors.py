@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 if __package__ in (None, ""):  # pragma: no cover - script entry point
@@ -65,7 +66,41 @@ async def _observe(bot: dict, pages: int) -> dict:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def _write_record(
+    results: list[dict[str, object]],
+    out: Path | None,
+) -> None:
+    """Persist what was observed, so a later session does not have to rediscover it.
+
+    The credential outage on 2026-09-26 cost the whole author allowlist, and the
+    only place it had ever existed was this tool's stdout: terminal scrollback,
+    gone by the next session. Every channel would have to be re-read by hand with
+    no way to check the new answer against the old one.
+
+    So the observation gets written down. Author ids, counts and channel ids only
+    - no message content, no tokens - and the default path is gitignored, because
+    an author id is a small secret: it is the ingestion allowlist.
+    """
+    if out is None:
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "bots": results,
+    }
+    out.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"recorded to {out}", file=sys.stderr)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Separate so a test can read the tool's own defaults.
+
+    The gitignore check has to know where the record lands, and hardcoding that
+    path in the test meant it kept passing after the default moved to a committed
+    location.
+    """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--pages",
@@ -80,6 +115,19 @@ def main(argv: list[str] | None = None) -> int:
         help="path to .accounts.env (default: the project file)",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        # Default is inside the gitignored data dir: an author id IS the
+        # ingestion allowlist, so it must never be committed by accident.
+        default=Path("data/discord_authors.json"),
+        help="where to record what was observed (default: %(default)s)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
 
     # `discover_discord_bots_from_env` reads DEFAULT_ACCOUNTS_ENV itself, so the
@@ -100,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
+        _write_record(results, args.out)
         return 0
 
     failed = 0

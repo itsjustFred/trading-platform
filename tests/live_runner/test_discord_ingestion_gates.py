@@ -2997,3 +2997,102 @@ def test_every_bot_path_honours_the_negation_guard() -> None:
     )
 
     assert signal is None, f"a negated message produced {signal!r}"
+
+class TestAuthorDiscoveryRecord:
+    """The author allowlist must be written down, not printed to a terminal.
+
+    The 2026-09-26 credential outage cost the whole allowlist because the only
+    place the author ids had ever existed was this tool's stdout. By the next
+    session the scrollback was gone, and every channel would have to be re-read
+    by hand with nothing to check the new answer against.
+
+    The record deliberately holds no message content: an author id is a small
+    secret, since it is the ingestion allowlist, and trading text is not needed
+    to reconstruct it.
+    """
+
+    def _script(self):
+        from live_runner import service_discovery  # noqa: F401
+
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "scripts" / "discover_discord_authors.py"
+        spec = importlib.util.spec_from_file_location("discover_authors_under_test", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_successful_observation_is_persisted(self, tmp_path) -> None:
+        module = self._script()
+        out = tmp_path / "record.json"
+        module._write_record(
+            [
+                {
+                    "bot": "NITRO",
+                    "channel_id": "111",
+                    "authors": [{"id": "123", "messages": 84}],
+                    "error": None,
+                }
+            ],
+            out,
+        )
+
+        import json
+
+        record = json.loads(out.read_text(encoding="utf-8"))
+        assert record["bots"][0]["authors"][0]["id"] == "123"
+        assert record["recorded_at"], "the record has no timestamp, so it cannot be aged"
+
+    def test_an_auth_failure_is_persisted_too(self, tmp_path) -> None:
+        """A failed run is exactly when the evidence matters most.
+
+        Before this, the outage left nothing behind at all - which is why the
+        channel ids and the 401 had to be re-derived by hand in a later session.
+        """
+        module = self._script()
+        out = tmp_path / "record.json"
+        module._write_record(
+            [
+                {
+                    "bot": "NITRO",
+                    "channel_id": "111",
+                    "authors": [],
+                    "error": "Discord auth failed (401)",
+                }
+            ],
+            out,
+        )
+
+        import json
+
+        record = json.loads(out.read_text(encoding="utf-8"))
+        assert "401" in record["bots"][0]["error"]
+        assert record["bots"][0]["channel_id"] == "111"
+
+    def test_the_default_path_is_gitignored(self) -> None:
+        """An author id is the ingestion allowlist, so it must never be committed.
+
+        Read the default out of the tool's own argparse rather than repeating the
+        path here. The first version hardcoded `data/discord_authors.json`, which
+        meant it kept passing after the default was changed to a committed
+        location - the same "test something other than the thing" trap, twelfth
+        instance.
+        """
+        import argparse
+        import subprocess
+
+        module = self._script()
+        parser = module._build_parser()
+        default = str(parser.get_default("out"))
+
+        probe = subprocess.run(
+            ["git", "check-ignore", "-v", default],
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 0, (
+            f"the default record path {default!r} is NOT gitignored, so an "
+            f"author id could be committed by accident: {probe.stdout}{probe.stderr}"
+        )
