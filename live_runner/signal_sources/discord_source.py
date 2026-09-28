@@ -88,7 +88,29 @@ _PRICE_LABEL_RE = re.compile(
 )
 _DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 _AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
-_ACTION_BUY_RE = re.compile(r"\bbuy\b|\blong\b", re.IGNORECASE)
+# The mirror of _ACTION_SELL_RE, and the same hazard in the other direction: a
+# buy is the fallback, so an incidental "buy" opens a real position. Matched
+# bare, "could buy here" and - worse - "do not buy" both read as a BUY signal.
+#
+# An explicit buy directive is the action word next to "signal", or the action
+# word immediately followed by a ticker - which is the shape
+# _extract_action_symbol already recognises, and what the real RamJet channel
+# emits ("RAM JET BUY AAPL @ 100.0"). Anchoring to the start of the message
+# instead would have broken every real RamJet signal, so the ticker is required
+# rather than a position: "do not buy" and "could buy here" have no ticker after
+# the word and so resolve to nothing.
+_ACTION_BUY_RE = re.compile(
+    r"\b(?:buy|long)\s+signal\b"
+    r"|\b(?:buy|long)\s+\**\$?[A-Za-z]{1,10}\b",
+    re.IGNORECASE,
+)
+# Captures the word after buy/long so it can be run through the same
+# _SKIP_WORDS filter the symbol extractors use. A regex cannot know that "here"
+# is not a ticker, but _normalize_symbol_candidate already knows.
+_ACTION_BUY_TICKER_RE = re.compile(
+    r"\b(?:buy|long)\s+\**\$?([A-Za-z]{1,10})\b",
+    re.IGNORECASE,
+)
 # An action word only decides direction when the message is actually a signal.
 # Matched bare, "sellers are short-term weak" inside an unambiguous buy message
 # flipped it to a sell - and a sell a bot accepts is a real short position.
@@ -331,6 +353,40 @@ def _is_well_formed_price_token(raw_price: str) -> bool:
     return all(len(part) == 3 and part.isdigit() for part in parts[1:])
 
 
+def _reads_as_buy_directive(content: str) -> bool:
+    """True when the message issues a buy, rather than merely mentioning one.
+
+    Same hazard as the sell side, in the direction that opens a position: matched
+    bare, "could buy here" and "do not buy" both read as a BUY signal. A negated
+    instruction parsed as a trade is the clearest failure this parser can make.
+
+    The ticker requirement is what separates "BUY AAPL" (a signal, and what the
+    real RamJet channel emits) from "could buy here" (commentary). The captured
+    word goes through _normalize_symbol_candidate so it obeys the same _SKIP_WORDS
+    list as every other symbol extractor - duplicating that knowledge in a regex
+    would let the two drift.
+    """
+    if _ACTION_BUY_RE.search(content) is None:
+        return False
+    explicit = re.search(
+        r"\b(?:buy|long)\s+signal\b", content, re.IGNORECASE
+    )
+    if explicit:
+        return True
+    match = _ACTION_BUY_TICKER_RE.search(content)
+    if match is None:
+        return False
+    if _normalize_symbol_candidate(match.group(1)) is None:
+        return False
+    # A real entry carries a price, and the parser needs one anyway - without it
+    # the message is discarded two lines later. Keying on that is what separates
+    # "BUY AAPL @ 100.0" from "could buy here": a stop-word list cannot enumerate
+    # every English word that might follow "buy", but a price is unambiguous.
+    # Deliberately structural rather than a longer word list, which would grow
+    # with every phrasing someone happens to use.
+    return _extract_price(content) is not None
+
+
 def _reads_as_sell_directive(content: str) -> bool:
     """True when the message issues a sell, rather than merely mentioning one.
 
@@ -376,7 +432,7 @@ def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
         return "buy"
     if _reads_as_sell_directive(content):
         return "sell"
-    if _ACTION_BUY_RE.search(content):
+    if _reads_as_buy_directive(content):
         return "buy"
     return None
 

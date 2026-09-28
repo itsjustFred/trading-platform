@@ -1871,6 +1871,117 @@ class TestNitroGrammarContract:
             _signal_type, action = self._parse(content)
             assert action == "sell", content
 
+    def test_incidental_buy_words_do_not_open_a_position(self):
+        """The same hazard as the sell side, in the direction that actually opens.
+
+        ``_ACTION_BUY_RE`` matched the bare words "buy"/"long" and is the
+        *fallback* - a message with a symbol and a price but no recognised signal
+        shape resolves to buy if it contains either word. So commentary became an
+        entry:
+
+            EURUSD 1.0850 could buy here     -> buy
+            EURUSD 1.0850 do not buy         -> buy
+
+        The second is the worse one. A negated instruction parsed as a trade is
+        the clearest possible failure of this parser, and it would have placed a
+        real long on a message that said not to.
+        """
+        for content in (
+            "EURUSD 1.0850 could buy here",
+            "EURUSD 1.0850 I would long it",
+            "EURUSD 1.0850 do not buy",
+            "EURUSD 1.0850 buyers are pushing",
+        ):
+            _signal_type, action = self._parse(content)
+            assert action is None, f"{content!r} was read as {action!r}"
+
+    def test_real_entry_forms_still_parse(self):
+        """The legitimate directive forms, carrying a price as every real one does.
+
+        Tested through the full parser rather than the action resolver alone,
+        because that is the level that matters: a message with no price is
+        discarded before the action is ever consulted, so asserting an action for
+        "BUY EURUSD" would have been asserting something unreachable. The price
+        requirement is what the fix keys on, so it belongs in the example.
+        """
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        for content in (
+            "RAM JET BUY AAPL @ 100.0",
+            "BUY EURUSD @ 1.0850",
+            "LONG AAPL @ 100.0",
+        ):
+            signal = _parse_trade_signal_from_message(
+                _live_channel_message(content), default_timeframe="1h"
+            )
+            assert signal is not None, content
+            assert signal.action == "buy", content
+
+    def test_the_action_regexes_do_not_match_incidental_words(self):
+        """The predicates filter, so a widened regex alone is not a failure.
+
+        Mutating ``_ACTION_BUY_RE`` back to bare words still passed every other
+        test here, because ``_reads_as_buy_directive`` re-checks the ticker and
+        the price afterwards. The predicate is the load-bearing part; the regex
+        is the cheap pre-filter in front of it.
+
+        Pinning the regexes directly matters anyway, because they are the thing a
+        reader looks at to understand what counts as a signal, and because a
+        future change that consults one of them directly would otherwise inherit
+        the wider behaviour with nothing to catch it.
+        """
+        from live_runner.signal_sources.discord_source import (
+            _ACTION_BUY_RE,
+            _ACTION_SELL_RE,
+        )
+
+        # The buy pre-filter is a cheap "is there a buy word at all" test, so it
+        # does match "could buy here" - the ticker and price checks in the
+        # predicate are what reject it. Asserting the wider truth here rather
+        # than the imagined narrow one, because a test that documents a fiction
+        # is worse than no test.
+        assert _ACTION_BUY_RE.search("BUY AAPL") is not None
+        assert _ACTION_BUY_RE.search("buy signal") is not None
+        assert _ACTION_BUY_RE.search("do not buy") is None
+
+        # The sell regex is genuinely narrow, because the sell predicate needs a
+        # bare-word match to tell an explicit "sell signal" from a noun phrase.
+        assert _ACTION_SELL_RE.search("sellers are weak") is None
+        assert _ACTION_SELL_RE.search("SELL AAPL") is not None
+        assert _ACTION_SELL_RE.search("sell signal") is not None
+
+    def test_oversold_buy_signal_still_needs_a_price(self):
+        """The RamJet/Nitro phrasing is recognised as a buy by the action
+        resolver, and still yields no signal without a price - the parser's
+        price requirement, asserted for the phrasing that matters most."""
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        assert (
+            _parse_trade_signal_from_message(
+                _live_channel_message("EURUSD is now oversold buy signal"),
+                default_timeframe="1h",
+            )
+            is None
+        )
+
+    def test_a_buy_without_a_price_is_discarded_regardless_of_action(self):
+        """A directive with no price cannot trade, so the parser drops it either
+        way. Asserted so the price requirement reads as intentional."""
+        from live_runner.signal_sources.discord_source import (
+            _parse_trade_signal_from_message,
+        )
+
+        assert (
+            _parse_trade_signal_from_message(
+                _live_channel_message("BUY EURUSD"), default_timeframe="1h"
+            )
+            is None
+        )
+
     def test_prose_noun_forms_are_not_directives(self):
         for content in (
             "sellers are weak into the close",
