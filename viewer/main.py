@@ -2080,6 +2080,35 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return numeric
 
 
+def _optional_float(value: object) -> float | None:
+    """Coerce to float, but let an absent value stay absent.
+
+    ``_safe_float`` substitutes a default, which for psr and p_value means an
+    undefined metric becomes the *worst* attainable value (psr 0.0, p_value 1.0)
+    and so reads as a measured result rather than a missing one. runner/stats.py
+    already names what it could not compute in ``stats["undefined_metrics"]``, and
+    shared/database.py now lets that None through; this keeps it intact on the
+    way to the client, where the UI already renders "N/A" for it.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _round_optional(value: float | None, digits: int) -> float | None:
+    """Round a value that may legitimately be absent.
+
+    ``round(None, 4)`` is a TypeError, and it fired as a 500 on the backtests
+    list the moment an undefined PSR was allowed to stay None. An absent metric
+    has to survive formatting as well as parsing.
+    """
+    return None if value is None else round(value, digits)
+
+
 @lru_cache(maxsize=8192)
 def _parse_iso_datetime_cached(text: str) -> datetime | None:
     normalized = str(text or "").strip()
@@ -3260,9 +3289,9 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         else total_return_decimal * 100.0
     )
     cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
-    sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
-    psr = _safe_float(meta.get("psr"), 0.0)
-    p_value = _safe_float(meta.get("p_value"), 1.0)
+    sharpe_ratio = _optional_float(meta.get("sharpe_ratio"))
+    psr = _optional_float(meta.get("psr"))
+    p_value = _optional_float(meta.get("p_value"))
     max_drawdown_decimal = abs(_safe_float(meta.get("max_drawdown"), 0.0))
     trade_count = max(int(meta.get("trade_count", 0) or 0), 0)
     backtest_id = str(meta.get("id") or "").strip()
@@ -3290,8 +3319,8 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
         "net_profit": round(total_pnl, 6),
         "net_profit_pct": round(net_profit_pct, 2),
-        "psr": round(psr, 4),
-        "p_value": round(p_value, 6),
+        "psr": _round_optional(psr, 4),
+        "p_value": _round_optional(p_value, 6),
         "win_rate": round(win_rate, 6) if win_rate is not None else None,
         "equity_mini": [],
     }
@@ -3317,9 +3346,9 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
         "total_return": _safe_float(meta.get("total_return"), 0.0),
-        "sharpe_ratio": _safe_float(meta.get("sharpe_ratio"), 0.0),
-        "psr": _safe_float(meta.get("psr"), 0.0),
-        "p_value": _safe_float(meta.get("p_value"), 1.0),
+        "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
+        "psr": _optional_float(meta.get("psr")),
+        "p_value": _optional_float(meta.get("p_value")),
         "cagr": _safe_float(meta.get("cagr"), 0.0),
         "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
@@ -3445,13 +3474,17 @@ def _apply_backtest_numeric_filters(
         ]
     if psr_min is not None or psr_max is not None:
         filtered = [
-            item for item in filtered if in_range(_safe_float(item.get("psr"), 0.0), psr_min, psr_max)
+            item
+            for item in filtered
+            if item.get("psr") is not None
+            and in_range(float(item["psr"]), psr_min, psr_max)
         ]
     if p_value_min is not None or p_value_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("p_value"), 1.0), p_value_min, p_value_max)
+            if item.get("p_value") is not None
+            and in_range(float(item["p_value"]), p_value_min, p_value_max)
         ]
     if cagr_min is not None or cagr_max is not None:
         filtered = [
@@ -6405,9 +6438,9 @@ def _portfolio_contribution_payload(
         "trade_count": trade_count,
         "win_rate": round(metric_win_rate * 100.0, 2),
         "wins": wins,
-        "sharpe_ratio": round(sharpe_ratio, 6),
-        "psr": round(psr, 6),
-        "p_value": round(p_value, 6),
+        "sharpe_ratio": _round_optional(sharpe_ratio, 6),
+        "psr": _round_optional(psr, 6),
+        "p_value": _round_optional(p_value, 6),
         "max_drawdown": round(max_drawdown, 6),
         "cagr": round(cagr, 6),
         "pnl_total": round(pnl_value, 6),

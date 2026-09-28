@@ -3597,6 +3597,31 @@ def _safe_stat_number(value: Any, default: float = 0.0) -> float:
     return numeric
 
 
+def _stat_number_or_undefined(
+    stats: dict[str, Any], key: str, default: float
+) -> float | None:
+    """Resolve a stat, honouring the producer's own ``undefined_metrics`` list.
+
+    ``runner/stats.py`` already follows the documented convention: it names every
+    quantity it could not compute in ``undefined_metrics`` and omits the value
+    (``shared/models.py`` then leaves the key out of the dict entirely). Reading
+    the missing key back with a numeric default quietly undid that: an undefined
+    PSR became ``0.0``, which is the *worst* attainable PSR, so a backtest with no
+    trades was listed as "PSR (higher = better) 0.0%" and read as a measured
+    result. A default p_value of 1.0 has the same problem -- it reads as maximum
+    confidence in the null.
+
+    The producer is the only party that knows whether a number is missing or
+    genuinely zero, so it is asked rather than guessed. A stat the producer did
+    not name still falls back to the historical default, so artifacts written
+    before the convention keep their previous values.
+    """
+    undefined = stats.get("undefined_metrics")
+    if isinstance(undefined, (list, tuple, set)) and key in undefined:
+        return None
+    return _safe_stat_number(stats.get(key), default)
+
+
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
     data = backtest.data or {}
     stats = backtest.stats or {}
@@ -3625,9 +3650,9 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "total_pnl": _safe_stat_number(stats.get("total_pnl"), 0.0),
         "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
         "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
-        "sharpe_ratio": _safe_stat_number(stats.get("sharpe_ratio"), 0.0),
-        "psr": _safe_stat_number(stats.get("psr"), 0.0),
-        "p_value": _safe_stat_number(stats.get("p_value"), 1.0),
+        "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
+        "psr": _stat_number_or_undefined(stats, "psr", 0.0),
+        "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
         "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),

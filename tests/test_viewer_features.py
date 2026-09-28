@@ -4139,6 +4139,59 @@ def test_backtests_list_uses_persisted_runner_stats(viewer_client, monkeypatch):
     assert item["equity_mini"] == []
 
 
+def test_undefined_psr_stays_absent_instead_of_becoming_the_worst_value(
+    viewer_client, monkeypatch
+):
+    """runner/stats.py names what it could not compute; that must survive the API.
+
+    PSR is omitted from the stats dict and listed in `undefined_metrics` when it
+    cannot be computed (fewer than ten daily observations, or no variance). The
+    metadata layer substituted 0.0, which is the *worst* attainable PSR, so a
+    backtest with no trades at all was listed as "PSR (higher = better) 0.0%" and
+    read as a measured result. p_value had the same shape, defaulting to 1.0.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(
+        viewer_app_module,
+        "list_backtest_metadata_rows",
+        lambda: [
+            {
+                "id": "no-psr",
+                "engine": "native",
+                "strategy_name": "No PSR",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "start_date": "2026-03-07",
+                "end_date": "2026-03-08",
+                "initial_capital": 100000.0,
+                "total_pnl": 0.0,
+                "total_return": 0.0,
+                "cagr": 0.0,
+                "trade_count": 0,
+                "created_at": "2026-03-07T15:00:00Z",
+                "undefined_metrics": ["sharpe_ratio", "psr", "p_value"],
+            }
+        ],
+    )
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+
+    payload = viewer_client.get("/api/backtests").json()["items"]
+    item = next(row for row in payload if row["id"] == "no-psr")
+
+    # Absent, not 0.0 and not 1.0.
+    assert item["psr"] is None
+    assert item["p_value"] is None
+    assert item["sharpe_ratio"] is None
+
+    # A psr range filter is a claim about the value, so an unknown value cannot
+    # satisfy one. It used to be read as 0.0, which fell inside psr_min=0.0 and
+    # let a backtest with no PSR through a "PSR >= 0" filter.
+    filtered = viewer_client.get("/api/backtests?psr_min=0.0").json()["items"]
+    assert [row["id"] for row in filtered] == []
+
+
 def test_backtests_list_filters_and_sorts_new_stat_fields(viewer_client, monkeypatch):
     import viewer.main as viewer_app_module
 
