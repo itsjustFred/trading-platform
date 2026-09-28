@@ -4783,7 +4783,19 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
     return safe_payload if isinstance(safe_payload, dict) else {}
 
 
+#: A service that has not reported activity for this long is reported stale. The
+#: daemon's poll interval is 10s, so this is a wide multiple of it: it is meant to
+#: catch a dead or wedged process, not to flicker on one slow loop.
+SERVICE_STALE_AFTER_SECONDS = 120
+
+
 def _serialize_service_payload(service: Service) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    last_activity = service.last_activity
+    if last_activity is not None and last_activity.tzinfo is None:
+        # Stored naive-UTC; comparing it against an aware `now` would raise.
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    age_seconds = (now - last_activity).total_seconds() if last_activity else None
     payload = {
         "id": str(service.id),
         "name": service.name,
@@ -4791,6 +4803,10 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         "status": service.status.value,
         "config": service.config or {},
         "last_activity": service.last_activity.isoformat() if service.last_activity else None,
+        # `status` alone cannot distinguish a live-but-idle service from a dead
+        # one, which is exactly the ambiguity a heartbeat exists to remove.
+        "last_activity_age_seconds": None if age_seconds is None else max(0.0, age_seconds),
+        "is_stale": last_activity is None or age_seconds > SERVICE_STALE_AFTER_SECONDS,
         "created_at": service.created_at.isoformat(),
     }
     safe_payload = redact_value(payload)

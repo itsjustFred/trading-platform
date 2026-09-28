@@ -447,3 +447,53 @@ def test_optimization_summary_preserves_zero_oos_baseline():
     assert summary["train_stats"]["total_pnl"] == 0.0
     assert summary["test_stats"]["total_pnl"] == 0.0
     assert summary["oos_status"] == "available"
+
+
+def test_service_payload_distinguishes_idle_from_dead():
+    """`status` alone cannot tell a live-but-idle service from a dead one.
+
+    That ambiguity is the whole reason the daemon heartbeats. This pins the two
+    fields that resolve it, including the naive/aware comparison that a stored
+    naive-UTC timestamp would otherwise blow up on.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from shared.models import Service, ServiceStatus, ServiceType
+    from viewer.main import SERVICE_STALE_AFTER_SECONDS, _serialize_service_payload
+
+    now = datetime.now(timezone.utc)
+
+    def _service(last_activity):
+        return Service(
+            id="11111111-1111-1111-1111-111111111111",
+            name="trading-daemon",
+            type=ServiceType.TRADING_DAEMON,
+            status=ServiceStatus.RUNNING,
+            config={},
+            last_activity=last_activity,
+            created_at=now,
+        )
+
+    fresh = _serialize_service_payload(_service(now))
+    assert fresh["is_stale"] is False
+    assert fresh["last_activity_age_seconds"] < SERVICE_STALE_AFTER_SECONDS
+    # A heartbeat that is merely old is still a heartbeat.
+    assert fresh["status"] == "running"
+
+    old = _serialize_service_payload(
+        _service(now - timedelta(seconds=SERVICE_STALE_AFTER_SECONDS + 60))
+    )
+    assert old["is_stale"] is True
+    assert old["last_activity_age_seconds"] > SERVICE_STALE_AFTER_SECONDS
+
+    # Never reported: the worst case, and it must not be silently "fresh".
+    never = _serialize_service_payload(_service(None))
+    assert never["is_stale"] is True
+    assert never["last_activity_age_seconds"] is None
+
+    # Stored timestamps are naive UTC; comparing them to an aware now used to
+    # raise TypeError and take the whole /api/services response down.
+    naive = _serialize_service_payload(
+        _service(datetime.now(timezone.utc).replace(tzinfo=None))
+    )
+    assert naive["is_stale"] is False

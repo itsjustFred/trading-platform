@@ -86,6 +86,11 @@ class StrategyType(str, Enum):
 class ServiceType(str, Enum):
     DISCORD_BOT = "discord_bot"
     SCHEDULED_JOB = "scheduled_job"
+    # The trading daemon itself. It registers itself as a service so its liveness
+    # is observable: without it there is no way to tell "the daemon is running and
+    # has nothing to do" from "the daemon is dead", because a paused platform is
+    # silent by design.
+    TRADING_DAEMON = "trading_daemon"
 
 
 class ServiceStatus(str, Enum):

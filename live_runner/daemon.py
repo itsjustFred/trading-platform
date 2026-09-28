@@ -58,6 +58,7 @@ from shared.database import (
     release_live_deployment_submission,
     save_live_balance,
     update_service_status,
+    record_daemon_heartbeat,
 )
 from shared.logging import get_logger
 from shared.models import (
@@ -3601,6 +3602,38 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
+#: How often the daemon reports that it is still turning. Comfortably longer than
+#: the 10s deployment poll so a single slow loop cannot look like a dead daemon.
+DAEMON_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+async def _daemon_heartbeat_loop(
+    active_adapters: dict[str, BaseLiveAdapter],
+) -> None:
+    """Publish the daemon's liveness into the services table.
+
+    A paused platform produces no logs and no trades, so from the outside it is
+    indistinguishable from a dead process. This writes the same row the UI already
+    reads, which is what makes "running but idle" separable from "stopped".
+
+    Failures are logged and swallowed: a heartbeat that can take the daemon down
+    would be worse than no heartbeat, since the thing it reports on is the thing
+    doing the reporting.
+    """
+    while True:
+        try:
+            await asyncio.to_thread(
+                record_daemon_heartbeat,
+                detail={
+                    "connected_adapters": len(active_adapters),
+                    "heartbeat_interval_seconds": DAEMON_HEARTBEAT_INTERVAL_SECONDS,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Daemon heartbeat failed: %r", exc)
+        await asyncio.sleep(DAEMON_HEARTBEAT_INTERVAL_SECONDS)
+
+
 async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
@@ -3639,8 +3672,11 @@ async def run_daemon(
         name="service-sync-loop",
     )
     balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+    heartbeat_task = asyncio.create_task(
+        _daemon_heartbeat_loop(active_adapters), name="daemon-heartbeat"
+    )
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task)
+        await asyncio.gather(sync_task, service_sync_task, balance_task, heartbeat_task)
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise

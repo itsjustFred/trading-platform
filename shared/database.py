@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5 as _uuid5
 
 from sqlalchemy import (
     JSON,
@@ -2376,6 +2376,59 @@ def _normalize_service_status(value: ServiceStatus | str) -> str:
     }:
         raise ValueError(f"Invalid service status '{value}'")
     return normalized
+
+
+#: The daemon registers itself under this name, so its liveness is a service row
+#: rather than a heartbeat file nobody reads. The id is derived rather than random
+#: because it has to be the *same* row on every beat and across restarts, and
+#: Service.id is a UUID.
+TRADING_DAEMON_SERVICE_NAME = "trading-daemon"
+TRADING_DAEMON_SERVICE_ID = str(
+    _uuid5(NAMESPACE_URL, "urn:perma:service:trading-daemon")
+)
+
+
+def record_daemon_heartbeat(
+    *,
+    last_activity: datetime | None = None,
+    detail: dict[str, Any] | None = None,
+) -> Service:
+    """Upsert the daemon's own service row so its liveness is observable.
+
+    A paused platform is silent by design, so "no recent activity" is ambiguous:
+    it means either "running, nothing to do" or "dead". The daemon reporting
+    itself into the same services table the UI already reads removes the
+    ambiguity, and keeps the daemon visible in the one place an operator looks.
+
+    Upsert rather than update because ``update_service_status`` needs an existing
+    row, and this must work on the daemon's very first loop. The status is
+    deliberately left alone: the daemon does not get to declare itself healthy,
+    it only reports that it is still turning. ``detail`` is merged into the config
+    so the loop can publish counts (deployments seen, adapters connected) without
+    inventing a second place to look.
+    """
+    now = last_activity or _utcnow_naive()
+    config = dict(detail or {})
+    init_db()
+    with get_session() as session:
+        record = session.get(ServiceModel, TRADING_DAEMON_SERVICE_ID)
+        if record is None:
+            record = ServiceModel(
+                id=TRADING_DAEMON_SERVICE_ID,
+                name=TRADING_DAEMON_SERVICE_NAME,
+                type=ServiceType.TRADING_DAEMON.value,
+                status=ServiceStatus.RUNNING.value,
+            )
+            session.add(record)
+        record.last_activity = now
+        record.updated_at = _utcnow_naive()
+        merged = dict(record.config_json or {})
+        merged.update(config)
+        record.config_json = merged
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    return record.to_service()
 
 
 def create_service(service: Service) -> Service:

@@ -54,3 +54,76 @@ def test_undefined_metrics_survive_the_metadata_payload() -> None:
     assert database._stat_number_or_undefined(legacy, "psr", 0.0) == 0.75
     assert database._stat_number_or_undefined(legacy, "p_value", 1.0) == 1.0
     assert database._stat_number_or_undefined({}, "psr", 0.0) == 0.0
+
+
+def test_daemon_heartbeat_upserts_and_reports_liveness(isolated_db) -> None:
+    """A paused platform is silent, so "no activity" is ambiguous.
+
+    The daemon publishing itself into the services table is what makes "running
+    but idle" separable from "dead" for anyone reading the UI. The upsert has to
+    work on the first beat, because update_service_status needs an existing row.
+    """
+    import shared.database as database
+
+    first = database.record_daemon_heartbeat(detail={"connected_adapters": 2})
+    assert str(first.id) == database.TRADING_DAEMON_SERVICE_ID
+    assert first.name == "trading-daemon"
+    assert first.type.value == "trading_daemon"
+    assert first.last_activity is not None
+    assert first.config["connected_adapters"] == 2
+
+    # A second beat updates the same row rather than creating a second one.
+    second = database.record_daemon_heartbeat(detail={"connected_adapters": 0})
+    assert second.id == first.id
+    assert second.last_activity >= first.last_activity
+    assert second.config["connected_adapters"] == 0
+
+    from shared.database import list_services
+
+    rows = [
+        s for s in list_services() if str(s.id) == database.TRADING_DAEMON_SERVICE_ID
+    ]
+    assert len(rows) == 1, "the heartbeat must upsert, not accumulate rows"
+
+
+def test_daemon_heartbeat_failure_cannot_stop_the_daemon(monkeypatch) -> None:
+    """A heartbeat that can take the daemon down is worse than no heartbeat.
+
+    The component reporting on liveness must not be able to fail because of it,
+    so the loop swallows a database error and keeps going. Asserted by letting it
+    survive several failing beats, not by inspecting cancellation semantics.
+    """
+    import asyncio
+
+    import live_runner.daemon as daemon
+
+    beats: list[int] = []
+
+    # Plain sync, like the real record_daemon_heartbeat: it is called *through*
+    # asyncio.to_thread, which invokes it synchronously in a worker. An async
+    # double would return an un-awaited coroutine and never run at all.
+    def _boom(**_kwargs):
+        beats.append(1)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(daemon, "record_daemon_heartbeat", _boom)
+    # A short interval so the loop actually iterates inside the test.
+    monkeypatch.setattr(daemon, "DAEMON_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    async def _exercise() -> int:
+        task = asyncio.ensure_future(daemon._daemon_heartbeat_loop({}))
+        deadline = 0.0
+        while len(beats) < 3 and deadline < 2.0:
+            await asyncio.sleep(0.01)
+            deadline += 0.01
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return len(beats)
+
+    assert asyncio.run(_exercise()) >= 3, (
+        "the loop must survive repeated database failures rather than exiting on "
+        "the first one"
+    )
