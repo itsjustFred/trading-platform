@@ -2799,3 +2799,93 @@ def test_an_unset_per_bot_allowlist_still_falls_back_to_shared() -> None:
     )
 
     assert resolved == {"1", "2", "3"}
+
+from live_runner.signal_sources.discord_source import (  # noqa: E402
+    _BUY_NEGATED_RE,
+    _detect_rocket_fuel_signal_type,
+    _resolve_action,
+)
+
+
+def test_a_negated_buy_instruction_does_not_open_a_long() -> None:
+    """A negation must veto the buy, in the direction that opens a position.
+
+    The buy predicate's own docstring claimed "do not buy" did not read as a
+    signal. It did: the only check was that a ticker followed the action word, so
+    "this is not a buy signal" and "I should not long here" both resolved to BUY.
+    The sell side had a noun guard for exactly this and the buy side had nothing,
+    which is why the same message could be shorted or bought depending on which
+    word appeared.
+    """
+    for content in (
+        "on EURUSD $1.0850 this is not a buy signal",
+        "on EURUSD $1.0850 I should not long here",
+        "wait on EURUSD, do not buy",
+        "EURUSD is not a buy",
+    ):
+        signal_type = _detect_rocket_fuel_signal_type(content)
+        assert _resolve_action(content, signal_type=signal_type) is None, (
+            f"{content!r} opened a long"
+        )
+
+
+def test_a_negation_overrides_an_inferred_oversold_reading() -> None:
+    """"oversold" alone was enough to open a position, over an explicit refusal.
+
+    `_resolve_action` returned "buy" from the signal_type branch before any
+    directive check ran, so the negation guard never applied to it. A message
+    reading "**EURUSD** is now oversold / Do not buy this yet" resolved to a long
+    purely because the word "oversold" was present. An explicit instruction not to
+    trade is stronger evidence than an inferred reading of the same message.
+    """
+    content = "**EURUSD** is now oversold\nDo not buy this yet. Support at $1.0850"
+    assert _detect_rocket_fuel_signal_type(content) == "oversold_buy"
+
+    assert _resolve_action(content, signal_type="oversold_buy") is None
+
+
+def test_a_negation_in_one_clause_does_not_cancel_the_next() -> None:
+    """"do not sell, buy instead" is an instruction to buy.
+
+    The negation window stops at clause punctuation. A window that crossed the
+    comma turned this into no signal at all, so tightening the guard would have
+    introduced a false negative of its own - the exact trade-off that fix is
+    supposed to avoid.
+    """
+    negation = _BUY_NEGATED_RE
+
+    assert negation.search("do not sell, buy instead") is None
+    assert negation.search("this is not a buy signal") is not None
+
+def test_every_bot_path_honours_the_negation_guard() -> None:
+    """The RamJet branch set the action outright, so no guard ever ran on it.
+
+    "**EURUSD** is now oversold buy signal - do not buy this yet" opened a long on
+    the RamJet path while the RocketFuel path refused the same message. Two bots
+    reading one message in opposite directions is the inconsistency the shared
+    predicate is meant to prevent, and it only existed because that branch
+    returned before the guard.
+    """
+    from live_runner.signal_sources.discord_source import (
+        _is_ramjet_signal,
+        _parse_trade_signal_from_message,
+    )
+
+    # A price is required, and without one the parser returns None on the
+    # symbol/price gate before any action is resolved. The first version of this
+    # test had no price, so it passed with the guard deleted - a fixture that
+    # could not reach the code it claims to pin.
+    content = "**EURUSD** is now oversold buy signal @ 1.0850 - do not buy this yet"
+    from live_runner.signal_sources.discord_source import _extract_price
+
+    assert _extract_price(content) is not None, "fixture cannot reach the action"
+    message = _live_channel_message(content, author_id="bot-1")
+    assert _is_ramjet_signal(content), "fixture no longer exercises the RamJet branch"
+
+    signal = _parse_trade_signal_from_message(
+        message,
+        default_timeframe="1h",
+        trusted_author_ids={"bot-1"},
+    )
+
+    assert signal is None, f"a negated message produced {signal!r}"

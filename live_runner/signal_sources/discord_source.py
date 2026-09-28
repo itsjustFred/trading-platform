@@ -392,6 +392,25 @@ def _is_well_formed_price_token(raw_price: str) -> bool:
     return all(len(part) == 3 and part.isdigit() for part in parts[1:])
 
 
+# A negation between here and the action word cancels the instruction.
+#
+# This is the buy-side mirror of _SELL_AS_NOUN_RE, and it was missing: the buy
+# predicate only ever checked that a ticker followed the action word, so "this
+# is not a buy signal", "I should not long here" and "Do not buy this yet" all
+# opened a long. The predicate's own docstring claimed "do not buy" did not read
+# as a signal, and it did.
+#
+# `[^.!?\n,;]` is load-bearing. A negation in one clause must not cancel an
+# instruction in the next: "do not sell, buy instead" is an instruction to buy,
+# and a window that crossed the comma turned it into no signal at all.
+_BUY_NEGATED_RE = re.compile(
+    r"\b(?:do\s*n[o']?t|don'?t|never|should\s*n[o']?t|shouldn'?t|wouldn'?t|"
+    r"would\s*n[o']?t|can'?t|cannot|won'?t|avoid|wait\s+on|not)\b"
+    r"[^.!?\n,;]{0,30}?\b(?:buy|long|enter|add)\b",
+    re.IGNORECASE,
+)
+
+
 def _reads_as_buy_directive(content: str) -> bool:
     """True when the message issues a buy, rather than merely mentioning one.
 
@@ -406,6 +425,8 @@ def _reads_as_buy_directive(content: str) -> bool:
     would let the two drift.
     """
     if _ACTION_BUY_RE.search(content) is None:
+        return False
+    if _BUY_NEGATED_RE.search(content):
         return False
     explicit = re.search(
         r"\b(?:buy|long)\s+signal\b", content, re.IGNORECASE
@@ -472,6 +493,17 @@ def _detect_rocket_fuel_signal_type(content: str) -> str | None:
 
 def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
     if signal_type in {"overbought_alert", "death_cross_warning"}:
+        return None
+    # A negation vetoes the inferred direction before it is applied.
+    #
+    # The signal_type branch used to return "buy" straight away, so the negation
+    # guard below never ran for it: "**EURUSD** is now oversold / Do not buy this
+    # yet" resolved to a long, because "oversold" was enough on its own. An
+    # explicit instruction not to trade is stronger evidence than an inferred
+    # reading of the same message, and it is the direction that opens a position.
+    if _BUY_NEGATED_RE.search(content) and not _reads_as_buy_directive(content):
+        if _reads_as_sell_directive(content):
+            return "sell"
         return None
     if signal_type in {"momentum_reversal"}:
         return "sell"
@@ -578,6 +610,13 @@ def _parse_trade_signal_from_message(
 
     signal_type = None
     if _is_ramjet_signal(content):
+        # Still subject to the negation guard. This branch sets the action
+        # outright, so "oversold buy signal - do not buy this yet" was a long on
+        # the RamJet path while the RocketFuel path correctly refused it. Two bots
+        # reading the same message in opposite directions is exactly the
+        # inconsistency the one shared predicate exists to prevent.
+        if _BUY_NEGATED_RE.search(content):
+            return None
         action = "buy"
         signal_type = "ram_jet_oversold_buy"
     else:
