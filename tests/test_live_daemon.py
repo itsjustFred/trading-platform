@@ -2280,3 +2280,127 @@ def test_stopped_deployment_without_an_adapter_stays_an_info_retry(
     assert retries, f"expected a retry, got {[r.getMessage() for r in records]}"
     assert all(record.levelno == logging.INFO for record in retries)
     assert not [r for r in records if "can never get an adapter" in r.getMessage()]
+
+
+class TestOneDeploymentsConfigErrorDoesNotSilenceTheOthers:
+    """A config typo on one deployment must not silence the rest of the channel.
+
+    `_dispatch_discord_trade_signal` loops over every deployment on a channel.
+    One deployment's malformed boolean used to `return` out of the whole function
+    from inside that loop, abandoning every *later* deployment as well.
+
+    The surrounding comment already said the intent - "must skip the deployment,
+    not kill the listener loop or other deployments on the same account" - so the
+    code contradicted its own stated invariant. The reason it stayed invisible:
+    each deployment still reported ACTIVE, its Discord service still showed
+    connected, and no signal was ever *rejected*. The deployments just quietly
+    stopped trading, which looks exactly like a strategy that stopped firing.
+
+    Every sibling check in the same loop uses `continue`. This one did not.
+    """
+
+    @staticmethod
+    def _deployment(name: str):
+        from shared.models import LiveDeploymentConfig
+
+        return LiveDeploymentConfig(
+            strategy_name=name,
+            account_id="acc-1",
+            symbols=["AAPL"],
+            timeframe="1m",
+            status="ACTIVE",
+            signal_source_type="discord",
+            signal_source_id="rocketfuel",
+        )
+
+    def test_a_broken_deployment_does_not_stop_the_next_one(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        import live_runner.daemon as daemon
+        from risk.models import TradeSignal
+
+        monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda d: True)
+        monkeypatch.setattr(
+            daemon, "_deployment_matches_stockkit_route", lambda *a, **k: True
+        )
+        monkeypatch.setattr(
+            daemon, "_deployment_covers_discord_symbol", lambda *a, **k: True
+        )
+        monkeypatch.setattr(
+            daemon, "_deployment_accepts_signal_author", lambda *a, **k: True
+        )
+        monkeypatch.setattr(daemon, "_deployment_trusted_author_ids", lambda d: {"a"})
+
+        def _wait(deployment, _env):
+            if deployment.strategy_name == "BROKEN":
+                raise ValueError("wait_for_candle_close must be a boolean")
+            return True
+
+        monkeypatch.setattr(daemon, "_deployment_wait_for_candle_close", _wait)
+
+        dispatched: list[str] = []
+
+        async def _submit(_account_id, _adapter, deployment, _signal, **_kwargs):
+            dispatched.append(deployment.strategy_name)
+
+        monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _submit)
+
+        signal = TradeSignal(
+            action="buy", symbol="AAPL", entry_price=100.0, stop_loss=None,
+            take_profit=None, timeframe="1m", metadata={},
+        )
+
+        asyncio.run(
+            daemon._dispatch_discord_trade_signal(
+                "acc-1",
+                None,
+                [self._deployment("BROKEN"), self._deployment("HEALTHY")],
+                signal,
+                accounts_env_values={},
+            )
+        )
+
+        assert "HEALTHY" in dispatched, (
+            "a broken deployment's config error silently silenced every later "
+            f"deployment on the channel; dispatched={dispatched}"
+        )
+        assert "BROKEN" not in dispatched
+
+    def test_every_sibling_refusal_in_that_loop_uses_continue(
+        self, monkeypatch
+    ):
+        """A structural guard, so the bug cannot be reintroduced by a new branch.
+
+        The failure was one `return` among four `continue`s in the same loop, and
+        it is invisible in review because the function is long. This reads the
+        loop body and asserts no early return appears inside it.
+        """
+        import inspect
+
+        import live_runner.daemon as daemon
+
+        source = inspect.getsource(daemon._dispatch_discord_trade_signal)
+        lines = source.splitlines()
+
+        # Locate the per-deployment loop and its body.
+        start = next(
+            i for i, line in enumerate(lines) if line.strip().startswith("for deployment in")
+        )
+        body_indent = len(lines[start]) - len(lines[start].lstrip())
+        # Any return at or below the loop body's indentation, at any nesting
+        # depth. An earlier version of this guard compared indentation for
+        # equality, which missed the bug: the offending `return` sits at depth 12
+        # inside a try/except while the loop is at depth 4. Equality would have
+        # missed exactly the case it was written for.
+        offenders = [
+            line.strip()
+            for line in lines[start + 1 :]
+            if line.strip().startswith("return")
+            and (len(line) - len(line.lstrip())) >= body_indent
+        ]
+        assert not offenders, (
+            f"a bare return inside the per-deployment loop skips every later "
+            f"deployment: {offenders}"
+        )

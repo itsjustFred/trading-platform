@@ -1941,16 +1941,24 @@ async def _dispatch_discord_trade_signal(
             # A typo'd boolean must skip the deployment, not kill the listener
             # loop or other deployments on the same account. It also must not
             # default into immediate market orders.
+            #
+            # `continue`, not `return`: this sits inside the per-deployment loop,
+            # and returning abandoned every *later* deployment on the channel too.
+            # One deployment's config typo then silently stopped all the others
+            # trading, which is the opposite of the intent recorded above and
+            # invisible from the dashboard - each deployment still reported
+            # ACTIVE and connected, it just never received a signal.
             logger.exception(
                 "Invalid deployment boolean config; skipping deployment",
                 extra={
                     "data": {
                         "account_id": account_id,
+                        "deployment_id": str(deployment.id),
                         "strategy_name": deployment.strategy_name,
                     }
                 },
             )
-            return
+            continue
 
         dispatched_to_any = True
         await _submit_normalized_discord_signal(
