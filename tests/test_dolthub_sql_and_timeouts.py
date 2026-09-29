@@ -262,3 +262,103 @@ class TestDoltTimeout:
         out = tmp_path / "out.csv"
         with pytest.raises(DoltTimeoutError):
             dm._export_table_csv(tmp_path, "ohlcv", out)
+
+
+def test_no_sql_string_interpolates_an_unquoted_value() -> None:
+    """The rule the module already documents, enforced independently of syntax.
+
+    `test_no_raw_interpolated_sql_in_manager_source` denies two literal strings.
+    That is a denylist of *spellings*, and measured against it:
+
+    - an f-string using `FROM {table_name}` -> caught (first literal)
+    - an f-string with spaces, `act_symbol = '{symbol}'` -> caught (first literal)
+    - a `.format()` call -> caught (second literal, `act_symbol='`)
+    - **the same injection written with `%` formatting -> NOT caught**
+
+    The last one is the finding. `%s` and `FROM %s` match neither literal, and
+    the query is exactly as injectable as the ones the guard does catch. A
+    denylist of spellings cannot cover a rule about values, because there are
+    four ways to interpolate in Python and only two were named.
+
+    The module already states the rule it means: the table name goes through
+    `quote_identifier` and a given symbol through `quote_literal`, both of which
+    validate and raise on anything unsafe. So this asserts the rule directly -
+    every value interpolated into a SQL string must have been through one of
+    those helpers - across f-strings, `%` and `.format()` alike.
+    """
+    import ast
+    import inspect
+
+    source = inspect.getsource(dm)
+    tree = ast.parse(source)
+
+    quoting_helpers = {"quote_identifier", "quote_literal"}
+    sql_verbs = ("SELECT", "INSERT", "UPDATE", "DELETE", "FROM", "WHERE")
+
+    def _looks_like_sql(text: str) -> bool:
+        upper = text.upper()
+        return any(verb in upper for verb in sql_verbs)
+
+    def _is_quoted(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and (
+            getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        ) in quoting_helpers
+
+    offenders: list[str] = []
+
+    for node in ast.walk(tree):
+        interpolated: list[tuple[str, ast.AST]] = []
+
+        if isinstance(node, ast.JoinedStr):
+            # f-string: the literal chunks tell us whether this is SQL, and the
+            # FormattedValue nodes are the values spliced into it.
+            literal_text = "".join(
+                part.value
+                for part in node.values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            if not _looks_like_sql(literal_text):
+                continue
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    interpolated.append(("f-string", part.value))
+
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            # `"... %s ..." % (a, b)`
+            left = node.left
+            if not (isinstance(left, ast.Constant) and isinstance(left.value, str)):
+                continue
+            if not _looks_like_sql(left.value):
+                continue
+            right = node.right
+            targets = (
+                list(right.elts)
+                if isinstance(right, ast.Tuple)
+                else [right]
+            )
+            for target in targets:
+                interpolated.append(("%-format", target))
+
+        elif (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "format"
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and _looks_like_sql(node.func.value.value)
+        ):
+            for arg in node.args:
+                interpolated.append((".format()", arg))
+
+        for mechanism, value in interpolated:
+            if not _is_quoted(value):
+                offenders.append(
+                    f"line {getattr(value, 'lineno', '?')}: {mechanism} interpolates "
+                    f"{ast.dump(value)[:60]} into a SQL string without going through "
+                    f"{sorted(quoting_helpers)}"
+                )
+
+    assert not offenders, (
+        "these SQL strings interpolate a value that was never quoted, so a table "
+        "name or symbol containing a quote or a semicolon reaches dolt verbatim:\n  "
+        + "\n  ".join(offenders)
+    )
