@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests.integration import viewer_isolation
 from tests.validators.backtest_validator import BacktestExpectation, BacktestResultValidator
 
 #: This suite drives a RUNNING viewer over HTTP, which means whatever DATA_DIR
@@ -25,6 +26,16 @@ _REQUIRE_OPT_IN = os.getenv("PERMA_ALLOW_LIVE_VIEWER_WRITES", "").strip().lower(
     "true",
     "yes",
 }
+
+#: The isolation decision lives in a side-effect-free module so it can be tested
+#: without making a request, and so this file consults it *before* the
+#: import-time discovery below. See viewer_isolation.py for why that ordering is
+#: the whole fix: marks attach to test functions and are evaluated long after
+#: the import-time request has already gone out.
+_ISOLATION_REFUSED = bool(API_BASE_URL) and viewer_isolation.targets_production(
+    API_BASE_URL
+)
+
 
 _REQUIRES_ISOLATED_VIEWER = pytest.mark.skipif(
     not (API_BASE_URL and _REQUIRE_OPT_IN),
@@ -126,10 +137,16 @@ def _poll_task_completion(client: httpx.Client, task_id: str) -> dict[str, Any]:
     )
 
 
-if not (API_BASE_URL and _REQUIRE_OPT_IN):
-    # Import-time discovery already performs HTTP. The skipif above has not been
-    # evaluated yet at this point, so short-circuit here as well; otherwise the
-    # module reaches the viewer during collection no matter what the marks say.
+# Isolation is checked here, not only in the marks above, and that ordering is the
+# whole fix. This module performs HTTP *at import time*: the skipif marks are
+# attached to test functions, so they have not been evaluated when this line runs.
+# A short-circuit on the opt-in alone was already here and was not enough - with
+# BASE_URL aimed at the live platform on :5556 and the opt-in set, discovery still
+# ran and still reached production during collection, before any test could be
+# skipped. That is the shape of the incident that put 219 rows in the live
+# database, so the refusal has to happen before the request, not before the test.
+
+if not (API_BASE_URL and _REQUIRE_OPT_IN) or _ISOLATION_REFUSED:
     _DISCOVERY = None
 else:
     _DISCOVERY = _discover_strategy_matrix()
@@ -140,6 +157,14 @@ pytestmark = [
     pytest.mark.slow,
     _REQUIRES_ISOLATED_VIEWER,
 ]
+
+if _ISOLATION_REFUSED:
+    # Skipped at module level so the reason names the refusal rather than a
+    # connection error from a viewer that should never have been contacted.
+    pytest.skip(
+        viewer_isolation.refusal_reason(API_BASE_URL),
+        allow_module_level=True,
+    )
 
 if _DISCOVERY is not None and _DISCOVERY.error:
     pytest.skip(_DISCOVERY.error, allow_module_level=True)
