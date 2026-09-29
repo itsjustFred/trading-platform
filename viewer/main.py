@@ -503,7 +503,17 @@ async def _prewarm_jforex_jvm_background() -> None:
     try:
         from data_tools.downloaders import jforex_dl
 
-        await asyncio.to_thread(jforex_dl.prewarm_jvm)
+        # Called directly, NOT via asyncio.to_thread: JPype requires the JVM to
+        # be started from the main thread, and this coroutine already runs there
+        # because the lifespan schedules it with asyncio.create_task. Handing it
+        # to a worker thread starts the JVM off the main thread, and JPype's
+        # atexit shutdown then deadlocks - the process hangs forever after the
+        # tests report success, holding its RAM. Verified both directions: a
+        # main-thread start exits in ~1s, a worker-thread start hangs, and a
+        # main-thread shutdownJVM() does not rescue a worker-thread start.
+        # Losing the ~1s of loop blocking is the point: it is a background task,
+        # so the server is not delayed by it.
+        jforex_dl.prewarm_jvm()
         logger.info("JVM prewarmed for JForex")
     except ImportError:
         logger.info("JPype not available, JForex disabled")

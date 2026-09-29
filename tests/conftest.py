@@ -168,3 +168,34 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
         )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _never_start_a_real_jvm_during_tests():
+    """Stop the JForex JVM prewarm from starting a real JVM in the test session.
+
+    The prewarm genuinely works here: the SDK jars are vendored under
+    `data/.jforex-sdk/`, so `prewarm_jvm` starts a real JVM and imports the real
+    `com.dukascopy.api` classes. Any test that builds a `TestClient(app)` runs
+    the lifespan, which fires the prewarm.
+
+    That leaves a live JVM inside the pytest process, and JPype's atexit
+    shutdown then deadlocks - the process hangs *after* printing a green
+    summary. So the suite looked like it passed while pinning a worktree's RAM
+    until something reaped it, and `merge-rehearsal.sh` read the SIGTERM as a
+    failed suite and refused to certify the merge.
+
+    No test needs a live JVM: the JForex paths are covered with a JPype stand-in
+    in `tests/test_jforex_bootstrap.py`. So the JVM is stubbed out for the whole
+    session, and the real start-on-the-main-thread requirement is pinned
+    separately in `test_api_codegen_gate.py`, where it can be checked without
+    paying for a JVM.
+    """
+    from data_tools.downloaders import jforex_dl
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(jforex_dl, "prewarm_jvm", lambda: None)
+    try:
+        yield
+    finally:
+        patch.undo()

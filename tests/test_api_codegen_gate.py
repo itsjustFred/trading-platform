@@ -77,3 +77,47 @@ def test_approve_rejects_path_traversal(client):
     # ..%2f survives httpx/ASGI path normalization and reaches the route handler.
     response = test_client.post("/api/strategies/..%2f..%2fetc%2fpasswd/approve")
     assert response.status_code == 400
+
+
+def test_jforex_prewarm_starts_the_jvm_on_the_main_thread(monkeypatch):
+    """The JForex JVM prewarm must not be pushed onto a worker thread.
+
+    `viewer.main._prewarm_jforex_jvm_background` used to await
+    `asyncio.to_thread(jforex_dl.prewarm_jvm)`, which started the JVM on a
+    `ThreadPoolExecutor` worker. JPype then deadlocks in its atexit shutdown, so
+    the process hangs forever *after* the suite has already printed a green
+    summary. That is worse than a plain failure: it looks like a pass, and it
+    keeps the worktree's RAM pinned until something reaps it.
+
+    Measured, not assumed: a main-thread `prewarm_jvm()` exits in ~1s, the
+    worker-thread version hangs, and calling `jpype.shutdownJVM()` from the main
+    thread afterwards does not rescue it. The only correct fix is to start the
+    JVM on the main thread, which this pins.
+
+    The prewarm stays a background task via `asyncio.create_task`, so the server
+    still is not delayed by the ~1s.
+    """
+    import asyncio
+    import threading
+
+    from data_tools.downloaders import jforex_dl
+
+    seen: dict[str, object] = {}
+
+    def _fake_prewarm() -> None:
+        seen["thread"] = threading.current_thread()
+
+    monkeypatch.setattr(jforex_dl, "prewarm_jvm", _fake_prewarm)
+
+    asyncio.run(_call_prewarm())
+
+    assert seen.get("thread") is threading.main_thread(), (
+        "the JForex prewarm ran off the main thread, which is how the JVM gets "
+        "started somewhere JPype cannot shut it down again"
+    )
+
+
+async def _call_prewarm() -> None:
+    from viewer.main import _prewarm_jforex_jvm_background
+
+    await _prewarm_jforex_jvm_background()
