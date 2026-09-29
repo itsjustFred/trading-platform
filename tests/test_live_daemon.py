@@ -2729,3 +2729,60 @@ class TestDiscordDispatchIsolation:
 
         monkeypatch.setattr(daemon, "list_services", _no_services)
         assert daemon._service_id_for_discord_deployment(deployment) is None
+
+
+def test_the_daemon_cancels_every_task_it_started(monkeypatch):
+    """The comment said "cancel EVERYTHING"; the list had drifted from the gather.
+
+    `heartbeat_task` was awaited in the happy-path gather but absent from the
+    finally block's cancel list, so when any sibling raised, the heartbeat kept
+    running against a daemon that was already unwinding - writing heartbeats for
+    a process on its way down.
+
+    The same shape as the PAUSED floor and the allowlist drift: the rule is stated
+    once and implemented by a list that nobody re-checks. Found by the CodeRabbit
+    review, not by a test.
+    """
+    import ast
+    import textwrap
+
+    # `inspect.cleandoc` is for docstrings. It strips the first line's indentation
+    # unconditionally, which for a function body silently removes one level from
+    # every subsequent line and produced a tree with no `create_task` at all -
+    # the test then failed on its own precondition while the fix was present.
+    # `textwrap.dedent` is the right tool and is the reason the first version of
+    # this test was a no-op.
+    source = textwrap.dedent(inspect.getsource(daemon.run_daemon))
+    tree = ast.parse(source)
+
+    created = {
+        node.targets[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Call)
+        # `asyncio.create_task` parses as an ast.Attribute, not a Name - matching
+        # only `.id` finds nothing, which is why this test failed its own
+        # precondition while the fix it was written for was present.
+        and (getattr(node.value.func, "attr", None) or getattr(node.value.func, "id", None))
+        == "create_task"
+    }
+    assert "heartbeat_task" in created, "precondition: the heartbeat task exists"
+
+    # Every task created must appear in the finally block's cancel list.
+    # `for task in (...)` - the target is a single Name, not a tuple. Unpacking is
+    # a loop target, so the tuple is `node.iter`.
+    cancelled: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Tuple):
+            continue
+        for elt in node.iter.elts:
+            if isinstance(elt, ast.Name):
+                cancelled.add(elt.id)
+
+    missing = created - cancelled
+    assert not missing, (
+        f"started but never cancelled on shutdown: {sorted(missing)}; a task that "
+        "outlives the daemon keeps running against a process that is unwinding"
+    )

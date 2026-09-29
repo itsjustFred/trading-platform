@@ -3925,12 +3925,21 @@ async def run_daemon(
         # B2: cancel EVERYTHING (sync + balance loops leaked before) and
         # await the cancels — fire-and-forget cancel() leaves pending tasks
         # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task):
+        # heartbeat_task is gathered on the happy path but was missing here, so
+        # when a sibling raised it was never cancelled and kept running against a
+        # daemon that was already unwinding. The comment above states the rule -
+        # cancel EVERYTHING - and the list had drifted from the gather that waits
+        # on it. Found by the CodeRabbit review.
+        for task in (sync_task, service_sync_task, balance_task, heartbeat_task):
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(
-                sync_task, service_sync_task, balance_task, return_exceptions=True
+                sync_task,
+                service_sync_task,
+                balance_task,
+                heartbeat_task,
+                return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):
             if not task.done():

@@ -948,10 +948,16 @@ class DiscordSignalSource(BaseSignalSource):
         # found FAILED - not PAUSED - and reset it to RUNNING on the next daemon
         # start, so the process had undone a decision the operator had just made.
         # A status that an inbound message can flip is not a record of intent.
-        current = await asyncio.to_thread(get_service, self.service_id)
-        if current is not None and current.status == ServiceStatus.PAUSED:
-            return
         try:
+            # The PAUSED read is inside the try, not merely next to it. A
+            # transient database error here would otherwise propagate out of a
+            # method whose whole job is to report status without failing, and
+            # take the caller's loop with it - this is called from the poll path,
+            # so an unreachable database would stop the bot rather than just
+            # leaving a status unwritten. Found by the CodeRabbit review.
+            current = await asyncio.to_thread(get_service, self.service_id)
+            if current is not None and current.status == ServiceStatus.PAUSED:
+                return
             await asyncio.to_thread(
                 update_service_status,
                 self.service_id,
