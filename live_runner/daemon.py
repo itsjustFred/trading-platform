@@ -52,13 +52,16 @@ from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
     claim_live_deployment_submission,
+    clear_live_deployment_stopped_enforced,
     create_service,
     get_live_account,
     get_live_deployment,
     list_live_accounts,
     list_live_deployments,
     list_services,
+    list_stopped_enforced_deployment_ids,
     live_account_submission_block_reason,
+    mark_live_deployment_stopped_enforced,
     record_daemon_heartbeat,
     release_live_deployment_submission,
     save_live_balance,
@@ -3297,9 +3300,26 @@ async def _enforce_stopped_deployments(
     # transition enforces the controls again instead of being skipped as
     # "already done" from a previous stop.
     stopped_ids = {str(deployment.id) for deployment in stopped}
-    already_enforced.difference_update(
-        {deployment_id for deployment_id in already_enforced if deployment_id not in stopped_ids}
-    )
+    left_stopped = {
+        deployment_id for deployment_id in already_enforced if deployment_id not in stopped_ids
+    }
+    already_enforced.difference_update(left_stopped)
+    # Persist the clearing too. In-memory only, a deployment that left STOPPED
+    # kept its stamp in the database, so a restart would seed the ledger with it
+    # and skip the enforcement for a deployment stopped for a second time - the
+    # exact failure this ledger was added to prevent, one step along.
+    for deployment_id in sorted(left_stopped):
+        try:
+            await asyncio.to_thread(
+                clear_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not clear a stale STOPPED enforcement stamp",
+                extra={
+                    "data": {"deployment_id": deployment_id, "error": repr(exc)}
+                },
+            )
 
     # cancel/flatten act on the whole broker account, not on one deployment's
     # positions. If another deployment on the same account is still ACTIVE, its
@@ -3479,6 +3499,20 @@ async def _enforce_stopped_deployments(
             )
 
         already_enforced.add(deployment_id)
+        # Persist the ledger, not just the in-memory set. After a restart the set
+        # starts empty, and cancel + flatten ran again for deployments that were
+        # already stopped: re-sending cancel orders and re-closing positions that
+        # are already flat. Harmless per event, wrong in aggregate, and invisible
+        # because nothing recorded that it had happened.
+        try:
+            await asyncio.to_thread(
+                mark_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not record STOPPED enforcement for a deployment",
+                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+            )
         logger.warning(
             "Enforced STOPPED deployment: orders cancelled and positions flattened",
             extra={
@@ -3730,7 +3764,23 @@ async def sync_deployments_loop(
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
-    enforced_stopped_deployments: set[str] = set()
+    # Seeded from the database, not empty. Every restart used to re-run cancel
+    # and flatten for deployments that were already stopped, because this set was
+    # process-local and the enforcement stamp it now mirrors is persisted.
+    try:
+        enforced_stopped_deployments = await asyncio.to_thread(
+            list_stopped_enforced_deployment_ids
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # Fail toward re-enforcing rather than toward skipping it: an empty
+        # ledger repeats work, a wrong one would leave a stopped deployment with
+        # open positions.
+        enforced_stopped_deployments = set()
+        logger.warning(
+            "Could not read the persisted STOPPED enforcement ledger; "
+            "enforcement will be re-run for every stopped deployment this tick",
+            extra={"data": {"error": repr(exc)}},
+        )
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:

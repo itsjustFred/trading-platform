@@ -213,6 +213,15 @@ class LiveDeploymentConfig(BaseModel):
     symbols: list[str]
     timeframe: str
     status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    # When STOPPED enforcement last completed for this deployment.
+    #
+    # The daemon keeps this in a set in memory, which meant a restart re-ran
+    # cancel and flatten for deployments already stopped: re-sending cancel
+    # orders and re-closing positions that are already flat. Harmless per event
+    # and wrong in aggregate, and invisible because the ledger was never
+    # written down. Cleared deliberately when the deployment leaves STOPPED, so
+    # stopping again re-enforces.
+    stopped_enforced_at: datetime | None = None
     signal_source_type: Literal["internal", "discord"] = "internal"
     signal_source_id: str | None = None
     symbol_filter: list[str] = Field(default_factory=list)

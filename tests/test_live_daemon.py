@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import inspect
+import textwrap
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -2785,4 +2786,136 @@ def test_the_daemon_cancels_every_task_it_started(monkeypatch):
     assert not missing, (
         f"started but never cancelled on shutdown: {sorted(missing)}; a task that "
         "outlives the daemon keeps running against a process that is unwinding"
+    )
+
+
+class TestPersistedStoppedEnforcementLedger:
+    """STOPPED enforcement must survive a process, not just a tick.
+
+    The ledger was a set in daemon memory, so every restart re-ran cancel and
+    flatten for deployments that were already stopped: re-sending cancel orders
+    and re-closing positions that are already flat. Harmless per event, wrong in
+    aggregate, and invisible because nothing recorded that it had happened.
+    """
+
+    def test_the_ledger_survives_a_restart(self, isolated_db_sandbox) -> None:
+        database_module, _engine, _data_dir = isolated_db_sandbox
+        import uuid as _uuid
+
+        database_module.ensure_live_account("acc-stop", "alpaca", is_demo=True)
+        did = str(_uuid.uuid4())
+        database_module.create_live_deployment(
+            database_module.LiveDeploymentConfig(
+                id=_uuid.UUID(did),
+                strategy_name="trend_following/trend_following.py",
+                account_id="acc-stop",
+                symbols=["EURUSD"],
+                timeframe="M15",
+                status="STOPPED",
+                signal_source_type="discord",
+            )
+        )
+
+        assert database_module.list_stopped_enforced_deployment_ids() == set()
+
+        database_module.mark_live_deployment_stopped_enforced(did)
+
+        # A fresh process rebuilds the ledger from here, so the second stop of
+        # the same deployment is not repeated.
+        assert did in database_module.list_stopped_enforced_deployment_ids(), (
+            "the enforcement ledger did not survive, so a restart would flatten "
+            "this deployment's account a second time"
+        )
+
+    def test_leaving_stopped_clears_the_stamp(self, isolated_db_sandbox) -> None:
+        """The opposite error matters too: a stale stamp skips a real stop.
+
+        Without clearing, a deployment that was stopped, enforced, then paused,
+        then stopped again would be skipped as "already done" from the first
+        stop - leaving orders and positions open. That is worse than repeating
+        work, so both directions are pinned.
+        """
+        database_module, _engine, _data_dir = isolated_db_sandbox
+        import uuid as _uuid
+
+        database_module.ensure_live_account("acc-stop2", "alpaca", is_demo=True)
+        did = str(_uuid.uuid4())
+        database_module.create_live_deployment(
+            database_module.LiveDeploymentConfig(
+                id=_uuid.UUID(did),
+                strategy_name="trend_following/trend_following.py",
+                account_id="acc-stop2",
+                symbols=["EURUSD"],
+                timeframe="M15",
+                status="STOPPED",
+                signal_source_type="discord",
+            )
+        )
+        database_module.mark_live_deployment_stopped_enforced(did)
+
+        database_module.clear_live_deployment_stopped_enforced(did)
+
+        assert database_module.list_stopped_enforced_deployment_ids() == set(), (
+            "a stale stamp survived leaving STOPPED, so stopping again would be "
+            "skipped and positions would stay open"
+        )
+
+    def test_a_legacy_table_gains_the_column(self, isolated_db_sandbox) -> None:
+        """Model field without an ALTER works on a fresh DB and nowhere else."""
+        import sqlite3 as _sqlite3
+        from pathlib import Path
+
+        _database_module, engine, _data_dir = isolated_db_sandbox
+        db_path = Path(str(engine.url).replace("sqlite:///", ""))
+
+        with _sqlite3.connect(str(db_path)) as con:
+            con.execute("ALTER TABLE live_deployments RENAME TO ld_new")
+            con.execute(
+                "CREATE TABLE live_deployments (id TEXT PRIMARY KEY,"
+                " strategy_name TEXT, account_id TEXT, symbols_json TEXT,"
+                " timeframe TEXT, status TEXT, signal_source TEXT,"
+                " signal_source_type TEXT, signal_source_id TEXT,"
+                " symbol_filter_json TEXT, signal_config_json TEXT,"
+                " settings_json TEXT, created_at DATETIME, updated_at DATETIME)"
+            )
+            con.execute("DROP TABLE ld_new")
+
+        _database_module._migrate_schema()
+
+        with _sqlite3.connect(str(db_path)) as con:
+            cols = {r[1] for r in con.execute("PRAGMA table_info('live_deployments')")}
+        assert "stopped_enforced_at" in cols, (
+            "no ALTER for stopped_enforced_at, so the column would be missing in "
+            "every existing install while every model-driven test passed"
+        )
+
+
+def test_the_daemon_reads_and_writes_the_ledger_rather_than_a_local_set(
+    isolated_db_sandbox,
+):
+    """The DB functions passing is not the same as the daemon using them.
+
+    Two mutations survived the first version of these pins: seeding the ledger
+    empty again, and replacing the clear with a no-op. Both left every test green,
+    because the tests exercised the database helpers directly and never the daemon
+    code that calls them - the same "the test cannot reach the code under test"
+    trap, and the reason the first pins were worth nothing on their own.
+
+    So this asserts the wiring structurally: the enforcement loop must stamp
+    through the persisting call, must clear through the other one, and the ledger
+    must be seeded from the database rather than initialised empty.
+    """
+    source = textwrap.dedent(inspect.getsource(daemon._enforce_stopped_deployments))
+    assert "mark_live_deployment_stopped_enforced" in source, (
+        "enforcement records the id in a local set but not in the database, so a "
+        "restart re-flattens the account"
+    )
+    assert "clear_live_deployment_stopped_enforced" in source, (
+        "the stamp is never cleared, so stopping a deployment a second time is "
+        "skipped as already done and positions stay open"
+    )
+
+    runner = textwrap.dedent(inspect.getsource(daemon.sync_deployments_loop))
+    assert "list_stopped_enforced_deployment_ids" in runner, (
+        "the ledger starts empty on every process, which is the defect itself"
     )

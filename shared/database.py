@@ -834,6 +834,7 @@ class LiveDeploymentModel(SQLModel, table=True):
     )
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
+    stopped_enforced_at: datetime | None = Field(default=None, index=True)
     signal_source: str = Field(default="internal", index=True)
     signal_source_type: str = Field(default="internal", index=True)
     signal_source_id: str = Field(default="", index=True)
@@ -875,6 +876,10 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols_json=deployment.symbols,
             timeframe=deployment.timeframe,
             status=deployment.status,
+            # Preserved across a status write, so stamping the enforcement does
+            # not reset it. A deployment that is stopped, enforced and then
+            # paused keeps its stamp; stopping it again clears it explicitly.
+            stopped_enforced_at=deployment.stopped_enforced_at,
             signal_source=source_name,
             signal_source_type=source_type,
             signal_source_id=source_id,
@@ -905,6 +910,9 @@ class LiveDeploymentModel(SQLModel, table=True):
             signal_source=source_name if source_name in {"internal", "discord"} else "internal",
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
+            # Read back, so the daemon's startup ledger can be rebuilt from the
+            # database rather than starting empty on every process.
+            stopped_enforced_at=self.stopped_enforced_at,
         )
 
 
@@ -1474,6 +1482,23 @@ def _add_backtests_tags_column(connection: Connection) -> None:
         )
 
 
+def _add_live_deployment_enforced_column(connection: Connection) -> None:
+    """Add `live_deployments.stopped_enforced_at` to legacy tables.
+
+    Persists the STOPPED enforcement ledger, which used to be a set in daemon
+    memory and so was lost on every restart - re-running cancel and flatten for
+    deployments that were already stopped.
+    """
+    column_names = _table_column_names(connection, "live_deployments")
+    if "stopped_enforced_at" not in column_names:
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN stopped_enforced_at DATETIME"
+            )
+        )
+
+
 def _add_service_columns(connection: Connection) -> None:
     """Add `services.last_attempt_at` to legacy tables.
 
@@ -1742,6 +1767,7 @@ def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         _add_service_columns(connection)
+        _add_live_deployment_enforced_column(connection)
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
@@ -2808,6 +2834,66 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
 # of silently reading as "drained".
 LIVE_SUBMISSION_CLAIM_TTL_SECONDS = 30.0
 LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS = LIVE_SUBMISSION_CLAIM_TTL_SECONDS * 2.0
+
+
+def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Record that STOPPED enforcement completed for this deployment.
+
+    The daemon keeps the same set in memory, which is what made a restart re-run
+    cancel and flatten for deployments already stopped. Writing it down means the
+    ledger survives a process, and a restart resumes rather than repeating.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        record.stopped_enforced_at = _utcnow_naive()
+        record.updated_at = record.stopped_enforced_at
+        session.add(record)
+        session.commit()
+    return True
+
+
+def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Forget the enforcement stamp so a later STOPPED transition re-enforces.
+
+    Called when a deployment leaves STOPPED. Without it, stopping the same
+    deployment again would be skipped as "already done" from the previous stop,
+    which is the opposite error to the one this column was added to fix.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        record.stopped_enforced_at = None
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def list_stopped_enforced_deployment_ids() -> set[str]:
+    """Deployment ids whose STOPPED enforcement already completed.
+
+    Read once at daemon startup to rebuild the in-memory ledger, so a restart
+    does not repeat work that is already done.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveDeploymentModel.id).where(
+                LiveDeploymentModel.stopped_enforced_at.is_not(None)
+            )
+        ).all()
+    return {str(row) for row in rows}
 
 
 def claim_live_deployment_submission(
