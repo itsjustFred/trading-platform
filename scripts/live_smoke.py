@@ -1169,7 +1169,9 @@ def _stockkit_deployment_and_signal(
     message = SimpleNamespace(
         content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",
         id=f"stockkit-e2e-{uuid4().hex}",
-        channel=SimpleNamespace(id=str(env.get(f"DISCORD_BOT_{route.upper()}_CHANNEL_ID", ""))),
+        channel=SimpleNamespace(
+            id=str(env.get(discord_bot_env_key(route, "CHANNEL_ID"), ""))
+        ),
         author=SimpleNamespace(id=f"stockkit-{route}", bot=True),
         created_at=datetime.now(timezone.utc),
     )

@@ -31,7 +31,10 @@ if __package__ in (None, ""):  # pragma: no cover - script entry point
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from live_runner import service_discovery
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import (
+    discord_bot_env_key,
+    load_accounts_env_values,
+)
 from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 from live_runner.signal_sources.discord_source import DiscordSignalSource
 
@@ -170,7 +173,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         ids = ",".join(row["author_id"] for row in entry["authors"])
         print("\n  # review the above, then set:")
-        print(f"  DISCORD_BOT_{entry['bot'].upper()}_TRUSTED_AUTHOR_IDS={ids}")
+        # Through the helper. This is the variable the operator is told to set, so
+        # a key built any other way emits something the daemon will never read -
+        # and the bot then falls back to the shared list, which is exactly the
+        # cross-bot trust the per-bot variable exists to prevent.
+        print(
+            f"  {discord_bot_env_key(entry['bot'], 'TRUSTED_AUTHOR_IDS')}={ids}"
+        )
     if failed:
         print(
             f"\n{failed} of {len(results)} channels could not be read; those values "

@@ -1364,7 +1364,7 @@ def _resolve_account_discord_token(
     token_env_key = ""
     if service_name:
         canonical_name = discord_bot_env_canonical_name(service_name)
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     if token_env_key:
         per_bot_token = resolve_env_value(accounts_env_values, token_env_key)
         if per_bot_token:
@@ -1441,7 +1441,7 @@ def _resolve_discord_auth_scheme(
     """
     canonical_name = discord_bot_env_canonical_name(bot_name)
     per_bot_keys = (
-        (f"DISCORD_BOT_{canonical_name}_AUTH_SCHEME",) if canonical_name else ()
+        (discord_bot_env_key(canonical_name, "AUTH_SCHEME"),) if canonical_name else ()
     )
     for key in (*per_bot_keys, "DISCORD_AUTH_SCHEME"):
         resolved = resolve_env_value(accounts_env_values, key).strip().lower()
@@ -2369,7 +2369,7 @@ def _resolve_discord_bot_runtime(
     token_env_key = _service_config_string(config, "token_env_key")
     if not token_env_key:
         canonical_name = discord_bot_env_canonical_name(service.name)
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     token = resolve_env_value(accounts_env_values, token_env_key)
     channel_id = _service_config_string(config, "channel_id")
     return token_env_key, token, channel_id

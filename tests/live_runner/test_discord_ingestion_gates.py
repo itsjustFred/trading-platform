@@ -3288,3 +3288,49 @@ class TestStandardsReviewFindings:
                     f"service={sorted(via_service)} "
                     f"deployment={sorted(via_deployment)}"
                 )
+
+
+def test_no_per_bot_env_key_is_built_by_hand():
+    """Every ``DISCORD_BOT_<NAME>_...`` key goes through the one helper.
+
+    ``discord_bot_env_canonical_name``'s own docstring says every per-bot key
+    "must be built through this helper, otherwise the keys for two credentials of
+    the same bot silently diverge" - and the branch had seven copies of the
+    prefix spelled out by hand across three files. Six were already-canonical
+    round-trips; one, in the tool that tells the operator which variable to set,
+    was a plain ``.upper()``.
+
+    A static assertion rather than a behavioural one, because the whole failure
+    is that the two spellings agree today. A test that ran the code would pass
+    with any number of copies; only reading the source can see the seventh
+    appear.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        parts = set(path.parts)
+        if {"tests", ".venv", "node_modules"} & parts:
+            continue
+        if path.name == "credential_env.py":
+            # The helper is where the prefix is legitimately spelled out.
+            continue
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+        ):
+            if "DISCORD_BOT_" not in line:
+                continue
+            stripped = line.strip()
+            if stripped[:1] in {"#", "*", '"', "'"}:
+                continue
+            if "discord_bot_env_key" in line or "discord_bot_env_canonical_name" in line:
+                continue
+            if re.search(r'f?["\']DISCORD_BOT_\{', line):
+                offenders.append(f"{path.relative_to(root)}:{lineno}: {stripped[:66]}")
+
+    assert not offenders, (
+        "per-bot env keys built by hand, which is how the two copies of the same "
+        "rule drifted before:\n  " + "\n  ".join(offenders)
+    )
