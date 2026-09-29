@@ -3334,3 +3334,32 @@ def test_no_per_bot_env_key_is_built_by_hand():
         "per-bot env keys built by hand, which is how the two copies of the same "
         "rule drifted before:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_the_allowlist_never_falls_back_to_the_process_environment(monkeypatch):
+    """`.accounts.env` is never installed into `os.environ`, so a fallback finds nothing.
+
+    The service path has always refused it, with the reason written down: "this is
+    an allowlist, and an inherited process variable must not silently become one".
+    The deployment path did fall back, which meant a caller that forgot to thread
+    the mapping got an empty allowlist - and an empty allowlist means "no
+    restriction" at the gate. That is the inert-gate shape from 8d8a3c3, one layer
+    up.
+
+    All three production callers pass the mapping today, so this is unreachable
+    in production. The point is that it is now loud rather than quietly
+    permissive if that ever changes.
+    """
+    from live_runner.daemon import _deployment_trusted_author_ids
+
+    monkeypatch.setenv("DISCORD_TRUSTED_AUTHOR_IDS", "1,2,3")
+    deployment = SimpleNamespace(
+        id="d1", settings={}, signal_config={}, signal_source_id="nitro"
+    )
+
+    resolved = _deployment_trusted_author_ids(deployment)
+
+    assert resolved == set(), (
+        f"the process environment leaked into the ingestion allowlist: "
+        f"{sorted(resolved)}"
+    )

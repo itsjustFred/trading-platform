@@ -1880,10 +1880,28 @@ def _deployment_trusted_author_ids(
     )
     if direct:
         return direct
-    if accounts_env_values is not None:
-        env_source: Mapping[str, str] = accounts_env_values
-    else:
-        env_source = os.environ
+    # No fallback to os.environ, deliberately.
+    #
+    # `.accounts.env` is read into a mapping and never installed into the process
+    # environment, so an `os.environ` fallback resolves nothing here: the
+    # allowlist comes back empty, and `_deployment_accepts_signal_author` treats
+    # empty as "no restriction" and returns True. That is the exact shape of the
+    # inert-gate bug fixed in 8d8a3c3, one layer up - a gate that resolves
+    # nothing and reports success. The service path refuses os.environ for the
+    # same reason; this one now does too.
+    #
+    # All three production call sites pass the mapping, so this branch is
+    # unreachable today. It is here to be loud if a future caller forgets, rather
+    # than quietly permissive.
+    if accounts_env_values is None:
+        logger.error(
+            "Discord author allowlist requested without the accounts env; "
+            "refusing to fall back to the process environment, which never "
+            "contains it",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return set()
+    env_source: Mapping[str, str] = accounts_env_values
     service_name = _deployment_service_name(deployment)
     if service_name:
         # Through the canonicalisation helper, as its own docstring requires of
