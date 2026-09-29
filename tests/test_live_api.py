@@ -1776,3 +1776,51 @@ def test_the_api_is_the_one_caller_allowed_to_clear_a_pause(isolated_db_sandbox)
         "an operator cannot resume a service they paused, so the guard is a "
         "trap rather than a safety"
     )
+
+
+def test_every_stockkit_route_call_site_resolves_configured_accounts():
+    """Four call sites, one rule, and the arguments were not shared.
+
+    `a182e50` moved expected-account resolution out of a hardcoded table into
+    configuration and wired it into three of four callers. The viewer API - the
+    path an operator walks to create a Discord deployment - kept resolving
+    `STOCKKIT_ACCOUNT_ROUTES`, the table the same commit describes as matching
+    none of the configured paper accounts. A correctly routed deployment was
+    refused, and the refusal named a broker account the deployment was not on.
+
+    Asserted by inspecting the source rather than by driving the endpoint: the
+    defect is an *argument* that one call site omitted, and an HTTP-level test
+    has to satisfy every other precondition of that endpoint before it reaches
+    the line in question. That is the "unreachable code" trap again, one level up
+    from the fixtures - the assertion has to be about the thing that is wrong.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        if {"tests", ".venv", "node_modules"} & set(path.parts):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "validate_stockkit_deployment_route(" not in text:
+            continue
+        if "def validate_stockkit_deployment_route" in text:
+            continue
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", "") != "validate_stockkit_deployment_route":
+                continue
+            names = {kw.arg for kw in node.keywords}
+            if "accounts_env_values" not in names:
+                offenders.append(
+                    f"{path.relative_to(root)}:{node.lineno} "
+                    "(validated routing without the configured accounts)"
+                )
+
+    assert not offenders, (
+        "call sites that resolve the stale static account table instead of the "
+        "configured one:\n  " + "\n  ".join(offenders)
+    )

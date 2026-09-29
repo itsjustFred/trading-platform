@@ -412,11 +412,37 @@ def multiple_testing_correction(
 
     best_observed = min(clean) if minimize else max(clean)
     reported = best_observed if observed_metric is None else float(observed_metric)
-    survives = (
-        reported <= significance_threshold
-        if minimize
-        else reported >= significance_threshold
-    )
+    # A bounded metric gets the direct test instead of the z-bar.
+    #
+    # `mean - z*sigma` is the right construction for an unbounded metric like
+    # Sharpe, and structurally wrong for one bounded in [0, 1] like a p-value: a
+    # uniform p-value sample has mean ~0.5 and sigma ~0.29, so at n=60 the bar
+    # lands at 0.56 - 3.16*0.29 = -0.36, and no p-value can ever be <= -0.36.
+    # The verdict was a constant False - measured 0/300 on realistic p-value
+    # studies - and it read as a *measured negative* rather than an absent
+    # measurement, which is the "never render absence as a value" failure this
+    # repo keeps fixing elsewhere.
+    #
+    # The direct test is `min(p) <= alpha / n`: exact, bounded, and interpretable
+    # as "does the best trial clear the Bonferroni-corrected bar". Its false
+    # positive rate on pure noise is bounded by alpha, which is the entire point of
+    # a multiple-testing correction.
+    #
+    # Detected from the data rather than passed in, because the caller knows the
+    # direction but not the metric name, and a hardcoded metric list here would be
+    # exactly the "one rule in two places" shape this branch has been closing.
+    # Every observed value in [0, 1] is a necessary condition rather than a
+    # sufficient one, so an unbounded metric that happens to land there degrades
+    # to the stricter test instead of to a wrong verdict.
+    if minimize and all(0.0 <= value <= 1.0 for value in clean):
+        significance_threshold = bonferroni
+        survives = reported <= bonferroni
+    else:
+        survives = (
+            reported <= significance_threshold
+            if minimize
+            else reported >= significance_threshold
+        )
 
     return {
         "n_trials": n_trials,

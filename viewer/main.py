@@ -12492,6 +12492,23 @@ async def create_live_deployment_endpoint(
         settings=payload.settings or {},
     )
     try:
+        # Same resolution order the database and daemon use: the configured
+        # account number, else the static table.
+        #
+        # Omitting it meant the API - the path an operator walks to create a
+        # Discord deployment - resolved `STOCKKIT_ACCOUNT_ROUTES`, the table
+        # a182e50 itself describes as matching none of the configured paper
+        # accounts. A correctly routed deployment was refused, and the refusal
+        # named a broker account the deployment was not on. The check is the
+        # shared chokepoint; its arguments were not, so this one call site
+        # validated against a different answer than every other.
+        try:
+            from live_runner.credential_env import load_accounts_env_values
+            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+            route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+        except Exception:
+            route_env = {}
         validate_stockkit_deployment_route(
             deployment,
             # Routing compares BROKER identity, not the local account id. Without
@@ -12502,6 +12519,7 @@ async def create_live_deployment_endpoint(
                 or account_payload.get("ctid")
                 or ""
             ),
+            accounts_env_values=route_env,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc

@@ -942,3 +942,66 @@ def test_an_unreadable_pnl_is_dropped_rather_than_charged_to_a_subperiod():
     # The sub-period is still reported (measured, not skipped) and carries no
     # invented result.
     assert realized == {"fold_0": 0.0}
+
+
+def test_the_selection_bias_verdict_is_reachable_for_a_p_value_study():
+    """`survives_selection_bias` was a constant False for every p-value study.
+
+    The significance bar was `mean - z*sigma`. A uniform p-value sample has mean
+    ~0.5 and sigma ~0.29, so at n=60 with alpha=0.05 the bar lands near -0.36 and
+    no p-value can be <= -0.36. Measured 0/300 on realistic studies.
+
+    That is worse than a wrong number: `104fa42` tells operators to gate promotion
+    on this field, and an inert field reads as a *measured negative* rather than
+    an absent measurement.
+
+    A p-value study is bounded in [0, 1], so it gets the direct test
+    `min(p) <= alpha / n`, which is exact and whose false-positive rate is bounded
+    by alpha. The unbounded construction is kept for metrics like Sharpe.
+    """
+    import random
+
+    random.seed(7)
+
+    def flagged(with_real_effect: bool) -> int:
+        hits = 0
+        for _ in range(120):
+            n = random.randint(5, 60)
+            values = [random.betavariate(1, 1) for _ in range(n)]
+            if with_real_effect:
+                for _ in range(random.randint(0, 3)):
+                    values[random.randrange(n)] = random.uniform(1e-6, 1e-3)
+            result = multiple_testing_correction(values, direction="minimize")
+            hits += bool(result["survives_selection_bias"])
+        return hits
+
+    with_effect = flagged(True)
+    noise_only = flagged(False)
+
+    assert with_effect > 0, (
+        "a p-value study with a genuine effect is never reported as surviving "
+        "selection bias, so the field is inert"
+    )
+    # A correction whose whole purpose is a bounded false-positive rate.
+    assert noise_only <= 12, (
+        f"{noise_only}/120 pure-noise studies were called significant; the "
+        "correction is not correcting"
+    )
+    assert with_effect > noise_only, (
+        "the verdict does not distinguish a real effect from noise"
+    )
+
+
+def test_an_unbounded_metric_still_uses_the_sigma_scaled_bar():
+    """The bounded path must not swallow metrics that merely look small.
+
+    A Sharpe study whose values all happen to fall in [0, 1] degrades to the
+    stricter test rather than to a wrong verdict - but an ordinary unbounded
+    metric must keep the construction the earlier commits verified.
+    """
+    unbounded = [1.8, 2.1, 1.95, 2.3, 2.05, 1.88, 2.2, 1.99]
+    result = multiple_testing_correction(unbounded, direction="maximize")
+    assert result["significance_threshold"] > max(unbounded), (
+        "an unbounded maximize study cannot clear its own bar, so the "
+        "z-construction was lost"
+    )
