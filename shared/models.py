@@ -107,6 +107,17 @@ class Service(BaseModel):
     status: ServiceStatus
     config: dict[str, Any] = Field(default_factory=dict)
     last_activity: datetime | None = None
+    # When the service was last *tried*, successfully or not.
+    #
+    # `last_activity` only advances on a successful read, so a service that has
+    # been failing for three days keeps showing the last time it worked - which
+    # reads as "the process is not trying" when it is. Confirmed by restarting the
+    # daemon on 2026-09-29: all three bots were re-discovered, restarted and
+    # re-authenticated, and `last_activity` did not move by a second while
+    # `updated_at` did. Anyone triaging a failed service from `last_activity`
+    # alone draws the wrong conclusion, and the healthier the rest of the system
+    # is, the more misleading that column becomes.
+    last_attempt_at: datetime | None = None
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )

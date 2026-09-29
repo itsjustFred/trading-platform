@@ -3167,6 +3167,7 @@ def test_service_payload_redacts_structured_secrets():
             "safe": "visible",
         },
         last_activity=None,
+        last_attempt_at=None,
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
 

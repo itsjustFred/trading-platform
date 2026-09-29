@@ -1932,3 +1932,75 @@ def test_an_absent_confirmation_is_refused(isolated_db_sandbox):
         f"a missing confirmation was accepted (status {response.status_code})"
     )
     assert database_module.get_live_deployment(did).status == "PAUSED"
+
+
+def test_a_failed_service_records_that_it_was_actually_tried(isolated_db_sandbox):
+    """`last_activity` only advances on success, so it cannot answer this.
+
+    Found by restarting the daemon rather than reasoning about it: all three
+    Discord bots were re-discovered, restarted and re-authenticated, and
+    `last_activity` did not move by a second while `updated_at` did. A service
+    failing for days therefore shows the last time it *worked*, and reads as "the
+    process is not trying" when it is.
+
+    Two questions, two columns: `last_activity` is when this last worked,
+    `last_attempt_at` is when anyone last tried.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    service = database_module.create_service(
+        database_module.Service(
+            name="TEST_BOT",
+            type=database_module.ServiceType.DISCORD_BOT,
+            status=database_module.ServiceStatus.RUNNING,
+            config={},
+        )
+    )
+    assert service.last_attempt_at is None
+
+    database_module.update_service_status(
+        str(service.id), database_module.ServiceStatus.FAILED
+    )
+    after = database_module.get_service(str(service.id))
+
+    assert after.status == database_module.ServiceStatus.FAILED
+    assert after.last_attempt_at is not None, (
+        "a failed attempt left no record that it was tried, so the service is "
+        "indistinguishable from one nobody is attempting"
+    )
+    # And last_activity is deliberately untouched: it means "last success".
+    assert after.last_activity is None
+
+
+def test_a_legacy_services_table_gains_the_column(isolated_db_sandbox):
+    """The migration has to reach an existing install, not just a fresh schema.
+
+    Every operator running this has a database created before the column existed,
+    and a model field with no ALTER leaves the column absent in production while
+    the tests - which build from the model - all pass.
+    """
+    import sqlite3 as _sqlite3
+    from pathlib import Path
+
+    database_module, engine, _data_dir = isolated_db_sandbox
+    db_path = Path(str(engine.url).replace("sqlite:///", ""))
+
+    # Rebuild `services` in the pre-column shape, then re-run the migration.
+    with _sqlite3.connect(str(db_path)) as con:
+        cols = {r[1] for r in con.execute("PRAGMA table_info('services')")}
+        assert "last_attempt_at" in cols, "precondition: the fresh schema has it"
+        con.execute("ALTER TABLE services RENAME TO services_new")
+        con.execute(
+            "CREATE TABLE services (id TEXT PRIMARY KEY, name TEXT, type TEXT,"
+            " status TEXT, config TEXT, last_activity DATETIME,"
+            " created_at DATETIME, updated_at DATETIME)"
+        )
+        con.execute("DROP TABLE services_new")
+
+    database_module._migrate_schema()
+
+    with _sqlite3.connect(str(db_path)) as con:
+        cols = {r[1] for r in con.execute("PRAGMA table_info('services')")}
+    assert "last_attempt_at" in cols, (
+        "the migration did not add the column to a legacy services table, so it "
+        "would be missing in every existing install"
+    )

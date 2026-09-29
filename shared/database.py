@@ -777,6 +777,7 @@ class ServiceModel(SQLModel, table=True):
         sa_column=Column("config", JSON, nullable=False),
     )
     last_activity: datetime | None = Field(default=None, index=True)
+    last_attempt_at: datetime | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
     updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
 
@@ -816,6 +817,7 @@ class ServiceModel(SQLModel, table=True):
             status=parsed_status,
             config=dict(self.config_json or {}),
             last_activity=self.last_activity,
+            last_attempt_at=self.last_attempt_at,
             created_at=self.created_at,
         )
 
@@ -1472,6 +1474,22 @@ def _add_backtests_tags_column(connection: Connection) -> None:
         )
 
 
+def _add_service_columns(connection: Connection) -> None:
+    """Add `services.last_attempt_at` to legacy tables.
+
+    Separate from `last_activity` on purpose: that column only advances on a
+    successful read, so a service failing for days shows the last time it worked.
+    The two questions - "when did this last work?" and "when did anyone last try?"
+    - need different answers, and conflating them makes a working retry look like
+    an idle process.
+    """
+    column_names = _table_column_names(connection, "services")
+    if "last_attempt_at" not in column_names:
+        connection.execute(
+            text("ALTER TABLE services ADD COLUMN last_attempt_at DATETIME")
+        )
+
+
 def _add_live_account_columns(connection: Connection) -> None:
     """Add broker identity columns to legacy live_accounts tables."""
     column_names = _table_column_names(connection, "live_accounts")
@@ -1723,6 +1741,7 @@ def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
 
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
+        _add_service_columns(connection)
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
@@ -2632,6 +2651,10 @@ def update_service_status(
         record = session.get(ServiceModel, normalized_id)
         if record is None:
             return None
+        # Any status write is an attempt, successful or not. Without this the only
+        # record that anything tried is `updated_at`, which is a row-modification
+        # timestamp rather than a statement about the service.
+        record.last_attempt_at = _utcnow_naive()
         if (
             respect_operator_intent
             and record.status == ServiceStatus.PAUSED.value

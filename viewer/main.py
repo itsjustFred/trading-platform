@@ -4800,6 +4800,12 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         # Stored naive-UTC; comparing it against an aware `now` would raise.
         last_activity = last_activity.replace(tzinfo=timezone.utc)
     age_seconds = (now - last_activity).total_seconds() if last_activity else None
+    last_attempt = service.last_attempt_at
+    if last_attempt is not None and last_attempt.tzinfo is None:
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    attempt_age = (
+        (now - last_attempt).total_seconds() if last_attempt else None
+    )
     payload = {
         "id": str(service.id),
         "name": service.name,
@@ -4807,6 +4813,16 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         "status": service.status.value,
         "config": service.config or {},
         "last_activity": service.last_activity.isoformat() if service.last_activity else None,
+        # "When did this last work?" and "when did anyone last try?" are different
+        # questions. Only the second one tells an operator whether the process is
+        # still making an effort - a service failing for days shows a stale
+        # `last_activity` and looks idle, when it is retrying.
+        "last_attempt_at": (
+            service.last_attempt_at.isoformat() if service.last_attempt_at else None
+        ),
+        "last_attempt_age_seconds": (
+            None if attempt_age is None else max(0.0, attempt_age)
+        ),
         # `status` alone cannot distinguish a live-but-idle service from a dead
         # one, which is exactly the ambiguity a heartbeat exists to remove.
         "last_activity_age_seconds": None if age_seconds is None else max(0.0, age_seconds),
