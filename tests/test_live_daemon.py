@@ -2919,3 +2919,76 @@ def test_the_daemon_reads_and_writes_the_ledger_rather_than_a_local_set(
     assert "list_stopped_enforced_deployment_ids" in runner, (
         "the ledger starts empty on every process, which is the defect itself"
     )
+
+
+def test_the_daemon_writes_the_ledger_to_the_database_not_just_its_own_set(isolated_db):
+    """The behavioural half of the static pin, and the half that matters.
+
+    `test_the_daemon_reads_and_writes_the_ledger_rather_than_a_local_set` reads the
+    source and asserts the identifier is mentioned. That is the weakest possible
+    check: it passes if the name appears anywhere, so it cannot tell a working call
+    from one that never executes. Confirmed by mutation - replacing the daemon's
+    stamp with a no-op, keeping the in-memory set update, fails that test and
+    nothing else. 95 other tests in this file pass, because every one of them
+    asserts the local set.
+
+    The defect that pin exists for is real and specific: the ledger is a set in
+    daemon memory, so every restart re-ran cancel and flatten for deployments
+    already stopped. That only stops happening if the write lands in the
+    database, which is the thing to observe.
+
+    So: drive the real enforcement path against a real (isolated) database, then
+    read the ledger back through the database function rather than the argument
+    the daemon was handed. A restart is simulated by asking a *fresh* reader,
+    exactly as `sync_deployments_loop` does at startup.
+    """
+    import uuid as _uuid
+
+    database_module, _engine, _data_dir = isolated_db
+    # "acc-1" is what _stopped_deployment() returns; using a different id here
+    # made the daemon find no adapter and - correctly - decline to stamp the
+    # ledger, so the first version of this test failed for the wrong reason.
+    database_module.ensure_live_account("acc-1", "alpaca", is_demo=True)
+    did = "44444444-4444-4444-8444-444444444444"
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(did),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-1",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="STOPPED",
+            signal_source_type="discord",
+        )
+    )
+    adapter = _RecordingAdapter()
+    enforced: set[str] = set()
+
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()], {"acc-1": adapter}, already_enforced=enforced
+        )
+    )
+
+    # The daemon's own set is not the evidence. This is, because a restarted
+    # process would see nothing else.
+    assert did in database_module.list_stopped_enforced_deployment_ids(), (
+        "the daemon updated its in-memory set but never wrote the ledger, so the "
+        "next process starts empty and re-flattens an account that is already "
+        "stopped - the exact defect this column was added to prevent"
+    )
+
+    # And a fresh reader must not re-do the work, which is the whole point.
+    assert did in database_module.list_stopped_enforced_deployment_ids()
+    second = _RecordingAdapter()
+    asyncio.run(
+        daemon._enforce_stopped_deployments(
+            [_stopped_deployment()],
+            {"acc-1": second},
+            already_enforced=database_module.list_stopped_enforced_deployment_ids(),
+        )
+    )
+    assert second.flatten_calls == 0, (
+        "a restarted daemon re-flattened despite the ledger, so the persisted "
+        "state is not being read back"
+    )
