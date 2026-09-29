@@ -1799,6 +1799,8 @@ async def _submit_claimed_discord_signal(
 def _deployment_accepts_signal_author(
     deployment: LiveDeploymentConfig,
     signal_author_id: str,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     """Per-deployment author gate applied at dispatch time.
 
@@ -1807,8 +1809,17 @@ def _deployment_accepts_signal_author(
     is submitted, the signal must also satisfy the target deployment's own
     allowlist so a deployment cannot trade on an author another deployment
     trusted.
+
+    `accounts_env_values` must be threaded in. The call used to omit it, so the
+    resolver fell back to `os.environ` - and `.accounts.env` is never installed
+    there, only read into a mapping. The allowlist therefore resolved empty, the
+    empty case below returned True, and this gate was **inert**: it accepted every
+    author. The one defence against a deployment trading on another bot's author
+    was not running, silently, in the documented production config.
     """
-    allowlist = _deployment_trusted_author_ids(deployment)
+    allowlist = _deployment_trusted_author_ids(
+        deployment, accounts_env_values=accounts_env_values
+    )
     if not allowlist:
         # The listener refuses to start without any allowlist, so a deployment
         # without its own one inherits the channel-merged set; refusing here
@@ -1870,13 +1881,21 @@ def _deployment_trusted_author_ids(
         env_source = os.environ
     service_name = _deployment_service_name(deployment)
     if service_name:
-        canonical = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
-        per_service_key = f"DISCORD_BOT_{canonical}_TRUSTED_AUTHOR_IDS"
-        per_service = _trusted_author_ids_from_config(
-            _split_env_id_list(env_source.get(per_service_key, ""))
-        )
-        if per_service:
-            return per_service
+        # Through the canonicalisation helper, as its own docstring requires of
+        # every per-bot key. This one was built by hand, so a name that kept its
+        # punctuation would look for a variable no operator could set and fall
+        # through to the shared list.
+        per_service_key = discord_bot_env_key(service_name, "TRUSTED_AUTHOR_IDS")
+        # Presence, not truthiness. A blank per-bot var means "this bot trusts
+        # nobody", and it must NOT fall through to the shared list: that widened
+        # Nitro to all three bots' authors, so the fail-closed configuration was
+        # unreachable from here - while the *service* path, fixed in 626e485,
+        # correctly returned empty for the same input. Same allowlist, two
+        # answers, on the path all three live deployments use.
+        if per_service_key in env_source:
+            return _trusted_author_ids_from_config(
+                _split_env_id_list(env_source.get(per_service_key, ""))
+            )
     return _trusted_author_ids_from_config(
         _split_env_id_list(env_source.get("DISCORD_TRUSTED_AUTHOR_IDS", ""))
     )
@@ -1943,7 +1962,9 @@ async def _dispatch_discord_trade_signal(
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue
-        if not _deployment_accepts_signal_author(deployment, signal_author_id):
+        if not _deployment_accepts_signal_author(
+            deployment, signal_author_id, accounts_env_values=accounts_env_values
+        ):
             logger.debug(
                 "Skipping discord signal: author not in deployment allowlist",
                 extra={

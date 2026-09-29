@@ -3093,3 +3093,102 @@ class TestAuthorDiscoveryRecord:
             f"the default record path {default!r} is NOT gitignored, so an "
             f"author id could be committed by accident: {probe.stdout}{probe.stderr}"
         )
+
+class TestRealBugsFromThePreMortem:
+    """Four defects the 2026-09-28 pre-mortem found as *present*, not hypothetical.
+
+    Each was a case where the same rule existed twice and the two copies had
+    drifted, or where a safety gate was quietly inert. The theme is the one this
+    file keeps hitting: a second copy of a rule is a rule nobody maintains.
+    """
+
+    def test_a_blank_per_bot_var_does_not_widen_on_the_deployment_path(self) -> None:
+        """`if per_service:` fell through to the shared list on a blank value.
+
+        Fixed on the *service* path in 626e485; missed here, on the path all three
+        live deployments use. So the same env file produced the right answer from
+        one code path and the wrong one from the other - Nitro trusting all three
+        bots' authors, which is the cross-bot trust the per-bot var exists to
+        prevent, and the fail-closed configuration being unreachable.
+        """
+        from live_runner.daemon import _deployment_trusted_author_ids
+
+        deployment = SimpleNamespace(
+            id="d1", settings={},
+            signal_config={"service_name": "NITRO"}, signal_source_id="nitro",
+        )
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "",
+            "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+        }
+
+        resolved = _deployment_trusted_author_ids(
+            deployment, accounts_env_values=env
+        )
+
+        assert resolved == set(), (
+            "a blank per-bot allowlist widened to the shared list on the "
+            f"deployment path: {sorted(resolved)}"
+        )
+
+    def test_the_per_deployment_author_gate_is_not_inert(self) -> None:
+        """The gate read os.environ, which never holds .accounts.env.
+
+        The file is read into a mapping, never installed into the process
+        environment, so the resolver returned an empty set, the empty case
+        returned True, and the gate accepted every author. The one defence
+        against a deployment trading on another bot's author was not running, and
+        said nothing about it.
+        """
+        from live_runner.daemon import _deployment_accepts_signal_author
+
+        deployment = SimpleNamespace(
+            id="d1", settings={},
+            signal_config={"service_name": "NITRO"}, signal_source_id="nitro",
+        )
+        env = {
+            "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "9",
+            "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+        }
+
+        # The trusted author passes, and an untrusted one is refused - which it
+        # could not do while the gate was reading an empty environment.
+        assert _deployment_accepts_signal_author(
+            deployment, "9", accounts_env_values=env
+        ) is True
+        assert _deployment_accepts_signal_author(
+            deployment, "1", accounts_env_values=env
+        ) is False, (
+            "the per-deployment author gate accepted an author outside the "
+            "deployment's own allowlist: the gate was inert"
+        )
+
+    def test_a_failed_write_cannot_clobber_an_operators_pause(self, monkeypatch) -> None:
+        """The PAUSED guard covered only RUNNING, so FAILED got through.
+
+        `_recover_failed_services` resets FAILED to RUNNING on the next daemon
+        start, so the sequence pause -> FAILED write -> restart silently resumed
+        a service the operator had just stopped. FAILED is system state and PAUSED
+        is intent; intent must win.
+        """
+        from live_runner.signal_sources import discord_source as module
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+        from shared.models import ServiceStatus
+
+        source = DiscordSignalSource(
+            token="t", channel_ids={"c"}, service_id="svc",
+            trusted_author_ids=["bot-1"],
+        )
+        written: list[object] = []
+        monkeypatch.setattr(
+            module, "get_service",
+            lambda _sid: SimpleNamespace(status=ServiceStatus.PAUSED),
+        )
+        monkeypatch.setattr(
+            module, "update_service_status",
+            lambda sid, status, **_kw: written.append(status),
+        )
+
+        asyncio.run(source._set_service_status(ServiceStatus.FAILED))
+
+        assert written == [], f"a FAILED write landed on a PAUSED service: {written}"

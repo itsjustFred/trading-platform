@@ -926,14 +926,19 @@ class DiscordSignalSource(BaseSignalSource):
     ) -> None:
         if not self.service_id:
             return
-        # Never overwrite PAUSED with RUNNING. That is operator intent, and it has
-        # to survive whatever the process last observed - including a message
-        # arriving after the pause. The daemon's stop path guards the same way,
-        # and a status an inbound message can flip is not a record of intent.
-        if str(status) == str(ServiceStatus.RUNNING):
-            current = await asyncio.to_thread(get_service, self.service_id)
-            if current is not None and current.status == ServiceStatus.PAUSED:
-                return
+        # Never overwrite PAUSED at all. That is operator intent, and it has to
+        # survive whatever the process last observed - a message arriving after the
+        # pause, a connector failing, an author allowlist turning out to be wrong.
+        #
+        # The guard originally covered only RUNNING, which left the nastier case
+        # open: within a sync tick of the operator pausing a service, a
+        # FAILED write landed on the PAUSED row. `_recover_failed_services` then
+        # found FAILED - not PAUSED - and reset it to RUNNING on the next daemon
+        # start, so the process had undone a decision the operator had just made.
+        # A status that an inbound message can flip is not a record of intent.
+        current = await asyncio.to_thread(get_service, self.service_id)
+        if current is not None and current.status == ServiceStatus.PAUSED:
+            return
         try:
             await asyncio.to_thread(
                 update_service_status,

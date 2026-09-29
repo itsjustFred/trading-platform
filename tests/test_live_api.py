@@ -1616,3 +1616,78 @@ def test_arming_an_internal_source_deployment_is_refused_by_the_api(
     ]
     assert entries, "the refused arming must be audited"
     assert "internal" in (entries[0].get("detail") or {}).get("reason", "")
+
+
+def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
+    isolated_db_sandbox,
+):
+    """A 30s TTL is shorter than a slow broker submit, and expiry deletes the row.
+
+    `claim_live_deployment_submission` deletes claims whose `expires_at` has
+    passed before checking for a conflict, so a second dispatcher gets a clean
+    claim while the first is still inside its submission. The `finally` that
+    releases the claim does not help, because the two orders are placed before
+    either returns.
+
+    Nothing enforces the relationship in the other direction: the claimed region
+    in `daemon.py` spans three or four sequential broker round trips, so it is
+    not bounded by anything but luck. This is not a claim that the current TTL is
+    too short - it may be right for a market order - it is a pin on the shape, so
+    that shortening the TTL or adding a reaper grace period cannot quietly turn
+    into a double-order.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-ttl", "ctrader", is_demo=True)
+    database_module.record_live_account_demo_verification(
+        "acc-ttl", is_demo=True, ctid="46736452"
+    )
+    # The claim reads the live deployment row, so it must exist and be ACTIVE.
+    # A nonexistent id would be refused for an unrelated reason and the test
+    # would pass for the wrong one.
+    import uuid as _uuid
+
+    deployment_id = str(_uuid.uuid4())
+    created = database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-ttl",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="ACTIVE",
+            signal_source_type="discord",
+        )
+    )
+    assert created.status == "ACTIVE", (
+        f"precondition failed: the claim is refused unless the deployment is "
+        f"ACTIVE, and this one is {created.status}"
+    )
+
+    # The TTL is set by the *first* claim. A later caller's ttl_seconds only sizes
+    # the lease it would take, so it cannot shorten the wait - which is why the
+    # first claim here uses a short TTL and the second a long one.
+    first = database_module.claim_live_deployment_submission(
+        deployment_id, "token-first", ttl_seconds=0.3
+    )
+    assert first is True, "the first claim should succeed"
+
+    # Still inside the TTL: a second dispatcher must be refused.
+    assert (
+        database_module.claim_live_deployment_submission(
+            deployment_id, "token-second", ttl_seconds=30.0
+        )
+        is False
+    ), "a live claim was not honoured, so the atomicity guarantee is already gone"
+
+    # Past the TTL the row is deleted, so the second claim succeeds. That is what
+    # makes the TTL load-bearing: whatever it is set to is the real upper bound on
+    # a submission, and nothing else in the code enforces one.
+    import time
+
+    time.sleep(0.5)
+    assert database_module.claim_live_deployment_submission(
+        deployment_id, "token-second", ttl_seconds=30.0
+    ) is True, (
+        "an expired claim is not reclaimable, so a dispatcher that died "
+        "mid-submission would block the deployment forever"
+    )
