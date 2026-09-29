@@ -2004,3 +2004,72 @@ def test_a_legacy_services_table_gains_the_column(isolated_db_sandbox):
         "the migration did not add the column to a legacy services table, so it "
         "would be missing in every existing install"
     )
+
+
+def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db_sandbox):
+    """A fresh schema proves nothing. Production is a populated, pre-column table.
+
+    Both columns this branch adds were only ever exercised against a database
+    built from the current model, which is the shape a *new* install has. Every
+    operator running this has a populated table without them, and the failure that
+    matters is silent: the column is missing, reads return `None`, and the
+    enforcement ledger is empty on every restart - the defect the column was added
+    to fix, reappearing.
+
+    So this rebuilds both tables in their pre-column shape with rows in them, and
+    asserts the migration brings them up and the rows survive.
+    """
+    import sqlite3 as _sqlite3
+    from pathlib import Path
+
+    database_module, engine, _data_dir = isolated_db_sandbox
+    db_path = Path(str(engine.url).replace("sqlite:///", ""))
+
+    database_module.ensure_live_account("acc-mig", "alpaca", is_demo=True)
+    import uuid as _uuid
+
+    did = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(did),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-mig",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="STOPPED",
+            signal_source_type="discord",
+        )
+    )
+
+    with _sqlite3.connect(str(db_path)) as con:
+        con.execute("ALTER TABLE services RENAME TO svc_new")
+        con.execute(
+            "CREATE TABLE services (id TEXT PRIMARY KEY, name TEXT, type TEXT,"
+            " status TEXT, config TEXT, last_activity DATETIME,"
+            " created_at DATETIME, updated_at DATETIME)"
+        )
+        con.execute("DROP TABLE svc_new")
+        con.execute("ALTER TABLE live_deployments RENAME TO ld_new")
+        con.execute(
+            "CREATE TABLE live_deployments (id TEXT PRIMARY KEY,"
+            " strategy_name TEXT, account_id TEXT, symbols_json TEXT,"
+            " timeframe TEXT, status TEXT, signal_source TEXT,"
+            " signal_source_type TEXT, signal_source_id TEXT,"
+            " symbol_filter_json TEXT, signal_config_json TEXT,"
+            " settings_json TEXT, created_at DATETIME, updated_at DATETIME)"
+        )
+        con.execute("DROP TABLE ld_new")
+
+    database_module._migrate_schema()
+
+    with _sqlite3.connect(str(db_path)) as con:
+        svc = {r[1] for r in con.execute("PRAGMA table_info('services')")}
+        dep = {r[1] for r in con.execute("PRAGMA table_info('live_deployments')")}
+    assert "last_attempt_at" in svc, (
+        "services.last_attempt_at missing after migration: a failed attempt would "
+        "again leave no trace that anything tried"
+    )
+    assert "stopped_enforced_at" in dep, (
+        "live_deployments.stopped_enforced_at missing after migration: the "
+        "enforcement ledger would be empty on every restart"
+    )
