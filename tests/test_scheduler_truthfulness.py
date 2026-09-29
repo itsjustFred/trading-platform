@@ -356,3 +356,90 @@ def test_scheduler_task_ids_are_unique_within_a_second() -> None:
 
     source = inspect.getsource(scheduler_module.ServiceScheduler._run_service_job)
     assert "%Y%m%d%H%M%S%f" in source
+
+
+def test_two_service_runs_in_the_same_second_get_different_task_ids(monkeypatch) -> None:
+    """The behavioural half of the truthfulness pin, and the half that matters.
+
+    `test_scheduler_task_ids_are_unique_within_a_second` asserts the format string
+    `"%Y%m%d%H%M%S%f"` appears in the source. That is the weakest form of check
+    there is: it says nothing about what the code does with the value, and any
+    refactor to a different correct-looking construction would fail it.
+
+    Measured: dropping the microseconds so two runs in one second collide fails
+    that test and **nothing else**. Five other files mention `task_id`; all pass.
+    So the property had a single line of coverage and it was a line of text.
+
+    What a collision costs is concrete. The id is the key of
+    `upsert_background_task_record`, so a second run in the same second
+    *overwrites* the first run's record rather than queueing beside it. One of two
+    service executions is not rendered oddly - it is simply gone from the task list.
+
+    The clock here *advances*, in quarter-second steps, rather than being frozen.
+    That is the whole design: freezing it would give every call an identical
+    instant and the correct implementation would fail too, because the
+    microsecond suffix comes from the clock. Stepping inside one second models the
+    real case - two runs a fraction of a second apart - where a second-resolution
+    id collides and a microsecond one does not.
+    """
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    import scheduler.scheduler as scheduler_module
+
+    origin = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
+    # One millisecond per call. Small enough that a whole run - which calls
+    # `now()` several times, twice of them feeding one task id - still lands
+    # inside the same wall-clock second, so both runs really are "in the same
+    # second" and a second-resolution id would collide.
+    ticks = iter(origin + timedelta(milliseconds=n) for n in range(200))
+
+    class _SteppingDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001, ANN206 - mirrors datetime's signature
+            return next(ticks)
+
+    seen: list[str] = []
+
+    # Plain `def`, not `async def`: the code reaches these through
+    # `asyncio.to_thread`, which calls them synchronously in a worker. An async
+    # fake returns a coroutine that is never awaited, so nothing is recorded and
+    # the test fails for a reason unrelated to task ids.
+    def _fake_upsert(**kwargs):  # noqa: ANN003
+        seen.append(str(kwargs["task_id"]))
+
+    def _fake_status(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return None
+
+    async def _fake_handler(**_kwargs):  # noqa: ANN003
+        return {"status": "completed"}
+
+    monkeypatch.setattr(scheduler_module, "datetime", _SteppingDatetime)
+    monkeypatch.setattr(scheduler_module, "upsert_background_task_record", _fake_upsert)
+    monkeypatch.setattr(scheduler_module, "update_service_status", _fake_status)
+    monkeypatch.setitem(scheduler_module._SCHEDULED_JOB_HANDLERS, "probe", _fake_handler)
+
+    scheduler = scheduler_module.ServiceScheduler()
+
+    # One id per run, read from the run's *first* write. The two writes inside a
+    # run deliberately share an id - that is what makes the start record and the
+    # completion record one task rather than two - so the thing to compare is the
+    # id of run 1 against the id of run 2.
+    first_of_each_run: list[str] = []
+    for _ in range(2):
+        seen.clear()
+        asyncio.run(
+            scheduler._run_service_job(
+                service_id="svc-1",
+                service_name="Probe",
+                job_type="probe",
+            )
+        )
+        assert seen, "precondition: the job wrote no task record at all"
+        first_of_each_run.append(seen[0])
+
+    assert first_of_each_run[0] != first_of_each_run[1], (
+        f"both runs produced the task id {first_of_each_run[0]!r} within the same "
+        "second. The id is an upsert key, so the first run's record is overwritten "
+        "and that service execution disappears from the task list entirely."
+    )
