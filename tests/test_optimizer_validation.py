@@ -798,3 +798,68 @@ def test_run_optimization_forwards_the_configured_embargo():
         "run_optimization must pass embargo_pct into _split_backtest_period; "
         "without it the embargo is never applied to the windows that run"
     )
+
+
+def test_every_split_call_site_forwards_a_real_embargo_value():
+    """The embargo is forwarded in four places, and one pin only checked one of them.
+
+    The pin above inspects `run_optimization` and nothing else. But
+    `_split_backtest_period` is called from four places in `runner/optimizer.py`:
+    `run_optimization`, `_stability_subperiods`, and twice in
+    `_build_diagnostics_payload`. Measured, not assumed - hard-coding
+    `embargo_pct=0.0` inside `_stability_subperiods` while leaving the keyword
+    present passes the existing pin and all 77 tests in the optimizer and
+    diagnostics suites. That function is named in no test file at all.
+
+    The failure it permits is the exact one the embargo work was for: windows that
+    are not actually embargoed being reported as though they were, so a study
+    reports a gap between train and test that does not exist. A duplicate rule in
+    four places with one guard is the same defect shape as the PAUSED floor and the
+    allowlist splitter, and it is only safe because all four currently agree.
+
+    So this asserts the property across the whole module by AST: every call must
+    pass `embargo_pct`, and it must not be a bare constant. A constant is the
+    mutation that defeats a presence check, which is the whole reason this is not
+    just the same grep four times.
+    """
+    import ast
+    import inspect
+
+    # Three different splitters take the embargo, and the rule is that all three
+    # are told the configured value. Naming only one of them is how this went
+    # unnoticed: the first attempt at this test looked for `_split_backtest_period`
+    # alone and found a single call site, which is precisely the blind spot.
+    embargo_splitters = {"_split_backtest_period", "walk_forward_splits", "embargo_split"}
+
+    tree = ast.parse(inspect.getsource(optimizer_module))
+    call_sites: list[tuple[int, str, ast.Call]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = getattr(func, "id", None) or getattr(func, "attr", None)
+        if name in embargo_splitters:
+            call_sites.append((getattr(node, "lineno", -1), name, node))
+
+    found = sorted({name for _, name, _ in call_sites})
+    assert len(found) >= 2, (
+        "precondition: expected several embargo-aware splitters in this module, "
+        f"found only {found} - so this test is no longer checking what it claims"
+    )
+    assert len(call_sites) >= 3, (
+        f"precondition: expected at least three call sites, found {len(call_sites)}"
+    )
+
+    for lineno, name, call in call_sites:
+        keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg}
+        assert "embargo_pct" in keywords, (
+            f"line {lineno}: the {name}() call does not pass embargo_pct, so its "
+            "windows are not embargoed while the diagnostics describe a gap that "
+            "is not there"
+        )
+        value = keywords["embargo_pct"]
+        assert not isinstance(value, ast.Constant), (
+            f"line {lineno}: the {name}() call hard-codes embargo_pct to a "
+            "constant, so the configured value is ignored. A presence check "
+            "cannot see this, and it is exactly the shape of bug this guards"
+        )
