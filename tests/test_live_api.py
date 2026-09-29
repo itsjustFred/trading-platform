@@ -2041,24 +2041,40 @@ def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db
         )
     )
 
+    # The pre-column shape is derived from the models minus the columns this
+    # branch adds, rather than hand-written. The hand-written version used
+    # `symbols_json`, `symbol_filter_json` and `signal_config_json`, and the
+    # production table has `symbols`, `symbol_filter` and `signal_config` - so
+    # the fixture described a schema that has never existed, while claiming to
+    # be production-shaped. Deriving it keeps the fixture honest and keeps it
+    # correct when the next column is added.
+    from sqlmodel import SQLModel
+
+    added_by_this_branch = {"last_attempt_at", "stopped_enforced_at"}
+
     with _sqlite3.connect(str(db_path)) as con:
-        con.execute("ALTER TABLE services RENAME TO svc_new")
-        con.execute(
-            "CREATE TABLE services (id TEXT PRIMARY KEY, name TEXT, type TEXT,"
-            " status TEXT, config TEXT, last_activity DATETIME,"
-            " created_at DATETIME, updated_at DATETIME)"
-        )
-        con.execute("DROP TABLE svc_new")
-        con.execute("ALTER TABLE live_deployments RENAME TO ld_new")
-        con.execute(
-            "CREATE TABLE live_deployments (id TEXT PRIMARY KEY,"
-            " strategy_name TEXT, account_id TEXT, symbols_json TEXT,"
-            " timeframe TEXT, status TEXT, signal_source TEXT,"
-            " signal_source_type TEXT, signal_source_id TEXT,"
-            " symbol_filter_json TEXT, signal_config_json TEXT,"
-            " settings_json TEXT, created_at DATETIME, updated_at DATETIME)"
-        )
-        con.execute("DROP TABLE ld_new")
+        for table in ("services", "live_deployments"):
+            declared = [
+                c.name
+                for c in SQLModel.metadata.tables[table].columns
+                if c.name not in added_by_this_branch
+            ]
+            present = [r[1] for r in con.execute(f"PRAGMA table_info('{table}')")]
+            keep = [c for c in declared if c in present]
+            assert keep, f"{table} fixture would have no columns to carry over"
+            con.execute(f"ALTER TABLE {table} RENAME TO {table}_pre_column")
+            cols = ", ".join(
+                f"{c} TEXT PRIMARY KEY" if c == "id" else f"{c} TEXT" for c in declared
+            )
+            con.execute(f"CREATE TABLE {table} ({cols})")
+            # Copy the rows across. The previous version dropped the populated
+            # table and started empty, so the rows it claimed to protect were
+            # gone before the migration ran and nothing could have detected it.
+            con.execute(
+                f"INSERT INTO {table} ({', '.join(keep)}) "
+                f"SELECT {', '.join(keep)} FROM {table}_pre_column"
+            )
+            con.execute(f"DROP TABLE {table}_pre_column")
 
     database_module._migrate_schema()
 
@@ -2073,3 +2089,44 @@ def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db
         "live_deployments.stopped_enforced_at missing after migration: the "
         "enforcement ledger would be empty on every restart"
     )
+
+    # And the general form of the same check, so this test does not become a
+    # monument to the two columns someone remembered. Asserting a hand-listed
+    # pair certifies the schema only as far as the list goes: add a third column,
+    # forget its migration, and this test still passes while production reads
+    # None from it - the exact silent failure it exists to prevent.
+    with _sqlite3.connect(str(db_path)) as con:
+        absent: dict[str, list[str]] = {}
+        for table in SQLModel.metadata.sorted_tables:
+            actual = {r[1] for r in con.execute(f"PRAGMA table_info('{table.name}')")}
+            if not actual:
+                absent[table.name] = sorted(c.name for c in table.columns)
+                continue
+            for col in table.columns:
+                if col.name not in actual:
+                    absent.setdefault(table.name, []).append(col.name)
+    assert not absent, (
+        "declared columns absent from the migrated schema, so their migration "
+        f"is missing or incomplete: {absent}"
+    )
+
+    # The half the docstring promised and never checked: a migration that
+    # rebuilds a table must not take the operator's rows with it. These rows
+    # carry the PAUSED/STOPPED state that stops a deployment trading, so losing
+    # them is not a cosmetic failure - it is the migration silently re-arming
+    # something the operator deliberately turned off.
+    with _sqlite3.connect(str(db_path)) as con:
+        survived = con.execute(
+            "SELECT id, status FROM live_deployments WHERE id = ?", (did,)
+        ).fetchone()
+        total = con.execute("SELECT count(*) FROM live_deployments").fetchone()[0]
+    assert survived is not None, (
+        "the deployment row did not survive the migration; a migration that "
+        "rebuilds a table and drops its rows would silently re-arm whatever "
+        "the operator had PAUSED"
+    )
+    assert survived[1] == "STOPPED", (
+        f"the row survived but its status changed to {survived[1]!r}; the "
+        "operator's stop state must not be rewritten by a migration"
+    )
+    assert total == 1, f"expected exactly the one seeded deployment, found {total}"
