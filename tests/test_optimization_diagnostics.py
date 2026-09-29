@@ -357,13 +357,26 @@ def test_diagnostics_payload_reports_embargo_in_bars():
     payload = opt._build_diagnostics_payload(
         trials=trials,
         config=config,
+        # A real gap. The fixture used to pass `train.end == test.start`, so the
+        # payload's only source of a non-zero bar count was `embargo_pct` being
+        # re-applied inside the report - the test was pinning a fiction rather
+        # than the embargo that ran. The reported windows are now the ones handed
+        # in, so a gapless fixture honestly reports zero.
         train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
-        test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
+        test_period={"start": "2024-04-08T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="sharpe_ratio",
         timeframe="1h",
     )
     assert payload["split"]["embargo_bars_equivalent"] > 0, (
         "the embargo must be expressible in bars so it is actionable"
+    )
+    # And the reported split must be the one that ran, not a re-derivation.
+    # `embargo_pct` is 0.05 of the whole window, which is far more than the 7-day
+    # gap these periods actually carry - so if the payload re-derives the split
+    # instead of reporting it, the two disagree.
+    assert payload["split"]["test"]["start"] == "2024-04-08T00:00:00+00:00", (
+        "the reported test window is not the one that ran; the payload carries a "
+        "re-derived split rather than the actual embargo"
     )
     assert len(payload["walk_forward"]) == 2
     assert payload["plateau"]["parameter"] == "window"

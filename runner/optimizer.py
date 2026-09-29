@@ -1097,7 +1097,31 @@ def _build_diagnostics_payload(
             embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
             bar_duration=bar_duration,
         )
-        payload["split"] = split.as_dict()
+        reported = split.as_dict()
+        # The gap is `embargo_days` PLUS `embargo_pct` - `_split_backtest_period`
+        # applies both, and `embargo_split` models only the percentage. So this
+        # re-derived split was not the one that ran: with the default
+        # embargo_days=1 the reported test start came out a full day earlier than
+        # the real one, and `embargo_bars_equivalent` read 0.0 for a study that
+        # dropped a day.
+        #
+        # `9d6a29c` removed one fiction from this payload and left another of the
+        # opposite sign, and the artifact carried both answers - the correct
+        # `train_period`/`test_period` beside this one. The fix is to report the
+        # windows that ran rather than recompute them, and to take the embargo
+        # geometry from the same place they came from.
+        actual_gap = pd.Timedelta(
+            pd.Timestamp(test_period["start"]) - pd.Timestamp(train_period["end"])
+        )
+        reported["test"] = dict(test_period)
+        reported["embargo"] = {
+            "start": train_period["end"],
+            "end": test_period["start"],
+        }
+        reported["embargo_bars_equivalent"] = (
+            float(actual_gap / bar_duration) if bar_duration else 0.0
+        )
+        payload["split"] = reported
     except (ValueError, KeyError) as exc:
         payload["split"] = {"error": str(exc)}
 
