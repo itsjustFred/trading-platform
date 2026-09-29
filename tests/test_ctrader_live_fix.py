@@ -1658,3 +1658,60 @@ def test_flatten_closes_the_other_positions_after_an_unusable_id():
 
     assert _run(adapter.close_all_positions()) == 2
     assert [request.positionId for request in adapter.sent] == [201, 202]
+
+
+def test_flatten_tolerates_an_unmapped_symbol_while_position_reporting_does_not():
+    """The two reconcile readers diverge on purpose, and the difference is load-bearing.
+
+    The spec review flagged `_fetch_open_positions` and `get_positions` as a
+    duplicated rule that has drifted: they share the same reconcile request and
+    the same open-position filter, but `get_positions` *raises* on an unmapped
+    `symbolId` while `_fetch_open_positions` skips it.
+
+    That is not drift, it is the two callers needing different things:
+
+    - `get_positions` converts broker volume to a platform quantity, which needs
+      the symbol's scale. An unmapped id has no scale, and refusing is the
+      fail-closed shape already pinned for #80 - guessing an FX scale would
+      misreport a position.
+    - `close_all_positions` closes by `positionId` and the raw broker `volume`.
+      It never consults the scale at all, so an unmapped id costs it nothing, and
+      raising there would leave a real position open - the opposite of what a
+      stop control should do.
+
+    So the divergence is correct by construction, and the risk is that a future
+    refactor "deduplicates" it and either reintroduces a guessed scale or breaks
+    the flatten. Pinned on both sides.
+    """
+    import inspect
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    fetch = inspect.getsource(CTraderLiveAdapter._fetch_open_positions)
+    report = inspect.getsource(CTraderLiveAdapter.get_positions)
+
+    # Flatten reads the id and the raw broker volume; it has no use for a scale.
+    assert "_scale_for" not in fetch, (
+        "the flatten reader started scaling positions, which would give it a "
+        "reason to need a symbol mapping it deliberately does not require"
+    )
+    assert "_broker_volume_to_qty" not in fetch
+    # It returns the raw protos; `close_all_positions` reads positionId and the
+    # raw broker volume from them. The first version of this test asserted the id
+    # appears in the fetch itself, which it never does - the reader does not
+    # interpret the proto at all.
+    assert "open_positions.append(position)" in fetch
+    assert "getattr(position, \"positionId\"" not in fetch, (
+        "the flatten reader is now interpreting positions rather than passing the "
+        "raw protos through, so it has started depending on the proto shape"
+    )
+
+    # Position reporting converts to a platform quantity, so it must fail closed.
+    assert "_broker_volume_to_qty" in report, (
+        "position reporting no longer converts broker volume, so the unmapped-id "
+        "refusal below is guarding nothing"
+    )
+    assert "raise" in report, (
+        "position reporting no longer refuses an unmapped symbol id, so it would "
+        "scale a position with a guessed FX factor"
+    )
