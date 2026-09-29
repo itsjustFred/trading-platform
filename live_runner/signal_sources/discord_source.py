@@ -494,19 +494,31 @@ def _detect_rocket_fuel_signal_type(content: str) -> str | None:
 def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
     if signal_type in {"overbought_alert", "death_cross_warning"}:
         return None
-    # A negation vetoes the inferred direction before it is applied.
+    # A buy-side negation vetoes the inferred BUY before it is applied.
     #
     # The signal_type branch used to return "buy" straight away, so the negation
-    # guard below never ran for it: "**EURUSD** is now oversold / Do not buy this
-    # yet" resolved to a long, because "oversold" was enough on its own. An
-    # explicit instruction not to trade is stronger evidence than an inferred
-    # reading of the same message, and it is the direction that opens a position.
-    if _BUY_NEGATED_RE.search(content) and not _reads_as_buy_directive(content):
-        if _reads_as_sell_directive(content):
-            return "sell"
-        return None
+    # guard never ran for it: "**EURUSD** is now oversold / Do not buy this yet"
+    # resolved to a long, because "oversold" was enough on its own. An explicit
+    # instruction not to trade is stronger evidence than an inferred reading of
+    # the same message, and it is the direction that opens a position.
+    #
+    # Scoped to the BUY side on purpose. An earlier version delegated to
+    # `_reads_as_sell_directive` to preserve an exit, and that defeated the exit
+    # it was protecting: "momentum reversal ... do not buy, sellers in control"
+    # dropped to no signal at all, because the noun guard vetoes "sellers" before
+    # the momentum-reversal alternative is reached. A position that should be
+    # closed stayed open. Refusing to open is the safe direction; refusing to
+    # exit is not.
     if signal_type in {"momentum_reversal"}:
+        # Checked before the buy-side negation veto, and deliberately not gated by
+        # it. "momentum reversal ... do not buy" is an instruction to close, and a
+        # clause like "sellers in control" is commentary about it. Dropping those
+        # would leave a position open, which is the one outcome that is not the
+        # safe direction: refusing to open is conservative, refusing to exit is
+        # not.
         return "sell"
+    if _BUY_NEGATED_RE.search(content):
+        return None
     if signal_type in {"oversold_buy", "golden_cross"}:
         return "buy"
     if _reads_as_sell_directive(content):

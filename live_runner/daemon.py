@@ -1456,6 +1456,13 @@ def _resolve_discord_auth_scheme(
     return DEFAULT_DISCORD_AUTH_SCHEME
 
 
+def _split_env_id_list(raw: object) -> set[str]:
+    """Split a comma/whitespace-separated env ID list into an ID set."""
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+
+
 def _resolve_discord_service_trusted_author_ids(
     service: Service,
     *,
@@ -1496,14 +1503,12 @@ def _resolve_discord_service_trusted_author_ids(
     # inherited process variable must not silently become one.
     if accounts_env_values is not None and env_key in accounts_env_values:
         per_bot = str(accounts_env_values.get(env_key) or "").strip()
-        return _trusted_author_ids_from_config(
-            item.strip() for item in per_bot.split(",") if item.strip()
-        )
+        return _trusted_author_ids_from_config(_split_env_id_list(per_bot))
     raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
     if not raw_env:
         return set()
     return _trusted_author_ids_from_config(
-        item.strip() for item in raw_env.split(",") if item.strip()
+        _split_env_id_list(raw_env)
     )
 
 
@@ -1899,13 +1904,6 @@ def _deployment_trusted_author_ids(
     return _trusted_author_ids_from_config(
         _split_env_id_list(env_source.get("DISCORD_TRUSTED_AUTHOR_IDS", ""))
     )
-
-
-def _split_env_id_list(raw: object) -> set[str]:
-    """Split a comma/whitespace-separated env ID list into an ID set."""
-    if not isinstance(raw, str) or not raw.strip():
-        return set()
-    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
 
 
 def _deployment_discord_auth_scheme(deployment: LiveDeploymentConfig) -> str:

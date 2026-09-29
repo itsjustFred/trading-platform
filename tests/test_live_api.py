@@ -552,7 +552,11 @@ def test_services_crud_and_logs_endpoints(monkeypatch):
     def _get_service(value: str):
         return services.get(value)
 
-    def _update_service_status(value: str, status, *, last_activity=None):
+    # Mirrors the real signature, including `respect_operator_intent`: a double
+    # that does not accept it fails loudly rather than hiding the new contract.
+    def _update_service_status(
+        value: str, status, *, last_activity=None, respect_operator_intent=True
+    ):
         existing = services.get(value)
         if existing is None:
             return None
@@ -1690,4 +1694,85 @@ def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
     ) is True, (
         "an expired claim is not reclaimable, so a dispatcher that died "
         "mid-submission would block the deployment forever"
+    )
+
+
+def test_a_paused_service_cannot_be_moved_by_the_process(isolated_db_sandbox):
+    """PAUSED is a floor, enforced where no caller can bypass it.
+
+    There were six unguarded `update_service_status` call sites in the daemon and
+    one guarded copy in the signal source. A rule enforced by eight call sites is
+    not a rule: it had been applied to one of them, and the rest kept the hole.
+
+    The failure was invisible. A FAILED write landed on a PAUSED row, and
+    `_recover_failed_services` then reads FAILED rather than PAUSED and resets the
+    service to RUNNING on the next daemon start - so the process undid a decision
+    the operator had just made, silently, across a restart.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    service = database_module.create_service(
+        database_module.Service(
+            name="TEST_BOT",
+            type=database_module.ServiceType.DISCORD_BOT,
+            status=database_module.ServiceStatus.RUNNING,
+            config={},
+        )
+    )
+
+    paused = database_module.update_service_status(
+        str(service.id), database_module.ServiceStatus.PAUSED
+    )
+    assert paused.status == database_module.ServiceStatus.PAUSED
+
+    # Nothing the process observes afterwards may move it off PAUSED.
+    for status in (
+        database_module.ServiceStatus.RUNNING,
+        database_module.ServiceStatus.FAILED,
+        database_module.ServiceStatus.STOPPED,
+    ):
+        after = database_module.update_service_status(str(service.id), status)
+        assert after.status == database_module.ServiceStatus.PAUSED, (
+            f"the process moved a PAUSED service to {status}; an operator pause "
+            "must survive anything the process observes"
+        )
+
+    # And the recovery path must therefore never pick it up.
+    assert not any(
+        item.id == service.id
+        for item in database_module.list_services(
+            service_type=database_module.ServiceType.DISCORD_BOT
+        )
+        if item.status == database_module.ServiceStatus.FAILED
+    ), "a PAUSED service became FAILED, so startup recovery would resurrect it"
+
+
+def test_the_api_is_the_one_caller_allowed_to_clear_a_pause(isolated_db_sandbox):
+    """`respect_operator_intent=False` exists so a person can clear their pause.
+
+    Without it the guard would be unfalsifiable in the other direction: an
+    operator could never resume a service they had paused. The endpoint opts out
+    explicitly, so the exemption is visible at the call site rather than implied.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    service = database_module.create_service(
+        database_module.Service(
+            name="TEST_BOT",
+            type=database_module.ServiceType.DISCORD_BOT,
+            status=database_module.ServiceStatus.RUNNING,
+            config={},
+        )
+    )
+    database_module.update_service_status(
+        str(service.id), database_module.ServiceStatus.PAUSED
+    )
+
+    resumed = database_module.update_service_status(
+        str(service.id),
+        database_module.ServiceStatus.RUNNING,
+        respect_operator_intent=False,
+    )
+
+    assert resumed.status == database_module.ServiceStatus.RUNNING, (
+        "an operator cannot resume a service they paused, so the guard is a "
+        "trap rather than a safety"
     )

@@ -12033,7 +12033,15 @@ async def update_service_status_endpoint(
     payload: ServiceStatusUpdateRequest,
 ) -> dict[str, Any]:
     try:
-        updated = await asyncio.to_thread(update_service_status, service_id, payload.status)
+        # This endpoint IS the operator setting or clearing a pause, so the
+        # PAUSED floor does not apply here - it is the one caller allowed to
+        # overwrite a paused row, and it has to be explicit that it is.
+        updated = await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            payload.status,
+            respect_operator_intent=False,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:

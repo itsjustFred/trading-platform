@@ -2602,7 +2602,27 @@ def update_service_status(
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
+    respect_operator_intent: bool = True,
 ) -> Service | None:
+    """Write a service's status.
+
+    `respect_operator_intent` makes PAUSED a floor: a PAUSED service is never
+    moved to any other status by this function. The pause was set by a person
+    through the API, and nothing the process observes afterwards - a message
+    arriving, a connector failing, an author allowlist turning out to be wrong,
+    a reconnect completing - outranks that.
+
+    This lives here rather than in a caller because there were six unguarded
+    call sites in the daemon and a guarded one in the signal source, and a rule
+    enforced by eight call sites is not a rule. It was applied to one of them and
+    the other seven kept the hole: a FAILED landing on a PAUSED row, and
+    `_recover_failed_services` then reading FAILED rather than PAUSED and
+    resetting the service to RUNNING on the next daemon start. The pause was
+    undone by the process, silently.
+
+    Pass `respect_operator_intent=False` only where the caller is *establishing*
+    operator intent, i.e. an API call that is itself setting or clearing a pause.
+    """
     normalized_id = str(service_id or "").strip()
     if not normalized_id:
         return None
@@ -2612,6 +2632,12 @@ def update_service_status(
         record = session.get(ServiceModel, normalized_id)
         if record is None:
             return None
+        if (
+            respect_operator_intent
+            and record.status == ServiceStatus.PAUSED.value
+            and normalized_status != ServiceStatus.PAUSED.value
+        ):
+            return record.to_service()
         record.status = normalized_status
         if last_activity is not None:
             record.last_activity = last_activity

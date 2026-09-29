@@ -3192,3 +3192,99 @@ class TestRealBugsFromThePreMortem:
         asyncio.run(source._set_service_status(ServiceStatus.FAILED))
 
         assert written == [], f"a FAILED write landed on a PAUSED service: {written}"
+
+class TestStandardsReviewFindings:
+    """Findings from the 2026-09-28 standards-axis review of this branch.
+
+    Two of them were on the live path and one was a regression this branch
+    introduced in its own earlier commit.
+    """
+
+    def test_a_negated_momentum_reversal_still_exits(self) -> None:
+        """A refusal to buy must not become a refusal to sell.
+
+        The buy-side negation veto was written to stop "oversold / do not buy
+        this yet" opening a long, and it delegated its exit-preservation to
+        `_reads_as_sell_directive`. That defeated the exit it was protecting: the
+        noun guard vetoes "sellers in control" before the momentum-reversal
+        alternative is reached, so an instruction to close a position became no
+        signal at all. The position stayed open.
+
+        Refusing to open is the safe direction. Refusing to exit is not.
+        """
+        for content in (
+            "AAPL momentum reversal @ 100. Do not buy, sellers in control.",
+            "AAPL momentum reversal @ 100. Do not buy.",
+        ):
+            signal_type = _detect_rocket_fuel_signal_type(content)
+            assert signal_type == "momentum_reversal"
+            assert _resolve_action(content, signal_type=signal_type) == "sell", (
+                f"{content!r} dropped an exit signal"
+            )
+
+    def test_a_negation_vetoes_a_buy_even_with_an_explicit_buy_directive(self) -> None:
+        """Pins the *behaviour*, which is what the simplified condition now states.
+
+        The review found the old condition had a second conjunct,
+        `and not _reads_as_buy_directive(content)`, that could never be False -
+        `_reads_as_buy_directive` already short-circuits to False whenever the
+        negation matches. So the conjunct was dead, and the comment around it
+        described an escape hatch that did not exist: a reader would reasonably
+        believe an explicit buy directive could survive the veto. It cannot.
+
+        Worth being precise about why this test cannot catch that class of defect
+        by itself: the two conditions are *logically equivalent*, so no
+        behavioural test distinguishes them. Adding the conjunct back leaves the
+        whole suite green - verified. A misleading condition is a documentation
+        bug, and only the comment change fixes it.
+        """
+        for content in (
+            "AAPL buy signal @ 100. Do not add.",
+            "AAPL buy signal @ 100. Do not buy more.",
+            "on EURUSD $1.0850 this is not a buy signal",
+        ):
+            assert _BUY_NEGATED_RE.search(content), f"precondition: {content!r}"
+            assert _resolve_action(content, signal_type=None) is None, (
+                f"{content!r} opened a long despite an explicit negation"
+            )
+
+    def test_both_allowlist_paths_split_a_list_identically(self) -> None:
+        """Two resolvers, one env var, two parsers - and they disagreed.
+
+        The service path split on commas; the deployment path split on commas
+        *and* whitespace. `DISCORD_TRUSTED_AUTHOR_IDS=111 222 333` therefore
+        trusted three authors on the deployment path - the one all three live
+        deployments use - and one impossible id on the service path. The tests
+        written for this class only used comma-separated input, so they exercised
+        the one case where the copies agreed.
+        """
+        from live_runner.daemon import (
+            _deployment_trusted_author_ids,
+            _resolve_discord_service_trusted_author_ids,
+        )
+
+        service = SimpleNamespace(
+            id="s", name="NITRO", config={}, status="running"
+        )
+        deployment = SimpleNamespace(
+            id="d", settings={},
+            signal_config={"service_name": "NITRO"}, signal_source_id="nitro",
+        )
+
+        for raw in ("111,222", "111 222", "111,222 333", " 111 , 222 ", "111,,222"):
+            for key in (
+                "DISCORD_TRUSTED_AUTHOR_IDS",
+                "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS",
+            ):
+                env = {key: raw}
+                via_service = _resolve_discord_service_trusted_author_ids(
+                    service, accounts_env_values=env
+                )
+                via_deployment = _deployment_trusted_author_ids(
+                    deployment, accounts_env_values=env
+                )
+                assert via_service == via_deployment, (
+                    f"{key}={raw!r} resolved differently: "
+                    f"service={sorted(via_service)} "
+                    f"deployment={sorted(via_deployment)}"
+                )
