@@ -118,3 +118,106 @@ class TestNitroInheritsRamJetWithoutDrift:
         processor = get_signal_processor("nitro", {})
         with pytest.raises(ValueError):
             processor._normalize_buy_action("sell")
+
+
+def test_every_processor_acts_on_the_side_policy_it_declares() -> None:
+    """Each bot declares which sides it trades; the code must enforce its own.
+
+    The BUY-only restriction is stated three times across two processors with the
+    same wording - "only supports BUY/LONG entry signals" - and only one of them
+    was tested. `_normalize_buy_action` was pinned for Nitro. Removing the
+    equivalent guard from **RamJet** passes all 106 tests in the registry and
+    daemon files.
+
+    That is the same shape as the optimizer embargo: the same rule implemented in
+    more than one place, with a guard on one of them. And the consequence is
+    directional, not cosmetic. These processors turn Discord messages into trades,
+    so a "sell" that is no longer rejected is not ignored - it is normalised to
+    "buy" and the position goes the wrong way. It is the same class as the negated
+    buy that opened a long.
+
+    RocketFuel is the counter-case that makes this worth deriving rather than
+    hand-listing: it is deliberately two-way ("supports BUY/LONG and SELL/SHORT"),
+    so the rule is not "all bots are BUY-only". The rule is that a processor's
+    declared policy and its accepted actions agree - in both directions, so neither
+    deleting a guard nor adding one to a two-way bot passes.
+    """
+    import inspect
+
+    from signal_bots.registry import _BOT_DIRS, get_signal_processor
+
+    def _normaliser(processor):
+        """Find the action normaliser, whatever it is called.
+
+        Nitro and RamJet name theirs `_normalize_buy_action`; RocketFuel names its
+        `_normalize_action` and handles both sides. Assuming one name is how the
+        first version of this test ended up not covering RocketFuel at all - its
+        own precondition caught that, which is why the precondition is there.
+        """
+        for name in ("_normalize_buy_action", "_normalize_action"):
+            if hasattr(processor, name):
+                return name, getattr(processor, name)
+        return None, None
+
+    checked: dict[str, str] = {}
+    for bot in sorted(_BOT_DIRS):
+        try:
+            processor = get_signal_processor(bot, {})
+        except Exception as exc:  # pragma: no cover - surfaced by the assert below
+            pytest.fail(f"could not build a processor for {bot!r}: {exc!r}")
+        name, normalise = _normaliser(processor)
+        if normalise is None:
+            continue
+
+        source = inspect.getsource(type(processor))
+        declared_buy_only = "only supports BUY/LONG" in source
+
+        accepts_buy = normalise("buy") == "buy"
+        assert accepts_buy, f"{bot} no longer accepts a plain buy signal"
+
+        try:
+            result = normalise("sell")
+        except ValueError:
+            rejected_sell = True
+            result = None
+        else:
+            rejected_sell = False
+            # Three outcomes, not two. "Rejects a sell" and "accepts a sell" are
+            # opposites, but a *third* case - returning "buy" for a sell input -
+            # is neither. That is a sell signal silently becoming a long, which is
+            # the exact defect class this branch has spent the session fixing
+            # (a negated buy that opened a long; a negated momentum reversal that
+            # stopped being an exit). It is wrong for every bot, BUY-only or not,
+            # and an earlier version of this test scored it the same as a correct
+            # two-way bot, so a mutation that forced RocketFuel to map sells onto
+            # buys passed it.
+            assert str(result).strip().lower() not in {"buy", "long"}, (
+                f"{bot} maps a sell signal to {result!r} instead of rejecting it or "
+                "returning a sell. A sell that silently becomes a buy opens a "
+                "position in the opposite direction to the one the signal asked "
+                "for, and no further test in this file would notice."
+            )
+
+        checked[bot] = f"buy-only via {name}" if declared_buy_only else f"two-way via {name}"
+        assert declared_buy_only == rejected_sell, (
+            f"{bot} declares {'BUY-only' if declared_buy_only else 'two-way'} in its "
+            f"source, but it {'rejects' if rejected_sell else 'accepts'} a sell "
+            f"signal (returned {result!r}). The declaration and the behaviour "
+            "disagree, so either a guard was deleted or one was added to a bot "
+            "that is meant to trade both ways."
+        )
+
+    # Precondition on the test's own reach: if the registry ever stops exposing
+    # both kinds of processor, this would pass vacuously. It earned its keep
+    # immediately - the first version of this test skipped RocketFuel entirely
+    # because it assumed the normaliser was called `_normalize_buy_action`, and
+    # this assertion is what noticed that the two-way arm was never exercised.
+    policies = {value.split(" via ")[0] for value in checked.values()}
+    assert "buy-only" in policies, (
+        f"expected at least one BUY-only processor, found {checked} - the rule "
+        "under test is no longer being exercised"
+    )
+    assert "two-way" in policies, (
+        f"expected at least one two-way processor, found {checked} - the "
+        "buy-only arm alone would not prove the check is two-sided"
+    )
