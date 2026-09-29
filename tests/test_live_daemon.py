@@ -2992,3 +2992,96 @@ def test_the_daemon_writes_the_ledger_to_the_database_not_just_its_own_set(isola
         "a restarted daemon re-flattened despite the ledger, so the persisted "
         "state is not being read back"
     )
+
+
+def test_every_task_the_daemon_starts_is_actually_cancelled_when_it_crashes(monkeypatch):
+    """The behavioural half of the AST pin: the right task really is cancelled.
+
+    `test_the_daemon_cancels_every_task_it_started` walks the AST and compares
+    two *name sets* - the names assigned from `create_task`, and the names in the
+    finally block's cancel tuple. That catches a task nobody added to the list.
+    It cannot catch the list being right and the behaviour being wrong.
+
+    Measured: replacing `task.cancel()` with a cancel of a different variable,
+    leaving every name in the tuple exactly where it was, passes that pin and
+    passes all 97 tests in this file. A heartbeat loop that outlives the daemon
+    keeps writing heartbeats for a process that is already unwinding, which is
+    the failure the pin's own docstring describes.
+
+    So this drives the real `run_daemon`, makes one loop raise, and then checks
+    what actually happened to the tasks it started - not what the source says
+    about them.
+    """
+    created: dict[str, asyncio.Task] = {}
+    real_create_task = asyncio.create_task
+
+    def _recording_create_task(coro, *, name=None, **kwargs):
+        task = real_create_task(coro, name=name, **kwargs)
+        if name:
+            created[name] = task
+        return task
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("sibling loop crashed")
+
+    async def _sleep_briefly(*_args, **_kwargs):
+        # Bounded, not forever. `run_daemon` gathers the tasks it started before
+        # its finally block runs, so a daemon that fails to cancel them blocks
+        # inside its own gather and the test would die on a 180s pytest-timeout
+        # instead of naming the task. With a short sleep, a daemon that does not
+        # cancel lets them *complete*, and the test says so precisely: done but
+        # not cancelled.
+        await asyncio.sleep(0.25)
+
+    class _StubScheduler:
+        async def start(self):
+            return None
+
+    monkeypatch.setattr(asyncio, "create_task", _recording_create_task)
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _boom)
+    monkeypatch.setattr(daemon, "sync_services_loop", _sleep_briefly)
+    monkeypatch.setattr(daemon, "_poll_balances", _sleep_briefly)
+    monkeypatch.setattr(daemon, "_daemon_heartbeat_loop", _sleep_briefly)
+    monkeypatch.setattr(daemon, "_discover_and_register_discord_services", lambda **_k: None)
+    monkeypatch.setattr(daemon, "_recover_failed_services", lambda: None)
+    monkeypatch.setattr(daemon, "ServiceScheduler", _StubScheduler)
+    monkeypatch.setattr(daemon, "capture_exception", lambda *_a, **_k: None)
+
+    observed: dict[str, tuple[bool, bool]] = {}
+
+    async def _drive():
+        try:
+            with pytest.raises(RuntimeError, match="sibling loop crashed"):
+                await daemon.run_daemon()
+            # A cancel that was never awaited has not landed yet, so give the
+            # loop a turn before reading the state.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            for name, task in created.items():
+                observed[name] = (task.done(), task.cancelled())
+        finally:
+            # Clean up whatever the daemon failed to stop, so `asyncio.run` does
+            # not block on a forever-sleeping task. Without this the test would
+            # fail on a 180s pytest-timeout instead of saying what is wrong.
+            for task in created.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*created.values(), return_exceptions=True)
+
+    asyncio.run(_drive())
+
+    for name in (
+        "service-sync-loop",
+        "balance-poller",
+        "daemon-heartbeat",
+    ):
+        assert name in created, f"precondition: {name} was never created"
+        done, cancelled = observed.get(name, (False, False))
+        assert done, (
+            f"{name} was still pending after the daemon unwound; a task that "
+            "outlives its daemon keeps running against a dead process"
+        )
+        assert cancelled, (
+            f"{name} finished some other way. A loop that was told to stop must "
+            "be cancelled, not left to complete on its own schedule"
+        )
