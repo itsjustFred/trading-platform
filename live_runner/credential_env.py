@@ -45,7 +45,12 @@ def discord_bot_env_canonical_name(name: str) -> str:
 def discord_bot_env_key(name: str, suffix: str) -> str:
     """Build the per-bot env key for a credential, e.g. ``_TOKEN``/``_AUTH_SCHEME``."""
     canonical = discord_bot_env_canonical_name(name)
-    if not canonical:
+    # A name made only of punctuation canonicalises to "_", which is not a name
+    # an operator could ever have written in the variable. Returning a key for it
+    # is worse than returning none: the lookup then misses silently and the bot
+    # falls back to the shared author list, which looks like a lookup that
+    # happened. Found by mutation testing, not by reading.
+    if not canonical.strip("_"):
         return ""
     return f"{DISCORD_BOT_ENV_PREFIX}{canonical}_{suffix}"
 

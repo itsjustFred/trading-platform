@@ -3363,3 +3363,33 @@ def test_the_allowlist_never_falls_back_to_the_process_environment(monkeypatch):
         f"the process environment leaked into the ingestion allowlist: "
         f"{sorted(resolved)}"
     )
+
+
+def test_an_empty_bot_name_yields_no_key_at_all():
+    """`discord_bot_env_key` must return "" for a name that cannot be canonicalised.
+
+    Without the guard a deployment whose `service_name` is missing produced
+    `DISCORD_BOT__TOKEN` - a key no operator can ever set, so the lookup silently
+    misses and the bot falls back to the shared author list. Found by mutation:
+    inverting this guard left every credential-related test green, because every
+    one of them uses a real bot name.
+
+    Returning "" is the fail-closed answer. A key that cannot match anything is
+    worse than no key, because it looks like a lookup that happened.
+    """
+    from live_runner.credential_env import discord_bot_env_key
+
+    for bad_name in ("", "   ", None, "---", "..."):
+        for suffix in ("TOKEN", "CHANNEL_ID", "AUTH_SCHEME", "TRUSTED_AUTHOR_IDS"):
+            assert discord_bot_env_key(bad_name, suffix) == "", (
+                f"{bad_name!r} produced "
+                f"{discord_bot_env_key(bad_name, suffix)!r} for {suffix}; it must "
+                "produce no key rather than one that cannot be set"
+            )
+
+    # And a real name still produces a real key, so the guard is not simply
+    # rejecting everything.
+    assert (
+        discord_bot_env_key("nitro", "TRUSTED_AUTHOR_IDS")
+        == "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS"
+    )

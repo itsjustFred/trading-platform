@@ -1824,3 +1824,111 @@ def test_every_stockkit_route_call_site_resolves_configured_accounts():
         "call sites that resolve the stale static account table instead of the "
         "configured one:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_a_confirmation_naming_a_different_deployment_is_refused(
+    isolated_db_sandbox,
+):
+    """The echo check stops an operator confirming the wrong row.
+
+    Every existing test passes the *correct* deployment id, so the mismatch branch
+    was never reached - confirmed by mutation: replacing the echoed value with the
+    requested one left all 8 confirmation tests green. The guard exists so that
+    arming or stopping a deployment cannot be aimed at the wrong one by a stale
+    tab, a mis-read id, or a UI that dropped the field.
+
+    The refusal is a 409, is audited like every other refused live control, and
+    leaves the row untouched.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-echo", "alpaca", is_demo=True)
+    database_module.record_live_account_demo_verification(
+        "acc-echo", is_demo=True, ctid="PA_ECHO"
+    )
+
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    ids = []
+    for _ in range(2):
+        did = str(_uuid.uuid4())
+        database_module.create_live_deployment(
+            database_module.LiveDeploymentConfig(
+                id=_uuid.UUID(did),
+                strategy_name="trend_following/trend_following.py",
+                account_id="acc-echo",
+                symbols=["EURUSD"],
+                timeframe="M15",
+                status="PAUSED",
+                signal_source_type="internal",
+            )
+        )
+        ids.append(did)
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{ids[0]}/status",
+        json={
+            "status": "ACTIVE",
+            # Names the OTHER deployment: exactly the stale-tab mistake.
+            "confirmation": {"confirmed_deployment_id": ids[1]},
+        },
+    )
+
+    assert response.status_code == 409, (
+        "a confirmation naming a different deployment was accepted, so an "
+        "operator can arm the wrong row from a stale tab"
+    )
+    detail = response.json()["detail"]
+    assert "does not match" in detail or "different deployment" in detail
+    assert database_module.get_live_deployment(ids[0]).status == "PAUSED", (
+        "the deployment was armed despite a mismatched confirmation"
+    )
+
+
+def test_an_absent_confirmation_is_refused(isolated_db_sandbox):
+    """Omitting the field entirely must not arm anything.
+
+    A missing `confirmed_deployment_id` stringifies to "", which is not the
+    deployment id, so the same branch refuses it. Worth pinning because "" is the
+    value that makes an `if not confirmed` shortcut look reasonable, and that
+    shortcut would be a different behaviour from this one.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-noecho", "alpaca", is_demo=True)
+    database_module.record_live_account_demo_verification(
+        "acc-noecho", is_demo=True, ctid="PA_NOECHO"
+    )
+
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    did = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(did),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-noecho",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="PAUSED",
+            signal_source_type="internal",
+        )
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{did}/status",
+        json={"status": "ACTIVE", "confirmation": {}},
+    )
+
+    assert response.status_code in (409, 422), (
+        f"a missing confirmation was accepted (status {response.status_code})"
+    )
+    assert database_module.get_live_deployment(did).status == "PAUSED"
