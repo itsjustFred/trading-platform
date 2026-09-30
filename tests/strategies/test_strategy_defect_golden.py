@@ -135,7 +135,6 @@ def test_pine_strategies_4_tuple_output_flows_through_vectorbt_normalization():
         if not path.name.startswith("__")
         and not path.stem.endswith("_context")
         and path.parent.name == path.stem
-        and path.stem not in {"pynecore_orb", "pynecore_sma_crossover", "tiingo_sentiment"}
     ),
 )
 def test_every_strategy_module_returns_four_tuple_contract(relative):
@@ -145,13 +144,47 @@ def test_every_strategy_module_returns_four_tuple_contract(relative):
     repair a len-3 output silently, so a refactor that drops ``drawings``
     from one strategy passes CI and only shows up as missing chart markers /
     empty annotation exports later. Pinning every module keeps the ambiguity
-    from returning. The PyneCore scripts are excluded: they need the optional
-    ``pynecore`` package and are covered by the sibling test above plus
-    ``test_naming_integrity_meta_matches_implementation``.
+    from returning. Modules outside the contract are now **derived and asserted**
+    rather than listed by name: a driver script with no `generate_signals` must have a
+    sibling `<stem>_context.py`, and a strategy that deliberately refuses to invent a
+    signal must declare itself BLOCKED *and* raise NotImplementedError. The previous
+    hardcoded set of three names could not say why any of them was excluded.
     """
+    path = PROJECT_ROOT / relative
     module = _load_strategy_module(relative, "arity_" + Path(relative).stem)
+    source = path.read_text(encoding="utf-8")
+
     if not hasattr(module, "generate_signals"):
-        pytest.skip("module exposes no generate_signals")
+        # The skip here used to be unconditional, and that was the hole: renaming
+        # `generate_signals` in any strategy gave **25 passed / 1 skipped / exit 0**, so a
+        # strategy that had lost its entry point simply stopped being checked.
+        #
+        # There is exactly one legitimate shape - the PyneCore driver scripts, whose logic
+        # lives in a sibling `<stem>_context.py` - and it is derived rather than listed. The
+        # previous version listed three names in a set, which could not explain why
+        # `tiingo_sentiment` was in it: it is not a PyneCore script at all, its
+        # `generate_signals` deliberately raises rather than fabricate a signal.
+        assert (path.parent / f"{path.stem}_context.py").exists(), (
+            f"{relative}: this module has no generate_signals and no sibling "
+            f"<stem>_context.py, so there is no derived reason it is outside the arity "
+            f"contract. Either restore the entry point, or give it the documented driver "
+            f"shape - a list of names is not a reason."
+        )
+        return
+
+    if "BLOCKED" in source:
+        # A deliberately blocked strategy refuses to invent a signal. That is a legitimate
+        # way to be outside the contract, but only if it *says* so - otherwise any strategy
+        # could opt out by raising.
+        assert "NotImplementedError" in source, (
+            f"{relative}: marked BLOCKED but does not raise NotImplementedError; a strategy "
+            f"must not be able to leave the arity contract by declining to run"
+        )
+        with pytest.raises(NotImplementedError):
+            # `_call` adapts to the signature; calling `generate_signals` directly does
+            # not, and a TypeError here would read as the module not being blocked.
+            _call(module, _trend_frame())
+        return
     output = _call(module, _trend_frame())
     assert isinstance(output, tuple), f"{relative}: generate_signals must return a tuple"
     assert len(output) == 4, (
