@@ -1082,11 +1082,18 @@ def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
     stamps = list(
         pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC")
     ) + [pd.Timestamp("2024-03-11 22:00", tz="UTC")]
-    _write_series(root / "ohlcv" / "GOLD1", "1h.parquet", stamps)
+    # AAPL, not the metal this used to use. The shape asserted here - closed
+    # Friday 21:00 UTC, no bars until Monday - is a *US equity* weekend, and the
+    # calendar that excuses it models US equities. On GOLD1 the same fixture is
+    # not market behaviour at all: a 24/5 Dukascopy venue trades Sunday 22:00
+    # through Monday, so those bars should exist. Asserting a US closure on a
+    # non-US venue is the same confusion that let a four-day FX outage be excused
+    # as a holiday, so the symbol is corrected rather than the assertion.
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
     report = analyze_ohlcv_coverage(
         root,
         DataRequirement(
-            symbol="GOLD1", timeframe="1h",
+            symbol="AAPL", timeframe="1h",
             start="2024-03-06", end="2024-03-11",
         ),
     )
@@ -1271,7 +1278,10 @@ def test_a_gap_with_unreadable_endpoints_is_never_excused():
     from data_tools.auto_download import _gap_is_market_closure
 
     weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
-    assert _gap_is_market_closure(weekend, timeframe="1m")
+    # The positive control names a US venue, because that is the only kind this
+    # calendar can account for. Called with no symbol it now returns False - an
+    # unstated venue is not a licence to excuse, and that is the defect.
+    assert _gap_is_market_closure(weekend, timeframe="1m", symbol="AAPL")
 
     assert not _gap_is_market_closure({**weekend, "start": ""}, timeframe="1m")
     assert not _gap_is_market_closure({**weekend, "end": "not-a-date"}, timeframe="1m")
@@ -1281,3 +1291,92 @@ def test_a_gap_with_unreadable_endpoints_is_never_excused():
         {"start": "2026-09-11", "end": "2026-09-14", "gap_days": 2.73},
         timeframe="1m",
     )
+
+
+def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
+    """The defect: a real hole in FX, certified as a holiday.
+
+    Martin Luther King Jr Day 2026 closed US equities on Monday 19 January, and
+    the calendar's shape test asks whether any *US session* falls between the
+    hole's endpoints. Between a Friday close and a Tuesday resume there is none -
+    Saturday, Sunday, and the holiday itself - so a Dukascopy series that simply
+    died for those four days matched the shape exactly and was excused, even
+    though `_uses_us_equity_calendar` already knew EURUSD was not a US venue.
+
+    A silent four-day hole in FX is worse than a spurious failure: the backtest
+    runs over a series with forward-filled prices and reports a result.
+    `shared/market_calendar` says it outright - "Non-US venues are not modelled ...
+    nothing here should be used to judge those" - and the check ignored it.
+    """
+    from data_tools.auto_download import _gap_is_market_closure, _uses_us_equity_calendar
+
+    fx_outage = {
+        "start": "2026-01-16",   # Friday 21:00 UTC, last bar
+        "end": "2026-01-20",     # Tuesday 22:00 UTC, first bar back
+        "gap_seconds": 349_200.0,
+        "gap_days": 4.04,
+    }
+
+    for symbol in ("EURUSD", "USDJPY", "XAUUSD", "BTCUSD"):
+        assert not _uses_us_equity_calendar(symbol), (
+            f"{symbol} is not a US equity venue, so the calendar cannot account "
+            f"for its closures"
+        )
+        assert not _gap_is_market_closure(
+            fx_outage, timeframe="1m", symbol=symbol
+        ), (
+            f"a four-day hole in {symbol} was excused as a market closure. The US "
+            "equity calendar does not model this venue, so it cannot certify its "
+            "outage as a holiday - the data is missing, not closed."
+        )
+
+    # The identical hole on a US equity is a genuine long weekend, and still
+    # passes. The fix narrows the excuse; it does not remove it.
+    for symbol in ("AAPL", "SPY"):
+        assert _gap_is_market_closure(fx_outage, timeframe="1m", symbol=symbol), (
+            f"a real US equity holiday week stopped being excused for {symbol}"
+        )
+
+
+def test_an_unknown_venue_is_never_excused():
+    """No symbol is not a licence.
+
+    The positive control in the fail-closed test above had to start naming a US
+    venue, because with no symbol the function now returns False. That is
+    deliberate: `closure_explains_hole` cannot know what it is being asked about,
+    and guessing "probably equities" is how a four-day hole becomes a warning.
+    """
+    from data_tools.auto_download import _gap_is_market_closure
+
+    weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
+
+    assert not _gap_is_market_closure(weekend, timeframe="1m")
+    assert not _gap_is_market_closure(weekend, timeframe="1m", symbol="")
+    assert not _gap_is_market_closure(weekend, timeframe="1m", symbol="   ")
+
+
+def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
+    """The whole path, not just the helper: a status the backtest actually sees."""
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    # Friday 21:00 UTC, then nothing until Tuesday 22:00 - a 24/5 FX venue that
+    # was open the whole time in between.
+    stamps = list(
+        pd.date_range("2026-01-16 15:00", "2026-01-16 21:00", freq="1h", tz="UTC")
+    ) + [pd.Timestamp("2026-01-20 22:00", tz="UTC")]
+    _write_series(root / "ohlcv" / "EURUSD", "1h.parquet", stamps)
+
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="EURUSD", timeframe="1h", start="2026-01-16", end="2026-01-20"
+        ),
+    )
+
+    assert report["status"] == "failed", (
+        f"a four-day hole in FX must fail coverage, not warn: {report}"
+    )
+    assert report["gaps"], "the hole must still be reported, not merely fail silently"

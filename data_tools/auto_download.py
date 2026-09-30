@@ -1268,11 +1268,32 @@ def closure_hole_allowance_seconds(
 
 
 def _gap_is_market_closure(
-    gap: dict[str, object], *, timeframe: str | None
+    gap: dict[str, object],
+    *,
+    timeframe: str | None,
+    symbol: str = "",
+    data_dir: str | Path = "",
 ) -> bool:
     """Whether the exchange calendar accounts for this hole.
 
-    Two independent questions, in this order. The shape comes from
+    Three questions, in this order. **First: is this venue one the calendar
+    models at all?** :func:`market_calendar` says so itself — "Non-US venues are
+    not modelled ... nothing here should be used to judge those" — and the shape
+    test it offers is not venue-agnostic. A Monday-holiday week in US equities
+    has no US session between Friday and Tuesday, so a Dukascopy FX series that
+    simply died for those four days matched the shape exactly and was excused,
+    while `_uses_us_equity_calendar` already knew the symbol was not a US venue.
+    A silent four-day hole in FX is worse than a spurious failure, so a venue the
+    calendar does not model gets no excuse at all.
+
+    That is deliberately fail-closed, and it has a known cost: a *genuine* 24/5
+    venue closure (FX reopens Sunday ~22:00 UTC, so the resuming bar's date is a
+    Sunday and the shape test refuses it) now hard-fails rather than being
+    excused. Closing that properly needs a real per-venue calendar, and guessing
+    a width for a market we do not model is the failure this whole check exists
+    to prevent. Recorded rather than papered over.
+
+    The remaining two questions are the original ones. The shape comes from
     :func:`market_calendar.closure_explains_hole` -- did the hole span any
     scheduled session? Then the width is checked against
     :func:`closure_hole_allowance_seconds`.
@@ -1283,6 +1304,10 @@ def _gap_is_market_closure(
     would hide it -- as would guessing a width from the rounded ``gap_days``,
     which cannot resolve a one-minute bar.
     """
+    if not _uses_us_equity_calendar(symbol, timeframe or "", data_dir):
+        # A venue the calendar does not model. Refusing here is the whole point:
+        # the alternative is certifying a data hole as market behaviour.
+        return False
     raw_start = str(gap.get("start") or "").strip()
     raw_end = str(gap.get("end") or "").strip()
     if not raw_start or not raw_end or "gap_seconds" not in gap:
@@ -1380,6 +1405,16 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
     # weekend is 2.73 days and a Monday-holiday week is 3.73, so any constant big
     # enough for the second also passes the 3.6-day hole that motivated the
     # original 4.0-day floor.
+    #
+    # The calendar only speaks for venues it models, so `_gap_is_market_closure`
+    # returns False for anything else. Known cost, accepted deliberately: a
+    # genuine multi-day closure on a 24/5 venue (FX, metals, crypto) now hard-fails
+    # rather than being excused, because a 24/5 venue reopens Sunday ~22:00 UTC and
+    # the resuming bar's date is a Sunday, which the US shape test refuses. Closing
+    # that properly needs a real per-venue calendar; guessing closure dates for a
+    # market we do not model is the exact failure this check prevents. Ordinary
+    # weekends on those venues are unaffected -- they pass on the threshold above,
+    # not on the calendar.
     fail_threshold = scaled_gap_threshold_days(
         requirement.timeframe,
         INTERNAL_GAP_FAIL_DAYS,
@@ -1390,7 +1425,15 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
             gap
             for gap in gaps
             if float(gap.get("gap_days", 0)) > fail_threshold
-            and not _gap_is_market_closure(gap, timeframe=requirement.timeframe)
+            and not _gap_is_market_closure(
+                gap,
+                timeframe=requirement.timeframe,
+                symbol=requirement.symbol,
+                # data_root is the already-resolved root; _resolve_data_root
+                # accepts either form, so passing it here keeps the venue lookup
+                # reading the same tree the coverage check just read.
+                data_dir=data_root,
+            )
         ],
         required_start,
         required_end,
