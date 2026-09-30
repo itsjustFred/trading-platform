@@ -10,6 +10,7 @@ These pin the seams the split introduced:
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import pkgutil
@@ -37,13 +38,46 @@ def test_size_trade_record_keys_reach_risk_math():
 
     import runner.engines.vectorbt_adapter as vbt
 
-    source = inspect.getsource(vbt._process_symbol)
-    start = source.index('trade_meta["risk_math"]')
-    block = source[start : source.index("capped_by_max_leverage", start) + 200]
+    # Read the *dict literal*, not the text.
+    #
+    # The previous version sliced the source between `trade_meta["risk_math"]` and
+    # `capped_by_max_leverage` and asserted the bare quoted name appears in it. Measured:
+    # deleting `max_position_pct` and `max_position_exposure_pct` from the emitted
+    # `risk_math` left this test **passing** - because the explanatory comment three lines
+    # above them already read `# "max_position_pct" stays for artifact compatibility`, and a
+    # quoted name in a comment is indistinguishable from a dict key to a substring match.
+    #
+    # So this test was already comment-satisfied before anything was deleted. The strongest
+    # behavioural probe for the same record, `test_risk_math_records_binding_caps`, also
+    # passed with both keys gone, so there was no behavioural twin to catch it either.
+    #
+    # An AST walk is the fix: a dict key is a node, and a comment is not. It also drops the
+    # fragile `+ 200` character window, which depended on how many lines the surrounding
+    # keys happened to occupy.
+    tree = ast.parse(inspect.getsource(vbt._process_symbol))
+    emitted: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Subscript):
+                continue
+            label = target.slice
+            if isinstance(label, ast.Constant) and label.value == "risk_math":
+                emitted.update(
+                    key.value
+                    for key in node.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                )
+
+    assert emitted, (
+        "no dict literal is assigned to trade_meta[\"risk_math\"] in _process_symbol; "
+        "the risk_math payload the viewer contract depends on is gone or was renamed"
+    )
 
     for key in record_keys:
         expected = SIZE_RECORD_RENAMED_KEYS.get(key, key)
-        assert f'"{expected}"' in block, (
+        assert expected in emitted, (
             f"sizing record key {key!r} (risk_math name {expected!r}) is not "
             "serialized into risk_math; the viewer contract "
             "(frontend TradeRiskMath) will silently lose it"

@@ -11,6 +11,7 @@ Seams under test:
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import subprocess
@@ -198,4 +199,48 @@ def test_permission_posture_is_documented():
 
     from runner.llm_providers import copilot_sdk_provider
 
-    assert "PERMISSION_POSTURE_NOTE" in inspect.getsource(copilot_sdk_provider)
+    # Read the module's AST, not its text.
+    #
+    # The previous assertion was a substring check over `inspect.getsource`, and it was
+    # **already satisfied by a comment before anything was deleted**: line 331 reads
+    # `# Documented trust posture - see PERMISSION_POSTURE_NOTE (F27).` immediately above
+    # the one line that actually uses the constant. Measured: deleting that
+    # `logger.debug(...)` - the only executable use of the constant in the module - left
+    # all 14 tests in this file passing.
+    #
+    # So the posture was documented, referenced by a comment, and never actually surfaced
+    # to an operator, with nothing failing. A comment is not a node, which is what makes
+    # this the right instrument: it can only be satisfied by code that reads the constant.
+    #
+    # Driving `generate` behaviourally would need the whole copilot client stood up
+    # (`start`, `_list_available_model_ids`, `create_session`) for one log line, so the
+    # check is structural with the specific property pinned rather than merely "the name
+    # occurs": the constant must be *read as an argument to a logger call*.
+    tree = ast.parse(inspect.getsource(copilot_sdk_provider))
+
+    logged = False
+    read_anywhere = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for arg in node.args:
+            if (
+                isinstance(arg, ast.Name)
+                and arg.id == "PERMISSION_POSTURE_NOTE"
+                and isinstance(arg.ctx, ast.Load)
+            ):
+                read_anywhere = True
+                func = node.func
+                rendered = ast.unparse(func)
+                if "logger" in rendered:
+                    logged = True
+
+    assert read_anywhere, (
+        "PERMISSION_POSTURE_NOTE is never read anywhere in the module. The constant and "
+        "the comment referring to it still exist, so a substring check is satisfied, but "
+        "the documented trust posture is never actually surfaced to an operator."
+    )
+    assert logged, (
+        "PERMISSION_POSTURE_NOTE is read but never passed to a logger call, so the "
+        "documented trust posture is not surfaced anywhere an operator would see it"
+    )
