@@ -431,10 +431,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca adapter falling back to resolved-env credentials",
                 extra={"data": {"account_id": account_id}},
             )
+        # Presence is checked separately from the value, for the same reason as the
+        # cTrader adapter and against the same failure. `resolve_env_value` returns ""
+        # both for an absent key and for one an operator deliberately blanked, and
+        # keeping those apart is its whole purpose. `or None` collapsed the blanked
+        # case into "absent" so the strict parse never saw the empty string.
+        # `_default_alpaca_credentials` above already gets this right by testing for
+        # `None` rather than falsiness; the two must not disagree about whether a
+        # blanked paper flag is a refusal or a default.
+        paper_configured = (env_values is not None and "ALPACA_PAPER" in env_values) or (
+            "ALPACA_PAPER" in os.environ
+        )
         self.paper = (
             _parse_bool_env(
                 "ALPACA_PAPER",
-                resolve_env_value(env_values, "ALPACA_PAPER") or None,
+                resolve_env_value(env_values, "ALPACA_PAPER") if paper_configured else None,
                 default=True,
             )
             if paper is None
