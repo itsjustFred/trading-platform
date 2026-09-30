@@ -1759,3 +1759,92 @@ def test_a_file_with_only_expected_gaps_reports_none(tmp_path):
     assert result.status == "ok", (
         f"a clean weekday series reported {result.status}: {result.warnings}"
     )
+
+
+def test_source_meta_is_found_under_the_key_the_downloader_actually_writes(
+    tmp_path, monkeypatch
+):
+    """Two readers of one shared file must agree on its key.
+
+    The downloader writes `source/asset_class/symbol/timeframe` and `catalog_builder`
+    reads that shape. `validate` looked up three *path-shaped* keys - the absolute
+    path, the posix path, and the path relative to `DATA_DIR`, all of which end in
+    `.parquet`. Verified against the live `data/source_meta.json`: 56 keys, every
+    one canonical, none path-shaped.
+
+    So the lookup never matched anything and `_dataset_metadata` always returned
+    empty, and `validate_parquet` fell back to the observed-session heuristic. That
+    fallback is the lossy consumer: the metadata carries the session and calendar the
+    downloader *knows*, and it was being discarded, so the verdict on whether data
+    is clean was made from an inference.
+
+    Legacy path-shaped keys are still accepted - the point is not to break an older
+    file - but the canonical shape is tried first because that is what is written.
+    """
+    import json
+
+    import pandas as pd
+
+    from data_tools import validate as validate_module
+    from data_tools.validate import _dataset_metadata
+
+    key = "dukascopy/forex/EURUSD/1h"
+    declared = {"session": {"start": "08:00", "end": "16:00"}, "calendar": "FX"}
+
+    root = tmp_path
+    (root / "ohlcv").mkdir()
+    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }
+    ).to_parquet(target, index=False)
+    (root / "source_meta.json").write_text(json.dumps({key: declared}))
+    monkeypatch.setattr(validate_module, "DATA_DIR", root)
+
+    assert _dataset_metadata(target) == declared, (
+        f"the dataset metadata was not found under the key the downloader writes "
+        f"({key!r}), so validation fell back to inferring the session from the data"
+    )
+
+
+def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
+    tmp_path, monkeypatch
+):
+    """The fix must not break a file written under the old scheme."""
+    import json
+
+    import pandas as pd
+
+    from data_tools import validate as validate_module
+    from data_tools.validate import _dataset_metadata
+
+    root = tmp_path
+    (root / "ohlcv").mkdir()
+    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }
+    ).to_parquet(target, index=False)
+    (root / "source_meta.json").write_text(
+        json.dumps({str(target): {"calendar": "legacy"}})
+    )
+    monkeypatch.setattr(validate_module, "DATA_DIR", root)
+
+    assert _dataset_metadata(target) == {"calendar": "legacy"}, (
+        "an existing path-shaped key stopped resolving, which would discard metadata "
+        "for any dataset written before the canonical scheme"
+    )

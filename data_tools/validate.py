@@ -367,7 +367,27 @@ def _dataset_metadata(path: Path) -> dict:
             continue
         if not isinstance(payload, Mapping):
             continue
-        keys = [str(path), path.as_posix()]
+        # The canonical key first: `source/asset_class/symbol/timeframe`, which is
+        # what the downloader writes and what catalog_builder reads. Verified
+        # against the live file - 56 keys, every one of that shape, none
+        # path-shaped.
+        #
+        # The path-shaped lookups below never matched anything. Every one of them is
+        # a way of naming a *file*, while the writer names a *dataset*, so this
+        # function silently returned nothing and `validate_parquet` always fell back
+        # to the observed-session heuristic - the lossy consumer was the one
+        # deciding whether data is clean. Two readers of one shared file, disagreeing
+        # on its key scheme, which is the third appearance of that shape in this
+        # function's own file (see also the timeframe parsing).
+        keys: list[str] = []
+        source = path.parts[-4] if len(path.parts) >= 4 else ""
+        asset_class = path.parts[-3] if len(path.parts) >= 3 else ""
+        symbol = path.parent.name
+        timeframe_stem = path.stem
+        canonical = f"{source}/{asset_class}/{symbol}/{timeframe_stem}"
+        keys.append(canonical)
+        # Retained for any file written under the old path-shaped scheme.
+        keys.extend([str(path), path.as_posix()])
         try:
             keys.append(str(path.resolve().relative_to(DATA_DIR.resolve())))
         except (OSError, RuntimeError, ValueError):
