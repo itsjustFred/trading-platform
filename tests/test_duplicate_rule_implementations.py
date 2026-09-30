@@ -47,6 +47,15 @@ PRODUCTION_ROOTS = (
 # must agree today; raising it without keeping them identical fails, which is the
 # point - adding a copy has to come with an argument that it is the same rule.
 DUPLICATED_RULES: tuple[tuple[str, int], ...] = (
+    # Message-spelling timeframe normalisation, in the two processors that each
+    # carry their own copy. Nitro is not listed because it subclasses RamJet and
+    # therefore has no copy of its own - which is asserted separately below,
+    # precisely because "no copy" is the thing that could change silently.
+    ("_resolve_timeframe", 2),
+    # OHLCV cleaning on the live signal path. Coerce-then-dropna looks like the
+    # opposite policy to the downloaders' `errors="raise"`, but it fails closed:
+    # an all-unreadable frame raises rather than silently sizing a position.
+    ("_prepare_market_data", 2),
     # Provider timeframe normalisation. These three differ by *design* in one
     # respect - yfinance serves `1w`/`4h`, alpaca and huggingface do not - so the
     # per-provider map is data, not duplication, and is deliberately not compared.
@@ -289,3 +298,102 @@ def test_every_timeframe_alias_is_a_direct_key_in_each_downloader_map(module_nam
     for alias in TIMEFRAME_ALIASES:
         for variant in (alias.upper(), f"  {alias}  "):
             assert module._normalize_supported_timeframe(variant) == TIMEFRAME_ALIASES[alias]
+
+
+# --------------------------------------------------------------------------
+# The three bots share a parser, but they do not share the table the same way
+# --------------------------------------------------------------------------
+#
+# Nitro subclasses RamJet, so it *inherits* `_resolve_timeframe` and RamJet's
+# `_TIMEFRAME_ALIASES`. RocketFuel carries its own copy of both. The copies are
+# equal today.
+#
+# The asymmetry is the hazard, not the duplication. A fix to RamJet's table
+# silently changes Nitro - which nobody would read as a Nitro change - while
+# RocketFuel keeps the old values. On the path where this repo has already had a
+# parser bug open a short position on a message that said buy, "which bots are
+# affected by this edit" should not be answerable by accident.
+#
+# Deriving all three from one owner is the better fix and `GRID_TIMEFRAME_ALIASES`
+# in `shared/constants.py` is the precedent for it. Not done here: the tables
+# agree, so this is a hazard rather than a bug, and the change would edit the live
+# signal path of all three bots on the strength of nothing observable. Pinned
+# instead, so the drift is caught rather than prevented, and the decision stays
+# with the human.
+
+
+def _signal_timeframe_aliases() -> list[tuple[str, dict[str, str]]]:
+    from signal_bots.ramjet.processor import _TIMEFRAME_ALIASES as ramjet
+    from signal_bots.rocketfuel.processor import _TIMEFRAME_ALIASES as rocketfuel
+
+    return [("signal_bots/ramjet/processor.py", ramjet),
+            ("signal_bots/rocketfuel/processor.py", rocketfuel)]
+
+
+def test_every_signal_bot_resolves_timeframe_spellings_identically() -> None:
+    """All three bots must map a message's timeframe spelling to the same thing."""
+    from signal_bots.nitro.processor import NitroSignalProcessor
+    from signal_bots.ramjet.processor import RamJetSignalProcessor
+
+    tables = _signal_timeframe_aliases()
+    ramjet_table = dict(tables[0][1])
+    for label, table in tables[1:]:
+        assert table == ramjet_table, (
+            f"{label} timeframe spellings differ from {tables[0][0]}: "
+            f"{ {k: v for k, v in table.items() if ramjet_table.get(k) != v} }"
+        )
+
+    # Nitro has no copy of the table because it subclasses RamJet and resolves a
+    # timeframe by delegating to RamJet's `process_signal` via `super()`. Asserted
+    # structurally, because "Nitro reuses RamJet's" is exactly the property that
+    # silently stops being true if someone rewrites that override.
+    assert NitroSignalProcessor.__mro__[1] is RamJetSignalProcessor, (
+        "NitroSignalProcessor no longer subclasses RamJetSignalProcessor."
+    )
+    import pathlib as _pathlib
+
+    module_tree = ast.parse(
+        (_pathlib.Path(NitroSignalProcessor.__module__.replace(".", "/") + ".py"))
+        .read_text(encoding="utf-8")
+    )
+    nitro_process = next(
+        fn
+        for cls in module_tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "NitroSignalProcessor"
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "process_signal"
+    )
+    delegates = [
+        node
+        for node in ast.walk(nitro_process)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "process_signal"
+        and isinstance(node.func.value, ast.Call)
+        and isinstance(node.func.value.func, ast.Name)
+        and node.func.value.func.id == "super"
+    ]
+    assert delegates, (
+        "NitroSignalProcessor.process_signal no longer calls "
+        "super().process_signal(...). It overrides RamJet's entry point, so it now "
+        "decides its own timeframe handling - and this test must compare three bots."
+    )
+
+    # Behaviour, not just data: the same spellings through both resolvers.
+    from signal_bots.ramjet import processor as ramjet_module
+    from signal_bots.rocketfuel import processor as rocketfuel_module
+
+    resolvers = {
+        "ramjet (and nitro, via super)": ramjet_module._resolve_timeframe,
+        "rocketfuel": rocketfuel_module._resolve_timeframe,
+    }
+    for spelling in ["", "5min", "5MIN", " 5min ", "1min", "60min", "1h", "5m", "nonsense"]:
+        resolved = {label: fn(spelling) for label, fn in resolvers.items()}
+        assert len(set(resolved.values())) == 1, (
+            f"timeframe spelling {spelling!r} resolves differently per bot: {resolved}"
+        )
+
+    # And the OHLCV cleaning both bots share is the same object, not two copies.
+    assert NitroSignalProcessor._prepare_market_data is RamJetSignalProcessor._prepare_market_data, (
+        "NitroSignalProcessor._prepare_market_data is no longer the inherited RamJet one."
+    )
