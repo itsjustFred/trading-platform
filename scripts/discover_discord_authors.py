@@ -149,16 +149,28 @@ def main(argv: list[str] | None = None) -> int:
 
     results = [asyncio.run(_observe(bot, args.pages)) for bot in bots]
 
+    # Recorded before the format branch, not inside the --json arm. --out has a
+    # default, so the record was silently skipped for the default text output -
+    # and the text output is what the operator actually runs. The whole reason
+    # this file exists is that the author allowlist used to live only in terminal
+    # scrollback, which the 2026-09-26 credential outage destroyed. Writing the
+    # record only in the mode nobody uses defeats that.
+    _write_record(results, args.out)
+
+    # Counted once, here, and reported in both formats. --json returned a flat 0
+    # no matter what it had just printed, so a caller reading the exit status saw
+    # success next to a JSON body full of `error` fields. An allowlist silently
+    # missing channels is the failure this tool exists to prevent, and returning
+    # 0 for it made that failure invisible to any wrapper.
+    failed = sum(1 for entry in results if entry["error"])
+
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
-        _write_record(results, args.out)
-        return 0
+        return 1 if failed else 0
 
-    failed = 0
     for entry in results:
         print(f"\n{entry['bot']}  (channel {entry['channel_id']})")
         if entry["error"]:
-            failed += 1
             print(f"  could not read this channel: {entry['error']}")
             print("  the token may be expired, revoked, or lack channel access")
             continue

@@ -6,6 +6,7 @@ ID per source; that check is the source gate.
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -2998,6 +2999,33 @@ def test_every_bot_path_honours_the_negation_guard() -> None:
 
     assert signal is None, f"a negated message produced {signal!r}"
 
+def _coro(value):
+    async def _inner():
+        return value
+
+    return _inner()
+
+
+def _ok_entry():
+    return {
+        "bot": "nitro",
+        "channel_id": "111",
+        "error": None,
+        "authors": [
+            {
+                "author_id": "42",
+                "message_count": 3,
+                "is_bot": False,
+                "username": "someone",
+            }
+        ],
+    }
+
+
+def _error_entry(bot="nitro"):
+    return {"bot": bot, "channel_id": "111", "error": "401 unauthorized", "authors": []}
+
+
 class TestAuthorDiscoveryRecord:
     """The author allowlist must be written down, not printed to a terminal.
 
@@ -3092,6 +3120,139 @@ class TestAuthorDiscoveryRecord:
         assert probe.returncode == 0, (
             f"the default record path {default!r} is NOT gitignored, so an "
             f"author id could be committed by accident: {probe.stdout}{probe.stderr}"
+        )
+
+    # --- main() wiring -------------------------------------------------------
+    # The record is written from main(), not only from _write_record's unit test,
+    # because the defect was never in the writer. It was that main() called the
+    # writer from inside the --json arm, so the default text run - the one an
+    # operator actually types - recorded nothing. A unit test on the writer passes
+    # either way and would not have caught it.
+
+    def _run_main(self, module, results, argv, monkeypatch):
+        """Drive main() with observation and bot discovery stubbed out.
+
+        Every patch goes through `monkeypatch`. Assigning onto the imported
+        `service_discovery` module object would work in isolation and then leak:
+        the stubbed `discover_discord_bots_from_env` is the real module's
+        attribute, so the two service-discovery tests that ran later in the suite
+        got a lambda returning a list of strings and failed with "string indices
+        must be integers". A test that only passes when it runs alone is not
+        evidence of anything.
+        """
+        pending = list(results)
+        monkeypatch.setattr(
+            module.service_discovery, "DEFAULT_ACCOUNTS_ENV", module.args_ns_path
+        )
+        monkeypatch.setattr(
+            module.service_discovery, "load_accounts_env_values", lambda path: None
+        )
+        monkeypatch.setattr(
+            module.service_discovery,
+            "discover_discord_bots_from_env",
+            lambda: [entry["bot"] for entry in results],
+        )
+
+        # One observation per discovered bot, consumed in order. Handing every
+        # bot the same one was this test's own bug: it reported "1 of 1" for a
+        # three-entry fixture, so the assertion failed for the right reason
+        # against the wrong data.
+        monkeypatch.setattr(
+            module, "_observe", lambda bot, pages: _coro(pending.pop(0))
+        )
+        return module.main(argv)
+
+    def test_the_record_is_written_for_the_default_text_output(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        module = self._script()
+        module.args_ns_path = tmp_path / "accounts.env"
+        out = tmp_path / "record.json"
+        code = self._run_main(
+            module,
+            [_ok_entry()],
+            ["--out", str(out)],
+            monkeypatch,
+        )
+
+        assert code == 0
+        assert out.exists(), (
+            "the default text run recorded nothing: --out has a default and the "
+            "write was nested inside the --json arm, so the mode the operator "
+            "actually runs was the one that lost the evidence"
+        )
+        recorded = json.loads(out.read_text(encoding="utf-8"))
+        assert recorded["bots"][0]["bot"] == "nitro"
+
+    def test_the_record_is_written_for_json_output_too(self, tmp_path, capsys, monkeypatch):
+        module = self._script()
+        module.args_ns_path = tmp_path / "accounts.env"
+        out = tmp_path / "record.json"
+        code = self._run_main(
+            module, [_ok_entry()], ["--json", "--out", str(out)], monkeypatch
+        )
+
+        assert code == 0
+        assert out.exists()
+        # The JSON goes to stdout, so a caller parsing it must not also receive
+        # the writer's stderr note.
+        json.loads(capsys.readouterr().out)
+
+    def test_json_output_exits_nonzero_when_a_channel_failed(self, tmp_path, capsys, monkeypatch):
+        """A JSON body full of `error` fields must not exit 0.
+
+        The exit status is the only channel a wrapper reads. It returned 0 while
+        printing failures, so a caller saw success next to an incomplete
+        allowlist - the exact outcome this tool exists to prevent.
+        """
+        module = self._script()
+        module.args_ns_path = tmp_path / "accounts.env"
+        out = tmp_path / "record.json"
+        code = self._run_main(
+            module, [_error_entry()], ["--json", "--out", str(out)], monkeypatch
+        )
+
+        assert code == 1, (
+            "--json returned success while reporting an unreadable channel; an "
+            "allowlist silently missing channels is the failure being guarded"
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert payload[0]["error"]
+        # Still recorded, so a later session can see what failed.
+        assert out.exists()
+
+    def test_text_output_exits_nonzero_when_a_channel_failed(self, tmp_path, monkeypatch):
+        module = self._script()
+        module.args_ns_path = tmp_path / "accounts.env"
+        code = self._run_main(
+            module,
+            [_error_entry()],
+            ["--out", str(tmp_path / "r.json")],
+            monkeypatch,
+        )
+
+        assert code == 1
+
+    def test_a_partially_failed_run_reports_the_count_once(self, tmp_path, capsys, monkeypatch):
+        """One failure must not be double-counted by the shared pre-count.
+
+        The text arm used to increment as it walked; the count is now taken once
+        before the branch so --json can use it too. Both arms read the same
+        number, so a mixed run cannot report two failures for one channel.
+        """
+        module = self._script()
+        module.args_ns_path = tmp_path / "accounts.env"
+        code = self._run_main(
+            module,
+            [_error_entry(), _error_entry("ramjet"), _ok_entry()],
+            ["--out", str(tmp_path / "r.json")],
+            monkeypatch,
+        )
+        out = capsys.readouterr().err
+
+        assert code == 1
+        assert "2 of 3 channels" in out, (
+            f"expected 2 of 3, got: {out!r}"
         )
 
 class TestRealBugsFromThePreMortem:
