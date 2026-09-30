@@ -7,6 +7,14 @@ from uuid import uuid4
 
 
 def _finite_float(value: Any, field_name: str) -> float:
+    # A bool is not a number here, even though `float(True)` is `1.0`. The two
+    # sibling copies of this rule - `risk/config.py::_finite_float` and
+    # `risk/engine.py::_finite_number` - both refuse it, and this one did not,
+    # so `TradeSignal(entry_price=True)` was accepted as an entry at 1.0. This is
+    # the copy that guards the live signal object, so it is the one where the
+    # difference could reach a trade rather than a config parse.
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be numeric")
     try:
         numeric = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
