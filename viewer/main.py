@@ -3478,13 +3478,28 @@ def _apply_backtest_numeric_filters(
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("total_return"), 0.0), total_return_min, total_return_max)
+            if item.get("total_return") is not None
+            and in_range(
+                _safe_float(item.get("total_return"), 0.0),
+                total_return_min,
+                total_return_max,
+            )
         ]
     if sharpe_min is not None or sharpe_max is not None:
+        # An unmeasurable metric is not a metric of zero. These payload fields are
+        # None by design - a run with too few daily returns has no Sharpe - and the
+        # psr and p_value filters just below already skip None for exactly that
+        # reason. Coercing to 0.0 made `?sharpe_max=1.0` return a backtest whose
+        # Sharpe was never computed, rendering as null, and rank it worst-in-class
+        # instead of excluding it: a screen meant to drop unmeasurable results
+        # promoted them. The same argument applies to the four filters below.
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("sharpe_ratio"), 0.0), sharpe_min, sharpe_max)
+            if item.get("sharpe_ratio") is not None
+            and in_range(
+                _safe_float(item.get("sharpe_ratio"), 0.0), sharpe_min, sharpe_max
+            )
         ]
     if psr_min is not None or psr_max is not None:
         filtered = [
@@ -3502,19 +3517,32 @@ def _apply_backtest_numeric_filters(
         ]
     if cagr_min is not None or cagr_max is not None:
         filtered = [
-            item for item in filtered if in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
+            item
+            for item in filtered
+            if item.get("cagr") is not None
+            and in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
         ]
     if win_rate_min is not None or win_rate_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(_normalize_win_rate(item.get("win_rate")) or 0.0, win_rate_min, win_rate_max)
+            if item.get("win_rate") is not None
+            and in_range(
+                _normalize_win_rate(item.get("win_rate")) or 0.0,
+                win_rate_min,
+                win_rate_max,
+            )
         ]
     if max_drawdown_min is not None or max_drawdown_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(abs(_safe_float(item.get("max_drawdown"), 0.0)), max_drawdown_min, max_drawdown_max)
+            if item.get("max_drawdown") is not None
+            and in_range(
+                abs(_safe_float(item.get("max_drawdown"), 0.0)),
+                max_drawdown_min,
+                max_drawdown_max,
+            )
         ]
     return filtered
 
@@ -12708,7 +12736,9 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
 
 @app.put("/api/live/deployments/{deployment_id}/status")
 async def update_live_deployment_status_endpoint(
-    deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
+    deployment_id: str,
+    payload: LiveDeploymentStatusUpdateRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}/status",
@@ -12722,7 +12752,7 @@ async def update_live_deployment_status_endpoint(
         action="deployment.status",
         deployment_id=deployment_id,
         confirmation=payload.confirmation,
-        request=None,
+        request=request,
     )
 
     if requested_status == "ACTIVE":
@@ -12802,6 +12832,9 @@ async def update_live_deployment_status_endpoint(
         action="deployment.status",
         target_type="live_deployment",
         target_id=deployment_id,
+        # The refusal path above forwards this; the applied change has to as well,
+        # or the audit records who was stopped but never who acted.
+        request=request,
         detail={
             "requested_status": requested_status,
             "applied_status": str(updated.status or ""),
@@ -12862,7 +12895,9 @@ async def update_live_deployment_status_endpoint(
 
 @app.put("/api/live/deployments/{deployment_id}/account")
 async def update_live_deployment_account_endpoint(
-    deployment_id: str, payload: LiveDeploymentAccountUpdateRequest
+    deployment_id: str,
+    payload: LiveDeploymentAccountUpdateRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Re-point a deployment at a different broker account.
 
@@ -12880,7 +12915,7 @@ async def update_live_deployment_account_endpoint(
         action="deployment.account",
         deployment_id=deployment_id,
         confirmation=payload.confirmation,
-        request=None,
+        request=request,
     )
     try:
         updated = await asyncio.to_thread(
@@ -12897,6 +12932,7 @@ async def update_live_deployment_account_endpoint(
         action="deployment.account",
         target_type="live_deployment",
         target_id=deployment_id,
+        request=request,
         detail={"account_id": str(updated.account_id or "")},
     )
     return _serialize_live_deployment_payload(updated)
@@ -12905,6 +12941,7 @@ async def update_live_deployment_account_endpoint(
 @app.delete("/api/live/deployments/{deployment_id}")
 async def delete_live_deployment_endpoint(
     deployment_id: str,
+    request: Request = None,  # type: ignore[assignment]
     confirm_deployment_id: str | None = Query(
         default=None,
         description=(
@@ -12928,7 +12965,7 @@ async def delete_live_deployment_endpoint(
             if confirm_deployment_id is not None
             else None
         ),
-        request=None,
+        request=request,
     )
     deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     if not deleted:
@@ -12937,6 +12974,7 @@ async def delete_live_deployment_endpoint(
         action="deployment.delete",
         target_type="live_deployment",
         target_id=deployment_id,
+        request=request,
     )
     return {"status": "deleted", "id": deployment_id}
 

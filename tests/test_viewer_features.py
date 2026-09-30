@@ -7341,3 +7341,83 @@ def test_matrix_summary_ignores_failed_cells(viewer_client, monkeypatch, tmp_pat
     monkeypatch.setattr(viewer_app_module, "MATRIX_RESULTS_DIR", matrix_dir)
 
     assert viewer_client.get("/api/backtests/matrix/summary").status_code == 200
+
+
+def test_backtest_filters_exclude_metrics_that_were_never_computed(
+    viewer_client, monkeypatch
+):
+    """A metric that could not be computed is not a metric of zero.
+
+    These payload fields are None by design: a run with too few daily returns has
+    no Sharpe, no CAGR, no drawdown. The `psr` and `p_value` filters already skip
+    None for that reason, but the other six coerced it to 0.0 through
+    `_safe_float(..., 0.0)`. So `?sharpe_max=1.0` returned a backtest whose
+    Sharpe was never computed, rendered it as `null`, and ranked it worst-in-class
+    instead of excluding it - a screen meant to drop unmeasurable results
+    promoted them.
+
+    Every filtered column is checked, because the fix is the same one line in six
+    places and a partial fix is exactly what the psr/p_value precedent already
+    looks like.
+    """
+    import viewer.main as viewer_app_module
+
+    unmeasured = {
+        "id": "bt-unmeasured",
+        "engine": "native",
+        "strategy_name": "Unmeasured",
+        "symbols": ["EURUSD"],
+        "timeframe": "1d",
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "total_return": None,
+        "cagr": None,
+        "sharpe_ratio": None,
+        "max_drawdown": None,
+        "win_rate": None,
+        "trade_count": 1,
+        "created_at": "2026-03-09T15:00:00Z",
+    }
+    measured = {
+        "id": "bt-measured",
+        "engine": "native",
+        "strategy_name": "Measured",
+        "symbols": ["AAPL"],
+        "timeframe": "1d",
+        "start_date": "2024-01-01",
+        "end_date": "2024-12-31",
+        "total_return": 0.20,
+        "cagr": 0.15,
+        "sharpe_ratio": 0.2,
+        "max_drawdown": -0.15,
+        "win_rate": 0.55,
+        "trade_count": 10,
+        "created_at": "2026-03-08T15:00:00Z",
+    }
+    monkeypatch.setattr(
+        viewer_app_module, "list_backtest_metadata_rows", lambda: [unmeasured, measured]
+    )
+    with viewer_app_module._BACKTEST_META_CACHE_LOCK:
+        viewer_app_module._BACKTEST_META_CACHE.clear()
+
+    # Bounds chosen to pass the measured row, so only the None coercion can let
+    # the unmeasured one through. The first attempt used 5, which the percent
+    # normalisation turns into 0.05 - so the query was testing the units helper
+    # rather than the None check, and the measured row was dropped for a reason
+    # that had nothing to do with this fix.
+    for query in (
+        "sharpe_max=5",
+        "total_return_max=0.5",
+        "cagr_max=0.5",
+        "max_drawdown_max=0.5",
+        "win_rate_max=0.9",
+        "total_return_min=0.05",
+    ):
+        resp = viewer_client.get(f"/api/backtests?{query}")
+        assert resp.status_code == 200, query
+        ids = [item["id"] for item in resp.json()["items"]]
+        assert "bt-unmeasured" not in ids, (
+            f"{query} returned a backtest whose metric is null; a filter must "
+            f"exclude an unmeasurable value, not read it as 0.0"
+        )
+        assert "bt-measured" in ids, f"{query} dropped the genuinely measured row"

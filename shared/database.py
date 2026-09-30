@@ -2686,6 +2686,16 @@ def update_service_status(
             and record.status == ServiceStatus.PAUSED.value
             and normalized_status != ServiceStatus.PAUSED.value
         ):
+            # Refusing the status change is still an attempt, and the attempt is the
+            # thing worth knowing: it is how an operator finds out something kept
+            # trying to un-pause a service they paused. This needs its own commit,
+            # because returning from inside `get_session` closes the session without
+            # one and the pending write is rolled back - so the column added to
+            # answer "when did anyone last try?" was empty for exactly the attempts
+            # worth noticing. The refusal itself stays fail-closed: the status is
+            # untouched either way.
+            session.add(record)
+            session.commit()
             return record.to_service()
         record.status = normalized_status
         if last_activity is not None:

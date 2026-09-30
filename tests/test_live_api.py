@@ -2130,3 +2130,169 @@ def test_the_migrations_apply_to_a_population_shaped_like_production(isolated_db
         "operator's stop state must not be rewritten by a migration"
     )
     assert total == 1, f"expected exactly the one seeded deployment, found {total}"
+
+
+def test_a_refused_status_change_is_still_recorded_as_an_attempt(isolated_db_sandbox):
+    """Refusing to un-pause is an attempt, and the attempt has to survive.
+
+    `last_attempt_at` was added to answer "when did anything last try to change
+    this service?", which is how an operator discovers something repeatedly
+    fighting a pause they set. But the refusal path returned from inside
+    `get_session` without committing, so the pending write was rolled back: the
+    column was empty for exactly the attempts worth noticing, while the returned
+    object still carried the timestamp - so a caller serialising the return value
+    would report a time that is not in the database.
+
+    Asserted against a re-read from the database, not against the return value.
+    The return value passing is what let this look correct in the first place.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    service = database_module.create_service(
+        database_module.Service(
+            name="TEST_BOT",
+            type=database_module.ServiceType.DISCORD_BOT,
+            status=database_module.ServiceStatus.RUNNING,
+            config={},
+        )
+    )
+    database_module.update_service_status(
+        str(service.id), database_module.ServiceStatus.PAUSED
+    )
+
+    def _persisted_attempt() -> object:
+        # A second, independent session, because the one under test still holds
+        # the write in its own open transaction - a read there sees the
+        # uncommitted row and cannot see this bug at all.
+        with database_module.get_session() as verify:
+            return verify.execute(
+                database_module.text(
+                    "SELECT last_attempt_at FROM services WHERE id = :sid"
+                ),
+                {"sid": str(service.id)},
+            ).scalar_one_or_none()
+
+    after_pause = _persisted_attempt()
+    assert after_pause is not None
+
+    refused = database_module.update_service_status(
+        str(service.id), database_module.ServiceStatus.RUNNING
+    )
+
+    assert refused.status == database_module.ServiceStatus.PAUSED, (
+        "the pause was cleared; the guard is the safety and must not weaken"
+    )
+
+    # The value must ADVANCE, not merely exist. Asserting "is not None" passed
+    # with the fix reverted, because the earlier pause had already set the
+    # column - the test was satisfied by the wrong write. Verified by mutation.
+    after_refusal = _persisted_attempt()
+    assert after_refusal is not None and after_refusal > after_pause, (
+        f"the refused attempt was rolled back: last_attempt_at stayed at "
+        f"{after_pause} instead of advancing, so the column is empty for exactly "
+        f"the attempts an operator needs to see"
+    )
+
+
+def test_a_live_control_audit_row_records_who_asked(monkeypatch):
+    """`X-Operator` has to reach the audit row, not just the helper.
+
+    `_live_control_actor` reads the header and has always been tested - with a
+    fake request object, directly. But all three live-control endpoints passed
+    `request=None` and none of them declared a `Request` parameter, so the header
+    could never arrive: every row in `live_control_audit` said
+    `actor = "local-operator"`, including the refused attempts, which are the
+    more interesting half. The audit trail was an action log with no attribution,
+    which is the one thing it exists to provide.
+
+    Driven through the real HTTP route, because the gap was in the wiring between
+    the endpoint and the helper, and a helper-only test cannot see wiring.
+    """
+    import viewer.main as viewer_main_module
+
+    recorded: list[dict] = []
+
+    async def _capture_audit(
+        *,
+        action: str,
+        target_type: str,
+        target_id: str,
+        request=None,
+        succeeded: bool = True,
+        detail: dict | None = None,
+    ) -> None:
+        # Mirrors the real signature exactly. A first attempt guessed
+        # `deployment_id` positionally and missed `target_type`/`target_id`, so
+        # the stub raised TypeError instead of recording anything - a test that
+        # fails on its own harness, not on the wiring it exists to check.
+        recorded.append(
+            {
+                "action": action,
+                "target_id": target_id,
+                "succeeded": succeeded,
+                "actor": viewer_main_module._live_control_actor(request),
+            }
+        )
+
+    monkeypatch.setattr(viewer_main_module, "_audit_live_control", _capture_audit)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_ensure_live_account_for_deployment",
+        lambda _account_id: {
+            "id": _account_id,
+            "broker": "alpaca",
+            "name": "Alpaca Paper",
+            "broker_login": "PAPER",
+        },
+    )
+    # A real UUID: LiveDeploymentConfig validates the id, and a non-UUID 400s
+    # before the audit path is reached, which is a confusing way to fail a test
+    # about attribution.
+    deployment_id = "77777777-7777-7777-7777-777777777777"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "update_live_deployment_status",
+        lambda _deployment_id, _status: _deployment_config(_deployment_id, "PAUSED"),
+    )
+
+    client = TestClient(viewer_main_module.app)
+    resp = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        headers={"X-Operator": "fred-from-the-console"},
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert recorded, "the audit helper was never called, so this proves nothing"
+    assert recorded[0]["actor"] == "fred-from-the-console", (
+        f"the declared operator was dropped: {recorded[0]['actor']!r}. The header "
+        "never reached the helper, so every audit row claimed 'local-operator'."
+    )
+
+    # And the default still holds when nobody declares themselves.
+    recorded.clear()
+    client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+    assert recorded[0]["actor"] == "local-operator", (
+        "an undeclared operator must stay 'local-operator', not become empty"
+    )
+
+
+def _deployment_config(deployment_id: str, status: str):
+    return LiveDeploymentConfig(
+        id=deployment_id,
+        strategy_name="s",
+        account_id="acc",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status=status,
+        signal_source_type="discord",
+        signal_source_id="RAMJET",
+    )
