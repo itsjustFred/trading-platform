@@ -5,6 +5,8 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.live_smoke import SmokeCheck, SmokeReport, _position_qty_for_symbol, main, run_smoke
 
 
@@ -186,3 +188,123 @@ def test_both_the_cancel_and_the_position_read_can_fail_at_once() -> None:
     assert details["cancel_status"] == "cancel_failed:ValueError"
     assert details["position_known"] is False
     assert details["position_error"] == "OSError"
+
+
+def _route_env(route: str, broker_login: str) -> dict:
+    """An accounts-env binding one named route to one account number."""
+    return {
+        "ALPACA_API_KEY_ACC1": "key-one",
+        "ALPACA_SECRET_KEY_ACC1": "secret-one",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": broker_login,
+        "ALPACA_ACCOUNT_NAME_ACC1": route,
+        "ALPACA_ENDPOINT_ACC1": "https://paper-api.alpaca.markets/v2",
+    }
+
+
+def test_the_smoke_route_reports_the_account_its_credentials_belong_to() -> None:
+    """The reported account must come from the env, not the hard-coded route table.
+
+    `STOCKKIT_ACCOUNT_ROUTES` is a literal table in `stockkit_routing.py`, and the
+    accounts env is operator-supplied. The two can disagree: a bot named "nitro" can
+    be bound in the env to an account other than the one the table records.
+
+    The smoke run used to resolve credentials for the env's account and then report
+    the table's, so it would trade one account while `details["account_id"]` named
+    another - and the routing check below it, which is fed the reported value, would
+    compare the table's number against itself and pass. A false "routing OK" for an
+    account nobody traded.
+    """
+    from live_runner.stockkit_routing import STOCKKIT_ACCOUNT_ROUTES
+    from scripts.live_smoke import _stockkit_route_with_credentials
+
+    env = _route_env("nitro", "PA0ENVBOUND99")
+    route, account, credentials = _stockkit_route_with_credentials(env)
+
+    assert route == "nitro"
+    assert credentials is not None
+    assert account == "PA0ENVBOUND99", (
+        f"reported {account!r} - the account the credentials belong to is "
+        f"PA0ENVBOUND99, not the route table's "
+        f"{STOCKKIT_ACCOUNT_ROUTES['nitro']!r}"
+    )
+    assert account != STOCKKIT_ACCOUNT_ROUTES["nitro"], (
+        "this test is only meaningful while the env and the table disagree"
+    )
+
+
+def test_the_smoke_routing_check_can_actually_fail() -> None:
+    """End to end: an env that resolves the route to one account but the credentials to
+    another is now refused, rather than waved through.
+
+    `expected_account_number_for_route` resolves in three steps - an explicit
+    `STOCKKIT_ACCOUNT_NUMBER_<ROUTE>`, then the ACC block whose name label matches,
+    then the static table. `_stockkit_route_with_credentials` finds credentials by the
+    *name label* rule. So an env that sets the explicit entry to one account while a
+    differently-numbered block carries the bot's name puts the two resolvers on
+    different accounts, and the smoke run would trade the labelled one on a route that
+    is required to use the explicit one.
+
+    Before the fix this passed. The deployment was labelled with a value derived the
+    same way the validator derived its expectation, so the comparison was circular. A
+    check that cannot fail is not a check, and this is the check in the smoke script
+    an operator runs to convince themselves a Discord route is safe.
+    """
+    from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from scripts.live_smoke import _stockkit_route_with_credentials
+    from shared.models import LiveDeploymentConfig
+
+    # The route is explicitly required to be PA0REQUIRED99 ...
+    env = _route_env("nitro", "PA0LABELLED77")
+    env["STOCKKIT_ACCOUNT_NUMBER_NITRO"] = "PA0REQUIRED99"
+
+    route, account, _ = _stockkit_route_with_credentials(env)
+    assert account == "PA0LABELLED77", "credentials resolve by the name label"
+    assert account != "PA0REQUIRED99"
+
+    deployment = LiveDeploymentConfig(
+        strategy_name="stockkit_discord_e2e",
+        account_id=account,
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source_type="discord",
+        signal_source="discord",
+        signal_source_id=route.upper(),
+        signal_config={"service_name": route, "channel_id": "1234567890123456789"},
+    )
+
+    with pytest.raises(ValueError, match="must route to Alpaca account"):
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account,
+            accounts_env_values=env,
+        )
+
+
+def test_an_env_matching_the_route_table_still_validates() -> None:
+    """The fix must not refuse a correctly configured operator."""
+    from live_runner.stockkit_routing import (
+        STOCKKIT_ACCOUNT_ROUTES,
+        validate_stockkit_deployment_route,
+    )
+    from scripts.live_smoke import _stockkit_route_with_credentials
+    from shared.models import LiveDeploymentConfig
+
+    env = _route_env("nitro", STOCKKIT_ACCOUNT_ROUTES["nitro"])
+    route, account, _ = _stockkit_route_with_credentials(env)
+    deployment = LiveDeploymentConfig(
+        strategy_name="stockkit_discord_e2e",
+        account_id=account,
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source_type="discord",
+        signal_source="discord",
+        signal_source_id=route.upper(),
+        signal_config={"service_name": route, "channel_id": "1234567890123456789"},
+    )
+
+    validate_stockkit_deployment_route(
+        deployment, account_broker_login=account, accounts_env_values=env
+    )
+    assert account == STOCKKIT_ACCOUNT_ROUTES["nitro"]

@@ -1104,7 +1104,14 @@ def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, 
                 env=env,
             )
             if credentials is not None:
-                return route, expected_account, credentials
+                # Report the account these credentials actually belong to, not the
+                # table's value for the route. The accounts env is operator-supplied
+                # and can name the same bot against a different Alpaca account than
+                # STOCKKIT_ACCOUNT_ROUTES records; returning the table value here
+                # would make the smoke run trade one account while reporting another,
+                # and it would make the routing check downstream compare that value
+                # against itself - a false "routing OK" for an account not traded.
+                return route, broker_login, credentials
     raise RuntimeError("No Alpaca credentials matched a configured StockKit route.")
 
 
@@ -1195,8 +1202,14 @@ def _stockkit_deployment_and_signal(
             "max_positions": 20,
         },
     )
-    # Validate routing against the configured broker account number for this
-    # route, resolved from the same accounts-env the smoke run uses.
+    # Fail closed unless the account this deployment routes to is the one the route
+    # is meant to use. The comparison is only meaningful because
+    # `_stockkit_route_with_credentials` reports the account its credentials belong
+    # to, which is read from the operator's accounts env and can disagree with the
+    # hard-coded STOCKKIT_ACCOUNT_ROUTES table. It is fed here as the "broker
+    # reported" side on purpose: for the DB-create, viewer and daemon call sites that
+    # value genuinely comes from the broker, and this one is the closest equivalent
+    # the smoke run can obtain before it connects.
     smoke_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
     validate_stockkit_deployment_route(
         deployment,
