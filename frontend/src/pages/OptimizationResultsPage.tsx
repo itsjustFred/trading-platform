@@ -11,6 +11,7 @@ import {
 } from "../lib/optimizationEvidence";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import { toPercentPointsForKey } from "../api/metricScale";
+import { describeError } from "../lib/errorMessage";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -89,9 +90,7 @@ export function OptimizationResultsPage() {
       })
       .catch((caughtError) => {
         setError(
-          caughtError instanceof Error
-            ? caughtError.message
-            : "Could not load optimization.",
+          describeError(caughtError, "Could not load optimization."),
         );
         setLoadedId(id);
       });

@@ -44,6 +44,7 @@ import type {
 import { requireMetricScale } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
 import { useToast } from "../components/toastContext";
+import { describeError } from "../lib/errorMessage";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
 const TRADE_PAGE_SIZE = 100;
@@ -226,10 +227,7 @@ export function BacktestDetailPage() {
         setCapmData(payload);
       })
       .catch((error_: unknown) => {
-        const message =
-          error_ instanceof Error && error_.message
-            ? error_.message
-            : "Could not load CAPM data";
+        const message = describeError(error_, "Could not load CAPM data");
         setCapmError(message);
         setCapmData(null);
       })
@@ -248,11 +246,7 @@ export function BacktestDetailPage() {
       setInfo(refreshed);
       setShowRenameModal(false);
     } catch (renameIssue: unknown) {
-      setRenameError(
-        renameIssue instanceof Error && renameIssue.message
-          ? renameIssue.message
-          : "Could not rename backtest",
-      );
+      setRenameError(describeError(renameIssue, "Could not rename backtest"));
     } finally {
       setSavingRename(false);
     }
@@ -268,10 +262,7 @@ export function BacktestDetailPage() {
       showToast("Backtest deleted.", "success");
       navigate("/backtests", { replace: true });
     } catch (error_: unknown) {
-      const message =
-        error_ instanceof Error && error_.message
-          ? error_.message
-          : "Could not delete backtest";
+      const message = describeError(error_, "Could not delete backtest");
       showToast(message, "error");
       setDeleting(false);
     }

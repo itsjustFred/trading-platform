@@ -21,6 +21,7 @@ import {
   type PercentScale,
 } from "../api/metricScale";
 import type { BacktestsCompareResponse } from "../api/types";
+import { describeError } from "../lib/errorMessage";
 
 const COLORS = ["#58a6ff", "#3fb950"];
 
@@ -176,9 +177,7 @@ export function ComparePage() {
         setFailure({
           key: idsKey,
           message:
-            error_ instanceof Error
-              ? error_.message
-              : "Could not load comparison data",
+            describeError(error_, "Could not load comparison data"),
         });
       });
     return () => {

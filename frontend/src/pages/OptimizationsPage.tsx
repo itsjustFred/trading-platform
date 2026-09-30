@@ -5,6 +5,7 @@ import { ArrowUpRight, Target, Telescope } from "lucide-react";
 import { getOptimizations } from "../api/client";
 import type { OptimizationSummary } from "../api/types";
 import { toPercentPointsForKey } from "../api/metricScale";
+import { describeError } from "../lib/errorMessage";
 import {
   classifyOptimizationOosEvidence,
   resolveCompatibleInSampleValue,
@@ -48,7 +49,7 @@ export function OptimizationsPage() {
         setLoading(false);
       })
       .catch((caughtError) => {
-        setError(caughtError instanceof Error ? caughtError.message : "Could not load optimizations.");
+        setError(describeError(caughtError, "Could not load optimizations."));
         setLoading(false);
       });
   }, []);
