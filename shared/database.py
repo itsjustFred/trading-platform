@@ -3144,6 +3144,38 @@ def record_live_account_demo_verification(
         return record.to_live_account()
 
 
+def demo_verification_age_seconds(account_id: str) -> float | None:
+    """Seconds since an account's broker demo verification, or None if unknown.
+
+    Same arithmetic as the freshness half of
+    `live_account_verification_block_reason`, extracted so a caller that wants to
+    know *whether to re-verify* is not forced to call the gate and parse its
+    prose. Returns None when the account or its stamp is missing, which callers
+    must treat as "needs verification" rather than "fresh" - an absent stamp is
+    the unverified state, never a recent one.
+    """
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveAccountModel, str(account_id or "").strip())
+        if record is None:
+            return None
+        verified_at = record.demo_verified_at
+        if verified_at is None:
+            return None
+        if not isinstance(verified_at, datetime):
+            try:
+                verified_at = datetime.fromisoformat(str(verified_at))
+            except ValueError:
+                return None
+        return (_utcnow_naive() - verified_at).total_seconds()
+
+
+def live_account_verification_needs_refresh(account_id: str) -> bool:
+    """True when the stamp is absent or older than the TTL, so a refresh is due."""
+    age = demo_verification_age_seconds(account_id)
+    return age is None or age > DEMO_VERIFICATION_TTL_SECONDS
+
+
 def live_account_verification_block_reason(
     account: LiveAccountModel | None,
 ) -> str | None:

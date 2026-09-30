@@ -122,7 +122,6 @@ from shared.database import (
     mark_background_tasks_interrupted,
     migrate_json_to_sqlite,
     normalize_task_status,
-    record_live_account_demo_verification,
     record_live_control_audit,
     save_result_to_sqlite,
     update_live_deployment_account,
@@ -171,6 +170,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
+
+# The recorder is a hard import, not part of the optional block above: the daemon
+# imports the same function from the same module, so a viewer-only fallback for it
+# would give the two processes different verification semantics - exactly the
+# split that let the TTL go unrefreshed in the first place.
+from live_runner.account_discovery import record_discovered_account_verification
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
@@ -4871,46 +4876,6 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
     return safe_payload if isinstance(safe_payload, dict) else {}
 
 
-def _record_discovered_account_verification(
-    account_id: str,
-    *,
-    is_demo: bool | None,
-    ctid: str | None,
-    broker_login: str | None,
-) -> None:
-    """Persist a broker demo verification for a freshly discovered account.
-
-    Discovery is the only place that has just spoken to the broker, so it is the
-    only legitimate writer of the verification stamp that ACTIVE transitions
-    require. Failure is logged and swallowed: discovery must still return the
-    account list even when the write fails, and the account simply stays
-    unverified (fail-closed) until the next successful discovery.
-
-    ``is_demo`` is tri-state. ``None`` means the source did not report the flag
-    at all, and then there is no verification to record: defaulting it to False
-    would invent a "the broker says this is live" confirmation out of an absent
-    field, and would stamp a live-looking verification onto the account besides.
-    """
-    if is_demo is None:
-        logger.warning(
-            "Discovery reported no is_demo flag; recording no demo verification",
-            extra={"data": {"account_id": account_id}},
-        )
-        return
-    try:
-        record_live_account_demo_verification(
-            account_id,
-            is_demo=is_demo,
-            ctid=ctid,
-            broker_login=broker_login,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not persist broker demo verification for account",
-            extra={"data": {"account_id": account_id, "error": repr(exc)}},
-        )
-
-
 def _discover_live_accounts_payload() -> list[dict[str, Any]]:
     discovered = _run_coroutine_sync(discover_configured_accounts)
     payload: list[dict[str, Any]] = []
@@ -4933,7 +4898,7 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
             # into a False that would demote a verified demo account.
             raw_is_demo = account.get("is_demo")
             is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
-            _record_discovered_account_verification(
+            record_discovered_account_verification(
                 account_id,
                 is_demo=is_demo,
                 ctid=normalized_ctid,
@@ -4960,7 +4925,7 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
             str(account.ctid).strip() if getattr(account, "ctid", None) else None
         )
         is_demo = bool(account.is_demo)
-        _record_discovered_account_verification(
+        record_discovered_account_verification(
             account.id,
             is_demo=is_demo,
             ctid=normalized_ctid,

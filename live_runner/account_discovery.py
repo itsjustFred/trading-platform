@@ -18,6 +18,10 @@ from live_runner.alpaca_adapter import (
     _default_alpaca_credentials,
 )
 from live_runner.credential_env import load_accounts_env_values
+from shared.database import (
+    demo_verification_age_seconds,
+    record_live_account_demo_verification,
+)
 from shared.logging import get_logger
 from shared.models import LiveAccount
 
@@ -929,3 +933,104 @@ async def discover_configured_accounts(
         discovered_accounts.values(),
         key=lambda item: (item.broker, item.name.lower(), item.id),
     )
+
+
+def record_discovered_account_verification(
+    account_id: str,
+    *,
+    is_demo: bool | None,
+    ctid: str | None,
+    broker_login: str | None,
+) -> None:
+    """Persist a broker demo verification for a freshly discovered account.
+
+    Lives here rather than in the viewer's request path because **two processes
+    need it and only one of them was calling it**. The daemon enforces
+    `DEMO_VERIFICATION_TTL_SECONDS` before every broker submission, but the only
+    writer of the stamp was the viewer's account-discovery endpoint. The daemon is
+    a separate systemd unit, so a headless deployment - no browser tab holding
+    `/ws/live/accounts`, nobody calling `GET /api/live/accounts` - aged every
+    account out and then silently refused every dispatch, while the deployment row
+    still read `ACTIVE` and the adapter was still built, because that path checks
+    the `is_demo` flag rather than the age.
+
+    Discovery is the only place that has just spoken to the broker, so it is the
+    only legitimate writer. Failure is logged and swallowed: discovery must still
+    return the account list even when the write fails, and the account then simply
+    stays unverified (fail-closed) until the next successful discovery.
+
+    `is_demo` is tri-state. `None` means the source did not report the flag at
+    all, and then there is no verification to record: defaulting it to False would
+    invent a "the broker says this is live" confirmation out of an absent field,
+    and would stamp a live-looking verification onto the account besides.
+    """
+    if is_demo is None:
+        logger.warning(
+            "Discovery reported no is_demo flag; recording no demo verification",
+            extra={"data": {"account_id": account_id}},
+        )
+        return
+    try:
+        record_live_account_demo_verification(
+            account_id,
+            is_demo=is_demo,
+            ctid=ctid,
+            broker_login=broker_login,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not persist broker demo verification for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+
+
+async def refresh_account_demo_verifications() -> int:
+    """Re-ask the broker about every configured account and record the answers.
+
+    Returns the number of verifications written, for logging. Never raises: a
+    refresh failure must not stop the daemon's loop, and the accounts simply stay
+    as they were - which for a stale stamp means dispatch keeps being refused,
+    i.e. fail-closed.
+
+    This is the daemon's half of the TTL. The viewer refreshes on demand, which
+    is the right behaviour for an operator watching a screen and useless as the
+    only mechanism: nothing about running headless should change whether the
+    process that places orders is allowed to place them.
+    """
+    try:
+        discovered = await discover_configured_accounts()
+    except Exception as exc:
+        logger.warning(
+            "Broker demo re-verification failed; accounts keep their current state",
+            extra={"data": {"error": repr(exc)}},
+        )
+        return 0
+
+    written = 0
+    for account in discovered:
+        if not isinstance(account, dict):
+            continue
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            continue
+        raw_is_demo = account.get("is_demo")
+        is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
+        broker_login = str(
+            account.get("broker_login") or account.get("login") or ""
+        ).strip() or None
+        ctid = str(account.get("ctid") or "").strip() or None
+        before = demo_verification_age_seconds(account_id)
+        record_discovered_account_verification(
+            account_id,
+            is_demo=is_demo,
+            ctid=ctid,
+            broker_login=broker_login,
+        )
+        if demo_verification_age_seconds(account_id) != before:
+            written += 1
+    if written:
+        logger.info(
+            "Refreshed broker demo verification for account(s)",
+            extra={"data": {"written": written}},
+        )
+    return written

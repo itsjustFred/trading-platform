@@ -1532,9 +1532,13 @@ def test_discovered_payload_without_is_demo_records_no_verification(
     assert payload[0]["is_demo_asserted"] is False
     # And nothing recorded against the account row.
     recorded: list[str] = []
+    # The recorder moved to `live_runner.account_discovery` so the daemon and the
+    # viewer share one definition rather than two that can drift - which is how
+    # the TTL came to be refreshed by only one of them. Patching the module
+    # attribute the viewer actually calls, not the name it used to define.
     monkeypatch.setattr(
         viewer_main_module,
-        "_record_discovered_account_verification",
+        "record_discovered_account_verification",
         lambda account_id, **kwargs: recorded.append(f"{account_id}:{kwargs['is_demo']}"),
     )
     viewer_main_module._discover_live_accounts_payload()
@@ -2295,4 +2299,239 @@ def _deployment_config(deployment_id: str, status: str):
         status=status,
         signal_source_type="discord",
         signal_source_id="RAMJET",
+    )
+
+
+def test_the_daemon_refreshes_its_own_demo_verification(
+    isolated_db_sandbox, monkeypatch
+):
+    """The process that enforces the TTL has to be the one that refreshes it.
+
+    `DEMO_VERIFICATION_TTL_SECONDS` is checked by the daemon before every broker
+    submission, but the only writer of the stamp was the viewer's account
+    discovery endpoint - a different systemd unit. Nothing about running headless
+    should change whether the process that places orders is allowed to place them,
+    so a browser tab being open was an invisible precondition for live trading.
+
+    Asserted through the refresher the daemon's loop calls, with the broker
+    conversation stubbed: the daemon must be able to renew the stamp on its own,
+    and the renewal must be the thing the TTL gate reads.
+    """
+    import asyncio
+
+    from live_runner.account_discovery import refresh_account_demo_verifications
+
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts(
+        [
+            database_module_module.LiveAccountConfig(
+                id="acct-ttl",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-1",
+                is_demo=True,
+            )
+        ]
+    )
+    account_id = "acct-ttl"
+
+    # Stale on arrival: no broker has been asked yet.
+    assert database_module_module.live_account_submission_block_reason(account_id) == (
+        "account has no broker demo verification on record"
+    )
+    assert database_module_module.live_account_verification_needs_refresh(account_id)
+
+    async def _fake_discovery():
+        return [
+            {
+                "id": account_id,
+                "broker": "alpaca",
+                "name": "Alpaca Paper",
+                "is_demo": True,
+                "broker_login": "PAPER-1",
+                "ctid": "ctid-ttl",
+            }
+        ]
+
+    import live_runner.account_discovery as discovery_module
+
+    monkeypatch.setattr(
+        discovery_module, "discover_configured_accounts", _fake_discovery
+    )
+
+    written = asyncio.run(refresh_account_demo_verifications())
+
+    assert written == 1, f"the refresh wrote {written} verifications, expected 1"
+    assert not database_module_module.live_account_verification_needs_refresh(
+        account_id
+    ), "the stamp is still stale after a successful broker round-trip"
+    assert (
+        database_module_module.live_account_submission_block_reason(account_id) is None
+    ), "the account is still refused for a reason unrelated to freshness"
+    assert database_module_module.live_account_submission_block_reason(account_id) is None
+
+
+def test_a_broker_that_stops_reporting_demo_leaves_the_account_refused(
+    isolated_db_sandbox, monkeypatch
+):
+    """Fail-closed on the refresh path too, not just on the gate.
+
+    A refresh that discovers the account with no `is_demo` flag must not clear a
+    stamp that has expired - the absence of an answer is not an answer. If the
+    refresher wrote `False`, or stamped freshness from nothing, a broker outage
+    would look like a passing check.
+    """
+    import asyncio
+
+    from live_runner.account_discovery import refresh_account_demo_verifications
+
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts([
+        database_module_module.LiveAccountConfig(
+            id="acct-quiet",
+            broker="alpaca",
+            name="Alpaca Paper",
+            broker_login="PAPER-2",
+            is_demo=True,
+        )
+    ])
+    account_id = "acct-quiet"
+
+    async def _silent_discovery():
+        # No is_demo key at all: the source did not assert anything.
+        return [
+            {
+                "id": account_id,
+                "broker": "alpaca",
+                "name": "Alpaca Paper",
+                "broker_login": "PAPER-2",
+            }
+        ]
+
+    import live_runner.account_discovery as discovery_module
+
+    monkeypatch.setattr(
+        discovery_module, "discover_configured_accounts", _silent_discovery
+    )
+
+    written = asyncio.run(refresh_account_demo_verifications())
+
+    assert written == 0, (
+        "a discovery that reported no is_demo flag recorded a verification; an "
+        "absent answer must not become a fresh one"
+    )
+    assert database_module_module.live_account_submission_block_reason(account_id) == (
+        "account has no broker demo verification on record"
+    )
+
+
+def test_a_refresh_failure_leaves_the_account_as_it_was(isolated_db_sandbox, monkeypatch):
+    """A broker error must not raise out of the daemon's loop, nor clear a stamp.
+
+    The refresher runs inside the daemon's main `while True`. Letting an exception
+    escape would kill the loop that places and flattens orders, and clearing the
+    stamp on failure would trade a stale-but-true record for a missing one.
+    """
+    import asyncio
+
+    from live_runner.account_discovery import refresh_account_demo_verifications
+
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts([
+        database_module_module.LiveAccountConfig(
+            id="acct-boom",
+            broker="alpaca",
+            name="Alpaca Paper",
+            broker_login="PAPER-3",
+            is_demo=True,
+        )
+    ])
+    database_module_module.record_live_account_demo_verification(
+        "acct-boom",
+        is_demo=True,
+        ctid="ctid-boom",
+        broker_login="PAPER-3",
+    )
+
+    async def _explode():
+        raise RuntimeError("broker unreachable")
+
+    import live_runner.account_discovery as discovery_module
+
+    monkeypatch.setattr(discovery_module, "discover_configured_accounts", _explode)
+
+    written = asyncio.run(refresh_account_demo_verifications())
+
+    assert written == 0
+    # The earlier verification stands - it is simply approaching its TTL.
+    assert not database_module_module.live_account_verification_needs_refresh(
+        "acct-boom"
+    ), "a failed refresh discarded a still-valid verification"
+
+
+def test_the_daemon_loop_refreshes_stale_verifications_and_skips_fresh_ones(
+    isolated_db_sandbox, monkeypatch
+):
+    """The decision is pinned, not just the refresher.
+
+    The first version of this fix tested `refresh_account_demo_verifications` and
+    nothing caught deleting its call from the loop - the whole suite stayed green,
+    which is precisely the "correct guard, nothing calls it" shape the change
+    exists to fix. Repeating that mistake inside the fix would have been worse
+    than the original bug, so the *decision* is exercised here: no stale account
+    means no broker conversation, and a stale one means exactly one.
+
+    Then the wiring itself: the loop body has to call this helper. A source check,
+    because running the daemon's main loop is not a test.
+    """
+    import asyncio
+
+    from live_runner import daemon as daemon_module
+
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts(
+        [
+            database_module_module.LiveAccountConfig(
+                id="acct-wire",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-9",
+                is_demo=True,
+            )
+        ]
+    )
+
+    calls: list[int] = []
+
+    async def _counting_refresh() -> int:
+        calls.append(1)
+        return 1
+
+    monkeypatch.setattr(
+        daemon_module, "refresh_account_demo_verifications", _counting_refresh
+    )
+
+    from types import SimpleNamespace
+
+    stale = [SimpleNamespace(id="acct-wire")]
+    written = asyncio.run(daemon_module._refresh_stale_account_verifications(stale))
+    assert written == 1, "a stale account did not trigger a refresh"
+    assert len(calls) == 1
+
+    # Verified and fresh: nothing to do, so no broker round-trip this tick.
+    database_module_module.record_live_account_demo_verification(
+        "acct-wire", is_demo=True, ctid="ctid-9", broker_login="PAPER-9"
+    )
+    written = asyncio.run(daemon_module._refresh_stale_account_verifications(stale))
+    assert written == 0, "a freshly verified account triggered a needless refresh"
+    assert len(calls) == 1, "the broker was asked again with nothing stale to fix"
+
+    # And the loop actually calls it. A test of the helper alone would pass with
+    # the call site deleted, which is the bug this whole change is about.
+    from pathlib import Path
+
+    source = Path(daemon_module.__file__).read_text(encoding="utf-8")
+    assert "_refresh_stale_account_verifications(accounts)" in source, (
+        "the daemon's main loop no longer calls the refresher; every dispatch "
+        "would be refused once the TTL expires, with nothing in the loop to renew it"
     )

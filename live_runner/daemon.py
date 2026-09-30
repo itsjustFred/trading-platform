@@ -32,6 +32,7 @@ from live_runner.credential_env import (
     load_accounts_env_values,
     resolve_env_value,
 )
+from live_runner.account_discovery import refresh_account_demo_verifications
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.service_discovery import (
     discover_discord_bots_from_env,
@@ -61,6 +62,7 @@ from shared.database import (
     list_services,
     list_stopped_enforced_deployment_ids,
     live_account_submission_block_reason,
+    live_account_verification_needs_refresh,
     mark_live_deployment_stopped_enforced,
     record_daemon_heartbeat,
     release_live_deployment_submission,
@@ -3794,6 +3796,7 @@ async def sync_deployments_loop(
                 # selected credential signature actually changed.
                 _clear_discord_auth_blocked_accounts()
             accounts, deployments = await _load_db_accounts_and_deployments()
+            await _refresh_stale_account_verifications(accounts)
             validate_live_account_routes(accounts)
             changed_ctrader_account_ids = _refresh_ctrader_blocked_state_for_accounts(
                 accounts, accounts_env_values
@@ -3914,6 +3917,38 @@ async def _daemon_heartbeat_loop(
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Daemon heartbeat failed: %r", exc)
         await asyncio.sleep(DAEMON_HEARTBEAT_INTERVAL_SECONDS)
+
+
+async def _refresh_stale_account_verifications(
+    accounts: list[LiveAccountConfig],
+) -> int:
+    """Re-verify accounts whose broker demo stamp has aged out. Returns the count.
+
+    The daemon enforces `DEMO_VERIFICATION_TTL_SECONDS` before every submission, so
+    it has to be the one that refreshes it. The viewer refreshed on demand, which
+    is right for an operator watching a screen and useless as the only mechanism:
+    the two are separate systemd units, so a headless deployment aged every account
+    out and then refused every dispatch, while the row still read ACTIVE and the
+    adapter was still built - because that path checks the `is_demo` flag rather
+    than the age.
+
+    Extracted from the loop body so the decision is testable. Testing the refresher
+    alone left the wiring unpinned: deleting this call from the loop left the whole
+    suite green, which is the same "correct guard, nothing calls it" shape this
+    change exists to fix.
+    """
+    stale = [
+        account
+        for account in accounts
+        if live_account_verification_needs_refresh(account.id)
+    ]
+    if not stale:
+        return 0
+    logger.info(
+        "Refreshing broker demo verification for stale account(s)",
+        extra={"data": {"account_ids": sorted(a.id for a in stale)}},
+    )
+    return await refresh_account_demo_verifications()
 
 
 async def run_daemon(
