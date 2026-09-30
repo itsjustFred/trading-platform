@@ -122,6 +122,18 @@ def test_ensure_adapter_refuses_non_demo_account(monkeypatch):
 
 
 def test_ensure_adapter_refuses_non_paper_alpaca_adapter(monkeypatch):
+    """A non-paper Alpaca adapter must not be registered, and this has to be visible.
+
+    The assertion used to be `adapter.paper is False` on a value the test itself had
+    just set, so it passed whether or not `_ensure_adapter_for_active_account`
+    refused anything. The registry was passed as a literal `{}`, so the one thing
+    worth asserting - that the adapter was not put in it - could not be observed.
+
+    Production is correct: the paper check at the construction site returns before
+    `active_adapters[account_id] = adapter`. This now proves it, and the companion
+    case below proves the pair can fail in the other direction, so neither test
+    passes merely because the function returned early for any reason.
+    """
     account = LiveAccountConfig(
         id="acc-paper",
         broker="alpaca",
@@ -132,17 +144,61 @@ def test_ensure_adapter_refuses_non_paper_alpaca_adapter(monkeypatch):
     monkeypatch.setattr(
         daemon, "_create_adapter_for_account", lambda *_args, **_kwargs: adapter
     )
+    active_adapters: dict = {}
 
     asyncio.run(
         daemon._ensure_adapter_for_active_account(
             "acc-paper",
             {"acc-paper": account},
-            {},
+            active_adapters,
             accounts_env_values={},
         )
     )
 
-    assert adapter.paper is False
+    assert "acc-paper" not in active_adapters, (
+        "a non-paper Alpaca adapter was registered; the refusal happens at the "
+        "construction site, before the assignment"
+    )
+    assert active_adapters == {}
+
+
+def test_ensure_adapter_registers_a_paper_alpaca_adapter(monkeypatch):
+    """The other half of the pair, so the refusal test above is not vacuous.
+
+    Without this, a change that made `_ensure_adapter_for_active_account` return
+    early for *every* account would keep the refusal test green.
+    """
+    account = LiveAccountConfig(
+        id="acc-paper",
+        broker="alpaca",
+        name="Paper",
+        is_demo=True,
+    )
+    adapter = SimpleNamespace(paper=True, connect=None, disconnect=None)
+    monkeypatch.setattr(
+        daemon, "_create_adapter_for_account", lambda *_args, **_kwargs: adapter
+    )
+    active_adapters: dict = {}
+
+    async def _connect() -> None:
+        return None
+
+    adapter.connect = _connect
+    monkeypatch.setattr(daemon, "_adapter_is_ready", lambda _a: True)
+
+    asyncio.run(
+        daemon._ensure_adapter_for_active_account(
+            "acc-paper",
+            {"acc-paper": account},
+            active_adapters,
+            accounts_env_values={},
+        )
+    )
+
+    assert active_adapters.get("acc-paper") is adapter, (
+        "a paper Alpaca adapter must be registered, otherwise the refusal test "
+        "proves nothing"
+    )
 
 
 def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypatch):
