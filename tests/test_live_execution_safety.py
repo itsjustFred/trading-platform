@@ -6793,3 +6793,97 @@ def test_deleting_a_deployment_closes_the_claim_gate_before_draining(
         "after the operator was told the deployment was deleted."
     )
     assert database.get_live_deployment(deployment_id) is None
+
+
+def test_alpaca_reconcile_tells_a_missing_order_from_a_failed_lookup():
+    """A broker that cannot answer is not the same as a broker saying "no order".
+
+    `_reconcile_signal_fill` caught every exception from the order lookup and
+    returned False, so a 429, a 5xx or a dropped connection read exactly like a
+    genuine "no such order". The local filled quantity never advances, `recovered`
+    stays put, and `reconcile_executions` returns normally - so the caller's
+    `except` in `connect()` never fires and nothing anywhere says a fill is
+    unrecorded. A missed fill stays missed, quietly, on every connect.
+
+    The contrast is in the same module: `_recover_existing_signal_order` makes the
+    identical call and deliberately re-raises "so a transient failure cannot be
+    mistaken for absence", and cTrader's equivalent logs before returning None.
+
+    Both directions are pinned: 404 is genuine absence and stays quiet, anything
+    else must be visible. The handler is attached to the logger directly because
+    `get_logger` sets `propagate = False`, so `caplog` - which hangs off the root -
+    sees nothing at all. Using caplog here would have asserted against an empty
+    list and passed for the wrong reason, which is how this file's first attempt
+    behaved.
+    """
+    import asyncio
+    import logging
+
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(
+        api_key="k", secret_key="s", paper=True, account_id="alpaca-acc-1"
+    )
+    signal_id = str(uuid4())
+
+    class _Boom(Exception):
+        def __init__(self, status):
+            super().__init__("broker said no")
+            self.status_code = status
+
+    def _install(exception):
+        adapter._trading_client = SimpleNamespace(
+            get_order_by_client_id=lambda _cid: (_ for _ in ()).throw(exception)
+        )
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    capture = _Capture(level=logging.WARNING)
+    source_logger = logging.getLogger("trading.live-runner")
+    source_logger.addHandler(capture)
+    try:
+        # A genuine 404 is a real answer: no such order, so no fill. Silent.
+        _install(_Boom(404))
+        assert asyncio.run(adapter._reconcile_signal_fill(signal_id)) is False
+        assert not [
+            r for r in records if "Could not read order state" in r.getMessage()
+        ], "a 404 is genuine absence and must not be reported as a failure"
+
+        # Anything else is the broker failing to answer, and must say so.
+        for status in (429, 500, 502):
+            records.clear()
+            _install(_Boom(status))
+            assert asyncio.run(adapter._reconcile_signal_fill(signal_id)) is False
+            messages = [r.getMessage() for r in records]
+            assert any(
+                "Could not read order state" in m for m in messages
+            ), f"a {status} during reconciliation was silent: {messages}"
+            assert any(
+                getattr(r, "data", {}).get("signal_id") == signal_id for r in records
+            ), f"the warning did not name the signal it could not reconcile: {messages}"
+    finally:
+        source_logger.removeHandler(capture)
+
+
+def test_a_lookup_error_with_no_status_code_is_not_treated_as_absence():
+    """An exception carrying no status is still a failed lookup, not a 404.
+
+    The predicate reads the status code structurally, so an error with none - a
+    transport failure, or an SDK that moved the field - must fall on the "could not
+    answer" side. Defaulting it to "not found" would reintroduce the original bug
+    for exactly the case we cannot inspect.
+    """
+    from live_runner.alpaca_adapter import _is_order_not_found
+
+    assert _is_order_not_found(Exception("connection reset")) is False
+    assert _is_order_not_found(ValueError("bad request")) is False
+    # And a 404 is recognised whether the SDK hung the code on the exception or on
+    # the response object.
+    assert _is_order_not_found(SimpleNamespace(status_code=404)) is True
+    assert _is_order_not_found(
+        SimpleNamespace(response=SimpleNamespace(status_code=404))
+    ) is True

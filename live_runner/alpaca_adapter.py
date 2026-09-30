@@ -44,6 +44,27 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 
 
+def _is_order_not_found(exc: BaseException) -> bool:
+    """Whether an order lookup failed because the order is genuinely absent.
+
+    Alpaca answers 404 for a client order id it does not know, which is a real
+    answer: there is no fill. A 429, a 5xx or a transport error is the broker
+    failing to answer, which is not an answer at all, and must not be collapsed into
+    the same case as absence.
+
+    Read structurally rather than by exception class, because `APIError` moves
+    between alpaca-py releases and this module already treats the SDK as optional.
+    The status code carries the meaning, wherever the SDK hung it.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) == 404
+    except (TypeError, ValueError):
+        return False
+
+
 def _normalize_broker_order_id(value: Any) -> str | None:
     if value is None or isinstance(value, bool):
         return None
@@ -524,8 +545,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order = await asyncio.to_thread(
                 self._trading_client.get_order_by_client_id, signal_id
             )
-        except Exception:
-            # Unknown to this account or not found.
+        except Exception as exc:
+            # Only a genuine "no such order" may read as "no fill". Anything else -
+            # a 429, a 5xx, a dropped connection - is the broker failing to answer,
+            # and treating that as absence is how a missed fill stays missed: the
+            # local filled quantity never advances, the `recovered` counter stays
+            # put, and `reconcile_executions` returns normally, so the caller's
+            # `except` in connect() never fires and nothing is logged anywhere.
+            #
+            # The contrast is in this same file: `_recover_existing_signal_order`
+            # makes the identical call and deliberately re-raises "so a transient
+            # failure cannot be mistaken for absence", and cTrader's equivalent logs
+            # before returning None. Only this path was silent.
+            if _is_order_not_found(exc):
+                return False
+            logger.warning(
+                "Could not read order state during reconciliation; a fill may be "
+                "unrecorded until the next pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "signal_id": signal_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
             return False
         broker_filled_qty = _to_float(
             getattr(order, "filled_qty", None), default=0.0
