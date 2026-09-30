@@ -358,14 +358,15 @@ def export_data():
         else:
             logger.info(f"Using table: {table_name}")
 
-            # Get symbols
-            result = run_dolt(
-                ["dolt", "sql", "-q", build_distinct_symbol_select(table_name), "-r", "csv"],
-                cwd=stocks_repo,
-                capture=True,
-            )
-            lines = result.stdout.strip().split("\n")[1:]  # skip header
-            symbols = [line.strip() for line in lines if line.strip()]
+            # Get symbols, through the helper that already carries the timeout and
+            # dolt-failure guard. This used to be inlined, and the inline copy had
+            # no `except`: a `DoltTimeoutError` from the symbol listing escaped
+            # `export_data` and took the earnings and rates exports with it, so one
+            # slow or broken `stocks` repo meant *no* fundamentals at all, with a
+            # traceback and no partial-success report. The guard was added to
+            # `_list_symbols` - which nothing in production called, since this
+            # re-implementation is what actually runs.
+            symbols = _list_symbols(stocks_repo, table_name)
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):

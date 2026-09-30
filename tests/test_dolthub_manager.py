@@ -120,3 +120,68 @@ def test_repo_parquet_export_keeps_previous_file_when_write_fails(tmp_path, monk
 
     assert output_path.read_text(encoding="utf-8") == "previous parquet"
     assert not (output_dir / "earnings.csv").exists()
+
+
+def test_a_failing_stocks_repo_does_not_take_the_fundamentals_exports_with_it(
+    tmp_path, monkeypatch
+):
+    """One broken repo must not cost every other table its export.
+
+    `export_data` inlined the symbol listing instead of calling `_list_symbols`,
+    and the inline copy had no `except`. A `DoltTimeoutError` from
+    `SELECT DISTINCT act_symbol` - a large table, a transient dolt failure, the
+    600s default - escaped the function before `_export_repo_tables("earnings")`
+    and `_export_repo_tables("rates")` ran. So a slow `stocks` repo meant *no*
+    fundamentals at all, with a traceback and no partial-success report.
+
+    The guard this branch added went to `_list_symbols`, which nothing in
+    production called. Hardening the copy that is dead is not hardening.
+    """
+    import data_tools.dolthub_manager as dolthub_manager
+
+    stocks_repo = tmp_path / "stocks"
+    (stocks_repo / dolthub_manager.DOLT_METADATA_DIR).mkdir(parents=True)
+    monkeypatch.setattr(dolthub_manager, "DOLT_DIR", tmp_path)
+    monkeypatch.setattr(dolthub_manager, "EXPORT_DIR", tmp_path / "exports")
+    monkeypatch.setattr(dolthub_manager, "_stocks_table_name", lambda repo: "ohlcv")
+
+    monkeypatch.setattr(
+        dolthub_manager, "_list_tables", lambda repo: ["ohlcv"]
+    )
+
+    seen_queries: list[str] = []
+
+    def _only_the_symbol_listing_times_out(args, **_kwargs):
+        query = " ".join(str(a) for a in args)
+        seen_queries.append(query)
+        if "DISTINCT" in query.upper():
+            raise dolthub_manager.DoltTimeoutError("dolt exceeded 600s")
+        return SimpleNamespace(stdout="table\n", returncode=0)
+
+    # Only the *symbol listing* fails. The first attempt stubbed every `run_dolt`
+    # to raise, but `_list_tables` runs first and swallows its own failure, so
+    # `table_name` came back None, the whole stocks block was skipped, and the
+    # fundamentals exported for a reason that had nothing to do with the code
+    # under test. The mutation passed on a test that was never exercising it.
+    monkeypatch.setattr(
+        dolthub_manager, "run_dolt", _only_the_symbol_listing_times_out
+    )
+
+    exported_tables: list[str] = []
+
+    def _capture_tables(name, target):
+        exported_tables.append(name)
+
+    monkeypatch.setattr(dolthub_manager, "_export_repo_tables", _capture_tables)
+
+    dolthub_manager.export_data()
+
+    assert any("DISTINCT" in q for q in seen_queries), (
+        f"the symbol listing was never reached, so this test proved nothing: "
+        f"{seen_queries}"
+    )
+    assert exported_tables == ["earnings", "rates"], (
+        f"a failing stocks symbol listing skipped the fundamentals exports: "
+        f"{exported_tables}. Earnings and rates have nothing to do with the "
+        f"equity repo, and a traceback is not a partial-success report."
+    )
