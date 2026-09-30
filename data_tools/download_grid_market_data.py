@@ -30,13 +30,27 @@ from data_tools.file_fingerprint import file_fingerprint, files_have_same_conten
 from data_tools.path_safety import build_dataset_path
 from data_tools.resample import resample_file
 from shared.atomic_io import atomic_replace, write_parquet_atomically
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 
 DEFAULT_SYMBOLS = ["XAUUSD", "SP500", "NAS100", "EURUSD", "USDJPY", "OIL"]
-DEFAULT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-# Canonical ordering for every normalized timeframe we support. Used for stable
-# sorting; must stay in sync with shared.constants.VALID_TIMEFRAMES.
-TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+# The canonical granularity order is owned by shared.constants; this module takes
+# the subset it can actually serve rather than restating it. The old comment here
+# claimed the list was "every normalized timeframe we support" and that it "must
+# stay in sync", which was a hand-copied literal that had already drifted - tick,
+# s1 and 1w were missing while the other tools handled all three.
+#
+# tick and s1 are excluded on purpose: every series here is resampled from a
+# 1-minute source, and nothing can be resampled to something finer than its input.
+# 1w is excluded too, but for a different reason: the same resampler produces 4h
+# and 1d from 1m, and data_tools/resample.py lists 1w, so weekly bars look
+# derivable and the exclusion may be an oversight. That is a decision about this
+# pipeline rather than something to settle by editing a constant, so the set is
+# pinned by a test and the question is left visible.
+UNSUPPORTED_TIMEFRAMES = frozenset({"tick", "s1", "1w"})
+TIMEFRAME_ORDER = [tf for tf in VALID_TIMEFRAMES if tf not in UNSUPPORTED_TIMEFRAMES]
+# The CLI default is the served set, not a fourth copy of the same list.
+DEFAULT_TIMEFRAMES = list(TIMEFRAME_ORDER)
+SUPPORTED_TIMEFRAMES = frozenset(TIMEFRAME_ORDER)
 DEFAULT_START = "2020-01-01"
 CANONICAL_SYMBOLS = {
     "SP500": "US500",
@@ -225,8 +239,6 @@ def ensure_alias_copy(
     return alias_path
 
 
-VALID_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
-
 def download_symbol(
     *,
     requested_symbol: str,
@@ -251,12 +263,12 @@ def download_symbol(
     )
     source_path = build_dataset_path(canonical_dir, "1m.parquet")
     requested_timeframes = sorted(set(timeframes), key=_timeframe_sort_key)
-    known_timeframes = [tf for tf in requested_timeframes if tf in VALID_TIMEFRAMES]
+    known_timeframes = [tf for tf in requested_timeframes if tf in SUPPORTED_TIMEFRAMES]
     higher_timeframes = [tf for tf in known_timeframes if tf != "1m"]
     timeframe_errors: dict[str, str] = {
-        tf: f"unsupported timeframe {tf!r}. Valid: {sorted(VALID_TIMEFRAMES)}"
+        tf: f"unsupported timeframe {tf!r}. Valid: {sorted(SUPPORTED_TIMEFRAMES)}"
         for tf in requested_timeframes
-        if tf not in VALID_TIMEFRAMES
+        if tf not in SUPPORTED_TIMEFRAMES
     }
 
     started_at = datetime.now(timezone.utc).isoformat()
