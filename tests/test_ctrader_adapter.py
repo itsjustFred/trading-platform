@@ -891,3 +891,76 @@ def test_a_new_connection_cannot_inherit_authentication_from_the_previous_one() 
         "the already-logged-in notice is per-connection too; a new session should "
         "be free to log the fact again"
     )
+
+
+def test_a_blanked_ctrader_demo_value_is_refused_rather_than_defaulted(monkeypatch) -> None:
+    """An empty `CTRADER_DEMO` means someone blanked it, not that it was never set.
+
+    `live_runner/credential_env.resolve_env_value` is explicit about this: a key
+    defined in `.accounts.env` wins "even when its value is empty
+    (present-but-empty stays empty)". Preserving that distinction is the whole
+    point of the function, and it is what lets an operator blank a value on purpose.
+
+    The adapter then discarded it with `resolve_env_value(...) or None`, which turns
+    every falsy value into "absent" and hands the parser a `None` - so the strict
+    parse never sees the empty string and the default is applied instead. The other
+    two readers of the same variable disagree: `preflight` and `daemon` pass the
+    value through and both raise on `''`.
+
+    The consequences are not hypothetical. An operator who blanks `CTRADER_DEMO`
+    gets a preflight that refuses to start and an adapter that would quietly
+    connect as demo. The adapter is the thing that opens the connection, so it is
+    the one whose opinion counts - and the divergence sits one token away from the
+    worst outcome in this codebase: change `default=True` to `default=False` and
+    the same empty value selects *live* trading, silently, with no error anywhere.
+
+    So the empty value has to reach the parser, which rejects it.
+    """
+    monkeypatch.delenv("CTRADER_DEMO", raising=False)
+    env_values = {"CTRADER_DEMO": ""}
+
+    with pytest.raises(ValueError) as excinfo:
+        CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="1",
+            env_values=env_values,
+        )
+    assert "CTRADER_DEMO" in str(excinfo.value), (
+        f"the refusal did not name the variable: {excinfo.value}"
+    )
+
+
+def test_an_absent_ctrader_demo_still_defaults_to_demo(monkeypatch) -> None:
+    """The default must survive: only a *present* empty value is an error.
+
+    Distinguishing "blanked" from "never set" is the entire point, so the fix has to
+    refuse the first without breaking the second.
+    """
+    monkeypatch.delenv("CTRADER_DEMO", raising=False)
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="1",
+        env_values={},
+    )
+    assert adapter.demo is True
+
+
+def test_an_explicit_demo_argument_still_wins_over_the_environment(monkeypatch) -> None:
+    """A caller that passed `demo=` has already decided, blanks included.
+
+    Guarding the fallback must not start second-guessing an explicit argument.
+    """
+    monkeypatch.delenv("CTRADER_DEMO", raising=False)
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="1",
+        demo=False,
+        env_values={"CTRADER_DEMO": ""},
+    )
+    assert adapter.demo is False

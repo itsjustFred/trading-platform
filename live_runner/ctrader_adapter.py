@@ -496,9 +496,23 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
+        # Presence is checked separately from the value on purpose.
+        # `resolve_env_value` returns "" both for a key that is absent and for one an
+        # operator deliberately blanked, and it is built to keep those two apart -
+        # "present-but-empty stays empty". Passing its result through `or None`
+        # collapsed the blanked case into "absent", so the strict parse never saw the
+        # empty string and applied the default instead. preflight and daemon both
+        # refuse on `CTRADER_DEMO=""`; this is the reader that opens the connection,
+        # and with `default=False` the same blank would have selected live trading
+        # silently. So: absent means the default, present-but-blank is an error.
+        demo_configured = (env_values is not None and "CTRADER_DEMO" in env_values) or (
+            "CTRADER_DEMO" in os.environ
+        )
         self.demo = (
             _parse_bool_env(
-                "CTRADER_DEMO", resolve_env_value(env_values, "CTRADER_DEMO") or None, default=True
+                "CTRADER_DEMO",
+                resolve_env_value(env_values, "CTRADER_DEMO") if demo_configured else None,
+                default=True,
             )
             if demo is None
             else demo
