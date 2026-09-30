@@ -67,8 +67,65 @@ _TABLE_CONST = "PERCENT_METRIC_SCALES_BY_PAYLOAD"
 _ENTRY = "fraction|points|not-applicable"
 
 
+def _strip_ts_comments(source: str) -> str:
+    """Drop `//` and block comments from TypeScript source, keeping string contents.
+
+    A comment is not code, but nothing about a substring or regex over raw source tells it
+    apart from one - and this file's whole job is to assert the TypeScript table and the
+    Python model agree.
+
+    Measured: commenting out every entry of the real `PERCENT_METRIC_KEYS` array, and
+    re-declaring the same seven keys inside the `// ` comment block, left this file
+    **9 passed**. The frontend would have had an *empty* percent-metric key list - no
+    metric scaled as a percentage - with the cross-language contract green.
+
+    Hand-written rather than a regex, because `//` occurs inside string literals - every
+    URL - and a regex strip would eat a line holding `https://`. Regex literals are *not*
+    tracked: a `/` followed by a `/` inside one would be read as a comment start. The file
+    this is applied to was checked for a regex literal containing `//` and there is none;
+    the limitation is recorded here rather than left as a surprise for whoever adds one.
+    """
+    quotes = {"'", '"', "`"}
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if quote is not None:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in quotes:
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            i += 2
+            while i < n and not (source[i] == "*" and i + 1 < n and source[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _ts_text() -> str:
-    return METRIC_SCALE_TS.read_text(encoding="utf-8")
+    """The metricScale table with comments removed - see `_strip_ts_comments`."""
+    return _strip_ts_comments(METRIC_SCALE_TS.read_text(encoding="utf-8"))
 
 
 def _string_array(const_name: str) -> list[str]:
