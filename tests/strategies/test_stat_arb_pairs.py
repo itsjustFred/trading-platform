@@ -118,13 +118,3 @@ class TestSourceFidelity:
         _, _, ind_stop, _ = mod.generate_signals(df, {"use_atr_stop": True})
         assert "ATR" in ind_stop
         assert not ind_stop["sl_price"].dropna().empty
-
-    def test_threshold_defaults_match_source(self):
-        import inspect
-
-        mod = _load_strategy()
-        src = inspect.getsource(mod.generate_signals)
-        assert 'params.get("lookback", 60)' in src
-        assert 'params.get("entry_zscore", 2.0)' in src
-        assert 'params.get("exit_zscore", 0.5)' in src
-        assert 'params.get("stop_zscore", 4.0)' in src

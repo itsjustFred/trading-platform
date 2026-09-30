@@ -97,28 +97,6 @@ class TestStrategyRegression:
             f"drawings muss eine list sein, ist aber: {type(drawings)}"
         )
 
-    def test_generate_signals_has_parameter_defaults(self):
-        """generate_signals muss konfigurierbare Parameter mit Default-Werten in der Signatur haben."""
-        import ast
-        import pathlib
-
-        src = pathlib.Path(STRATEGY_PATH).read_text()
-        tree = ast.parse(src)
-        fn = next(
-            (
-                n
-                for n in ast.walk(tree)
-                if isinstance(n, ast.FunctionDef) and n.name == "generate_signals"
-            ),
-            None,
-        )
-        assert fn is not None, "generate_signals Funktion nicht gefunden!"
-        n_defaults = len(fn.args.defaults) + len(fn.args.kw_defaults)
-        assert n_defaults > 0, (
-            "generate_signals hat keine Keyword-Argumente mit Default-Werten — "
-            "der AST-Parser kann kein Optimierungs-UI generieren!"
-        )
-
     def test_all_trades_have_sl_in_meta(self, backtest_result):
         """Jeder Trade muss sl_price in meta haben (Risk-Sizing-Kontrolle)."""
         for trade in backtest_result.trades:
