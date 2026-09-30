@@ -1303,15 +1303,34 @@ async def _cancel_stockkit_buy_order(
     buy_order_id: str,
     details: dict[str, Any],
 ) -> None:
+    """Cancel a buy order left open by a failed check, and record what happened.
+
+    The sibling `_cancel_unfilled_alpaca_order` returns `buy_order_cancelled` or
+    `cancel_failed:<Type>` rather than discarding the error, and this path did not.
+    A cancel that failed here left a possibly-open position with nothing in the
+    report to say so - and `remaining_qty` is initialised to `None`, so a position
+    that could not be read was indistinguishable from a clean zero.
+
+    The check's verdict is already `failed` for the original reason, so this does
+    not change pass/fail. It changes what the report is allowed to imply: the
+    residue of a failure is the part an operator needs, and it was the part being
+    dropped.
+    """
     try:
         await asyncio.to_thread(adapter._trading_client.cancel_order_by_id, buy_order_id)
-    except Exception:
-        pass
+        details["cancel_status"] = "buy_order_cancelled"
+    except Exception as cancel_exc:
+        details["cancel_status"] = f"cancel_failed:{type(cancel_exc).__name__}"
+
     try:
-        remaining = _position_qty_for_symbol(await adapter.get_positions(), symbol)
-        details["remaining_qty"] = remaining
-    except Exception:
-        pass
+        details["remaining_qty"] = _position_qty_for_symbol(
+            await adapter.get_positions(), symbol
+        )
+        details["position_known"] = True
+    except Exception as position_exc:
+        details["remaining_qty"] = None
+        details["position_known"] = False
+        details["position_error"] = type(position_exc).__name__
 
 
 async def _alpaca_stockkit_e2e(
