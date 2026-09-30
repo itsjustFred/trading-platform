@@ -88,3 +88,21 @@ Ein parametrierter Test in `tests/test_risk_consistency.py` sollte folgende Fäl
 1. Identische Inputs → identische Outputs zwischen `engine.size_*` und `live.size_*`
 2. Strikter Stop-Direction Check wird im Live-Pfad erzwungen
 3. ATR-basierter Fallback wird in beiden Pfaden gleich berechnet
+
+Alle drei sind abgedeckt (Stand 2026-09-30). Fall 3 war die letzte Lücke: der Test
+verglich nur die `RiskConfig`-Defaults und lief nie mit einem Signal ohne Stop durch
+beide Pfade. Jetzt wird ein stop-loser Pfad über eine Matrix aus `buy`/`sell` und
+ATR vorhanden/fehlend geschickt, und **der erwartete Stop wird explizit geprüft** —
+nur ein Vergleich der Pfade miteinander wäre auch erfüllt, wenn in beiden der
+ATR-Zweig tot wäre und beide auf den Prozent-Fallback zurückfielen.
+
+Der Erwartungswert ist dabei nicht redundant: er ist das, was den Fall von
+"gleiche Defaults" zu "gleicher berechneter Fallback" macht. Zusätzlich geprüft wird
+die Verweigerungs-Parität: ein unbrauchbarer ATR (0, negativ, NaN, inf, nicht
+parsebar) muss in **beiden** Pfaden ablehnen. Ein Pfad, der heilen würde, würde
+gegen eine nie meaningful Stop-Distanz size'n.
+
+Eine Asymmetrie, die dabei auffiel: `TradeSignal.action` akzeptiert
+`buy`/`sell`/`long`/`short`, `LiveSignal.action` nur `buy`/`sell`. Die Matrix bleibt
+in der Schnittmenge — eine long/short-Schreibweise, die der Backtest-Pfad akzeptiert,
+kann den Live-Pfad gar nicht erst erreichen.
