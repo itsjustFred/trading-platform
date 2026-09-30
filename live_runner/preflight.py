@@ -98,53 +98,55 @@ def _resolve_ctrader_credentials(
     return app_id, app_secret, access_token, refresh_token, demo
 
 
-def _run_tradeable_symbol_check(adapter: object) -> set[str]:
-    """Ask the broker which instruments this account can trade.
-
-    The adapter has already been disconnected by the connectivity check, so
-    this is a second short round-trip rather than a free read. That is why it
-    is only attempted after the account proved it connects, and why a failure
-    reports "not checked" instead of guessing.
-    """
-
-    async def _read() -> set[str]:
-        try:
-            return await adapter.tradeable_symbol_names()
-        finally:
-            with contextlib.suppress(Exception):
-                await adapter.disconnect()
-
-    return asyncio.run(_read())
-
-
 def _run_broker_connectivity_check(
     adapter: AlpacaLiveAdapter | CTraderLiveAdapter,
     *,
     broker_label: str,
     errors: list[str],
-) -> tuple[bool, float | None, float | None, int | None]:
+    warnings: list[str] | None = None,
+) -> tuple[bool, float | None, float | None, int | None, set[str] | None]:
+    """Connect once, read everything the preflight needs, then disconnect.
+
+    The tradeable-symbol read used to be a second `asyncio.run` *after* the
+    connectivity check had already disconnected, so each account cost a second
+    connect/disconnect round-trip and the same broker client was driven from two
+    different event loops. Reading it here, before the `finally` disconnects, reuses
+    the connection that was just proven and the loop that was just used.
+
+    The symbol read stays best-effort: it is wrapped separately so that an unreadable
+    symbol list reports a warning and leaves the result as None ("not checked") rather
+    than failing a preflight that already established the account connects.
+    """
     connected = False
     balance: float | None = None
     equity: float | None = None
     positions_count: int | None = None
+    tradeable: set[str] | None = None
 
-    async def _check() -> tuple[float | None, float | None, int]:
-        nonlocal connected
+    async def _check() -> tuple[float | None, float | None, int, set[str] | None]:
+        nonlocal connected, tradeable
         try:
             await adapter.connect()
             fetched_balance, fetched_equity = await adapter.get_balance()
             positions = await adapter.get_positions()
             connected = True
-            return fetched_balance, fetched_equity, len(positions)
+            try:
+                tradeable = set(await adapter.tradeable_symbol_names())
+            except Exception as exc:
+                if warnings is not None:
+                    warnings.append(
+                        f"Could not read the account's tradeable symbol list: {exc!r}"
+                    )
+            return fetched_balance, fetched_equity, len(positions), tradeable
         finally:
             with contextlib.suppress(Exception):
                 await adapter.disconnect()
 
     try:
-        balance, equity, positions_count = asyncio.run(_check())
+        balance, equity, positions_count, tradeable = asyncio.run(_check())
     except Exception as exc:
         errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
-    return connected, balance, equity, positions_count
+    return connected, balance, equity, positions_count, tradeable
 
 
 def _preflight_alpaca_account(
@@ -181,7 +183,13 @@ def _preflight_alpaca_account(
                 paper=paper,
                 account_id=account.id,
             )
-            connected, balance, equity, positions_count = _run_broker_connectivity_check(
+            (
+                connected,
+                balance,
+                equity,
+                positions_count,
+                _tradeable_symbols,
+            ) = _run_broker_connectivity_check(
                 adapter,
                 broker_label="Alpaca",
                 errors=errors,
@@ -265,22 +273,22 @@ def _preflight_ctrader_account(
             account_config_id=account.id,
             accounts_env_path=accounts_env_path,
         )
-        connected, balance, equity, positions_count = _run_broker_connectivity_check(
+        (
+            connected,
+            balance,
+            equity,
+            positions_count,
+            tradeable_symbols,
+        ) = _run_broker_connectivity_check(
             adapter,
             broker_label="cTrader",
             errors=errors,
+            warnings=warnings,
         )
-        if connected:
-            try:
-                tradeable_symbols = _run_tradeable_symbol_check(adapter)
-            except Exception as exc:
-                # Best effort on purpose: an unreadable symbols list must not
-                # fail a preflight that already proved the account connects.
-                # None is carried through as "not checked", so the deployment
-                # check below stays quiet rather than guessing.
-                warnings.append(
-                    f"Could not read the account's tradeable symbol list: {exc!r}"
-                )
+        # Best effort on purpose, and handled inside the check: an unreadable symbols
+        # list must not fail a preflight that already proved the account connects.
+        # None is carried through as "not checked", so the deployment check below
+        # stays quiet rather than guessing.
     return (
         demo,
         connected,

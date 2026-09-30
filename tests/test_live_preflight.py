@@ -367,3 +367,86 @@ def test_live_preflight_threads_accounts_env_path_to_ctrader_adapter(
     # The default .accounts.env must be untouched.
     default_after = default_path.read_text(encoding="utf-8") if default_path.exists() else None
     assert default_after == default_before
+
+
+class _CountingAdapter:
+    """Records how many times each broker call happened, in order."""
+
+    def __init__(self, *, symbols_error: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self.connected = False
+        self._symbols_error = symbols_error
+
+    async def connect(self) -> None:
+        self.calls.append("connect")
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.calls.append("disconnect")
+        self.connected = False
+
+    async def get_balance(self):
+        self.calls.append("get_balance")
+        return 100000.0, 100000.0
+
+    async def get_positions(self):
+        self.calls.append("get_positions")
+        return []
+
+    async def tradeable_symbol_names(self):
+        self.calls.append("tradeable_symbol_names")
+        if self._symbols_error is not None:
+            raise self._symbols_error
+        return ["AAPL", "MSFT"]
+
+
+def test_the_tradeable_symbol_read_reuses_the_connected_client() -> None:
+    """One connect per account, not two, and on the same event loop.
+
+    The symbol read used to run as a second `asyncio.run` after the connectivity
+    check had already disconnected, so every account cost a second connect/disconnect
+    round-trip and the same broker client was driven from two different event loops -
+    which for a client holding sockets and timers is not merely wasteful.
+    """
+    from live_runner.preflight import _run_broker_connectivity_check
+
+    adapter = _CountingAdapter()
+    errors: list[str] = []
+    connected, _balance, _equity, _positions, symbols = _run_broker_connectivity_check(
+        adapter, broker_label="Alpaca", errors=errors
+    )
+
+    assert connected is True
+    assert symbols == {"AAPL", "MSFT"}
+    assert errors == []
+    assert adapter.calls.count("connect") == 1, (
+        f"the account was connected more than once: {adapter.calls}"
+    )
+    assert adapter.calls.count("disconnect") == 1
+    assert adapter.calls.index("tradeable_symbol_names") < adapter.calls.index("disconnect"), (
+        "the symbol read must happen on the open connection, not after it closes: "
+        f"{adapter.calls}"
+    )
+
+
+def test_an_unreadable_symbol_list_warns_without_failing_connectivity() -> None:
+    """Best effort, preserved: the account connected, so the preflight must not fail.
+
+    A symbol list the broker will not hand over is "not checked" - None, plus a
+    warning - rather than a failed preflight. Failing here would turn an
+    informational read into a blocker on an account that demonstrably works.
+    """
+    from live_runner.preflight import _run_broker_connectivity_check
+
+    adapter = _CountingAdapter(symbols_error=RuntimeError("symbols unavailable"))
+    errors: list[str] = []
+    warnings: list[str] = []
+    connected, _balance, _equity, _positions, symbols = _run_broker_connectivity_check(
+        adapter, broker_label="cTrader", errors=errors, warnings=warnings
+    )
+
+    assert connected is True, "connectivity was proven; it must not be undone by a symbols read"
+    assert errors == [], f"an unreadable symbol list must not be an error: {errors}"
+    assert symbols is None, "None means 'not checked', not an empty tradeable set"
+    assert len(warnings) == 1 and "tradeable symbol list" in warnings[0]
+    assert adapter.calls.count("connect") == 1
