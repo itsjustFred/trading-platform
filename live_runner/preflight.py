@@ -130,13 +130,29 @@ def _run_broker_connectivity_check(
             fetched_balance, fetched_equity = await adapter.get_balance()
             positions = await adapter.get_positions()
             connected = True
-            try:
-                tradeable = set(await adapter.tradeable_symbol_names())
-            except Exception as exc:
+            # Only cTrader has a *per-account* tradeable-symbol list, so only
+            # cTrader defines the method. Calling it unconditionally meant every
+            # Alpaca preflight raised AttributeError here - and because the Alpaca
+            # caller passes no `warnings` list, that error was discarded and the
+            # result stayed None with nothing recorded. A guaranteed failure that
+            # reports nothing is worse than not attempting the read, and it made
+            # the docstring's "leaves the result as None" claim true by accident
+            # rather than by design.
+            symbol_reader = getattr(adapter, "tradeable_symbol_names", None)
+            if symbol_reader is None:
                 if warnings is not None:
                     warnings.append(
-                        f"Could not read the account's tradeable symbol list: {exc!r}"
+                        f"{adapter.__class__.__name__} does not expose a per-account "
+                        "tradeable symbol list; symbols were not checked"
                     )
+            else:
+                try:
+                    tradeable = set(await symbol_reader())
+                except Exception as exc:
+                    if warnings is not None:
+                        warnings.append(
+                            f"Could not read the account's tradeable symbol list: {exc!r}"
+                        )
             return fetched_balance, fetched_equity, len(positions), tradeable
         finally:
             with contextlib.suppress(Exception):

@@ -450,3 +450,96 @@ def test_an_unreadable_symbol_list_warns_without_failing_connectivity() -> None:
     assert symbols is None, "None means 'not checked', not an empty tradeable set"
     assert len(warnings) == 1 and "tradeable symbol list" in warnings[0]
     assert adapter.calls.count("connect") == 1
+
+
+def test_a_broker_without_a_symbol_list_is_reported_not_silently_swallowed():
+    """Only cTrader has a per-account tradeable list; Alpaca has no such method.
+
+    The read was called unconditionally, so every Alpaca preflight raised
+    `AttributeError` at that line - and because the Alpaca caller passes no
+    `warnings` list, the error was discarded and the result stayed None with
+    nothing recorded anywhere. A guaranteed failure that reports nothing is worse
+    than not attempting the read: it made the docstring's "leaves the result as
+    None" true by accident, and it would have hidden a real failure if Alpaca ever
+    grew the method and it started erroring.
+
+    So the result must be None *and* the reason recorded, whenever a caller is
+    collecting warnings.
+    """
+
+    from live_runner import preflight
+
+    class _NoSymbolListAdapter:
+        """Everything the connectivity check needs, and nothing more."""
+
+        def __init__(self):
+            self.connected = False
+            self.disconnected = False
+
+        async def connect(self):
+            self.connected = True
+
+        async def get_balance(self):
+            return 1000.0, 1000.0
+
+        async def get_positions(self):
+            return []
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    adapter = _NoSymbolListAdapter()
+    warnings: list[str] = []
+
+    connected, balance, equity, positions, tradeable = (
+        preflight._run_broker_connectivity_check(
+            adapter, broker_label="Test", errors=[], warnings=warnings
+        )
+    )
+
+    assert connected is True
+    assert tradeable is None, "an unchecked list must stay None, never an empty set"
+    assert warnings, (
+        "an adapter with no symbol-list method was skipped in silence; the "
+        "operator cannot tell 'not checked' from 'checked and empty'"
+    )
+    assert any("tradeable symbol list" in w for w in warnings), warnings
+    assert adapter.connected and adapter.disconnected, (
+        "the read must not disturb the single connect/disconnect round-trip"
+    )
+
+
+def test_a_symbol_list_failure_is_warned_and_leaves_the_result_unchecked():
+    """The best-effort contract: a failing read warns, and claims nothing."""
+
+    from live_runner import preflight
+
+    class _FailingSymbolAdapter:
+        async def connect(self):
+            return None
+
+        async def get_balance(self):
+            return 1000.0, 1000.0
+
+        async def get_positions(self):
+            return []
+
+        async def tradeable_symbol_names(self):
+            raise RuntimeError("broker said no")
+
+        async def disconnect(self):
+            return None
+
+    warnings: list[str] = []
+    connected, _b, _e, _p, tradeable = (
+        preflight._run_broker_connectivity_check(
+            _FailingSymbolAdapter(),
+            broker_label="Test",
+            errors=[],
+            warnings=warnings,
+        )
+    )
+
+    assert connected is True, "a failed symbol read must not fail connectivity"
+    assert tradeable is None, "a failed read must leave the list unchecked, not empty"
+    assert any("broker said no" in w for w in warnings), warnings
