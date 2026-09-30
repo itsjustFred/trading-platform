@@ -377,9 +377,10 @@ def _deployment_with_signal_config(
     signal_config: dict[str, object],
     *,
     settings: dict[str, object] | None = None,
+    strategy_name: str = "fx_breakout",
 ) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
-        strategy_name="fx_breakout",
+        strategy_name=strategy_name,
         account_id="ctrader-demo",
         symbols=["EURUSD"],
         timeframe="15m",
@@ -514,20 +515,71 @@ def _signal_with_metadata(metadata: dict[str, object] | None = None):
     )
 
 
-def test_dispatch_drops_signal_when_matched_deployment_has_typo_bool(monkeypatch) -> None:
-    """A typo'd wait boolean drops the signal for the matched deployment. It must
-    NOT fall through to a sibling deployment on the same channel: that would leak
-    one strategy's signal into another strategy. Fail-closed beats fail-over."""
+def _patch_dispatch_guards(monkeypatch, wait_impl):
+    """Satisfy every guard `_dispatch_discord_trade_signal` checks *before* the
+    candle-wait branch these tests are about.
+
+    Without them `_deployment_is_currently_active` reads the real database, the
+    synthetic deployment has no row, it returns False, and the loop `continue`s
+    before the branch under test. Both tests here were in exactly that state: they
+    asserted on a submission list that could never be filled, so the branch they
+    named was dead code as far as the suite was concerned.
+
+    The stub signature matters too. The real call passes `trade_signal`
+    *positionally* (daemon.py:2031), so the keyword-only stub these tests used
+    would raise TypeError the moment that line ran - which is the proof it never
+    did.
+    """
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda d: True)
+    monkeypatch.setattr(
+        daemon, "_deployment_matches_stockkit_route", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        daemon, "_deployment_covers_discord_symbol", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        daemon, "_deployment_accepts_signal_author", lambda *a, **k: True
+    )
+    monkeypatch.setattr(daemon, "_deployment_trusted_author_ids", lambda d: {"a"})
+    monkeypatch.setattr(daemon, "_deployment_wait_for_candle_close", wait_impl)
+
+
+def test_dispatch_drops_only_the_misconfigured_deployment_on_a_typo_bool(
+    monkeypatch,
+) -> None:
+    """A typo'd wait boolean skips that deployment and no other.
+
+    This test asserted the *opposite* of the codebase's recorded decision, and only
+    passed because it never executed. Its docstring said the signal "must NOT fall
+    through to a sibling deployment on the same channel", while the code it names
+    carries a comment explaining that `return` there was a real bug: one deployment's
+    config typo silently stopped every *later* deployment on the channel, each still
+    reporting ACTIVE and connected. A sibling test 100 lines down asserts the correct
+    behaviour, with all four guards patched and a correctly-shaped stub.
+
+    So the fix is to make this test assert what the code is supposed to do: the
+    misconfigured deployment is skipped, its sibling still trades, and the typo never
+    becomes an immediate market order. Fail-closed without fail-over.
+    """
     submitted: list[str] = []
-    bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
+    bad = _deployment_with_signal_config(
+        {"wait_candle_close": "ture"}, strategy_name="typo_deployment"
+    )
     good = _deployment_with_signal_config(
         {"wait_candle_close": "true"},
         settings={"signal_processor": "other"},
+        strategy_name="healthy_deployment",
     )
 
-    async def _record_submit(
-        account_id, adapter, deployment, *, trade_signal, signal_timeframe, wait_enabled
-    ):
+    def _wait(deployment, _env):
+        if deployment.strategy_name == "typo_deployment":
+            raise ValueError("wait_for_candle_close must be a boolean")
+        return True
+
+    _patch_dispatch_guards(monkeypatch, _wait)
+
+    # Positional `_signal`, matching the real call site.
+    async def _record_submit(_account_id, _adapter, deployment, _signal, **_kwargs):
         submitted.append(deployment.strategy_name)
 
     monkeypatch.setattr(daemon, "_submit_normalized_discord_signal", _record_submit)
@@ -542,11 +594,20 @@ def test_dispatch_drops_signal_when_matched_deployment_has_typo_bool(monkeypatch
         )
     )
 
-    assert submitted == []
+    assert submitted == ["healthy_deployment"], (
+        f"expected only the healthy deployment to trade, got {submitted}. A config "
+        f"typo must skip its own deployment and must not stop the others - that was "
+        f"the bug `continue` was chosen over `return` to fix."
+    )
 
 
 def test_dispatch_typo_bool_does_not_raise_to_listener_loop(monkeypatch) -> None:
     bad = _deployment_with_signal_config({"wait_candle_close": "ture"})
+
+    def _wait(_deployment, _env):
+        raise ValueError("wait_for_candle_close must be a boolean")
+
+    _patch_dispatch_guards(monkeypatch, _wait)
 
     async def _fail_submit(*args, **kwargs):
         raise AssertionError("submission must never be attempted for a bad config")
