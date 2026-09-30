@@ -1391,3 +1391,44 @@ def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
         f"a four-day hole in FX must fail coverage, not warn: {report}"
     )
     assert report["gaps"], "the hole must still be reported, not merely fail silently"
+
+
+def test_unit_first_sub_daily_labels_are_not_sized_as_daily_bars():
+    """`s1` and `tick` are one second, and the fallback said one day.
+
+    The numeric-prefix pattern this function uses (`5m`, `4w`) cannot match a
+    label that puts the unit first, so `s1` and `tick` fell through to the `1.0`
+    daily fallback. That silently loosened their gap threshold from 1.0 to 3.0
+    days, and a two-day hole in tick data was reported as `ok` instead of as a
+    warning - a coverage report nobody should believe.
+
+    These are the repo's own labels, not hypotheticals: `KNOWN_TIMEFRAMES` in
+    `consolidate_parquets.py` and the viewer's timeframe list both spell them this
+    way, and the grid downloader names them in `UNSUPPORTED_TIMEFRAMES`.
+
+    The unparseable fallback is asserted too, because the fix must not turn a
+    genuinely unknown label into a permissive one - `nonsense` is still a day, and
+    that is the existing deliberate behaviour.
+    """
+    from data_tools.auto_download import (
+        scaled_gap_threshold_days,
+        timeframe_nominal_days,
+    )
+
+    one_second = 1.0 / 86_400.0
+    for label in ("s1", "tick", "S1", "TICK", " s1 "):
+        assert timeframe_nominal_days(label) == pytest.approx(one_second), (
+            f"{label!r} sized as {timeframe_nominal_days(label)} days; it is one second"
+        )
+        assert scaled_gap_threshold_days(label, 1) == 1.0, (
+            f"{label!r} got a {scaled_gap_threshold_days(label, 1)}-day threshold; "
+            f"a sub-daily series must not be allowed a multi-day hole"
+        )
+
+    # `1s` and `s1` are the same spacing expressed two ways, so they must agree.
+    assert timeframe_nominal_days("s1") == pytest.approx(timeframe_nominal_days("1s"))
+
+    # And the pre-existing fallback is untouched.
+    assert timeframe_nominal_days("nonsense") == 1.0
+    assert timeframe_nominal_days(None) == 1.0
+    assert timeframe_nominal_days("") == 1.0

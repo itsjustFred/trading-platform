@@ -32,10 +32,24 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 
 # Parent Decision Record (2026-08-31): coverage checks fail closed on
 # significant internal gaps. Small missing-bar windows may warn; larger gaps
-# fail. Defaults follow the thresholds proposed in the parent issue: an
-# internal hole longer than INTERNAL_GAP_FAIL_DAYS (3 calendar days) fails the
-# coverage check, a hole longer than INTERNAL_GAP_WARN_DAYS (1 calendar day)
-# warns, and anything shorter is tolerated (source downtime).
+# fail. The parent issue's figures are INTERNAL_GAP_FAIL_DAYS (3 calendar days)
+# and INTERNAL_GAP_WARN_DAYS (1 calendar day), and those remain the base.
+#
+# They are the base, not the whole rule. `scaled_gap_threshold_days` scales the
+# threshold by the timeframe's own bar spacing, because a flat 3-day budget flags
+# every bar of a weekly series as a hole and no weekly or monthly backtest could
+# pass the gate at all. What is actually applied:
+#
+#     1m .. 1d   3 days   (unchanged from the parent record)
+#     1w        21 days   (3 x the 7-day bar spacing)
+#     1mo       90 days   (3 x the 30-day bar spacing)
+#
+# A separate calendar-derived allowance covers scheduled closures; see
+# `_gap_is_market_closure` for why it only speaks for US equity venues. This
+# comment previously stated a flat 3 days for every timeframe, which was wrong for
+# 1w and 1mo by a factor of seven and thirty - anyone reasoning about the gate from
+# the comment rather than from `scaled_gap_threshold_days` would have modelled it
+# incorrectly.
 #
 # Thresholds deliberately count calendar days, not business days (the parent
 # record states the fail threshold in calendar days): a regular FX weekend
@@ -590,6 +604,14 @@ def long_weekend_gap_days() -> float:
 LONG_WEEKEND_GAP_DAYS = long_weekend_gap_days()
 
 
+#: Unit-first sub-daily labels, which the numeric-prefix pattern cannot express.
+#: Values are the nominal bar spacing in days.
+_SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS: dict[str, float] = {
+    "s1": 1.0 / 86_400.0,
+    "tick": 1.0 / 86_400.0,
+}
+
+
 def timeframe_nominal_days(timeframe: str | None) -> float:
     """Nominal calendar spacing of one bar in ``timeframe``.
 
@@ -598,6 +620,20 @@ def timeframe_nominal_days(timeframe: str | None) -> float:
     allowed hole against the wrong spacing.
     """
     normalized = str(timeframe or "").strip().lower()
+    # The repo's own sub-daily labels put the unit first, so the numeric-prefix regex
+    # below never matched them and they fell through to the `1.0` daily fallback -
+    # sizing `s1` and `tick` as *one day* when they are one second. That silently
+    # loosened their gap threshold 3x (1.0 -> 3.0 days), so a two-day hole in tick
+    # data was reported as `ok` rather than as a warning. These are real labels:
+    # `KNOWN_TIMEFRAMES` in consolidate_parquets and the viewer both spell them this
+    # way, and the grid downloader lists them by name in UNSUPPORTED_TIMEFRAMES.
+    #
+    # Not a backtest hazard on its own - `TIMEFRAME_MINUTES` has no entry for either,
+    # so `has_sufficient_segment_coverage` returns False and they cannot be traded -
+    # but a coverage report that says "ok" about a two-day hole is a report nobody
+    # should believe.
+    if normalized in _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS:
+        return _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS[normalized]
     match = re.match(r"^(\d+(?:\.\d+)?)\s*(mo|[a-z]+)$", normalized)
     if match is None:
         return 1.0
@@ -830,8 +866,13 @@ def find_internal_gaps(
     Coverage based on global min/max passes files that simply stop in the
     middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
     that belongs to the symbol: adjacent files (segmented/monthly storage) and
-    the bars inside one file. The largest hole longer than ``threshold_days``
-    (default: 1 calendar day) is reported — gaps are measured in calendar
+    the bars inside one file. Only holes longer than ``threshold_days``
+    (default: ``INTERNAL_GAP_WARN_DAYS``, 1 calendar day) is reported, and only
+    the **largest** one — so a caller gets a single actionable gap, but a
+    second, smaller hole in the same symbol directory is not surfaced and the
+    coverage verdict is computed from the largest alone. That is a known
+    limitation rather than an accident: removing it means returning every hole
+    above the threshold. — gaps are measured in calendar
     days, so a regular weekend (~2 days) is reported as a warning.
     """
     def _matches_timeframe(path: Path) -> bool:
