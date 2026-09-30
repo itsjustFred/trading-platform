@@ -60,11 +60,28 @@ STAT_ARB_DEFAULTS = {
 }
 
 
+# These strategies are **git-tracked files**. A missing or unimportable one is a
+# defect, not an environment condition - and this file originally called
+# `pytest.skip` in all three of these places, which is how six of its seven guards
+# could be made to vanish in silence. Measured: renaming
+# `strategies/stat_arb_pairs` away gave **6 skipped, 1 passed, exit 0**. The pass
+# count looked fine and six guards provided no evidence at all.
+#
+# So every one of these is a hard failure. This is the same defect this branch has
+# been closing all session - a check that stops being evidence without saying so -
+# found in code written to *fix* that defect, which is the part worth recording.
+STRATEGY_SOURCE_MISSING = (
+    "a git-tracked strategy source is missing or unimportable; these guards exist to "
+    "pin that source, so its absence is the failure they were written to report. "
+    "A skip here would make them pass by not running."
+)
+
+
 def _strategy_source(directory: Path) -> Path:
     """Resolve the strategy module inside a strategy directory."""
     matches = sorted(directory.glob("*.py"))
     if not matches:
-        pytest.skip(f"no strategy source under {directory}")
+        raise AssertionError(f"{STRATEGY_SOURCE_MISSING} No source under {directory}")
     preferred = directory / f"{directory.name}.py"
     if preferred in matches:
         return preferred
@@ -75,11 +92,11 @@ def _load_strategy(path: Path, module_name: str):
     if not path.exists():
         candidates = sorted(path.parent.glob(f"{path.stem}.py"))
         if not candidates:
-            pytest.skip(f"strategy source not found: {path}")
+            raise AssertionError(f"{STRATEGY_SOURCE_MISSING} Not found: {path}")
         path = candidates[0]
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        pytest.skip(f"strategy source is not importable: {path}")
+        raise AssertionError(f"{STRATEGY_SOURCE_MISSING} Not importable: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
