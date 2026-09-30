@@ -875,6 +875,53 @@ class TradeEngine:
             return None, None
         return resolve_ask_high_low(row, self._bar_spread(row))
 
+=======
+    def _record_bar_excursion(
+        self,
+        position: Position,
+        row: pd.Series,
+        *,
+        exit_price: float | None = None,
+    ) -> None:
+        """Record this bar's maximum favourable and adverse excursion.
+
+        `exit_price` clamps the bar to where the engine decided the position left.
+        It is supplied for stop and take-profit exits, and only those: their fill is
+        a level *inside* the bar, so movement past that level never belonged to the
+        position, and crediting it overstates MFE on a take-profit and MAE on a stop
+        - on exactly the trades where the exit determined the outcome.
+
+        A signal or time exit is deliberately not clamped. It fills at the bar's
+        close under Fill-zum-Trigger-Close, so the position existed for the whole bar
+        and the bar's range genuinely is its excursion; `test_trade_engine_mae_includes_
+        signal_exit_bar_excursion` pins that, and it is a decision rather than an
+        oversight. The clamp therefore follows the engine's own exit model: the price
+        passed in is the same fill the close uses, spread convention included, so
+        excursion and exit cannot disagree.
+        """
+        qty = float(position.remaining_qty)
+        if qty <= 0:
+            return
+        if position.direction == "LONG":
+            high = float(row["high"])
+            low = float(row["low"])
+            if exit_price is not None:
+                high = min(high, exit_price)
+                low = max(low, exit_price)
+            favorable = (high - position.entry_price) * qty
+            adverse = (low - position.entry_price) * qty
+        else:
+            ask_high, ask_low = self._ask_bar(row)
+            ref_high = ask_high if ask_high is not None else float(row["high"])
+            ref_low = ask_low if ask_low is not None else float(row["low"])
+            if exit_price is not None:
+                ref_high = min(ref_high, exit_price)
+                ref_low = max(ref_low, exit_price)
+            favorable = (position.entry_price - ref_low) * qty
+            adverse = (position.entry_price - ref_high) * qty
+        position.mfe = max(position.mfe, favorable)
+        position.mae = min(position.mae, adverse)
+
     def _check_stops(
         self,
         row: pd.Series,
@@ -940,6 +987,22 @@ class TradeEngine:
                 first_event = "stop"
             elif tp_hit:
                 first_event = "tp"
+
+            # The excursion for this bar is recorded once the exit event is known, so
+            # a stop or take-profit exit is credited only up to its own fill. A
+            # position that stays open (first_event is None) keeps full-bar recording.
+            excursion_exit_price: float | None = None
+            if first_event == "stop" and position.stop_loss is not None:
+                excursion_exit_price = float(position.stop_loss)
+                if position.direction != "LONG":
+                    excursion_exit_price += self._bar_spread(row)
+            elif first_event == "tp" and first_tp_price is not None:
+                excursion_exit_price = (
+                    first_tp_price + self._bar_spread(row)
+                    if position.direction != "LONG"
+                    else first_tp_price
+                )
+            self._record_bar_excursion(position, row, exit_price=excursion_exit_price)
 
             if first_event == "stop" and position.stop_loss is not None:
                 # D4 (Phase 3, A-M1 exit convention): the unified convention

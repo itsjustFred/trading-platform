@@ -590,3 +590,110 @@ class TestIssueC2ExposureMath:
             )
         )
         assert engine._current_risk_exposure(100.0) == pytest.approx(0.01)
+
+
+def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index: int = 20):
+    """One entry, and a single bar whose range sits well outside any exit level.
+
+    Bar 10 is wide (high 130, low 70) around an entry near 100. That separation is
+    the whole point: if an exit level coincided with a bar extreme, clamping and not
+    clamping would be indistinguishable.
+
+    Stop and take-profit travel on the signals frame - `entries`, `exits`,
+    `direction`, `stop_loss` - which is how the engine's own tests supply them. The
+    first attempt at this test put them in the strategy's third return value, which
+    is *params*, so no stop was ever set and the position signal-exited: a path that
+    is deliberately unclamped. The test passed the wrong way and reported a
+    full-bar MAE as if it were a bug in the clamp.
+    """
+    records = []
+    for index in range(25):
+        records.append(
+            {
+                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+                "open": 100.0,
+                "high": 130.0 if index == 10 else 101.0,
+                "low": 70.0 if index == 10 else 99.0,
+                "close": 100.0,
+                "volume": 1000,
+            }
+        )
+    data = pd.DataFrame.from_records(records)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        signals = pd.DataFrame(index=df.index)
+        signals["entries"] = False
+        signals["exits"] = False
+        signals["direction"] = "LONG"
+        signals["stop_loss"] = pd.NA
+        signals["take_profit"] = pd.NA
+        signals.loc[1, "entries"] = True
+        if stop is not None:
+            signals.loc[1, "stop_loss"] = stop
+        if take_profit is not None:
+            signals.loc[1, "take_profit"] = take_profit
+        else:
+            signals.loc[exit_index, "exits"] = True
+        return signals
+
+    cfg = BacktestConfig(
+        strategy_name=strategy_name,
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        modeling_resolution="main_timeframe",
+        parameters={"fees": "zero"},
+    )
+    return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
+
+
+def test_a_take_profit_exit_is_not_credited_with_the_bars_high():
+    """MFE stops at the fill, not at a price the position never held.
+
+    The bar's high is 130 and the position exits at a 120 take-profit. It never
+    traded above 120, so an MFE of 130 is fiction - and it is fiction on precisely
+    the trades that worked, which biases comparison toward whichever strategy
+    happened to exit inside a wide bar.
+    """
+    result = _wide_bar_run("tp-excursion", take_profit=120.0)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exits[-1].price == pytest.approx(120.0)
+    assert trade.mfe == pytest.approx(
+        (120.0 - trade.entry_price) * trade.quantity
+    ), f"MFE reached {trade.mfe}, beyond the 120.0 fill"
+
+
+def test_a_stop_exit_is_not_credited_with_the_bars_low():
+    """The mirror: MAE stops at the stop, not below it.
+
+    A stop-out closes at the stop level, so the loss taken is the stop distance.
+    Attributing the bar's low reports a loss larger than the one that occurred, on
+    exactly the trades that failed.
+    """
+    result = _wide_bar_run("stop-excursion", stop=90.0)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exits[-1].reason == "stop_loss"
+    assert trade.exits[-1].price == pytest.approx(90.0)
+    assert trade.mae == pytest.approx(
+        (90.0 - trade.entry_price) * trade.quantity
+    ), f"MAE reached {trade.mae}, beyond the 90.0 stop fill"
+
+
+def test_a_position_that_stays_open_keeps_full_bar_recording():
+    """The clamp is for exits only; a position held through the bar sees all of it."""
+    result = _wide_bar_run("open-excursion")
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.mfe == pytest.approx(
+        (130.0 - trade.entry_price) * trade.quantity
+    ), "a position held through the bar must still record the bar's high"
+    assert trade.mae == pytest.approx((70.0 - trade.entry_price) * trade.quantity)
