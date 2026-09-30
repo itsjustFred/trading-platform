@@ -12947,6 +12947,30 @@ async def delete_live_deployment_endpoint(
     pending_claims = await asyncio.to_thread(
         list_live_deployment_submission_claims, deployment_id
     )
+
+    # Close the claim gate *before* draining, not just delete afterwards.
+    # `claim_live_deployment_submission` only inserts a lease while the row reads
+    # ACTIVE, and DELETE never changed the status - so the gate was open for the
+    # whole drain. A dispatcher could claim, submit and release inside it, and the
+    # response then read DRAINED, complete, in_flight 0, with no warning key at all.
+    # That is the exact false assurance this drain was added to remove.
+    #
+    # PAUSE and STOP get this right by committing the status write first and
+    # draining second. Deleting straight from ACTIVE skipped that step, so the same
+    # ordering is reproduced here: snapshot, write a non-ACTIVE status, drain, then
+    # delete. The intermediate PAUSED is transient - the row is about to go - and it
+    # is the same status the status endpoint writes before its own drain.
+    try:
+        gated = await asyncio.to_thread(
+            update_live_deployment_status, deployment_id, "PAUSED"
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=_public_value_error_detail(exc)
+        ) from exc
+    if gated is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
     drain = await _drain_live_deployment_submissions(
         deployment_id, initial_claims=pending_claims
     )

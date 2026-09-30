@@ -6740,3 +6740,56 @@ def test_deleting_a_deployment_with_nothing_in_flight_reports_a_clean_drain(
         f"a clean delete warned anyway, which trains operators to ignore the "
         f"field that matters: {body}"
     )
+
+
+def test_deleting_a_deployment_closes_the_claim_gate_before_draining(
+    viewer_client, isolated_db, monkeypatch
+):
+    """A drain with the gate still open can report a clean bill of health.
+
+    `claim_live_deployment_submission` only takes a lease while the row reads
+    ACTIVE. PAUSE and STOP commit their status write *first* and drain second, so
+    no new claim can appear during the drain. DELETE went straight from ACTIVE to
+    deleted, leaving the gate open for the whole drain: a dispatcher could claim,
+    submit and release inside that window, and the response then read DRAINED,
+    complete, zero in flight, with no warning key at all - the exact false
+    assurance the drain was added to remove.
+
+    Asserted by having a claim taken *during* the drain, which is only possible
+    while the row still reads ACTIVE.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    claims_taken_during_drain: list[str] = []
+    real_drain = viewer_app_module._drain_live_deployment_submissions
+
+    async def _drain_and_try_to_claim(target_deployment_id, **_kwargs):
+        # Exactly what a dispatcher does while the endpoint waits: take a lease
+        # and submit. If the row is still ACTIVE this succeeds.
+        took = database.claim_live_deployment_submission(
+            target_deployment_id, "tok-during-drain", ttl_seconds=30.0
+        )
+        claims_taken_during_drain.append(str(took))
+        return await real_drain(target_deployment_id, timeout_seconds=0.2)
+
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _drain_and_try_to_claim
+    )
+
+    resp = viewer_client.delete(
+        f"/api/live/deployments/{deployment_id}"
+        f"?confirm_deployment_id={deployment_id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert claims_taken_during_drain == ["False"], (
+        "a new submission claim was taken while the delete was draining. The row "
+        "must be made non-ACTIVE before the drain, or an order can be submitted "
+        "after the operator was told the deployment was deleted."
+    )
+    assert database.get_live_deployment(deployment_id) is None
