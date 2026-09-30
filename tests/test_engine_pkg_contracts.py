@@ -107,7 +107,11 @@ def test_engine_shim_exposes_package_public_surface():
     imports and re-exports are intentionally not shimmed.
     """
     missing = []
-    for module_info in pkgutil.iter_modules(engine_pkg.__path__):
+    # `walk_packages`, not `iter_modules`: the latter is non-recursive, so a
+    # subpackage added later would be missed in silence. The engine package has no
+    # subpackages today, so this changes nothing now and removes a way for it to
+    # become wrong - the same non-recursive-glob shape fixed in df64c93 and 49260b6.
+    for module_info in pkgutil.walk_packages(engine_pkg.__path__):
         if module_info.name.startswith("_"):
             continue
         module = importlib.import_module(f"runner.engine_pkg.{module_info.name}")
