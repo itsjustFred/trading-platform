@@ -951,12 +951,45 @@ async def _metadata_for_exit_only_order(
 
 
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
+    """Count open broker positions, counting anything unreadable as open.
+
+    This count *is* a risk limit: it becomes `current_positions` and, multiplied by
+    `max_risk_per_trade`, `current_exposure` in `submit_order_with_risk`. So a
+    quantity this function cannot read must not read as zero.
+
+    It used to: `except (TypeError, ValueError): position_qty = 0.0`, and NaN failed
+    the `abs(qty) > 0` comparison the same way. Measured, every one of these counted
+    as **flat**: a non-numeric string, `None`, `""`, `"NaN"` and a real float NaN. One
+    unreadable row among several therefore under-reported both `max_positions` and
+    `max_total_exposure`, and the engine sized the next entry as though the account
+    had room it did not have.
+
+    The asymmetry that gave it away is inside this same module: the exit-only path
+    uses `_coerce_live_float`, which raises on exactly these values rather than
+    defaulting. Two readers of the same broker payload, one refusing and one
+    assuming flat.
+
+    Counting unreadable as open is the fail-closed direction: it blocks a new entry
+    rather than permitting one, and it is visible - the count is returned to the
+    caller and logged. Refusing outright was rejected because a single malformed
+    row from one broker payload would stop the deployment trading entirely, which is
+    a bigger failure than the one being prevented.
+    """
     open_positions_count = 0
     for position in positions:
+        raw = position.get("qty")
         try:
-            position_qty = float(position.get("qty") or 0.0)
+            position_qty = float(raw)
         except (TypeError, ValueError):
-            position_qty = 0.0
+            position_qty = None
+        if position_qty is None or not math.isfinite(position_qty):
+            open_positions_count += 1
+            logger.warning(
+                "Broker position has an unreadable quantity; counting it as open so "
+                "the risk limits cannot be under-reported",
+                extra={"data": {"qty": repr(raw)}},
+            )
+            continue
         if abs(position_qty) > 0:
             open_positions_count += 1
     return open_positions_count

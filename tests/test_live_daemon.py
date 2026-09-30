@@ -3212,3 +3212,61 @@ def test_every_task_the_daemon_starts_is_actually_cancelled_when_it_crashes(monk
             f"{name} finished some other way. A loop that was told to stop must "
             "be cancelled, not left to complete on its own schedule"
         )
+
+
+def test_an_unreadable_position_quantity_counts_as_open_not_as_flat() -> None:
+    """This count is a risk limit, so an unreadable row must not read as zero.
+
+    `_count_open_broker_positions` becomes `current_positions`, and multiplied by
+    `max_risk_per_trade` becomes `current_exposure`, in `submit_order_with_risk`. It
+    used to do `except (TypeError, ValueError): position_qty = 0.0`, and NaN failed
+    the `abs(qty) > 0` comparison the same way. So a non-numeric string, `None`,
+    `""`, `"NaN"` and a real NaN each counted as **flat**, and one unreadable row
+    among several under-reported both `max_positions` and `max_total_exposure` — the
+    engine then sized the next entry as if the account had room it did not.
+
+    The asymmetry that gave it away is in this same module: the exit-only path uses
+    `_coerce_live_float`, which raises on exactly these values rather than
+    defaulting. Two readers of one broker payload, one refusing and one assuming flat.
+
+    Counting them as open is the fail-closed direction: it blocks an entry rather
+    than permitting one. Refusing outright was rejected because one malformed row
+    would stop the deployment trading entirely, which is a worse failure than the
+    one being prevented.
+    """
+    for bad in ("abc", None, "", "NaN", float("nan"), float("inf"), "1e400", "not-a-number"):
+        assert daemon._count_open_broker_positions([{"qty": bad}]) == 1, (
+            f"qty={bad!r} counted as flat, so the risk limits were under-reported "
+            f"by one open position"
+        )
+
+    # The ordinary cases must be untouched, or the guard is just noise.
+    assert daemon._count_open_broker_positions([{"qty": "10"}]) == 1
+    assert daemon._count_open_broker_positions([{"qty": 10.0}]) == 1
+    assert daemon._count_open_broker_positions([{"qty": "-3"}]) == 1
+    assert daemon._count_open_broker_positions([{"qty": "0"}]) == 0
+    assert daemon._count_open_broker_positions([{"qty": 0}]) == 0
+    assert daemon._count_open_broker_positions([{"qty": 0.0}]) == 0
+
+    # A mixed list counts the readable ones and the unreadable one alike.
+    assert (
+        daemon._count_open_broker_positions(
+            [{"qty": "5"}, {"qty": "0"}, {"qty": "junk"}, {"qty": "2"}]
+        )
+        == 3
+    ), "an unreadable row among several must not be dropped from the count"
+
+
+def test_an_unreadable_quantity_is_logged_rather_than_silently_assumed_flat(
+    caplog,
+) -> None:
+    """A silent default is how this hid. The fallback has to be visible."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="live-runner"):
+        daemon._count_open_broker_positions([{"qty": "junk"}])
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("unreadable quantity" in message for message in messages), (
+        f"an unreadable quantity was substituted without a word: {messages}"
+    )
