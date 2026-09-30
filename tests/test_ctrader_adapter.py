@@ -845,3 +845,49 @@ def test_get_balance_marks_terminal_auth_failure_for_not_authorized() -> None:
 
     assert adapter._terminal_auth_failure_code == "TRADING_ACCOUNT_IS_NOT_AUTHORIZED"
     assert "not authorized" in adapter._terminal_auth_failure_reason.lower()
+
+
+def test_a_new_connection_cannot_inherit_authentication_from_the_previous_one() -> None:
+    """A connect event means a socket that has not been authenticated yet.
+
+    `_on_disconnected` clears `_authenticated`, and `_teardown_client` clears it
+    too, so the ordinary paths leave nothing stale. What neither covers is a
+    transport that reports a fresh connection on the same client without a
+    disconnect in between - an internal reconnect, or a dropped event.
+
+    That case matters because of what `_authenticate` does with the flag:
+
+        if self._authenticated and self._symbol_name_to_id:
+            return
+
+    A stale True plus a populated symbol cache returns before any authentication
+    request is sent. The adapter would then satisfy every `if not self._connected
+    or not self._authenticated` gate - a dozen of them, including the order paths -
+    on a connection the broker never authenticated.
+
+    The fix belongs in `_on_connected` rather than in the callers: establishing a
+    connection and being authenticated on it are separate facts, and a connect
+    callback is the only place that learns the first one has just become true.
+    """
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    client = object()
+    adapter._client = client
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._already_logged_in_notified = True
+
+    adapter._on_connected(client)
+
+    assert adapter._connected is True, "the connection is real; only the auth state is stale"
+    assert adapter._authenticated is False, (
+        "a new connection must not inherit authentication from the previous one - "
+        "_authenticate returns early on a stale True, so every downstream gate "
+        "would pass on a socket the broker never authenticated"
+    )
+    assert adapter._already_logged_in_notified is False, (
+        "the already-logged-in notice is per-connection too; a new session should "
+        "be free to log the fact again"
+    )

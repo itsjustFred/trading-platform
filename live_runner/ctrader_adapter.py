@@ -793,6 +793,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _on_connected(self, client: Any) -> None:
         if client is not self._client:
             return
+        # A connect event describes a socket that has not been authenticated yet, so
+        # the per-connection auth state starts clean here. Disconnect and teardown
+        # both clear these flags already; what neither covers is a transport that
+        # reconnects without reporting the disconnect. Leaving `_authenticated` True
+        # would let `_authenticate` return before sending a request, and every
+        # `not self._authenticated` gate would then pass on a connection the broker
+        # never authenticated.
+        self._authenticated = False
+        self._already_logged_in_notified = False
         self._connected = True
         self._connected_event.set()
         logger.info(
