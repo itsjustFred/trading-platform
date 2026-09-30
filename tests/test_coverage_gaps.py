@@ -1432,3 +1432,91 @@ def test_unit_first_sub_daily_labels_are_not_sized_as_daily_bars():
     assert timeframe_nominal_days("nonsense") == 1.0
     assert timeframe_nominal_days(None) == 1.0
     assert timeframe_nominal_days("") == 1.0
+
+
+def _two_holes_one_excusable(tmp_path):
+    """A real 3.5-day outage alongside a longer, excusable US holiday week.
+
+    Three bar ranges, so two distinct holes: Friday 16 January's close to Tuesday
+    20 January is the MLK week and the calendar excuses it, while 10 to 14 January
+    is 3.5 days of missing bars - above the 3.0-day fail threshold, so it has to
+    fail coverage. The holiday is the *larger* of the two, which is the whole point.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    stamps = (
+        list(pd.date_range("2026-01-10 00:00", "2026-01-10 23:00", freq="1h", tz="UTC"))
+        + list(
+            pd.date_range("2026-01-14 11:00", "2026-01-16 12:00", freq="1h", tz="UTC")
+        )
+        + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
+    )
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="AAPL", timeframe="1h", start="2026-01-10", end="2026-01-20"
+        ),
+    )
+    return report
+
+
+def test_a_smaller_hole_next_to_an_excusable_one_is_still_caught(tmp_path):
+    """Collapsing to the largest hole hid the hole that mattered.
+
+    `find_internal_gaps` returned only the longest hole per symbol directory, and
+    the coverage verdict is computed per gap - so a second, smaller hole was never
+    examined. The bias points straight at the failure: **the largest hole is
+    systematically the most likely to be an excusable closure**, because holiday
+    weeks are the longest gaps there are. Picking the largest therefore surfaced
+    the one hole the calendar would excuse and discarded the one it would not.
+
+    Measured before the fix, on these bar boundaries: one gap reported (the 4.00-day
+    holiday), status `warning`, `failed_downloads` empty - while a 3.50-day hole sat
+    above the 3.0-day fail threshold the whole time.
+    """
+    report = _two_holes_one_excusable(tmp_path)
+
+    assert report["status"] == "failed", (
+        f"a 3.5-day hole next to an excusable holiday must fail coverage: {report}"
+    )
+    failed = report.get("failed_downloads") or []
+    assert any(abs(float(gap["gap_days"]) - 3.5) < 0.01 for gap in failed), (
+        f"the real outage is not among the failed downloads: {failed}"
+    )
+    # And the genuine holiday is still excused - the fix must not turn every
+    # multi-day gap into a failure.
+    assert not any(
+        abs(float(gap["gap_days"]) - 4.0) < 0.01 for gap in failed
+    ), f"the MLK holiday week was failed as a data hole: {failed}"
+
+
+def test_every_hole_above_the_threshold_is_returned_largest_first(tmp_path):
+    """The report is the whole set, ordered so the first is still the worst.
+
+    Largest first preserves what the `max()` guaranteed for any caller that only
+    looks at the first element, while no longer discarding the rest.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    root = tmp_path / "data"
+    stamps = (
+        list(pd.date_range("2026-01-10 00:00", "2026-01-10 23:00", freq="1h", tz="UTC"))
+        + list(
+            pd.date_range("2026-01-14 11:00", "2026-01-16 12:00", freq="1h", tz="UTC")
+        )
+        + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
+    )
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+
+    gaps = find_internal_gaps(root / "ohlcv" / "AAPL", "1h", threshold_days=1.0)
+
+    assert len(gaps) == 2, f"expected both holes, got {gaps}"
+    assert [round(float(gap["gap_days"]), 2) for gap in gaps] == [4.0, 3.5], (
+        f"gaps must come back largest first: {[(g['start'], g['gap_days']) for g in gaps]}"
+    )

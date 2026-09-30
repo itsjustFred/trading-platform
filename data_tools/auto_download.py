@@ -850,9 +850,21 @@ def _find_gaps_inside_file(
             )
         )
 
-    # Report the largest hole per file so callers get a single actionable gap.
-    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
-    return [largest] if largest is not None else []
+    # Every hole above the threshold, largest first - not just the largest.
+    #
+    # Collapsing to the largest was a fail-open with the bias pointing the wrong
+    # way. The coverage verdict is computed per gap, so a second, smaller hole was
+    # never examined at all; and the *largest* hole is systematically the one most
+    # likely to be an excusable market closure, because holiday weeks are the
+    # longest holes there are. Demonstrated on real bar boundaries: a directory
+    # holding a 3.50-day outage and a 4.00-day Friday-to-Tuesday US holiday week
+    # reported only the holiday, which the calendar excused, and the coverage check
+    # answered "warning" with no failed downloads - while the 3.50-day hole sat
+    # above the 3.0-day fail threshold the whole time.
+    #
+    # Sorted largest-first so any caller that inspects only the first still gets
+    # the most actionable one, which is what the old behaviour guaranteed.
+    return sorted(gaps, key=lambda gap: gap.gap_days, reverse=True)
 
 
 def find_internal_gaps(
@@ -866,14 +878,11 @@ def find_internal_gaps(
     Coverage based on global min/max passes files that simply stop in the
     middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
     that belongs to the symbol: adjacent files (segmented/monthly storage) and
-    the bars inside one file. Only holes longer than ``threshold_days``
-    (default: ``INTERNAL_GAP_WARN_DAYS``, 1 calendar day) is reported, and only
-    the **largest** one — so a caller gets a single actionable gap, but a
-    second, smaller hole in the same symbol directory is not surfaced and the
-    coverage verdict is computed from the largest alone. That is a known
-    limitation rather than an accident: removing it means returning every hole
-    above the threshold. — gaps are measured in calendar
-    days, so a regular weekend (~2 days) is reported as a warning.
+    the bars inside one file. Every hole longer than ``threshold_days``
+    (default: ``INTERNAL_GAP_WARN_DAYS``, 1 calendar day) is reported, largest
+    first, so the coverage verdict is computed over all of them rather than over
+    whichever one happened to be longest. Gaps are measured in calendar days, so a
+    regular weekend (~2 days) is reported as a warning.
     """
     def _matches_timeframe(path: Path) -> bool:
         if timeframe is None:
@@ -926,10 +935,12 @@ def find_internal_gaps(
         file_gaps = _find_gaps_inside_file(path, threshold_days=threshold_days)
         gaps.extend(file_gaps)
 
-    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
-    if largest is not None:
-        return [largest.to_dict()]
-    return []
+    # Every hole above the threshold, largest first. The `max()` this replaces
+    # collapsed *across* files as well as within them, so the same fail-open
+    # applied to a segmented layout: a real outage in one month's file was invisible
+    # whenever a longer holiday week lived in another. Largest first keeps the
+    # "most actionable gap first" property the collapse was there to provide.
+    return [gap.to_dict() for gap in sorted(gaps, key=lambda g: g.gap_days, reverse=True)]
 
 
 def _contained_rglob(root: Path, pattern: str) -> Iterator[Path]:
