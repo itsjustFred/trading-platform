@@ -36,9 +36,24 @@ CTRADER_SOURCE = REPO_ROOT / "live_runner" / "ctrader_adapter.py"
 
 
 def _literal_tuple(node: ast.AST) -> tuple[str, ...]:
-    """Read a tuple of string literals straight out of the AST."""
+    """Read the tuple passed at a call site, from the AST.
+
+    A tuple literal is read directly. A bare name is resolved to the module-level
+    constant it names, so a call site that passes the shared definition is recognised
+    rather than rejected - while a call site passing a literal of its own is still
+    visible, and still shows up in the comparison below as a value that has to match.
+    """
+    if isinstance(node, ast.Name):
+        resolved = getattr(ctrader_adapter, node.id, None)
+        if isinstance(resolved, tuple) and resolved and all(
+            isinstance(item, str) for item in resolved
+        ):
+            return tuple(resolved)
+        raise AssertionError(
+            f"call site passes a bare name {node.id!r} that is not a string tuple"
+        )
     if not isinstance(node, ast.Tuple):
-        raise AssertionError(f"expected a tuple literal, found {type(node).__name__}")
+        raise AssertionError(f"expected a tuple, found {type(node).__name__}")
     values = []
     for element in node.elts:
         if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
@@ -48,26 +63,35 @@ def _literal_tuple(node: ast.AST) -> tuple[str, ...]:
 
 
 def _alpaca_aliases() -> dict[str, tuple[str, ...]]:
-    """The alias tuples Alpaca declares as module constants."""
-    found: dict[str, tuple[str, ...]] = {}
-    for node in ast.parse(ALPACA_SOURCE.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Tuple):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in {
-                    "_SL_METADATA_KEYS",
-                    "_TP_METADATA_KEYS",
-                }:
-                    found[target.id] = _literal_tuple(node.value)
-    assert found, "the Alpaca alias constants are no longer module-level tuples"
+    """The alias tuples Alpaca resolves stop-loss and take-profit from.
+
+    Read from the module rather than from the source, because these are no longer
+    literals: all three paths now import one definition from `shared.models`. The
+    previous version required a module-level tuple literal and failed to collect once
+    they became references - which is a useful reminder that a source-reading pin also
+    pins the *shape* of the code, not just the rule.
+
+    Reading the value is strictly better for this file's purpose. The docstring's
+    worry was that restating the tuples would let the test pass on the day the two
+    sides diverge; taking the value from the module cannot do that, because if the two
+    sides disagree the values differ. Only cTrader's copy had to be read from the AST,
+    and it no longer needs to be.
+    """
+    found = {
+        name: tuple(getattr(alpaca_adapter, name))
+        for name in ("_SL_METADATA_KEYS", "_TP_METADATA_KEYS")
+    }
+    assert all(found.values()), "the Alpaca alias constants resolved to nothing"
     return found
 
 
 def _ctrader_aliases() -> list[tuple[str, ...]]:
-    """The alias tuples cTrader passes inline at its two call sites.
+    """The tuples cTrader resolves stop-loss and take-profit from, read from the calls.
 
-    Read from the calls rather than from constants, because there are no constants
-    to read - the tuples are literals in the call, and that duplication is half of
-    what this file is about.
+    The call sites are read rather than the module attribute because what matters here
+    is what is *passed* at each call: a module constant that is correct while one call
+    site passes a literal of its own is exactly the divergence this file exists to
+    catch, and reading the module would not see it.
     """
     found: list[tuple[str, ...]] = []
     tree = ast.parse(CTRADER_SOURCE.read_text(encoding="utf-8"))
@@ -79,7 +103,7 @@ def _ctrader_aliases() -> list[tuple[str, ...]]:
             and len(node.args) >= 2
         ):
             found.append(_literal_tuple(node.args[1]))
-    assert found, "cTrader no longer resolves stop-loss or take-profit through a literal tuple"
+    assert found, "cTrader no longer resolves stop-loss or take-profit through a tuple"
     return found
 
 
@@ -224,3 +248,56 @@ def test_a_malformed_bracket_value_is_refused_rather_than_dropped() -> None:
         assert "stop_loss" in str(excinfo.value), (
             f"{broker} raised without naming the offending key: {excinfo.value}"
         )
+
+
+def test_all_three_paths_share_one_alias_definition() -> None:
+    """One definition, not N equal copies.
+
+    The list existed in three places: a module constant in `alpaca_adapter`, inline
+    literals at cTrader's two call sites, and a fourth tuple in `risk/live.py`. The
+    comparison above would have passed for as long as the copies were equal, which is
+    exactly the state that hides the hazard.
+
+    Asserted as identity. Equality is what the original pin proved, and it is the
+    weaker claim: two tuples that happen to agree today say nothing about tomorrow.
+    This asserts there is nothing to disagree.
+    """
+    from risk import live as risk_live
+    from shared.models import SL_METADATA_KEYS, TP_METADATA_KEYS
+
+    assert alpaca_adapter._SL_METADATA_KEYS is SL_METADATA_KEYS
+    assert alpaca_adapter._TP_METADATA_KEYS is TP_METADATA_KEYS
+    assert risk_live._LIVE_SL_KEYS is SL_METADATA_KEYS
+    assert risk_live._LIVE_TP_KEYS is TP_METADATA_KEYS
+
+    # cTrader has no constant of its own, so check what its call sites pass.
+    for node in ast.walk(ast.parse(CTRADER_SOURCE.read_text(encoding="utf-8"))):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_first_metadata_float"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Name)
+        ):
+            assert getattr(ctrader_adapter, node.args[1].id) in (
+                SL_METADATA_KEYS,
+                TP_METADATA_KEYS,
+            ), (
+                f"cTrader resolves {node.args[1].id!r}, which is not the shared "
+                f"definition; the alias list exists in more than one place again"
+            )
+
+
+def test_the_live_sizing_path_is_covered_by_the_bracket_matrix() -> None:
+    """`risk/live.py` resolves the same keys, so it belongs in the union.
+
+    Its copy was invisible to every assertion in this file: the matrix covered the two
+    broker adapters, and a fourth copy in the sizing path could drift without anything
+    here noticing. It shares the definition now, and this asserts it stays in the
+    matrix so a future re-copy is a test failure rather than a silent fourth copy.
+    """
+    from risk import live as risk_live
+
+    assert tuple(risk_live._LIVE_SL_KEYS) in set(CTRADER_CALL_TUPLES)
+    assert tuple(risk_live._LIVE_TP_KEYS) in set(CTRADER_CALL_TUPLES)
+

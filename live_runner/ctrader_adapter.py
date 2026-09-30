@@ -35,7 +35,12 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.models import LiveExecution, LiveSignal
+from shared.models import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LiveExecution,
+    LiveSignal,
+)
 
 logger = get_logger("live-runner")
 
@@ -2111,10 +2116,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.volume = self._resolve_order_volume(signal)
         request.timeInForce = self._ProtoOATimeInForce.IMMEDIATE_OR_CANCEL
         request.clientOrderId = str(signal.id)
-        stop_loss = _first_metadata_float(
-            metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-        )
-        take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        # One definition, in shared/models.py, shared with live_runner/alpaca_adapter.py
+        # and risk/live.py. These were inline literals here, so the alias list existed in
+        # three places and two of them were spelled as a tuple in a call. See the note in
+        # shared/models.py: if the paths drift, the same signal is bracketed differently
+        # depending on which account it routed to.
+        stop_loss = _first_metadata_float(metadata, SL_METADATA_KEYS)
+        take_profit = _first_metadata_float(metadata, TP_METADATA_KEYS)
         unbounded_tp = take_profit is None and is_unbounded_tp(metadata)
         if stop_loss is None or (take_profit is None and not unbounded_tp):
             missing = [

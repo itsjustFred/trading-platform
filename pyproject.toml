@@ -132,6 +132,10 @@ select = ["E", "F", "I", "W"]
 "signal_bots/registry.py" = ["E402"]
 "viewer/main.py" = ["E402"]
 "tests/test_ctrader_live_fix.py" = ["E402"]
+# Re-exports: `shared.constants` is the import path existing callers use, and it now
+# forwards the canonical definitions from `shared.models` rather than restating
+# them. F401 would call that dead; it is the opposite.
+"shared/constants.py" = ["F401"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

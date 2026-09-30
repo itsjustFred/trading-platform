@@ -351,8 +351,35 @@ class Portfolio(BaseModel):
 
 # ─── Timeframe constants ────────────────────────────────────────────────────
 
+# The canonical sets, defined here because this module is the leaf both sides reach:
+# `shared/constants.py` re-exports them, and this is what model and config validation
+# uses. They were previously written out verbatim in both files, and *both copies were
+# imported by live consumers* - this one by `execution_timing.py` and the engine
+# contract, the constants one by the grid downloader. A timeframe added to one side
+# only would have been a live split rather than a duplicate nobody noticed.
+#
+# Defined here rather than in `shared/constants.py` so that importing `shared.models`
+# does not drag in `load_dotenv()` and the `DATA_DIR` resolution that runs at constants'
+# module level. The import direction matters: `shared.constants` already depends on this
+# module, not the other way round.
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
+
+# The metadata keys that mean "a stop loss", in priority order, and likewise take profit.
+#
+# The backtest path (`live_runner/alpaca_adapter.py`) and the live sizing path
+# (`risk/live.py`) must agree on this list, because the whole point of the risk
+# consistency contract is that a backtest predicts live behaviour. If the two drift, a
+# backtest sizes a stop that live then ignores - a stop that looks honoured in the
+# artifact and is not honoured in the position. They were two identical four-tuples, one
+# in each module, with nothing relating them.
+SL_METADATA_KEYS: tuple[str, ...] = (
+    "stop_loss",
+    "sl_price",
+    "stop_price",
+    "resolved_stop_loss",
+)
+TP_METADATA_KEYS: tuple[str, ...] = ("take_profit", "tp_price")
 
 
 # ─── Exit ────────────────────────────────────────────────────────────────────

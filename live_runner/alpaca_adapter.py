@@ -34,14 +34,22 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.models import LiveExecution, LiveSignal
+from shared.models import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LiveExecution,
+    LiveSignal,
+)
 
 logger = get_logger("live-runner")
 
 _ALPACA_ACC_RE = re.compile(r"^ALPACA_API_KEY_ACC(?P<index>\d+)$")
 
-_SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-_TP_METADATA_KEYS = ("take_profit", "tp_price")
+# One definition, in shared/models.py, shared with the live sizing path in
+# risk/live.py. See the note there: if these drift, a backtest sizes a stop that live
+# ignores.
+_SL_METADATA_KEYS = SL_METADATA_KEYS
+_TP_METADATA_KEYS = TP_METADATA_KEYS
 
 
 def _is_order_not_found(exc: BaseException) -> bool:

@@ -15,7 +15,11 @@ from typing import Any
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import SizedOrder, TradeSignal
-from shared.models import LiveSignal
+from shared.models import (
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    LiveSignal,
+)
 
 
 def _to_float(value: Any, *, default: float) -> float:
@@ -56,8 +60,11 @@ def _to_int(value: Any, *, default: int) -> int:
 #: wrong distances). Entry falls back to theoretical_price; SL/TP accept the
 #: same alias keys the daemon resolves (stop_loss/sl_price/stop_price/
 #: resolved_stop_loss, take_profit/tp_price) — never bare theoretical math.
-_LIVE_SL_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-_LIVE_TP_KEYS = ("take_profit", "tp_price")
+# One definition, in shared/models.py, shared with the backtest path in
+# live_runner/alpaca_adapter.py. The two paths must read the same keys or a backtest
+# will size a stop that live sizing ignores.
+_LIVE_SL_KEYS = SL_METADATA_KEYS
+_LIVE_TP_KEYS = TP_METADATA_KEYS
 
 
 def _first_metadata_float(metadata: dict[str, Any], keys: tuple[str, ...]) -> float | None:

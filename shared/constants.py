@@ -18,8 +18,14 @@ try:  # pragma: no cover - pwd is not available on Windows
 except ImportError:  # pragma: no cover - Windows
     pwd = None
 
-VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
-VALID_DIRECTIONS = ("LONG", "SHORT")
+# Re-exported, not restated. See `shared/models.py` for why the definition lives there
+# and why these were previously two divergent copies with live consumers on both sides.
+from shared.models import (  # noqa: E402
+    SL_METADATA_KEYS,
+    TP_METADATA_KEYS,
+    VALID_DIRECTIONS,
+    VALID_TIMEFRAMES,
+)
 VALID_ENGINES = ("native", "lean", "vectorbt", "pynecore")
 TIMEFRAME_ALIASES: dict[str, str] = {
     "m1": "1m",
