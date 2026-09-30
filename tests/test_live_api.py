@@ -1808,15 +1808,39 @@ def test_every_stockkit_route_call_site_resolves_configured_accounts():
         if {"tests", ".venv", "node_modules"} & set(path.parts):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if "validate_stockkit_deployment_route(" not in text:
-            continue
-        if "def validate_stockkit_deployment_route" in text:
+        if "validate_stockkit_deployment_route" not in text:
             continue
         tree = ast.parse(text)
+        # Skip the *definition*, not the file.
+        #
+        # The previous guard did `if "def validate_stockkit_deployment_route" in
+        # text: continue`, which exempts every line of stockkit_routing.py - the
+        # module that defines it. That is the natural home for a shared helper, and
+        # the one file whose authors would not think of it as containing a "call
+        # site", so a call added there would be skipped in silence. A whole-file
+        # exemption standing in for a node filter is the same structural mistake as a
+        # substring search standing in for a loop check.
+        definitions = {
+            id(node)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "validate_stockkit_deployment_route"
+        }
+        skipped: set[int] = set()
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            if id(node) in definitions:
+                skipped.update(id(n) for n in ast.walk(node))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or id(node) in skipped:
                 continue
-            if getattr(node.func, "id", "") != "validate_stockkit_deployment_route":
+            # Match a qualified call as well as a bare one.
+            #
+            # `getattr(func, "id", "")` only matches a bare Name, so
+            # `stockkit_routing.validate_stockkit_deployment_route(...)` - which is
+            # how the definition's own module would call it - parsed as an
+            # ast.Attribute and was skipped entirely. Verified against a real parse.
+            callee = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if callee != "validate_stockkit_deployment_route":
                 continue
             names = {kw.arg for kw in node.keywords}
             if "accounts_env_values" not in names:
