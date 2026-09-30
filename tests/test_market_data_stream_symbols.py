@@ -230,22 +230,62 @@ def test_the_worker_tracks_the_symbols_it_was_given() -> None:
     assert worker._symbols == {"AAPL"}
 
 
-def test_bars_for_an_abandoned_symbol_are_not_recorded() -> None:
-    """The consequence, not just the subscription state.
+def _service_with_worker(symbols: set[str]):
+    """A real service holding a real worker, so nothing is invented.
 
-    `_on_bar` lived on the service, not the worker - the worker is handed the
-    handler - so the bar path is driven through the service with a real worker
-    attached. It accepted any symbol the stream sent, so a stale subscription turned
-    into bars sitting in `_bars` where a consumer cannot tell them from live ones.
-
-    The bar carries the full attribute names `_serialize_bar_payload` reads. An
-    abbreviated stand-in would leave `symbol` empty, `_on_bar` would return early,
-    and this test would pass without recording anything at all.
+    The first version of this test built the service with `__new__` and set
+    `service._symbols` by hand. That manufactured an attribute the class does not
+    have - subscriptions live on the worker - so the test passed against production
+    code that raised `AttributeError` on every single bar. A fixture that invents the
+    state under test is worse than no fixture, because it hides the defect it was
+    meant to catch.
     """
+    from live_runner.market_data_stream import _StreamWorker
+
     service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
     service._lock = threading.Lock()
     service._max_bars_per_symbol = 10
     service._bars = defaultdict(lambda: deque(maxlen=10))
+    service._workers = {}
+
+    worker = _StreamWorker(
+        kind="stock",
+        api_key="key",
+        secret_key="secret",
+        paper=True,
+        bar_handler=None,
+    )
+    worker.set_symbols(symbols)
+    service._workers[("key", "stock")] = worker
+    return service
+
+
+def test_the_service_has_no_symbol_set_of_its_own() -> None:
+    """The attribute the first version of this filter read does not exist.
+
+    A subscription belongs to a worker, not to the service. This asserts that
+    directly, so a future filter cannot reintroduce a service-level read and have the
+    tests agree with it.
+    """
+    service = _service_with_worker({"AAPL", "MSFT"})
+    assert not hasattr(service, "_symbols"), (
+        "LiveMarketDataStreamService must not carry a symbol set; subscriptions are "
+        "per worker and a service-level read cannot see them"
+    )
+
+
+def test_bars_for_an_abandoned_symbol_are_not_recorded() -> None:
+    """The consequence, not just the subscription state.
+
+    A bar can still arrive for a symbol just dropped, because the broker may have it
+    in flight. It used to be recorded anyway, leaving data for an abandoned symbol in
+    `_bars` where a consumer cannot tell it from a live one.
+
+    The bar carries the full attribute names `_serialize_bar_payload` reads. An
+    abbreviated stand-in would leave `symbol` empty, `_on_bar` would return early, and
+    this test would pass without recording anything at all.
+    """
+    service = _service_with_worker({"AAPL", "MSFT"})
 
     def bar(symbol: str):
         return SimpleNamespace(
@@ -257,14 +297,38 @@ def test_bars_for_an_abandoned_symbol_are_not_recorded() -> None:
     async def deliver(symbol: str) -> None:
         await service._on_bar(bar(symbol))
 
-    service._symbols = {"AAPL", "MSFT"}
     asyncio.run(deliver("AAPL"))
     assert set(service._bars) == {"AAPL"}, "the fixture must actually record bars"
 
-    # The deployment drops MSFT.
-    service._symbols = {"AAPL"}
+    # The deployment drops MSFT; the worker stops subscribing to it.
+    worker = service._workers[("key", "stock")]
+    worker.set_symbols({"AAPL"})
     asyncio.run(deliver("MSFT"))
 
     assert set(service._bars) == {"AAPL"}, (
         f"bars for a dropped symbol are still being recorded: {sorted(service._bars)}"
+    )
+
+
+def test_a_subscribed_bar_is_recorded_after_the_filter_change() -> None:
+    """The other half, so the filter cannot be satisfied by dropping every bar.
+
+    A filter that returned early unconditionally would make the test above pass
+    while no market data reached anything at all.
+    """
+    service = _service_with_worker({"AAPL", "MSFT"})
+
+    def bar(symbol: str):
+        return SimpleNamespace(
+            symbol=symbol,
+            timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0,
+        )
+
+    asyncio.run(service._on_bar(bar("AAPL")))
+    asyncio.run(service._on_bar(bar("MSFT")))
+
+    assert set(service._bars) == {"AAPL", "MSFT"}, (
+        "bars for subscribed symbols must still be recorded; a filter that drops "
+        "everything would satisfy the abandoned-symbol test on its own"
     )

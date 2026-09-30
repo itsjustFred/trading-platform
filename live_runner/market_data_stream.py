@@ -347,16 +347,27 @@ class LiveMarketDataStreamService:
         symbol = payload["symbol"]
         if not symbol:
             return
-        # Only record bars for symbols this worker is currently subscribed to. A bar
-        # can still arrive for one that was just dropped, because the broker may
-        # have it in flight, and it used to be recorded regardless - leaving data
-        # for an abandoned symbol in `_bars`, where a consumer cannot tell it from
-        # a live one.
+        # Only record bars for a symbol some worker is currently subscribed to. A bar
+        # can still arrive for one that was just dropped, because the broker may have
+        # it in flight, and it used to be recorded regardless - leaving data for an
+        # abandoned symbol in `_bars`, where a consumer cannot tell it from a live one.
+        #
+        # Subscriptions are per worker, not per service: the service holds no symbol set
+        # of its own, only the workers keyed by (credentials, stream kind). An earlier
+        # version of this filter read `self._symbols` here, which does not exist on this
+        # class, so every bar raised AttributeError. The service's own lock also cannot
+        # be used to read a worker's set, so each worker's lock is taken separately.
         with self._lock:
-            current = self._symbols
-        if symbol not in current:
+            workers = list(self._workers.values())
+        if not any(self._worker_subscribes(worker, symbol) for worker in workers):
             return
         await asyncio.to_thread(self._append_bar_sync, symbol, payload)
+
+    @staticmethod
+    def _worker_subscribes(worker: "_StreamWorker", symbol: str) -> bool:
+        """Whether one worker currently holds a subscription for `symbol`."""
+        with worker._lock:
+            return symbol in worker._symbols
 
     def _append_bar_sync(self, symbol: str, payload: dict[str, Any]) -> None:
         with self._lock:
