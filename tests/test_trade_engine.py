@@ -494,9 +494,20 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
       trades is a failure, not "assert True");
     - divergence is capped at one trade, not 30%.
     """
-    strategy_path = Path("strategies/example_sma/example_sma.py").resolve()
-    if not strategy_path.exists():
-        pytest.skip("example_sma strategy not found")
+    # Repo-relative, not CWD-relative.
+    #
+    # `Path("strategies/...")` resolves against the process working directory, so this
+    # test skipped for a *different reason* depending on where pytest was invoked.
+    # Measured: from the repo root the skip read "No local 1h OHLCV parquet data
+    # available"; run from /tmp against an absolute test path it read "example_sma
+    # strategy not found" - a tracked file that is always present.
+    #
+    # The data skips below are legitimate, this one was not: the strategy is a git-tracked
+    # file, so its absence is a defect rather than a condition. And on a machine that
+    # *does* have 1h data, invoking pytest from anywhere but the repo root would have
+    # skipped this smoke test for good, silently, with exit 0.
+    strategy_path = Path(__file__).resolve().parents[1] / "strategies" / "example_sma" / "example_sma.py"
+    assert strategy_path.exists(), f"git-tracked strategy is missing: {strategy_path}"
 
     ohlcv_root = DATA_DIR / "ohlcv"
     parquet_files = list(ohlcv_root.rglob("**/1h.parquet"))
@@ -916,4 +927,74 @@ def test_a_multi_level_ladder_is_credited_with_the_furthest_level_reached():
     ), (
         f"MFE is {trade.mfe / trade.quantity:+.1f} per unit; both levels filled, so "
         f"the furthest one reached (115) is the cap, not the first pending (105)"
+    )
+
+
+def test_no_test_resolves_a_repo_path_against_the_working_directory() -> None:
+    """Repo paths in tests must be derived from `__file__`, never from the CWD.
+
+    AGENTS.md requires scripts and paths to be portable across Linux, Windows and macOS, and
+    a CWD-relative path is the opposite: it resolves against wherever pytest happened to be
+    invoked from.
+
+    This is not hypothetical. `Path("strategies/example_sma/example_sma.py")` in the smoke
+    test above meant that test skipped for a **different reason** depending on the working
+    directory - measured, "No local 1h OHLCV parquet data available" from the repo root
+    against "example_sma strategy not found" from `/tmp`, for a git-tracked file that is
+    always present. On a machine that *did* have the data, invoking pytest from anywhere but
+    the root would have skipped it for good, silently, with exit 0.
+
+    A static pin, because the defect is a *spelling*: `Path("strategies/...")` looks
+    identical to the correct form until the CWD moves. And a pin on the pattern rather than
+    on that one line, so the next instance is caught here.
+
+    `tests/test_destructive_scripts_safety.py:355` is excluded, and the exclusion is narrow
+    and stated rather than a file allowlist: a `Path(...)` built inside a
+    `monkeypatch.setattr(...)` call is a **value handed to a replaced dependency**, not a
+    location. There the path is never touched - `_run_strategy` is itself patched to raise
+    - so requiring it to be repo-relative would be requiring the wrong thing. Everything
+    outside such a call is scanned, including string literals inside them.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    repo_dirs = ("strategies", "data", "runner", "viewer", "scripts", "shared",
+                 "signal_bots", "live_runner", "risk", "data_tools", "validation")
+    offenders: list[str] = []
+
+    for path in sorted(_Path(__file__).resolve().parent.glob("test_*.py")):
+        source = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:  # pragma: no cover - would fail collection anyway
+            continue
+        # `Path(...)` anywhere inside a `monkeypatch.setattr(...)` call is a stand-in
+        # value for a replaced dependency, not a filesystem location.
+        patched: set[int] = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "setattr"):
+                continue
+            for inner in ast.walk(node):
+                patched.add(id(inner))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == "Path"):
+                continue
+            if id(node) in patched:
+                continue
+            for arg in node.args:
+                if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+                    continue
+                head = arg.value.replace("\\", "/").split("/")[0]
+                if head in repo_dirs and not arg.value.startswith("/"):
+                    offenders.append(f"{path.name}:{node.lineno} Path({arg.value!r})")
+
+    assert not offenders, (
+        "these paths resolve against the working directory, so the tests skip or fail "
+        "depending on where pytest was invoked. Use Path(__file__).resolve().parents[N]:\n  "
+        + "\n  ".join(offenders)
     )
