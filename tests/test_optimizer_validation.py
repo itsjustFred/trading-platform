@@ -694,8 +694,17 @@ def test_split_period_applies_an_embargo_gap():
     test_start = pd.Timestamp(test["start"])
     assert test_start > train_end
     # 10-day window, 10% embargo => about a day of dead time.
-    assert (test_start - train_end) == pytest.approx(
-        pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1)
+    #
+    # An explicit bound rather than `pytest.approx`: Timedelta is not numeric, so
+    # pytest's numeric tolerance does not apply the way it reads, and the assertion
+    # accepts values it looks like it should not. `pytest.approx(1us, abs=1s)` was
+    # measured to pass for a gap of *zero*, so a split that overlapped train and test
+    # would have satisfied it - the opposite of what this test exists to prevent.
+    gap = test_start - train_end
+    # 10% of a 10-day window is one day, and the split adds a 1µs sentinel on top,
+    # so the observed gap is 1 day + 1µs. Bounded generously around one day.
+    assert pd.Timedelta(hours=23) <= gap <= pd.Timedelta(days=1, hours=1), (
+        f"10% of a 10-day window should be about one day of embargo, got {gap}"
     )
 
 
@@ -707,8 +716,14 @@ def test_split_period_without_embargo_stays_contiguous():
     train, test = opt._split_backtest_period(
         "2024-01-01T00:00:00+00:00", "2024-01-11T00:00:00+00:00", 0.7
     )
-    assert pd.Timestamp(test["start"]) - pd.Timestamp(train["end"]) == pytest.approx(
-        pd.Timedelta(microseconds=1), abs=pd.Timedelta(seconds=1)
+    # The split must leave a positive sentinel gap so train and test cannot overlap.
+    # An exact comparison, because the same `pytest.approx`-on-Timedelta behaviour
+    # measured above accepts a gap of zero here, which is precisely the overlap this
+    # test is meant to rule out.
+    gap = pd.Timestamp(test["start"]) - pd.Timestamp(train["end"])
+    assert gap > pd.Timedelta(0), f"train and test overlap: gap is {gap}"
+    assert gap == pd.Timedelta(microseconds=1), (
+        f"expected the 1µs sentinel gap, got {gap}"
     )
 
 

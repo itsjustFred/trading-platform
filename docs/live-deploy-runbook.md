@@ -164,13 +164,13 @@ Beide Broker implementieren die Kontrollen inzwischen:
 
 - **Alpaca:** `cancel_orders()` (Bulk) und `close_all_positions()`.
 - **cTrader:** `ProtoOAReconcileReq` für den aktuellen Stand (Orders und
-  Positionen) + `ProtoOACancelOrderReq` / `ProtoOAClosePositionReq`. Der
-  Reconcile-Aufruf hat bewusst keine Zeitgrenzen: `ProtoOAOrderListReq` ist
-  eine historische Abfrage, und `fromTimestamp=0`/`toTimestamp=0` bedeutet
-  nicht „jetzt" – sie könnte nichts liefern und damit einen Storno als
-  erfolgreich melden, obwohl die Order noch liegt.
-  (Market-/Market-Range-Orders sind nicht stornierbar, da sofort ausgeführt) und
-  `ProtoOAClosePositionReq` je offener Position.
+  Positionen), `ProtoOACancelOrderReq` je stornierbarer Order und
+  `ProtoOAClosePositionReq` je offener Position. Market-/Market-Range-Orders sind
+  nicht stornierbar, da sofort ausgeführt. Der Reconcile-Aufruf hat bewusst keine
+  Zeitgrenzen: `ProtoOAOrderListReq` ist eine historische Abfrage, und
+  `fromTimestamp=0`/`toTimestamp=0` bedeutet nicht „jetzt" – sie könnte nichts
+  liefern und damit einen Storno als erfolgreich melden, obwohl die Order noch
+  liegt.
 
 Ein Adapter, der eine Aktion nicht kann, meldet das über
 `supports_cancel_orders` / `supports_flatten`; der Daemon verweigert dann die

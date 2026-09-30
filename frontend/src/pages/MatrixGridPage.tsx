@@ -274,7 +274,11 @@ export function MatrixGridPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [selectedStrategy, setSelectedStrategy] = useState("");
+  // `null` means "not chosen yet" and falls back to the first strategy; `""` is the
+  // explicit "alle" the option at line 619 offers. Collapsing both into "" made the
+  // "alle" option unreachable: choosing it re-derived the first strategy, so a user
+  // could never see all strategies. Two different intentions need two values.
+  const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
   const [symbolFilter, setSymbolFilter] = useState("");
   const [timeframeFilter, setTimeframeFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -330,9 +334,11 @@ export function MatrixGridPage() {
     [rows],
   );
 
-  // An unset filter falls back to the first strategy, so the default selection
-  // is derived instead of being written into state by an effect.
-  const effectiveStrategy = selectedStrategy || strategies[0] || "";
+  // A null selection falls back to the first strategy, so the default is derived
+  // instead of being written into state by an effect. An explicit "" is left alone:
+  // that is the "alle" choice, and treating it as unset is what made the option
+  // unreachable in the first place.
+  const effectiveStrategy = selectedStrategy ?? strategies[0] ?? "";
 
   const selectedStrategyRows = useMemo(
     () =>

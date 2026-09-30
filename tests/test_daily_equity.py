@@ -449,10 +449,23 @@ class TestAttachDailyEquity:
         assert len(result.equity_curve) == 33
         assert result.equity_curve[0].equity == 100000.0
         assert result.equity_curve[-1].equity == 101000.0
-        # Each trade day carries that day's cumulative net PnL.
-        assert result.equity_curve[10].equity == 100500.0
-        assert result.equity_curve[15].equity == 100800.0
-        assert result.equity_curve[20].equity == 101000.0
+
+        # Looked up by date, not by index. Index 0 is 2024-01-01, so index 10 is
+        # 2024-01-11 -- the day *after* trade 1 closed on the 10th. The old index-based
+        # assertions therefore checked the day after each booking and passed only
+        # because equity carries forward, which meant a curve that booked PnL one day
+        # late passed this test too. The day-before assertions are what catch that;
+        # a date-keyed check of the flat days is what the intent always was.
+        by_day = {point.time[:10]: point.equity for point in result.equity_curve}
+
+        assert by_day["2024-01-09"] == 100000.0, "before the first exit"
+        assert by_day["2024-01-10"] == 100500.0, "trade 1 books on its exit date"
+        assert by_day["2024-01-14"] == 100500.0, "unchanged between exits"
+        assert by_day["2024-01-15"] == 100800.0, "trade 2 books on its exit date"
+        assert by_day["2024-01-19"] == 100800.0, "unchanged between exits"
+        assert by_day["2024-01-20"] == 101000.0, "trade 3 books on its exit date"
+        assert by_day["2024-01-01"] == 100000.0
+        assert by_day["2024-02-01"] == 101000.0
         assert result.stats["daily_return_count"] == 32
 
     def test_does_not_preserve_single_point_engine_curve(self):
