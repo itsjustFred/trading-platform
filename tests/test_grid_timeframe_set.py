@@ -181,3 +181,68 @@ def test_an_unsupported_timeframe_is_refused_by_name(timeframe) -> None:
     assert timeframe not in grid.SUPPORTED_TIMEFRAMES
     message = f"unsupported timeframe {timeframe!r}. Valid: {sorted(grid.SUPPORTED_TIMEFRAMES)}"
     assert "1m" in message and timeframe not in message.split("Valid:")[1]
+
+
+def test_the_grid_alias_map_has_exactly_one_definition() -> None:
+    """Both grid entry points must resolve to the *same* map, not two equal copies.
+
+    `runner/backtest_grid.py` and `data_tools/download_grid_market_data.py` each carried
+    an identical thirteen-entry `TIMEFRAME_ALIASES` literal. They agreed, and nothing
+    related them, so an edit to one would have been invisible from the other - the same
+    shape as the hand-copied timeframe *list* already found in the downloader, which had
+    drifted by three entries while its comment claimed it was canonical.
+
+    Asserted as object identity rather than equality. Two equal dicts pass `==`, which is
+    precisely the state that hid the problem: the copies were correct, and the hazard is
+    what happens the first time one of them is edited.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    import runner.backtest_grid as backtest_grid
+    from shared.constants import GRID_TIMEFRAME_ALIASES
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_grid_downloader_under_test", root / "data_tools" / "download_grid_market_data.py"
+    )
+    assert spec is not None and spec.loader is not None
+    downloader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(downloader)
+
+    assert backtest_grid.TIMEFRAME_ALIASES is GRID_TIMEFRAME_ALIASES, (
+        "backtest_grid carries its own copy of the CLI alias map; a change to one will "
+        "not reach the other"
+    )
+    assert downloader.TIMEFRAME_ALIASES is GRID_TIMEFRAME_ALIASES, (
+        "download_grid_market_data carries its own copy of the CLI alias map"
+    )
+
+
+def test_every_cli_alias_lands_on_a_valid_timeframe() -> None:
+    """An alias that normalises to something outside VALID_TIMEFRAMES is a dead entry.
+
+    The CLI map is wider than the strict one on purpose, so an entry pointing at a
+    non-canonical value would pass every consistency check above and still be rejected
+    at the validation boundary - the operator sees "unsupported timeframe" for a spelling
+    the grid advertises.
+    """
+    from shared.constants import GRID_TIMEFRAME_ALIASES, TIMEFRAME_ALIASES, VALID_TIMEFRAMES
+
+    bad_targets = {
+        alias: target
+        for alias, target in GRID_TIMEFRAME_ALIASES.items()
+        if target not in VALID_TIMEFRAMES
+    }
+    assert not bad_targets, f"CLI aliases pointing outside VALID_TIMEFRAMES: {bad_targets}"
+
+    # The strict map must be a subset with identical targets, or the two disagree about
+    # a spelling both claim to accept.
+    disagreements = {
+        alias: (target, TIMEFRAME_ALIASES[alias])
+        for alias, target in TIMEFRAME_ALIASES.items()
+        if GRID_TIMEFRAME_ALIASES.get(alias) != target
+    }
+    assert not disagreements, (
+        f"aliases present in both maps with different targets: {disagreements}"
+    )

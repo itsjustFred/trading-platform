@@ -27,6 +27,39 @@ TIMEFRAME_ALIASES: dict[str, str] = {
     "d1": "1d",
 }
 
+# The CLI spelling set, which is deliberately wider than TIMEFRAME_ALIASES above.
+#
+# TIMEFRAME_ALIASES is what model and config validation uses, so it stays small and
+# strict: an alias that is not there fails validation, which is the right answer for a
+# stored artifact. A command line is the opposite case - a person typing `--timeframes
+# m15` should be understood, not rejected. Both grid entry points therefore accepted
+# these thirteen spellings.
+#
+# This lived as an identical thirteen-entry literal in `runner/backtest_grid.py` and
+# `data_tools/download_grid_market_data.py`, with no test relating the two copies. That
+# is the same shape as the drifted hand-copied timeframe *list* already found in the
+# grid downloader and fixed by deriving it: two copies agree until the moment one is
+# edited, and then they disagree silently, with the disagreement only observable as a
+# grid that accepts a timeframe one entry point normalises and the other does not.
+#
+# Every value must be in VALID_TIMEFRAMES, and every key in TIMEFRAME_ALIASES must be
+# present here with the same target. `tests/test_grid_timeframe_set.py` asserts both.
+GRID_TIMEFRAME_ALIASES: dict[str, str] = {
+    "m1": "1m",
+    "1min": "1m",
+    "min1": "1m",
+    "m5": "5m",
+    "m15": "15m",
+    "m30": "30m",
+    "h1": "1h",
+    "hour1": "1h",
+    "h4": "4h",
+    "hour4": "4h",
+    "d1": "1d",
+    "daily": "1d",
+    "day": "1d",
+}
+
 
 def normalize_timeframe(timeframe: str | None) -> str:
     """Normalize timeframe aliases to canonical values.
