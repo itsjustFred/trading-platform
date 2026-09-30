@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from shared.models import (
@@ -2535,3 +2536,109 @@ def test_the_daemon_loop_refreshes_stale_verifications_and_skips_fresh_ones(
         "the daemon's main loop no longer calls the refresher; every dispatch "
         "would be refused once the TTL expires, with nothing in the loop to renew it"
     )
+
+
+def test_re_pointing_a_deployment_requires_a_verified_account_not_just_a_demo_flag(
+    isolated_db_sandbox, monkeypatch
+):
+    """The docstring promised a *verified* demo account; the check read a flag.
+
+    `update_live_deployment_account` is one of three ways to put a deployment in
+    front of a broker account, and the only one that did not run the full
+    activation verdict. It checked `bool(account.is_demo)` and nothing else, so
+    both halves of `_activation_block_reason` were skipped: the freshness window
+    and the identity fingerprint. An operator could re-point - including an
+    ACTIVE deployment with `allow_active` - at an account whose verification had
+    expired hours ago, or whose credentials had been rotated since.
+
+    The daemon's per-dispatch gate still refuses the resulting orders, so nothing
+    reaches a non-demo broker. The real cost is quieter: a silently mis-armed
+    deployment, and a `succeeded=True` audit row for a state the documented gate
+    should have refused.
+
+    Two arms, because the two halves fail differently: an expired stamp is caught
+    by age, a rotated credential by the fingerprint, and a check that only ever
+    read the flag caught neither.
+    """
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts(
+        [
+            database_module_module.LiveAccountConfig(
+                id="acct-fresh",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-A",
+                is_demo=True,
+            ),
+            database_module_module.LiveAccountConfig(
+                id="acct-stale",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-B",
+                is_demo=True,
+            ),
+            database_module_module.LiveAccountConfig(
+                id="acct-rotated",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-C",
+                is_demo=True,
+            ),
+        ]
+    )
+    for account_id, login in (
+        ("acct-fresh", "PAPER-A"),
+        ("acct-stale", "PAPER-B"),
+        ("acct-rotated", "PAPER-C"),
+    ):
+        database_module_module.record_live_account_demo_verification(
+            account_id, is_demo=True, ctid=f"ctid-{account_id}", broker_login=login
+        )
+
+    created = database_module_module.create_live_deployment(
+        database_module_module.LiveDeploymentConfig(
+            id="11111111-2222-3333-4444-555555555555",
+            strategy_name="s",
+            account_id="acct-fresh",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+            signal_source_type="discord",
+            signal_source_id="RAMJET",
+        )
+    )
+    deployment_id = str(created.id)
+
+    # The happy path still works, so this is a gate and not a lockout.
+    ok = database_module_module.update_live_deployment_account(
+        deployment_id, "acct-fresh"
+    )
+    assert ok is not None and ok.account_id == "acct-fresh"
+
+    # Arm 1: the verification aged out. Only the is_demo flag is still true.
+    with database_module_module.get_session() as session:
+        record = session.get(database_module_module.LiveAccountModel, "acct-stale")
+        record.demo_verified_at = record.demo_verified_at.replace(year=2020)
+        session.add(record)
+        session.commit()
+    assert database_module_module.live_account_submission_block_reason("acct-stale")
+    with pytest.raises(ValueError, match="older than"):
+        database_module_module.update_live_deployment_account(
+            deployment_id, "acct-stale"
+        )
+
+    # Arm 2: the credentials were rotated, so the fingerprint no longer matches
+    # even though the stamp is fresh and the flag is set.
+    with database_module_module.get_session() as session:
+        record = session.get(database_module_module.LiveAccountModel, "acct-rotated")
+        record.broker_login = "PAPER-ROTATED"
+        session.add(record)
+        session.commit()
+    reason = database_module_module.live_account_submission_block_reason(
+        "acct-rotated"
+    )
+    assert reason, "the fixture must actually be a mismatch, or this arm is vacuous"
+    with pytest.raises(ValueError):
+        database_module_module.update_live_deployment_account(
+            deployment_id, "acct-rotated"
+        )

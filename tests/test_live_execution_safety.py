@@ -6638,3 +6638,105 @@ class TestPreflightSymbolCoverage:
 
         assert errors == []
         assert warnings == []
+
+
+def test_deleting_a_deployment_with_an_in_flight_submission_says_so(
+    viewer_client, isolated_db, monkeypatch
+):
+    """DELETE is a live control too, and it was the only one with no drain.
+
+    PAUSE and STOP snapshot the leases, apply the change, drain, and return a
+    verdict that distinguishes "nothing was in flight" from "N orders may still
+    reach the broker". DELETE did none of that: it removed every claim and the row
+    and answered `{"status": "deleted"}`. An operator who deleted an ACTIVE
+    deployment with a live lease was told it was deleted while the dispatcher
+    still held its order at the broker - and because the reap later removes the
+    claim row, no code path could ever classify the outcome. The row's
+    disappearance proves nothing, which is exactly what the drain's own docstring
+    says.
+
+    The drain has to run *before* the delete, because `delete_live_deployment`
+    removes the claim rows as part of it. Draining afterwards would find nothing
+    left to account for and report a clean stop for submissions it never saw.
+
+    Deliberately no `status` key here, unlike the status path: the deployment is
+    gone and there is no status to report. The verdict fields are the whole point.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-delete-in-flight", ttl_seconds=30.0
+    ) is True
+
+    real_drain = viewer_app_module._drain_live_deployment_submissions
+
+    async def _budgeted_drain(target_deployment_id, **_kwargs):
+        return await real_drain(target_deployment_id, timeout_seconds=0.2)
+
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _budgeted_drain
+    )
+
+    resp = viewer_client.delete(
+        f"/api/live/deployments/{deployment_id}"
+        f"?confirm_deployment_id={deployment_id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "deleted"
+    assert body["submission_drain_outcome"] == "IN_FLIGHT", (
+        f"a delete with a live lease reported a clean outcome: {body}"
+    )
+    assert body["submission_drain_complete"] is False
+    assert body["in_flight_submissions"] == 1
+    assert "may still reach the broker" in body["warning"], (
+        f"an in-flight order was deleted without saying so: {body}"
+    )
+    # And the deployment really is gone, so the warning is not an excuse.
+    assert database.get_live_deployment(deployment_id) is None
+
+
+def test_deleting_a_deployment_with_nothing_in_flight_reports_a_clean_drain(
+    viewer_client, isolated_db, monkeypatch
+):
+    """The other direction: the verdict must not be theatre that always warns.
+
+    A control that always says "verify the broker" teaches operators to ignore
+    it. Nothing in flight is the overwhelmingly common case and has to read as
+    DRAINED with no warning.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    real_drain = viewer_app_module._drain_live_deployment_submissions
+
+    async def _budgeted_drain(target_deployment_id, **_kwargs):
+        return await real_drain(target_deployment_id, timeout_seconds=0.2)
+
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _budgeted_drain
+    )
+
+    resp = viewer_client.delete(
+        f"/api/live/deployments/{deployment_id}"
+        f"?confirm_deployment_id={deployment_id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["submission_drain_outcome"] == "DRAINED", body
+    assert body["submission_drain_complete"] is True
+    assert body["in_flight_submissions"] == 0
+    assert "warning" not in body, (
+        f"a clean delete warned anyway, which trains operators to ignore the "
+        f"field that matters: {body}"
+    )

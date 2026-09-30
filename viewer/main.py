@@ -12932,6 +12932,25 @@ async def delete_live_deployment_endpoint(
         ),
         request=request,
     )
+    # Drain before the delete, not after. PAUSE and STOP snapshot the leases, apply
+    # the change, drain, and report a verdict; DELETE did none of that - it removed
+    # every claim and the row, and answered `{"status": "deleted"}`. An operator who
+    # deleted an ACTIVE deployment with a live lease was told it was deleted while
+    # the dispatcher still held its order at the broker, and the reap that later
+    # removed the claim row meant no code path could ever classify the outcome.
+    # That is the ambiguity the drain verdict exists to make observable, and this
+    # was the one state-changing live control that skipped it.
+    #
+    # The drain has to come first because `delete_live_deployment` deletes the claim
+    # rows as part of the delete: draining afterwards would find nothing left to
+    # account for and report a clean stop for submissions it never observed.
+    pending_claims = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    drain = await _drain_live_deployment_submissions(
+        deployment_id, initial_claims=pending_claims
+    )
+
     deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
@@ -12940,8 +12959,45 @@ async def delete_live_deployment_endpoint(
         target_type="live_deployment",
         target_id=deployment_id,
         request=request,
+        detail={
+            "submission_drain_outcome": drain.outcome.value,
+            "in_flight_submissions": drain.in_flight,
+            "expired_unreleased_submissions": drain.expired_unreleased,
+        },
     )
-    return {"status": "deleted", "id": deployment_id}
+    result: dict[str, Any] = {
+        "status": "deleted",
+        "id": deployment_id,
+        "submission_drain_outcome": drain.outcome.value,
+        "submission_drain_complete": drain.complete,
+        "in_flight_submissions": drain.in_flight,
+        "expired_unreleased_submissions": drain.expired_unreleased,
+    }
+    if drain.outcome is LiveSubmissionDrainOutcome.IN_FLIGHT:
+        result["warning"] = (
+            f"Deployment deleted, but {drain.in_flight} submission(s) were in "
+            "flight when it was removed and may still reach the broker. Verify "
+            "the broker account."
+        )
+    elif drain.outcome is LiveSubmissionDrainOutcome.INDETERMINATE:
+        result["warning"] = (
+            f"Deployment deleted, but {drain.expired_unreleased} submission "
+            "lease(s) expired without being released, so whether those orders "
+            "reached the broker is unknown. Verify the broker account."
+        )
+    if not drain.complete:
+        logger.error(
+            "Live deployment deleted; submission drain did not complete cleanly",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "submission_drain_outcome": drain.outcome.value,
+                    "in_flight_submissions": drain.in_flight,
+                    "expired_unreleased_submissions": drain.expired_unreleased,
+                }
+            },
+        )
+    return result
 
 
 @app.get("/api/live/audit")

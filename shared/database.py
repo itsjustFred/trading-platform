@@ -3331,10 +3331,25 @@ def update_live_deployment_account(
         account = session.get(LiveAccountModel, normalized_account)
         if account is None:
             raise ValueError(f"Refusing to re-point at unknown account '{account_id}'")
-        if not bool(account.is_demo):
+        # The full verdict, not just the is_demo flag. The docstring has always
+        # promised a *verified* demo account, and this check only ever read the
+        # flag, so it skipped both the freshness window and the identity
+        # fingerprint that every other arming path enforces. An operator could
+        # therefore re-point a deployment - including an ACTIVE one, with
+        # allow_active - at an account whose verification expired hours ago, or
+        # whose credentials had been rotated since. The daemon's per-dispatch gate
+        # would still refuse the resulting orders, so no order reaches a non-demo
+        # broker: the damage is a silently mis-armed deployment and a succeeded
+        # audit record for a state the documented gate should have refused.
+        #
+        # Same helper, same reason strings, as create_live_deployment and
+        # update_live_deployment_status, so the three cannot disagree about what
+        # "verified" means.
+        account_block_reason = live_account_verification_block_reason(account)
+        if account_block_reason is not None:
             raise ValueError(
-                "Refusing to re-point a deployment at an account that is not "
-                "verified as demo"
+                f"Refusing to re-point a deployment at an account that is not "
+                f"verified for live trading: {account_block_reason}"
             )
 
         current_status = str(record.status or "").strip().upper()
