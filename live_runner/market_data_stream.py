@@ -160,14 +160,35 @@ class _StreamWorker:
     def set_symbols(self, symbols: set[str]) -> None:
         normalized = {_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)}
         with self._lock:
+            removed = sorted(self._symbols - normalized)
             self._symbols = normalized
         if self.stream is None:
             return
-        if hasattr(self.stream, "unsubscribe_bars"):
+        if removed and hasattr(self.stream, "unsubscribe_bars"):
             try:
-                self.stream.unsubscribe_bars()
-            except Exception:
-                pass
+                # The symbols being dropped have to be named. In alpaca-py
+                # `unsubscribe_bars(*symbols)` deletes exactly the symbols it is
+                # given - "*" is the spelling for all of them - so the argument-less
+                # call this used to make removed nothing, and because `subscribe_bars`
+                # merges into the handler dict rather than replacing it, the
+                # subscribed set could only ever grow.
+                self.stream.unsubscribe_bars(*removed)
+            except Exception as exc:
+                # Logged rather than raised: set_symbols is called once per worker
+                # from the refresh loop, so an exception here would abandon the
+                # remaining workers' updates. Not raised means a websocket that is
+                # already closed leaves the old subscription in place, which must
+                # not pass unnoticed.
+                logger.warning(
+                    "Alpaca bar unsubscribe failed; the previous symbols stay subscribed",
+                    extra={
+                        "data": {
+                            "removed_symbols": removed,
+                            "current_symbols": sorted(normalized),
+                            "error": str(exc),
+                        }
+                    },
+                )
         if normalized:
             self._subscribe_symbols(sorted(normalized))
 
@@ -325,6 +346,15 @@ class LiveMarketDataStreamService:
         payload = _serialize_bar_payload(bar)
         symbol = payload["symbol"]
         if not symbol:
+            return
+        # Only record bars for symbols this worker is currently subscribed to. A bar
+        # can still arrive for one that was just dropped, because the broker may
+        # have it in flight, and it used to be recorded regardless - leaving data
+        # for an abandoned symbol in `_bars`, where a consumer cannot tell it from
+        # a live one.
+        with self._lock:
+            current = self._symbols
+        if symbol not in current:
             return
         await asyncio.to_thread(self._append_bar_sync, symbol, payload)
 
