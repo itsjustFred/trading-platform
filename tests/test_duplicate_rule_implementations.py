@@ -397,3 +397,43 @@ def test_every_signal_bot_resolves_timeframe_spellings_identically() -> None:
     assert NitroSignalProcessor._prepare_market_data is RamJetSignalProcessor._prepare_market_data, (
         "NitroSignalProcessor._prepare_market_data is no longer the inherited RamJet one."
     )
+
+
+def test_both_signal_processors_compute_the_same_atr() -> None:
+    """The two copies of `_calculate_atr` must agree, and neither was tested at all.
+
+    They differ textually - one drops the scratch columns and returns, the other returns
+    the drop inline - so a body-equality pin cannot see them, and before this the
+    function was named in no test file. It is the ATR that becomes the live stop and
+    take-profit, so a divergence here is a divergence in order prices.
+
+    Pinned by output rather than by text, because the textual difference is benign and
+    normalising it would be churn.
+    """
+    import numpy as np
+    import pandas as pd
+    from signal_bots.ramjet.processor import RamJetSignalProcessor as RamJet
+    from signal_bots.rocketfuel.processor import RocketFuelSignalProcessor as RocketFuel
+
+    rng = np.random.default_rng(11)
+    rows = 200
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, rows)))
+    frame = pd.DataFrame(
+        {
+            "open": close,
+            "high": close * 1.005,
+            "low": close * 0.995,
+            "close": close,
+            "volume": 1000.0,
+        }
+    )
+    for period in (5, 7, 14, 30, 50):
+        ramjet = RamJet._calculate_atr(frame, period)
+        rocketfuel = RocketFuel._calculate_atr(frame, period)
+        assert ramjet["atr"].equals(rocketfuel["atr"]), (
+            f"period {period}: the two processors compute a different ATR, and this "
+            f"value becomes the live stop-loss and take-profit offset"
+        )
+        # Neither may leak the scratch columns it builds on the way.
+        for scratch in ("h_l", "h_pc", "l_pc", "tr"):
+            assert scratch not in ramjet.columns, f"period {period}: leaked {scratch!r}"
