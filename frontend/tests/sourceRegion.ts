@@ -132,3 +132,56 @@ const functionSource = (source: string, name: string): string => {
  * finds a function body is the same hazard as two copies of the function body itself.
  */
 export { functionSource };
+
+/**
+ * Source text with comments removed.
+ *
+ * A whole-file presence assertion is satisfied by a comment. Measured in
+ * `optimizationEvidence.test.ts`: renaming the `In-sample selected score` label to
+ * `Selected score` and dropping the `oos_status ?? "unavailable"` coalesce left all 19
+ * tests green, because a comment at the end of the file mentioned both. That label is
+ * the disclosure that tells an operator the displayed score came from the training
+ * window, so a comment standing in for it is not a cosmetic weakness.
+ *
+ * Comments are tracked rather than stripped by regex because `//` and `/*` occur
+ * inside strings - every URL in this codebase - and a regex strip would eat a line
+ * that happened to hold `https://`. Regex *literals* are not tracked; the two files this
+ * is used against were checked for one containing `//`, and there is none.
+ */
+export function stripComments(source: string): string {
+  const isQuote = (ch: string): boolean => ch === '"' || ch === "'" || ch === "`";
+  let out = "";
+  let quote: string | null = null;
+  let escaped = false;
+  let i = 0;
+  while (i < source.length) {
+    const ch = source[i];
+    if (quote) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (isQuote(ch)) {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && source[i + 1] === "/") {
+      while (i < source.length && source[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && source[i + 1] === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
