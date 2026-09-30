@@ -283,6 +283,31 @@ def cmd_run(args):
             logger.error("Config error: %s", e)
         sys.exit(1)
 
+    # Universe provenance (#70): who decided the symbol list, and when. The
+    # artifact records the membership fact even when nobody declared one, so a
+    # reader can tell "current list" from "point-in-time list" from "unknown"
+    # instead of having to assume the best case. The disclosure is logged too —
+    # a run that cannot rule out survivorship bias should say so out loud.
+    #
+    # Resolved here, next to the other fail-fast validation, rather than after the
+    # run. Every value it needs is known before a bar is processed, and it rejects
+    # contradictory input — an unknown membership basis, an unreadable date, or
+    # point-in-time without an as-of. Paying for a full backtest to learn that the
+    # flags were contradictory is the worst version of this bug: hours of compute,
+    # then an error, and a saved run whose provenance is unrecorded.
+    provenance = universe_provenance(
+        symbols=list(config.symbols),
+        provider=str(getattr(args, "universe_source", "") or "").strip()
+        or DEFAULT_UNIVERSE_PROVIDER,
+        as_of=str(getattr(args, "universe_as_of", "") or "").strip() or None,
+        membership=_declared_membership_basis(args),
+        point_in_time_source=str(getattr(args, "universe_source_name", "") or "").strip(),
+        resolved_at=datetime.now(timezone.utc),
+        window_start=start,
+        window_end=end,
+    )
+    logger.info("Universe provenance: %s", provenance["disclosure"])
+
     logger.info(
         "Running backtest: engine=%s, strategy=%s, symbols=%s",
         engine.name,
@@ -333,19 +358,7 @@ def cmd_run(args):
     # reader can tell "current list" from "point-in-time list" from "unknown"
     # instead of having to assume the best case. The disclosure is logged too —
     # a run that cannot rule out survivorship bias should say so out loud.
-    provenance = universe_provenance(
-        symbols=list(config.symbols),
-        provider=str(getattr(args, "universe_source", "") or "").strip()
-        or DEFAULT_UNIVERSE_PROVIDER,
-        as_of=str(getattr(args, "universe_as_of", "") or "").strip() or None,
-        membership=_declared_membership_basis(args),
-        point_in_time_source=str(getattr(args, "universe_source_name", "") or "").strip(),
-        resolved_at=datetime.now(timezone.utc),
-        window_start=start,
-        window_end=end,
-    )
     result.meta.data[UNIVERSE_PROVENANCE_KEY] = provenance
-    logger.info("Universe provenance: %s", provenance["disclosure"])
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)

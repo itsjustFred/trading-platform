@@ -15,6 +15,7 @@ needs before trusting such a result:
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import runner.cli as cli
 from runner.universe_provenance import (
     MEMBERSHIP_CURRENT,
     MEMBERSHIP_POINT_IN_TIME,
@@ -824,3 +826,73 @@ def test_a_legacy_base_artifact_reports_unknown_provenance_instead_of_a_clean_bi
     # Nothing to compare across sub-periods with a single trial and no trades:
     # unknown, not "stable".
     assert payload["diagnostics"]["subperiod_stability"]["status"] == "unknown"
+
+
+class _RecordingEngine:
+    """An engine that reports whether it was ever asked to process a bar."""
+
+    name = "native"
+
+    def __init__(self):
+        self.run_calls = 0
+
+    def validate_config(self, config):
+        return []
+
+    def run(self, *args, **kwargs):
+        self.run_calls += 1
+        raise AssertionError(
+            "engine.run was called, so a bad universe flag cost a full backtest "
+            "before it was rejected"
+        )
+
+
+def test_contradictory_universe_flags_fail_before_the_engine_runs(monkeypatch, tmp_path):
+    """`--universe-membership point_in_time` without an as-of is contradictory.
+
+    The provenance artifact exists so a reader can tell a point-in-time list from a
+    current one. Claiming the former without the date that defines it is not a
+    weaker claim, it is a false one, so it is rejected.
+
+    What matters is *when*. Every input the check needs is known before a bar is
+    processed, so it belongs with the other fail-fast validation. Rejecting it
+    afterwards means the user pays for the whole backtest, gets an error, and is
+    left with a saved run whose provenance was never recorded — the failure is
+    expensive and still leaves a misleading artifact behind. Hence the assertion on
+    run_calls: it fails if the ordering regresses, not merely if the value is wrong.
+    """
+    engine = _RecordingEngine()
+    monkeypatch.setattr(cli, "get_engine", lambda name: engine)
+    monkeypatch.setattr(cli, "require_generated_strategy_approval", lambda path: None)
+    monkeypatch.setattr(cli, "ensure_backtest_data", lambda **kwargs: [])
+    monkeypatch.setattr(
+        cli,
+        "_resolve_strategy_type",
+        lambda path: argparse.Namespace(value="market_data"),
+    )
+
+    strategy = tmp_path / "gen_strategy.py"
+    strategy.write_text("# generated\n", encoding="utf-8")
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--engine",
+            "native",
+            "--strategy",
+            str(strategy),
+            "--symbols",
+            "TEST",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-31",
+            "--universe-membership",
+            "point_in_time",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="as-of|as_of"):
+        cli.cmd_run(args)
+
+    assert engine.run_calls == 0, "the engine ran before the flags were rejected"
