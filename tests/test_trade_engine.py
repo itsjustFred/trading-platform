@@ -697,3 +697,164 @@ def test_a_position_that_stays_open_keeps_full_bar_recording():
         (130.0 - trade.entry_price) * trade.quantity
     ), "a position held through the bar must still record the bar's high"
     assert trade.mae == pytest.approx((70.0 - trade.entry_price) * trade.quantity)
+
+
+def _excursion_run(take_profit=None, stop=None, direction="LONG", tps=None, hi=115.0, lo=90.0):  # noqa: C901
+    """One entry, one wide bar, and the exit kind under test.
+
+    `direction` is a parameter because the short side of the clamp is a different
+    code path - it uses the ask-side bar and adds the spread to the fill - and every
+    excursion test before this one was LONG-only. A mutation that broke the short
+    branch by one spread passed the whole file.
+    """
+    records = [
+        {
+            "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=i),
+            "open": 100.0,
+            "high": hi if i == 10 else 101.0,
+            "low": lo if i == 10 else 99.0,
+            "close": 100.0,
+            "volume": 1000,
+        }
+        for i in range(25)
+    ]
+    data = pd.DataFrame(records)
+
+    def strategy_fn(df: pd.DataFrame, params: dict):
+        signals = pd.DataFrame(index=df.index)
+        signals["entries"] = False
+        signals["exits"] = False
+        signals["direction"] = direction
+        signals["stop_loss"] = pd.NA
+        signals["take_profit"] = pd.NA
+        signals.loc[1, "entries"] = True
+        if stop is not None:
+            signals.loc[1, "stop_loss"] = stop
+        # A ladder arrives as numbered `tpN` columns, which is how the engine
+        # collects them; a list in `take_profit` is not a shape it understands.
+        for level in range(1, 5):
+            signals[f"tp{level}"] = pd.NA
+        for name, value in (tps or {}).items():
+            signals[name] = float(value)
+        if take_profit is not None:
+            signals.loc[1, "take_profit"] = take_profit
+        else:
+            signals.loc[20, "exits"] = True
+        return signals
+
+    cfg = BacktestConfig(
+        strategy_name="excursion-side",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        max_leverage=3.0,
+        modeling_resolution="main_timeframe",
+        parameters={"fees": "zero"},
+    )
+    return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn).trades[0]
+
+
+def test_a_take_profit_cap_leaves_the_adverse_side_alone():
+    """Capping the favourable side must not flatten the adverse one.
+
+    The first version clamped the bar symmetrically to the fill, which capped *both*
+    sides. On this bar (90 to 115, entry near 100) a take-profit at 110 correctly
+    reported MFE of +10 per unit and then reported MAE of -1 per unit instead of the
+    bar's -10. Every stop-out likewise reported a near-zero MFE, so every trade looked
+    like a monotone excursion and the two metrics stopped carrying independent
+    information - the bias traded places rather than going away.
+    """
+    trade = _excursion_run(take_profit=110.0)
+
+    assert trade.mfe == pytest.approx(
+        (110.0 - trade.entry_price) * trade.quantity
+    ), "the take-profit fill must cap the favourable side"
+    assert trade.mae == pytest.approx(
+        (90.0 - trade.entry_price) * trade.quantity
+    ), (
+        f"MAE is {trade.mae / trade.quantity:+.1f} per unit; the bar's low alone is "
+        f"{90.0 - trade.entry_price:+.1f}. A take-profit exit says nothing about the "
+        f"adverse side, so capping it erases real excursion."
+    )
+
+
+def test_a_stop_cap_leaves_the_favourable_side_alone():
+    """The mirror: the stop caps MAE, and the bar's high is still the MFE."""
+    trade = _excursion_run(stop=95.0)
+
+    assert trade.mae == pytest.approx(
+        (95.0 - trade.entry_price) * trade.quantity
+    ), "the stop fill must cap the adverse side"
+    assert trade.mfe == pytest.approx(
+        (115.0 - trade.entry_price) * trade.quantity
+    ), (
+        f"MFE is {trade.mfe / trade.quantity:+.1f} per unit; the bar's high alone is "
+        f"{115.0 - trade.entry_price:+.1f}. A stop-out does not mean the position "
+        f"never went favourably."
+    )
+
+
+def test_a_short_take_profit_caps_only_the_favourable_side():
+    """The short branch is separate code and had no coverage at all.
+
+    It reads the ask-side bar via `_ask_bar` and adds the spread to the fill, so a
+    mutation there is invisible to every LONG test. A bar whose low is 90 and high
+    115 against a short entry near 100: taking profit at 90 caps the favourable
+    excursion at that level, and the adverse side still comes from the high.
+    """
+    trade = _excursion_run(take_profit=90.0, direction="SHORT", hi=115.0, lo=90.0)
+
+    # A short profits as the price falls, so the TP at 90 is the favourable cap.
+    assert trade.mfe <= trade.quantity * (trade.entry_price - 90.0) + 1e-6, (
+        f"MFE is {trade.mfe / trade.quantity:+.2f} per unit, beyond the take-profit "
+        f"fill the position actually exited at"
+    )
+    assert trade.mae == pytest.approx(
+        (trade.entry_price - 115.0) * trade.quantity
+    ), (
+        f"MAE is {trade.mae / trade.quantity:+.2f} per unit; a short's adverse side "
+        f"is the bar's high, which the take-profit exit says nothing about"
+    )
+
+
+def test_a_short_stop_caps_only_the_adverse_side():
+    """The short stop path, which adds the spread to the fill."""
+    trade = _excursion_run(stop=115.0, direction="SHORT", hi=115.0, lo=90.0)
+
+    assert trade.mae >= trade.quantity * (trade.entry_price - 115.0) - 1e-6, (
+        f"MAE is {trade.mae / trade.quantity:+.2f} per unit, worse than the stop the "
+        f"position exited at; the stop must cap the adverse side"
+    )
+    assert trade.mfe == pytest.approx(
+        (trade.entry_price - 90.0) * trade.quantity
+    ), (
+        f"MFE is {trade.mfe / trade.quantity:+.2f} per unit; the bar's low alone is "
+        f"{trade.entry_price - 90.0:+.2f}, and a stop-out does not erase it"
+    )
+
+
+def test_a_multi_level_ladder_is_credited_with_the_furthest_level_reached():
+    """Capping at the *first* pending level understated MFE five-fold.
+
+    The first version clamped to `pending_tp[0]`, but the close loop fills every
+    reached level at its own price. A ladder at 105 and 115 that fills both is
+    credited with 115; clamping to 105 reported less than half the real excursion,
+    on exactly the trades the cap was added to describe correctly.
+    """
+    trade = _excursion_run(
+        tps={"tp1": 105.0, "tp2": 115.0}, hi=130.0, lo=99.5
+    )
+
+    reached = {e.reason for e in trade.exits}
+    assert "tp1" in reached and "tp2" in reached, (
+        f"the fixture must fill both levels, got {reached}"
+    )
+    assert trade.mfe == pytest.approx(
+        (115.0 - trade.entry_price) * trade.quantity
+    ), (
+        f"MFE is {trade.mfe / trade.quantity:+.1f} per unit; both levels filled, so "
+        f"the furthest one reached (115) is the cap, not the first pending (105)"
+    )
