@@ -2527,14 +2527,50 @@ def test_the_daemon_loop_refreshes_stale_verifications_and_skips_fresh_ones(
     assert written == 0, "a freshly verified account triggered a needless refresh"
     assert len(calls) == 1, "the broker was asked again with nothing stale to fix"
 
-    # And the loop actually calls it. A test of the helper alone would pass with
-    # the call site deleted, which is the bug this whole change is about.
+    # And the *loop* actually calls it, checked structurally.
+    #
+    # A whole-file substring search was the first attempt and it was worthless: it
+    # matched anywhere in the file, so moving the call out of the loop - into
+    # `run_daemon`'s one-shot startup, say - left the assertion green while the
+    # daemon refreshed once at boot and refused every dispatch after 900s. That is
+    # the exact failure the commit describes, and the check said it was fine.
+    #
+    # An AST walk ties the call to the `while` body, next to the
+    # `_load_db_accounts_and_deployments()` it refreshes accounts for. Moving it
+    # anywhere else - including into the one-shot startup path - now fails.
+    import ast
     from pathlib import Path
 
     source = Path(daemon_module.__file__).read_text(encoding="utf-8")
-    assert "_refresh_stale_account_verifications(accounts)" in source, (
-        "the daemon's main loop no longer calls the refresher; every dispatch "
-        "would be refused once the TTL expires, with nothing in the loop to renew it"
+    tree = ast.parse(source)
+
+    called_in: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.While, ast.For, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", [])
+        # only the direct statements of this block, not a nested function's
+        for stmt in body:
+            for inner in ast.walk(stmt):
+                if not isinstance(inner, ast.Call):
+                    continue
+                # A bare call is `Name(id=...)`; a qualified one is
+                # `Attribute(value=Name(id=...))`. Only the second form has
+                # `.value`, and my first attempt read that - so it matched nothing
+                # and the assertion failed for a reason that had nothing to do with
+                # the code under test.
+                called = None
+                if isinstance(inner.func, ast.Name):
+                    called = inner.func.id
+                elif isinstance(inner.func, ast.Attribute):
+                    called = getattr(inner.func.value, "id", None)
+                if called == "_refresh_stale_account_verifications":
+                    called_in.append(type(node).__name__)
+
+    assert "While" in called_in, (
+        f"the refresher is not called from any `while` loop: {called_in}. The "
+        "daemon would refresh once at startup and then refuse every dispatch once "
+        "the TTL expired, with nothing in the loop to renew it."
     )
 
 

@@ -111,8 +111,15 @@ SENTINEL = {
     name: 100.0 + 10.0 * position for position, name in enumerate(ALL_ALIAS_NAMES)
 }
 
-assert len(set(SENTINEL.values())) == len(ALL_ALIAS_NAMES), (
-    f"sentinel values must be distinct or precedence cannot be told apart: {SENTINEL}"
+# No distinctness assertion here: `SENTINEL` is built by a comprehension over
+# ALL_ALIAS_NAMES with strictly increasing offsets, so distinctness holds for every
+# possible value of that set. The check I first wrote beside it was a tautology that
+# could never fail - which is worse than no check, because it reads like a guard. An
+# adversarial review caught it. The real protection is structural: the values come
+# from the union itself, so an alias that appears in the source cannot be missing here.
+assert all(value > 0 for value in SENTINEL.values()), (
+    f"a sentinel must parse as a plausible price, or the matrix exercises a parse "
+    f"failure instead of a precedence difference: {SENTINEL}"
 )
 
 
@@ -151,7 +158,7 @@ def test_a_single_alias_resolves_to_the_same_number_in_both_adapters(name) -> No
 
 @pytest.mark.parametrize("name", ALL_ALIAS_NAMES)
 def test_precedence_over_conflicting_aliases_matches(name) -> None:
-    """Every alias populated with a distinct number pins the precedence order.
+    """One alias omitted at a time pins the precedence order.
 
     The order of the alias tuple decides the stop, so a reorder on one side is a
     silent change to where a position gets stopped out - and both adapters reading
@@ -166,7 +173,8 @@ def test_precedence_over_conflicting_aliases_matches(name) -> None:
     for keys in (ALPACA_ALIASES["_SL_METADATA_KEYS"], ALPACA_ALIASES["_TP_METADATA_KEYS"]):
         outcomes = {broker: _resolve(fn, metadata, keys) for broker, fn in RESOLVERS.items()}
         assert outcomes["alpaca"] == outcomes["ctrader"], (
-            f"with every alias populated, {name!r} present, the two adapters disagree: "
+            f"with {name!r} omitted and the rest populated, the two adapters "
+            f"disagree: "
             f"{outcomes}. Precedence is what decides the stop price."
         )
 
