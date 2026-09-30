@@ -143,10 +143,27 @@ export function formatRatioStat(
   return Number(value).toFixed(decimals);
 }
 
-/** Tier color for Sharpe ratio values. */
-export function sharpeTone(sharpe: number): string {
-  if (sharpe > 1) return SHARPE_TONES.strong;
-  if (sharpe > 0) return SHARPE_TONES.weak;
+/**
+ * Tier color for a Sharpe ratio, or `undefined` when it cannot be computed.
+ *
+ * The backend emits `null` for a statistic it could not compute, and `undefined` is
+ * how a caller says "no opinion" to `StatCard`, which then renders its neutral
+ * state. Returning a tone for an absent number would attach a performance judgement
+ * to a measurement that was never made - amber for a null Sharpe reads as "measured,
+ * and mediocre".
+ *
+ * This is the only place the Sharpe tiers are decided. `PortfolioDetailPage` used to
+ * inline a two-tier version of this rule while `BacktestDetailPage` called this
+ * helper, so a *negative* Sharpe showed amber on the portfolio page and red on the
+ * backtest page: the same metric, two screens, two answers.
+ */
+export function sharpeTone(
+  sharpe: number | string | null | undefined,
+): string | undefined {
+  if (isUnavailableStatValue(sharpe)) return undefined;
+  const value = Number(sharpe);
+  if (value > 1) return SHARPE_TONES.strong;
+  if (value > 0) return SHARPE_TONES.weak;
   return SHARPE_TONES.negative;
 }
 

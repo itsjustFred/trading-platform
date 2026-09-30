@@ -28,6 +28,7 @@ import type {
 import {
   UNAVAILABLE_STAT_TEXT,
   formatRatioStat,
+  sharpeTone,
   isUnavailableStatValue,
 } from "../lib/statFormat";
 import {
@@ -515,7 +516,7 @@ export function PortfolioDetailPage() {
         <StatCard
           label="Sharpe (higher = better)"
           value={formatRatioStat(stats.sharpe)}
-          color={stats.sharpe > 1 ? "#3fb950" : "#d29922"}
+          color={sharpeTone(stats.sharpe)}
         />
         <StatCard label="Sortino" value={formatRatioStat(stats.sortino)} color="#58a6ff" />
         <StatCard

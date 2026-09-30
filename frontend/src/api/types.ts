@@ -470,7 +470,7 @@ export interface LiveAccount {
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
-export type ServiceType = "discord_bot" | "scheduled_job";
+export type ServiceType = "discord_bot" | "scheduled_job" | "trading_daemon";
 export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
 export type VerificationEvidenceStatus =
   | "success"
@@ -485,6 +485,13 @@ export interface Service {
   status: ServiceStatus;
   config: Record<string, unknown>;
   last_activity?: string | null;
+  /**
+   * When anyone last *tried* this service, which is a different question from
+   * `last_activity`. A service that has failed keeps re-reading as failed long
+   * after its listener is gone, so "when did it last do anything?" cannot answer
+   * "is it still trying?". Mirrors `shared.models.Service`.
+   */
+  last_attempt_at?: string | null;
   created_at: string;
 }
 
@@ -1247,18 +1254,27 @@ export interface PortfolioDetail {
   account_capital: number;
   components: PortfolioComponent[];
   strategies: PortfolioStrategy[];
+  /**
+   * Mirrors `shared.models.PortfolioStats`. The nullable members are nullable
+   * *upstream*, not optionally: the backend emits `null` for a statistic it could
+   * not compute, and `isUnavailableStatValue` in `lib/statFormat.ts` exists to
+   * render that as unavailable rather than as zero. Declaring them `number` while
+   * the code checks them for null is a type lie that `tsc` cannot catch in the
+   * other direction - it rejects the correct handling and permits arithmetic on
+   * a null at runtime.
+   */
   combined_stats: {
-    sharpe: number;
-    sortino?: number;
-    cagr: number;
+    sharpe: number | null;
+    sortino?: number | null;
+    cagr: number | null;
     total_return?: number;
     max_drawdown_duration?: number;
     win_rate?: number;
-    profit_factor?: number;
-    calmar?: number;
-    max_drawdown: number;
+    profit_factor?: number | null;
+    calmar?: number | null;
+    max_drawdown: number | null;
     net_profit: number;
-    psr?: number;
+    psr?: number | null;
     p_value?: number;
     correlation_matrix: Record<string, Record<string, number>>;
   };

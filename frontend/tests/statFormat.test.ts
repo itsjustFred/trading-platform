@@ -5,6 +5,7 @@ import {
   formatRatioStat,
   formatStatCardValue,
   isUnavailableStatValue,
+  sharpeTone,
   resolveStatCardColor,
 } from "../src/lib/statFormat.ts";
 
@@ -119,4 +120,36 @@ test("a ratio that cannot be computed is absent, not zero", () => {
   assert.equal(formatRatioStat(1.23456), "1.235");
   assert.equal(formatRatioStat("-2.5"), "-2.500");
   assert.equal(formatRatioStat("1.5", 2), "1.50");
+});
+
+test("sharpeTone returns undefined for a ratio the backend could not compute", () => {
+  // The backend emits null for a statistic it could not compute. Returning a tone
+  // for it attaches a judgement to a measurement that was never made: amber on a
+  // null Sharpe reads as "measured, and mediocre".
+  assert.equal(sharpeTone(null), undefined);
+  assert.equal(sharpeTone(undefined), undefined);
+  assert.equal(sharpeTone(Number.NaN), undefined);
+  assert.equal(sharpeTone(""), undefined);
+});
+
+test("sharpeTone has three tiers, so a negative Sharpe is not amber", () => {
+  // PortfolioDetailPage used to inline a two-tier version of this rule while
+  // BacktestDetailPage called the helper, so the same negative Sharpe was amber on
+  // one screen and red on the other. The third tier is the point.
+  assert.equal(sharpeTone(2.0), "#3fb950");
+  assert.equal(sharpeTone(1.0), "#d29922");
+  assert.equal(sharpeTone(0.5), "#d29922");
+  assert.equal(sharpeTone(0), "#f85149");
+  assert.equal(sharpeTone(-1.5), "#f85149");
+});
+
+test("sharpeTone accepts the string spelling a payload may carry", () => {
+  assert.equal(sharpeTone("2.0"), "#3fb950");
+  assert.equal(sharpeTone("0.5"), "#d29922");
+  assert.equal(sharpeTone("-0.5"), "#f85149");
+  // "n/a" is not "unavailable" as far as `isUnavailableStatValue` is concerned -
+  // there is a pre-existing test pinning that, and it is not mine to overturn here.
+  // So it is a value that is merely not a number, `Number("n/a")` is NaN, and every
+  // comparison is false, which lands it in the negative tier.
+  assert.equal(sharpeTone("n/a"), "#f85149");
 });
