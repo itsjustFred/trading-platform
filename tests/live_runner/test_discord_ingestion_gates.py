@@ -1352,8 +1352,20 @@ def test_unknown_auth_scheme_is_rejected():
         )
 
 
-def test_daemon_resolves_auth_scheme_file_first_with_per_bot_override():
+def _no_auth_scheme_in_environment(monkeypatch) -> None:
+    monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
+    monkeypatch.delenv("DISCORD_BOT_NITRO_AUTH_SCHEME", raising=False)
+
+
+def test_daemon_resolves_auth_scheme_file_first_with_per_bot_override(monkeypatch):
     import live_runner.daemon as daemon
+
+    # The empty-dict arm below asserts the unconfigured fallback, and
+    # `resolve_env_value` falls through to the process environment, so an exported
+    # DISCORD_AUTH_SCHEME would decide that answer instead of the code. Every
+    # sibling in this file clears both variables first; this one did not, which
+    # made one assertion depend on the shell it was launched from.
+    _no_auth_scheme_in_environment(monkeypatch)
 
     env = {"DISCORD_AUTH_SCHEME": "account"}
     assert daemon._resolve_discord_auth_scheme("RAMJET", env) == "account"
@@ -1414,11 +1426,6 @@ def test_process_environment_cannot_override_the_accounts_file(monkeypatch):
 # interchangeable, so an unrecognised value (a typo such as `bearer`) must be
 # refused at config load. Guessing it instead means sending the wrong
 # Authorization header and 401ing at send time, once per poll.
-
-
-def _no_auth_scheme_in_environment(monkeypatch) -> None:
-    monkeypatch.delenv("DISCORD_AUTH_SCHEME", raising=False)
-    monkeypatch.delenv("DISCORD_BOT_NITRO_AUTH_SCHEME", raising=False)
 
 
 def test_daemon_rejects_an_unknown_global_auth_scheme(monkeypatch):

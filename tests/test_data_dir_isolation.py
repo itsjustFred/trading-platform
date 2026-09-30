@@ -103,12 +103,23 @@ def _probe(data_dir: str, modules: list[str]) -> dict[str, str | None]:
         env=env,
         cwd=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
     )
+    # Checked before its stdout is used. A failed lookup prints nothing, and the
+    # probe would then be handed an empty project path - so the failure surfaces
+    # as "the probe failed", pointing at the isolation check rather than at the
+    # lookup that actually broke. The two also shared no cwd, which is not why
+    # this went unnoticed but is one fewer difference between them.
+    project_root = repo_root.stdout.strip()
+    assert repo_root.returncode == 0 and project_root, (
+        f"could not resolve PROJECT_ROOT, so the probe was handed "
+        f"{project_root!r} and any failure below would point at the wrong thing:\n"
+        f"{repo_root.stderr[-800:]}"
+    )
     done = subprocess.run(
         [
             sys.executable,
             "-c",
             _PROBE,
-            repo_root.stdout.strip(),
+            project_root,
             data_dir,
             json.dumps(modules),
         ],
@@ -116,6 +127,7 @@ def _probe(data_dir: str, modules: list[str]) -> dict[str, str | None]:
         text=True,
         timeout=180,
         env=env,
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parent.parent),
     )
     assert done.returncode == 0, (
         f"the probe itself failed, so this test would be asserting nothing:\n"

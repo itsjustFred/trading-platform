@@ -2634,7 +2634,17 @@ class TestStoppedDiscordServiceStatus:
             def cancel(self) -> None:
                 return None
 
-            async def __await__(self):
+            def __await__(self):
+                # A generator, not `async def`. `__await__` must return an
+                # iterator, so an `async def __await__` hands the awaiter a
+                # coroutine and the failure becomes
+                # `TypeError: __await__() returned a coroutine` - measured, not
+                # assumed. The double then simulated a task that raised the wrong
+                # exception entirely, while naming "listener died" in its body.
+                # The cleanup path does `await task` (daemon.py:2524), so this was
+                # one await away from masking the very failure it claims to model.
+                if False:  # pragma: no cover - makes this a generator function
+                    yield
                 raise RuntimeError("listener died")
 
             def __iter__(self):

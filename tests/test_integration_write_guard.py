@@ -36,6 +36,9 @@ _MODULE_PATH = (
 )
 
 
+OVERRIDE_ENV = "PERMA_ALLOW_PRODUCTION_INTEGRATION"
+
+
 def _isolation():
     """Import the side-effect-free guard, not the suite that uses it."""
     from tests.integration import viewer_isolation
@@ -70,6 +73,13 @@ def _import_suite(monkeypatch, base_url: str, **env: str):
     """
     monkeypatch.setenv("BASE_URL", base_url)
     monkeypatch.setenv("PERMA_ALLOW_LIVE_VIEWER_WRITES", "1")
+    # The production-write override is read from the environment on *every* call
+    # (`viewer_isolation.override_enabled`), not captured at import, so an operator
+    # shell that exports it silently changes what this file verifies: the guard
+    # under test turns itself off and the refusal cases stop being refusals. The
+    # other two variables are set; this one has to be cleared. A passing run must
+    # not depend on the shell it was launched from.
+    monkeypatch.delenv(OVERRIDE_ENV, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     name = "integration_suite_probe"
@@ -194,3 +204,27 @@ def test_no_environment_means_no_discovery_either(monkeypatch, no_network):
 
     assert no_network == [], "with no BASE_URL there is nothing to contact"
     assert module.STRATEGY_TEST_MATRIX == []
+
+
+def test_the_production_write_override_cannot_come_from_the_shell(monkeypatch):
+    """These tests must mean the same thing whoever launches them.
+
+    `viewer_isolation.override_enabled()` reads the environment on every call, and
+    it is the single switch that turns the production-write guard off. Nothing
+    cleared it here, so an operator who exports it in their shell would watch the
+    refusal cases quietly stop refusing - and a green run would mean "the guard was
+    disabled", not "the guard worked".
+
+    Set from the environment exactly as a shell would, then assert the guard is
+    still armed after the import helper has run.
+    """
+    monkeypatch.setenv(OVERRIDE_ENV, "1")
+
+    _import_suite(monkeypatch, PRODUCTION)
+
+    from tests.integration import viewer_isolation
+
+    assert not viewer_isolation.override_enabled(), (
+        "the production-write override survived the import; a passing run in an "
+        "operator shell would mean the guard was disabled, not that it worked"
+    )

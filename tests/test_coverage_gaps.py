@@ -1283,13 +1283,24 @@ def test_a_gap_with_unreadable_endpoints_is_never_excused():
     # unstated venue is not a licence to excuse, and that is the defect.
     assert _gap_is_market_closure(weekend, timeframe="1m", symbol="AAPL")
 
-    assert not _gap_is_market_closure({**weekend, "start": ""}, timeframe="1m")
-    assert not _gap_is_market_closure({**weekend, "end": "not-a-date"}, timeframe="1m")
+    # Every negative case names the US venue too. Without it these assertions
+    # still passed - but for the wrong reason: an unnamed venue is refused before
+    # the endpoints are ever read, so the test was measuring the venue guard three
+    # times over and the fail-closed parsing it exists to pin was not exercised at
+    # all. Found by a CodeRabbit review scoped to tests/, one commit after the
+    # venue guard landed.
+    assert not _gap_is_market_closure(
+        {**weekend, "start": ""}, timeframe="1m", symbol="AAPL"
+    )
+    assert not _gap_is_market_closure(
+        {**weekend, "end": "not-a-date"}, timeframe="1m", symbol="AAPL"
+    )
     # A report with no exact width is not guessed at from the rounded
     # `gap_days`, which cannot resolve a one-minute bar.
     assert not _gap_is_market_closure(
         {"start": "2026-09-11", "end": "2026-09-14", "gap_days": 2.73},
         timeframe="1m",
+        symbol="AAPL",
     )
 
 

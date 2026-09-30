@@ -31,8 +31,19 @@ def test_embargo_split_drops_a_real_gap_between_train_and_test():
     test_start = pd.Timestamp(split.test["start"])
     assert test_start > train_end, "test must start strictly after the train window"
     # 10 days total, 10% embargo => ~1 day gap.
-    assert (test_start - train_end) == pytest.approx(
-        pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1)
+    #
+    # Explicit bounds rather than `pytest.approx`. Timedelta is not numeric, so the
+    # `abs=` tolerance is silently ignored: measured here, a gap of *59 seconds* off
+    # the target already fails, so the assertion demanded an exact day while reading
+    # as if it allowed a minute. `test_optimizer_validation.py` documents the same
+    # behaviour and the worse case it causes there - `pytest.approx(1us, abs=1s)`
+    # passes for a gap of *zero*, which is precisely the train/test overlap this
+    # assertion exists to rule out. Same trap, opposite symptom: one too strict, one
+    # far too loose. The message carries the observed gap, so a failure says what it
+    # actually got instead of a bare comparison.
+    gap = test_start - train_end
+    assert pd.Timedelta(hours=23) <= gap <= pd.Timedelta(days=1, hours=1), (
+        f"10% of a 10-day window should be about one day of embargo, got {gap}"
     )
 
 

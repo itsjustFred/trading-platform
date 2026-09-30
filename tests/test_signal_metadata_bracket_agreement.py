@@ -101,14 +101,19 @@ RESOLVERS = {
 
 # A value that parses to something no real price is, so a wrong precedence shows up
 # as a mismatch rather than as a plausible number.
+#
+# Built from ALL_ALIAS_NAMES rather than written out by hand, and distinct per name
+# by construction. The hand-written version happened to cover all six aliases, which
+# is the problem: it was correct by coincidence and nothing would have said so when
+# a seventh alias appeared. An alias with no entry here resolves as absent, so a
+# precedence error involving it becomes invisible rather than failing.
 SENTINEL = {
-    "stop_loss": 333.0,
-    "sl_price": 111.0,
-    "stop_price": 222.0,
-    "resolved_stop_loss": 444.0,
-    "take_profit": 555.0,
-    "tp_price": 666.0,
+    name: 100.0 + 10.0 * position for position, name in enumerate(ALL_ALIAS_NAMES)
 }
+
+assert len(set(SENTINEL.values())) == len(ALL_ALIAS_NAMES), (
+    f"sentinel values must be distinct or precedence cannot be told apart: {SENTINEL}"
+)
 
 
 def _resolve(resolver, metadata, keys):
@@ -152,7 +157,12 @@ def test_precedence_over_conflicting_aliases_matches(name) -> None:
     silent change to where a position gets stopped out - and both adapters reading
     the same metadata must land on the same one.
     """
-    metadata = dict(SENTINEL)
+    # `name` is omitted, so each parametrised case is a *different* scenario: with
+    # every alias present the winner is the first key in the tuple and the rest are
+    # never consulted, which is one fact repeated six times. Dropping one alias at a
+    # time is what actually walks the order - a reorder on either side moves which
+    # of the remaining values wins.
+    metadata = {k: v for k, v in SENTINEL.items() if k != name}
     for keys in (ALPACA_ALIASES["_SL_METADATA_KEYS"], ALPACA_ALIASES["_TP_METADATA_KEYS"]):
         outcomes = {broker: _resolve(fn, metadata, keys) for broker, fn in RESOLVERS.items()}
         assert outcomes["alpaca"] == outcomes["ctrader"], (

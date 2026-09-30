@@ -30,6 +30,20 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST_INDEX = PROJECT_ROOT / "frontend" / "dist" / "index.html"
 
 
+def _sync_playwright():
+    """`sync_playwright`, or skip the test that needs it.
+
+    importorskip rather than a bare import: nothing else here covers "the
+    playwright package is not installed". The `e2e` gate covers the browser and the
+    fixture covers "no browser launches", but on a checkout without the optional
+    dependency the import raised ModuleNotFoundError and the run failed instead of
+    skipping. Both call sites go through this so the two cannot disagree.
+    """
+    return pytest.importorskip(
+        "playwright.sync_api", reason="playwright is not installed"
+    ).sync_playwright
+
+
 @pytest.fixture(scope="module")
 def journey_browser() -> str:
     """The first browser that can actually launch here.
@@ -39,7 +53,7 @@ def journey_browser() -> str:
     owns the `browser_name` paramspec - so relying on either would make this test
     silently skip on a box where a browser *is* present.
     """
-    from playwright.sync_api import sync_playwright
+    sync_playwright = _sync_playwright()
 
     with sync_playwright() as playwright:
         for name in ("chromium", "firefox", "webkit"):
@@ -176,7 +190,7 @@ def read_only_viewer(tmp_path_factory: pytest.TempPathFactory):
 def test_backtests_journey_is_read_only_and_honest(
     read_only_viewer: str, journey_browser: str
 ) -> None:
-    from playwright.sync_api import sync_playwright
+    sync_playwright = _sync_playwright()
 
     base_url = read_only_viewer
     # Anything a "view" page must never do. Recorded, not blocked: the point is to
