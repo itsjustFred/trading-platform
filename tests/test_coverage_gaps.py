@@ -1520,3 +1520,242 @@ def test_every_hole_above_the_threshold_is_returned_largest_first(tmp_path):
     assert [round(float(gap["gap_days"]), 2) for gap in gaps] == [4.0, 3.5], (
         f"gaps must come back largest first: {[(g['start'], g['gap_days']) for g in gaps]}"
     )
+
+
+def _segmented_gap_file(tmp_path, name: str):
+    """One 1-minute file with a 30-minute hole, written under `name`."""
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    idx = pd.date_range("2024-03-01 14:30", periods=240, freq="1min", tz="UTC")
+    idx = idx.delete(slice(120, 150))
+    base = np.arange(len(idx), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / name
+    directory.mkdir(parents=True)
+    path = directory / f"{name}.parquet"
+    frame.to_parquet(path, index=False)
+    return validate_parquet(path, ohlcv_root=root)
+
+
+def test_a_segmented_dataset_is_validated_at_its_own_timeframe(tmp_path):
+    """A segmented file must not be validated at the 3-hour default.
+
+    `validate_parquet` took `candidate.stem` as the timeframe, so every segmented
+    dataset became a timeframe called `1m_2024_03`. That misses the gap-threshold
+    table and falls back to 180 minutes - a **36x** loosening against the 5 minutes
+    a 1-minute file actually gets. Measured on identical data, before the fix:
+
+        1m.parquet          -> status=warning  gaps=1
+        1m_2024_03.parquet  -> status=ok      gaps=0
+
+    A 30-minute hole in a segmented 1m file was not merely under-reported; it was
+    invisible, and `status=ok` is a claim that the data is clean. Segmented storage
+    is a layout this repo deliberately supports - `catalog_builder` parses the
+    segment out, has whole machinery for `tick_2024_01` monthly layouts, and merges
+    the entries - so its datasets were being validated by a reader that did not know
+    they existed.
+
+    It reached further than the threshold too: this same value is passed to
+    `_gap_classification`, so gap classification was deciding with a name no
+    calendar could match.
+
+    Both files now report the same timeframe and the same gap, and the segmented
+    name is still recognised as segmented by the shared parser.
+    """
+    plain = _segmented_gap_file(tmp_path, "1m")
+    segmented = _segmented_gap_file(tmp_path, "1m_2024_03")
+
+    assert segmented.timeframe == plain.timeframe == "1m", (
+        f"segmented reported {segmented.timeframe!r} and plain {plain.timeframe!r}; "
+        f"one parser should serve both readers"
+    )
+    assert len(segmented.gaps) == len(plain.gaps) == 1, (
+        f"the same data yielded {len(plain.gaps)} gap(s) plain and "
+        f"{len(segmented.gaps)} segmented"
+    )
+    assert segmented.status == plain.status, (
+        f"the same data was {plain.status} plain and {segmented.status} segmented"
+    )
+    # "warning", not "ok": the hole is real and must be surfaced, not tolerated.
+    assert segmented.status != "ok", (
+        "a 30-minute hole in a 1-minute series reported 'ok', which is a claim the "
+        "data is clean"
+    )
+
+
+def test_a_tick_segmented_dataset_is_still_recognised(tmp_path):
+    """The other segmented shape the catalog builder supports explicitly.
+
+    `tick_2024_01` is a monthly tick layout with its own handling in the shared
+    parser, so it is the case most likely to regress if the parser is ever changed
+    to reject rather than strip a segment.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.catalog_builder import _extract_timeframe_and_segment
+    from data_tools.validate import validate_parquet
+
+    timeframe, segment = _extract_timeframe_and_segment("tick_2024_01")
+    assert (timeframe, segment) == ("tick", "2024_01")
+
+    idx = pd.date_range("2024-01-02 09:00", periods=200, freq="min", tz="UTC")
+    base = np.arange(len(idx), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "tick_2024_01"
+    directory.mkdir(parents=True)
+    path = directory / "tick_2024_01.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = validate_parquet(path, ohlcv_root=root)
+
+    assert result.timeframe == "tick", (
+        f"a monthly tick layout was read as {result.timeframe!r}"
+    )
+
+
+def _many_expected_gaps_plus_one_real_hole(tmp_path):
+    """25 weekend-sized gaps first, then one genuine hole late in the file.
+
+    Mirrors the shape that defeats a "look at the first N gaps" rule: in a real
+    multi-month intraday file the earliest large gaps are all weekends, holidays and
+    overnight closes, and they classify as *expected*.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    days = pd.date_range("2024-01-01", "2024-02-05", freq="D", tz="UTC")
+    stamps: list[pd.Timestamp] = []
+    for day in days:
+        if day.weekday() >= 5:
+            continue
+        segment = pd.date_range(
+            day + pd.Timedelta(hours=14), periods=30, freq="1min", tz="UTC"
+        )
+        if day.day > 20:
+            segment = segment.delete(slice(10, 18))  # 8 minutes, mid-session
+        stamps.extend(segment)
+    index = pd.DatetimeIndex(sorted(set(stamps)))
+    base = np.arange(len(index), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": index,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "1m"
+    directory.mkdir(parents=True)
+    path = directory / "1m.parquet"
+    frame.to_parquet(path, index=False)
+    return validate_parquet(path, ohlcv_root=root)
+
+
+def test_a_gap_after_the_twentieth_is_still_examined(tmp_path):
+    """A verdict computed from the first 20 of 130 gaps is a claim about the first 20.
+
+    The loop was `for pos in range(min(20, len(large_gaps)))`. In a multi-month
+    intraday file the earliest large gaps are weekends, holidays and overnight
+    closes, and they classify as expected - so they consumed the whole budget and
+    nothing after them was ever looked at. A real 45-minute hole in the middle of a
+    session reported `status=ok` with no warnings at all.
+
+    The cap is kept for the *report*, which is a fair thing to want, and lifted for
+    the *examination*: a file with 130 gaps and one real hole must still say it has a
+    real hole. And when the list is truncated it says so, because a truncated list
+    that does not mention the truncation is how the cap became invisible.
+    """
+    from data_tools.validate import MAX_REPORTED_GAPS
+
+    result = _many_expected_gaps_plus_one_real_hole(tmp_path)
+
+    detected = [w for w in result.warnings if "data gaps detected" in w]
+    assert detected, f"no gap was reported at all: {result.warnings}"
+    # The property, not a count I guessed: more unexpected gaps exist than the
+    # report lists, so the examination ran past the cap. (My first attempt asserted
+    # an exact number from a fixture whose arithmetic I had not checked - 28 gaps,
+    # not 21 - so the assertion was wrong in a way that had nothing to do with the
+    # code under test.)
+    reported_total = int(detected[0].split()[0])
+    assert reported_total > MAX_REPORTED_GAPS, (
+        f"only {reported_total} gap(s) were examined, so the cap still bounds the "
+        f"examination rather than only the report"
+    )
+    assert len(result.gaps) <= MAX_REPORTED_GAPS, (
+        f"the report grew past its own cap: {len(result.gaps)}"
+    )
+    assert any("not listed" in w for w in result.warnings), (
+        f"the report was truncated without saying so: {result.warnings}. A capped "
+        f"list that does not mention the cap reads as a complete one."
+    )
+    assert result.status == "warning", (
+        f"a file with a genuine mid-session hole reported {result.status}"
+    )
+
+
+def test_a_file_with_only_expected_gaps_reports_none(tmp_path):
+    """The other direction: lifting the cap must not manufacture findings."""
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    # One continuous session, no hole anywhere. The first version of this fixture
+    # used a 30-minute window per weekday, which makes the weekday-to-weekday
+    # overnight a *genuine* 23.5-hour gap rather than an expected close - so the
+    # test failed for a correct reason and was testing the wrong thing.
+    index = pd.date_range("2024-01-02 14:30", periods=600, freq="1min", tz="UTC")
+    base = np.arange(len(index), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": index,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "1m"
+    directory.mkdir(parents=True)
+    path = directory / "1m.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = validate_parquet(path, ohlcv_root=root)
+
+    assert not result.gaps, (
+        f"weekend and overnight gaps must stay expected, got {result.gaps[:3]}"
+    )
+    assert result.status == "ok", (
+        f"a clean weekday series reported {result.status}: {result.warnings}"
+    )
