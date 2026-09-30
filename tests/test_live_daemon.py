@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 import live_runner.daemon as daemon
-import live_runner.signal_sources.discord_source as discord_source_module
 import shared.database as database
 from live_runner.ctrader_adapter import CTraderAuthTerminalError
 from live_runner.signal_sources.discord_source import (
@@ -1134,23 +1133,33 @@ def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monke
     async def _fetch(_channel_id):
         return [message]
 
-    def _forbid_source_persistence(*_args, **_kwargs):
-        pytest.fail("Discord source must not persist an execution intent before routing")
-
-    # Keep the guard effective if a future regression restores the former
-    # module-level import used by the removed source persistence helper.
-    monkeypatch.setattr(
-        discord_source_module,
-        "save_live_signal",
-        _forbid_source_persistence,
-        raising=False,
-    )
     source._fetch_messages = _fetch
 
     asyncio.run(source._poll_once("channel-1"))
 
     queued = source._queue.get_nowait()
     assert queued.metadata["discord_message_id"] == "discord-123"
+
+    # The property itself, checked rather than trusted to a tripwire.
+    #
+    # This test used to patch `save_live_signal` onto the source module with
+    # `raising=False`, as a guard for a hypothetical future re-import. That patch
+    # could never fire: the module does not import the name, so `raising=False`
+    # simply *created* an attribute nothing reads. The only true no-op patch of its
+    # kind in the suite, and the comment above it described an intent the code did
+    # not implement.
+    #
+    # So the effect is asserted instead. `list_live_signals_for_replay` reads the
+    # table the removed helper wrote to, so an empty result is proof no execution
+    # intent was persisted - and it holds regardless of how a future regression
+    # chooses to import the writer, which is the point a name-based patch cannot
+    # offer.
+    from shared.database import list_live_signals_for_replay
+
+    assert list_live_signals_for_replay() == [], (
+        "polling persisted an execution intent; the execution adapter must be the "
+        "sole authority for a persisted order"
+    )
 
 
 def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
@@ -2501,28 +2510,58 @@ class TestOneDeploymentsConfigErrorDoesNotSilenceTheOthers:
 
         import live_runner.daemon as daemon
 
-        source = inspect.getsource(daemon._dispatch_discord_trade_signal)
-        lines = source.splitlines()
+        # An AST walk, not a line-prefix scan.
+        #
+        # The previous version compared stripped line text, which is defeatable
+        # twice over. Verified by mutation: changing the offending `continue` to
+        # `raise RuntimeError(...)` left this test **green**, and a `raise` ends the
+        # sibling deployments exactly as a `return` does - so the guard did not guard
+        # the thing it names. The scan also ran `lines[start + 1:]` to the end of the
+        # *function* rather than the end of the loop, so it over-scanned and would
+        # have flagged a perfectly legal `return` after the loop.
+        #
+        # Now it finds the real `for` node and rejects any Return, Raise or Break at
+        # any depth inside its body, which is what "a sibling refusal must not end the
+        # loop" actually means. Nested function definitions are excluded: a `return`
+        # inside one of those is that function's, not the loop's. This is the same
+        # technique the refresher-wiring check uses, and the reason to prefer it is
+        # that one was written after a substring search passed for the wrong reason.
+        import ast
 
-        # Locate the per-deployment loop and its body.
-        start = next(
-            i for i, line in enumerate(lines) if line.strip().startswith("for deployment in")
-        )
-        body_indent = len(lines[start]) - len(lines[start].lstrip())
-        # Any return at or below the loop body's indentation, at any nesting
-        # depth. An earlier version of this guard compared indentation for
-        # equality, which missed the bug: the offending `return` sits at depth 12
-        # inside a try/except while the loop is at depth 4. Equality would have
-        # missed exactly the case it was written for.
-        offenders = [
-            line.strip()
-            for line in lines[start + 1 :]
-            if line.strip().startswith("return")
-            and (len(line) - len(line.lstrip())) >= body_indent
+        tree = ast.parse(inspect.getsource(daemon._dispatch_discord_trade_signal))
+        loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and any(
+                isinstance(inner, ast.Name) and inner.id == "deployment"
+                for inner in ast.walk(node.target)
+            )
         ]
+        assert len(loops) == 1, (
+            f"expected exactly one per-deployment loop, found {len(loops)}; the "
+            f"guard cannot tell which one it is protecting"
+        )
+        loop = loops[0]
+        offenders: list[str] = []
+        # A nested definition's returns are its own, not the loop's.
+        skipped: set[int] = set()
+        for node in ast.walk(loop):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                skipped.update(id(n) for n in ast.walk(node))
+        for node in ast.walk(loop):
+            if id(node) in skipped:
+                continue
+            if isinstance(node, (ast.Return, ast.Raise)):
+                offenders.append(f"{type(node).__name__} at line {node.lineno}")
+            elif isinstance(node, ast.Break):
+                offenders.append(f"Break at line {node.lineno}")
         assert not offenders, (
-            f"a bare return inside the per-deployment loop skips every later "
-            f"deployment: {offenders}"
+            f"a return/raise/break inside the per-deployment loop ends the sibling "
+            f"deployments after it, which is the bug this guard exists for: "
+            f"{offenders}"
         )
 
 
