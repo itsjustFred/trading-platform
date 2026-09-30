@@ -1007,18 +1007,36 @@ async def refresh_account_demo_verifications() -> int:
         return 0
 
     written = 0
+    skipped = 0
     for account in discovered:
-        if not isinstance(account, dict):
-            continue
-        account_id = str(account.get("id") or "").strip()
+        # `discover_configured_accounts` returns `list[LiveAccount]` - pydantic
+        # models, not dicts. The dict-only guard this replaces was copied from the
+        # viewer's `_discover_live_accounts_payload`, where it is correct because
+        # *that* function receives dicts. Here it rejected every real account, so
+        # this function returned 0 forever: the TTL it exists to renew expired 900s
+        # after the last viewer-side discovery and the daemon refused every
+        # dispatch - the exact failure it was committed to fix, still in place.
+        # The tests missed it because they stubbed dicts, the shape this function
+        # never receives.
+        #
+        # Both shapes are handled so neither can silently stop working, and a
+        # wholly unexplained zero is logged below.
+        if isinstance(account, dict):
+            account_id = str(account.get("id") or "").strip()
+            raw_is_demo = account.get("is_demo")
+            raw_login = account.get("broker_login") or account.get("login")
+            raw_ctid = account.get("ctid")
+        else:
+            account_id = str(getattr(account, "id", "") or "").strip()
+            raw_is_demo = getattr(account, "is_demo", None)
+            raw_login = getattr(account, "broker_login", None)
+            raw_ctid = getattr(account, "ctid", None)
         if not account_id:
+            skipped += 1
             continue
-        raw_is_demo = account.get("is_demo")
         is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
-        broker_login = str(
-            account.get("broker_login") or account.get("login") or ""
-        ).strip() or None
-        ctid = str(account.get("ctid") or "").strip() or None
+        broker_login = str(raw_login or "").strip() or None
+        ctid = str(raw_ctid or "").strip() or None
         before = demo_verification_age_seconds(account_id)
         record_discovered_account_verification(
             account_id,
@@ -1028,6 +1046,17 @@ async def refresh_account_demo_verifications() -> int:
         )
         if demo_verification_age_seconds(account_id) != before:
             written += 1
+    if discovered and written == 0 and skipped == 0:
+        # Every account was understood and none produced a new stamp. Either
+        # the writes are failing, or the shape changed again. Either way it is
+        # worth a line in the log rather than a silent 0 - a refresher that
+        # reports zero with no explanation is exactly how the first version of
+        # this function hid a no-op for a whole session.
+        logger.warning(
+            "Broker discovery returned accounts but no demo verification was "
+            "recorded; stamps stay as they are",
+            extra={"data": {"discovered": len(discovered)}},
+        )
     if written:
         logger.info(
             "Refreshed broker demo verification for account(s)",

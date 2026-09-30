@@ -2642,3 +2642,78 @@ def test_re_pointing_a_deployment_requires_a_verified_account_not_just_a_demo_fl
         database_module_module.update_live_deployment_account(
             deployment_id, "acct-rotated"
         )
+
+
+def test_the_refresher_understands_what_discovery_actually_returns(
+    isolated_db_sandbox, monkeypatch
+):
+    """The refresher must consume the real return type, not a convenient one.
+
+    `discover_configured_accounts` returns `list[LiveAccount]` - pydantic models.
+    The first version of the refresher copied the viewer's `isinstance(account,
+    dict)` guard, which is correct there because *the viewer's* payload really is
+    dicts, and wrong here: it rejected every real account, so the function
+    returned 0 forever and the daemon never renewed the stamp. The TTL it was
+    written to refresh expired 900s after the last viewer-side discovery and
+    every dispatch was refused again - the exact failure it was committed to fix,
+    still in place.
+
+    **The tests missed it because they stubbed dicts** - the shape the real
+    function never returns. So this test builds the objects the real function
+    returns, from the real class, and the guard asserts the refresher
+    understood them.
+
+    The dict branch is still covered, deliberately: it is now a fallback rather
+    than the only path, and the skip counter plus the log guard exist so a future
+    shape change cannot go silent again.
+    """
+    import asyncio
+
+    from live_runner.account_discovery import refresh_account_demo_verifications
+    from shared.models import LiveAccount
+
+    database_module_module, _engine, _data_dir = isolated_db_sandbox
+    database_module_module.upsert_live_accounts(
+        [
+            database_module_module.LiveAccountConfig(
+                id="acct-real",
+                broker="alpaca",
+                name="Alpaca Paper",
+                broker_login="PAPER-REAL",
+                is_demo=True,
+            )
+        ]
+    )
+
+    async def _real_shaped_discovery():
+        # Exactly what discover_configured_accounts returns: LiveAccount models.
+        return [
+            LiveAccount(
+                id="acct-real",
+                name="Alpaca Paper",
+                broker="alpaca",
+                balance=0.0,
+                is_demo=True,
+                broker_login="PAPER-REAL",
+                ctid="ctid-real",
+            )
+        ]
+
+    import live_runner.account_discovery as discovery_module
+
+    monkeypatch.setattr(
+        discovery_module, "discover_configured_accounts", _real_shaped_discovery
+    )
+
+    written = asyncio.run(refresh_account_demo_verifications())
+
+    assert written == 1, (
+        f"the refresher wrote {written} verifications from a LiveAccount list. "
+        f"discover_configured_accounts returns models, not dicts - a dict-only "
+        f"guard makes this function a permanent no-op and the daemon's TTL goes "
+        f"unrefreshed."
+    )
+    assert database_module_module.live_account_submission_block_reason(
+        "acct-real"
+    ) is None, "the account is still refused after a successful re-verification"
+    assert database_module_module.get_live_account("acct-real").ctid == "ctid-real"
