@@ -18,6 +18,7 @@ database the suite would have hit without isolation.
 from __future__ import annotations
 
 import sqlite3
+import ast
 from pathlib import Path
 
 import pytest
@@ -122,7 +123,56 @@ def test_grid_tester_sqlite_tests_do_not_use_bare_init_db() -> None:
     database that the module resolved at import time.
     """
     source = Path(__file__).parent.joinpath("test_grid_tester_sqlite.py").read_text()
-    assert "isolated_db" in source, "grid tester sqlite tests must opt into isolated_db"
+
+    # Which tests *request* the fixture, read from the AST.
+    #
+    # The previous assertion was `assert "isolated_db" in source`, and the target file's
+    # own module docstring contains the word - so the check was satisfied by prose
+    # describing the convention rather than by any test obeying it. Read the signatures
+    # instead: a fixture request is a parameter, and a docstring is not a parameter.
+    tree = ast.parse(source)
+
+    def _params(fn: ast.FunctionDef) -> list[str]:
+        return [a.arg for a in fn.args.args + fn.args.kwonlyargs]
+
+    tests = [
+        fn for fn in tree.body
+        if isinstance(fn, ast.FunctionDef) and fn.name.startswith("test_")
+    ]
+    assert tests, "no test functions found in test_grid_tester_sqlite.py"
+
+    users = [fn.name for fn in tests if "isolated_db" in _params(fn)]
+    assert users, (
+        "no test in test_grid_tester_sqlite.py requests the isolated_db fixture; the "
+        "database-touching tests in this file write permanent rows into production"
+    )
+
+    # And the property that actually matters, which a substring check could not express:
+    # any test in this file that calls a database entry point must be one of them. B-32
+    # was exactly that regression - a new DB-touching test added without opting in.
+    db_entry_points = {
+        "init_db",
+        "save_grid_result",
+        "get_grid_results",
+        "run_strategy_grid",
+        "get_engine",
+        "get_database",
+        "create_engine",
+    }
+    offenders = []
+    for fn in tests:
+        calls = {
+            node.func.id
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in db_entry_points
+        }
+        if calls and "isolated_db" not in _params(fn):
+            offenders.append(f"{fn.name} calls {sorted(calls)} without isolated_db")
+    assert not offenders, (
+        "database-touching tests must opt into isolated_db:\n  " + "\n  ".join(offenders)
+    )
     # Any top-level (0-indent) statement that merely calls init_db() is a bare
     # production write. Calls nested deeper (e.g. under `with database.get_session()`)
     # still operate on the sandbox the test opted into.
