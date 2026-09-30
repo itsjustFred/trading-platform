@@ -20,7 +20,7 @@ import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from data_tools.path_safety import build_dataset_path
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ RESAMPLE_RULES: dict[str, str] = {
 
 def _normalize_supported_timeframe(value: str) -> str:
     normalized = str(value or "").strip().lower()
-    canonical = TIMEFRAME_MAP.get(normalized) or TIMEFRAME_MAP.get(normalize_timeframe(normalized))
+    canonical = TIMEFRAME_MAP.get(normalized)
     if not canonical:
         raise ValueError(
             f"Unsupported timeframe '{value}'. Supported: {sorted(set(TIMEFRAME_MAP.values()))}"

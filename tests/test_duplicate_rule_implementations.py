@@ -47,6 +47,13 @@ PRODUCTION_ROOTS = (
 # must agree today; raising it without keeping them identical fails, which is the
 # point - adding a copy has to come with an argument that it is the same rule.
 DUPLICATED_RULES: tuple[tuple[str, int], ...] = (
+    # Provider timeframe normalisation. These three differ by *design* in one
+    # respect - yfinance serves `1w`/`4h`, alpaca and huggingface do not - so the
+    # per-provider map is data, not duplication, and is deliberately not compared.
+    # The rule around it is one rule, and two of the three copies carried a second
+    # lookup the third did not. See the alias-coverage pin at the end of this file
+    # for why removing it is safe.
+    ("_normalize_supported_timeframe", 3),
     # Timestamp normalisation for a downloaded row. Three downloaders each need
     # it, and `errors='raise'` is the load-bearing part: coercing would turn an
     # unreadable timestamp into NaT and silently drop the row, which is how a
@@ -222,3 +229,63 @@ def test_every_risk_finite_coercer_agrees_on_bool_and_finiteness(
                 coercer(value, "field")
         else:
             assert isinstance(coercer(value, "field"), float)
+
+
+# --------------------------------------------------------------------------
+# The coincidence that made the divergence above harmless
+# --------------------------------------------------------------------------
+#
+# `_normalize_supported_timeframe` in alpaca and huggingface did a second lookup,
+# `TIMEFRAME_MAP.get(normalize_timeframe(x))`, that yfinance did not. It is
+# unreachable today, and for a reason that is worth stating precisely because
+# nothing about it looks like a guarantee:
+#
+# `normalize_timeframe` translates only `TIMEFRAME_ALIASES`, which is
+# `{d1: 1d, h1: 1h, m1: 1m}`. Those three are *also* direct keys of every
+# downloader's `TIMEFRAME_MAP`, so the first lookup always wins and the second
+# can never fire. Verified two ways: 245,410 fuzzed inputs rescued by the second
+# lookup (0), and the set-inclusion assertion below.
+#
+# So the two copies disagreed on a line whose harmlessness depended on one table
+# agreeing with another for no stated reason. Removing the fallback is safe
+# **only** as long as that inclusion holds, and the inclusion is the thing that
+# can change - a fourth alias in `shared/constants.py` would make alpaca and
+# huggingface silently accept it while yfinance rejected it, which is the
+# same drift shape as the timeframe-set bug this branch already closed once.
+#
+# Hence the pin. If someone adds an alias, this fails and the three copies are
+# reconsidered together, rather than one of them quietly changing behaviour.
+
+_ALIAS_BEARING_DOWNLOADERS = (
+    "data_tools.downloaders.alpaca_dl",
+    "data_tools.downloaders.huggingface_dl",
+    "data_tools.downloaders.yfinance_dl",
+)
+
+
+@pytest.mark.parametrize("module_name", _ALIAS_BEARING_DOWNLOADERS)
+def test_every_timeframe_alias_is_a_direct_key_in_each_downloader_map(module_name: str) -> None:
+    """Every alias must be directly accepted, with no help from a second lookup.
+
+    `m1` resolves to `1m` because `m1` is a key in the map, not because a
+    fallback normalised it. If that stops being true, an accepted spelling starts
+    depending on which downloader handles it.
+    """
+    import importlib
+
+    from shared.constants import TIMEFRAME_ALIASES
+
+    module = importlib.import_module(module_name)
+    keys = set(module.TIMEFRAME_MAP)
+    missing = sorted(alias for alias in TIMEFRAME_ALIASES if alias not in keys)
+    assert not missing, (
+        f"{module_name}: aliases {missing} are not direct keys of its TIMEFRAME_MAP. "
+        f"They currently resolve only via normalize_timeframe, and no downloader "
+        f"has that second lookup any more - so these spellings now raise where "
+        f"they used to work. Either add them as keys, or drop them from "
+        f"TIMEFRAME_ALIASES deliberately."
+    )
+    # And the behaviour that is easy to break by accident: upper case and padding.
+    for alias in TIMEFRAME_ALIASES:
+        for variant in (alias.upper(), f"  {alias}  "):
+            assert module._normalize_supported_timeframe(variant) == TIMEFRAME_ALIASES[alias]
