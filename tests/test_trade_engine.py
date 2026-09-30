@@ -966,11 +966,26 @@ def test_no_test_resolves_a_repo_path_against_the_working_directory() -> None:
     import ast
     from pathlib import Path as _Path
 
-    repo_dirs = ("strategies", "data", "runner", "viewer", "scripts", "shared",
-                 "signal_bots", "live_runner", "risk", "data_tools", "validation")
+    # The scanned scope is **derived** from the repo root, not listed.
+    #
+    # The first version carried a hardcoded tuple of top-level directories and it was wrong
+    # twice: it omitted `tests` - so a planted `Path("tests/fixtures/...")` passed the guard
+    # unnoticed, which is the exact shape of the seven real paths fixed in the previous
+    # commit - and it had to be edited by hand every time the repo gained a directory. A
+    # list of what to check is a list that can be wrong; reading the root is not.
+    repo_root = _Path(__file__).resolve().parents[1]
+    repo_dirs = {
+        entry.name
+        for entry in repo_root.iterdir()
+        if entry.is_dir() and not entry.name.startswith(".")
+    }
+    assert repo_dirs, "could not read the repository root to derive the scanned scope"
     offenders: list[str] = []
 
-    for path in sorted(_Path(__file__).resolve().parent.rglob("test_*.py")):
+    # Every `.py` under tests/, not only `test_*.py`. Support modules and conftests carry
+    # the same CWD hazard, and narrowing the filename pattern is how the first version
+    # missed a whole subdirectory.
+    for path in sorted(_Path(__file__).resolve().parent.rglob("*.py")):
         source = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(source)

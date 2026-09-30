@@ -15,15 +15,15 @@ from validation.reference import ValidationReference
 
 
 def _eurusd_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx")
+    return Path(__file__).resolve().parents[2] / "strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx"
 
 
 def _nas100_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx")
+    return Path(__file__).resolve().parents[2] / "strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx"
 
 
 def _sp500_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx")
+    return Path(__file__).resolve().parents[2] / "strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx"
 
 
 @pytest.fixture
