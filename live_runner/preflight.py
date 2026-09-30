@@ -15,6 +15,11 @@ from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.credential_env import (
+    FALSE_BOOL_TOKENS,
+    TRUE_BOOL_TOKENS,
+    parse_bool_env,
+)
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -61,28 +66,20 @@ def _load_env_file(path: Path) -> dict[str, str]:
     }
 
 
-_TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
-_FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
+_TRUE_BOOL_TOKENS = TRUE_BOOL_TOKENS
+_FALSE_BOOL_TOKENS = FALSE_BOOL_TOKENS
 
 
 def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
-    """Strictly parse a boolean env var.
+    """Delegate to the one definition in `live_runner.credential_env`.
 
-    Missing value -> default. Recognized true/false tokens (case-insensitive,
-    stripped) parse accordingly. Anything else raises so a malformed value can
-    never implicitly select live trading.
+    A private copy of a strict boolean parser is how a *blanked* value ended up
+    silently selecting a default in this repo - twice, once per broker, and the
+    default was demo mode. Four copies that agree today is the same hazard as
+    every other duplicate this audit has found; the difference is that this rule
+    has already produced two live bugs. See the note in `credential_env`.
     """
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
+    return parse_bool_env(name, value, default=default)
 
 
 def _resolve_ctrader_credentials(

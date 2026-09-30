@@ -26,10 +26,13 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
 )
 from live_runner.credential_env import (
+    FALSE_BOOL_TOKENS,
+    TRUE_BOOL_TOKENS,
     accounts_env_mtime,
     discord_bot_env_canonical_name,
     discord_bot_env_key,
     load_accounts_env_values,
+    parse_bool_env,
     resolve_env_value,
 )
 from live_runner.account_discovery import refresh_account_demo_verifications
@@ -167,28 +170,30 @@ def _adapter_is_ready(adapter: BaseLiveAdapter) -> bool:
     return True
 
 
-def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
+# A second boolean parser used to sit here, named `_parse_bool_env`, and it was the
+# *lenient* one: `value.strip().lower() in {"1", "true", "yes", "on"}`, so a blank or
+# garbled value returned False rather than raising. That is the exact defect the strict
+# parser exists to prevent - a present-but-blank value quietly resolving to a decision
+# instead of refusing - and it is the shape both recorded live bugs took.
+#
+# It had no callers. Removed rather than delegated: delegating would have changed its
+# behaviour from "blank means False" to "blank raises", and leaving a function that
+# looks like a parser but is not the parser is how the next reader picks the wrong one.
+# `_parse_strict_bool_env` above is the one to use.
+_TRUE_BOOL_TOKENS = TRUE_BOOL_TOKENS
+_FALSE_BOOL_TOKENS = FALSE_BOOL_TOKENS
 
 
 def _parse_strict_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
+    """Delegate to the one definition in `live_runner.credential_env`.
+
+    A private copy of a strict boolean parser is how a *blanked* value ended up
+    silently selecting a default in this repo - twice, once per broker, and the
+    default was demo mode. Four copies that agree today is the same hazard as
+    every other duplicate this audit has found; the difference is that this rule
+    has already produced two live bugs. See the note in `credential_env`.
+    """
+    return parse_bool_env(name, value, default=default)
 
 
 def _raw_bool_text(value: object) -> str | None:

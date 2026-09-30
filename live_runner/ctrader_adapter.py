@@ -23,6 +23,11 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
 )
 from live_runner.credential_env import resolve_env_value
+from live_runner.credential_env import (
+    FALSE_BOOL_TOKENS,
+    TRUE_BOOL_TOKENS,
+    parse_bool_env,
+)
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -63,22 +68,20 @@ class CTraderAuthTerminalError(RuntimeError):
         super().__init__(message)
 
 
-_TRUE_BOOL_TOKENS = {"1", "true", "yes", "y", "on"}
-_FALSE_BOOL_TOKENS = {"0", "false", "no", "n", "off"}
+_TRUE_BOOL_TOKENS = TRUE_BOOL_TOKENS
+_FALSE_BOOL_TOKENS = FALSE_BOOL_TOKENS
 
 
 def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
-    if value is None:
-        return default
-    token = value.strip().lower()
-    if token in _TRUE_BOOL_TOKENS:
-        return True
-    if token in _FALSE_BOOL_TOKENS:
-        return False
-    valid = ", ".join(sorted(_TRUE_BOOL_TOKENS | _FALSE_BOOL_TOKENS))
-    raise ValueError(
-        f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
-    )
+    """Delegate to the one definition in `live_runner.credential_env`.
+
+    A private copy of a strict boolean parser is how a *blanked* value ended up
+    silently selecting a default in this repo - twice, once per broker, and the
+    default was demo mode. Four copies that agree today is the same hazard as
+    every other duplicate this audit has found; the difference is that this rule
+    has already produced two live bugs. See the note in `credential_env`.
+    """
+    return parse_bool_env(name, value, default=default)
 
 
 def _to_datetime_from_ms(timestamp_ms: int | float | None) -> datetime:

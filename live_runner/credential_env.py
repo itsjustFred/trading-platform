@@ -80,6 +80,22 @@ def parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
     Missing value -> default. Recognized true/false tokens (case-insensitive,
     stripped) parse accordingly. Anything else raises so a malformed value can
     never implicitly select live trading or disable a safety behaviour.
+
+    This is the only definition. It was previously written out four times -
+    here, in `ctrader_adapter.py`, `daemon.py` and `preflight.py` - as three
+    private copies plus this one, along with two parallel token sets.
+
+    The failure mode is the reason that mattered. The rule had already been got
+    wrong twice before it was right, once per broker, and both times the same
+    way: an `or None` collapsed a *blanked* value to "unset", so a value that
+    should have been a loud parse error instead silently selected the default -
+    and the default was demo mode. The notes record both.
+
+    Four copies that agree today is the same hazard as every other duplicate
+    this audit has found, and it is the one shape that has already produced two
+    live bugs in this repository. Nothing related the copies, so a fix applied
+    to one of them would have left the other three on the old behaviour - which
+    is precisely how the second instance survived the first fix.
     """
     if value is None:
         return default
