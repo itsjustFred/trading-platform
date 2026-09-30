@@ -1156,7 +1156,7 @@ def _stockkit_deployment_and_signal(
 ) -> tuple[Any, Any, Any]:
     from types import SimpleNamespace
 
-    from live_runner.credential_env import load_accounts_env_values
+    from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
     from live_runner.daemon import _trade_signal_to_live_signal
     from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
