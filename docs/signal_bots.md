@@ -94,10 +94,10 @@ Konfiguration:
   zusammengeführt).
 - Discord-Bot-Service, in dieser Reihenfolge:
   1. Service-Config `trusted_author_ids` (bzw. `trusted_bot_ids`)
-  2. Umgebungsvariable `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`, kommagetrennt —
-     z. B. `DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS`
-  3. Umgebungsvariable `DISCORD_TRUSTED_AUTHOR_IDS`, kommagetrennt (Fallback für
-     Single-Bot-Setups)
+  2. Umgebungsvariable `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`, getrennt durch
+     Komma **oder Whitespace** — z. B. `DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS`
+  3. Umgebungsvariable `DISCORD_TRUSTED_AUTHOR_IDS`, getrennt durch Komma oder
+     Whitespace (Fallback für Single-Bot-Setups)
 
   Die Bot-spezifische Variante ist wichtig, wenn mehrere Bots dieselbe
   `.accounts.env` teilen: ohne sie fällt jeder Bot auf dieselbe gemeinsame Liste
@@ -107,6 +107,19 @@ Konfiguration:
   gewinnt, ein gesetzter Wert fällt nicht auf die allgemeinere zurück.
 
 Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
+
+**Leer ist nicht „nicht gesetzt".** Für die Broker-Credentials
+(`CTRADER_DEMO`, `ALPACA_PAPER`, `CTRADER_APP_ID` …) gilt dieselbe Regel wie oben:
+Ein in `.accounts.env` vorhandener, aber leerer Wert ist ein absichtliches Leeren und
+wird **nicht** als „nicht gesetzt" behandelt. `resolve_env_value` liefert für beide
+Fälle `""`; die Anwesenheit wird deshalb getrennt geprüft, und der Wert geht roh in
+den strikten Parser. Ein leeres `CTRADER_DEMO` oder `ALPACA_PAPER` führt damit zu
+einem Abbruch mit Nennung der Variablen, nicht zu einem stillen Default.
+
+Der Grund ist die Richtung, in die ein Fehler hier zeigt: der Default ist `true`, also
+Demo/Paper. Ein leerer Wert wird also nicht versehentlich zu *Live* — aber er wird
+stillschweigend zu einer Annahme, und dieselbe Codezeile mit `default=False` wäre
+Live-Trading. Der Parse-Fehler ist die Form, in der die Absicht sichtbar bleibt.
 
 - Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
   verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
