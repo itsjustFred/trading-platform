@@ -54,11 +54,11 @@ def _valid_strategy_code() -> str:
 
 def test_positive_fixture_gate_is_not_empty():
     """M18: a lost fixtures directory must fail loudly, not pass vacuously."""
-    fixtures = sorted(FIXTURES_DIR.glob("*.py"))
+    fixtures = sorted(FIXTURES_DIR.rglob("*.py"))
     assert fixtures, f"No positive AI fixtures found in {FIXTURES_DIR}"
 
 
-@pytest.mark.parametrize("fixture_path", sorted((FIXTURES_DIR).glob("*.py")), ids=lambda p: p.stem)
+@pytest.mark.parametrize("fixture_path", sorted((FIXTURES_DIR).rglob("*.py")), ids=lambda p: p.stem)
 def test_positive_fixtures_pass(fixture_path: Path):
     result = _result_for(fixture_path.read_text(encoding="utf-8"), fixture_path.stem)
     assert result.passed, f"{fixture_path.name} failed validation: {result.errors}"
@@ -82,12 +82,12 @@ def test_intentionally_broken_fixture_is_not_actually_valid_by_name_only():
 
 
 def test_negative_fixture_gate_is_not_empty():
-    negatives = sorted(INVALID_FIXTURES_DIR.glob("*.py"))
+    negatives = sorted(INVALID_FIXTURES_DIR.rglob("*.py"))
     assert negatives, f"No negative-control fixtures found in {INVALID_FIXTURES_DIR}"
 
 
 @pytest.mark.parametrize(
-    "fixture_path", sorted((INVALID_FIXTURES_DIR).glob("*.py")), ids=lambda p: p.stem
+    "fixture_path", sorted((INVALID_FIXTURES_DIR).rglob("*.py")), ids=lambda p: p.stem
 )
 def test_negative_fixtures_fail(fixture_path: Path):
     result = _result_for(fixture_path.read_text(encoding="utf-8"), fixture_path.stem)

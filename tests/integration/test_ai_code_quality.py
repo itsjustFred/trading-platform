@@ -8,7 +8,7 @@ from tests.validators.code_validator import AICodeValidator
 
 FIXTURES_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "ai_generated_strategies"
 FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-STRATEGY_FILES = sorted(FIXTURES_DIR.glob("*.py"))
+STRATEGY_FILES = sorted(FIXTURES_DIR.rglob("*.py"))
 
 pytestmark = [pytest.mark.ai_code, pytest.mark.integration]
 
