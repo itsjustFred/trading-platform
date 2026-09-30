@@ -7,86 +7,90 @@ actual backtests may import a module.
 
 from __future__ import annotations
 
-import builtins
 from pathlib import Path
 
-import pytest
 
 
-@pytest.fixture
-def no_strategy_imports(monkeypatch):
-    """Block exec/import of strategy files for the duration of a test."""
+def _strategy_source(tmp_path: Path, slug: str, meta_line: str) -> Path:
+    """Write a strategy file that *records being executed*.
 
-    original_import = builtins.__import__
-    blocked: list[str] = []
+    The guard this replaces patched `builtins.__import__` and blocked any name starting
+    with `strategy_`. It could not fire for anything:
 
-    def _guard(name, globals=None, locals=None, fromlist=(), level=0):
-        # importlib used by the registry goes through __import__ too; block
-        # any import whose name matches a strategy module naming pattern.
-        if name.startswith("strategy_"):
-            blocked.append(name)
-            raise AssertionError(f"strategy module import attempted: {name}")
-        return original_import(name, globals, locals, fromlist, level)
+    - the modules under test are named `example_strategy`, `lookup_strategy` and
+      `static_meta`, none of which starts with `strategy_`;
+    - and loading a file by path is `spec_from_file_location` + `exec_module`, which never
+      calls `builtins.__import__` at all, so the mechanism was wrong as well as the pattern.
 
-    monkeypatch.setattr(builtins, "__import__", _guard)
-    return blocked
+    So `assert not no_strategy_imports` was true by construction in all three tests, while
+    this file's stated purpose is that listing and looking up strategies "must not execute
+    strategy files". The property was never being checked.
+
+    A sentinel written by the strategy file itself is mechanism-independent: if any code path
+    executes the file - import, exec, `runpy`, anything - the marker appears, and no
+    naming convention has to be guessed at.
+    """
+    strategy_dir = tmp_path / slug
+    strategy_dir.mkdir()
+    path = strategy_dir / f"{slug}.py"
+    path.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(strategy_dir / 'EXECUTED')!r}).write_text('executed')\n"
+        f"{meta_line}\n",
+        encoding="utf-8",
+    )
+    return strategy_dir / "EXECUTED"
 
 
 def test_iter_strategy_entries_does_not_execute_strategy_files(
-    tmp_path: Path, no_strategy_imports
+    tmp_path: Path,
 ) -> None:
     """Listing strategies parses instead of importing."""
     from shared.strategy_registry import iter_strategy_entries
 
-    strategy_dir = tmp_path / "example_strategy"
-    strategy_dir.mkdir()
-    (strategy_dir / "example_strategy.py").write_text(
-        "STRATEGY_META = {'name': 'Example Strategy', 'tags': {'type': ['trend']}}\n",
-        encoding="utf-8",
+    marker = _strategy_source(
+        tmp_path,
+        "example_strategy",
+        "STRATEGY_META = {'name': 'Example Strategy', 'tags': {'type': ['trend']}}",
     )
 
-    entries = iter_strategy_entries(strategy_dir)
+    entries = iter_strategy_entries(marker.parent)
 
     assert len(entries) == 1
     assert entries[0].slug == "example_strategy"
     assert entries[0].display_name == "Example Strategy"
-    assert not no_strategy_imports
+    assert not marker.exists(), "iter_strategy_entries executed the strategy file"
 
 
 def test_find_strategy_entry_does_not_execute_strategy_files(
-    tmp_path: Path, no_strategy_imports
+    tmp_path: Path,
 ) -> None:
     """Lookup by identifier parses instead of importing."""
     from shared.strategy_registry import find_strategy_entry
 
-    strategy_dir = tmp_path / "lookup_strategy"
-    strategy_dir.mkdir()
-    (strategy_dir / "lookup_strategy.py").write_text(
-        "STRATEGY_META = {'name': 'Lookup Strategy'}\n",
-        encoding="utf-8",
+    marker = _strategy_source(
+        tmp_path, "lookup_strategy", "STRATEGY_META = {'name': 'Lookup Strategy'}"
     )
 
-    entry = find_strategy_entry("lookup_strategy", strategy_dir)
+    entry = find_strategy_entry("lookup_strategy", marker.parent)
 
     assert entry is not None
     assert entry.display_name == "Lookup Strategy"
-    assert not no_strategy_imports
+    assert not marker.exists(), "find_strategy_entry executed the strategy file"
 
 
 def test_load_strategy_meta_is_static(tmp_path: Path) -> None:
     """load_strategy_meta returns parsed STRATEGY_META without importing."""
     from shared.strategy_registry import load_strategy_meta
 
-    strategy_dir = tmp_path / "static_meta"
-    strategy_dir.mkdir()
-    (strategy_dir / "static_meta.py").write_text(
-        "STRATEGY_META = {'name': 'Static Meta', 'engine': 'native'}\n",
-        encoding="utf-8",
+    marker = _strategy_source(
+        tmp_path, "static_meta", "STRATEGY_META = {'name': 'Static Meta', 'engine': 'native'}"
     )
 
-    meta = load_strategy_meta(strategy_dir / "static_meta.py", strategy_dir)
+    meta = load_strategy_meta(marker.parent / "static_meta.py", marker.parent)
 
     assert meta == {"name": "Static Meta", "engine": "native"}
+    assert not marker.exists(), "load_strategy_meta executed the strategy file"
 
 
 def test_load_strategy_meta_without_literal(tmp_path: Path) -> None:
