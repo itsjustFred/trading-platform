@@ -4,6 +4,8 @@ import test from "node:test";
 
 import { functionSource } from "./sourceRegion.ts";
 
+import { stripComments } from "./sourceRegion.ts";
+
 const read = (path: string) => readFile(new URL(path, import.meta.url), "utf8");
 
 test("live deployment controls sit above the card overlay link and offer resume", async () => {
@@ -117,8 +119,8 @@ test("a pause that had to wait out submissions is never reported as a failure", 
   // toast - or, when the pause was refused, a red error for a stop that had
   // actually worked, which is what led operators to click ACTIVE and re-arm the
   // bot they were trying to stop.
-  const types = await read("../src/api/types.ts");
-  const client = await read("../src/api/client.ts");
+  const types = stripComments(await read("../src/api/types.ts"));
+  const client = stripComments(await read("../src/api/client.ts"));
   const liveHub = await read("../src/pages/LiveHub.tsx");
 
   assert.match(types, /interface LiveDeploymentStatusUpdateResponse/);
@@ -178,7 +180,7 @@ test("a pause that had to wait out submissions is never reported as a failure", 
 });
 
 test("an absent portfolio metric is never coerced to a numeric zero", async () => {
-  const page = await read("../src/pages/PortfolioDetailPage.tsx");
+  const page = stripComments(await read("../src/pages/PortfolioDetailPage.tsx"));
 
   // Each of these metrics can come back null from the API when it could not be
   // computed. Coercing with `?? 0` / `|| 0` before handing the value to StatCard
