@@ -437,3 +437,85 @@ def test_both_signal_processors_compute_the_same_atr() -> None:
         # Neither may leak the scratch columns it builds on the way.
         for scratch in ("h_l", "h_pc", "l_pc", "tr"):
             assert scratch not in ramjet.columns, f"period {period}: leaked {scratch!r}"
+
+
+# --------------------------------------------------------------------------
+# A recorded divergence, pinned so it cannot move without the decision moving
+# --------------------------------------------------------------------------
+#
+# `_parse_session_clock` exists in `data_tools/auto_download.py` and
+# `data_tools/validate.py`, and they disagree about what a malformed trading
+# session *is*. Measured across the same inputs:
+#
+#   input                        validate.py        auto_download.py
+#   absent                       None               None
+#   09:30-16:00                  (570, 960)         (570, 960)
+#   09:30-24:00                  (570, 1440)        (570, 1440)
+#   25:00-23:00  (malformed)     None               ValueError
+#   abc/def     (malformed)      None               ValueError
+#   16:00-09:30  (reversed)      (960, 2010)        ValueError
+#
+# So the downloader treats a malformed session as fatal and the validator treats
+# it as absent. In `validate.py` those are the same value: `_session_window`
+# returns `None` either way, its caller at :254 substitutes an observed session
+# only for equity-like assets, and :266 then skips the whole
+# session/holiday/weekend/overnight classification. For forex, metals and crypto a
+# configured session can therefore stop being applied to the coverage check with
+# nothing recorded - the silent-failure signature this branch has been removing.
+#
+# **This test asserts the divergence exists.** That is deliberate, and it is the
+# point: the alternative was no pin at all, where fixing one copy would leave the
+# other quietly different. When the decision in `notes/backlog.md` is taken, this
+# fails and points at the entry to be updated with it.
+#
+# It is not a claim that the validator is right. Reversing it would fail
+# configurations that currently pass, and whether a malformed session should fail
+# the run or be reported is a policy question about what this validator is for.
+
+_SESSION_CASES = [
+    ("absent", None),
+    ("valid", {"start": "09:30", "end": "16:00"}),
+    ("valid 24h close", {"start": "09:30", "end": "24:00"}),
+    ("malformed hour", {"start": "25:00", "end": "23:00"}),
+    ("malformed text", {"start": "abc", "end": "def"}),
+    ("one side malformed", {"start": "09:30", "end": "oops"}),
+    ("reversed", {"start": "16:00", "end": "09:30"}),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "session"),
+    _SESSION_CASES,
+    ids=[label for label, _ in _SESSION_CASES],
+)
+def test_known_session_parsing_divergence_pending_decision(label: str, session: object) -> None:
+    """The validator and the downloader currently disagree; see backlog.md.
+
+    Read this as a tripwire, not an endorsement. Both copies are correct about the
+    cases they agree on; the assertion is that the disagreement has not moved.
+    """
+    from data_tools import auto_download, validate
+
+    def outcome(call, *args):
+        try:
+            return ("value", call(*args))
+        except ValueError as exc:
+            return ("refused", str(exc))
+
+    as_validator = outcome(validate._session_window, session)
+    as_downloader = outcome(auto_download._explicit_session_window, session, None, None)
+
+    if label in {"absent", "valid", "valid 24h close"}:
+        assert as_validator == as_downloader, (
+            f"{label}: the two copies used to agree on this and no longer do. If that is "
+            f"the fix for the recorded divergence, update the entry in notes/backlog.md "
+            f"in the same commit that changed it."
+        )
+        return
+
+    assert as_validator != as_downloader, (
+        f"{label}: the recorded divergence between validate._session_window and "
+        f"auto_download._explicit_session_window has been resolved - the validator now "
+        f"returns {as_downloader[0]} where it used to return a value. Update the "
+        f"needs-decision entry in notes/backlog.md to match; do not delete this test."
+    )
