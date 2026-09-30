@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { functionSource } from "./sourceRegion.ts";
+
 const read = (path: string) => readFile(new URL(path, import.meta.url), "utf8");
 
 test("live deployment controls sit above the card overlay link and offer resume", async () => {
@@ -131,9 +133,25 @@ test("a pause that had to wait out submissions is never reported as a failure", 
   assert.match(types, /INDETERMINATE/);
 
   // The status endpoint must be typed with the response that carries them.
+  //
+  // Scoped to the function body. This matched with `[\s\S]*?` across the whole file, so
+  // it never established that the type was on *this* endpoint. Measured: pointing
+  // `updateLiveDeploymentStatus` at `Record<string, never>` and adding
+  // `fetchJSON<LiveDeploymentStatusUpdateResponse>(x)` as a comment at the end of the
+  // file passed all ten tests in this file. The drain fields asserted just above are
+  // carried by that type, so this is the line that makes those assertions mean anything.
   assert.match(
-    client,
-    /updateLiveDeploymentStatus[\s\S]*?fetchJSON<LiveDeploymentStatusUpdateResponse>/,
+    functionSource(client, "updateLiveDeploymentStatus"),
+    /fetchJSON<LiveDeploymentStatusUpdateResponse>/,
+  );
+
+  // And the scope is real: an extractor that returned the whole file would satisfy the
+  // line above. Without this, degrading the extractor to whole-file scope would leave
+  // this file looking correct - which is exactly what happened to the regex.
+  assert.doesNotMatch(
+    functionSource(client, "updateLiveDeploymentStatus"),
+    /deleteLiveDeployment/,
+    "the extractor is returning more than updateLiveDeploymentStatus",
   );
 
   // A non-clean drain is surfaced as a warning, from the returned result, and
