@@ -7421,3 +7421,52 @@ def test_backtest_filters_exclude_metrics_that_were_never_computed(
             f"exclude an unmeasurable value, not read it as 0.0"
         )
         assert "bt-measured" in ids, f"{query} dropped the genuinely measured row"
+
+
+def test_the_persisted_and_cleared_singleflight_keys_are_one_list() -> None:
+    """The lease fields are persisted by one module and released by the other.
+
+    `viewer/main.py::_task_snapshot_payload` copies every key in
+    `_SINGLEFLIGHT_PERSISTED_KEYS` into the stored payload, and
+    `viewer/core.py::_clear_singleflight_reservation` pops every key in
+    `_SINGLEFLIGHT_RUNTIME_KEYS`. The two lists were identical thirteen-entry tuples in
+    two modules with nothing relating them.
+
+    The asymmetry is why this is a safety property rather than tidiness. A key that is
+    persisted but never cleared leaves the reservation in memory forever, so the task
+    reads as claimed by a worker that no longer exists and cannot be re-claimed. The
+    reverse leaves a stale field on disk, which at worst costs one redundant claim
+    after a restart.
+
+    Asserted as identity, not equality: two lists that happen to agree today say
+    nothing about tomorrow, and agreement is exactly what hid the duplicate.
+    """
+    from viewer import core, main
+
+    assert main._SINGLEFLIGHT_PERSISTED_KEYS is core._SINGLEFLIGHT_RUNTIME_KEYS, (
+        "the persisted and cleared singleflight key lists have diverged; a key in the "
+        "persisted set that is not cleared leaves a reservation that is never released"
+    )
+
+
+def test_every_persisted_singleflight_key_is_actually_cleared() -> None:
+    """Belt and braces: the two loops must cover the same fields, whatever the lists are.
+
+    The identity check above pins the lists to each other. This one pins them to their
+    *use*, so a refactor that stops calling one of the loops with the shared list is
+    caught too - the case where both lists still agree and one of them is no longer
+    consulted.
+    """
+    from viewer import core
+
+    task = {key: f"value-{key}" for key in core._SINGLEFLIGHT_RUNTIME_KEYS}
+    task["status"] = "running"
+    task["operation"] = "download"
+
+    core._clear_singleflight_reservation(task)
+
+    leftover = sorted(k for k in core._SINGLEFLIGHT_RUNTIME_KEYS if k in task)
+    assert not leftover, f"clearing a reservation left these fields behind: {leftover}"
+    assert task["status"] == "running" and task["operation"] == "download", (
+        "clearing a reservation must not touch the task's own fields"
+    )

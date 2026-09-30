@@ -261,16 +261,10 @@ REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
-_SINGLEFLIGHT_PERSISTED_KEYS = (
-    "download_request_key",
-    "owner_pid",
-    "owner_thread_id",
-    "owner_token",
-    "singleflight_owner_boot_id",
-    "singleflight_heartbeat_at",
-    "singleflight_lease_until",
-    "singleflight_lease_expires_at",
-)
+# One definition, in viewer/core.py, next to the clear that must agree with it.
+# See the note there: this list is persisted and that one is popped, so a key
+# present here but absent there is a reservation that is never released.
+_SINGLEFLIGHT_PERSISTED_KEYS = legacy_viewer._SINGLEFLIGHT_RUNTIME_KEYS
 _TASK_LOG_WS_CHUNK_BYTES = 64 * 1024
 _TASK_LOG_WS_MAX_BYTES = 2 * 1024 * 1024
 _TASK_LOG_RESPONSE_MAX_LINES = 2000

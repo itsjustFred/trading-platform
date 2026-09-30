@@ -2306,6 +2306,24 @@ def _download_request_key(identity: dict[str, Any]) -> str:
 
 
 _SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
+# The singleflight lease fields, defined once.
+#
+# Two operations read this list and they are *not* symmetric, which is what makes a
+# divergence here dangerous rather than merely untidy:
+#
+# - `_clear_singleflight_reservation` in this module POPS every key, releasing the lease
+#   in memory;
+# - `viewer/main.py::_task_snapshot_payload` COPIES every key into the persisted payload,
+#   so a held lease survives a restart and is not re-acquired by a second worker.
+#
+# A key present in the persisted set but missing from the cleared set is therefore the
+# bad direction: the field is written to disk and never released, so the reservation is
+# never freed and the task is stuck as permanently claimed. The reverse direction leaves a
+# stale field on disk, which at worst costs a redundant re-claim after a restart.
+#
+# These were two identical thirteen-entry tuples, one per module, with nothing relating
+# them. Same shape as every other duplicate this audit has found: they agree today, and
+# agreement is what hides it.
 _SINGLEFLIGHT_RUNTIME_KEYS = (
     "download_request_key",
     "owner_pid",
