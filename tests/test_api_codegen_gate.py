@@ -10,13 +10,26 @@ from __future__ import annotations
 
 import pytest
 
-fastapi_testclient = pytest.importorskip("fastapi.testclient")
-
 from viewer.main import app  # noqa: E402
 
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
+    # Scoped to the tests that actually drive an HTTP client.
+    #
+    # This used to be a module-level `pytest.importorskip("fastapi.testclient")`, which
+    # gated all five tests in the file. Four of them need a client; the fifth,
+    # `test_jforex_prewarm_starts_the_jvm_on_the_main_thread`, needs only
+    # `viewer.main` - it asserts the JVM starts on the main thread rather than on a
+    # ThreadPoolExecutor worker, which is the defect whose atexit deadlock had the whole
+    # suite hanging and reporting green.
+    #
+    # So on a machine with `fastapi` but without `httpx`, that guard went silently - and
+    # it is the guard for the bug that produced 7.2 GiB of hung pytest runs. `viewer.main`
+    # itself is imported at module scope with no skip, so a genuinely missing `fastapi` is
+    # a collection *error* - loud, which is the right outcome and the reason the skip can
+    # be narrowed to this fixture rather than removed.
+    fastapi_testclient = pytest.importorskip("fastapi.testclient")
     strategies_dir = tmp_path / "strategies"
     strategies_dir.mkdir()
     monkeypatch.setattr("viewer.main.STRATEGIES_DIR", strategies_dir)
