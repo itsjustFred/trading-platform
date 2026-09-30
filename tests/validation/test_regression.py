@@ -406,7 +406,7 @@ class TestTolerances:
 
 class TestImporterAndEdgeCases:
     def test_regression_run_with_importer(self, tmp_path: Path) -> None:
-        html_path = Path("tests/fixtures/validation/mt5_html/sample_report.html")
+        html_path = Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/sample_report.html"
         if not html_path.exists():
             pytest.skip("HTML fixture not available")
 

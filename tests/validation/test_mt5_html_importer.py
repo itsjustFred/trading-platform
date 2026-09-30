@@ -13,7 +13,7 @@ from validation.reference import ValidationReference
 
 
 def _sample_path() -> Path:
-    return Path("tests/fixtures/validation/mt5_html/sample_report.html")
+    return Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/sample_report.html"
 
 
 @pytest.fixture
@@ -210,14 +210,14 @@ class TestDirectionRequiresTypColumn:
     """DV-B42: direction must never be inferred from a missing Typ column."""
 
     def test_missing_typ_column_raises(self, tmp_path: Path):
-        report = Path("tests/fixtures/validation/mt5_html/missing_typ.html")
+        report = Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/missing_typ.html"
         importer = MT5HTMLImporter()
         with pytest.raises(ValueError) as excinfo:
             importer.load(report)
         assert "Typ" in str(excinfo.value)
 
     def test_unsupported_entry_typ_raises(self):
-        report = Path("tests/fixtures/validation/mt5_html/bad_typ.html")
+        report = Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/bad_typ.html"
         importer = MT5HTMLImporter()
         with pytest.raises(ValueError) as excinfo:
             importer.load(report)
@@ -268,7 +268,7 @@ class TestGermanNumberParsing:
 
     def test_sltp_map_parses_german_formats(self):
         ref = MT5HTMLImporter().load(
-            Path("tests/fixtures/validation/mt5_html/german_sltp.html")
+            Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/german_sltp.html"
         )
         sl_values = [t.meta.get("stop_loss") for t in ref.trades]
         tp_values = [t.meta.get("take_profit") for t in ref.trades]

@@ -948,6 +948,14 @@ def test_no_test_resolves_a_repo_path_against_the_working_directory() -> None:
     identical to the correct form until the CWD moves. And a pin on the pattern rather than
     on that one line, so the next instance is caught here.
 
+    It walks **recursively**. The first version used `glob("test_*.py")`, which is not
+    recursive and so never reached `tests/validation/` - where seven CWD-relative fixture
+    paths sat, unseen. Measured from `/tmp`: `test_mt5_html_importer.py` went from 52 passed
+    to **24 failed**, and `test_split_fills.py` from 12 passed to **11 failed**. Those fail
+    loudly rather than skipping, which is better, but it still means the suite only runs
+    from the repo root - which is the portability AGENTS.md asks for. The pin that was
+    supposed to catch exactly this missed them because of a non-recursive glob.
+
     `tests/test_destructive_scripts_safety.py:355` is excluded, and the exclusion is narrow
     and stated rather than a file allowlist: a `Path(...)` built inside a
     `monkeypatch.setattr(...)` call is a **value handed to a replaced dependency**, not a
@@ -962,7 +970,7 @@ def test_no_test_resolves_a_repo_path_against_the_working_directory() -> None:
                  "signal_bots", "live_runner", "risk", "data_tools", "validation")
     offenders: list[str] = []
 
-    for path in sorted(_Path(__file__).resolve().parent.glob("test_*.py")):
+    for path in sorted(_Path(__file__).resolve().parent.rglob("test_*.py")):
         source = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(source)

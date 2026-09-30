@@ -24,7 +24,7 @@ from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 
 def _split_fill_html() -> Path:
-    return Path("tests/fixtures/validation/mt5_html/split_fills.html")
+    return Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_html/split_fills.html"
 
 
 class TestHTMLSplitFills:
@@ -82,7 +82,7 @@ class TestHTMLSplitFills:
 
 
 def _split_fill_xlsx() -> Path:
-    return Path("tests/fixtures/validation/mt5_xlsx_split_fills.xlsx")
+    return Path(__file__).resolve().parents[2] / "tests/fixtures/validation/mt5_xlsx_split_fills.xlsx"
 
 
 class TestXLSXSplitFills:
