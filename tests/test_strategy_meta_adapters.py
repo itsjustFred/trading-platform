@@ -192,14 +192,29 @@ def test_all_vectorbt_strategies_return_entries_exits_and_indicators_dict():
         module = _load_module(strategy_path)
         output = module.generate_signals(df.copy(), {})
         assert isinstance(output, tuple), strategy_path.name
-        assert len(output) in {3, 4}, strategy_path.name
-        entries, exits, indicators = output[:3]
+        # Exactly four, not `{3, 4}`.
+        #
+        # The adapter *repairs* a len-3 output silently, which is precisely why the
+        # contract has to be pinned rather than tolerated. Measured: dropping `drawings`
+        # from `trend_following` left **this test passing** while the repo-wide arity
+        # contract in `tests/strategies/test_strategy_defect_golden.py` failed it.
+        #
+        # So this test was not providing the coverage it appeared to, and it stated a
+        # different contract from the other test describing the same property. Two
+        # documents of one rule disagreeing is a defect in itself: it means the weaker one
+        # would let the regression through the moment the stronger one was narrowed,
+        # removed, or skipped by the module-scoped data gate.
+        assert len(output) == 4, (
+            f"{strategy_path.name}: generate_signals must return the 4-tuple platform "
+            f"contract (entries, exits, indicators_dict, drawings), got "
+            f"{len(output)} elements"
+        )
+        entries, exits, indicators, drawings = output
         assert len(pd.Series(entries)) == len(df), strategy_path.name
         assert len(pd.Series(exits)) == len(df), strategy_path.name
         assert isinstance(indicators, dict), strategy_path.name
         assert indicators, strategy_path.name
-        if len(output) == 4:
-            assert isinstance(output[3], list), strategy_path.name
+        assert isinstance(drawings, list), strategy_path.name
 
 
 def test_vectorbt_adapter_merges_strategy_meta_parameters(tmp_path: Path):
