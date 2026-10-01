@@ -301,3 +301,79 @@ def test_size_live_signal_rejects_malformed_present_metadata():
 
     with pytest.raises(ValueError, match="entry_price"):
         size_live_signal(signal, account_balance=10000.0)
+
+
+# --------------------------------------------------------------------------
+# The zero boundaries in resolve_live_levels
+# --------------------------------------------------------------------------
+#
+# Found by mutation testing `risk/live.py` with `mutate.sh`: turning each of
+# these `<= 0` guards into `< 0` **survived** 408 collected tests, so at first
+# sight these looked like three unpinned boundaries.
+#
+# They are not, and the reason matters more than the tests. Each of these
+# mutations is an **equivalent mutant**: `risk/models.py::_finite_positive`
+# refuses a non-positive level too, on the way to a `TradeSignal`, so removing
+# this layer's guard changes nothing observable. Verified rather than assumed -
+# with `risk/live.py:96` mutated, `resolve_live_levels` really does return
+# `(0.0, 95.0, None)`, and the refusal arrives one layer down from
+# `risk/models.py:30`.
+#
+# So this is defence in depth, and that is the good news. The bad news is the
+# corollary: **each guard is currently unpinned, and a mutation that removes both
+# at once is invisible.** Weakening all three here plus `_finite_positive` is
+# killed by exactly the three cases below.
+#
+# A stop at 0 is not a tight stop - it is a risk distance of the whole entry
+# price, so the position sizes about 20x smaller than intended and the trade goes
+# out silently mis-sized. That is the consequence worth pinning, and it takes
+# both layers failing before it can happen.
+
+@pytest.mark.parametrize(
+    ("key", "message"),
+    [
+        ("entry_price", "entry_price must be > 0"),
+        ("stop_loss", "stop_loss must be > 0"),
+        ("take_profit", "take_profit must be > 0"),
+    ],
+)
+def test_a_zero_level_is_refused_exactly_at_the_boundary(key: str, message: str) -> None:
+    """Exactly zero, not just negative. The guard says `> 0`, so zero must fail."""
+    signal = _signal({"entry_price": 100.0, "stop_loss": 95.0, "take_profit": 110.0, key: 0})
+
+    with pytest.raises(ValueError, match=message):
+        size_live_signal(signal, account_balance=10000.0)
+
+
+@pytest.mark.parametrize("key", ["entry_price", "stop_loss", "take_profit"])
+def test_a_negative_level_is_refused(key: str) -> None:
+    """The obvious half, pinned alongside the boundary so neither can move alone."""
+    signal = _signal({"entry_price": 100.0, "stop_loss": 95.0, "take_profit": 110.0, key: -1.0})
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        size_live_signal(signal, account_balance=10000.0)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("entry_price", 0.0001), ("stop_loss", 0.0001), ("take_profit", 0.0001)],
+)
+def test_a_tiny_but_positive_level_is_still_accepted(key: str, value: float) -> None:
+    """The boundary is `<= 0`, not a sanity floor. A near-zero price is a real price.
+
+    Without this, tightening the guard to reject implausibly small values would
+    pass every other test here, and a broker quoting a very low-priced instrument
+    would start being refused.
+    """
+    metadata = {"entry_price": 100.0, "stop_loss": 95.0, "take_profit": 110.0, key: value}
+    signal = _signal(metadata)
+
+    # Whatever the outcome, it must be a decision rather than a ValueError on the
+    # level itself - a rejection for geometry is fine, refusing the price is not.
+    try:
+        size_live_signal(signal, account_balance=10000.0)
+    except ValueError as exc:
+        assert "must be > 0" not in str(exc), (
+            f"{key}={value!r} is positive and must not be refused by the level guard: {exc}"
+        )
+        raise
