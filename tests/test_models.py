@@ -7,6 +7,7 @@ import pytest
 
 from shared.models import (
     BacktestMeta,
+    IndicatorSeries,
     BacktestStats,
     PortfolioStats,
     BacktestResult,
@@ -301,6 +302,62 @@ class TestTrade:
         )
         assert long_trade.to_dict()["direction"] == "LONG"
         assert Trade.from_dict(long_trade.to_dict()).direction_sign == 1
+
+    def test_the_free_form_meta_bucket_survives_the_roundtrip(self):
+        """`Trade.meta` is the trade's free-form bucket, and its reader default is unread.
+
+        `from_dict` falls back to `{}` for `meta` (and to `[]` for `tags`), but every
+        existing fixture leaves both empty, so `to_dict` omits them and the fallbacks are
+        never reached. Changing either default survives the suite.
+
+        `meta` is where a producer records anything the fixed fields do not cover -
+        which exit reason applied per leg, signal provenance, broker order ids. Losing it
+        on read-back means a stored backtest cannot answer "why did this trade close
+        this way", which is the first question asked of any unexplained position.
+
+        Asserted as a payload that omits the key, since that is the only shape that
+        reaches the fallback.
+        """
+        payload = {
+            "id": 11,
+            "symbol": "AAPL",
+            "direction": "SHORT",
+            "entry_time": "2021-01-01T00:00:00Z",
+            "entry_price": 100.0,
+            "quantity": 10,
+            "exits": [
+                {"time": "2021-01-02T00:00:00Z", "price": 105.0, "quantity": 10}
+            ],
+            "pnl": 50.0,
+        }
+        restored = Trade.from_dict(payload)
+
+        assert restored.meta == {}, repr(restored.meta)
+        assert restored.tags == [], repr(restored.tags)
+
+        # And populated values do survive, so the guard is not "always write them".
+        with_meta = Trade.from_dict({**payload, "meta": {"broker_order_id": "abc-123"}})
+        assert with_meta.meta == {"broker_order_id": "abc-123"}
+        with_tags = Trade.from_dict({**payload, "tags": ["manual-review"]})
+        assert with_tags.tags == ["manual-review"]
+
+    def test_populated_meta_and_tags_round_trip_through_to_dict(self):
+        original = Trade(
+            id=12, symbol="AAPL", direction="LONG",
+            entry_time="2021-01-01T00:00:00Z", entry_price=100.0,
+            quantity=10,
+            exits=[TradeExit(time="2021-01-02T00:00:00Z", price=105.0, quantity=10)],
+            pnl=50.0,
+            tags=["kept"],
+            meta={"broker_order_id": "abc-123", "leg_reasons": ["tp1"]},
+        )
+        payload = original.to_dict()
+        assert payload["tags"] == ["kept"]
+        assert payload["meta"]["broker_order_id"] == "abc-123"
+
+        restored = Trade.from_dict(payload)
+        assert restored.tags == ["kept"]
+        assert restored.meta == {"broker_order_id": "abc-123", "leg_reasons": ["tp1"]}
 
     def test_optional_fields_omitted_when_none(self):
         t = Trade(
@@ -663,6 +720,75 @@ class TestBacktestMetaDefaults:
                 f"{name!r} did not survive an omit-and-restore round trip: "
                 f"{getattr(restored, name)!r}"
             )
+
+
+class TestIndicatorSeriesRoundtrip:
+    """`IndicatorSeries` had no serialisation test at all.
+
+    Three viewer tests construct an `IndicatorSeries`, but none round-trips one, so both
+    `to_dict` mutations survived: dropping `style`, and hardcoding `type` to
+    `"overlay"`.
+
+    `type` is the sharp edge. `"overlay"` draws on the main price chart; `"panel"` gets
+    its own sub-panel below it. Hardcoding `"overlay"` therefore does not raise and does
+    not look wrong - an RSI rendered as a price-chart overlay simply draws on top of the
+    candles, which reads as a rendering quirk rather than a data bug.
+
+    `style` carries the colour, width and dash pattern, so dropping it loses the
+    presentation an artifact was saved with.
+
+    Both are asserted with the *less common* value, which is the only way a
+    hardcoded-default mutation is caught: an `"overlay"` fixture passes against a
+    hardcoded `"overlay"`.
+    """
+
+    def _series(self) -> IndicatorSeries:
+        return IndicatorSeries(
+            name="rsi_14",
+            type="panel",
+            data=[
+                {"time": "2024-01-01T00:00:00+00:00", "value": 54.2},
+                {"time": "2024-01-01T01:00:00+00:00", "value": 57.8},
+            ],
+            style={"color": "#a855f7", "width": 2, "dash": "dashed"},
+        )
+
+    def test_type_survives_so_a_panel_is_not_drawn_as_an_overlay(self):
+        payload = self._series().to_dict()
+        assert payload["type"] == "panel", (
+            "the indicator type was not carried through: " + repr(payload.get("type"))
+        )
+        assert IndicatorSeries.from_dict(payload).type == "panel"
+
+    def test_style_survives_the_roundtrip(self):
+        payload = self._series().to_dict()
+        assert payload["style"] == {
+            "color": "#a855f7",
+            "width": 2,
+            "dash": "dashed",
+        }, "the indicator style was dropped on serialisation: " + repr(payload.get("style"))
+
+        restored = IndicatorSeries.from_dict(payload)
+        assert restored.style["color"] == "#a855f7"
+        assert restored.style["dash"] == "dashed"
+        # The other fields are unaffected, so the guard is not "keep the payload raw".
+        assert restored.name == "rsi_14"
+        assert len(restored.data) == 2
+
+    def test_an_overlay_round_trips_too(self):
+        overlay = IndicatorSeries(name="ema_20", type="overlay", data=[{"value": 1.0}])
+        assert IndicatorSeries.from_dict(overlay.to_dict()).type == "overlay"
+
+    def test_a_bare_series_reads_the_documented_defaults(self):
+        """`from_dict`'s fallbacks, exercised by a payload that omits the keys.
+
+        The same structural issue as `BacktestMeta`: `data` and `style` are optional in
+        the reader, so a producer that omits them relies on the fallbacks - and nothing
+        read one.
+        """
+        bare = IndicatorSeries.from_dict({"name": "x", "type": "overlay"})
+        assert bare.data == []
+        assert bare.style == {}
 
 
 class TestStrategyMeta:
