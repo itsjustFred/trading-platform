@@ -1024,3 +1024,441 @@ class TestCtraderNameAndBalanceExtraction:
 
         with pytest.raises(ValueError):
             _ctrader_extract_login(SimpleNamespace(traderLogin="²"))
+
+
+class TestCtraderWireProtocol:
+    """The length-prefixed frame layer. All eight mutations here survived.
+
+    Nothing in the suite exercised this layer at all, and it is the part that decides whether
+    account discovery reads a *correct* account list. A framing bug does not raise - it
+    returns a plausible-looking wrong answer, or hangs.
+
+    The protocol is a 4-byte big-endian length followed by a serialised `ProtoMessage`, and
+    every mutation in this family targets one of three things: the framing, the read loop, or
+    the loop that decides which frame is the answer.
+
+    **The three consequences, in order of how badly they fail:**
+
+    | broken | consequence |
+    |---|---|
+    | length prefix little-endian or absent | every frame is misparsed; discovery reads garbage or desynchronises permanently |
+    | read loop stops early, or a socket close returns a short buffer | a truncated frame is parsed as a whole one - **silently** |
+    | a frame for another `clientMsgId` accepted | a response to a *different* request is treated as the answer |
+
+    The middle row is the one worth dwelling on, because it is the quietest. A short read is
+    not detectable after the fact: `ParseFromString` on a truncated buffer either raises or,
+    for a well-formed prefix, yields a message missing fields that then read as defaults.
+    So the two guards here - the loop condition and the `ConnectionError` - are the only
+    things standing between a closed socket and a silently incomplete account list.
+
+    `test_a_truncated_frame_is_refused_rather_than_parsed` asserts both halves of that, because
+    the two guards are independently necessary: a socket that closes must raise even if the
+    caller asked for one byte.
+    """
+
+    @staticmethod
+    def _chunked_socket(chunks: list[bytes], *, closed: bool = False):
+        """A socket that hands back the given chunks, in order, then closes or blocks.
+
+        Records every `recv` size it was asked for, so the read loop's request pattern is
+        observable rather than inferred.
+        """
+
+        class _Sock:
+            def __init__(self) -> None:
+                self._pending = list(chunks)
+                self.requested: list[int] = []
+                self.sent: list[bytes] = []
+                self.timeouts: list[float] = []
+
+            def recv(self, size: int) -> bytes:
+                """Honour the requested size, the way a real socket does.
+
+                This matters more than it looks. A fake that returns whole chunks regardless
+                of the request would let a read loop pass that a real socket would fail - it
+                would never notice the loop asking for a 4-byte length prefix and being handed
+                a whole frame. So chunks are split to the requested size, and `requested`
+                records the pattern for the assertions that check it.
+                """
+                self.requested.append(size)
+                if not self._pending:
+                    if closed:
+                        return b""
+                    raise AssertionError(
+                        f"recv({size}) called with no data left; the read loop asked for "
+                        f"more than the frame contains"
+                    )
+                chunk = self._pending[0]
+                if len(chunk) <= size:
+                    return self._pending.pop(0)
+                self._pending[0] = chunk[size:]
+                return chunk[:size]
+
+            advance_on_read: float = 0.0
+
+            def sendall(self, data: bytes) -> None:
+                self.sent.append(data)
+
+            def settimeout(self, value: float) -> None:
+                self.timeouts.append(value)
+
+        return _Sock()
+
+    def _quiet_socket(self):
+        """A socket with no data that times out, the way a real one does.
+
+        `socket.timeout` is an alias of `TimeoutError` in modern Python, so raising
+        `TimeoutError` here is faithful to what the caller actually sees.
+        """
+
+        class _Quiet:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+
+            def recv(self, size: int) -> bytes:
+                raise TimeoutError()
+
+            def sendall(self, data: bytes) -> None:
+                raise AssertionError("a quiet socket should not be sent to")
+
+            def settimeout(self, value: float) -> None:
+                self.timeouts.append(value)
+
+        return _Quiet()
+
+    # ------------------------------------------------------------------ framing
+
+    def test_recv_exact_keeps_reading_until_the_frame_is_complete(self) -> None:
+        """A frame arrives in pieces; the loop must ask only for what is still missing.
+
+        The single most important assertion in this class, and the request pattern is checked
+        as well as the result: a loop that asks for the *whole* size each time, or stops after
+        one chunk, is the difference between working and corrupting.
+        """
+        from live_runner.account_discovery import _ctrader_recv_exact
+
+        sock = self._chunked_socket([b"ab", b"cde", b"fg"])
+        assert _ctrader_recv_exact(sock, 7) == b"abcdefg", "the frame was not reassembled"
+        assert sock.requested == [7, 5, 2], (
+            f"the read loop requested the wrong remaining sizes: {sock.requested}"
+        )
+
+    def test_recv_exact_raises_when_the_socket_closes_mid_frame(self) -> None:
+        """A short read must be an error, never a short buffer.
+
+        The caller passes the result straight to `ParseFromString`, so returning a truncated
+        buffer would parse a *partial* message whose missing fields then read as defaults -
+        and protobuf defaults are quietly valid.
+        """
+        from live_runner.account_discovery import _ctrader_recv_exact
+
+        sock = self._chunked_socket([b"ab", b"c"], closed=True)
+        try:
+            result = _ctrader_recv_exact(sock, 7)
+        except ConnectionError as exc:
+            assert "closed" in str(exc).lower(), str(exc)
+        else:
+            raise AssertionError(
+                f"a socket that closed mid-frame returned {result!r} instead of raising; "
+                "the caller would parse a truncated frame as a whole one"
+            )
+
+    def test_a_single_byte_read_that_closes_still_raises(self) -> None:
+        """The guard is not sized to the request: a one-byte read on a dead socket raises too.
+
+        Checked separately because a loop that special-cases small reads would satisfy the
+        previous test while still returning short buffers for the length prefix - which is the
+        four-byte read every frame starts with.
+        """
+        from live_runner.account_discovery import _ctrader_recv_exact
+
+        sock = self._chunked_socket([], closed=True)
+        try:
+            _ctrader_recv_exact(sock, 1)
+        except ConnectionError:
+            pass
+        else:
+            raise AssertionError("a one-byte read on a closed socket returned data")
+
+    def test_send_message_prefixes_a_big_endian_length(self) -> None:
+        """The framing the broker's parser expects, asserted by decoding it back.
+
+        Little-endian and no-prefix both "work" locally - the socket accepts any bytes - so the
+        only way to catch either is to decode the prefix and check it. Asserted against the
+        actual payload length, so a stale prefix fails too.
+        """
+        import struct
+
+        from live_runner.account_discovery import _ctrader_send_message
+
+        account_discovery._load_ctrader_protocol()
+        # Read through the module, not a `from ... import`: the module-level aliases are
+        # None until the protocol is loaded, so an import taken earlier binds None.
+        message = account_discovery._ProtoMessage(
+            payloadType=1234, payload=b"hello", clientMsgId="cid-1"
+        )
+        sock = self._chunked_socket([])
+        _ctrader_send_message(sock, message, "cid-1")
+
+        assert len(sock.sent) == 1, sock.sent
+        frame = sock.sent[0]
+        prefix, body = frame[:4], frame[4:]
+        (declared,) = struct.unpack(">I", prefix)
+        assert declared == len(body), (
+            f"the length prefix says {declared} but {len(body)} bytes follow; the broker's "
+            "parser would desynchronise on this frame"
+        )
+        # And a little-endian prefix would decode to something else entirely.
+        (as_little,) = struct.unpack("<I", prefix)
+        assert as_little != declared or declared == 0, (
+            "the prefix is not distinguishable by byte order for this length"
+        )
+        envelope = account_discovery._ProtoMessage()
+        envelope.ParseFromString(body)
+        assert envelope.clientMsgId == "cid-1"
+        assert envelope.payloadType == 1234
+
+    # -------------------------------------------------------- response dispatch
+
+    def _account_list_res(self, account_id: int = 12345):
+        """A minimal but *valid* account-list response carrying a known account id.
+
+        Two things are load-bearing here.
+
+        `ctidTraderAccountId` and `accessToken` are protobuf required fields, so a bare
+        message refuses to serialise - a fixture that skips them fails loudly rather than
+        teaching the test to expect the wrong thing.
+
+        And the account id is parameterised because **two responses of the same type are
+        indistinguishable by type alone.** An earlier version of the mismatched-frame test
+        asserted only `isinstance(result, <that type>)`, which a response carrying the
+        *wrong* account also satisfies - so removing the `clientMsgId` check survived a test
+        that looked like it covered exactly that. Asserting the id is what makes the
+        dispatch check observable.
+        """
+        account_discovery._load_ctrader_protocol()
+        message = account_discovery._ProtoOAGetAccountListByAccessTokenRes()
+        message.accessToken = "test-token"
+        account = message.ctidTraderAccount.add()
+        account.ctidTraderAccountId = account_id
+        return message
+
+    def _frame(self, *, payload_type: int, client_msg_id: str, payload: bytes) -> bytes:
+        import struct
+
+        # Built with a real serialisation round trip so the wire form is genuine, and read
+        # through the module because the alias is None until the protocol is loaded.
+        account_discovery._load_ctrader_protocol()
+        envelope = account_discovery._ProtoMessage(
+            payloadType=payload_type,
+            payload=payload,
+            clientMsgId=client_msg_id,
+        )
+        raw = envelope.SerializeToString()
+        return struct.pack(">I", len(raw)) + raw
+
+    def test_a_frame_for_another_request_is_skipped_until_the_match(self) -> None:
+        """Only the frame whose `clientMsgId` matches is the answer.
+
+        The broker interleaves frames - heartbeats, and responses to earlier requests - so
+        this loop is what keeps a stale response from being returned as the answer to the
+        current request. Asserted by putting the wrong one first and checking it is skipped
+        rather than returned.
+        """
+        from live_runner.account_discovery import (
+            _ProtoOAErrorRes,
+            _ProtoMessage,
+            _ctrader_wait_response,
+        )
+
+        account_discovery._load_ctrader_protocol()
+
+        wanted = self._account_list_res(account_id=12345)
+        wanted_frame = self._frame(
+            payload_type=int(wanted.payloadType),
+            client_msg_id="mine",
+            payload=wanted.SerializeToString(),
+        )
+        # Same message type, different account, different client id. Only the client id can
+        # tell them apart, so the assertion has to look at the account inside the payload.
+        other = self._account_list_res(account_id=999)
+        other_frame = self._frame(
+            payload_type=int(other.payloadType),
+            client_msg_id="someone-else",
+            payload=other.SerializeToString(),
+        )
+        sock = self._chunked_socket([other_frame, wanted_frame])
+
+        result = _ctrader_wait_response(sock, "mine", timeout_seconds=5)
+        assert isinstance(
+            result, account_discovery._ProtoOAGetAccountListByAccessTokenRes
+        ), type(result).__name__
+        returned_id = result.ctidTraderAccount[0].ctidTraderAccountId
+        assert returned_id == 12345, (
+            f"the response for another request was returned as the answer: it carries "
+            f"account {returned_id}, not the awaited 12345"
+        )
+
+    def test_an_error_response_is_raised_not_returned(self) -> None:
+        """A broker error must raise, or the caller proceeds as though the call succeeded."""
+        from live_runner.account_discovery import _ctrader_wait_response
+
+        account_discovery._load_ctrader_protocol()
+        error = account_discovery._ProtoOAErrorRes(errorCode="101", description="nope")
+        frame = self._frame(
+            payload_type=int(error.payloadType),
+            client_msg_id="mine",
+            payload=error.SerializeToString(),
+        )
+        sock = self._chunked_socket([frame])
+
+        try:
+            result = _ctrader_wait_response(sock, "mine", timeout_seconds=5)
+        except RuntimeError as exc:
+            assert "101" in str(exc) and "nope" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                f"an error response was returned as a success: {type(result).__name__}"
+            )
+
+    def test_a_heartbeat_is_answered_and_the_loop_continues(self) -> None:
+        """The broker sends heartbeats on the same socket; they are replied to and skipped.
+
+        Two things in one test because they are one behaviour: the heartbeat must be answered
+        with an empty client id (it is not a reply to anything), and the loop must continue
+        rather than treating it as the awaited payload.
+        """
+        from live_runner.account_discovery import (
+            _ProtoHeartbeatEvent,
+            _ProtoOAGetAccountListByAccessTokenRes,
+            _ctrader_wait_response,
+        )
+
+        account_discovery._load_ctrader_protocol()
+        heartbeat = _ProtoHeartbeatEvent()
+        heartbeat_frame = self._frame(
+            payload_type=int(heartbeat.payloadType),
+            client_msg_id="",
+            payload=heartbeat.SerializeToString(),
+        )
+        wanted = self._account_list_res()
+        wanted_frame = self._frame(
+            payload_type=int(wanted.payloadType),
+            client_msg_id="mine",
+            payload=wanted.SerializeToString(),
+        )
+        sock = self._chunked_socket([heartbeat_frame, wanted_frame])
+
+        result = _ctrader_wait_response(sock, "mine", timeout_seconds=5)
+        assert isinstance(
+            result, account_discovery._ProtoOAGetAccountListByAccessTokenRes
+        ), type(result).__name__
+        assert sock.sent, "the heartbeat was not answered; the broker would drop the stream"
+
+    def test_a_quiet_socket_surfaces_a_timeout(self) -> None:
+        """A socket with no frames surfaces the timeout rather than hanging or returning junk.
+
+        The fake raises `TimeoutError` when it has no data, which is what a real socket does
+        once its timeout expires - and `_ctrader_wait_response` lets that propagate. Asserted
+        so the path is exercised, and so the socket timeout being set is visible.
+        """
+        from live_runner.account_discovery import _ctrader_wait_response
+
+        account_discovery._load_ctrader_protocol()
+        sock = self._quiet_socket()
+        try:
+            _ctrader_wait_response(sock, "mine", timeout_seconds=5)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("a socket that sent nothing did not time out")
+        assert sock.timeouts, "the socket timeout was never set"
+
+    def test_each_iteration_shrinks_the_socket_timeout_to_what_is_left(self) -> None:
+        """The deadline is a budget for the whole loop, not per iteration.
+
+        Driven with a fake clock rather than real time, for two reasons. A wall-clock test
+        would take as long as the budget on every run, and - more importantly - if the
+        deadline check were removed the loop would spin forever instead of failing, so the
+        mutation would hang the suite rather than kill it. With a fake clock the loop's
+        arithmetic is observable directly.
+
+        Three heartbeats are interleaved ahead of the answer, and each iteration must lower
+        the socket timeout by the time the clock advanced.
+        """
+        from live_runner.account_discovery import (
+            _ProtoHeartbeatEvent,
+            _ProtoOAGetAccountListByAccessTokenRes,
+            _ctrader_wait_response,
+        )
+
+        account_discovery._load_ctrader_protocol()
+        heartbeat = _ProtoHeartbeatEvent()
+        wanted = self._account_list_res()
+        frames = [
+            self._frame(
+                payload_type=int(heartbeat.payloadType),
+                client_msg_id="",
+                payload=heartbeat.SerializeToString(),
+            )
+            for _ in range(3)
+        ]
+        frames.append(
+            self._frame(
+                payload_type=int(wanted.payloadType),
+                client_msg_id="mine",
+                payload=wanted.SerializeToString(),
+            )
+        )
+        sock = self._chunked_socket(frames)
+
+        # Each recv advances the clock by half a second, so the budget must shrink.
+        clock = {"now": 1000.0}
+        for _ in frames:
+            sock.advance_on_read = 0.5
+        original_time = account_discovery.time.time
+        account_discovery.time.time = lambda: clock["now"]
+        original_recv = sock.recv
+
+        def recv(size: int) -> bytes:
+            clock["now"] += sock.advance_on_read
+            return original_recv(size)
+
+        sock.recv = recv
+        try:
+            result = _ctrader_wait_response(sock, "mine", timeout_seconds=10)
+        finally:
+            account_discovery.time.time = original_time
+
+        assert isinstance(
+            result, account_discovery._ProtoOAGetAccountListByAccessTokenRes
+        ), type(result).__name__
+        assert len(sock.timeouts) >= 4, f"only {len(sock.timeouts)} iterations: {sock.timeouts}"
+        assert sock.timeouts == sorted(sock.timeouts, reverse=True), (
+            f"the socket timeout did not shrink as the budget was consumed: {sock.timeouts}"
+        )
+        assert sock.timeouts[0] == pytest.approx(10.0), sock.timeouts
+        assert sock.timeouts[-1] < sock.timeouts[0], sock.timeouts
+        assert all(0 < t <= 10.0 for t in sock.timeouts), sock.timeouts
+
+    def test_an_expired_budget_raises_before_reading_the_socket(self) -> None:
+        """With no time left the loop must not attempt a read.
+
+        Checked through the socket recording zero `recv` calls, and this is the test that kills
+        the "deadline ignored" mutation. Reading anyway would block on a socket whose timeout
+        has not been set, so the read would hang rather than fail - which is the difference
+        between a bounded discovery attempt and a wedged daemon.
+        """
+        from live_runner.account_discovery import _ctrader_wait_response
+
+        account_discovery._load_ctrader_protocol()
+        sock = self._chunked_socket([])
+        try:
+            _ctrader_wait_response(sock, "mine", timeout_seconds=0.0)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("a zero budget did not raise")
+        assert sock.requested == [], (
+            f"the loop read from the socket with no budget left: {sock.requested}"
+        )
