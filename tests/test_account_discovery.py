@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +85,187 @@ def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
     accounts = account_discovery.discover_alpaca_accounts("k", "s", True)
     assert len(accounts) == 1
     assert accounts[0].broker_login == "broker-42"
+
+
+def test_a_missing_islive_flag_reads_as_demo_not_live(monkeypatch):
+    """An absent `isLive` must fail toward demo. `getattr(..., False)` is that choice.
+
+    The default decides which way an unanswerable question resolves, and this one
+    resolves toward `is_demo=True`, i.e. the account is treated as paper. Flipping it
+    to `True` leaves every collected test green, because no test builds an account
+    item without the flag - so the safety direction of this default was unverified.
+
+    The asymmetry is the point. An absent flag is *not* evidence of a live account,
+    and a demo that silently trades real money is unrecoverable; a live account
+    misreported as demo merely refuses to arm.
+    """
+    monkeypatch.setattr(account_discovery, "_request_ctrader_account_detail", lambda *_a, **_k: None)
+    monkeypatch.setattr(account_discovery, "_load_ctrader_trader_details", lambda *_a, **_k: None)
+    monkeypatch.setattr(account_discovery, "_ctrader_resolved_account_id", lambda _item: 12345)
+    monkeypatch.setattr(
+        account_discovery,
+        "_ctrader_account_context",
+        lambda *_a, **_k: SimpleNamespace(
+            balance=100.0,
+            trader_login="7",
+            account_name_hint="",
+            broker_name="cTrader",
+            ignored_name_values=set(),
+        ),
+    )
+
+    without_flag = SimpleNamespace()  # no `isLive` at all
+    account = account_discovery._build_ctrader_live_account(
+        "demo.ctraderapi.com", None, "tok", without_flag
+    )
+    assert account is not None, "the account was dropped, so this test proves nothing"
+    assert account.is_demo is True, (
+        "an absent isLive flag was read as a live account; the default must fail "
+        "toward demo"
+    )
+
+    # And the explicit values still decide, so the default is not doing the work.
+    monkeypatch.setattr(
+        account_discovery, "_ctrader_host_matches_environment", lambda **_kw: True
+    )
+    assert (
+        account_discovery._build_ctrader_live_account(
+            "live.ctraderapi.com", None, "tok", SimpleNamespace(isLive=True)
+        ).is_demo
+        is False
+    )
+    assert (
+        account_discovery._build_ctrader_live_account(
+            "demo.ctraderapi.com", None, "tok", SimpleNamespace(isLive=False)
+        ).is_demo
+        is True
+    )
+
+
+def test_an_account_on_the_wrong_ctrader_host_is_dropped(monkeypatch):
+    """A live account discovered on the demo host is a routing bug, and is dropped.
+
+    The host says `live.` and the flag says demo, or the reverse. Keeping either
+    would mean trading against an environment the credentials were not issued for -
+    so the account is dropped and the mismatch is logged. Dropping the guard left
+    every test green, since `_ctrader_host_matches_environment` is only pinned
+    directly, never through the caller that acts on its answer.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        account_discovery,
+        "_log_ctrader_host_environment_mismatch",
+        lambda host, account_id, is_demo: calls.append(f"{host}:{account_id}:{is_demo}"),
+    )
+    monkeypatch.setattr(account_discovery, "_request_ctrader_account_detail", lambda *_a, **_k: None)
+    monkeypatch.setattr(account_discovery, "_load_ctrader_trader_details", lambda *_a, **_k: None)
+    monkeypatch.setattr(account_discovery, "_ctrader_resolved_account_id", lambda _item: 999)
+    monkeypatch.setattr(
+        account_discovery,
+        "_ctrader_account_context",
+        lambda *_a, **_k: SimpleNamespace(
+            balance=1.0,
+            trader_login=None,
+            account_name_hint="",
+            broker_name="cTrader",
+            ignored_name_values=set(),
+        ),
+    )
+
+    # A live account arriving on the demo host.
+    assert (
+        account_discovery._build_ctrader_live_account(
+            "demo.ctraderapi.com", None, "tok", SimpleNamespace(isLive=True)
+        )
+        is None
+    )
+    assert calls == ["demo.ctraderapi.com:999:False"], (
+        "the mismatch was not reported, so the drop would be silent: " + repr(calls)
+    )
+
+    # A demo account arriving on the live host, the other direction.
+    calls.clear()
+    assert (
+        account_discovery._build_ctrader_live_account(
+            "live.ctraderapi.com", None, "tok", SimpleNamespace(isLive=False)
+        )
+        is None
+    )
+    assert calls == ["live.ctraderapi.com:999:True"]
+
+
+def test_alpaca_discovery_reports_the_configured_paper_mode(monkeypatch):
+    """`is_demo` is the configured `paper` flag, for both settings.
+
+    The file's docstring on `_iter_alpaca_credentials` states the reason: sharing the
+    adapter's block parser keeps the discovered `paper` flag identical to the mode the
+    runtime adapter is constructed with, so `is_demo` can never contradict the actual
+    trading mode. Forcing it to `True` left every test green, because the one existing
+    Alpaca discovery test passes `paper=True` and only asserts `broker_login`.
+
+    This is the check that would catch a paper account being armed with live
+    credentials, or the reverse - the contradiction the docstring warns about.
+    """
+
+    def _discover(paper: bool):
+        class _FakeAccount:
+            id = "acc-id"
+            account_number = "broker-42"
+            status = "ACTIVE"
+            equity = 10.0
+            cash = 10.0
+
+        class _FakeTradingClient:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def get_account(self):
+                return _FakeAccount()
+
+        fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
+        monkeypatch.setitem(sys.modules, "alpaca", SimpleNamespace(trading=SimpleNamespace(client=fake_module)))
+        monkeypatch.setitem(sys.modules, "alpaca.trading", SimpleNamespace(client=fake_module))
+        monkeypatch.setitem(sys.modules, "alpaca.trading.client", fake_module)
+        return account_discovery.discover_alpaca_accounts("k", "s", paper)
+
+    assert [a.is_demo for a in _discover(True)] == [True]
+    assert [a.is_demo for a in _discover(False)] == [False], (
+        "a live Alpaca account was discovered as demo, so the deployment could be "
+        "armed against real money"
+    )
+
+
+def test_a_failed_verification_write_does_not_abort_discovery(monkeypatch):
+    """The write is best-effort: discovery still returns, and the account stays unverified.
+
+    The docstring is explicit that failure is logged and swallowed so discovery
+    returns the account list anyway, leaving the account unverified and therefore
+    fail-closed until the next successful discovery. Narrowing the `except Exception`
+    to a single type leaves every test green, so a write failure would instead
+    propagate out of discovery - which is how a headless deployment loses its account
+    list entirely.
+    """
+    monkeypatch.setattr(
+        account_discovery,
+        "record_live_account_demo_verification",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("db is locked")),
+    )
+
+    assert account_discovery.record_discovered_account_verification(
+        "acc-1", is_demo=True, ctid="1", broker_login="7"
+    ) is None
+
+    # And it is not recorded, so the account stays unverified rather than looking fine.
+    recorded: list[object] = []
+    monkeypatch.setattr(
+        account_discovery,
+        "record_live_account_demo_verification",
+        lambda *a, **k: recorded.append((a, k)),
+    )
+    account_discovery.record_discovered_account_verification(
+        "acc-1", is_demo=True, ctid="1", broker_login="7"
+    )
+    assert len(recorded) == 1
 
 
 def test_ctrader_host_matches_environment_filters_demo_and_live_hosts():
