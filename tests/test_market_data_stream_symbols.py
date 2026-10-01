@@ -88,6 +88,53 @@ def _worker(stream) -> _StreamWorker:
     return worker
 
 
+def test_blank_symbols_never_reach_the_subscription() -> None:
+    """The `if _normalize_symbol(symbol)` filter is what keeps blanks out.
+
+    `set_symbols` normalises each symbol and keeps only the non-empty results, so
+    `{"AAPL", "   "}` subscribes AAPL alone. Dropping that filter leaves every collected
+    test green - the existing tests pass well-formed symbol sets.
+
+    The consequence is a subscription to the empty string, which reaches
+    `subscribe_bars`. Alpaca answers a feed it cannot resolve with an error, and this
+    call site is inside the worker's per-update path: the comment above it says an
+    exception here "would abandon the remaining workers' updates", so one blank symbol
+    coming from a deployment's config stops the remaining symbols from being applied.
+
+    So the filter is not cosmetic - it is the boundary between a malformed config entry
+    and a refresh loop that stops updating.
+
+    Asserted on both facets: the blank is not in the tracked set, and it is not passed to
+    the stream. The stream is called with the real symbols only.
+    """
+    import threading
+
+    from live_runner import market_data_stream as mds
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        def subscribe_bars(self, _handler, *symbols) -> None:
+            self.subscribed.extend(symbols)
+
+    worker = mds._StreamWorker.__new__(mds._StreamWorker)
+    worker._lock = threading.Lock()
+    worker._symbols = set()
+    worker.stream = _Stream()
+    worker.bar_handler = lambda *_a, **_k: None
+
+    worker.set_symbols({"AAPL", "   ", "", "\t", " msft "})
+
+    assert worker._symbols == {"AAPL", "MSFT"}, (
+        "a blank or unnormalised symbol was kept: " + repr(sorted(worker._symbols))
+    )
+    assert sorted(worker.stream.subscribed) == ["AAPL", "MSFT"], (
+        "a blank symbol reached subscribe_bars, which would fail the feed and abandon "
+        "the remaining workers' updates: " + repr(worker.stream.subscribed)
+    )
+
+
 def test_crypto_and_stock_symbols_go_to_different_streams() -> None:
     """`stream_kind` decides which websocket a symbol is subscribed on.
 
