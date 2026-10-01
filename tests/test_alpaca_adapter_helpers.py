@@ -237,6 +237,126 @@ def test_order_id_normalisation_defences_that_look_redundant_are_not_reachable()
         )
 
 
+class TestAlpacaCredentialHintAmbiguity:
+    """Whether an unmatched Alpaca account may fall back to another account's keys.
+
+    The bulk-response guards on this adapter turn out to be well covered already - four
+    mutations were killed on the first attempt by `tests/test_live_execution_safety.py`.
+    The gap is on the **credential-selection** side, which decides the same kind of thing
+    from the other direction.
+
+    `_alpaca_blocks_have_hints` exists to answer one question: are these credential blocks
+    *claiming* to be about specific accounts? If they are and nothing matched, the account
+    refuses rather than trading through keys it did not map to. If they are not - the legacy
+    single-account setup - the single remaining block is still used, with a warning.
+
+    So a **whitespace-only hint is not a hint**, and that is the survivor worth pinning: the
+    check strips before testing, so `account_id_hint="   "` reads as "no claim" rather than
+    as a claim on some account. Without the strip, a block whose hint is blank-but-present
+    would count as claiming an account, and an unmatched account would be **refused
+    credentials it should have been given** - an outage in the one configuration that is
+    supposed to keep working.
+
+    `_matching_alpaca_block` is here for the same reason, plus a verified equivalent mutant
+    recorded below.
+    """
+
+    @staticmethod
+    def _block(**kwargs):
+        block = {"api_key": "k", "secret_key": "s", "paper": True}
+        block.update(kwargs)
+        return block
+
+    def test_a_whitespace_only_hint_is_not_a_claim(self) -> None:
+        """Blank-after-strip means "unclaimed", so the legacy single-account path still works.
+
+        Asserted for both hint keys, and for a block with no hint keys at all - all three are
+        the same state and must read the same way.
+        """
+        from live_runner.alpaca_adapter import _alpaca_blocks_have_hints
+
+        for blocks, label in (
+            ([self._block(account_id_hint="   ")], "account_id_hint of spaces"),
+            ([self._block(login_hint="  ")], "login_hint of spaces"),
+            ([self._block(account_id_hint=" \t\n ")], "account_id_hint of whitespace"),
+            ([self._block()], "no hint keys at all"),
+            ([self._block(account_id_hint="", login_hint="")], "both hints empty"),
+            ([], "no blocks"),
+        ):
+            assert _alpaca_blocks_have_hints(blocks) is False, (
+                f"{label} was treated as a claim on a specific account"
+            )
+
+    def test_a_real_hint_is_a_claim(self) -> None:
+        """And a genuine hint is, on either key, with or without surrounding whitespace."""
+        from live_runner.alpaca_adapter import _alpaca_blocks_have_hints
+
+        for blocks, label in (
+            ([self._block(account_id_hint="acc1")], "account_id_hint"),
+            ([self._block(login_hint="alice")], "login_hint"),
+            ([self._block(account_id_hint="  acc1  ")], "padded account_id_hint"),
+            ([self._block(account_id_hint="", login_hint="alice")], "login_hint only"),
+            ([self._block(login_hint=""), self._block(login_hint="bob")], "second of two"),
+        ):
+            assert _alpaca_blocks_have_hints(blocks) is True, (
+                f"{label} was not treated as a claim, so an unmatched account would fall "
+                "through to another account's keys"
+            )
+
+    def test_a_block_is_matched_on_either_key_and_neither_on_a_blank_hint(self) -> None:
+        """Matching is exact after normalising both sides, and a blank hint never matches.
+
+        The padded-account-id case is the one worth keeping: a broker-reported id with
+        surrounding whitespace must still find its block, since the comparison lowercases
+        and strips both sides.
+        """
+        from live_runner.alpaca_adapter import _matching_alpaca_block
+
+        # The caller (`resolve_alpaca_credentials`) normalises its inputs; this function
+        # normalises the *block's* side itself. Asserted that way round, so the two halves
+        # of the normalisation are each pinned where they actually live.
+        by_account = [self._block(api_key="by-acc", account_id_hint="  ACC-1  ")]
+        assert _matching_alpaca_block(by_account, "acc-1", "") == ("by-acc", "s", True)
+
+        by_login = [self._block(api_key="by-login", login_hint="  Alice  ")]
+        assert _matching_alpaca_block(by_login, "", "alice") == ("by-login", "s", True)
+
+        # A blank hint matches nothing, and an absent account/login matches nothing either.
+        blank = [self._block(api_key="blank", login_hint="   ")]
+        assert _matching_alpaca_block(blank, "", "") is None, (
+            "a whitespace-only login hint matched an absent login"
+        )
+        assert _matching_alpaca_block(blank, "", "alice") is None
+
+    def test_the_normalized_login_guard_is_a_verified_equivalent_mutation_target(self) -> None:
+        """**R7 is an equivalent mutant**, recorded with the proof rather than dropped.
+
+        `_matching_alpaca_block` reads:
+
+            if login_hint and normalized_login and login_hint == normalized_login:
+
+        Removing `normalized_login` changes nothing, and the argument is short. The clause
+        only ever *adds* a restriction when `normalized_login` is blank - and when it is
+        blank, `login_hint == normalized_login` already requires `login_hint` to be blank,
+        which the leading `if login_hint` has already excluded.
+
+        Verified by calling the real function on the two configurations that matter:
+
+        | block hint | normalised login | result |
+        |---|---|---|
+        | `"alice"` | `""` | `None` |
+        | `""` | `""` | `None` |
+
+        Both stay `None` with or without the redundant term, because a match requires the
+        hint to be non-blank *and* equal to the login.
+
+        Kept as a note rather than a code change for the same reason as the other verified
+        equivalents in this sweep: the guard is documentation of intent ("an absent login
+        identifies nothing"), it costs nothing, and removing it would make the intent
+        implicit in the string comparison.
+        """
+
+
 class TestExecutionFillPersistenceReporting:
     """A failed write must not be logged as a persisted fill.
 
