@@ -141,6 +141,35 @@ def test_unknown_deployment_status_is_fail_closed():
     assert _normalize_deployment_status("") == "UNKNOWN"
     assert _normalize_deployment_status(None) == "UNKNOWN"
 
+    # The allow-list is exactly the three deployment statuses, and nothing else. Adding a
+    # synonym to it turns a fail-closed read into a fail-open one: the value stops being
+    # UNKNOWN, and UNKNOWN is what every trading gate compares against.
+    #
+    # The dangerous additions are not nonsense strings - `DISABLED` already covers those -
+    # but plausible operator vocabulary that means the opposite of ACTIVE. `RUNNING` and
+    # `RESUMED` are the ones that matter: this repo already uses `running` as a *service*
+    # status (ServiceStatus.RUNNING) and `resume` as an operator action, so either can
+    # reach a deployment row. Adding either to the allow-list would make a row that does
+    # not say ACTIVE trade.
+    for near_miss in (
+        "RUNNING", "RESUMED", "ENABLED", "ON", "LIVE", "ACTIVE_PENDING",
+        "ACTIVE ", " ACTIVE", "ACTIVE	", "ACTIVA", "ACTI",
+    ):
+        assert _normalize_deployment_status(near_miss) in {"UNKNOWN", "ACTIVE"}, (
+            f"{near_miss!r} normalised to something other than UNKNOWN/ACTIVE"
+        )
+        if near_miss.strip() != near_miss or near_miss != near_miss.strip():
+            # Whitespace-padded ACTIVE is not ACTIVE: the comparison is on the exact
+            # token, so a padded value must not trade.
+            assert _normalize_deployment_status(near_miss) == "UNKNOWN", (
+                f"{near_miss!r} traded as if it were ACTIVE"
+            )
+
+    for synonym in ("RUNNING", "RESUMED", "ENABLED", "ON", "LIVE"):
+        assert _normalize_deployment_status(synonym) == "UNKNOWN", (
+            f"{synonym!r} is treated as a tradeable status; only ACTIVE may trade"
+        )
+
 
 # ── Live submission guards ─────────────────────────────────────────────────────
 
