@@ -268,6 +268,117 @@ def test_a_failed_verification_write_does_not_abort_discovery(monkeypatch):
     assert len(recorded) == 1
 
 
+def test_a_non_bool_demo_flag_is_treated_as_absent_not_as_a_value(monkeypatch):
+    """`is_demo` stays tri-state through the refresher: bool, or None. Never anything else.
+
+    The refresher narrows the broker's raw field with `isinstance(raw_is_demo, bool)`.
+    Relaxing that to `is not None` left every test green, because every stub reports a
+    real `bool` - so a broker that starts sending `"true"`, `1`, or `0` would have its
+    raw value passed straight through.
+
+    Two reasons that matters, and they pull in opposite directions:
+
+    - `bool("false")` is **True**. A broker answering with the *string* `"false"` - a
+      perfectly ordinary representation of a live account - would be recorded as
+      `is_demo=True` and the account would read as paper.
+    - `record_live_account_demo_verification` annotates `is_demo: bool`, so anything
+      else is a lie about the annotation, not a tolerated coercion.
+
+    The one-directional rule from `record_discovered_account_verification` applies here
+    too: an unrecognised value is *no* verification, which leaves the account
+    unverified and therefore fail-closed.
+    """
+    recorded: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        account_discovery,
+        "discover_configured_accounts",
+        _async_returning(
+            [
+                SimpleNamespace(id="acc-str", is_demo="false", broker_login="1", ctid="1"),
+                SimpleNamespace(id="acc-one", is_demo=1, broker_login="2", ctid="2"),
+                SimpleNamespace(id="acc-zero", is_demo=0, broker_login="3", ctid="3"),
+                SimpleNamespace(id="acc-none", is_demo=None, broker_login="4", ctid="4"),
+                SimpleNamespace(id="acc-true", is_demo=True, broker_login="5", ctid="5"),
+                SimpleNamespace(id="acc-false", is_demo=False, broker_login="6", ctid="6"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        account_discovery,
+        "record_discovered_account_verification",
+        lambda account_id, *, is_demo, ctid, broker_login: recorded.append(
+            (account_id, is_demo)
+        ),
+    )
+    monkeypatch.setattr(
+        account_discovery, "demo_verification_age_seconds", lambda _id: None
+    )
+
+    asyncio.run(account_discovery.refresh_account_demo_verifications())
+
+    by_id = dict(recorded)
+    assert by_id["acc-str"] is None, (
+        'the string "false" was recorded as a verification; bool("false") is True, so a '
+        "live account would read as paper"
+    )
+    assert by_id["acc-one"] is None, "the integer 1 was recorded as a verification"
+    assert by_id["acc-zero"] is None, "the integer 0 was recorded as a verification"
+    assert by_id["acc-none"] is None
+    # The real booleans still pass through unchanged, so the narrowing is not a blanket.
+    assert by_id["acc-true"] is True
+    assert by_id["acc-false"] is False
+    assert set(by_id) == {"acc-str", "acc-one", "acc-zero", "acc-none", "acc-true", "acc-false"}
+
+
+def test_an_account_with_no_id_is_skipped_not_written_to(monkeypatch):
+    """A blank account id is skipped before any write is attempted.
+
+    `record_live_account_demo_verification` raises `ValueError` on a blank id, and
+    `record_discovered_account_verification` swallows it - so removing the `continue`
+    leaves the outcome the same *and* the log noisier. It is pinned because the counter
+    is the observable part: `skipped` must count it, and the function's own warning at
+    the end distinguishes "understood but wrote nothing" from "had an unusable id".
+
+    Written as a shape assertion rather than a crash assertion, because the swallow is
+    deliberate and the defect it would introduce is a misleading log, not a wrong stamp.
+    """
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        account_discovery,
+        "discover_configured_accounts",
+        _async_returning(
+            [
+                SimpleNamespace(id="", is_demo=True, broker_login="1", ctid="1"),
+                SimpleNamespace(id="   ", is_demo=True, broker_login="2", ctid="2"),
+                SimpleNamespace(id=None, is_demo=True, broker_login="3", ctid="3"),
+                SimpleNamespace(id="acc-ok", is_demo=True, broker_login="4", ctid="4"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        account_discovery,
+        "record_discovered_account_verification",
+        lambda account_id, *, is_demo, ctid, broker_login: recorded.append(account_id),
+    )
+    monkeypatch.setattr(
+        account_discovery, "demo_verification_age_seconds", lambda _id: None
+    )
+
+    asyncio.run(account_discovery.refresh_account_demo_verifications())
+
+    assert recorded == ["acc-ok"], (
+        "a blank account id reached the verification writer: " + repr(recorded)
+    )
+
+
+def _async_returning(value):
+    async def _inner():
+        return value
+
+    return _inner
+
+
 def test_ctrader_host_matches_environment_filters_demo_and_live_hosts():
     assert account_discovery._ctrader_host_matches_environment(
         host="demo.ctraderapi.com",
