@@ -37,6 +37,232 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+def test_the_zero_distance_guard_in_resolve_relative_sl_tp_is_unreachable() -> None:
+    """**A verified equivalent mutant**, recorded with the proof rather than dropped.
+
+    Removing the `if distance <= 0: raise` inside `_distance` changes nothing, and the
+    reason is structural rather than incidental:
+
+        SL:  outward = reference - stop_loss   distance = abs(reference - stop_loss)
+        TP:  outward = take_profit - reference distance = abs(reference - take_profit)
+
+    In both cases `distance == abs(outward)` - the same difference, unsigned. The side
+    checks already refuse `outward <= 0`, so by the time `_distance` runs, `outward > 0`
+    strictly, and therefore `distance > 0` strictly. Zero is unreachable.
+
+    Verified by exhaustion over reference prices of 100.0, 1e-9 and 1e9 crossed with
+    stops at the reference, 1e-12 either side, 0.0, -1.0, +inf and NaN: no case with
+    `outward > 0` also has `distance == 0`.
+
+    **Why keep the note rather than delete the guard.** The guard is cheap, it documents
+    the invariant, and the argument above depends on the side checks staying *upstream of*
+    `_distance` for *both* roles. That is a property of the current shape of the code, not
+    of the arithmetic: moving `_distance` ahead of the side checks would turn this guard
+    into the only thing preventing a zero-distance order. So if the ordering ever changes,
+    this test's reasoning has to change with it.
+
+    The `zero-distance` refusal asserted in
+    `TestRelativeStopLossAndTakeProfit::test_a_stop_or_target_equal_to_entry_is_refused`
+    is therefore real behaviour, coming from the wrong-side check rather than from this
+    one. That test is what makes the distinction visible.
+    """
+
+
+class TestRelativeStopLossAndTakeProfit:
+    """The SL/TP geometry that becomes a live protective order, which was thin.
+
+    `_resolve_relative_sl_tp` converts absolute prices into cTrader's relative units
+    (int64 in 1/100000 of a price unit). Four mutations survive.
+
+    **Every refusal here is a trade that was not placed.** That is the point of the
+    function: a stop loss on the wrong side of entry is not a slightly-off stop, it is a
+    stop the broker would reject or, worse, accept as a take-profit trigger. So these
+    tests are written as "this must not submit" rather than "this returns a number".
+
+    The directions are the part worth stating plainly, because they are the part that is
+    easy to get backwards and impossible to notice:
+
+    | action | stop loss | take profit |
+    |---|---|---|
+    | `buy`  | **below** entry | **above** entry |
+    | `sell` | **above** entry | **below** entry |
+
+    Both refusals are asserted for both directions. Asserting only the buy case is how a
+    sell stop lands on the wrong side.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        # `_scale_for` is a symbol-cache lookup; this test is about the geometry, so the
+        # scale is stubbed and the divisor is asserted separately.
+        adapter._scale_for = lambda symbol: SimpleNamespace()
+        return adapter
+
+    @staticmethod
+    def _signal(action: str, *, reference: float = 100.0):
+        return SimpleNamespace(
+            action=action, symbol="EURUSD", theoretical_price=reference
+        )
+
+    def _resolve(self, action, stop_loss, take_profit=None, *, reference=100.0):
+        return self._adapter()._resolve_relative_sl_tp(
+            self._signal(action, reference=reference), stop_loss, take_profit
+        )
+
+    @pytest.mark.parametrize(
+        "action,stop_loss,take_profit",
+        [
+            ("buy", 90.0, 110.0),
+            ("sell", 110.0, 90.0),
+        ],
+    )
+    def test_a_well_placed_order_converts_to_relative_units(
+        self, action: str, stop_loss: float, take_profit: float
+    ) -> None:
+        """A 10-point stop and a 10-point target, at a divisor of 100000.
+
+        Both are outward from entry in the right direction, so both resolve to the same
+        magnitude: 10.0 price units -> 1_000_000 relative units. Symmetry is asserted
+        deliberately, because buy and sell are the two halves most likely to drift apart.
+        """
+        from live_runner.ctrader_adapter import (
+            CTRADER_RELATIVE_PRICE_UNIT_DIVISOR,
+        )
+
+        assert CTRADER_RELATIVE_PRICE_UNIT_DIVISOR == 100000
+        stop, take = self._resolve(action, stop_loss, take_profit)
+        assert stop == 1_000_000, f"stop distance is wrong for {action}: {stop}"
+        assert take == 1_000_000, f"take distance is wrong for {action}: {take}"
+        assert stop > 0 and take > 0, "relative units are a signed magnitude, never zero here"
+
+    def test_a_stop_loss_on_the_wrong_side_of_entry_is_refused(self) -> None:
+        """A stop the other side of entry is not a stop."""
+        # A buy with its stop *above* entry.
+        with pytest.raises(ValueError, match="stop_loss"):
+            self._resolve("buy", 110.0, 120.0)
+        # A sell with its stop *below* entry.
+        with pytest.raises(ValueError, match="stop_loss"):
+            self._resolve("sell", 90.0, 80.0)
+
+    def test_a_take_profit_on_the_wrong_side_of_entry_is_refused(self) -> None:
+        """The half that was untested: a take profit on the wrong side is accepted.
+
+        A buy whose target sits below entry would be submitted as a take profit that the
+        market reaches immediately, closing the position for a loss before the stop is
+        ever relevant. A sell whose target sits above entry is the mirror image. Both are
+        refused with the take profit named in the message.
+        """
+        with pytest.raises(ValueError, match="take_profit"):
+            self._resolve("buy", 90.0, 90.0)
+        with pytest.raises(ValueError, match="take_profit"):
+            self._resolve("sell", 110.0, 110.0)
+
+    def test_a_stop_or_target_equal_to_entry_is_refused(self) -> None:
+        """Zero distance is not a tight stop, it is no stop.
+
+        `stop_loss == reference_price` gives an outward distance of exactly zero. It is
+        refused by the wrong-side check rather than by a separate zero-distance check,
+        because a distance of zero is also a distance in the wrong direction - and saying
+        so in the message is more useful than a second, redundant guard.
+        """
+        with pytest.raises(ValueError, match="stop_loss"):
+            self._resolve("buy", 100.0, 110.0)
+        with pytest.raises(ValueError, match="take_profit"):
+            self._resolve("buy", 90.0, 100.0)
+
+    def test_an_unusable_reference_price_is_refused_before_anything_else(self) -> None:
+        """Without a reference there is no geometry, so nothing is computed.
+
+        Zero, negative and NaN are all refused. The reference is checked first precisely
+        because every later calculation is relative to it.
+        """
+        for reference in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="Invalid reference price"):
+                self._resolve("buy", 90.0, 110.0, reference=reference)
+
+    @pytest.mark.parametrize("bad_stop", [0.0, -5.0, float("nan")])
+    def test_an_unusable_stop_price_is_refused_by_the_distance_guard(
+        self, bad_stop: float
+    ) -> None:
+        """These three are caught *only* by the `price <= 0 / NaN` check in `_distance`.
+
+        That matters because the check looks redundant next to the wrong-side check, and
+        a mutation removing it survives unless these cases are asserted: a stop of `0.0`
+        has an outward distance of 100 (well positive), so the wrong-side check is happy
+        and the order would otherwise be submitted with a stop 100 points from entry.
+        """
+        with pytest.raises(ValueError, match="Invalid SL/TP price"):
+            self._resolve("buy", bad_stop, 110.0)
+
+    @pytest.mark.parametrize("bad_take", [float("nan"), float("inf")])
+    def test_a_non_finite_take_profit_is_refused_by_the_distance_guard(
+        self, bad_take: float
+    ) -> None:
+        """NaN and infinity slip past the wrong-side check, and only `_distance` catches them.
+
+        The comparison `take_outward <= 0` is False for NaN, so a NaN target passes the
+        side check and reaches the distance guard. For `+inf` the outward distance is
+        positive, so it passes too - and `abs(ref - inf) * scale` would be infinity,
+        which `int(round(inf))` cannot convert.
+        """
+        with pytest.raises(ValueError, match="Invalid SL/TP price"):
+            self._resolve("buy", 90.0, bad_take)
+
+    @pytest.mark.parametrize("bad_take", [0.0, -5.0])
+    def test_a_non_positive_take_profit_is_refused_as_the_wrong_side(self, bad_take) -> None:
+        """A target at or below entry for a buy is caught earlier, by the side check.
+
+        Documented because it is the *other* reason those values are refused, and
+        because it is the case that would otherwise look untested: the value is refused
+        either way, but by a different guard with a different message.
+        """
+        with pytest.raises(ValueError, match="take_profit"):
+            self._resolve("buy", 90.0, bad_take)
+
+    def test_an_infinite_stop_is_refused_as_the_wrong_side(self) -> None:
+        """`inf` is refused by the side check rather than the distance check.
+
+        For a buy, `reference - inf` is `-inf`, so the outward distance is negative and
+        the side check fires first. Asserted so the SL and TP rows above are not read as
+        "infinity always reaches the distance guard" - it depends on the direction.
+        """
+        with pytest.raises(ValueError, match="stop_loss"):
+            self._resolve("buy", float("inf"), 110.0)
+
+    def test_a_stop_only_order_sends_zero_for_the_take_profit(self) -> None:
+        """The explicit unbounded policy: `take_profit=None` means no take profit.
+
+        cTrader reads a zero `relativeTakeProfit` as "no take profit", so the zero is
+        load-bearing rather than a default. Asserted because a small negative or a
+        coincidental distance would silently change the order from stop-only to
+        something else.
+        """
+        stop, take = self._resolve("sell", 110.0, None)
+        assert take == 0, f"a stop-only order must send a zero take profit, not {take}"
+        assert stop == 1_000_000
+
+    def test_a_distance_below_one_price_unit_is_refused(self) -> None:
+        """Rounding a sub-unit distance would send `0`, which cTrader reads as unset.
+
+        A stop 1e-7 price units away rounds to zero relative units - and zero means "no
+        stop", so the order would go out **unprotected** rather than tightly stopped. The
+        guard refuses instead. Also asserted below the unit, so the boundary itself is
+        pinned rather than just the refusal.
+        """
+        from live_runner.ctrader_adapter import (
+            CTRADER_RELATIVE_PRICE_UNIT_DIVISOR,
+        )
+
+        divisor = float(CTRADER_RELATIVE_PRICE_UNIT_DIVISOR)
+        # Half a relative unit: rounds to 0, and must not be submitted as 0.
+        below_unit = 100.0 - (0.5 / divisor)
+        with pytest.raises(ValueError, match="below one"):
+            self._resolve("buy", below_unit, 110.0)
+        # One full relative unit is accepted, so the boundary is not off by one.
+        assert self._resolve("buy", 100.0 - (1.0 / divisor), 110.0)[0] == 1
+
+
 class TestFillRecordResolution:
     """How a cTrader fill becomes a persisted `LiveExecution`, which had no unit tests.
 
