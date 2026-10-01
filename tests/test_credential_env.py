@@ -9,6 +9,7 @@ from live_runner.credential_env import (
     accounts_env_mtime,
     load_accounts_env_values,
     parse_bool_env,
+    resolve_credential_value,
 )
 
 
@@ -295,3 +296,108 @@ class TestAdapterEnvValues:
                 account_id="test",
                 env_values={"ALPACA_API_KEY": "", "ALPACA_SECRET_KEY": "s"},
             )
+
+
+# --------------------------------------------------------------------------
+# resolve_credential_value: the per-key resolver had no tests at all
+# --------------------------------------------------------------------------
+#
+# Found by mutation testing `live_runner/credential_env.py` with `mutate.sh`.
+# Two mutations survived 423 collected tests. They are not the same kind of thing:
+#
+#   - **swapping the two branches so the environment wins over the file.** A real
+#     gap. Inverting it silently resolves a credential from the environment even
+#     when the file supplies one - measured as the *wrong broker account*, not a
+#     wrong value. Pinned below.
+#   - **replacing `get(key) or ""` with `get(key, "")`.** An *equivalent mutant*
+#     for any typed caller: the two differ only when the value is an explicit
+#     `None`, which a `Mapping[str, str]` parsed from an env file cannot contain.
+#     Under the mutation a `None` would become the literal credential `"None"`,
+#     which is a genuine hazard but needs a caller that violates the annotation.
+#
+# The loader beside it, `load_accounts_env_values`, has eight tests including
+# `test_load_accounts_env_values_file_wins_over_environ`. So there were two
+# precedence decisions in this module and only one was pinned.
+#
+# Separately, and recorded in `notes/backlog.md` rather than fixed here: a
+# *blanked* credential currently falls back to the environment, while the
+# docstring says the environment "only fills keys the file does not define".
+# That is a live divergence from the module's own documentation - the same
+# collapse `parse_bool_env`'s docstring blames for two earlier live bugs - and
+# changing credential resolution on the live path is the human's call. The last
+# test here pins today's behaviour so it cannot change silently.
+
+
+def test_resolve_credential_value_is_file_first_when_both_define_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kills the env-first mutation: the file's value must win, not the environment's."""
+    monkeypatch.setenv("CTRADER_APP_ID", "account-A-from-environment")
+
+    resolved = resolve_credential_value({"CTRADER_APP_ID": "account-B-from-file"}, "CTRADER_APP_ID")
+
+    assert resolved == "account-B-from-file"
+
+
+def test_resolve_credential_value_falls_back_to_environment_when_the_file_omits_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half, so the first cannot be satisfied by always preferring the file."""
+    monkeypatch.setenv("CTRADER_APP_ID", "only-in-environment")
+
+    assert resolve_credential_value({}, "CTRADER_APP_ID") == "only-in-environment"
+
+
+def test_resolve_credential_value_uses_the_env_key_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A per-key env alias is honoured, and the file still wins over it."""
+    monkeypatch.setenv("ACCOUNT_B_APP_ID", "aliased-environment-value")
+
+    values = {"ACCOUNT_B_APP_ID": "from-file"}
+    assert resolve_credential_value(values, "ACCOUNT_B_APP_ID", env_key="ACCOUNT_B_APP_ID") == "from-file"
+
+    monkeypatch.delenv("ACCOUNT_B_APP_ID")
+    monkeypatch.setenv("ALIASED_APP_ID", "aliased-environment-value")
+    assert resolve_credential_value({}, "ACCOUNT_B_APP_ID", env_key="ALIASED_APP_ID") == (
+        "aliased-environment-value"
+    )
+
+
+def test_resolve_credential_value_strips_surrounding_whitespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CTRADER_APP_ID", raising=False)
+    assert resolve_credential_value({"CTRADER_APP_ID": "  padded-key  "}, "CTRADER_APP_ID") == "padded-key"
+
+
+def test_an_empty_key_resolves_to_nothing() -> None:
+    """An empty key must short-circuit, not become a lookup of `""`.
+
+    No environment setup here on purpose: an empty-named variable cannot be set
+    (`os.environ[""] = ...` raises `OSError: Invalid argument`), so there is no
+    value for the empty key to accidentally pick up. The guard is the only thing
+    being tested.
+    """
+    assert resolve_credential_value({"": "value"}, "") == ""
+    assert resolve_credential_value({"": "value"}, "", env_key="ALSO_EMPTY") == ""
+
+
+@pytest.mark.parametrize("blanked", ["", "   "])
+def test_a_blanked_credential_currently_falls_back_to_the_environment(
+    blanked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins today's behaviour, which contradicts the docstring. See the backlog.
+
+    `or ""` makes a blanked value indistinguishable from an absent one, so the
+    environment supplies the credential even though the file *defines* the key.
+    This is the same collapse the module's `parse_bool_env` docstring blames for
+    two live bugs - there on a boolean whose default was demo mode, here on a
+    credential.
+
+    Pinned rather than asserted away: if someone changes it, this test fails and
+    points at the decision instead of the behaviour silently changing.
+    """
+    monkeypatch.setenv("CTRADER_APP_ID", "from-environment")
+
+    assert resolve_credential_value({"CTRADER_APP_ID": blanked}, "CTRADER_APP_ID") == "from-environment"
