@@ -736,3 +736,291 @@ def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatc
     assert used_app_secret == "secret"
     assert used_access_token == "token"
     assert [account.id for account in accounts] == ["47644617"]
+
+
+class TestCtraderNameAndBalanceExtraction:
+    """How a cTrader payload becomes a display name, login and balance. Six survivors.
+
+    These are the functions that decide **which account a signal is routed to** - the same
+    class of decision as cTrader's fill identity, which hid eight surviving mutations. A
+    wrong answer here does not raise; it names the wrong account, and the trade goes to the
+    wrong broker account.
+
+    Two of the six are about *rejection*, and the asymmetry between them is the thing worth
+    recording:
+
+    - **A broker name that is a bare number is refused.** A number in the `brokerName` slot
+      is an id that arrived in the wrong field, so it is skipped and the search continues to
+      the next field - which is why `brokerName="12345"` yields `""` while
+      `brokerName="OANDA"` yields `"OANDA"`.
+    - **A numeric login is *accepted*, as long as it is not zero.** cTrader logins really are
+      often numeric, so the same digit test has the opposite meaning here. `0` and `"00"` are
+      refused; `12345` is a perfectly good login.
+
+    The ignored-label set is what stops an account being *named after its own id*: the ctid
+    and the login are added to the ignored values, so `accountName="12345"` cannot become the
+    display name for account 12345. The strip on both sides is load-bearing - the candidate
+    is stripped before comparison, so unstripped ignored values would not match.
+
+    `_trader_balance` divides by `10**moneyDigits`, so an out-of-range `moneyDigits` would
+    scale a balance by a nonsense factor - or raise on a large negative exponent. The `0..12`
+    bound falls back to 2, which is asserted rather than assumed.
+
+    The last test records a **real crash** found while measuring this family.
+    """
+
+    @staticmethod
+    def _msg(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    # ---------------------------------------------------------------- broker name
+
+    def test_a_broker_name_is_taken_from_the_first_usable_field(self) -> None:
+        from live_runner.account_discovery import _ctrader_extract_broker_name
+
+        assert _ctrader_extract_broker_name(self._msg(brokerName="OANDA")) == "OANDA"
+        assert _ctrader_extract_broker_name(self._msg(companyName="IC Markets")) == "IC Markets"
+        # Whitespace-only is not a name.
+        assert _ctrader_extract_broker_name(self._msg(brokerName="   ")) == ""
+
+    def test_a_bare_number_in_the_broker_name_slot_is_refused(self) -> None:
+        """A number in a *name* field is an id that arrived in the wrong field.
+
+        Refused, and the search continues - so a later field can still supply a real name
+        rather than the id being accepted and displayed.
+        """
+        from live_runner.account_discovery import _ctrader_extract_broker_name
+
+        assert _ctrader_extract_broker_name(self._msg(brokerName="12345")) == ""
+        assert _ctrader_extract_broker_name(self._msg(brokerName="0")) == ""
+        # And a numeric field does not stop the search.
+        assert (
+            _ctrader_extract_broker_name(self._msg(brokerName="12345", companyName="OANDA"))
+            == "OANDA"
+        )
+        # No source at all is an empty name, never a crash.
+        assert _ctrader_extract_broker_name(None) == ""
+        assert _ctrader_extract_broker_name() == ""
+
+    # ------------------------------------------------------------------- login
+
+    def test_a_numeric_login_is_accepted_because_logins_really_are_numeric(self) -> None:
+        """The opposite of the broker-name rule, on purpose.
+
+        cTrader trader logins are frequently numeric, so `12345` is a valid login. Asserted
+        explicitly because it looks like it should fail the same digit test - it must not.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(self._msg(traderLogin="12345")) == "12345"
+        assert _ctrader_extract_login(self._msg(traderLogin="alice")) == "alice"
+        assert _ctrader_extract_login(self._msg(login="L-99")) == "L-99"
+
+    @pytest.mark.parametrize("zero_login", ["0", "00", "000"])
+    def test_a_zero_login_is_refused(self, zero_login: str) -> None:
+        """`0` is the broker's "unset" and must not become a login that identifies an account.
+
+        A login of `"0"` would be added to the ignored-label set and, worse, would be
+        published as `broker_login` - and `0` is the one value that can never identify a real
+        account.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(self._msg(traderLogin=zero_login)) == ""
+        # And the search continues to the next field.
+        assert (
+            _ctrader_extract_login(self._msg(traderLogin="0", login="alice")) == "alice"
+        )
+
+    def test_login_fields_are_tried_in_order_and_blank_ones_skipped(self) -> None:
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(
+            self._msg(traderLogin="  ", login="  bob  ", traderAccountId="999")
+        ) == "bob", "blank fields must be skipped rather than returned"
+        assert _ctrader_extract_login(self._msg(traderLogin=None, login="carol")) == "carol"
+        assert _ctrader_extract_login(None, self._msg(login="dave")) == "dave"
+        assert _ctrader_extract_login() == ""
+
+    # ---------------------------------------------------------- ignored labels
+
+    def test_ignored_labels_are_stripped_so_a_padded_candidate_still_matches(self) -> None:
+        """Both sides are stripped, which is the whole point of the helper.
+
+        The candidate is stripped before comparison, so an unstripped ignored value would
+        silently fail to match - and then an account could be named after its own ctid.
+        """
+        from live_runner.account_discovery import _ctrader_ignored_labels
+
+        assert _ctrader_ignored_labels({"  x  ", "y", ""}) == {"x", "y"}
+        assert _ctrader_ignored_labels(None) == set()
+        assert _ctrader_ignored_labels(set()) == set()
+
+    def test_an_ignored_label_is_not_used_as_a_display_name(self) -> None:
+        """The ctid and login are ignored so an account cannot be named after itself.
+
+        The **non-numeric** case is the one that carries the weight, and it is asserted
+        first. A numeric ignored value is also refused by the separate `isdigit()` rule, so
+        testing only that would leave the ignore check unpinned: dropping
+        `candidate in ignored` changes nothing for a number, and the mutation survives.
+        A broker login or account label like `"OANDA"` is not a digit string, so it is the
+        only value that actually distinguishes the two guards.
+        """
+        from live_runner.account_discovery import _ctrader_extract_account_label
+
+        assert (
+            _ctrader_extract_account_label(
+                self._msg(accountName="  12345  "), ignored_values={"12345"}
+            )
+            == ""
+        )
+        # A digit-string label is refused *regardless* of the ignore set, so an unignored
+        # numeric label is no more usable than an ignored one. Two separate reasons, both
+        # asserted: a bare number in a name field is an id that arrived in the wrong slot.
+        assert _ctrader_extract_account_label(
+            self._msg(accountName="  12345  "), ignored_values={"other"}
+        ) == ""
+        assert _ctrader_extract_account_label(self._msg(accountName="42")) == ""
+
+        # The distinguishing case: a non-numeric ignored label, which only the ignore check
+        # can refuse. Without this, removing `candidate in ignored` passes the suite.
+        # NOTE the assertion shape. An earlier version wrapped the message in the same
+        # parentheses:
+        #
+        #     assert (
+        #         _ctrader_extract_account_label(...) == "",
+        #         "an ignored label was used as the display name",
+        #     )
+        #
+        # That parses as `assert (False, "message")` - a **non-empty tuple, which is always
+        # true**. Python even emits "SyntaxWarning: assertion is always true, perhaps
+        # remove parentheses?". The assertion never ran, which is exactly why mutation D3
+        # survived a test that looked like it covered it.
+        #
+        # The failure message therefore goes in a plain second argument, outside any
+        # parentheses, and the comparison stays on its own lines.
+        resolved = _ctrader_extract_account_label(
+            self._msg(accountName="  OANDA  "), ignored_values={"OANDA"}
+        )
+        assert resolved == "", (
+            "an ignored label was used as the display name, so an account can be named "
+            f"after the login or id it is distinguished from: {resolved!r}"
+        )
+        assert _ctrader_extract_account_label(
+            self._msg(accountName="  OANDA  "), ignored_values={"other"}
+        ) == "OANDA"
+        # No sources yields no label, never a crash.
+        assert _ctrader_extract_account_label(None) == ""
+        assert _ctrader_extract_account_label() == ""
+
+    # ---------------------------------------------------------------- balance
+
+    @pytest.mark.parametrize(
+        "money_digits,expected",
+        [
+            (2, 1234.56),
+            (5, 1.23456),
+            (8, 0.00123456),
+            (12, 1.23456e-7),
+        ],
+    )
+    def test_the_balance_is_scaled_by_the_broker_money_digits(
+        self, money_digits: int, expected: float
+    ) -> None:
+        """cTrader reports balance in integer minor units, so the digits are the divisor."""
+        from live_runner.account_discovery import _trader_balance
+
+        assert _trader_balance(
+            SimpleNamespace(moneyDigits=money_digits, balance=123456)
+        ) == pytest.approx(expected)
+
+    def test_a_money_digits_count_of_zero_collapses_to_the_default_KNOWN_FALSY_COLLAPSE(self) -> None:
+        """**A falsy value is not a missing value** - documented here because it is invisible.
+
+        The line reads:
+
+            money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
+
+        `getattr` supplies `2` when the attribute is absent, and then `or 2` handles `None`.
+        But a broker that genuinely reports **zero** decimal places sends `0`, which is
+        falsy, so `or 2` replaces it. The zero is not honoured: the balance is divided by
+        `10**2` instead of `10**0`, so a 0-decimal balance comes out a hundred times too
+        small.
+
+        Whether that matters is a broker-behaviour question rather than a code bug - FX
+        balances are conventionally 2-decimal, so `0` may simply never occur. It is pinned
+        because the two failure modes are indistinguishable in the output: a mis-scaled
+        balance looks exactly like a small balance.
+
+        The same `or` pattern is what made `isLive=False` indistinguishable from absent
+        earlier in this module, so it is a recurring shape here rather than a one-off.
+        """
+        from live_runner.account_discovery import _trader_balance
+
+        assert _trader_balance(
+            SimpleNamespace(moneyDigits=0, balance=123456)
+        ) == pytest.approx(1234.56), (
+            "moneyDigits=0 is now honoured, so the falsy collapse this documents has "
+            "changed - check whether the broker can actually send it before relying on it"
+        )
+
+    @pytest.mark.parametrize("money_digits", [None, 13, 20, -1, -5])
+    def test_an_unusable_money_digits_count_falls_back_to_two(self, money_digits) -> None:
+        """Out of range falls back to the conventional 2, rather than scaling by nonsense.
+
+        `10**13` would divide the balance by a trillion and `10**-5` would multiply it by
+        a hundred thousand, so neither is a safe default. Asserted across both ends of the
+        range, plus `None`.
+        """
+        from live_runner.account_discovery import _trader_balance
+
+        assert _trader_balance(
+            SimpleNamespace(moneyDigits=money_digits, balance=123456)
+        ) == pytest.approx(1234.56), (
+            f"moneyDigits={money_digits!r} did not fall back to the 2-digit default"
+        )
+
+    def test_a_missing_balance_is_zero_not_an_exception(self) -> None:
+        from live_runner.account_discovery import _trader_balance
+
+        assert _trader_balance(SimpleNamespace()) == 0.0
+        assert _trader_balance(SimpleNamespace(moneyDigits=2, balance=None)) == 0.0
+        assert _trader_balance(
+            SimpleNamespace(moneyDigits=2, balance="not a number")
+        ) == 0.0
+
+    def test_a_superscript_digit_login_raises_value_error_OUTSIDE_THE_GUARD_KNOWN_DEFECT(self) -> None:
+        """**A real crash, found while measuring this family. Recorded, not fixed.**
+
+        `_ctrader_extract_login` reads:
+
+            if candidate.isdigit() and int(candidate) <= 0:
+                continue
+
+        `str.isdigit()` is broader than `int()`. `"²"` reports `isdigit() == True` but
+        `int("²")` raises `ValueError`. So a `traderLogin` of `"²"` - a superscript, which a
+        broker payload or a locale could plausibly carry - raises instead of being refused.
+
+        Why this is worth more than a shrug, and it is not the exception itself:
+
+        - `_ctrader_account_context` (line 772 of the module) is called **outside** the
+          `try` in `_build_ctrader_live_account`, which begins on the next line.
+        - The per-account loop in `discover_ctrader_accounts` has **no** `try` of its own.
+
+        So the `ValueError` escapes both, out of the discovery call entirely. **One account
+        with one odd character discards every account found so far**, including the ones that
+        were perfectly fine - and the caller sees an error rather than a short list.
+
+        **Not fixed here**, because the fix is a behaviour decision on the discovery path:
+        refuse the odd login and keep the account, or skip the account. Both are reasonable
+        and they differ in whether one bad payload costs you every account. Tracked as
+        `needs-decision`.
+
+        The test asserts the crash *exists*, so it fails the moment the defect is fixed
+        rather than being deleted as an obsolete expectation. If it starts failing and the
+        backlog entry is still open, that is the fix landing without a decision.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        with pytest.raises(ValueError):
+            _ctrader_extract_login(SimpleNamespace(traderLogin="²"))
