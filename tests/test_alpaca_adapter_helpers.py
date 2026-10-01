@@ -46,6 +46,161 @@ NIL_ORDER_ID = "00000000-0000-0000-0000-000000000000"
 # --------------------------------------------------------------------------
 
 
+class TestTradeUpdateQuantityResolution:
+    """The double-counting guard on the quantity a fill event carries.
+
+    `_resolve_trade_update_qty` picks which quantity to persist per event, and the rule
+    is arithmetic rather than a boolean:
+
+    - `data.qty` (or `data.filled_qty`) is **per-event**
+    - `order.filled_qty` is **cumulative** in alpaca-py
+
+    A `partial_fill` with no per-event quantity is therefore **skipped**, not persisted
+    from `order.filled_qty` - because on the second partial fill the cumulative value is
+    the sum of both legs, and persisting it again double-counts.
+
+    Five mutations survive the suite. The consequence of RQ1 is the most severe in this
+    sweep: with the guard removed, a stream of partial fills would inflate the recorded
+    position, and that number is what position reconciliation and PnL are computed from.
+
+    Asserted as arithmetic, not as a return value: the same two-leg scenario is walked
+    with and without a per-event quantity, and the totals are compared. A test asserting
+    only `skip is True` would pass against a guard that skipped for the wrong reason.
+    """
+
+    @staticmethod
+    def _data(**attrs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**attrs)
+
+    @staticmethod
+    def _order(**attrs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**attrs)
+
+    def _resolve(self, data, order, event):
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        return AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)._resolve_trade_update_qty(
+            data, order, event=event, client_order_id="cid"
+        )
+
+    def test_a_partial_fill_with_no_per_event_qty_is_skipped(self) -> None:
+        """The cumulative value must not be persisted as if it were this leg's."""
+        skip, qty = self._resolve(
+            self._data(), self._order(filled_qty=300.0), event="partial_fill"
+        )
+        assert skip is True
+        assert qty is None, (
+            "a partial fill with no per-event quantity was persisted from "
+            "order.filled_qty, which is cumulative: "
+            f"{qty!r}"
+        )
+
+    def test_a_partial_fill_with_a_per_event_qty_uses_it(self) -> None:
+        skip, qty = self._resolve(
+            self._data(qty=100.0),
+            self._order(filled_qty=300.0),
+            event="partial_fill",
+        )
+        assert skip is False
+        assert qty == 100.0, "the per-event quantity was not preferred over the cumulative one"
+
+    def test_two_legs_persist_their_own_quantities_not_the_running_total(self) -> None:
+        """The arithmetic, end to end: 100 + 50, not 100 + 150.
+
+        This is the shape the guard exists for. `order.filled_qty` is 150 after the second
+        leg, so persisting it would record 250 for two legs that filled 150.
+        """
+        order = self._order(filled_qty=150.0)
+
+        first_skip, first_qty = self._resolve(
+            self._data(qty=100.0), order, event="partial_fill"
+        )
+        order.filled_qty = 150.0
+        second_skip, second_qty = self._resolve(
+            self._data(qty=50.0), order, event="partial_fill"
+        )
+
+        assert (first_skip, second_skip) == (False, False)
+        assert (first_qty, second_qty) == (100.0, 50.0)
+        assert first_qty + second_qty == 150.0, (
+            "the two legs do not sum to the cumulative quantity, so the per-event "
+            f"preference is broken: {first_qty} + {second_qty}"
+        )
+
+    def test_a_partial_fill_missing_both_quantities_is_skipped(self) -> None:
+        skip, qty = self._resolve(self._data(), self._order(), event="partial_fill")
+        assert skip is True
+        assert qty is None
+
+    def test_a_full_fill_may_use_the_cumulative_quantity(self) -> None:
+        """Only `partial_fill` is refused; a complete fill has one event, so it is safe.
+
+        The distinction is the whole point of the guard: a `fill` event corresponds to the
+        whole order, so `order.filled_qty` *is* this event's quantity. Refusing it would
+        drop real fills.
+        """
+        skip, qty = self._resolve(self._data(), self._order(filled_qty=300.0), event="fill")
+        assert skip is False
+        assert qty == 300.0
+
+    def test_the_per_event_field_is_preferred_over_the_cumulative_one(self) -> None:
+        skip, qty = self._resolve(
+            self._data(qty=10.0, filled_qty=99.0),
+            self._order(filled_qty=150.0),
+            event="partial_fill",
+        )
+        assert skip is False
+        assert qty == 10.0, (
+            "order.filled_qty was preferred over the per-event quantity: " f"{qty!r}"
+        )
+
+    def test_filled_qty_is_used_when_qty_is_absent(self) -> None:
+        skip, qty = self._resolve(
+            self._data(filled_qty=25.0),
+            self._order(filled_qty=150.0),
+            event="partial_fill",
+        )
+        assert skip is False
+        assert qty == 25.0
+
+    def test_the_double_count_warning_is_a_warning_not_a_debug_line(self) -> None:
+        """The skip is deliberate, so the reason must be visible.
+
+        A silent skip of a partial fill reads as "nothing arrived", which is a different
+        diagnosis from "arrived without a per-event quantity, and I refused to
+        double-count it".
+        """
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Capture()
+        logger = logging.getLogger("trading.live-runner")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            self._resolve(self._data(), self._order(filled_qty=1.0), event="partial_fill")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+
+        assert records, "skipping a partial fill logged nothing at all"
+        assert all(r.levelno == logging.WARNING for r in records), (
+            "the double-count skip was demoted to "
+            + str({logging.getLevelName(r.levelno) for r in records})
+            + ", so it reads as an absence rather than a deliberate refusal"
+        )
+
+
 class TestTradeUpdateEventParsing:
     """`_parse_trade_update_event` gates every fill the adapter records, and had no test.
 
