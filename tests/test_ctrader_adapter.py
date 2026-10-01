@@ -37,6 +37,265 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestTerminalAuthFailureAndRetryBudget:
+    """How the adapter gives up on cTrader auth, and how long it keeps trying. Eight survivors.
+
+    The terminal-auth path is the one place in this adapter where the correct behaviour is
+    **stop**, and stopping wrong is quiet in a specific way: the adapter carries on with a
+    connection it should not trust. So the assertions here are about state *not* advancing -
+    `_authenticated` going false, the client being torn down, the reason surviving for the
+    log - rather than about a return value.
+
+    Two distinct concerns, tested separately because they fail differently:
+
+    - **Giving up** (`_mark_terminal_auth_failure`): if the adapter stays authenticated
+      after a terminal failure, every later call proceeds on a connection the broker has
+      already rejected, and the failure surfaces as a confusing downstream error instead of
+      as the auth problem it is.
+    - **Persisting** (`_connect_retry_parameters`): a retry budget of zero would mean no
+      retries at all, and a *negative* budget is the same. The floor is what makes
+      "always try at least once" true regardless of how the number arrived - including from
+      the environment, where a typo becomes a silent policy change rather than an error.
+
+    `_normalize_error_code` is here too, because the whole terminal-auth decision is driven
+    off normalised codes, and the normalisation is what makes a differently-spaced code from
+    the broker still match.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter._authenticated = True
+        adapter._terminal_auth_failure_reason = ""
+        adapter._terminal_auth_failure_code = ""
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        adapter._refresh_lock = None
+        return adapter
+
+    def test_a_terminal_failure_clears_authentication_and_keeps_the_reason(self) -> None:
+        """The state change that stops everything else.
+
+        Both fields are asserted because they are read separately: the reason is what the
+        operator sees in the log, and `_authenticated = False` is what stops the next call.
+        A mutation that skipped the flag would leave the adapter authenticated on a
+        connection the broker has rejected.
+        """
+        adapter = self._adapter()
+        adapter._mark_terminal_auth_failure("account not authorized", error_code="  not authorized  ")
+        assert adapter._authenticated is False, (
+            "the adapter stayed authenticated after a terminal auth failure, so later "
+            "calls proceed on a connection the broker rejected"
+        )
+        assert adapter._terminal_auth_failure_reason == "account not authorized"
+        assert adapter._terminal_auth_failure_code == "NOT_AUTHORIZED", (
+            "the code was stored unnormalised, so a differently-spaced broker code would "
+            "not match later"
+        )
+
+    @pytest.mark.parametrize("blank", ["", "   ", None])
+    def test_a_blank_reason_becomes_a_named_fallback(self, blank) -> None:
+        """A blank reason is replaced, because the log is the only diagnostic left.
+
+        Once the adapter is parked there is no further attempt, so an empty reason leaves
+        the operator with a failure and no cause. The fallback text is asserted by name.
+        """
+        from live_runner.ctrader_adapter import _CTRADER_AUTH_FAILURE_FALLBACK
+
+        adapter = self._adapter()
+        adapter._mark_terminal_auth_failure(blank)
+        assert adapter._terminal_auth_failure_reason == _CTRADER_AUTH_FAILURE_FALLBACK, (
+            "a blank reason was stored verbatim, leaving a terminal failure with no cause"
+        )
+
+    def test_the_terminal_handler_tears_the_client_down(self) -> None:
+        """The handler must not just record the failure - it must drop the connection.
+
+        Recorded separately from the flag because teardown is the part that releases the
+        socket, and a client left open keeps the account session alive on the broker side
+        even though this adapter has stopped using it.
+        """
+        from live_runner.ctrader_adapter import CTraderAuthTerminalError
+
+        adapter = self._adapter()
+        torn: list[bool] = []
+        adapter._teardown_client = lambda: torn.append(True)
+        adapter._log_terminal_auth_failure = lambda reason, *, error_code: None
+
+        adapter._handle_terminal_auth_failure(
+            CTraderAuthTerminalError("account not authorized", error_code="NOT_AUTH")
+        )
+        assert torn == [True], (
+            "the terminal auth handler left the client connected, so the broker session "
+            "stays open for an adapter that has given up"
+        )
+        assert adapter._authenticated is False
+        assert adapter._terminal_auth_failure_code == "NOT_AUTH"
+
+    def test_error_codes_are_normalised_so_spacing_cannot_defeat_the_match(self) -> None:
+        """Normalisation is what makes a code from the broker still match our constants.
+
+        The broker sends codes with inconsistent spacing and casing, so
+        `"  not authorized  "` and `"not authorized"` have to reach the same string -
+        otherwise the terminal-auth decision silently stops firing.
+        """
+        from live_runner.ctrader_adapter import _normalize_error_code
+
+        assert _normalize_error_code("  not authorized  ") == "NOT_AUTHORIZED"
+        assert _normalize_error_code("already logged in") == "ALREADY_LOGGED_IN"
+        assert _normalize_error_code("invalid token") == "INVALID_TOKEN"
+        assert _normalize_error_code(12345) == "12345", "a numeric code must not be dropped"
+        for blank in ("", "   ", None):
+            assert _normalize_error_code(blank) == ""
+
+    def test_the_normalised_code_is_what_drives_the_terminal_decision(self) -> None:
+        """The end-to-end claim: an oddly spaced code still parks the adapter.
+
+        Asserted through `_is_terminal_auth_error` rather than only through the string
+        helper, because the helper being correct does not mean the decision uses it.
+        """
+        from live_runner.ctrader_adapter import (
+            _is_already_logged_in_error,
+            _is_terminal_auth_error,
+        )
+
+        assert _is_terminal_auth_error("  INVALID TOKEN  ", "")
+        assert _is_terminal_auth_error("NOT_AUTHORIZED", "")
+        assert _is_terminal_auth_error("", "account is Not Authorized for this token")
+        assert _is_already_logged_in_error("  already logged in ", "")
+        assert not _is_terminal_auth_error("SOMETHING_ELSE", "")
+
+    def test_get_error_message_is_consulted_when_present_and_skipped_when_not(self) -> None:
+        """The optional accessor: used when there is one, never assumed.
+
+        A mutation that called it unconditionally would raise `AttributeError` on every
+        plain string reason - and this function runs on the error path, where raising
+        replaces the real diagnostic with a confusing one. So both the present and absent
+        cases are asserted, and the case where the accessor itself raises.
+        """
+
+        class WithMessage:
+            def getErrorMessage(self):
+                return "detailed reason"
+
+        class Raising:
+            def getErrorMessage(self):
+                raise RuntimeError("accessor failed")
+
+        from live_runner.ctrader_adapter import _reason_to_text
+
+        assert _reason_to_text(WithMessage()) == "detailed reason"
+        assert _reason_to_text("plain reason") == "plain reason"
+        # One instance, compared against itself: `str()` of a fresh instance embeds a
+        # different object address, so building two and comparing them compares ids.
+        raising = Raising()
+        assert _reason_to_text(raising) == str(raising), (
+            "a raising accessor did not fall back to the plain representation"
+        )
+        assert _reason_to_text(None) == "None"
+
+    def test_the_get_error_message_guard_is_a_verified_equivalent_mutation_target(self) -> None:
+        """**A8 is an equivalent mutant**, and this records why rather than leaving it open.
+
+        Removing `if hasattr(reason, "getErrorMessage")` and calling the accessor
+        unconditionally changes nothing at all, because the `except Exception` immediately
+        below catches the resulting `AttributeError` - and catches a raising accessor too.
+        Both variants were run by hand against the real function and produced identical
+        output for an accessor that raises and for a plain string.
+
+        So the honest conclusion is: **the `except` is load-bearing and the `hasattr` is
+        belt-and-braces.** That is not a reason to delete either - this runs on the error
+        path, where raising replaces the real diagnostic with an `AttributeError` from a
+        string formatting helper, which is a genuinely confusing thing to read in a log
+        about an auth failure.
+
+        What makes it safe to leave unfixed is that the *behaviour* is pinned by the test
+        above, and the stronger mutation is pinned too: removing the guard **and** the
+        `except` together is killed, because a plain string then raises
+        `AttributeError: 'str' object has no attribute 'getErrorMessage'` out of the error
+        path. So the property that matters - "this function never raises" - is verified,
+        not assumed.
+        """
+
+    def _retry(self, **attrs):
+        import os
+
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.connect_max_attempts = attrs.get("max_attempts")
+        adapter.connect_timeout_seconds = attrs.get("timeout")
+        return CTraderLiveAdapter._connect_retry_parameters(adapter), os
+
+    def test_the_retry_budget_is_never_below_one(self) -> None:
+        """Zero and negative budgets both mean "never retry", and the floor prevents it.
+
+        A budget of `0` would skip the first attempt entirely; a negative one comes from a
+        typo in the environment and would do the same. Asserted from both directions, since
+        the floor is `< 1` rather than `<= 0` and both inputs have to be covered.
+        """
+        (attempts, _delay, _timeout), _ = self._retry(max_attempts=0)
+        assert attempts == 1, f"a zero retry budget stayed at {attempts}"
+        (attempts, _, _), _ = self._retry(max_attempts=-4)
+        assert attempts == 1, f"a negative retry budget stayed at {attempts}"
+        (attempts, _, _), _ = self._retry(max_attempts=3)
+        assert attempts == 3, "a valid budget was altered"
+
+    def test_the_retry_budget_floor_applies_to_the_environment_too(self, monkeypatch) -> None:
+        """A typo in the environment must not silently become a policy change.
+
+        This is why the floor lives in this function rather than at the call site:
+        `CTRADER_CONNECT_MAX_ATTEMPTS=0` in an operator's shell would otherwise disable
+        connecting altogether, with no error anywhere. Both `0` and a negative are covered,
+        since the floor is `< 1` rather than `<= 0`.
+        """
+        monkeypatch.delenv("CTRADER_CONNECT_BACKOFF_S", raising=False)
+        for bad in ("0", "-4"):
+            monkeypatch.setenv("CTRADER_CONNECT_MAX_ATTEMPTS", bad)
+            adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+            adapter.connect_max_attempts = None
+            adapter.connect_timeout_seconds = None
+            attempts, _, _ = CTraderLiveAdapter._connect_retry_parameters(adapter)
+            assert attempts == 1, (
+                f"CTRADER_CONNECT_MAX_ATTEMPTS={bad} escaped the floor as {attempts} attempts"
+            )
+
+    def test_explicit_constructor_arguments_beat_the_environment(self) -> None:
+        """Precedence, both for the budget and for the timeout.
+
+        A caller that passes `connect_timeout_seconds=7.0` means 7 seconds. If the
+        environment won, the argument would be silently ignored - and it is the kind of
+        argument a test or a special account passes to avoid a 20s hang.
+        """
+        import os
+
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.connect_max_attempts = 3
+        adapter.connect_timeout_seconds = 7.0
+        os.environ["CTRADER_CONNECT_MAX_ATTEMPTS"] = "9"
+        os.environ["CTRADER_CONNECT_BACKOFF_S"] = "9.5"
+        try:
+            attempts, delay, timeout = CTraderLiveAdapter._connect_retry_parameters(adapter)
+        finally:
+            os.environ.pop("CTRADER_CONNECT_MAX_ATTEMPTS", None)
+            os.environ.pop("CTRADER_CONNECT_BACKOFF_S", None)
+
+        assert attempts == 3, "the environment overrode an explicit retry budget"
+        assert delay == 9.5, "the backoff delay must come from the environment"
+        assert timeout == 7.0, "the environment overrode an explicit connect timeout"
+
+    def test_the_defaults_apply_when_neither_argument_nor_environment_is_set(
+        self, monkeypatch
+    ) -> None:
+        """5 attempts, a 2s backoff and a 20s timeout, stated rather than assumed."""
+        import os
+
+        monkeypatch.delenv("CTRADER_CONNECT_MAX_ATTEMPTS", raising=False)
+        monkeypatch.delenv("CTRADER_CONNECT_BACKOFF_S", raising=False)
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.connect_max_attempts = None
+        adapter.connect_timeout_seconds = None
+        assert CTraderLiveAdapter._connect_retry_parameters(adapter) == (5, 2.0, 20.0), os
+
+
 class TestSymbolScaleFromBrokerProps:
     """The per-symbol unit conversion, which decides what a position is denominated in.
 
