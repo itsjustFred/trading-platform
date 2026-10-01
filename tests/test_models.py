@@ -682,6 +682,65 @@ class TestStrategyMeta:
         assert sm2.source_url == sm.source_url
         assert sm2.notes == sm.notes
 
+    def test_strategy_parameters_survive_the_roundtrip(self):
+        """`StrategyMeta.parameters` must serialise, and the existing fixture omits it.
+
+        The round-trip fixture sets `tags`, `source_url` and `notes` but leaves
+        `parameters` at its empty default - which `to_dict` omits. So dropping the
+        branch leaves every test green, the same single-branch-fixture pattern as the
+        `TradeExit.pnl` finding.
+
+        `parameters` is the strategy's own configuration: the indicator periods,
+        thresholds and lookbacks that produced a backtest. Losing it means a stored
+        artifact no longer says *why* it produced those results, so a re-run cannot be
+        reproduced and a promoted strategy cannot be re-optimised from the record.
+
+        Asserted both ways - populated serialises and round-trips, empty stays absent -
+        so the guard cannot be satisfied by always writing the key.
+        """
+        configured = StrategyMeta(
+            name="Configured",
+            parameters={"rsi_period": 14, "atr_period": 20, "stop_atr": 2.5},
+        )
+        payload = configured.to_dict()
+        assert payload.get("parameters") == {
+            "rsi_period": 14,
+            "atr_period": 20,
+            "stop_atr": 2.5,
+        }, "the strategy's parameters were dropped on serialisation: " + repr(payload)
+
+        restored = StrategyMeta.from_dict(payload)
+        assert restored.parameters["rsi_period"] == 14
+        assert restored.parameters["stop_atr"] == 2.5
+
+        # Empty stays absent, so the key is still omitted for a bare strategy.
+        assert "parameters" not in StrategyMeta(name="Bare").to_dict()
+
+    def test_an_artifact_without_a_version_reads_the_documented_default(self):
+        """`from_dict`'s version default is the only exercise of it.
+
+        `test_minimal` asserts `to_dict` writes `"1.0.0"` explicitly, so `version`
+        always appears in a produced payload and the reader's fallback is never
+        reached. Changing that fallback survives the suite.
+
+        The dangerous direction again: a hand-written or pre-version artifact omits the
+        key entirely, and the fallback is what decides what it claims to be. Getting it
+        wrong does not crash - it silently mislabels a strategy's version, which is what
+        a reader compares against when deciding whether a result is current.
+        """
+        legacy = StrategyMeta.from_dict({"name": "Legacy"})
+        assert legacy.version == "1.0.0", (
+            "an artifact with no version read as " + repr(legacy.version)
+            + " rather than the documented default"
+        )
+        assert legacy.parameters == {}
+        assert legacy.tags == {}
+        assert legacy.source_url == ""
+        assert legacy.notes == ""
+
+        # And the present case still wins, so the default is not overriding anything.
+        assert StrategyMeta.from_dict({"name": "X", "version": "2.5.0"}).version == "2.5.0"
+
     def test_minimal(self):
         sm = StrategyMeta(name="Minimal")
         d = sm.to_dict()
