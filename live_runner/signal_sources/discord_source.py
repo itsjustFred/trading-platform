@@ -97,9 +97,31 @@ _AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 # word immediately followed by a ticker - which is the shape
 # _extract_action_symbol already recognises, and what the real RamJet channel
 # emits ("RAM JET BUY AAPL @ 100.0"). Anchoring to the start of the message
-# instead would have broken every real RamJet signal, so the ticker is required
-# rather than a position: "do not buy" and "could buy here" have no ticker after
-# the word and so resolve to nothing.
+# instead would have broken every real RamJet signal.
+#
+# CORRECTION. This comment used to add: "the ticker is required rather than a
+# position: 'do not buy' and 'could buy here' have no ticker after the word and
+# so resolve to nothing." **That was wrong, and wrong in the way that matters** -
+# it credited this regex with work it does not do. Measured:
+#
+#   text              this regex   captured ticker   normalizes to   price
+#   "could buy here"  matches      "here"           HERE            None
+#   "do not buy this" matches      "this"           THIS            None
+#
+# Neither "here" nor "this" is in _SKIP_WORDS, and both are 1-10 letters, so
+# both are perfectly good ticker candidates by this regex's own definition. What
+# actually rejects them is further down, in _reads_as_buy_directive: the
+# **negation veto** for "do not buy", and the **price requirement** for "could
+# buy here" ("a stop-word list cannot enumerate every English word that might
+# follow 'buy', but a price is unambiguous").
+#
+# Why it was worth correcting rather than deleting: a developer tightening this
+# regex to match the stated rationale - requiring a real ticker shape, or
+# anchoring harder - would have been reinforcing a protection that lives
+# elsewhere, while the two guards that do the work went unremarked. Mutation
+# testing agrees: deleting the price requirement is caught, and deleting the
+# negation veto is caught, while five other mutations of this function and its
+# neighbours survive precisely because those two are load-bearing.
 _ACTION_BUY_RE = re.compile(
     r"\b(?:buy|long)\s+signal\b"
     r"|\b(?:buy|long)\s+\**\$?[A-Za-z]{1,10}\b",
