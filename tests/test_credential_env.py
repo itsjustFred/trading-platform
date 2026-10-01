@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+import live_runner.credential_env as credential_env
+
 from live_runner.credential_env import (
     accounts_env_mtime,
     load_accounts_env_values,
@@ -243,6 +245,108 @@ def asyncio_run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+def test_a_missing_accounts_env_file_is_the_normal_single_machine_setup(tmp_path):
+    """No `.accounts.env` must still yield the process environment.
+
+    The single-machine env-only setup this branch exists for was untested: every
+    fixture creates the file first. Getting it backwards means a total failure to
+    start for anyone running credentials from the environment alone.
+
+    The `FileNotFoundError` handler itself is an **equivalent mutant**, verified rather
+    than assumed: `dotenv_values` returns an empty mapping for a missing path instead
+    of raising, so that `except` clause is unreachable and narrowing it to
+    `except ValueError` changes nothing observable. The behaviour is nonetheless the
+    contract - a missing file must not stop the environment from being read - so it is
+    pinned at the level where it is actually reachable, and the unreachable clause is
+    recorded here rather than given a contrived test.
+
+    Also checked: a directory in place of the file, which `dotenv_values` also reads
+    as empty rather than raising.
+    """
+    missing = tmp_path / "no-such-file.env"
+    assert not missing.exists()
+
+    values = load_accounts_env_values(
+        missing, environ={"CTRADER_APP_ID": "from-process-env"}
+    )
+    assert values == {"CTRADER_APP_ID": "from-process-env"}, (
+        "a missing accounts file did not yield the process environment: " + repr(values)
+    )
+
+    as_directory = tmp_path / "accounts-dir.env"
+    as_directory.mkdir()
+    from_dir = load_accounts_env_values(
+        as_directory, environ={"CTRADER_APP_ID": "from-process-env"}
+    )
+    assert from_dir.get("CTRADER_APP_ID") == "from-process-env", (
+        "a directory in place of the accounts file lost the environment values: "
+        + repr(from_dir)
+    )
+
+    # Both an empty file and an unreadable one behave the same way: the environment
+    # is still what remains, which is what discovery decides from.
+    unreadable = tmp_path / "unreadable.env"
+    unreadable.write_text("CTRADER_APP_ID=file-value\n", encoding="utf-8")
+    unreadable.chmod(0o000)
+    try:
+        result = load_accounts_env_values(
+            unreadable, environ={"CTRADER_APP_SECRET": "env-secret"}
+        )
+        assert result.get("CTRADER_APP_SECRET") == "env-secret", (
+            "an unreadable accounts file cost the process environment: " + repr(result)
+        )
+    finally:
+        unreadable.chmod(0o600)
+
+
+def test_a_non_string_file_value_is_ignored_rather_than_stringified(tmp_path):
+    """Only `str` values from the file are kept, and a non-string is dropped.
+
+    The loop guards `isinstance(value, str)`. Replacing it with `str(value or "")`
+    leaves every test green, because a parsed `.accounts.env` yields strings or `None`
+    - so the guard's purpose is only visible with a value `dotenv_values` cannot
+    produce on its own.
+
+    Which is exactly why it is worth pinning: `None` is the one real case, and
+    `str(None or "")` would store an **empty string** for it, turning "this key is
+    commented out" into "this key is defined and empty". Since a present-but-empty
+    file value deliberately wins over the environment, that would shadow a working
+    process-env credential with nothing.
+
+    Simulated through a patched `dotenv_values`, because the divergence cannot be
+    reached through the real parser.
+    """
+    monkeypatched = {"X_OK": "value", "X_NONE": None, "X_EMPTY": "", "X_NUM": 7}
+    real = credential_env.dotenv_values
+
+    def _fake(path):
+        if str(path).endswith("fake.env"):
+            return monkeypatched
+        return real(path)
+
+    original = credential_env.dotenv_values
+    credential_env.dotenv_values = _fake
+    try:
+        values = credential_env.load_accounts_env_values(
+            "ignored/fake.env", environ={"X_NUM": "from-env", "X_NONE": "env-none"}
+        )
+    finally:
+        credential_env.dotenv_values = original
+
+    assert values["X_OK"] == "value"
+    assert values["X_EMPTY"] == "", "a genuinely empty file value must stay empty"
+    # The None value is dropped, so the environment may fill it.
+    assert values["X_NONE"] == "env-none", (
+        "a None file value was stored as empty, shadowing the environment with "
+        "nothing: " + repr(values.get("X_NONE"))
+    )
+    # A non-string is dropped too, rather than stringified into a credential.
+    assert values.get("X_NUM") == "from-env", (
+        "a non-string file value was stringified instead of dropped: "
+        + repr(values.get("X_NUM"))
+    )
 
 
 class TestResolveEnvValue:
