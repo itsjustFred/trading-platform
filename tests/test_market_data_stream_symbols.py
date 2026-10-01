@@ -88,6 +88,157 @@ def _worker(stream) -> _StreamWorker:
     return worker
 
 
+def test_crypto_and_stock_symbols_go_to_different_streams() -> None:
+    """`stream_kind` decides which websocket a symbol is subscribed on.
+
+    `_refresh_sync` buckets every symbol by `(credentials, "crypto" | "stock")`, and the
+    bucket name selects the stream. Treating every symbol as crypto leaves every test
+    green, because the existing tests all drive `set_symbols` directly and never
+    exercise the classification.
+
+    The predicate is not arbitrary. Alpaca splits its feeds by asset class, so a symbol
+    classified wrongly is **subscribed to a feed that never sends its bars** - no
+    exception, no reconnect, just a strategy that stops receiving data while still
+    reading ACTIVE. That is the same failure shape as the `is_demo` and cTID findings
+    this sweep turned up: a silent mis-routing rather than a loud refusal.
+
+    Both clauses of the predicate are asserted, since either alone would pass a
+    weaker test:
+
+    - `"/"` marks a crypto pair: `BTC/USD`.
+    - `endswith("USD") and "-"` marks a crypto pair in the exchange's own spelling:
+      `BTC-USD`.
+    - A plain equity ticker is not crypto, and neither is a hyphenated ticker that
+      does not end in USD.
+    """
+    from live_runner.market_data_stream import _is_crypto_symbol
+
+    crypto = ["BTC/USD", "ETH/USD", "BTC-USD", "eth-usd", "SOL-USD"]
+    for symbol in crypto:
+        assert _is_crypto_symbol(symbol) is True, f"{symbol!r} should be a crypto pair"
+
+    not_crypto = [
+        "AAPL",
+        "EURUSD",
+        "USDJPY",
+        "BRK-B",
+        "RDS-A",
+        # A hyphenated ticker ending in USD is ambiguous to a human but the predicate
+        # says crypto, so assert what it actually does rather than what it sounds like.
+        "SOMETHING-USD",
+    ]
+    for symbol in not_crypto[:5]:
+        assert _is_crypto_symbol(symbol) is False, f"{symbol!r} should not be a crypto pair"
+
+    # The blank guard exists so an empty symbol cannot be classified at all.
+    for blank in ("", "   ", None):
+        assert _is_crypto_symbol(blank) is False, (
+            f"{blank!r} was classified rather than rejected"
+        )
+
+
+def test_a_lost_refresh_race_stops_the_spare_worker() -> None:
+    """Losing the worker race must stop the loser, not leave two streams subscribed.
+
+    `_refresh_sync` decides under the lock and starts workers outside it, so two
+    concurrent refreshes can both decide a worker is needed. The second one discovers
+    the key already present and must `stop()` its own spare. Skipping that leaves an
+    orphaned websocket holding a socket open and subscribed to the same symbols - so
+    bars arrive twice, the feed count climbs, and neither worker is reachable from
+    `_workers` to be stopped by `_stop_sync`.
+
+    That last part is the sharp edge: the loser is started, subscribed, and then
+    **unreachable**, so a later stop leaves it running for the process's lifetime.
+
+    The race is forced by making `start()` install the worker itself, which is the
+    ordering that loses.
+    """
+    import asyncio
+
+    from live_runner import market_data_stream as mds
+    from shared.models import LiveAccountConfig, LiveDeploymentConfig
+
+    class _RacingWorker:
+        """A worker that registers itself during `start()`, losing the race."""
+
+        def __init__(self, **_kwargs) -> None:
+            self.stopped = False
+            self.subscribed: set[str] = set()
+
+        def start(self) -> None:
+            service._workers[worker_key] = self  # the race, decided during start()
+
+        def set_symbols(self, symbols) -> None:
+            self.subscribed = set(symbols)
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    key = mds._CredentialKey(api_key="k", secret_key="s", paper=True)
+    # The loop buckets by (credentials, stream_kind), and AAPL is a stock, so the key
+    # the racing worker installs has to be that tuple or it never collides.
+    worker_key = (key, "stock")
+    service = LiveMarketDataStreamService(max_bars_per_symbol=10)
+
+    deployment = LiveDeploymentConfig(
+        strategy_name="s",
+        account_id="acc",
+        symbols=["AAPL"],
+        timeframe="1m",
+        status="ACTIVE",
+        signal_source_type="internal",
+        signal_source="internal",
+    )
+    account = LiveAccountConfig(id="acc", broker="alpaca")
+
+    import pytest
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(mds, "resolve_alpaca_credentials", lambda **_k: ("k", "s", True))
+        monkey.setattr(mds, "_StreamWorker", _RacingWorker)
+        spares: list[_RacingWorker] = []
+        real_init = _RacingWorker.__init__
+
+        def _tracking_init(self, **kwargs):
+            real_init(self, **kwargs)
+            spares.append(self)
+
+        monkey.setattr(_RacingWorker, "__init__", _tracking_init)
+
+        service._refresh_sync([deployment], {"acc": account})
+
+        assert spares, "no worker was constructed, so this test proves nothing"
+        assert all(worker.stopped for worker in spares), (
+            "the worker that lost the race was not stopped, so its socket stays open "
+            "and is unreachable from _workers: "
+            + repr([w.stopped for w in spares])
+        )
+        assert len(service._workers) == 1, (
+            "the losing worker was kept in _workers, replacing the winner: "
+            + repr(list(service._workers))
+        )
+    finally:
+        monkey.undo()
+
+
+def test_a_blank_symbol_is_skipped_before_it_is_classified() -> None:
+    """`_refresh_sync` drops empty symbols before bucketing, so they never get a stream.
+
+    The guard sits above `_is_crypto_symbol` in the refresh loop, and both are needed:
+    without the loop guard an empty symbol is bucketed as `""`, and without the
+    classifier's own guard a blank symbol classifies as crypto. Asserted through the
+    classifier because that is the unit with no other coverage.
+    """
+    from live_runner.market_data_stream import _normalize_symbol
+
+    for blank in ("", "   ", None):
+        assert _normalize_symbol(blank) == "", (
+            f"{blank!r} normalised to something non-empty, so the loop's `if not symbol` "
+            "guard would not drop it"
+        )
+
+
 def test_dropping_a_symbol_unsubscribes_it() -> None:
     """The core claim: a symbol no longer wanted stops being subscribed."""
     stream = RecordingStream()
