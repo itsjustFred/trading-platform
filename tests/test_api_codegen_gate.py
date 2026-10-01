@@ -130,6 +130,118 @@ def test_jforex_prewarm_starts_the_jvm_on_the_main_thread(monkeypatch):
     )
 
 
+def test_jforex_prewarm_failure_classification(monkeypatch):
+    """Four JPype failures mean "JForex is unavailable"; anything else is a real fault.
+
+    `_prewarm_jforex_jvm_background` must never take the server down, so both
+    handlers only log. But they do not log the *same* thing, and the difference is the
+    point: a missing JPype, a missing Dukascopy module, a missing SDK classpath, or a
+    JVM that would not start all mean JForex is simply not installed here, and are
+    logged at INFO. Any other RuntimeError is an unexpected fault and is a WARNING.
+
+    Both survivors in this function come from that boundary being unpinned: raising
+    instead of warning escapes the coroutine, and dropping one phrase from the list
+    demotes a genuine "JVM failed to start" fault to an INFO line, which is how a
+    broken prewarm stays invisible.
+
+    Asserted on the log *level* rather than the message, since the level is the
+    contract the operator reads.
+    """
+    import asyncio
+    import logging
+
+    from data_tools.downloaders import jforex_dl
+
+    from viewer.main import _prewarm_jforex_jvm_background
+
+    unavailable = (
+        "JPype is required",
+        "failed to import 'com.dukascopy'",
+        "jforex sdk classpath",
+        "failed to start jvm",
+    )
+    for message in unavailable:
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Capture()
+        logger = logging.getLogger("trading.viewer")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            def _raise_unavailable() -> None:
+                raise RuntimeError(message)
+
+            monkeypatch.setattr(jforex_dl, "prewarm_jvm", _raise_unavailable)
+            # Must not raise: the server has to survive an unavailable JForex.
+            asyncio.run(_prewarm_jforex_jvm_background())
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+
+        assert records, f"nothing was logged for {message!r}"
+        assert all(r.levelno == logging.INFO for r in records), (
+            f"{message!r} was logged at "
+            + str({logging.getLevelName(r.levelno) for r in records})
+            + " rather than INFO; an expected-unavailable broker must not look like a fault"
+        )
+
+    # An unrecognised RuntimeError is a real fault, and stays a WARNING.
+    records: list[logging.LogRecord] = []
+
+    class _Capture2(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture2()
+    logger = logging.getLogger("trading.viewer")
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        def _raise_unexpected() -> None:
+            raise RuntimeError("something nobody anticipated")
+
+        monkeypatch.setattr(jforex_dl, "prewarm_jvm", _raise_unexpected)
+        asyncio.run(_prewarm_jforex_jvm_background())
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert records, "an unexpected prewarm failure logged nothing at all"
+    assert all(r.levelno == logging.WARNING for r in records), (
+        "an unrecognised failure was demoted to INFO, so a broken prewarm looks like "
+        "an absent one: " + str({logging.getLevelName(r.levelno) for r in records})
+    )
+
+    # And a non-RuntimeError exception is a warning too, not a crash.
+    records.clear()
+
+    class _Capture3(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture3()
+    logger.addHandler(handler)
+    try:
+        def _raise_other() -> None:
+            raise ValueError("not a RuntimeError")
+
+        monkeypatch.setattr(jforex_dl, "prewarm_jvm", _raise_other)
+        asyncio.run(_prewarm_jforex_jvm_background())
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert records and all(r.levelno == logging.WARNING for r in records), (
+        "a non-RuntimeError prewarm failure was not logged as a warning"
+    )
+
+
 async def _call_prewarm() -> None:
     from viewer.main import _prewarm_jforex_jvm_background
 
