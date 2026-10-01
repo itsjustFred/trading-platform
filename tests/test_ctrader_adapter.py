@@ -37,6 +37,205 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestFillIdentityResolution:
+    """Which signal a fill belongs to, which was entirely untested. Eight survivors.
+
+    These are the fields that decide *whose* trade a broker event is applied to. Getting
+    one wrong does not raise - it silently attributes a fill to the wrong signal, which is
+    the hardest class of bug to notice because every individual row looks plausible.
+
+    The two precedence questions, both pinned explicitly because neither is obvious:
+
+    **The order's own `orderId` beats the deal's.** They should agree, so a disagreement
+    means one of them is stale, and preferring the order keeps the identity anchored to
+    the order we actually submitted rather than to a related deal row.
+
+    **`position_ids` beats a scalar `position_id`, even when both are present.** That is
+    the opposite of "more specific wins" intuition and it is load-bearing: the list form
+    is the one the upstream exit planner emits, so a stale scalar left in the metadata
+    must not override it.
+
+    Every refusal is about refusing to act on an identifier that cannot be trusted -
+    a `True` that would become position 1, a `1.5` truncated to 1, a list of two where
+    exactly one is required.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter._order_id_to_signal_id = {111: "sig-111", 222: "sig-222"}
+        return adapter
+
+    def test_the_orders_own_id_wins_over_the_deals(self) -> None:
+        """When both carry an id, the order's is the identity.
+
+        They ought to match; when they do not, one is stale. The order is what we
+        submitted, so it is the anchor.
+        """
+        adapter = self._adapter()
+        order_id, client_order_id = adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=111, clientOrderId="co-1"),
+            SimpleNamespace(orderId=222),
+        )
+        assert (order_id, client_order_id) == (111, "co-1")
+
+    def test_the_deals_id_is_used_only_when_the_order_has_none(self) -> None:
+        adapter = self._adapter()
+        assert adapter._extract_order_and_client_ids(
+            SimpleNamespace(clientOrderId="co-1"), SimpleNamespace(orderId=222)
+        ) == (222, "co-1")
+        # And a zero on the order does not shadow a real id on the deal.
+        assert adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=111, clientOrderId="co-1"),
+            SimpleNamespace(orderId=0),
+        ) == (111, "co-1")
+
+    @pytest.mark.parametrize("bad_id", [0, -1, -5, 0.0, -0.5])
+    def test_a_non_positive_order_id_is_not_an_identity(self, bad_id: float) -> None:
+        """Zero is the broker's "no id", and it must not become one.
+
+        `0` is falsy in some places and truthy in others, which is exactly why the
+        comparison is explicit. Treated as a real id, order 0 would be looked up in the
+        signal map and - in a system where id 0 is not assigned - silently resolve to no
+        signal while still looking like a successful match.
+        """
+        adapter = self._adapter()
+        order_id, client_order_id = adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=bad_id, clientOrderId=""), None
+        )
+        assert order_id is None, f"{bad_id!r} was accepted as a broker order id"
+        assert client_order_id == ""
+
+    @pytest.mark.parametrize("bad_id", [0, -1, -5, 0.0, -0.5])
+    def test_a_non_positive_id_on_the_deal_alone_is_not_an_identity(self, bad_id) -> None:
+        """The same rule on the *fallback* path, which is a separate check in the source.
+
+        The order path and the deal path each carry their own `> 0` test. Asserting only
+        the order path leaves the deal one unverified, and that is the path taken whenever
+        cTrader sends a fill with no order row attached - so it is arguably the more
+        likely one to be reached.
+
+        `clientOrderId` is taken from the *order* only, so a deal-only event also has no
+        signal id to fall back on, and the result must be an empty string rather than a
+        plausible-looking one.
+        """
+        adapter = self._adapter()
+        order_id, client_order_id = adapter._extract_order_and_client_ids(
+            None, SimpleNamespace(orderId=bad_id)
+        )
+        assert order_id is None, f"{bad_id!r} on a deal was accepted as a broker order id"
+        assert client_order_id == ""
+
+    def test_a_deal_only_event_with_a_real_id_resolves_through_the_map(self) -> None:
+        """Confirms the deal path still works when the id is genuine."""
+        adapter = self._adapter()
+        assert adapter._extract_order_and_client_ids(None, SimpleNamespace(orderId=222)) == (
+            222,
+            "sig-222",
+        )
+
+    def test_a_blank_client_order_id_is_resolved_through_the_signal_map(self) -> None:
+        """The map is the only route from a broker order id back to a signal id.
+
+        cTrader does not always echo `clientOrderId` on a fill, so without this lookup a
+        legitimate fill cannot be attributed and is retained for reconciliation instead.
+        Asserted in both directions: the hit resolves, and an unmapped id resolves to
+        empty rather than to some other signal.
+        """
+        adapter = self._adapter()
+        assert adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=111, clientOrderId=""), None
+        ) == (111, "sig-111")
+        assert adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=999, clientOrderId=""), None
+        ) == (999, "")
+
+    def test_a_present_client_order_id_is_never_overwritten_by_the_map(self) -> None:
+        """The broker's own echo wins over our local map.
+
+        Otherwise a stale map entry could relabel a fill that the broker has already
+        identified - moving a fill onto a different signal's history.
+        """
+        adapter = self._adapter()
+        _, client_order_id = adapter._extract_order_and_client_ids(
+            SimpleNamespace(orderId=111, clientOrderId="broker-echo"), None
+        )
+        assert client_order_id == "broker-echo"
+
+    def test_an_exit_only_position_id_is_accepted_in_its_accepted_forms(self) -> None:
+        adapter = self._adapter()
+        assert adapter._requested_exit_position_id({"position_id": 7}) == 7
+        assert adapter._requested_exit_position_id({"position_id": "7"}) == 7, (
+            "a numeric string is a normal metadata encoding and must not be refused"
+        )
+        # An integral float is exact, so it is accepted rather than refused for its type.
+        assert adapter._requested_exit_position_id({"position_id": 7.0}) == 7
+        # Absent means "not an exit-only close", not "position zero".
+        assert adapter._requested_exit_position_id({}) is None
+        assert adapter._requested_exit_position_id({"position_id": None}) is None
+
+    @pytest.mark.parametrize("bad_id", [0, -1, -5])
+    def test_a_non_positive_position_id_is_refused(self, bad_id: int) -> None:
+        """An exit-only close needs a real position; 0 closes nothing."""
+        adapter = self._adapter()
+        with pytest.raises(ValueError, match="must be positive"):
+            adapter._requested_exit_position_id({"position_id": bad_id})
+
+    def test_a_fractional_position_id_is_refused_rather_than_truncated(self) -> None:
+        """`1.5` truncated to `1` would close the wrong position.
+
+        This is the case that makes the float check worth having: `int()` on a float is
+        silent, so a metadata value of `1.5` would close position 1 and leave position 2
+        open, with no error anywhere.
+        """
+        adapter = self._adapter()
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter._requested_exit_position_id({"position_id": 1.5})
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter._requested_exit_position_id({"position_id": "1.5"})
+
+    def test_a_bool_position_id_is_refused(self) -> None:
+        """`True` is an `int` in Python, and it means position 1.
+
+        Without the explicit check, `{"position_id": True}` closes position 1 - which is
+        a real, plausible-looking position id, so the mistake is invisible afterwards.
+        """
+        adapter = self._adapter()
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter._requested_exit_position_id({"position_id": True})
+        with pytest.raises(ValueError, match="not an integer"):
+            adapter._requested_exit_position_id({"position_id": False})
+
+    @pytest.mark.parametrize(
+        "raw", [[1, 2], [], [1, 2, 3], 5, "1", {1: 2}]
+    )
+    def test_a_list_of_position_ids_must_hold_exactly_one_entry(self, raw) -> None:
+        """An exit-only close targets one position, so the count is part of the contract.
+
+        Two ids means the caller wanted to close two positions on a path that can only
+        close one - closing the first silently would leave the second open and report
+        success. An empty list means nothing was chosen.
+        """
+        adapter = self._adapter()
+        with pytest.raises(ValueError, match="exactly one broker position id"):
+            adapter._requested_exit_position_id({"position_ids": raw})
+
+    def test_position_ids_wins_over_a_scalar_when_both_are_present(self) -> None:
+        """The list form overrides a stale scalar, which is the counter-intuitive one.
+
+        `position_ids` is what the upstream exit planner emits. If an older scalar
+        `position_id` is also present - carried from an earlier run, or written by an
+        older caller - the list must win, or the close targets the stale position. Pinned
+        because the natural reading of "both present" is that the singular is primary.
+        """
+        adapter = self._adapter()
+        assert adapter._requested_exit_position_id(
+            {"position_id": 9, "position_ids": [4]}
+        ) == 4
+        # And the single-element list is the only accepted list form.
+        assert adapter._requested_exit_position_id({"position_ids": [4]}) == 4
+
+
 def test_the_zero_distance_guard_in_resolve_relative_sl_tp_is_unreachable() -> None:
     """**A verified equivalent mutant**, recorded with the proof rather than dropped.
 
