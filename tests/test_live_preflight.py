@@ -543,3 +543,209 @@ def test_a_symbol_list_failure_is_warned_and_leaves_the_result_unchecked():
     assert connected is True, "a failed symbol read must not fail connectivity"
     assert tradeable is None, "a failed read must leave the list unchecked, not empty"
     assert any("broker said no" in w for w in warnings), warnings
+
+
+# --------------------------------------------------------------------------
+# The rest of the arming gate, found by mutation testing with `mutate.sh`
+# --------------------------------------------------------------------------
+#
+# `_validate_deployments` has four guards that no test reaches. Dropping any of
+# them leaves all 349 collected tests green, so a refactor could quietly delete
+# the arming preflight's own refusals. The unknown-account guard beside them *is*
+# pinned (`test_live_preflight_reports_unknown_deployment_account`), which is
+# what makes the asymmetry odd: the loudest failure is covered and the quieter
+# three are not.
+#
+# These are errors, not warnings, so each one is a deployment the preflight
+# refuses to certify. That refusal is the product.
+
+
+def _alpaca_config(tmp_path: Path, deployment_block: str) -> Path:
+    return _write_config(
+        tmp_path / "live_deployments.yaml",
+        f"""
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+        {deployment_block}
+        """,
+    )
+
+
+_ALPACA_ENV = {
+    "ALPACA_API_KEY": "alpaca-key",
+    "ALPACA_SECRET_KEY": "alpaca-secret",
+    "ALPACA_PAPER": "true",
+}
+
+
+def test_a_deployment_with_no_symbols_is_refused(tmp_path: Path) -> None:
+    """Kills dropping the no-symbols error. An empty symbol list can never trade."""
+    config_path = _alpaca_config(
+        tmp_path,
+        """
+          - strategy_name: symbol_less
+            account_id: alpaca-paper
+            symbols: []
+            timeframe: 1h
+        """,
+    )
+
+    result = run_live_preflight(config_path, env=_ALPACA_ENV)
+
+    assert result.ok is False
+    assert result.deployment_errors == ["symbol_less (alpaca-paper): has no symbols configured."]
+
+
+def test_a_deployment_with_no_timeframe_is_refused(tmp_path: Path) -> None:
+    """Kills dropping the no-timeframe error. Backtests and grids both need one."""
+    config_path = _alpaca_config(
+        tmp_path,
+        """
+          - strategy_name: timeless
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: "   "
+        """,
+    )
+
+    result = run_live_preflight(config_path, env=_ALPACA_ENV)
+
+    assert result.ok is False
+    assert result.deployment_errors == ["timeless (alpaca-paper): has no timeframe configured."]
+
+
+def test_a_discord_deployment_with_no_channel_is_warned(tmp_path: Path) -> None:
+    """Kills dropping the channel_id warning.
+
+    A Discord deployment with no channel id listens to nothing and says so only
+    here, so the warning is the whole of what makes that failure visible.
+    """
+    config_path = _alpaca_config(
+        tmp_path,
+        """
+          - strategy_name: silent_discord
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+            signal_source: discord
+            signal_config:
+              bot: rocketfuel
+        """,
+    )
+
+    result = run_live_preflight(config_path, env=_ALPACA_ENV)
+
+    assert any("has no channel_id in signal_config" in w for w in result.deployment_warnings), (
+        f"expected the channel_id warning, got {result.deployment_warnings}"
+    )
+
+
+def test_a_non_discord_deployment_is_not_warned_about_a_channel(tmp_path: Path) -> None:
+    """The other half, so the warning cannot be satisfied by always firing."""
+    config_path = _alpaca_config(
+        tmp_path,
+        """
+          - strategy_name: not_discord
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+
+    result = run_live_preflight(config_path, env=_ALPACA_ENV)
+
+    assert not any("channel_id" in w for w in result.deployment_warnings)
+
+
+def _account_result(account_id: str, tradeable: set[str] | None):
+    from live_runner.preflight import LivePreflightAccountResult
+
+    return LivePreflightAccountResult(
+        account_id=account_id,
+        broker="alpaca",
+        ok=True,
+        paper=True,
+        demo=None,
+        connected=True,
+        balance=1000.0,
+        equity=1000.0,
+        positions_count=0,
+        errors=[],
+        warnings=[],
+        tradeable_symbols=tradeable,
+    )
+
+
+def _deployment(account_id: str = "alpaca-paper", symbols: list[str] | None = None):
+    from live_runner.preflight import LiveDeploymentConfig
+
+    return LiveDeploymentConfig(
+        strategy_name="probe",
+        account_id=account_id,
+        symbols=symbols if symbols is not None else ["AAPL"],
+        timeframe="1h",
+    )
+
+
+def _account(account_id: str = "alpaca-paper"):
+    from live_runner.preflight import LiveAccountConfig
+
+    return LiveAccountConfig(id=account_id, broker="alpaca")
+
+
+def test_a_broker_answered_with_an_empty_symbol_list_still_warns() -> None:
+    """Kills turning `is not None` into a truthiness check at the consumer.
+
+    The producer side already insists an unchecked list stays `None`, "never an
+    empty set" - so that the operator can tell "not checked" from "checked and
+    empty". This is the other half: the consumer has to keep those apart too.
+
+    With `if tradeable:` instead of `if tradeable is not None:`, a broker that
+    genuinely answered with zero tradeable symbols becomes falsy, the check is
+    skipped, and the deployment is certified with a warning that never appears.
+    """
+    from live_runner.preflight import _validate_deployments
+
+    errors, warnings = _validate_deployments(
+        [_account()],
+        [_deployment(symbols=["AAPL", "MSFT"])],
+        [_account_result("alpaca-paper", set())],
+    )
+
+    assert errors == []
+    assert any("cannot trade AAPL, MSFT" in w for w in warnings), (
+        f"a broker that answered with an empty list must still be reported: {warnings}"
+    )
+
+
+def test_an_unchecked_symbol_list_claims_nothing() -> None:
+    """`None` means the broker never answered, so no claim is made in either direction."""
+    from live_runner.preflight import _validate_deployments
+
+    errors, warnings = _validate_deployments(
+        [_account()],
+        [_deployment(symbols=["AAPL"])],
+        [_account_result("alpaca-paper", None)],
+    )
+
+    assert errors == []
+    assert not any("cannot trade" in w for w in warnings), (
+        f"an unchecked list must not produce a claim: {warnings}"
+    )
+
+
+def test_a_broker_answered_with_the_symbols_we_want_is_quiet() -> None:
+    """The other half again: a checked, satisfied list must be silent."""
+    from live_runner.preflight import _validate_deployments
+
+    errors, warnings = _validate_deployments(
+        [_account()],
+        [_deployment(symbols=["aapl", " AAPL "])],
+        [_account_result("alpaca-paper", {"AAPL", "MSFT"})],
+    )
+
+    assert errors == []
+    assert not any("cannot trade" in w for w in warnings), warnings
