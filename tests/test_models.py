@@ -316,6 +316,78 @@ class TestTrade:
         assert "meta" not in d
 
 
+class TestBacktestResultEvidence:
+    """The equity-evidence contract, on the model rather than the validation reference.
+
+    Two separate guards, and the reference-level test does not reach either of them
+    through `BacktestResult.__post_init__` on its own terms.
+
+    **`available` requires a curve.** Without it, a result can claim its equity
+    evidence is available while carrying no curve at all - the artifact says it can
+    prove something and then cannot show it. `to_backtest_result()` raises for that
+    shape, so the check exists at the reference boundary too; what is missing is the
+    model saying so for itself, which is where every other construction path lands.
+
+    **A curve implies `available`.** `__post_init__` promotes `unknown` to
+    `available` when a curve is present, so the serialised record does not claim
+    ignorance about evidence it is carrying. Removing that leaves a result whose
+    status is `unknown` while `equity_curve` is populated.
+    """
+
+    def _result(self, *, curve=(), status="unknown"):
+        return BacktestResult(
+            meta=_make_result().meta,
+            trades=[],
+            equity_curve=list(curve),
+            equity_evidence_status=status,
+        )
+
+    def test_available_status_without_a_curve_is_refused(self):
+        with pytest.raises(ValueError, match="requires an equity curve"):
+            self._result(status="available")
+
+        # And the other direction is still allowed: a curve with status "available".
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0)]
+        ok = self._result(curve=curve, status="available")
+        assert ok.equity_curve == curve
+
+    def test_a_curve_promotes_the_evidence_status_from_unknown(self):
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0)]
+        result = self._result(curve=curve)
+        assert result.equity_evidence_status == "available", (
+            "a result carrying an equity curve still claims its evidence status is "
+            "unknown: " + result.equity_evidence_status
+        )
+
+    def test_no_curve_and_unknown_stays_unknown(self):
+        assert self._result().equity_evidence_status == "unknown"
+
+    def test_missing_is_preserved_rather_than_promoted(self):
+        # "missing" is a deliberate statement, so it must not be rewritten to
+        # "available" by the presence of a curve - that would turn a recorded
+        # absence into a claim.
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=1.0)]
+        result = self._result(curve=curve, status="missing")
+        assert result.equity_evidence_status == "missing"
+
+    def test_the_status_survives_serialisation(self):
+        curve = [EquityPoint(time="2024-01-01T00:00:00Z", equity=100000.0)]
+        result = self._result(curve=curve)
+        payload = result.to_dict()
+        assert payload.get("equity_evidence_status") == "available", (
+            "the evidence status was dropped on serialisation, so a reloaded result "
+            "cannot tell whether its curve is trustworthy: " + repr(payload.keys())
+        )
+        assert BacktestResult.from_dict(payload).equity_evidence_status == "available"
+
+        # A "missing" status is serialised explicitly rather than omitted as unknown.
+        missing = self._result(status="missing").to_dict()
+        assert missing["equity_evidence_status"] == "missing"
+
+        # "unknown" is the default, so it stays out of the payload entirely.
+        assert "equity_evidence_status" not in self._result().to_dict()
+
+
 class TestBacktestResult:
     def test_json_roundtrip(self):
         r = _make_result()
