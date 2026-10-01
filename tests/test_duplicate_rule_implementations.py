@@ -30,18 +30,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Production roots. `tests/` is excluded on purpose: these are rules about the
 # shipped code, and a test helper named the same thing is not a second copy.
-PRODUCTION_ROOTS = (
-    "data_tools",
-    "frontend",
-    "live_runner",
-    "risk",
-    "runner",
-    "scripts",
-    "shared",
-    "signal_bots",
-    "validation",
-    "viewer",
-)
+# Directories excluded from discovery, and why.
+_EXCLUDED_ROOTS = {
+    "tests",          # these guards are about shipped code, and a test helper
+                       # sharing a name is not a second copy
+    ".agents", ".git", "node_modules", "docs", "logs", "backups", "data",
+    ".venv", "venv", "build", "dist", "frontend/dist",
+}
+
+# Derived, not listed. A hand-maintained list of roots is exactly the "a list of
+# what to check is a list that can be wrong" mistake this branch has already
+# fixed twice - once for CWD-relative paths and once for fixture globs. The
+# previous hand-written ten-entry tuple omitted `strategies` (30 modules),
+# `scheduler` and `strategy-comparisons` while including `frontend`, which has
+# zero Python files, and a probe confirmed a third copy of
+# `_catalog_timestamp_to_epoch` placed under `strategies/` was completely
+# invisible to the comparison.
+def _production_roots() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            entry.name
+            for entry in REPO_ROOT.iterdir()
+            if entry.is_dir()
+            and not entry.name.startswith(".")
+            and entry.name not in _EXCLUDED_ROOTS
+            and any(entry.rglob("*.py"))
+        )
+    )
+
+
+PRODUCTION_ROOTS = _production_roots()
 
 # Each entry is one logical rule. `copies` is the number of implementations that
 # must agree today; raising it without keeping them identical fails, which is the
@@ -118,11 +136,27 @@ def _functions_named(path: Path, name: str) -> list[ast.FunctionDef | ast.AsyncF
 
 
 def _normalised_body(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    """Structure and names, with the docstring dropped.
+    """Structure and names, with the top-level docstring dropped.
 
     Comments and docstrings are excluded because they are the part that stays
     identical when two copies have already diverged in behaviour - which is
     exactly what must not decide the verdict here.
+
+    **Two known blind spots, verified rather than assumed:**
+
+    - *Module-level constants are not compared.* `_is_us_intraday_stock` and
+      `_auto_download_source` both read a file-local `US_INTRADAY_TIMEFRAMES`,
+      so a copy can diverge behaviourally while the bodies stay identical - which
+      is precisely the drift this pin claims to catch. A pre-existing viewer test
+      covers those two, so it is a limitation of the pin, not a hole in the suite.
+    - *Signatures are not compared.* `fn.body` only, so a differing default
+      argument, a missing `@staticmethod` or an `async def` in place of `def`
+      would pass. No currently pinned rule has a default argument.
+
+    A docstring nested inside an `if` or `for` **is** compared, so two
+    behaviourally identical copies could fail here on a wording difference. None
+    currently do; if one starts to, the fix is in this function rather than in
+    the copies.
     """
     body = [
         stmt
@@ -470,7 +504,7 @@ def test_both_signal_processors_compute_the_same_atr() -> None:
 #
 # **This test asserts the divergence exists.** That is deliberate, and it is the
 # point: the alternative was no pin at all, where fixing one copy would leave the
-# other quietly different. When the decision in `notes/backlog.md` is taken, this
+# other quietly different. When the decision in `/home/ubuntu/perma-runner/notes/backlog.md` is taken, this
 # fails and points at the entry to be updated with it.
 #
 # It is not a claim that the validator is right. Reversing it would fail
@@ -513,7 +547,8 @@ def test_known_session_parsing_divergence_pending_decision(label: str, session: 
     if label in {"absent", "valid", "valid 24h close"}:
         assert as_validator == as_downloader, (
             f"{label}: the two copies used to agree on this and no longer do. If that is "
-            f"the fix for the recorded divergence, update the entry in notes/backlog.md "
+            f"the fix for the recorded divergence, update the entry in "
+            f"/home/ubuntu/perma-runner/notes/backlog.md "
             f"in the same commit that changed it."
         )
         return
@@ -522,5 +557,6 @@ def test_known_session_parsing_divergence_pending_decision(label: str, session: 
         f"{label}: the recorded divergence between validate._session_window and "
         f"auto_download._explicit_session_window has been resolved - the validator now "
         f"returns {as_downloader[0]} where it used to return a value. Update the "
-        f"needs-decision entry in notes/backlog.md to match; do not delete this test."
+        f"needs-decision entry in /home/ubuntu/perma-runner/notes/backlog.md to "
+        f"match; do not delete this test."
     )
