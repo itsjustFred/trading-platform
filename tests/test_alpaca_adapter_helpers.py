@@ -201,6 +201,147 @@ class TestTradeUpdateQuantityResolution:
         )
 
 
+def test_order_id_normalisation_defences_that_look_redundant_are_not_reachable() -> None:
+    """Two more verified equivalent mutants in `_normalize_broker_order_id`.
+
+    Recorded here rather than as separate tests, because a test asserting an unreachable
+    branch asserts nothing - the standing rule this sweep has settled on three times now.
+
+    - **The `isinstance(value, bool)` guard.** `UUID(True)` raises, so the
+      `except (AttributeError, TypeError, ValueError)` below refuses it anyway. Verified
+      by direct call rather than by reading.
+    - **The `{"none", "null", "false"}` sentinel check.** None of those parses as a UUID,
+      so the same `except` refuses them. The check reads as defensive documentation of
+      what the SDK has been seen to emit, which is reasonable - it just is not what makes
+      the function correct.
+
+    Both behaviours are asserted below anyway, because they are the *contract* callers
+    rely on, and a future change to the `except` clause would change the outcome without
+    changing a line of either guard.
+
+    That is the real reason to keep them: not as kill-tests for the present code, but as
+    a tripwire for a future edit that removes the backstop.
+    """
+    from live_runner.alpaca_adapter import _normalize_broker_order_id
+
+    # The bool guard: True and False are not order ids.
+    for value in (True, False):
+        assert _normalize_broker_order_id(value) is None, (
+            f"{value!r} was accepted as a broker order id"
+        )
+
+    # The sentinel guard: SDK-shaped nulls are not order ids, in any case.
+    for sentinel in ("none", "null", "false", "NONE", "Null", "FALSE"):
+        assert _normalize_broker_order_id(sentinel) is None, (
+            f"{sentinel!r} was accepted as a broker order id"
+        )
+
+
+class TestExecutionFillPersistenceReporting:
+    """A failed write must not be logged as a persisted fill.
+
+    `_persist_execution_fill` returns a quantity, and the caller uses it to choose
+    between two log messages:
+
+        persisted_qty > 0  ->  "Persisted Alpaca execution fill"
+        otherwise          ->  "Skipped duplicate Alpaca execution fill"
+
+    So the return value is not a convenience - **it is what the record says happened.**
+    `save_live_execution` returns False for a duplicate (the dedupe key matched), and
+    that is correctly reported as a skip. But it can also return False because the write
+    *failed*, and reporting `execution.filled_qty` in that case records a fill that is
+    not in the database.
+
+    That is the consequence worth stating: the log then says the broker fill was stored
+    while nothing was written, so the position stays short of reality and the
+    discrepancy surfaces later as an unexplained reconciliation gap rather than as a
+    write error. **A stale-but-true record beats a confident one, and this is the case
+    where the code chose confidence.**
+
+    Three states, asserted separately because they are three different claims:
+    persisted, duplicate (skipped), and failed (skipped, and *not* reported as the
+    execution's quantity).
+    """
+
+    def _adapter(self):
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        return AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+
+    @staticmethod
+    def _execution():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id="exec-1",
+            signal_id="sig-1",
+            filled_qty=7.5,
+        )
+
+    def _persist(self, saved, *, cumulative=0.0):
+        import asyncio
+
+        from live_runner import alpaca_adapter as module
+
+        calls: list[tuple[object, float]] = []
+
+        def _save_live_execution(execution):
+            calls.append((execution, "plain"))
+            return saved
+
+        def _save_up_to_cumulative(execution, qty):
+            # The real function returns the cumulative quantity it wrote, not a bool.
+            calls.append((execution, "cumulative"))
+            return float(qty)
+
+        original_plain = module.save_live_execution
+        original_cumulative = module.save_live_execution_up_to_cumulative
+        module.save_live_execution = _save_live_execution
+        module.save_live_execution_up_to_cumulative = _save_up_to_cumulative
+        try:
+            result = asyncio.run(
+                self._adapter()._persist_execution_fill(self._execution(), cumulative)
+            )
+        finally:
+            module.save_live_execution = original_plain
+            module.save_live_execution_up_to_cumulative = original_cumulative
+        return result, calls
+
+    def test_a_successful_write_reports_the_execution_quantity(self) -> None:
+        persisted, calls = self._persist(True)
+        assert persisted == 7.5
+        assert calls and calls[0][1] == "plain"
+
+    def test_a_failed_write_reports_zero_not_the_execution_quantity(self) -> None:
+        """The gap in this sweep: a lost fill must not be logged as persisted.
+
+        `save_live_execution` returning False covers both "duplicate" and "failed", and
+        the caller cannot tell them apart - so the only correct report for False is a
+        skip. Returning `execution.filled_qty` regardless says a fill was stored that
+        was not.
+        """
+        persisted, _calls = self._persist(False)
+        assert persisted == 0.0, (
+            "a write that did not persist reported the execution's quantity, so the "
+            f"caller logs a fill as stored: {persisted!r}"
+        )
+
+    def test_a_positive_cumulative_quantity_uses_the_cumulative_write(self) -> None:
+        """The idempotent path exists so a redelivered event cannot double-count.
+
+        `save_live_execution_up_to_cumulative` writes the position as the broker's
+        running total rather than adding to it, so replaying the same event twice is
+        harmless. This asserts the routing, not just the result - the two functions must
+        not be interchangeable.
+        """
+        persisted, calls = self._persist(True, cumulative=20.0)
+        assert persisted == 20.0
+        assert calls and calls[0][1] == "cumulative", (
+            "a positive cumulative quantity did not take the idempotent path: "
+            + repr(calls)
+        )
+
+
 class TestTradeUpdateEventParsing:
     """`_parse_trade_update_event` gates every fill the adapter records, and had no test.
 
