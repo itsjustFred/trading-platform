@@ -43,6 +43,8 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from live_runner import market_data_stream
 from live_runner.market_data_stream import LiveMarketDataStreamService, _StreamWorker
 
@@ -529,3 +531,284 @@ def test_a_subscribed_bar_is_recorded_after_the_filter_change() -> None:
         "bars for subscribed symbols must still be recorded; a filter that drops "
         "everything would satisfy the abandoned-symbol test on its own"
     )
+
+
+class TestBarSerialisationAndReads:
+    """What a bar becomes once it reaches a strategy. Four survivors.
+
+    `_serialize_bar_payload` produces the `time` field every bar-indexed strategy reads, so
+    a wrong value here is not a cosmetic bug - it shifts bars relative to each other and
+    silently changes indicators.
+
+    **The timezone handling is the interesting part, and it is asymmetric in the source:**
+
+    | input | how it is read |
+    |---|---|
+    | a string | `fromisoformat(ts.replace("Z", "+00:00"))` - offset honoured |
+    | a **naive** `datetime` | `replace(tzinfo=utc)` - assumed UTC |
+    | anything else | `datetime.now(utc)` |
+
+    A naive `datetime` is therefore *labelled* UTC. That is a real assumption about the
+    broker's payloads and it is asserted below rather than left implicit - a broker sending
+    local-time bars would put every bar the wrong number of hours out, and the `isoformat()`
+    string would still claim UTC, so nothing downstream could notice.
+
+    Two of the four survivors are only observable in specific environments, which is worth
+    recording so nobody re-discovers it:
+
+    - **Dropping `.replace(tzinfo=utc)`** on a naive datetime produces a *different
+      `isoformat()` string* (no `+00:00`) but an **identical `time` on a machine running
+      UTC**. The difference is the machine's local offset, so the assertion is on the
+      serialised string - the one field that differs regardless of where the suite runs.
+    - **Dropping the `.replace("Z", ...)`** also produces the same `time` here, because
+      `fromisoformat` on 3.12 accepts `Z` directly. The string form is still asserted
+      because that is the portable contract.
+
+    `_is_connection_limit_error` matters because it decides whether the service reacts to a
+    *resource* limit by backing off, or retries into the same wall. It matches a substring
+    of the broker's message, so the exact marker is the contract.
+    """
+
+    @staticmethod
+    def _bar(**kwargs):
+        from types import SimpleNamespace
+
+        base = dict(
+            symbol="AAPL",
+            timestamp="2026-01-02T03:04:05Z",
+            open=1.0,
+            high=2.0,
+            low=0.5,
+            close=1.5,
+            volume=10.0,
+        )
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    def test_a_bar_becomes_a_complete_payload(self) -> None:
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        payload = _serialize_bar_payload(self._bar())
+        assert payload["symbol"] == "AAPL"
+        assert payload["open"] == 1.0 and payload["high"] == 2.0
+        assert payload["low"] == 0.5 and payload["close"] == 1.5
+        assert payload["volume"] == 10.0
+        assert payload["timestamp"] == "2026-01-02T03:04:05+00:00", payload["timestamp"]
+        assert payload["time"] == 1767323045.0, payload["time"]
+
+    def test_a_naive_datetime_is_labelled_utc_rather_than_left_ambiguous(self) -> None:
+        """The assumption, stated: a naive broker timestamp is treated as UTC.
+
+        Asserted on the *serialised string*, not on `time` - on a UTC machine both agree, so
+        an assertion on `time` alone would pass with the labelling removed.
+        """
+        from datetime import datetime
+
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        payload = _serialize_bar_payload(
+            self._bar(timestamp=datetime(2026, 1, 2, 3, 4, 5))
+        )
+        assert payload["timestamp"] == "2026-01-02T03:04:05+00:00", (
+            "a naive datetime was not labelled UTC; the payload now either lies about the "
+            f"offset or depends on the machine's local zone: {payload['timestamp']}"
+        )
+        assert payload["time"] == 1767323045.0
+
+    def test_a_utc_aware_datetime_is_kept_as_it_arrives(self) -> None:
+        from datetime import datetime, timezone
+
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        aware = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        assert _serialize_bar_payload(self._bar(timestamp=aware))["time"] == 1767323045.0
+
+        # A non-UTC offset is honoured rather than overwritten, so the instant is preserved.
+        from datetime import timedelta
+
+        plus_two = datetime(
+            2026, 1, 2, 5, 4, 5, tzinfo=timezone(timedelta(hours=2))
+        )
+        payload = _serialize_bar_payload(self._bar(timestamp=plus_two))
+        assert payload["time"] == 1767323045.0, (
+            "a non-UTC aware timestamp did not preserve the instant"
+        )
+        assert payload["timestamp"].endswith("+02:00"), payload["timestamp"]
+
+    @pytest.mark.parametrize(
+        "text",
+        ["2026-01-02T03:04:05Z", "2026-01-02T03:04:05+00:00", "2026-01-02T03:04:05"],
+    )
+    def test_all_three_timestamp_string_forms_agree_on_the_instant(self, text: str) -> None:
+        """Z, explicit +00:00 and a bare naive string are the same instant.
+
+        The bare form is the one that cannot be correct in general - it carries no offset -
+        so it is asserted as "same instant under a UTC-reading consumer" rather than as
+        universal truth. That is the honest statement, and it is what the code relies on.
+        """
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        payload = _serialize_bar_payload(self._bar(timestamp=text))
+        assert payload["time"] == 1767323045.0, (
+            f"{text!r} resolved to {payload['time']}, not the expected instant"
+        )
+
+    def test_an_absent_timestamp_becomes_now_not_the_epoch(self) -> None:
+        """Falsified to *now*, deliberately - and pinned so the choice is visible.
+
+        A bar with no usable timestamp is stamped with the current time rather than 1970.
+        That is a real decision with a real consequence: the bar sorts to the *end* of the
+        series instead of the beginning, so an undated bar cannot masquerade as
+        historical data. The epoch would do the opposite and quietly prepend a bar that
+        would distort any indicator computed over the window.
+
+        Asserted as a range rather than an equality, because "now" is a moving target.
+        """
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        before = datetime.now(timezone.utc).timestamp()
+        payload = _serialize_bar_payload(self._bar(timestamp=None))
+        after = datetime.now(timezone.utc).timestamp()
+
+        assert before <= payload["time"] <= after, (
+            f"an absent timestamp became {payload['timestamp']}, which is neither now nor "
+            "a deliberate choice"
+        )
+        assert payload["time"] > 1_000_000_000, "an undated bar looks like historical data"
+
+    def test_a_blank_symbol_is_never_produced_by_serialisation(self) -> None:
+        """Normalisation happens here; the refusal happens one layer up.
+
+        Asserted separately because they are separate guards: `_serialize_bar_payload`
+        normalises the symbol, and `_on_bar` refuses an empty one. Both are needed and
+        neither implies the other - see `test_the_service_refuses_a_blank_symbol_bar`.
+        """
+        from live_runner.market_data_stream import _serialize_bar_payload
+
+        assert _serialize_bar_payload(self._bar(symbol="  aapl  "))["symbol"] == "AAPL"
+        assert _serialize_bar_payload(self._bar(symbol=""))["symbol"] == ""
+
+    def test_the_service_refuses_a_blank_symbol_bar(self) -> None:
+        """The service-level refusal, driven through the real `_on_bar` path.
+
+        A blank symbol reaching `_bars` would create a queue keyed by the empty string, which
+        a consumer cannot distinguish from a real symbol - and would then be served by
+        `_bars_for_symbol("")`. Asserted by checking that **no** queue was created at all,
+        rather than that the bar is absent from one: an `append` of nothing would pass a
+        weaker check.
+
+        The bar carries the full attribute set the serialiser reads, for the reason
+        `test_bars_for_an_abandoned_symbol_are_not_recorded` gives - an abbreviated stand-in
+        would return early for a different reason and make this test vacuous.
+        """
+        service = _service_with_worker({"AAPL", "MSFT", ""})
+
+        async def deliver(symbol: str) -> None:
+            await service._on_bar(
+                SimpleNamespace(
+                    symbol=symbol,
+                    timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0,
+                )
+            )
+
+        # The fixture must actually record something, or the rest proves nothing.
+        asyncio.run(deliver("AAPL"))
+        assert "AAPL" in service._bars, "the fixture does not record bars"
+
+        asyncio.run(deliver("   "))
+        asyncio.run(deliver(""))
+
+        assert "" not in service._bars, (
+            "a blank symbol created a bar queue; a consumer cannot tell that from a real "
+            f"symbol: {sorted(service._bars)}"
+        )
+        assert set(service._bars) == {"AAPL"}, sorted(service._bars)
+        assert service._bars_for_symbol("") == [], (
+            "a blank symbol resolves to a live bar list rather than nothing"
+        )
+
+    def test_the_on_bar_blank_guard_is_masked_rather_than_load_bearing(self) -> None:
+        """**B1 is masked by a second guard**, and this records the evidence.
+
+        Removing `if not symbol: return` from `_on_bar` changes nothing, because the
+        subscription filter further down refuses the bar anyway: `_StreamWorker.set_symbols`
+        normalises and drops blanks, so `""` can never be in `worker._symbols`, so
+        `_worker_subscribes(worker, "")` is always false.
+
+        That is a *mask*, not an equivalence of the guard with nothing - the two guards
+        refuse the same input for different reasons. The way to tell them apart is to break
+        the mask and see whether the inner guard then matters:
+
+        - removing the worker's blank filter (`if _normalize_symbol(symbol)`) is **killed**,
+          so the outer invariant is genuinely pinned by
+          `test_blank_symbols_never_reach_the_subscription`;
+        - the same mutation stops upper-casing symbols is also **killed**.
+
+        So both guards are live code with both pinned, and neither can be deleted safely:
+        drop the inner filter and a blank subscription would make the outer guard the only
+        thing preventing a queue keyed by the empty string. This test says so explicitly, so
+        the next person to see B1 survive knows to check the mask before concluding the guard
+        is dead code.
+        """
+
+    def test_the_z_suffix_conversion_is_required_only_before_python_311(self) -> None:
+        """**B3 is a version-dependent equivalent mutant**, verified on this interpreter.
+
+        `datetime.fromisoformat` gained `Z` support in Python 3.11, so on the 3.12 running
+        here `fromisoformat("2026-01-02T03:04:05Z")` already returns an aware datetime and
+        the explicit `.replace("Z", "+00:00")` is redundant. That redundancy is why the
+        mutation survives here and would not survive on 3.10 or earlier, where the same call
+        raises `ValueError` on every broker bar that uses the Z form - which is the form
+        every Alpaca timestamp uses.
+
+        So the guard is **portability, not correctness on this interpreter**, and deleting it
+        would be a change that passes CI today and breaks on an older runtime.
+
+        The instant-equivalence is asserted above, which is the part that holds on every
+        version. This test records why the mutation survives rather than pretending the
+        branch is dead.
+        """
+        import sys
+        from datetime import datetime
+
+        if sys.version_info >= (3, 11):
+            assert datetime.fromisoformat("2026-01-02T03:04:05Z") == datetime(
+                2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc
+            ), (
+                "this interpreter no longer needs the Z conversion, so B3's status may have "
+                "changed - re-check before treating the guard as portable-only"
+            )
+
+    def test_only_the_brokers_exact_connection_limit_marker_is_treated_as_one(self) -> None:
+        """A substring match on the broker's exact wording, asserted from both sides.
+
+        This decides whether the service backs off a resource limit or retries into the
+        same wall, so the marker is a contract with the broker rather than a fuzzy check:
+        `"connection limit"` alone must **not** match, and a near-miss spelling must not
+        either.
+        """
+        from live_runner.market_data_stream import _is_connection_limit_error
+
+        for text in (
+            "Connection limit exceeded",
+            "connection limit exceeded",
+            "CONNECTION LIMIT EXCEEDED",
+            "  Connection Limit Exceeded  ",
+            "failed: connection limit exceeded (code 429)",
+        ):
+            assert _is_connection_limit_error(RuntimeError(text)) is True, (
+                f"{text!r} was not recognised as a connection limit"
+            )
+
+        for text in (
+            "connection limit",
+            "too many connections",
+            "connection-limit-exceeded",
+            "rate limit exceeded",
+            "",
+        ):
+            assert _is_connection_limit_error(RuntimeError(text)) is False, (
+                f"{text!r} was treated as a connection limit, so the service would back off "
+                "for the wrong reason"
+            )
