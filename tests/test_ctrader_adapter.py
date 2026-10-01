@@ -37,6 +37,265 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestFillRecordResolution:
+    """How a cTrader fill becomes a persisted `LiveExecution`, which had no unit tests.
+
+    Six mutations survive this family, and two of them are the same defect seen from
+    different sides: **`_build_dedupe_key`'s fallback cannot tell two distinct fills
+    apart**, so the second one is silently discarded as a duplicate.
+
+    Every one of these values lands in the fill record. That is the reason the
+    assertions are about the *record's* claims rather than about return values.
+
+    Note the asymmetry this suite pins deliberately: `_resolve_filled_volume` refuses a
+    non-positive volume and the caller refuses an unresolvable symbol, but
+    **`_resolve_execution_price` has no such refusal** - it returns `0.0` when nothing
+    resolves, and `LiveExecution` accepts `0.0` and even a negative price. The guard
+    exists for two of the three fields and not the third. That is documented below rather
+    than silently accepted, because it is a human decision whether a fill with no price
+    should be refused (it may be legitimate) or persisted as zero (it poisons PnL).
+    """
+
+    @staticmethod
+    def _adapter():
+        return CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+
+    def test_the_deal_price_wins_over_the_order_price(self) -> None:
+        """The deal is what actually executed; the order carries the submitted price."""
+        adapter = self._adapter()
+        deal = SimpleNamespace(executionPrice=50.0)
+        order = SimpleNamespace(executionPrice=99.0)
+        assert adapter._resolve_execution_price(order=order, deal=deal) == 50.0, (
+            "the order price was used for an execution price, so the fill is recorded at "
+            "the price we asked for rather than the price we got"
+        )
+
+    def test_a_deal_without_a_price_falls_back_to_the_order_price(self) -> None:
+        adapter = self._adapter()
+        deal = SimpleNamespace(executionPrice=0.0)
+        order = SimpleNamespace(executionPrice=99.0)
+        assert adapter._resolve_execution_price(order=order, deal=deal) == 99.0
+
+    def test_an_unresolvable_price_is_zero_and_that_is_accepted_downstream(self) -> None:
+        """Documents the gap, deliberately, with the consequence checked at both ends.
+
+        There is no positivity guard here, and `LiveExecution` does not add one - so a
+        fill whose price cannot be resolved is persisted as `actual_price = 0.0`. Any
+        PnL computed from it is meaningless. Asserted at both layers so that a future
+        guard shows up as a failure in *this* test, where the decision belongs, rather
+        than as a surprise in a PnL assertion somewhere else.
+        """
+        adapter = self._adapter()
+        resolved = adapter._resolve_execution_price(order=None, deal=None)
+        assert resolved == 0.0, "the resolver now refuses; update this test and the gap"
+
+        from datetime import datetime, timezone
+
+        from shared.models import LiveExecution
+
+        record = LiveExecution(
+            signal_id="00000000-0000-0000-0000-000000000001",
+            actual_price=resolved,
+            filled_qty=1.0,
+            commission=0.0,
+            timestamp=datetime.now(timezone.utc),
+            broker_order_id="1",
+            dedupe_key="k",
+        )
+        assert record.actual_price == 0.0, (
+            "LiveExecution now refuses a zero price, so the persistence gap is closed "
+            "downstream and this test should be revisited"
+        )
+
+    def test_a_negative_price_is_not_refused(self) -> None:
+        """The `if value:` check is truthiness, not positivity.
+
+        A negative price is truthy, so it is returned as an execution price. This is
+        pinned so the truthiness check cannot be mistaken for a positivity check.
+        """
+        adapter = self._adapter()
+        assert adapter._resolve_execution_price(
+            order=None, deal=SimpleNamespace(executionPrice=-1.5)
+        ) == -1.5
+
+    def test_the_deal_volume_wins_and_the_order_fallback_must_be_positive(self) -> None:
+        adapter = self._adapter()
+        deal = SimpleNamespace(filledVolume=500.0, volume=400.0)
+        assert adapter._resolve_filled_volume(order=None, deal=deal) == 500.0
+
+        # A deal carrying only `volume` still resolves.
+        assert adapter._resolve_filled_volume(
+            order=None, deal=SimpleNamespace(volume=400.0)
+        ) == 400.0
+
+        # And the order fallback is only accepted when positive - without that check a
+        # zero `executedVolume` would return and the caller's own guard would be the
+        # only thing standing between that and a zero-volume fill.
+        assert adapter._resolve_filled_volume(
+            order=SimpleNamespace(executedVolume=250.0), deal=None
+        ) == 250.0
+        assert adapter._resolve_filled_volume(
+            order=SimpleNamespace(executedVolume=0.0), deal=None
+        ) == 0.0
+        assert adapter._resolve_filled_volume(order=None, deal=None) == 0.0
+
+        # The case that actually separates the two guards. Zero returns 0.0 either way
+        # - an unguarded zero is indistinguishable from a guarded one - so dropping the
+        # positivity check is only observable on a *negative* executedVolume, which an
+        # unguarded version would return as the fill's volume.
+        assert adapter._resolve_filled_volume(
+            order=SimpleNamespace(executedVolume=-5.0), deal=None
+        ) == 0.0, (
+            "a negative executed volume was accepted as a fill volume, so a bad broker "
+            "payload becomes a negative position"
+        )
+
+    def test_the_timestamp_prefers_the_deal_then_the_order(self) -> None:
+        adapter = self._adapter()
+        assert adapter._resolve_execution_timestamp_ms(
+            order=SimpleNamespace(utcLastUpdateTimestamp=2000),
+            deal=SimpleNamespace(executionTimestamp=1000, utcLastUpdateTimestamp=9999),
+        ) == 1000
+        assert adapter._resolve_execution_timestamp_ms(
+            order=SimpleNamespace(utcLastUpdateTimestamp=2000), deal=None
+        ) == 2000
+        assert adapter._resolve_execution_timestamp_ms(order=None, deal=None) == 0
+
+    def test_an_unresolvable_broker_timestamp_is_recorded_as_the_current_time(self) -> None:
+        """The second falsification in this path, and the more consequential one.
+
+        A fill the broker sent without a usable timestamp is stored with
+        `datetime.now()`. So the record carries a **plausible, wrong** time rather than
+        an obviously missing one - and because `_build_dedupe_key` reads the same
+        resolved `timestamp_ms`, "0" reaches the key too (see the collision test below).
+
+        This is the same trade-off as the Alpaca "persisted vs skipped" report: a
+        falsified value is easy to miss later, whereas `0` would at least look wrong.
+        """
+        from datetime import datetime, timezone
+
+        from live_runner.ctrader_adapter import _to_datetime_from_ms
+
+        before = datetime.now(timezone.utc)
+        recorded = _to_datetime_from_ms(0)
+        after = datetime.now(timezone.utc)
+
+        assert before <= recorded <= after, (
+            "an unresolvable timestamp is no longer recorded as the current time; the "
+            "falsification this documents has been fixed and the test should be updated"
+        )
+        # None falsifies the same way. A fresh bound is taken here because this call
+        # happens *after* `after` was captured, so reusing `after` would be comparing
+        # against a moment in the past.
+        none_before = datetime.now(timezone.utc)
+        recorded_none = _to_datetime_from_ms(None)
+        assert none_before <= recorded_none <= datetime.now(timezone.utc)
+        assert _to_datetime_from_ms(1_700_000_000_000) == datetime.fromtimestamp(
+            1_700_000_000.0, tz=timezone.utc
+        )
+
+    def test_a_deal_id_yields_a_key_that_needs_no_fallback(self) -> None:
+        """The strong key: one deal is one fill, so the key is exact."""
+        adapter = self._adapter()
+        key = adapter._build_dedupe_key(
+            SimpleNamespace(dealId=987654),
+            order_id=123,
+            timestamp_ms=1000,
+            filled_volume=500.0,
+        )
+        assert key == "ctrader:deal:987654", (
+            f"the deal id is not used for the key, so the exact per-deal identity is lost: {key}"
+        )
+
+    def test_a_deal_id_of_zero_falls_back_instead_of_claiming_the_deal_namespace(self) -> None:
+        """`dealId = 0` means "no deal id", not "deal zero".
+
+        Claiming `ctrader:deal:0` for every such event would collapse *all* of them onto
+        one key, so the positive check has to run first.
+        """
+        adapter = self._adapter()
+        key = adapter._build_dedupe_key(
+            SimpleNamespace(dealId=0),
+            order_id=123,
+            timestamp_ms=1000,
+            filled_volume=500.0,
+        )
+        assert key != "ctrader:deal:0", (
+            "a zero deal id claimed the exact key namespace, so every such fill collides"
+        )
+        assert key == "ctrader:order:123:1000:500.0", key
+
+    def test_the_fallback_key_carries_every_component_that_separates_two_fills(self) -> None:
+        """Three components, so three ways for two fills to differ.
+
+        Without the volume, two equal-sized fills on one order in the same millisecond
+        collide. Without the order, fills on different orders collide. Each is asserted
+        by changing exactly one component.
+        """
+        adapter = self._adapter()
+        base = adapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=1000, filled_volume=500.0
+        )
+        assert base == "ctrader:order:123:1000:500.0", base
+        assert (
+            adapter._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=123, timestamp_ms=1000, filled_volume=500.0
+            )
+            == base
+        ), "the same fill must produce the same key, or every fill is stored twice"
+        for changed in (
+            adapter._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=124, timestamp_ms=1000, filled_volume=500.0
+            ),
+            adapter._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=123, timestamp_ms=2000, filled_volume=500.0
+            ),
+            adapter._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=123, timestamp_ms=1000, filled_volume=501.0
+            ),
+        ):
+            assert changed != base, (
+                f"a distinct fill produced the same key {base}, so it would be silently "
+                "discarded as a duplicate"
+            )
+
+    def test_two_fills_without_a_deal_id_or_a_timestamp_collide_KNOWN_DEFECT(self) -> None:
+        """**A real defect, documented rather than pinned as acceptable.**
+
+        The fallback key is `(order_id, timestamp_ms, filled_volume)`. When the broker
+        sends no deal id *and* no usable timestamp, `timestamp_ms` is 0 for every such
+        event - so two equal-sized fills on one order produce **identical keys**, and the
+        second is logged as "Skipped duplicate cTrader execution fill" and lost.
+
+        The consequence is the awkward one: the log says *duplicate* when the event was
+        a genuine second fill. The position ends up short and, unlike the price case,
+        there is no downstream guard - `filled_volume > 0` passes, the symbol resolves,
+        and the record is dropped purely on the key.
+
+        This test asserts the collision **on purpose**. It is written to fail loudly the
+        moment the defect is fixed, so the fix cannot land unnoticed with this comment
+        still claiming the collision is current. Until then it is a standing KNOWN
+        DEFECT, tracked for a human decision - refusing an event that cannot be
+        identified is a behaviour change on the live fill path.
+        """
+        adapter = self._adapter()
+        first = adapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=0, filled_volume=500.0
+        )
+        second = adapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=0, filled_volume=500.0
+        )
+        assert first == second == "ctrader:order:123:0:500.0", (
+            "the collision is gone, so this test is now wrong in the other direction: "
+            "remove the KNOWN DEFECT marker, un-rename the test, and keep the "
+            "distinctness assertions in the previous test"
+        )
+        # And this is reachable from the real caller, not just from a hand-made pair.
+        assert adapter._resolve_execution_timestamp_ms(
+            order=None, deal=SimpleNamespace(dealId=0)
+        ) == 0, "a deal with no timestamp no longer resolves to 0"
+
+
 class TestQuantityVolumeConversion:
     """The risk-engine quantity to broker volume conversion, which had no unit test.
 
