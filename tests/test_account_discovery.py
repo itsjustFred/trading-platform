@@ -1026,6 +1026,299 @@ class TestCtraderNameAndBalanceExtraction:
             _ctrader_extract_login(SimpleNamespace(traderLogin="²"))
 
 
+class TestCtraderApplicationAuthAndDetailMerge:
+    """Application authentication, and how account-list values merge with detail values.
+
+    Seven mutations survived. The detail merge is the interesting half, because it contains
+    **three precedence rules and two of them point the opposite way from the third** - with
+    nothing in the code saying why.
+
+    | field | when both sources have a value |
+    |---|---|
+    | `broker_name` | **first** wins (the account list) |
+    | `account_name_hint` | **first** wins (the account list) |
+    | `trader_login` | **last** wins (the detail payload) |
+
+    All three were measured, not read off the source, and all three are pinned together so the
+    asymmetry stays visible. A reader who assumes one rule for the whole function will get two
+    of the three wrong, and the login is the one that matters - it is the field the router
+    matches accounts by.
+
+    **The coherent reading, which is an inference rather than a documented intent:** the login
+    is an *identity* field and wants the most authoritative source, while the broker name and
+    display label are cosmetic and the earlier source suffices. That is a defensible design,
+    and the code is self-consistent with it - so this is recorded as a decision now on the
+    record rather than as a defect. If it was accidental, the fix is to make the third field
+    match the other two, and these tests are what would need updating.
+
+    `_authenticate_ctrader_application` is the first call on a fresh cTrader socket, so a
+    credential that never reaches the wire fails in the least diagnosable way: the broker
+    rejects an unauthenticated request and the error names nothing useful.
+    """
+
+    @staticmethod
+    def _ctx(*, broker: str = "", hint: str = "", login: str = "",
+             ignored: tuple[str, ...] = ()):
+        from live_runner.account_discovery import _CtraderAccountContext
+
+        return _CtraderAccountContext(
+            host="host",
+            sock=None,
+            access_token="token",
+            broker_name=broker,
+            account_name_hint=hint,
+            trader_login=login,
+            ignored_name_values=set(ignored),
+        )
+
+    @staticmethod
+    def _detail(**kwargs):
+        from types import SimpleNamespace
+
+        base = {}
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    # -------------------------------------------------- application auth
+
+    def test_the_application_credentials_reach_the_wire(self) -> None:
+        """Driven through the real function, decoding what was actually framed.
+
+        Stubs only the response side. Building the request by hand instead - the mistake the
+        account-list test already documents - would assert the fixture rather than the
+        production path, and this mutation is exactly the one that survives such a test.
+
+        Asserted by decoding the envelope off the captured socket bytes, so the claim is about
+        the wire rather than about a mutable message object.
+        """
+        account_discovery._load_ctrader_protocol()
+        import live_runner.account_discovery as ad
+
+        sent: list[bytes] = []
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                sent.append(data)
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        reply = ad._ProtoOAApplicationAuthRes()
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: reply
+        try:
+            ad._authenticate_ctrader_application(
+                _Sock(), app_id="the-client-id", app_secret="the-client-secret"
+            )
+        finally:
+            ad._ctrader_wait_response = original_wait
+
+        assert sent, "the auth request was never sent"
+        envelope = ad._ProtoMessage()
+        envelope.ParseFromString(sent[0][4:])
+        assert envelope.clientMsgId, "the auth request carried no client id"
+        request = ad._Protobuf.get(envelope.payloadType)
+        request.ParseFromString(envelope.payload)
+        assert request.clientId == "the-client-id", (
+            f"the client id that reached the wire was {request.clientId!r}"
+        )
+        assert request.clientSecret == "the-client-secret", (
+            f"the client secret that reached the wire was {request.clientSecret!r}; the broker "
+            "would reject the connection and name nothing useful"
+        )
+
+    def test_a_wrong_application_auth_response_is_refused(self) -> None:
+        """The auth reply must be the auth message, or the socket is unauthenticated.
+
+        Nothing downstream checks again, so accepting the wrong type here would let discovery
+        proceed on a connection the broker never authenticated - and the failure would surface
+        later as an empty account list rather than as an auth error.
+        """
+        account_discovery._load_ctrader_protocol()
+        import live_runner.account_discovery as ad
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                pass
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        wrong = ad._ProtoOATraderRes()
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: wrong
+        try:
+            ad._authenticate_ctrader_application(_Sock(), app_id="i", app_secret="s")
+        except RuntimeError as exc:
+            assert "Unexpected application auth response" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                f"a {type(wrong).__name__} was accepted as an application auth response; "
+                "discovery would continue on an unauthenticated socket"
+            )
+        finally:
+            ad._ctrader_wait_response = original_wait
+
+    def test_the_correct_application_auth_response_is_accepted(self) -> None:
+        """And the type check passes the right message through, so the guard is not vacuous."""
+        account_discovery._load_ctrader_protocol()
+        import live_runner.account_discovery as ad
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                pass
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        reply = ad._ProtoOAApplicationAuthRes()
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: reply
+        try:
+            # Returns None on success; the absence of an exception is the assertion.
+            assert (
+                ad._authenticate_ctrader_application(
+                    _Sock(), app_id="i", app_secret="s"
+                )
+                is None
+            )
+        finally:
+            ad._ctrader_wait_response = original_wait
+
+    # ------------------------------------------------------ the detail merge
+
+    def test_the_detail_payload_fills_fields_the_list_left_empty(self) -> None:
+        """The ordinary case: the list gave nothing, so detail supplies everything."""
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        ctx = self._ctx()
+        _apply_ctrader_account_detail(
+            ctx,
+            111,
+            self._detail(
+                brokerName="DetailBroker", accountName="DetailLabel", traderLogin="detaillogin"
+            ),
+        )
+        assert ctx.broker_name == "DetailBroker"
+        assert ctx.account_name_hint == "DetailLabel"
+        assert ctx.trader_login == "detaillogin"
+
+    def test_the_broker_name_and_label_keep_their_earlier_value(self) -> None:
+        """First-wins for the two cosmetic fields."""
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        ctx = self._ctx(broker="ListBroker", hint="ListLabel")
+        _apply_ctrader_account_detail(
+            ctx,
+            111,
+            self._detail(
+                brokerName="DetailBroker", accountName="DetailLabel", traderLogin="detaillogin"
+            ),
+        )
+        assert ctx.broker_name == "ListBroker", (
+            "the detail payload overrode the broker name from the account list"
+        )
+        assert ctx.account_name_hint == "ListLabel", (
+            "the detail payload overrode the account label from the account list"
+        )
+
+    def test_the_login_takes_the_later_value_which_is_the_opposite_rule(self) -> None:
+        """Last-wins for the identity field - the asymmetry this class exists to record.
+
+        Asserted on its own so that "first wins" cannot quietly become true for this field
+        either: the two rules are the finding, and either one changing should be a deliberate
+        edit that updates a named test.
+        """
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        ctx = self._ctx(login="listlogin")
+        _apply_ctrader_account_detail(
+            ctx, 111, self._detail(traderLogin="detaillogin")
+        )
+        assert ctx.trader_login == "detaillogin", (
+            "the detail login no longer overrides the list login; if that was deliberate the "
+            "asymmetry documented in this class needs updating"
+        )
+
+    def test_all_three_precedence_rules_together(self) -> None:
+        """The full matrix, so the asymmetry is visible in one place.
+
+        Splitting these across separate tests is how the shape of the merge becomes invisible:
+        each rule looks locally reasonable, and only the side-by-side shows that two are
+        first-wins and one is last-wins.
+        """
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        detail = self._detail(
+            brokerName="DetailBroker",
+            accountName="DetailLabel",
+            traderLogin="detaillogin",
+        )
+        ctx = self._ctx(broker="ListBroker", hint="ListLabel", login="listlogin", ignored=("111",))
+        _apply_ctrader_account_detail(ctx, 111, detail)
+
+        assert ctx.broker_name == "ListBroker"
+        assert ctx.account_name_hint == "ListLabel"
+        assert ctx.trader_login == "detaillogin", (
+            "the login should be the one field where the later source wins"
+        )
+
+    def test_a_blank_detail_login_changes_nothing_and_adds_nothing(self) -> None:
+        """A falsy login must not clear an existing one, nor join the ignored set.
+
+        Both halves matter: overwriting with `""` would leave an account that resolves to no
+        login at all, and adding `""` to the ignored set would make the empty label unusable as
+        a display name for every other field.
+        """
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        ctx = self._ctx(login="listlogin", ignored=("111",))
+        _apply_ctrader_account_detail(ctx, 111, self._detail(traderLogin="  "))
+        assert ctx.trader_login == "listlogin", "a blank detail login cleared the known one"
+        assert "" not in ctx.ignored_name_values, (
+            "the empty string was added to the ignored labels"
+        )
+
+    def test_the_detail_login_joins_the_ignored_labels(self) -> None:
+        """So the account cannot then be *named* after the login it is distinguished by.
+
+        That is the whole purpose of the ignored set: without it, an account whose display
+        label happens to equal its own login would be labelled with its own identifier.
+        """
+        from live_runner.account_discovery import _apply_ctrader_account_detail
+
+        ctx = self._ctx(ignored=("111",))
+        _apply_ctrader_account_detail(ctx, 111, self._detail(traderLogin="detaillogin"))
+        assert "detaillogin" in ctx.ignored_name_values, (
+            f"the login was not added to the ignored labels: {sorted(ctx.ignored_name_values)}"
+        )
+
+    def test_an_earlier_ignored_login_stays_ignored_after_the_login_changes(self) -> None:
+        """The list's login remains in the ignored set even though the login is replaced.
+
+        Follows from how the two are populated: `_ctrader_account_context` adds the list login
+        when it builds the context, and the detail merge *adds* to the same set rather than
+        replacing it. Asserted because the alternative - rebuilding the set from the current
+        login only - would un-ignore the earlier value and let an account be named after it.
+        """
+        from live_runner.account_discovery import (
+            _apply_ctrader_account_detail,
+            _ctrader_account_context,
+        )
+
+        item = SimpleNamespace(
+            ctidTraderAccountId=111, traderLogin="listlogin", brokerName="ListBroker"
+        )
+        ctx = _ctrader_account_context("host", None, "token", 111, item)
+        assert "listlogin" in ctx.ignored_name_values
+
+        _apply_ctrader_account_detail(ctx, 111, self._detail(traderLogin="detaillogin"))
+        assert ctx.trader_login == "detaillogin"
+        assert {"111", "listlogin", "detaillogin"} <= ctx.ignored_name_values, (
+            f"an earlier ignored login was dropped: {sorted(ctx.ignored_name_values)}"
+        )
+
+
 class TestCtraderWireProtocol:
     """The length-prefixed frame layer. All eight mutations here survived.
 
