@@ -75,6 +75,53 @@ behaviour and the assertion names the field. No cascading failures were observed
 which indicates the risk-model coercions have focused tests rather than only being
 exercised incidentally through large integration tests.
 
+## The harness was itself wrong once, so it was replaced
+
+Worth its own section, because it is the finding that matters most in this
+report.
+
+This report claims two mutations survived. **One of them did not.** An independent
+reviewer found that deleting the `_optional_finite_positive` `None` guard makes
+**177 tests fail** without `tests/test_risk_models.py`, including pre-existing ones in
+`tests/live_runner/` and `tests/validation/test_risk_sizing.py`. Re-running the mutation
+against *the exact selection used here* fails too — 36 failures, exit 1.
+
+So this report's claim that it "survived the whole suite" was wrong. It survived a
+*scoped selection*, and the scope was chosen after the fact rather than derived.
+
+The worse half: when the same harness was replayed with the same arguments it then
+reported **KILLED**. The mutation had applied and the suite really did fail, yet an
+earlier invocation of that harness printed "no test failed". That is a harness that
+can emit an unverified verdict, and it is the same failure as everything else this
+session has been about — a clean answer from a run that was not clean.
+
+The `_parse_bool` survivor is real and unaffected: exactly two failures, both from the
+new tests.
+
+### `mutate.sh`
+
+Rather than trust the ad-hoc harness to keep being careful, the paths by which it can
+lie are now closed:
+
+| exit | meaning |
+|---|---|
+| 0 | applied, suite ran, verdict printed, matched `--expect` |
+| 2 | mutation text not uniquely present — **nothing was mutated**, never "survived" |
+| 3 | applied but the file did not change — aborted |
+| 4 | **the suite did not run** — usage error, missing path, or nothing collected. No verdict. |
+| 5 | verdict disagreed with `--expect` |
+| 6 | revert failed — working tree dirty |
+
+Exit 2 and exit 4 are the two that matter. A mutation that silently failed to apply,
+and a suite that never collected anything, both look like a verdict to a reader — and
+the *first version of this script made exactly the exit-4 mistake*, calling pytest's
+usage-error exit 4 a "KILLED". That was caught by its own self-test, which is the
+argument for writing the self-test at all.
+
+Self-tested on five paths: real kill, real kill with a case-insensitive `--expect`,
+nonexistent suite path (infra), absent mutation text (apply-failed), and a
+deliberately wrong expectation (mismatch).
+
 ## Method notes
 
 - The first attempt at this pass used a bash array with `:` as a delimiter while
