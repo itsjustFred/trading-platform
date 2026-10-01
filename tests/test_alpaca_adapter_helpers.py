@@ -46,6 +46,169 @@ NIL_ORDER_ID = "00000000-0000-0000-0000-000000000000"
 # --------------------------------------------------------------------------
 
 
+class TestTradeUpdateEventParsing:
+    """`_parse_trade_update_event` gates every fill the adapter records, and had no test.
+
+    Six mutations survive the suite, which is unusual - this function was simply never
+    exercised directly. It is the front door of `_on_trade_update`, and its four refusals
+    are the difference between recording a fill and recording a wrong one.
+
+    Why each refusal matters, given that `_on_trade_update` catches every exception and
+    logs a warning:
+
+    - **a non-fill event** (`canceled`, `expired`, `new`) is not a fill. Processing one
+      as a partial fill writes a fill record with a quantity that was never filled.
+    - **no order payload** and **a missing `client_order_id`** are **equivalent mutants**,
+      verified by direct probe rather than assumed. With `order is None`,
+      `getattr(order, "client_order_id", "")` yields `""`, so the *next* guard refuses
+      regardless; and with an empty id the UUID parse refuses regardless. Both are
+      documented here rather than given separate tests, because neither branch can be
+      reached in isolation - and a test asserting an unreachable branch asserts nothing.
+      What the tests below pin instead is the behaviour they jointly produce.
+    - **a missing `client_order_id`** - that id is the signal UUID. Without it there is
+      no way to attribute the fill to a signal.
+    - **a `client_order_id` that is not a UUID** - the same, and worse: `UUID(str(...))`
+      is the only thing standing between a broker string and `signal_id` on the
+      persistence call at line 1353.
+
+    That last is why the `except ValueError` is asserted specifically rather than "an
+    exception is caught": narrowing it to `TypeError` means `UUID("not-a-uuid")` escapes
+    the handler - and the handler's own broad `except` then logs "Failed to process trade
+    update" and returns, so the fill is still not recorded, but as an *internal error*
+    rather than as the malformed broker input it is.
+    """
+
+    def _adapter(self):
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        return AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+
+    @staticmethod
+    def _event(name, *, order=..., client_order_id="..."):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(event=name, order=order, client_order_id=client_order_id)
+
+    def _order(self, client_order_id):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id="b-1", client_order_id=client_order_id)
+
+    def test_a_real_fill_is_accepted_and_yields_its_signal_uuid(self):
+        from uuid import uuid4
+
+        signal_uuid = uuid4()
+        parsed = self._adapter()._parse_trade_update_event(
+            self._event("fill", order=self._order(str(signal_uuid)))
+        )
+        assert parsed is not None
+        event, order, client_order_id, parsed_uuid = parsed
+        assert event == "fill"
+        assert parsed_uuid == signal_uuid
+        assert client_order_id == str(signal_uuid)
+        assert order.id == "b-1"
+
+    def test_partial_fill_is_accepted(self):
+        from uuid import uuid4
+
+        parsed = self._adapter()._parse_trade_update_event(
+            self._event("partial_fill", order=self._order(str(uuid4())))
+        )
+        assert parsed is not None
+        assert parsed[0] == "partial_fill"
+
+    @pytest.mark.parametrize(
+        "event", ["canceled", "expired", "new", "accepted", "rejected", ""]
+    )
+    def test_a_non_fill_event_is_refused(self, event: str) -> None:
+        """`canceled` and `expired` are the dangerous ones: they look like fills.
+
+        Processing an `expired` order as a partial fill records a quantity that was
+        never filled, which then feeds realised-PnL and position reconciliation.
+        """
+        from uuid import uuid4
+
+        parsed = self._adapter()._parse_trade_update_event(
+            self._event(event, order=self._order(str(uuid4())))
+        )
+        assert parsed is None, f"a {event!r} event was treated as a fill"
+
+    def test_the_event_name_is_matched_case_insensitively(self):
+        from uuid import uuid4
+
+        for spelling in ("fill", "FILL", "Fill", "PARTIAL_FILL", "partial_fill"):
+            parsed = self._adapter()._parse_trade_update_event(
+                self._event(spelling, order=self._order(str(uuid4())))
+            )
+            assert parsed is not None, f"{spelling!r} was not recognised as a fill"
+            assert parsed[0] == spelling.lower()
+
+    def test_a_fill_with_no_order_payload_is_refused(self) -> None:
+        """Both refusals at once, so neither guard is masked by the other.
+
+        This started as a single test passing `order=None` *and* a truthy
+        `client_order_id`, which cannot kill either mutation independently: with
+        `order is None` removed the next guard would refuse it anyway, and with
+        `client_order_id` removed the *first* guard would. Both mutants survived.
+
+        The shape that separates them is a payload that is otherwise complete and fails
+        **exactly one** thing - so only one guard can be the reason for the refusal.
+
+        Written after two attempts survived: the first passed `order=None` *and* a truthy
+        `client_order_id`, and the second assumed that separating the payloads would
+        kill both mutations. **It does not** - the two guards are interdependent, so each
+        still refuses the other's payload. Probing the mutants directly is what established
+        that, and it is the reason they are recorded as equivalent rather than written
+        around.
+        """
+        from uuid import uuid4
+
+        adapter = self._adapter()
+
+        # Only the order payload is missing; the client_order_id is a valid UUID.
+        parsed = adapter._parse_trade_update_event(
+            self._event("fill", order=None, client_order_id=str(uuid4()))
+        )
+        assert parsed is None, (
+            "a fill with no order payload was processed; the client_order_id was valid, "
+            "so only the payload guard could have refused it"
+        )
+
+        # Only the client_order_id is missing; the order payload is otherwise complete.
+        parsed = adapter._parse_trade_update_event(
+            self._event("fill", order=self._order(""), client_order_id="")
+        )
+        assert parsed is None, (
+            "a fill with no client_order_id was processed; the order payload was "
+            "present, so only the id guard could have refused it"
+        )
+
+    @pytest.mark.parametrize("client_order_id", ["", None, "   "])
+    def test_a_missing_client_order_id_is_refused(self, client_order_id) -> None:
+        parsed = self._adapter()._parse_trade_update_event(
+            self._event("fill", order=self._order(client_order_id))
+        )
+        assert parsed is None, (
+            f"client_order_id={client_order_id!r} was accepted; that id is the signal "
+            "UUID, so a fill would be unattributable"
+        )
+
+    @pytest.mark.parametrize(
+        "client_order_id",
+        ["not-a-uuid", "123", "", "  ", "{not-a-uuid}", "550e8400-e29b-not-a-uuid"],
+    )
+    def test_a_client_order_id_that_is_not_a_uuid_is_refused(
+        self, client_order_id: str
+    ) -> None:
+        parsed = self._adapter()._parse_trade_update_event(
+            self._event("fill", order=self._order(client_order_id))
+        )
+        assert parsed is None, (
+            f"{client_order_id!r} was accepted as a signal UUID; `UUID(str(...))` is the "
+            "only thing between a broker string and `signal_id` on the persistence call"
+        )
+
+
 def test_a_real_broker_order_id_is_normalised() -> None:
     """The positive case, so the nil guard cannot be satisfied by refusing everything."""
     assert _normalize_broker_order_id(REAL_ORDER_ID) == REAL_ORDER_ID
