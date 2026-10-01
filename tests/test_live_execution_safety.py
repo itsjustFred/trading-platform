@@ -2296,6 +2296,78 @@ def test_expired_submission_claim_is_reaped_but_never_hidden(isolated_db):
     assert reaped[0].expired is False
 
 
+def test_a_lease_is_reaped_at_the_exact_ttl_instant_not_after_it(isolated_db, monkeypatch):
+    """The reaping predicate is `<=`, not `<`: a lease dies *at* its TTL, not after.
+
+    The existing reaping test sleeps 50 ms past a 10 ms TTL, so it cannot tell
+    `expires_at <= now` from `expires_at < now`. That distinction is the whole
+    anti-wedge guarantee at its boundary: with `<`, a lease whose TTL expires in
+    the same instant the next claim arrives is not reaped, the INSERT hits
+    UNIQUE(deployment_id), and the claim is refused - wedging the deployment for a
+    claimor that died at the exact moment its lease lapsed, which is precisely the
+    case the TTL exists to recover from.
+
+    The clock is frozen so the lease is due at *exactly* the instant the claim
+    reads. Rewinding the stored expiry instead only makes it strictly earlier,
+    which both predicates accept, so the mutant survives; equality is the only
+    input that separates `<=` from `<`.
+    """
+    database = isolated_db
+    deployment = _deployment()
+    _verified_demo_account(database, "acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+
+    deployment_id = str(deployment.id)
+    frozen_now = datetime(2026, 9, 30, 12, 0, 0)
+    monkeypatch.setattr(database, "_utcnow_naive", lambda: frozen_now)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "due-now", ttl_seconds=30.0
+    ) is True
+
+    # Move the expiry onto the very instant the next claim will read as "now",
+    # which is what a lease expiring between two dispatch ticks looks like.
+    with database.get_session() as session:
+        row = session.get(database.LiveDeploymentSubmissionClaimModel, "due-now")
+        assert row is not None
+        row.expires_at = frozen_now
+        session.commit()
+
+    assert database.claim_live_deployment_submission(
+        deployment_id, "after-exact-ttl", ttl_seconds=30.0
+    ) is True, "a lease due at exactly `now` was not reaped, so the claim was refused"
+    reaped = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in reaped] == ["after-exact-ttl"]
+
+
+def test_a_blank_claim_token_is_refused(isolated_db):
+    """An empty or whitespace-only token must not take the lease.
+
+    `claim_live_deployment_submission` normalises both arguments and refuses
+    blank ones. Dropping that guard lets a blank token insert a real lease row,
+    and that row is then unreleasable: `release_live_deployment_submission`
+    applies the same normalisation and refuses a blank token too, so the caller
+    can never give the lease back. The deployment is wedged for the whole TTL.
+
+    The guard is what keeps a caller bug (an unset token) a visible refusal
+    instead of a silent 30-second outage.
+    """
+    database = isolated_db
+    deployment = _deployment()
+    _verified_demo_account(database, "acc-1", "ctrader")
+    database.create_live_deployment(deployment)
+
+    deployment_id = str(deployment.id)
+
+    assert database.claim_live_deployment_submission(deployment_id, "") is False
+    assert database.claim_live_deployment_submission(deployment_id, "   ") is False
+    assert database.claim_live_deployment_submission("", "tok") is False
+    assert database.claim_live_deployment_submission("   ", "tok") is False
+
+    # No lease was taken, and the deployment is still claimable by a real token.
+    assert database.list_live_deployment_submission_claims(deployment_id) == []
+    assert database.claim_live_deployment_submission(deployment_id, "real-token") is True
+
+
 def test_ctrader_reconciliation_candidates_include_partially_executed_signal(isolated_db):
     database = isolated_db
     deployment = _deployment()
