@@ -153,7 +153,6 @@ def test_a_lost_refresh_race_stops_the_spare_worker() -> None:
     The race is forced by making `start()` install the worker itself, which is the
     ordering that loses.
     """
-    import asyncio
 
     from live_runner import market_data_stream as mds
     from shared.models import LiveAccountConfig, LiveDeploymentConfig
