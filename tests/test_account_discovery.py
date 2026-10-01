@@ -1607,8 +1607,6 @@ class TestCtraderAccountIdentityAndListRequest:
         count that comes out is the number of accounts discovery believes exist.
         """
         account_discovery._load_ctrader_protocol()
-        from live_runner.account_discovery import _request_ctrader_account_list
-
         # `_request_ctrader_account_list` sends, waits, then type-checks. Stubbing only the
         # two ends keeps the type check itself under test.
         sent: list[bytes] = []
@@ -1621,26 +1619,21 @@ class TestCtraderAccountIdentityAndListRequest:
                 pass
 
         wrong = account_discovery._ProtoOATraderRes()
-        monkey = original_wait = None
-        try:
-            import live_runner.account_discovery as ad
+        import live_runner.account_discovery as ad
 
-            original_wait = ad._ctrader_wait_response
-            ad._ctrader_wait_response = lambda *a, **k: wrong
-            try:
-                ad._request_ctrader_account_list(
-                    _Sock(), access_token="secret-token"
-                )
-            except RuntimeError as exc:
-                assert "Unexpected account list response" in str(exc), str(exc)
-            else:
-                raise AssertionError(
-                    f"a {type(wrong).__name__} was accepted as an account list; iterating "
-                    "it would report a wrong account count"
-                )
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: wrong
+        try:
+            ad._request_ctrader_account_list(_Sock(), access_token="secret-token")
+        except RuntimeError as exc:
+            assert "Unexpected account list response" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                f"a {type(wrong).__name__} was accepted as an account list; iterating "
+                "it would report a wrong account count"
+            )
         finally:
-            if original_wait is not None:
-                ad._ctrader_wait_response = original_wait
+            ad._ctrader_wait_response = original_wait
         assert sent, "the request was never sent"
 
     def test_the_correct_response_type_is_returned(self) -> None:
