@@ -6246,6 +6246,124 @@ def test_a_dead_claimor_does_not_wedge_a_deployment(isolated_db):
 # ─── What an operator is told when a PAUSE cannot reach a clean stop ──────────
 
 
+def test_pause_hands_the_drain_the_leases_it_inventoried_before_the_write(
+    isolated_db, viewer_client, monkeypatch
+):
+    """The pre-write inventory is what closes the reaped-before-first-poll window.
+
+    `claim_live_deployment_submission` reaps expired leases, and the drain's own
+    poll loop cannot see a lease that was already reaped - a lease taken while the
+    deployment was ACTIVE, expired in the window between the status commit and the
+    drain's first poll, and was deleted by a later claim attempt. The drain would
+    then see an empty ledger and report `DRAINED`: a clean stop for a submission
+    nobody observed, which is exactly the false "nothing was in flight" this
+    mechanism exists to prevent.
+
+    `initial_claims` seeds the ledger from the inventory taken *before* the write.
+    Dropping that inventory left all 774 collected tests green, because the
+    existing pause test replaces the drain with a wrapper that accepts and
+    discards `initial_claims` - so the seed was never observed by anything.
+
+    The wrapper here records what it was handed instead.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-inventoried", ttl_seconds=30.0
+    ) is True
+
+    seen: list[object] = []
+
+    async def _capturing_drain(target_deployment_id, *, initial_claims=None, **_kwargs):
+        seen.append(initial_claims)
+        return viewer_app_module.LiveSubmissionDrainResult(
+            outcome=viewer_app_module.LiveSubmissionDrainOutcome.IN_FLIGHT,
+            in_flight=1,
+            expired_unreleased=0,
+        )
+
+    monkeypatch.setattr(
+        viewer_app_module, "_drain_live_deployment_submissions", _capturing_drain
+    )
+
+    resp = viewer_client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "PAUSED",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert seen, "the drain was never called, so this test proves nothing"
+    inventoried = [claim.token for claim in (seen[0] or ())]
+    assert inventoried == ["tok-inventoried"], (
+        "the drain was not seeded with the leases held before the pause commit, so a "
+        f"lease reaped before the first poll would be invisible: {inventoried}"
+    )
+
+
+def test_a_lease_reaped_before_the_first_poll_is_reported_indeterminate(
+    isolated_db,
+):
+    """The seed's purpose, asserted on the drain itself: vanished + expired = doubt.
+
+    The lease was present at the snapshot and gone by the first poll, so the drain
+    cannot tell the reaper from a late release. It reports `INDETERMINATE` rather
+    than `DRAINED`, because a row disappearing proves nothing - and under-reporting
+    doubt is the one thing this verdict must never do.
+    """
+    import viewer.main as viewer_app_module
+
+    database = isolated_db
+    _verified_demo_account(database, "acc-1", "ctrader")
+    created = database.create_live_deployment(_deployment())
+    deployment_id = str(created.id)
+
+    # The reaper only deletes leases whose TTL has already lapsed, so the window is
+    # an *already-expired* lease: expired while ACTIVE, then deleted by a later claim
+    # attempt between the status commit and the drain's first poll.
+    assert database.claim_live_deployment_submission(
+        deployment_id, "tok-vanished", ttl_seconds=0.01
+    ) is True
+    time.sleep(0.05)
+
+    seed = database.list_live_deployment_submission_claims(deployment_id)
+    assert [claim.token for claim in seed] == ["tok-vanished"]
+    assert seed[0].expired is True
+
+    # The reaper runs and removes it before the drain ever polls.
+    with database.get_session() as session:
+        session.exec(
+            database.delete(database.LiveDeploymentSubmissionClaimModel).where(
+                database.LiveDeploymentSubmissionClaimModel.token == "tok-vanished"
+            )
+        )
+        session.commit()
+    assert database.list_live_deployment_submission_claims(deployment_id) == []
+
+    # With the seed, the ledger still knows an expired lease existed here.
+    result = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.2, initial_claims=seed
+        )
+    )
+    assert result.outcome is viewer_app_module.LiveSubmissionDrainOutcome.INDETERMINATE
+    assert result.expired_unreleased == 1
+
+    # Without the seed, the drain sees an empty deployment and reports a clean stop.
+    unseeded = asyncio.run(
+        viewer_app_module._drain_live_deployment_submissions(
+            deployment_id, timeout_seconds=0.2
+        )
+    )
+    assert unseeded.outcome is viewer_app_module.LiveSubmissionDrainOutcome.DRAINED
+
+
 def test_pause_with_an_in_flight_submission_is_applied_and_reported_as_applied(
     isolated_db, viewer_client, monkeypatch
 ):
