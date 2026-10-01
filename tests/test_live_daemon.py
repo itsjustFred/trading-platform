@@ -2619,6 +2619,92 @@ class TestStoppedDiscordServiceStatus:
 
         assert updates == []
 
+    def test_a_paused_service_is_never_relabelled_stopped(self, monkeypatch) -> None:
+        """The caller's `paused` flag, which the row check does not cover.
+
+        `_record_discord_service_stopped` implements *"a PAUSED service stays
+        PAUSED: that is operator intent and must survive"* in **two independent
+        places**: the caller's `paused` flag at line 2518, and the `RUNNING` row
+        check at line 2537. The row check is pinned - a FAILED service must stay
+        FAILED, per the test above - but the flag was not, and dropping
+        `if paused: return` left all 584 collected tests green.
+
+        The two are not redundant. The flag is the caller's snapshot of intent; the
+        row is what the database says now. They disagree whenever the snapshot is
+        taken before a pause lands, and the flag is the one that carries the
+        operator's decision.
+
+        Deliberately constructed so the row says RUNNING while the flag says
+        paused, because that is the only state in which the two guards disagree and
+        therefore the only one in which dropping the flag changes anything.
+        """
+        updates: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(
+            daemon,
+            "update_service_status",
+            lambda service_id, status, **_kw: updates.append((service_id, status)),
+        )
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.RUNNING,
+                )
+            ],
+        )
+
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+                paused=True,
+            )
+        )
+
+        assert updates == [], (
+            "a service the caller reported as PAUSED was written STOPPED; operator "
+            f"intent was overwritten: {updates}"
+        )
+
+    def test_the_paused_flag_still_lets_a_running_service_be_recorded_stopped(
+        self, monkeypatch
+    ) -> None:
+        """The converse, so the guard cannot be satisfied by never writing STOPPED."""
+        updates: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(
+            daemon,
+            "update_service_status",
+            lambda service_id, status, **_kw: updates.append((service_id, status)),
+        )
+        monkeypatch.setattr(
+            daemon,
+            "list_services",
+            lambda **_kwargs: [
+                SimpleNamespace(
+                    id="service-1",
+                    name="TEST_BOT",
+                    status=daemon.ServiceStatus.RUNNING,
+                )
+            ],
+        )
+
+        asyncio.run(
+            daemon._stop_discord_bot_service(
+                "service-1",
+                active_discord_bots={},
+                active_discord_bot_tasks={},
+                paused=False,
+            )
+        )
+
+        assert updates == [("service-1", daemon.ServiceStatus.STOPPED)]
+
     def test_stopping_a_running_service_records_stopped(self, monkeypatch) -> None:
         updates: list[tuple[str, object]] = []
 
