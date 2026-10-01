@@ -137,6 +137,59 @@ class TestTradeExit:
         assert e2.reason == e.reason
         assert e2.fees == e.fees
 
+    def test_per_exit_pnl_survives_the_roundtrip(self):
+        """A partial exit's own `pnl` must serialise.
+
+        `reason` and `fees` are pinned by `test_roundtrip`, but `pnl` is not - that
+        fixture omits it. Dropping the `pnl` branch from `to_dict` leaves every test
+        green.
+
+        Why it matters: `Trade.pnl` is the *gross* total and `TradeExit.pnl` is the
+        per-leg figure. The per-leg number is what a partial exit is reconciled
+        against, so losing it on serialisation means a stored backtest's legs no longer
+        sum to the trade - a mismatch that surfaces much later as an unexplained
+        discrepancy rather than as a missing key.
+
+        Asserted both ways, so the guard cannot be satisfied by always writing the key:
+        present serialises and round-trips, absent stays absent.
+        """
+        with_pnl = TradeExit(
+            time="2021-03-18T15:45:00Z",
+            price=124.80,
+            quantity=40,
+            pnl=120.00,
+        )
+        d = with_pnl.to_dict()
+        assert d.get("pnl") == 120.00, (
+            "a per-exit pnl was dropped on serialisation: " + repr(d)
+        )
+        restored = TradeExit.from_dict(d)
+        assert restored.pnl == 120.00
+        assert restored.quantity == 40
+
+        without = TradeExit(time="2021-01-01T00:00:00Z", price=100.0, quantity=10)
+        assert "pnl" not in without.to_dict(), (
+            "an unset pnl was written as a key anyway: " + repr(without.to_dict())
+        )
+
+        # And through the parent, so the legs of a partial exit are preserved together.
+        partial = Trade(
+            id=3, symbol="AAPL", direction="LONG",
+            entry_time="2021-03-18T00:00:00Z", entry_price=120.0,
+            quantity=80,
+            exits=[
+                TradeExit(time="2021-03-18T15:45:00Z", price=124.80, quantity=40, pnl=192.0,
+                          reason="tp1"),
+                TradeExit(time="2021-03-19T10:00:00Z", price=126.00, quantity=40, pnl=240.0,
+                          reason="tp2"),
+            ],
+            pnl=432.0,
+        )
+        payload = partial.to_dict()
+        assert [e["pnl"] for e in payload["exits"]] == [192.0, 240.0], (
+            "per-exit pnl was lost through the parent trade: " + repr(payload["exits"])
+        )
+
     def test_minimal(self):
         e = TradeExit(time="2021-01-01T00:00:00Z", price=100.0, quantity=10)
         d = e.to_dict()
