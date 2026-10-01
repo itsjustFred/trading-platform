@@ -78,7 +78,11 @@ path.write_text(source.replace(old, new, 1), encoding="utf-8")
 after = path.read_text(encoding="utf-8")
 if new and new not in after:
     raise SystemExit("APPLY-FAILED: new text absent after write")
-if old and old != new and old in after:
+# Only meaningful when the replacement does not itself contain the original.
+# Appending to a line (`x = f(a)` -> `x = f(a) or g()`) makes `new` a superstring
+# of `old`, so "old still present" would be trivially true and would refuse a
+# mutation that applied correctly. Found by its own guard on D6.
+if old and old != new and old not in new and old in after:
     raise SystemExit("APPLY-FAILED: old text still present after write")
 PYEOF
 

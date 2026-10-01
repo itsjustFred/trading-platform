@@ -122,6 +122,44 @@ Self-tested on five paths: real kill, real kill with a case-insensitive `--expec
 nonexistent suite path (infra), absent mutation text (apply-failed), and a
 deliberately wrong expectation (mismatch).
 
+## Every verdict in this report re-verified through `mutate.sh`
+
+The table above was produced by the ad-hoc harness, and that harness was later shown to be able
+to print a verdict it had not verified. So all 14 were re-run through the replacement, which
+refuses to report a verdict it cannot prove.
+
+| # | earlier | re-verified | note |
+|---|---|---|---|
+| M1 | Killed | **Killed** (2 failures) | agrees |
+| M2 | Killed | **Killed** (1) | agrees |
+| M3 | Killed | **Killed** (3) | agrees |
+| M4 | Killed | **Killed** (5) | agrees |
+| M5 | Killed | **Killed** (7) | agrees |
+| **M6** | **Survived** | **Killed (41 failures)** | **the earlier verdict was false** |
+| M7 | Survived | Killed (2) | the survivor status was **true at the time**; the new tests now kill it |
+| M8 | Killed | **Killed** (7) | agrees (M5 and M8 are the same mutation, listed twice) |
+| D1–D6 | Killed | **Killed** (1–2 each) | all agree |
+
+**The M6/M7 split is the substantive result.** Both were reported as survivors. Only one was:
+`_parse_bool`'s integer branch genuinely had no coverage, and `tests/test_risk_models.py` now
+kills it. The `_optional_finite_positive` guard was already covered by 41 failures once the new
+file was in the suite — the "survivor" was the harness, not the test suite.
+
+## The replacement harness found a bug in itself, twice
+
+Both worth recording, because each was caught by a check rather than by care:
+
+1. It called pytest's **usage-error exit (4) a "KILLED"** — a suite that never collected anything
+   reported as a mutation caught. Now exit 4 is INFRA with no verdict.
+2. On **D6** it refused a mutation that had applied correctly, because the replacement was a
+   *superstring* of the original (`x = f(a)` → `x = f(a) or g()`), so "old text still present"
+   was trivially true. The guard now skips that case and asserts absence only when the
+   replacement does not contain the original.
+
+The second is the more interesting one: the guard was correct in principle and wrong in a case
+that the previous, unchecked harness had silently allowed. The two bugs are opposite — one too
+permissive, one too strict — and both were found by running the thing rather than by reading it.
+
 ## Method notes
 
 - The first attempt at this pass used a bash array with `:` as a delimiter while
