@@ -1383,6 +1383,162 @@ def test_download_registry_coalesces_concurrent_identical_requests(viewer_client
     assert len(viewer_app_module.legacy_viewer.DATA_TASKS) == 1
 
 
+
+class TestSingleflightOwnershipSecrets:
+    """The singleflight ownership tokens must be unpredictable, and nothing checked that.
+
+    Singleflight is an ownership lock: it stops two callers racing the same download
+    request from both executing it. The lock is identified by two secrets -
+    `SINGLEFLIGHT_BOOT_ID` (which process) and `_new_singleflight_owner_token()`
+    (which holder) - and both were unconstrained.
+
+    Three mutations survive the whole suite:
+
+    - the owner token drawn from `random.choice` instead of `secrets`
+    - `SINGLEFLIGHT_BOOT_ID` hardcoded to the constant `"boot"`
+    - the token shortened to `token_urlsafe(4)`
+
+    None is caught by the existing singleflight test, because it *reads*
+    `core.SINGLEFLIGHT_BOOT_ID` and writes it into its fixture. A test that copies the
+    value it is meant to be checking cannot fail when the value stops being a secret -
+    which is the same single-implementation trap as last pass, in a new costume.
+
+    Asserted as properties rather than as a literal:
+
+    - **entropy**: long, high-alphabet, and different on every call
+    - **unpredictability**: two tokens minted back to back must not share a prefix,
+      which a seeded or truncated generator would
+    - **the boot id is per-process**, i.e. not a fixed string
+
+    Entropy bounds are loose on purpose. They exist to catch `"boot"` and
+    `token_urlsafe(4)`, not to certify 256 bits of CSPRNG.
+    """
+
+    def test_the_owner_token_is_long_and_high_entropy(self):
+        from viewer import core
+
+        token = core._new_singleflight_owner_token()
+        assert isinstance(token, str)
+        assert len(token) >= 32, f"owner token is only {len(token)} chars: {token!r}"
+        # token_urlsafe uses base64url: 26 letters, 10 digits, dash and underscore.
+        assert set(token) <= set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        ), f"owner token has characters outside base64url: {token!r}"
+        # A short token from a reduced alphabet would collapse this.
+        assert len(set(token)) >= 10, f"owner token uses too few distinct symbols: {token!r}"
+
+    def test_successive_owner_tokens_do_not_share_a_prefix(self):
+        from viewer import core
+
+        tokens = [core._new_singleflight_owner_token() for _ in range(8)]
+        assert len(set(tokens)) == 8, "owner tokens repeated within one process"
+        for i, first in enumerate(tokens):
+            for second in tokens[i + 1:]:
+                shared = 0
+                for a, b in zip(first, second):
+                    if a != b:
+                        break
+                    shared += 1
+                assert shared < 8, (
+                    f"two owner tokens share a {shared}-char prefix, which a "
+                    f"predictable or truncated generator would: {first!r} {second!r}"
+                )
+
+    def test_the_boot_id_is_a_per_process_secret_not_a_constant(self):
+        from viewer import core
+
+        boot_id = core.SINGLEFLIGHT_BOOT_ID
+        assert isinstance(boot_id, str)
+        assert len(boot_id) >= 16, f"boot id is only {len(boot_id)} chars: {boot_id!r}"
+        assert len(set(boot_id)) >= 8, (
+            f"boot id looks like a fixed string rather than a secret: {boot_id!r}"
+        )
+
+    def test_the_secrets_come_from_the_csprng_not_a_seeded_prng(self):
+        """`secrets.token_urlsafe`, not `random` — pinned structurally.
+
+        The other assertions in this class cannot catch this one, and the reason is
+        worth stating precisely: **`secrets` and `random` are behaviourally
+        indistinguishable from a test.** Both produce a long, high-alphabet, unique
+        string. Swapping `secrets.token_urlsafe(32)` for `random.choice` over the same
+        alphabet passes every length, alphabet and prefix check above.
+
+        What differs is the *source*: `secrets` draws from the OS CSPRNG, `random` from
+        a Mersenne Twister that is reproducible from its seed. Nothing observable from
+        outside distinguishes them in a single run - and a statistical test would be
+        both slow and wrong.
+
+        So this is an **AST pin**, for the same reason `hmac.compare_digest` is one: the
+        property is a security claim rather than a behaviour, and security claims are
+        asserted structurally in this repo. Verified that this mutant survives every
+        other assertion in the class before pinning it, so the pin is doing real work.
+        """
+        import ast
+        import pathlib as _pathlib
+
+        source = (
+            _pathlib.Path(__file__).resolve().parent.parent / "viewer" / "core.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        sites = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "token_urlsafe":
+                value = node.value
+                if isinstance(value, ast.Name):
+                    sites.append(value.id)
+            # The module-level constant is `secrets.token_urlsafe(16)` too.
+        assert sites, "no token_urlsafe call found; has viewer/core.py changed shape?"
+
+        bad = [name for name in sites if name != "secrets"]
+        assert not bad, (
+            "a singleflight ownership secret is no longer drawn from `secrets`: "
+            + repr(bad)
+        )
+
+        # `random` must not appear as a token source anywhere in this module.
+        random_token_sites = [
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "random"
+            and node.func.attr in {"choice", "choices", "randint", "getrandbits"}
+        ]
+        assert not random_token_sites, (
+            "an ownership token is drawn from `random`, which is seeded and therefore "
+            "reproducible: " + repr(random_token_sites)
+        )
+
+        # Both required sites, so this cannot pass by the tokens being removed.
+        assert len(sites) >= 2, (
+            "expected both SINGLEFLIGHT_BOOT_ID and the owner token to use "
+            "secrets.token_urlsafe, found " + repr(sites)
+        )
+
+    def test_a_fixed_boot_id_would_be_caught(self):
+        from viewer import core
+
+        """The property above, stated as the failure it prevents.
+
+        `SINGLEFLIGHT_BOOT_ID` exists so a task written by a *previous* process is not
+        mistaken for one this process owns. If it were the constant `"boot"`, every
+        restart would look like the same owner and a stale task could be adopted
+        instead of being reaped.
+
+        Asserted by checking the constant is not reproducible from anything a reader
+        already knows - the module name, the pid, or the string "boot".
+        """
+        boot_id = core.SINGLEFLIGHT_BOOT_ID
+        for known in ("boot", "", "0", "viewer", "core"):
+            assert boot_id != known, (
+                f"boot id is the fixed value {known!r}, so every process looks like the "
+                "same owner"
+            )
+        assert str(core.os.getpid()) != boot_id
+
+
 def test_singleflight_starter_failure_leaves_failed_record_for_coalesced_id(
     viewer_client,
 ):
