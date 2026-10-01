@@ -379,6 +379,134 @@ def _async_returning(value):
     return _inner
 
 
+def test_the_account_error_verdicts_are_three_distinct_outcomes():
+    """Route error -> keep, not-authorised -> skip, anything else -> keep.
+
+    Only the middle one is a decision about the account itself. The other two are
+    transient broker-side conditions, and both were unpinned: relaxing the
+    not-authorised branch keeps an account the token has no authority to trade,
+    while reclassifying a route error or an unknown error as "skip" silently drops
+    a perfectly tradable account and the operator sees it vanish from the list.
+
+    Asserted as a table, because the value of the test is that the three branches
+    stay distinguishable - not that any one of them returns a particular string.
+    """
+    cases = [
+        ("CANT_ROUTE_REQUEST: NO ENVIRONMENT CONNECTION", "keep"),
+        ("TRADING_ACCOUNT_IS_NOT_AUTHORIZED", "skip"),
+        ("ACCOUNT_NOT_AUTHORIZED", "skip"),
+        ("NOT AUTHORIZED", "skip"),
+        ("Connection reset by peer", "keep"),
+        ("", "keep"),
+    ]
+    for error_text, expected in cases:
+        verdict = account_discovery._handle_ctrader_trader_error(
+            error_text, "demo.ctraderapi.com", 1234
+        )
+        assert verdict == expected, (
+            f"{error_text!r} was classified {verdict!r}, expected {expected!r}"
+        )
+
+    # The two that matter most are asserted apart from the table, with the reason.
+    assert (
+        account_discovery._handle_ctrader_trader_error(
+            "TRADING_ACCOUNT_IS_NOT_AUTHORIZED", "demo.ctraderapi.com", 1
+        )
+        == "skip"
+    ), "an account the token cannot trade must not be offered for deployment"
+
+
+def test_an_unknown_trader_error_keeps_the_account(monkeypatch):
+    """An unrecognised failure is a "keep", so a transient blip does not delete an account.
+
+    `_handle_ctrader_trader_error` returns "skip" for exactly one condition. Treating
+    every other failure as a skip would mean any unmodelled broker error removes the
+    account from discovery entirely, and the operator's only symptom is that a
+    deployment they configured is no longer listed.
+
+    Asserted through `_build_ctrader_live_account`, because that is the caller that
+    acts on the verdict - the same seam lesson as `_ctrader_host_matches_environment`.
+    """
+    monkeypatch.setattr(
+        account_discovery,
+        "_ctrader_account_context",
+        lambda *_a, **_k: SimpleNamespace(
+            balance=5.0,
+            trader_login="1",
+            account_name_hint="",
+            broker_name="cTrader",
+            ignored_name_values=set(),
+        ),
+    )
+    monkeypatch.setattr(account_discovery, "_ctrader_resolved_account_id", lambda _i: 42)
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("some unmodelled broker failure")
+
+    monkeypatch.setattr(account_discovery, "_request_ctrader_account_detail", lambda *_a, **_k: None)
+    monkeypatch.setattr(account_discovery, "_load_ctrader_trader_details", _raise)
+
+    account = account_discovery._build_ctrader_live_account(
+        "demo.ctraderapi.com", None, "tok", SimpleNamespace(isLive=False)
+    )
+    assert account is not None, (
+        "an unmodelled broker error dropped the account from discovery; only an "
+        "unauthorised token should do that"
+    )
+
+    # And the unauthorised case does drop it, through the same path.
+    def _raise_unauthorised(*_args, **_kwargs):
+        raise RuntimeError("TRADING_ACCOUNT_IS_NOT_AUTHORIZED")
+
+    monkeypatch.setattr(account_discovery, "_load_ctrader_trader_details", _raise_unauthorised)
+    assert (
+        account_discovery._build_ctrader_live_account(
+            "demo.ctraderapi.com", None, "tok", SimpleNamespace(isLive=False)
+        )
+        is None
+    )
+
+
+def test_partial_ctrader_credentials_do_not_start_a_discovery(monkeypatch, tmp_path):
+    """All three cTrader credentials or none of them.
+
+    `and` is the guard. Relaxing it to `or` leaves every test green, because every
+    existing fixture supplies a complete triple - so a half-configured account would
+    attempt a broker login with credentials the broker cannot authenticate, which
+    risks an auth-failure rate limit against the app and, depending on the broker's
+    response, a misleading account record.
+    """
+    attempts: list[str] = []
+
+    async def _spy(*args, **kwargs):
+        attempts.append("called")
+        return []
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _spy)
+    monkeypatch.setattr(account_discovery, "discover_alpaca_accounts", _spy)
+
+    env_file = tmp_path / ".accounts.env"
+    for body in (
+        'CTRADER_APP_ID="id"\n',
+        'CTRADER_APP_ID="id"\nCTRADER_APP_SECRET="secret"\n',
+        'CTRADER_APP_SECRET="secret"\nCTRADER_ACCESS_TOKEN="tok"\n',
+        'CTRADER_APP_ID="id"\nCTRADER_ACCESS_TOKEN="tok"\n',
+        'CTRADER_APP_ID="id"\nCTRADER_APP_SECRET="secret"\nCTRADER_ACCESS_TOKEN="tok"\n',
+    ):
+        env_file.write_text(body, encoding="utf-8")
+        attempts.clear()
+        asyncio.run(account_discovery.discover_configured_accounts(env_file))
+        complete = "ACCESS_TOKEN" in body and "APP_ID" in body and "APP_SECRET" in body
+        if complete:
+            assert attempts == ["called"], (
+                "a complete credential triple did not trigger discovery: " + body
+            )
+        else:
+            assert attempts == [], (
+                "partial cTrader credentials started a broker login: " + body
+            )
+
+
 def test_ctrader_host_matches_environment_filters_demo_and_live_hosts():
     assert account_discovery._ctrader_host_matches_environment(
         host="demo.ctraderapi.com",
