@@ -222,6 +222,68 @@ def test_daemon_fails_closed_before_adapter_creation_for_duplicate_ctrader_targe
     assert adapter_creations == []
 
 
+def test_duplicate_account_ids_are_compared_after_stripping(tmp_path: Path) -> None:
+    """Whitespace-padded ids are the same account, and the set uses the stripped value.
+
+    Verified as an **equivalent mutant** rather than a gap: mutating the local to
+    `str(account.id)` survives, because that single `strip()` feeds *both* the
+    membership check and `account_ids.add`, so the set comparison is unchanged and
+    only the error message would differ. Recorded here so the next audit does not
+    re-report it as a gap.
+
+    Asserted because the behaviour is load-bearing even though the mutation is not:
+    `"a"` and `" a "` name one account, and two local entries for one account would
+    each be routed separately.
+
+    The cTrader routing key gets the same treatment for the same reason - a cTID
+    differing only by whitespace is one broker account, and letting it through would
+    leave two local rows claiming it.
+    """
+    exact = _write_config(
+        tmp_path / "exact.yaml",
+        """accounts:
+  - id: shared-account
+    broker: alpaca
+  - id: shared-account
+    broker: alpaca
+
+deployments: []
+""",
+    )
+    with pytest.raises(ValueError, match="duplicate account id.*shared-account"):
+        parse_live_deployments_config(exact)
+
+    padded = _write_config(
+        tmp_path / "padded.yaml",
+        """accounts:
+  - id: shared-account
+    broker: alpaca
+  - id: '  shared-account  '
+    broker: alpaca
+
+deployments: []
+""",
+    )
+    with pytest.raises(ValueError, match="duplicate account id"):
+        parse_live_deployments_config(padded)
+
+    padded_ctid = _write_config(
+        tmp_path / "padded-ctid.yaml",
+        """accounts:
+  - id: strategy-a
+    broker: ctrader
+    ctid: "12345"
+  - id: strategy-b
+    broker: ctrader
+    ctid: " 12345 "
+
+deployments: []
+""",
+    )
+    with pytest.raises(ValueError, match="assigned to multiple local accounts"):
+        parse_live_deployments_config(padded_ctid)
+
+
 def test_live_config_rejects_non_numeric_ctrader_identifier(tmp_path: Path) -> None:
     """B3: a ctrader account without numeric cTID fails at validation."""
     config_path = _write_config(
