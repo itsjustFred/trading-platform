@@ -2368,6 +2368,113 @@ def test_a_blank_claim_token_is_refused(isolated_db):
     assert database.claim_live_deployment_submission(deployment_id, "real-token") is True
 
 
+def test_an_unrecognised_stockkit_route_resolves_to_no_account():
+    """A route nobody recognises must resolve to nothing, not to a fallback number.
+
+    `expected_account_number_for_route` returns `""` for an unknown route. Removing that
+    early return leaves every routing test green, because they all use known aliases -
+    so the question "which Alpaca account does this route trade on?" was only ever asked
+    for routes that had an answer.
+
+    The empty string is the only safe answer here. A fallback table lookup would trade
+    an unrecognised bot's signals on somebody's account: the failure is silent, the order
+    is real, and the account number in the log looks entirely legitimate.
+
+    Removing the guard is an **equivalent mutant** through the static table, since
+    `STOCKKIT_ACCOUNT_ROUTES.get("", "")` is also `""`. The one observable difference is
+    the env lookup, whose key becomes the *unrecognised route itself* rather than
+    nothing - so `STOCKKIT_ACCOUNT_NUMBER_` with an empty suffix resolves an unknown bot
+    onto a real account number. That case is asserted below, with a note that it is the
+    only path that distinguishes the mutant.
+    """
+    from live_runner.stockkit_routing import (
+        expected_account_number_for_route,
+        normalize_stockkit_route,
+    )
+
+    for route in (
+        "unknown-bot",
+        "NITRO_PLUS",
+        "ramjets",
+        "",
+        None,
+        "   ",
+        "12345",
+        "!!!",
+    ):
+        assert normalize_stockkit_route(route) == "", (
+            f"{route!r} was resolved to a route it does not name"
+        )
+        assert expected_account_number_for_route(route) == "", (
+            f"{route!r} resolved to an Alpaca account number; an unrecognised route "
+            "must trade on nothing"
+        )
+
+    # With env present, an unknown route still refuses rather than matching a block.
+    assert (
+        expected_account_number_for_route(
+            "unknown-bot",
+            {
+                "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+                "ALPACA_ACCOUNT_NUMBER_ACC1": "PA3E767TJ91D",
+                "STOCKKIT_ACCOUNT_NUMBER_NITRO": "PA3T0MQAGQ51",
+            },
+        )
+        == ""
+    ), "an unknown route matched a configured account block"
+
+    # The only input that distinguishes the mutant: with the early return gone the env
+    # key is looked up with an empty route suffix, so a stray entry resolves the unknown
+    # route onto a real account number. Verified by direct probe, not inference.
+    assert (
+        expected_account_number_for_route(
+            "unknown-bot", {"STOCKKIT_ACCOUNT_NUMBER_": "PA_REAL_ACCOUNT"}
+        )
+        == ""
+    ), (
+        "an unrecognised route resolved through an env key with an empty route suffix"
+    )
+
+
+def test_a_known_route_still_resolves_with_the_same_env_present():
+    """The guard above is not satisfied by refusing everything.
+
+    A test that only asserts `""` for everything passes against a function that never
+    resolves anything, so the known aliases are checked against the same env used
+    above - which is the shape that actually selects the wrong account when the
+    resolution order is wrong.
+    """
+    from live_runner.stockkit_routing import expected_account_number_for_route
+
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA3E767TJ91D",
+        "STOCKKIT_ACCOUNT_NUMBER_NITRO": "PA3T0MQAGQ51",
+    }
+    # Step 1: an explicit entry beats the indexed block for the same route.
+    assert expected_account_number_for_route("nitro", env) == "PA3T0MQAGQ51"
+
+    # Step 2: with no explicit entry, the account whose label matches resolves it.
+    # This is the step that survives a paper account being re-created, which
+    # silently invalidates any hardcoded number.
+    assert (
+        expected_account_number_for_route(
+            "nitro",
+            {
+                "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+                "ALPACA_ACCOUNT_NUMBER_ACC1": "PA3E767TJ91D",
+            },
+        )
+        == "PA3E767TJ91D"
+    )
+
+    # A route with no label and no explicit entry falls through to the static table.
+    assert expected_account_number_for_route("ramjet", env) == "PA3T0MQAGQ51"
+
+    # Step 3: nothing in env at all falls back to the same table.
+    assert expected_account_number_for_route("rocketfuel", {}) == "PA3EFBL4P7BU"
+
+
 def test_ctrader_reconciliation_candidates_include_partially_executed_signal(isolated_db):
     database = isolated_db
     deployment = _deployment()
