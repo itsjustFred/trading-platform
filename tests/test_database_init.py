@@ -198,6 +198,84 @@ def test_live_control_audit_survives_a_broken_database(isolated_db, monkeypatch)
     assert payload["target_id"] == "dep-9"
 
 
+def test_the_demo_identity_gate_compares_in_constant_time() -> None:
+    """`hmac.compare_digest`, not `==` or `!=`.
+
+    The fingerprint is what stands between a re-pointed credential and an armed account,
+    so the comparison is a security boundary. `==` and `!=` on strings short-circuit on
+    the first differing byte, which leaks how much of a hash matched; `hmac.compare_digest`
+    does not. Replacing it with `!=` changes no test-visible behaviour and every test in
+    the suite stays green - so this is pinned **structurally**, by inspecting the AST
+    rather than by asserting a value.
+
+    An AST pin because there is no behavioural assertion available: a timing property
+    cannot be observed from a test without becoming a timing test, which would be flaky in
+    the opposite direction. The repo already uses this pattern elsewhere for exactly that
+    reason.
+
+    The mutation report records `stored != current` as an equivalent mutant for
+    behaviour; this test is what makes it *not* equivalent as a security claim.
+    """
+    import ast
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).resolve().parent.parent / "shared" / "database.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_live_account_fingerprint_mismatch_reason"
+    )
+    compared = [
+        node.func.attr
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "hmac"
+    ]
+    assert "compare_digest" in compared, (
+        "the broker identity fingerprint is no longer compared with "
+        "hmac.compare_digest; a plain comparison leaks how much of the hash matched: "
+        + repr(compared)
+    )
+
+    # And the guard is still the *negative* one: mismatch means refuse.
+    mismatch_branches = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+    ]
+    assert mismatch_branches, (
+        "the mismatch guard is gone; a changed broker identity would pass the demo gate"
+    )
+
+    # Two sibling branches in that function are **equivalent mutants**, verified rather
+    # than assumed, and deliberately left unpinned:
+    #
+    # - the `except Exception` around the recomputation. Hashing a `str` cannot raise, and
+    #   `live_account_identity_fingerprint` is a `sha256(payload.encode()).hexdigest()`
+    #   with nothing else in it. The docstring on that function says as much.
+    # - the `if not current` branch. `hexdigest()` is always a 64-character string, so
+    #   `current` is never empty - including for all-blank inputs, which hash to a real
+    #   digest.
+    #
+    # Both are fail-closed guards on conditions that cannot occur, so removing either
+    # changes nothing observable. Recorded here rather than given tests, because a test
+    # asserting an unreachable branch asserts nothing.
+    source_text = ast.unparse(fn)
+    assert "if not current:" in source_text, (
+        "the empty-fingerprint guard was removed; it is currently unreachable (a "
+        "hexdigest is never empty), but it documents the invariant"
+    )
+
+
 def test_resolve_defined_stat_separates_absent_from_measured_zero() -> None:
     """One definition of the convention, used by both the DB and the viewer.
 
