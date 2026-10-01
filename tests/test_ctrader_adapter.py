@@ -37,6 +37,237 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestErrorResponseRoutingAndRetryAck:
+    """Which log line a broker error produces, and what an ack clears. Five survivors.
+
+    `_handle_error_response_payload` routes three cases and they must not blur together,
+    because two of them mean opposite things about the adapter's future:
+
+    | case | meaning | state change |
+    |---|---|---|
+    | already logged in | a **duplicate auth response** - harmless | none, and notify **once** |
+    | terminal auth error | the token is rejected | `_authenticated = False`, adapter parked |
+    | anything else | a normal API error | none, logged as a warning |
+
+    Getting the first wrong is the expensive one. If "already logged in" fell through to
+    the terminal-auth branch, a routine duplicate response would **park the adapter as if
+    the credential had been rejected** - so a harmless event that arrives on every reconnect
+    would silently stop trading. That is why E2 is the mutation that matters most here, and
+    it survived the suite.
+
+    The notify-once behaviour is asserted by counting records rather than by return value,
+    because the whole point is the *volume* of log output: a reconnect loop that logs this
+    every time turns one benign event into thousands of lines.
+
+    `_log_connect_failure` is in the same class because it is the same shape of decision -
+    auth-versus-timeout-versus-generic - and it exists to stop an operator reading a token
+    problem as a connectivity problem. Routing a token error to the generic branch does not
+    fail anything; it just tells the operator the wrong thing at 3am.
+
+    **Two mutants are deliberately left unmeasured** (E6, E7): `_ensure_asyncio_twisted_reactor`
+    installs a Twisted reactor, which mutates process-global state for the whole test run.
+    Exercising it in-process risks destabilising unrelated tests, and a test that can break
+    its neighbours is worse than an honest gap. Recorded in the note below rather than
+    silently skipped.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        adapter._already_logged_in_notified = False
+        adapter._authenticated = True
+        adapter._terminal_auth_failure_reason = ""
+        adapter._terminal_auth_failure_code = ""
+        return adapter
+
+    def test_an_already_logged_in_response_is_ignored_and_parks_nothing(self, caplog) -> None:
+        """The expensive case: a duplicate auth response must not park the adapter.
+
+        cTrader sends this on every reconnect. Treating it as a terminal auth failure would
+        mean a routine, expected response silently stops trading - so both halves are
+        asserted: the adapter stays authenticated, and no terminal reason is recorded.
+        """
+        import logging
+
+        adapter = self._adapter()
+        payload = SimpleNamespace(
+            errorCode="ALREADY_LOGGED_IN", description="Account is already logged in"
+        )
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            adapter._handle_error_response_payload(payload)
+
+        assert adapter._authenticated is True, (
+            "a duplicate already-logged-in response parked the adapter as though the "
+            "credential had been rejected"
+        )
+        assert adapter._terminal_auth_failure_reason == ""
+        assert any(
+            "already authenticated" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_the_duplicate_auth_notice_is_emitted_once(self, caplog) -> None:
+        """Notify-once, asserted by counting records.
+
+        cTrader re-sends this on every reconnect, so an unguarded log turns one benign event
+        into a stream of lines that pushes real failures out of view. The count is the
+        assertion - a return value cannot express "only the first one".
+        """
+        import logging
+
+        adapter = self._adapter()
+        payload = SimpleNamespace(errorCode="ALREADY_LOGGED_IN", description="")
+        with caplog.at_level(logging.INFO):
+            for _ in range(5):
+                caplog.clear()
+                adapter._handle_error_response_payload(payload)
+                notices = [
+                    r for r in caplog.records if "already authenticated" in r.getMessage()
+                ]
+                if _ == 0:
+                    assert len(notices) == 1, "the first response was not announced"
+                else:
+                    assert notices == [], (
+                        f"the duplicate auth response was announced {len(notices)} more "
+                        "times; a reconnect loop would flood the log"
+                    )
+        assert adapter._already_logged_in_notified is True
+
+    def test_a_terminal_auth_response_parks_the_adapter(self, caplog) -> None:
+        """The genuine terminal case still works, so the routing is a real split."""
+        import logging
+
+        adapter = self._adapter()
+        payload = SimpleNamespace(errorCode="NOT_AUTH", description="account is not authorized")
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            adapter._handle_error_response_payload(payload)
+
+        assert adapter._authenticated is False, (
+            "a terminal auth response left the adapter authenticated"
+        )
+        assert adapter._terminal_auth_failure_code == "NOT_AUTH"
+        assert "not authorized" in adapter._terminal_auth_failure_reason
+
+    def test_an_ordinary_api_error_parks_nothing(self, caplog) -> None:
+        """The third branch: logged as a warning, no state change."""
+        import logging
+
+        adapter = self._adapter()
+        payload = SimpleNamespace(errorCode="SYMBOL_NOT_FOUND", description="unknown symbol")
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            adapter._handle_error_response_payload(payload)
+
+        assert adapter._authenticated is True, (
+            "an ordinary API error parked the adapter"
+        )
+        assert adapter._terminal_auth_failure_reason == ""
+        assert any("API error response" in r.getMessage() for r in caplog.records)
+
+    def test_an_acknowledged_event_releases_its_retry_budget(self) -> None:
+        """The ack clears the counter, so a later failure gets a full retry budget.
+
+        `_requeue_execution_event` counts attempts against `EXECUTION_RETRY_LIMIT` and then
+        drops the event. If a successful persist did not clear the counter, an event that
+        failed once, succeeded, and was later re-delivered would resume with its old count -
+        so it would be dropped after fewer retries than the limit allows.
+        """
+        adapter = self._adapter()
+        adapter._execution_retry_counts = {}
+        event = SimpleNamespace(marker="e1")
+
+        adapter._execution_retry_counts[id(event)] = 2
+        adapter._ack_execution_event(event)
+        assert id(event) not in adapter._execution_retry_counts, (
+            "an acknowledged event kept its retry count, so a later failure would resume "
+            "part-way through the retry budget"
+        )
+
+        # And an ack for an event with no recorded attempt is harmless.
+        adapter._ack_execution_event(SimpleNamespace(marker="never-queued"))
+
+    def test_auth_and_timeout_connect_failures_are_logged_distinctly(self, caplog) -> None:
+        """Token problems and connectivity problems must not read the same at 3am.
+
+        Both are non-terminal - the daemon retries - so nothing breaks either way. The cost
+        is purely diagnostic, and the cost of getting it wrong is an operator chasing the
+        wrong cause: refreshing a token that was fine, or blaming credentials for a network
+        fault. So the routing is asserted on the message.
+        """
+        import asyncio
+        import logging
+
+        adapter = self._adapter()
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            adapter._log_connect_failure(RuntimeError("x"), "401", "invalid token")
+            auth_messages = [r.getMessage() for r in caplog.records]
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            adapter._log_connect_failure(asyncio.TimeoutError(), "timed out", "no response")
+            timeout_messages = [r.getMessage() for r in caplog.records]
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            adapter._log_connect_failure(RuntimeError("x"), "refused", "connection refused")
+            generic_messages = [r.getMessage() for r in caplog.records]
+
+        assert any("authentication unavailable" in m for m in auth_messages), auth_messages
+        assert any("connect timeout" in m for m in timeout_messages), timeout_messages
+        assert any("connect/auth unavailable" in m for m in generic_messages), generic_messages
+        assert len(set(auth_messages)) == len(set(timeout_messages)), (
+            "the token and timeout messages became the same, so an operator cannot tell a "
+            "credential problem from a connectivity problem"
+        )
+
+    def test_a_timeout_is_detected_from_the_exception_type_or_the_message(self, caplog) -> None:
+        """Both signals count, because which one arrives depends on the transport."""
+        import asyncio
+        import logging
+
+        adapter = self._adapter()
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            adapter._log_connect_failure(
+                asyncio.TimeoutError(), "read timeout", "read timeout"
+            )
+            by_type = [r.getMessage() for r in caplog.records]
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            # A non-timeout exception whose message still names a timeout - the check is
+            # a substring test on "timeout", not a semantic timeout classifier.
+            adapter._log_connect_failure(
+                RuntimeError("x"), "socket timeout", "connect timeout after 20s"
+            )
+            by_message = [r.getMessage() for r in caplog.records]
+
+        assert any("connect timeout" in m for m in by_type), (
+            "a real TimeoutError was not recognised by its type"
+        )
+        assert any("connect timeout" in m for m in by_message), (
+            "a timeout named only in the message was not recognised"
+        )
+
+    def test_the_twisted_reactor_validation_is_left_unmeasured_on_purpose(self) -> None:
+        """**E6 and E7 are deliberately not covered here**, and this records why.
+
+        `_ensure_asyncio_twisted_reactor` calls `asyncioreactor.install(loop)`, which
+        mutates process-global Twisted state for the remainder of the test run. Exercising
+        it in-process would risk destabilising unrelated tests, and a test that can break its
+        neighbours is worse than an admitted gap.
+
+        Both mutants - skipping the reactor validation entirely, and accepting a non-asyncio
+        reactor - therefore remain unmeasured by the suite. They are cheap to verify by hand:
+        install a non-asyncio reactor in a scratch process and confirm the function raises
+        `RuntimeError` rather than proceeding.
+
+        Stated here so the gap is visible in the test file, rather than being an absence
+        someone has to rediscover by re-running the mutation.
+        """
+
+
 class TestCancelEligibilityAndIdCoercion:
     """Which resting orders may be cancelled, and which ids may be believed. Seven survivors.
 
