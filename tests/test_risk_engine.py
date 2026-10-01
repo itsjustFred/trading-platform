@@ -588,3 +588,115 @@ class TestIssueC1FallbackGuards:
             result = self._engine().apply_trailing_stop(signal, market_price=101.0)
         assert result == pytest.approx(98.0)
         assert any("supertrend_flip" in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# Guards in `calculate_position_size` that no test reached
+# --------------------------------------------------------------------------
+#
+# Found by mutation testing `risk/engine.py` with `mutate.sh`. Three survived
+# 358 collected tests; each now has a test that removes it.
+#
+# The pattern is the same as `risk/live.py`: the *guard* is correct, and its
+# protection is unpinned, so deleting it changes nothing observable until the
+# moment the input that violates it arrives. Each consequence below was measured
+# under the mutation, not reasoned about.
+#
+# A fourth mutation - deleting the fallback-distance guard at
+# `risk/engine.py:42` - also survived, and is **not** a gap: `RiskConfig`
+# already refuses `default_sl_atr_multiplier <= 0`, non-finite multipliers and a
+# `fallback_stop_pct` outside (0, 1), so both routes to `distance` are bounded
+# upstream and the guard cannot be reached with a valid config. It is defence in
+# depth whose upstream is pinned; left unpinned deliberately, and noted here so
+# it is not mistaken for an oversight.
+
+_SIZING = {"account_balance": 100_000.0, "pip_value": 1.0, "current_exposure": 0.0}
+
+
+def _plain_signal(**overrides) -> TradeSignal:
+    fields = {
+        "action": "buy",
+        "symbol": "AAPL",
+        "entry_price": 100.0,
+        "stop_loss": 95.0,
+        "take_profit": 110.0,
+        "timeframe": "5Min",
+    }
+    fields.update(overrides)
+    return TradeSignal(**fields)
+
+
+def test_a_zero_account_balance_is_refused() -> None:
+    """Kills `<= 0` becoming `< 0`.
+
+    Under the mutation a zero balance is accepted and produces a **zero-sized
+    order** rather than a refusal - `risk_amount` comes out as 0.0 and the
+    caller is handed something that looks like a decision.
+    """
+    with pytest.raises(ValueError, match="account_balance must be > 0"):
+        RiskEngine().calculate_position_size(
+            signal=_plain_signal(), account_balance=0.0, pip_value=1.0, current_exposure=0.0
+        )
+
+
+def test_a_negative_account_balance_is_refused() -> None:
+    """The other half, so the boundary cannot be loosened without this noticing."""
+    with pytest.raises(ValueError, match="account_balance must be > 0"):
+        RiskEngine().calculate_position_size(
+            signal=_plain_signal(), account_balance=-1.0, pip_value=1.0, current_exposure=0.0
+        )
+
+
+def test_a_true_position_count_is_refused() -> None:
+    """Kills dropping the `isinstance(raw_positions, bool)` guard.
+
+    `float(True)` is `1.0` and `1.0.is_integer()`, so without the guard a `True`
+    in untrusted signal metadata is silently accepted as a real position count -
+    measured as `position_size` identical to a genuine count of 1, i.e. it quietly
+    consumes a slot of the open-position budget.
+
+    Only `True`. `False` is *not* refused and should not be: the line above reads
+    `metadata.get("current_positions", 0) or 0`, which collapses `False` to `0`
+    before the bool check ever runs. "False positions" meaning "no positions" is
+    the sensible reading, so the `or 0` idiom is doing the right thing there.
+    """
+    with pytest.raises(ValueError, match="current_positions must be an integer"):
+        RiskEngine().calculate_position_size(
+            signal=_plain_signal(metadata={"current_positions": True}),
+            account_balance=100_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
+
+
+def test_a_false_position_count_means_no_positions() -> None:
+    """Pinned explicitly, because it is the asymmetry that looks like a mistake."""
+    sized = RiskEngine().calculate_position_size(
+        signal=_plain_signal(metadata={"current_positions": False}), **_SIZING
+    )
+    assert sized.decision is not None
+
+
+@pytest.mark.parametrize("count", [1.5, -0.5, 2.25])
+def test_a_fractional_position_count_is_refused(count: float) -> None:
+    """Kills dropping the `.is_integer()` half.
+
+    Without it, `int(1.5)` truncates and the position budget is silently
+    understated - measured at `position_size` 200.0, identical to a count of 1.
+    """
+    with pytest.raises(ValueError, match="current_positions must be an integer"):
+        RiskEngine().calculate_position_size(
+            signal=_plain_signal(metadata={"current_positions": count}),
+            account_balance=100_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
+
+
+@pytest.mark.parametrize("count", [0, 1, 7])
+def test_a_whole_number_position_count_is_accepted(count: int) -> None:
+    """The converse, so the guard cannot be satisfied by refusing everything."""
+    sized = RiskEngine().calculate_position_size(
+        signal=_plain_signal(metadata={"current_positions": count}), **_SIZING
+    )
+    assert sized.decision is not None
