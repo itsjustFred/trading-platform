@@ -202,6 +202,51 @@ class TestTrade:
         t.direction = "SHORT"
         assert t.direction_sign == -1
 
+    def test_direction_survives_the_dict_roundtrip(self):
+        """A SHORT trade must serialise as SHORT, not as a hardcoded LONG.
+
+        Every `Trade` fixture in this file is a LONG - `_make_simple_trade`, the
+        round-trip tests, the direction_sign test's first assertion - so hardcoding
+        `"direction": "LONG"` in `to_dict` leaves all of them green. The only test that
+        mentions SHORT sets the attribute and reads `direction_sign` without ever
+        serialising.
+
+        The failure is quiet and total: a stored backtest's SHORT trades come back as
+        LONG, so direction-dependent PnL, MFE/MAE and R-multiples are wrong for exactly
+        half the trades, while the record still looks complete. Round-tripping SHORT
+        is also the only thing that would catch a `from_dict` that read the wrong key.
+        """
+        short = Trade(
+            id=7, symbol="EURUSD", direction="SHORT",
+            entry_time="2021-01-01T00:00:00Z", entry_price=1.2000,
+            quantity=1000,
+            exits=[TradeExit(time="2021-01-02T00:00:00Z", price=1.1900, quantity=1000)],
+            pnl=100.0,
+        )
+
+        assert short.to_dict()["direction"] == "SHORT", (
+            "to_dict did not carry the trade's own direction: "
+            + repr(short.to_dict()["direction"])
+        )
+
+        restored = Trade.from_dict(short.to_dict())
+        assert restored.direction == "SHORT", (
+            "a SHORT trade came back as " + restored.direction + " after a round trip"
+        )
+        assert restored.direction_sign == -1
+
+        # And LONG still round-trips, so the guard is not satisfied by always writing
+        # whatever the input happened to be - the two must stay distinguishable.
+        long_trade = Trade(
+            id=8, symbol="AAPL", direction="LONG",
+            entry_time="2021-01-01T00:00:00Z", entry_price=100.0,
+            quantity=10,
+            exits=[TradeExit(time="2021-01-02T00:00:00Z", price=105.0, quantity=10)],
+            pnl=50.0,
+        )
+        assert long_trade.to_dict()["direction"] == "LONG"
+        assert Trade.from_dict(long_trade.to_dict()).direction_sign == 1
+
     def test_optional_fields_omitted_when_none(self):
         t = Trade(
             id=1, symbol="X", direction="LONG",
