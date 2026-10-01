@@ -35,6 +35,56 @@ def test_discover_discord_bots_from_env_file(tmp_path, monkeypatch):
     assert by_name["NITRO"]["channel_id"] == "555666777"
 
 
+def test_a_token_without_a_channel_id_is_not_discovered(tmp_path, monkeypatch):
+    """A token with no channel is not a service. Discovery must not offer it as one.
+
+    `discover_discord_bots_from_env` pairs `DISCORD_BOT_<NAME>_TOKEN` with
+    `DISCORD_BOT_<NAME>_CHANNEL_ID` by naming, and requires the channel to be present
+    and non-blank. Removing that requirement leaves every collected test green, because
+    the one discovery test supplies a complete pair for all three bots.
+
+    The consequence is a service that authenticates and then has nothing to read -
+    and the validator's own docstring names the failure mode it prevents: "a channel
+    with no deployment means a service connects, authenticates and reads messages
+    that nothing will ever trade." Here it is worse, because there is no channel at
+    all, so the incoherence is invisible to the cross-check too: the pairing it looks
+    for cannot exist.
+
+    Asserted for a missing key and for a blank value, since `str(...).strip()` makes
+    both empty and the two arrive by different routes - one absent, one present.
+    """
+    env_file = tmp_path / ".accounts.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                # Complete pair: discovered.
+                "DISCORD_BOT_RAMJET_TOKEN=token-one",
+                "DISCORD_BOT_RAMJET_CHANNEL_ID=123456789",
+                # Token with no channel key at all.
+                "DISCORD_BOT_ROCKETFUEL_TOKEN=token-two",
+                # Token whose channel is present but blank.
+                "DISCORD_BOT_NITRO_TOKEN=token-three",
+                "DISCORD_BOT_NITRO_CHANNEL_ID=   ",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service_discovery, "DEFAULT_ACCOUNTS_ENV", env_file)
+
+    bots = service_discovery.discover_discord_bots_from_env()
+    by_name = {item["name"]: item for item in bots}
+
+    assert "RAMJET" in by_name
+    assert "ROCKETFUEL" not in by_name, (
+        "a token with no channel id was offered as a service, so it would "
+        "authenticate with nothing to read: " + repr(by_name.get("ROCKETFUEL"))
+    )
+    assert "NITRO" not in by_name, (
+        "a token with a blank channel id was offered as a service: "
+        + repr(by_name.get("NITRO"))
+    )
+
+
 def test_duplicate_channel_across_two_tokens_is_reported():
     """Two tokens on one channel means every message is processed twice.
 
