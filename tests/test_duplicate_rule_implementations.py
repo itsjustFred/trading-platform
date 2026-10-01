@@ -350,11 +350,16 @@ def test_every_signal_bot_resolves_timeframe_spellings_identically() -> None:
     assert NitroSignalProcessor.__mro__[1] is RamJetSignalProcessor, (
         "NitroSignalProcessor no longer subclasses RamJetSignalProcessor."
     )
-    import pathlib as _pathlib
-
+    # Resolved against REPO_ROOT, never against the working directory. Found by
+    # CodeRabbit: run pytest from anywhere but the repo root and this raised
+    # FileNotFoundError, so the pin reported the wrong problem when the thing it
+    # guards had actually changed. It is the same CWD-relative-path hazard this
+    # branch has now fixed three times - df64c93, e4523e5, and the recursive pin -
+    # this time introduced by the pin written to guard against it.
     module_tree = ast.parse(
-        (_pathlib.Path(NitroSignalProcessor.__module__.replace(".", "/") + ".py"))
-        .read_text(encoding="utf-8")
+        (REPO_ROOT / (NitroSignalProcessor.__module__.replace(".", "/") + ".py")).read_text(
+            encoding="utf-8"
+        )
     )
     nitro_process = next(
         fn
