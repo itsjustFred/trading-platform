@@ -96,6 +96,221 @@ def test_live_preflight_passes_for_demo_and_paper_accounts(tmp_path: Path) -> No
     assert result.deployment_errors == []
 
 
+def test_live_preflight_warns_when_ctrader_resolves_to_live_mode(tmp_path: Path) -> None:
+    """A cTrader account configured for live must be a warning, not silence.
+
+    `CTRADER_DEMO` is false, so the credentials resolve to live. The warning is the
+    only signal that the operator is about to arm real money - and removing it leaves
+    every collected test green, because the one cTrader preflight test sets
+    `CTRADER_DEMO: "true"` and asserts only `result.ok`.
+
+    Preflight still passes (`ok is True`), which is what makes the warning the only
+    thing standing between a demo deployment and a live one. Asserted on the warning
+    text rather than `ok`, so a test cannot pass by failing the account instead.
+    """
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: ctrader-live
+            broker: ctrader
+            ctid: "12345"
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: ctrader-live
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+
+    result = run_live_preflight(
+        config_path,
+        env={
+            "CTRADER_APP_ID": "app",
+            "CTRADER_APP_SECRET": "secret",
+            "CTRADER_ACCESS_TOKEN": "token",
+            "CTRADER_REFRESH_TOKEN": "refresh",
+            "CTRADER_DEMO": "false",
+        },
+        check_connectivity=False,
+    )
+
+    account = result.accounts[0]
+    assert account.ok is True, (
+        "the account should still pass; the warning is the signal, not a failure: "
+        + repr(account.errors)
+    )
+    assert any("live mode" in warning for warning in account.warnings), (
+        "a cTrader account resolving to live mode produced no warning, so the operator "
+        "has no signal that this deployment trades real money: " + repr(account.warnings)
+    )
+
+    # And demo mode must stay quiet, so the warning cannot become unconditional noise.
+    demo_config = _write_config(
+        tmp_path / "demo.yaml",
+        """
+        accounts:
+          - id: ctrader-demo
+            broker: ctrader
+            ctid: "12345"
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: ctrader-demo
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+    demo = run_live_preflight(
+        demo_config,
+        env={
+            "CTRADER_APP_ID": "app",
+            "CTRADER_APP_SECRET": "secret",
+            "CTRADER_ACCESS_TOKEN": "token",
+            "CTRADER_REFRESH_TOKEN": "refresh",
+            "CTRADER_DEMO": "true",
+        },
+        check_connectivity=False,
+    )
+    assert not any("live mode" in warning for warning in demo.accounts[0].warnings), (
+        "a demo account was warned about live mode: " + repr(demo.accounts[0].warnings)
+    )
+
+
+def test_live_preflight_warns_when_the_ctrader_refresh_token_is_missing(
+    tmp_path: Path,
+) -> None:
+    """No refresh token means token refresh cannot be verified - say so.
+
+    Without `CTRADER_REFRESH_TOKEN` the adapter cannot rotate its access token, so the
+    account will stop working once the current token expires, and it will do so with a
+    daemon log rather than a preflight answer. The warning is the only chance to see it
+    at start-up; removing it leaves every test green, because every cTrader fixture
+    supplies a refresh token.
+    """
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: ctrader-demo
+            broker: ctrader
+            ctid: "12345"
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: ctrader-demo
+            symbols: [EURUSD]
+            timeframe: 15m
+        """,
+    )
+
+    base_env = {
+        "CTRADER_APP_ID": "app",
+        "CTRADER_APP_SECRET": "secret",
+        "CTRADER_ACCESS_TOKEN": "token",
+        "CTRADER_DEMO": "true",
+    }
+
+    without = run_live_preflight(
+        config_path, env=base_env, check_connectivity=False
+    )
+    assert any(
+        "REFRESH_TOKEN" in warning for warning in without.accounts[0].warnings
+    ), (
+        "a missing refresh token produced no warning, so the account will fail later "
+        "when its token expires: " + repr(without.accounts[0].warnings)
+    )
+
+    with_token = run_live_preflight(
+        config_path,
+        env={**base_env, "CTRADER_REFRESH_TOKEN": "refresh"},
+        check_connectivity=False,
+    )
+    assert not any(
+        "REFRESH_TOKEN" in warning for warning in with_token.accounts[0].warnings
+    ), (
+        "the refresh-token warning appeared despite the token being present: "
+        + repr(with_token.accounts[0].warnings)
+    )
+
+
+def test_the_ctrader_connectivity_check_is_never_attempted_for_an_invalid_account(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """An account that cannot be routed must not also open a broker connection.
+
+    `_preflight_ctrader_account` runs the connectivity check only when
+    `check_connectivity and credentials is not None and not errors`. A wrong cTID
+    stops before any network call, which is worth pinning for a concrete reason: a
+    connect attempt with an identifier the broker will reject is an auth-failure
+    against the app, and repeated preflights are how an app gets rate-limited. A
+    non-numeric cTID is a config mistake a human fixes in seconds.
+
+    The adapter is replaced with a stub that records construction, so the assertion is
+    about whether a connection was *attempted*, not about what the broker answered.
+
+    Note on reachability. Both invalid-identifier shapes (non-numeric, and zero or
+    negative) are rejected by `parse_live_deployments_config` before any account
+    exists, so this test exercises the early return rather than the `not errors`
+    clause. That clause turns out to be an **equivalent mutant**: the only thing that
+    appends to `errors` before the check is `_ctrader_preflight_credentials`, and it
+    returns `None` in exactly the same breath, so `credentials is not None` already
+    excludes every case `not errors` would. Recorded rather than given a contrived
+    test - the behaviour is right, and the redundancy is harmless.
+    """
+    attempted: list[object] = []
+
+    class _ExplodingAdapter:
+        def __init__(self, **kwargs) -> None:
+            attempted.append(kwargs)
+
+        def connect(self, *_args, **_kwargs):
+            raise AssertionError("connect() must not be called for an invalid account")
+
+    monkeypatch.setattr("live_runner.preflight.CTraderLiveAdapter", _ExplodingAdapter)
+
+    env = {
+        "CTRADER_APP_ID": "app",
+        "CTRADER_APP_SECRET": "secret",
+        "CTRADER_ACCESS_TOKEN": "token",
+        "CTRADER_REFRESH_TOKEN": "refresh",
+        "CTRADER_DEMO": "true",
+    }
+
+    for ctid, reason in (("not-a-number", "numeric"), ("0", "non-positive")):
+        attempted.clear()
+        result = run_live_preflight(
+            _write_config(
+                tmp_path / f"invalid-{ctid}.yaml",
+                f"""
+                accounts:
+                  - id: ctrader-broken
+                    broker: ctrader
+                    ctid: "{ctid}"
+
+                deployments: []
+                """,
+            ),
+            env=env,
+            check_connectivity=True,
+        )
+
+        assert result.ok is False
+        assert attempted == [], (
+            f"a broker connection was attempted for cTID {ctid!r}: " + repr(attempted)
+        )
+        assert result.accounts == [], (
+            f"cTID {ctid!r} produced an account, so parsing accepted it: "
+            + repr(result.accounts)
+        )
+        assert any(reason in error for error in result.deployment_errors), (
+            f"cTID {ctid!r} was rejected without saying why: "
+            + repr(result.deployment_errors)
+        )
+
+
 def test_live_preflight_reports_missing_credentials(tmp_path: Path) -> None:
     config_path = _write_config(
         tmp_path / "live_deployments.yaml",
