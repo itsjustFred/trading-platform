@@ -224,30 +224,51 @@ def test_the_demo_identity_gate_compares_in_constant_time() -> None:
     ).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    fn = next(
+    # Every call site, not just the one this test was written against. There are two -
+    # `_live_account_fingerprint_mismatch_reason` (read-side gate) and
+    # `_invalidate_verification_for_changed_identity` (write-side invalidation) - and
+    # pinning one while the other went to `==` is exactly the single-implementation trap
+    # this whole sweep keeps finding. Mutating the second one survives the suite.
+    compared_sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        for call in ast.walk(node):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "hmac"
+            ):
+                compared_sites.append((node.name, call.func.attr))
+
+    assert compared_sites, "no hmac call sites found; has the module moved?"
+    plain = [(name, attr) for name, attr in compared_sites if attr != "compare_digest"]
+    assert not plain, (
+        "these sites no longer use hmac.compare_digest: " + repr(plain)
+    )
+
+    # Both fingerprint call sites must still be there, so this cannot pass by the
+    # comparisons being deleted outright.
+    for required in (
+        "_live_account_fingerprint_mismatch_reason",
+        "_invalidate_verification_for_changed_identity",
+    ):
+        assert any(name == required for name, _ in compared_sites), (
+            f"{required} no longer compares a fingerprint in constant time: "
+            + repr(compared_sites)
+        )
+
+    # And the guard is still the *negative* one: mismatch means refuse.
+    gate_fn = next(
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
         and node.name == "_live_account_fingerprint_mismatch_reason"
     )
-    compared = [
-        node.func.attr
-        for node in ast.walk(fn)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "hmac"
-    ]
-    assert "compare_digest" in compared, (
-        "the broker identity fingerprint is no longer compared with "
-        "hmac.compare_digest; a plain comparison leaks how much of the hash matched: "
-        + repr(compared)
-    )
-
-    # And the guard is still the *negative* one: mismatch means refuse.
     mismatch_branches = [
         node
-        for node in ast.walk(fn)
+        for node in ast.walk(gate_fn)
         if isinstance(node, ast.If)
         and isinstance(node.test, ast.UnaryOp)
         and isinstance(node.test.op, ast.Not)
@@ -269,7 +290,7 @@ def test_the_demo_identity_gate_compares_in_constant_time() -> None:
     # Both are fail-closed guards on conditions that cannot occur, so removing either
     # changes nothing observable. Recorded here rather than given tests, because a test
     # asserting an unreachable branch asserts nothing.
-    source_text = ast.unparse(fn)
+    source_text = ast.unparse(gate_fn)
     assert "if not current:" in source_text, (
         "the empty-fingerprint guard was removed; it is currently unreachable (a "
         "hexdigest is never empty), but it documents the invariant"
