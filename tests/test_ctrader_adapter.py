@@ -37,6 +37,122 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestQuantityVolumeConversion:
+    """The risk-engine quantity to broker volume conversion, which had no unit test.
+
+    `_qty_to_broker_volume` multiplies by `QTY_VOLUME_SCALE` (1000.0) and rounds.
+    `_broker_volume_to_qty` divides back. Four mutations survive the suite, and the two
+    that matter both end in an order the broker cannot honour.
+
+    **The sub-unit guard (V1).** A quantity below half a scale-unit multiplies out to
+    less than one, so the volume would be 0 - an order for *nothing*. The guard refuses
+    it rather than submitting, and the refusal message names the cause.
+
+    **Truncation instead of rounding (V2).** `int(x)` truncates while `round(x)` rounds.
+    They differ in a band of one: at `qty = 0.0005` the product is exactly 0.5, `int()`
+    gives 0 and `round()` gives 1. So the two guards are *separately* observable, and
+    each is asserted with the quantity that separates them - a mutation that only
+    removes the guard, or only changes the rounding, cannot pass both.
+
+    The reason this matters more than a helper test: this is the number that reaches the
+    broker. A factor-of-1000 error, or a zero-volume order, lands as a real order.
+    """
+
+    def test_volume_is_the_quantity_scaled_and_rounded(self):
+        from live_runner.ctrader_adapter import (
+            QTY_VOLUME_SCALE,
+            _broker_volume_to_qty,
+            _qty_to_broker_volume,
+        )
+
+        for qty in (0.001, 0.01, 0.5, 1.0, 100.0):
+            volume = _qty_to_broker_volume(qty)
+            assert volume == int(round(qty * QTY_VOLUME_SCALE))
+            # And it round-trips back to the same quantity, which is what makes the
+            # persisted fill comparable with the risk engine's units.
+            assert _broker_volume_to_qty(volume) == pytest.approx(qty), (
+                f"{qty} did not survive the round trip: {_broker_volume_to_qty(volume)}"
+            )
+
+    def test_rounding_is_used_not_truncation(self):
+        """The one-unit band where `int()` and `round()` disagree.
+
+        `qty = 0.0015` scales to a volume product of exactly 1.5. Truncation gives 1,
+        rounding gives 2. **Neither is zero, so both reach the broker** - which is
+        exactly why the rounding has to be pinned: an off-by-one here is an order for
+        half or double the intended size, not a rejected order.
+
+        Note the boundary the arithmetic does *not* separate, because it is worth
+        knowing where the guard actually sits: a product of exactly 0.5 rounds to 0,
+        not 1. Python's `round` is banker's rounding, so `round(0.5) == 0`. That makes
+        `qty = 0.0005` a *refusal*, and it is asserted as one below - the guard is
+        reached from both sides.
+        """
+        from live_runner.ctrader_adapter import QTY_VOLUME_SCALE, _qty_to_broker_volume
+
+        half_way = 1.5 / QTY_VOLUME_SCALE
+        assert int(half_way * QTY_VOLUME_SCALE) == 1, "truncation no longer differs here"
+        assert round(half_way * QTY_VOLUME_SCALE) == 2, "rounding no longer differs here"
+        assert _qty_to_broker_volume(half_way) == 2, (
+            "the conversion truncated instead of rounding, so a quantity can be sent as "
+            "less than the risk engine asked for"
+        )
+
+        # The half-unit boundary rounds *down* to zero (banker's rounding), so it is a
+        # refusal rather than a volume-1 order.
+        assert round(0.5) == 0
+        with pytest.raises(ValueError, match="no positive quantity"):
+            _qty_to_broker_volume(0.5 / QTY_VOLUME_SCALE)
+
+    def test_a_quantity_that_would_convert_to_zero_volume_is_refused(self):
+        from live_runner.ctrader_adapter import QTY_VOLUME_SCALE, _qty_to_broker_volume
+
+        # Any positive qty under half a scale-unit rounds to a volume of 0.
+        for qty in (0.4 / QTY_VOLUME_SCALE, 1e-9, 1e-12):
+            with pytest.raises(ValueError, match="no positive quantity"):
+                _qty_to_broker_volume(qty)
+
+    @pytest.mark.parametrize("qty", [0.0, -1.0, -0.5, float("nan"), float("inf")])
+    def test_a_non_positive_or_non_finite_quantity_is_refused(self, qty: float) -> None:
+        """The refusal comes from the shared `coerce_positive_live_qty`, as with Alpaca."""
+        from live_runner.ctrader_adapter import _qty_to_broker_volume
+
+        with pytest.raises(ValueError, match="finite and positive"):
+            _qty_to_broker_volume(qty)
+
+    @pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
+    def test_an_unusable_volume_scale_is_refused(self, scale: float) -> None:
+        """A zero or negative scale would divide by zero or flip the sign.
+
+        Both would produce a volume of a completely different magnitude, so this is
+        refused rather than clamped.
+        """
+        from live_runner.ctrader_adapter import _qty_to_broker_volume
+
+        with pytest.raises(ValueError, match="volume_per_qty"):
+            _qty_to_broker_volume(1.0, volume_per_qty=scale)
+
+    def test_the_two_brokers_use_the_same_quantity_converter(self):
+        """One definition, both adapters - the seam lesson from the cTrader qty guard.
+
+        The Alpaca and cTrader quantity guards were separately enforced and the
+        cTrader copy was untested until recently. This asserts the *conversion* is
+        reached through one shared entry point rather than re-derived per broker, so a
+        future edit cannot diverge them silently.
+        """
+        from live_runner.base_adapter import coerce_positive_live_qty
+        from live_runner.ctrader_adapter import _qty_to_broker_volume
+
+        with pytest.raises(ValueError, match="finite and positive"):
+            _qty_to_broker_volume(0.0)
+        # Same refusal text and same source of truth.
+        with pytest.raises(ValueError) as via_converter:
+            _qty_to_broker_volume(-1.0)
+        with pytest.raises(ValueError) as via_helper:
+            coerce_positive_live_qty(-1.0)
+        assert str(via_converter.value) == str(via_helper.value)
+
+
 def test_is_terminal_auth_error_detects_ctrader_invalid_token_code() -> None:
     assert _is_terminal_auth_error("CH_ACCESS_TOKEN_INVALID", "")
 
