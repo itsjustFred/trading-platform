@@ -7,6 +7,8 @@ import pytest
 
 from shared.models import (
     BacktestMeta,
+    BacktestStats,
+    PortfolioStats,
     BacktestResult,
     EquityPoint,
     StrategyMeta,
@@ -314,6 +316,116 @@ class TestTrade:
         assert "r_multiple" not in d
         assert "tags" not in d
         assert "meta" not in d
+
+
+class TestStatsExtrasRoundtrip:
+    """`BacktestStats.extras` is the forward-compatibility bucket, and it was dropped.
+
+    `BacktestStats.from_dict` splits a payload into known dataclass fields and an
+    `extras` dict holding everything else. Emptying that dict loses every metric a newer
+    producer wrote, on read-back only — and nothing raises, because the reader succeeded.
+
+    The mutation survives because the existing round-trip test only uses metrics that
+    *are* dataclass fields, so the extras bucket is exercised empty in both directions.
+    That is the shape of fixture blind spot this whole sweep has been about.
+
+    Two directions are asserted, because they fail differently:
+
+    - producer writes a custom metric, reader must preserve it
+    - a payload can also carry a field the *class* no longer has, and that is exactly
+      the case `extras` exists for
+    """
+
+    def test_a_custom_metric_survives_the_roundtrip(self):
+        original = BacktestStats(sharpe_ratio=1.5, cagr=0.2)
+        original.extras["deflated_sharpe"] = 1.42
+        original.extras["custom_engine_flag"] = "v2"
+
+        restored = BacktestStats.from_dict(original.to_dict())
+
+        assert restored.extras == {"deflated_sharpe": 1.42, "custom_engine_flag": "v2"}, (
+            "custom metrics were dropped on the way back in: " + repr(restored.extras)
+        )
+        # The known fields are unaffected, so the fix cannot be "keep everything raw".
+        assert restored.sharpe_ratio == 1.5
+        assert restored.cagr == 0.2
+
+    def test_an_unknown_field_from_a_newer_producer_is_kept_in_extras(self):
+        payload = {
+            "sharpe_ratio": 2.0,
+            "psr": 0.9,
+            "a_metric_from_the_future": [1, 2, 3],
+        }
+        restored = BacktestStats.from_dict(payload)
+
+        assert restored.extras == {"a_metric_from_the_future": [1, 2, 3]}, (
+            "a field this class does not know about was discarded rather than kept in "
+            "extras: " + repr(restored.extras)
+        )
+        assert restored.sharpe_ratio == 2.0
+        assert restored.psr == 0.9
+
+    def test_portfolio_correlation_matrix_survives_the_roundtrip(self):
+        """`PortfolioStats.correlation_matrix` must not serialise as an empty dict.
+
+        It is the one field in the class that is a nested structure rather than a
+        scalar, so replacing it with `{}` is a plausible-looking mutation that no
+        scalar-field test notices. The correlation tests in
+        `test_portfolio_optimizer_oos.py` exercise `_compute_correlation_matrix`, the
+        *producer*; nothing checked the matrix survives being read back.
+
+        The consequence is the portfolio shortlist losing the input to its own
+        diversification decision: a single-strategy portfolio and a correlated pair both
+        come back as `{}`, so anything downstream that reads it sees no correlation
+        rather than measured correlation.
+
+        Two shapes, because a one-element matrix is the easy one to get wrong: a full
+        2x2 and a single-strategy 1x1.
+        """
+        matrix = {"a": {"a": 1.0, "b": 0.42}, "b": {"a": 0.42, "b": 1.0}}
+        original = PortfolioStats(
+            sharpe=1.4,
+            sortino=1.9,
+            cagr=0.18,
+            max_drawdown=-9.5,
+            net_profit=18000.0,
+            win_rate=0.55,
+            profit_factor=1.6,
+            calmar=1.1,
+            total_return=0.18,
+            psr=0.87,
+            p_value=0.04,
+            correlation_matrix=matrix,
+        )
+
+        payload = original.to_dict()
+        assert payload["correlation_matrix"] == matrix, (
+            "the correlation matrix was written as an empty dict: "
+            + repr(payload["correlation_matrix"])
+        )
+
+        restored = PortfolioStats.from_dict(payload)
+        assert restored.correlation_matrix == matrix, (
+            "the correlation matrix was lost on the way back in: "
+            + repr(restored.correlation_matrix)
+        )
+        # Known scalars are unaffected, so the guard is not satisfied by keeping the
+        # whole payload raw.
+        assert restored.sharpe == 1.4
+        assert restored.psr == 0.87
+
+        single = PortfolioStats(correlation_matrix={"only": {"only": 1.0}})
+        assert single.to_dict()["correlation_matrix"] == {"only": {"only": 1.0}}
+        assert (
+            PortfolioStats.from_dict(single.to_dict()).correlation_matrix
+            == {"only": {"only": 1.0}}
+        )
+
+    def test_extras_is_empty_when_there_is_nothing_unrecognised(self):
+        restored = BacktestStats.from_dict(
+            BacktestStats(sharpe_ratio=1.0).to_dict()
+        )
+        assert restored.extras == {}, repr(restored.extras)
 
 
 class TestBacktestResultEvidence:
