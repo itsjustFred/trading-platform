@@ -37,6 +37,185 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestSymbolScaleFromBrokerProps:
+    """The per-symbol unit conversion, which decides what a position is denominated in.
+
+    `_symbol_scale_from_broker_props` builds `volume_per_qty = lot_size / 100`. Four
+    mutations survive, and every one of them is a **misstated exposure**: the qty unit is
+    0.01 lots, so a wrong scale here is a wrong position size by a factor of 100 or more -
+    on XAU and indices, where the module's own docstring warns this can be 10-1000x.
+
+    The rule throughout is the module's: **build from broker values, fall back only where
+    the broker value is unusable, and return `None` rather than a guess.** `None` is not a
+    failure to be retried - it is how the caller learns to refuse to scale a symbol at all,
+    which is the correct outcome for a fill on an unknown unit.
+
+    So these tests pin the *shape* of the refusal as much as its presence. A surviving C4
+    mutation would return a plausible FX scale for a symbol whose props never arrived,
+    which is precisely the guess the surrounding code refuses to make.
+
+    The digit range is the subtle one: `0` and `10` are **accepted**, because cTrader does
+    report those for real symbols. Only values outside `0..10` fall back.
+    """
+
+    @staticmethod
+    def _fallback():
+        from live_runner.ctrader_adapter import SymbolScale
+
+        return SymbolScale(
+            volume_per_qty=1000.0, price_digits=5, min_volume=1, lot_size=100000.0
+        )
+
+    @staticmethod
+    def _build(**kwargs):
+        from live_runner.ctrader_adapter import _symbol_scale_from_broker_props
+
+        kwargs.setdefault("fallback", None)
+        return _symbol_scale_from_broker_props(**kwargs)
+
+    def test_a_complete_set_of_broker_props_produces_the_scale(self) -> None:
+        """The happy path, with the FX contract asserted rather than assumed.
+
+        `100000 / 100 == 1000`: one qty unit is 0.01 lots, so 100000 units of lot size
+        make 1000 broker volume units. This is the number every cTrader order size runs
+        through, so it is pinned directly.
+        """
+        scale = self._build(digits=5, lot_size=100000.0, min_volume=1)
+        assert scale is not None
+        assert scale.volume_per_qty == 1000.0, scale.volume_per_qty
+        assert scale.price_digits == 5
+        assert scale.min_volume == 1
+
+    def test_the_lot_size_is_divided_by_one_hundred(self) -> None:
+        """Not every symbol is FX, so this is asserted with a second lot size."""
+        for lot_size, expected in ((100000.0, 1000.0), (1000.0, 10.0), (10.0, 0.1)):
+            scale = self._build(digits=3, lot_size=lot_size, min_volume=1)
+            assert scale is not None
+            assert scale.volume_per_qty == expected, (
+                f"lot_size {lot_size} produced {scale.volume_per_qty}, not {expected}"
+            )
+
+    @pytest.mark.parametrize("digits", [None, -1, 11, 20, 99])
+    def test_an_unusable_digit_count_falls_back_or_refuses(self, digits) -> None:
+        """Outside 0..10 there is no digit count worth trusting."""
+        # No fallback: refuse rather than invent one.
+        assert self._build(digits=digits, lot_size=100000.0, min_volume=1) is None
+        # With a fallback: use the fallback's digits, and the rest stays broker-sourced.
+        scale = self._build(digits=digits, lot_size=100000.0, min_volume=1, fallback=self._fallback())
+        assert scale is not None
+        assert scale.price_digits == 5, f"{digits!r} did not fall back to the fallback digits"
+
+    @pytest.mark.parametrize("digits", [0, 10])
+    def test_the_boundary_digit_counts_are_accepted(self, digits: int) -> None:
+        """`0` and `10` are inside the range and are what cTrader actually reports.
+
+        Asserted because an off-by-one in the range check would silently drop a real
+        symbol to the fallback table - and for a symbol whose fallback does not exist,
+        to a refusal on every fill.
+        """
+        scale = self._build(digits=digits, lot_size=100000.0, min_volume=1)
+        assert scale is not None, f"digits={digits} was treated as out of range"
+        assert scale.price_digits == digits
+
+    @pytest.mark.parametrize(
+        "lot_size", [None, 0.0, -1.0, float("nan"), float("inf"), "not-a-number"]
+    )
+    def test_an_unusable_lot_size_falls_back_or_refuses(self, lot_size) -> None:
+        """A zero or negative lot size would scale every order by zero or flip its sign."""
+        assert self._build(digits=5, lot_size=lot_size, min_volume=1) is None
+        scale = self._build(
+            digits=5, lot_size=lot_size, min_volume=1, fallback=self._fallback()
+        )
+        assert scale is not None
+        assert scale.lot_size == 100000.0, "the broker's unusable lot size was kept"
+
+    @pytest.mark.parametrize("min_volume", [None, 0, -1, -99])
+    def test_a_non_positive_minimum_volume_falls_back_or_refuses(self, min_volume) -> None:
+        """`min_volume` is the fail-closed floor on order size.
+
+        A zero floor would let a sub-minimum order through to the broker; a negative one
+        is nonsense. Both are refused without a fallback.
+        """
+        assert self._build(digits=5, lot_size=100000.0, min_volume=min_volume) is None
+        scale = self._build(
+            digits=5, lot_size=100000.0, min_volume=min_volume, fallback=self._fallback()
+        )
+        assert scale is not None
+        assert scale.min_volume == 1, "the broker's unusable minimum volume was kept"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"digits": None, "lot_size": 100000.0, "min_volume": 1},
+            {"digits": 5, "lot_size": None, "min_volume": 1},
+            {"digits": 5, "lot_size": 100000.0, "min_volume": None},
+            {"digits": None, "lot_size": None, "min_volume": None},
+        ],
+    )
+    def test_an_incomplete_scale_is_refused_rather_than_filled_in(self, kwargs) -> None:
+        """**The important one: `None` means "refuse to scale this symbol", not "retry".
+
+        A surviving mutation here would substitute a plausible FX scale for a symbol whose
+        props never arrived - a real-looking `volume_per_qty` for an instrument it knows
+        nothing about. That is the guess this whole function exists to avoid, and it is
+        invisible afterwards: the order would simply be the wrong size.
+
+        Each field is dropped in turn, since a mutation only has to break one to pass.
+        """
+        scale = self._build(**kwargs)
+        assert scale is None, (
+            f"an incomplete scale was returned as {scale!r} - the caller would size an "
+            "order from a symbol whose units are unknown"
+        )
+
+    def test_a_non_numeric_digit_count_falls_back_rather_than_raising(self) -> None:
+        """Unparseable metadata degrades, it does not crash the symbol load.
+
+        A string digits value is a realistic broker payload difference, and the load path
+        iterates every symbol - so raising here would take out the whole cache rather than
+        one entry.
+        """
+        assert self._build(digits="five", lot_size=100000.0, min_volume=1) is None
+        scale = self._build(
+            digits="five", lot_size=100000.0, min_volume=1, fallback=self._fallback()
+        )
+        assert scale is not None and scale.price_digits == 5
+
+    def test_the_broker_value_wins_over_the_fallback(self) -> None:
+        """When the broker reports a usable value, the fallback is not consulted.
+
+        The fallback table is a static guess by symbol class; the broker props are
+        authoritative. Overriding them would make every symbol's scale depend on the
+        fallback table being right for that instrument, which is the failure mode #80
+        was opened for.
+        """
+        from live_runner.ctrader_adapter import SymbolScale
+
+        stale = SymbolScale(
+            volume_per_qty=1.0, price_digits=2, min_volume=999, lot_size=100.0
+        )
+        scale = self._build(
+            digits=5, lot_size=100000.0, min_volume=1, fallback=stale
+        )
+        assert scale is not None
+        assert scale.volume_per_qty == 1000.0
+        assert scale.price_digits == 5
+        assert scale.min_volume == 1, "the fallback's minimum volume won over the broker's"
+
+    def test_the_fallback_fills_only_the_fields_it_must(self) -> None:
+        """A fallback supplies the gaps and nothing else.
+
+        With one bad broker field and two good ones, the two good ones stay broker-derived.
+        """
+        scale = self._build(
+            digits=5, lot_size=100000.0, min_volume=-1, fallback=self._fallback()
+        )
+        assert scale is not None
+        assert scale.price_digits == 5, "the broker's digit count was overwritten"
+        assert scale.lot_size == 100000.0, "the broker's lot size was overwritten"
+        assert scale.min_volume == 1, "only the bad field should have come from the fallback"
+
+
 class TestFillIdentityResolution:
     """Which signal a fill belongs to, which was entirely untested. Eight survivors.
 
