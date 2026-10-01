@@ -37,6 +37,297 @@ def test_is_terminal_auth_error_detects_invalid_token_code() -> None:
     assert _is_terminal_auth_error("INVALID_TOKEN", "")
 
 
+class TestCancelEligibilityAndIdCoercion:
+    """Which resting orders may be cancelled, and which ids may be believed. Seven survivors.
+
+    `_is_working_order` decides whether a cancel is legal. The cost of being wrong is
+    asymmetric, and the docstring says so: cancelling a filled or already-cancelled order
+    is **rejected by cTrader**, and because that rejection propagates it aborts the sweep
+    and leaves *every other* resting order uncancelled. So one bad status value takes out
+    the whole orphan sweep, and the orders it abandons are the orphans it existed to clean
+    up.
+
+    That asymmetry is why the function fails in a particular direction three separate
+    times, and all three are pinned below:
+
+    - **Status enum absent** -> cancel on type alone.
+    - **Status attribute absent or unreadable** -> cancel on type alone.
+    - **Status present and readable** -> only `ACCEPTED` is working.
+
+    The first two are *not* cautiousness. For an order we are about to cancel, the unsafe
+    direction is leaving it resting, so "I cannot tell" resolves to "cancel". Pinned as
+    behaviour rather than left implicit, because the natural instinct on reading
+    `return True` after two checks that both mean "unknown" is that something is inverted.
+
+    `_coerce_broker_order_id` is the other half: it gates the **duplicate-submission**
+    path, where returning a bogus id means a second live order for a signal that already
+    has one.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        return adapter
+
+    class _StatusEnum:
+        ORDER_STATUS_ACCEPTED = 1
+
+    def test_only_accepted_orders_are_treated_as_working(self) -> None:
+        """Every non-ACCEPTED status is terminal, whatever its number.
+
+        Filled, cancelled, rejected and the rest are all terminal. Asserted across a
+        spread of values rather than one, because a mutation that added a second status
+        to the set would pass a single-value test.
+        """
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = self._StatusEnum
+        working = adapter._is_working_order
+
+        assert working(SimpleNamespace(orderStatus=1)) is True, (
+            "an ACCEPTED order was not treated as working, so it would never be cancelled"
+        )
+        for terminal in (2, 3, 4, 5, 0, -1, 99):
+            assert working(SimpleNamespace(orderStatus=terminal)) is False, (
+                f"status {terminal} was treated as a cancellable working order"
+            )
+
+    def test_an_absent_status_enum_cancels_on_type_alone(self) -> None:
+        """Cannot tell -> cancel. Asserted so `return True` is not read as a mistake.
+
+        Two reasons this direction is right, and both are load-bearing: an unknown enum
+        means an older proto build, where the attribute may carry anything; and for an
+        order already selected for cancellation, the unsafe outcome is the order staying
+        resting, not a rejected cancel. The rejected cancel costs one log line; the
+        resting order costs exposure.
+        """
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = None
+        assert adapter._is_working_order(SimpleNamespace(orderStatus=2)) is True
+        assert adapter._is_working_order(SimpleNamespace(orderStatus=1)) is True
+
+    def test_an_unreadable_status_does_not_cancel_KNOWN_INCONSISTENCY(self) -> None:
+        """**Pinned as-is, because the code contradicts its own stated policy here.**
+
+        My first version of this test asserted that an unreadable status cancels on type
+        alone, reasoning from the docstring. It failed, and the code is right that my
+        expectation was wrong about what it does - but the behaviour is the interesting
+        part. There are three ways of saying "we cannot tell", and they do not agree:
+
+        | unknown because... | cancels? |
+        |---|---|
+        | the status enum is absent | **yes** |
+        | the status attribute is `None` | **yes** |
+        | the status will not convert to `int` | **no** |
+
+        The third row contradicts the docstring directly: *"for an order we are about to
+        cancel the unsafe direction is leaving it resting, so the caller cancels on type
+        alone."* By that rule an unparseable status should cancel. It does not.
+
+        So this is a **known inconsistency, not a verified policy**, and it is left
+        unmodified because either resolution changes live cancel behaviour:
+
+        - Treat it as unknown and cancel (consistent with the docstring): an already-filled
+          order produces a rejected cancel, which propagates and **aborts the orphan
+          sweep**, leaving every other resting order uncancelled.
+        - Leave it uncancellable (current behaviour): a genuinely working order whose
+          status arrived as a proto enum object rather than an int **stays resting**, which
+          is the exposure the docstring says to avoid.
+
+        Both outcomes are real, and choosing between them is a trading decision about which
+        failure is cheaper. Tracked as `needs-decision` in the backlog rather than silently
+        resolved here.
+
+        The test name ends `_KNOWN_INCONSISTENCY` so the next person to touch this is told.
+        """
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = self._StatusEnum
+        for unreadable in ("not-an-int", "ACCEPTED", object()):
+            assert adapter._is_working_order(
+                SimpleNamespace(orderStatus=unreadable)
+            ) is False, (
+                f"an unreadable status {unreadable!r} now cancels, so the inconsistency "
+                "documented in this test has been resolved - update it and the backlog "
+                "entry together"
+            )
+
+    def test_the_three_unknown_status_responses_are_pinned_together(self) -> None:
+        """The three cases above, asserted side by side so they cannot drift apart.
+
+        Splitting them across separate tests is how the inconsistency became invisible in
+        the first place: each looked locally reasonable. Asserting the triple in one place
+        makes the disagreement visible at a glance, which is the only reason to keep it
+        while it is unresolved.
+        """
+        adapter = self._adapter()
+        enum = self._StatusEnum
+
+        adapter._ProtoOAOrderStatus = enum
+        cancels_when_attribute_missing = adapter._is_working_order(
+            SimpleNamespace(orderStatus=None)
+        )
+        does_not_cancel_when_unreadable = adapter._is_working_order(
+            SimpleNamespace(orderStatus="ACCEPTED")
+        )
+        adapter._ProtoOAOrderStatus = None
+        cancels_when_enum_missing = adapter._is_working_order(SimpleNamespace(orderStatus=2))
+
+        assert cancels_when_attribute_missing is True
+        assert does_not_cancel_when_unreadable is False
+        assert cancels_when_enum_missing is True
+        assert cancels_when_attribute_missing != does_not_cancel_when_unreadable, (
+            "the two ways of not-knowing now agree; if that was deliberate, drop the "
+            "KNOWN_INCONSISTENCY test and the backlog entry"
+        )
+
+    def test_an_absent_status_attribute_cancels_on_type_alone(self) -> None:
+        """No status at all is unknown, and unknown cancels."""
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = self._StatusEnum
+        assert adapter._is_working_order(SimpleNamespace()) is True
+
+    def test_the_newer_order_status_attribute_wins_over_the_older_one(self) -> None:
+        """When a proto exposes both, `orderStatus` decides.
+
+        Pinned because the two disagreeing is the whole reason the attribute preference
+        exists: a newer build populating `orderStatus` while a legacy `status` field
+        still holds a stale value would otherwise cancel on the stale one. Asserted with
+        the two attributes set to opposite answers.
+        """
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = self._StatusEnum
+        assert adapter._is_working_order(
+            SimpleNamespace(orderStatus=2, status=1)
+        ) is False, "the newer attribute was overridden by the older one"
+        assert adapter._is_working_order(
+            SimpleNamespace(orderStatus=1, status=2)
+        ) is True, "the newer attribute was overridden by the older one"
+        # And when the newer attribute is None, the older one is consulted.
+        assert adapter._is_working_order(
+            SimpleNamespace(orderStatus=None, status=2)
+        ) is False
+
+    def test_a_broker_order_id_is_coerced_or_refused(self) -> None:
+        """Only a positive integer is an order id we will act on.
+
+        This gates duplicate submission: a returned id means "this signal already has an
+        order, return it instead of submitting another". So a wrong-but-accepted value
+        does not corrupt data, it **opens a second live position**.
+        """
+        adapter = self._adapter()
+        coerce = adapter._coerce_broker_order_id
+
+        assert coerce("123") == 123, "a numeric string is the normal stored form"
+        assert coerce(123) == 123
+        for refused in (0, -1, -99, "", None, "abc", True, False):
+            assert coerce(refused) is None, (
+                f"{refused!r} was accepted as a broker order id, which would short-circuit "
+                "duplicate submission"
+            )
+
+    def test_a_bool_order_id_is_refused_rather_than_read_as_one_or_zero(self) -> None:
+        """`True` is an `int` in Python, so `int(True) == 1` - a real order id.
+
+        This is the same trap as `position_id: True` in the exit-only path, and it is
+        worth asserting in both places: without the check, a bool in the database would
+        resolve to order 1 and suppress a legitimate submission.
+        """
+        adapter = self._adapter()
+        assert adapter._coerce_broker_order_id(True) is None
+        assert adapter._coerce_broker_order_id(False) is None
+
+    def test_a_float_order_id_is_truncated_to_an_int(self) -> None:
+        """Documented rather than asserted as a bug: `123.9` becomes `123`.
+
+        cTrader order ids are integers, so this only matters for a corrupt stored value -
+        and truncating is the tolerant reading here. Pinned so the behaviour is a
+        decision on record rather than an accident, and so a future change to *refuse*
+        floats would be deliberate.
+        """
+        adapter = self._adapter()
+        assert adapter._coerce_broker_order_id(123.9) == 123
+
+    def test_a_non_uuid_signal_id_returns_none_rather_than_raising(self) -> None:
+        """The parser's contract is "None when it cannot tell", and the caller relies on it.
+
+        `reconcile_executions` iterates ids from the database and does
+        `if signal_uuid is None: continue`. So returning `None` is the designed path for a
+        row we cannot parse, and the test asserts the garbage-string case that reaches it.
+        """
+        adapter = self._adapter()
+        parse = adapter._parse_signal_uuid
+        assert parse("00000000-0000-0000-0000-000000000001") is not None
+        for unparseable in ("not-a-uuid", "", "123", "00000000-0000"):
+            assert parse(unparseable) is None, (
+                f"{unparseable!r} did not return None, so reconciliation would not skip it"
+            )
+
+    def test_a_non_uuid_client_order_id_is_refused_not_raised(self) -> None:
+        """A fill whose `clientOrderId` is not a UUID cannot be attributed, and must not crash.
+
+        Both the blank and the malformed case are asserted, and the blank case matters on
+        its own: cTrader does not always echo `clientOrderId`, so "absent" is an ordinary
+        broker response rather than a malformed one, and it is logged as a warning with the
+        order id attached before being refused.
+        """
+        adapter = self._adapter()
+        parse = adapter._parse_client_order_id
+        valid = "00000000-0000-0000-0000-000000000001"
+        assert parse(valid, order_id=1, execution_type=1) is not None
+        assert parse("", order_id=1, execution_type=1) is None
+        assert parse("not-a-uuid", order_id=1, execution_type=1) is None
+
+    def test_a_blank_client_order_id_warns_distinctly_from_a_malformed_one(self, caplog) -> None:
+        """**W8 is an equivalent mutant**, and the reason is that its job is the log.
+
+        Removing `if not client_order_id:` returns `None` either way, because `UUID("")`
+        raises `ValueError` and the `except` below already catches it. So no return-value
+        assertion can ever kill it.
+
+        What the guard actually does is emit a *different warning*:
+
+        - blank      -> "cTrader fill missing clientOrderId mapping"
+        - malformed  -> "cTrader fill has non-UUID clientOrderId"
+
+        That difference is the whole value of the branch. cTrader does not always echo
+        `clientOrderId`, so "absent" is an **ordinary broker response** rather than a
+        protocol violation, and telling those two apart in the log is how an operator can
+        tell a broker behaviour change from a bug. So the assertion is on the logged
+        message, which is the only thing the branch actually distinguishes.
+
+        If the two are ever deliberately unified, this test is the thing to delete first.
+        """
+        import logging
+
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        parse = adapter._parse_client_order_id
+
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            parse("", order_id=42, execution_type=1)
+            blank_messages = [r.getMessage() for r in caplog.records]
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            parse("not-a-uuid", order_id=42, execution_type=1)
+            malformed_messages = [r.getMessage() for r in caplog.records]
+
+        assert any("missing clientOrderId mapping" in m for m in blank_messages), (
+            f"a blank clientOrderId did not log the 'missing mapping' warning: {blank_messages}"
+        )
+        assert any("non-UUID clientOrderId" in m for m in malformed_messages), (
+            f"a malformed clientOrderId did not log its own warning: {malformed_messages}"
+        )
+        assert blank_messages != malformed_messages, (
+            "the two cases now log the same thing, so an operator can no longer tell a "
+            "broker behaviour change from a malformed payload"
+        )
+
+
 class TestTerminalAuthFailureAndRetryBudget:
     """How the adapter gives up on cTrader auth, and how long it keeps trying. Eight survivors.
 
