@@ -15,6 +15,114 @@ from data_tools.auto_download import has_ohlcv_bars_in_range
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 
 
+class TestOptimizationConfigParameterRanges:
+    """The `parameter_ranges` validator, one malformed spec at a time.
+
+    Five mutations survive the suite: `n_trials` losing `gt=0`, `extra="forbid"`
+    becoming `"ignore"`, and the three per-spec checks - an unsupported `type`, an
+    int/float spec missing `min`/`max`, and a categorical with no `choices`.
+
+    **Every existing fixture uses one perfectly-formed parameter.** The shared
+    `_optimization_config` helper passes `{"type": "int", "min": 2, "max": 2, "step": 1}`
+    for every test in the file, so the validator's *malformed* branch has no exercise at
+    all. That is the fixture blind spot this sweep keeps finding, in its purest form.
+
+    Why each refusal matters, since these are the inputs an optimisation study is built
+    from rather than executed against:
+
+    - **A spec missing `min`/`max`** produces a range the sampler cannot bound, so the
+      study either never terminates or silently searches an unbounded space.
+    - **A categorical with empty `choices`** offers the optimiser nothing to choose from.
+    - **An unsupported `type`** passes validation here and fails much later, deep in the
+      sampler, where the message no longer names the parameter.
+    - **`n_trials <= 0`** runs zero trials and reports an empty study as a result.
+    - **`extra="ignore"`** accepts a misspelled field, so `n_trials: 500` is silently
+      discarded and the study runs at the default 100 trials.
+
+    Each is asserted as a rejection, and the valid form alongside so the guard cannot be
+    satisfied by refusing everything.
+    """
+
+    def _config(self, **overrides):
+        payload = {
+            "base_backtest_id": "base-demo",
+            "target_metric": "sharpe",
+            "n_trials": 1,
+            "train_split_pct": 0.7,
+            "parameter_ranges": {"window": {"type": "int", "min": 2, "max": 8}},
+        }
+        payload.update(overrides)
+        return optimizer_module.OptimizationConfig(**payload)
+
+    def test_an_int_range_without_boundaries_is_refused(self):
+        for spec in (
+            {"type": "int"},
+            {"type": "float"},
+            {"type": "int", "min": 2},
+            {"type": "float", "max": 8},
+        ):
+            with pytest.raises(ValidationError, match="boundaries"):
+                self._config(parameter_ranges={"window": spec})
+
+        # And a complete one is accepted, both types.
+        assert self._config(
+            parameter_ranges={"a": {"type": "int", "min": 1, "max": 2}}
+        ).parameter_ranges["a"]["type"] == "int"
+        assert self._config(
+            parameter_ranges={"a": {"type": "float", "min": 0.1, "max": 0.9}}
+        ).parameter_ranges["a"]["type"] == "float"
+
+    def test_a_categorical_without_choices_is_refused(self):
+        for spec in (
+            {"type": "categorical"},
+            {"type": "categorical", "choices": []},
+            {"type": "categorical", "choices": "abc"},
+        ):
+            with pytest.raises(ValidationError, match="choices"):
+                self._config(parameter_ranges={"mode": spec})
+
+        assert self._config(
+            parameter_ranges={"mode": {"type": "categorical", "choices": ["a", "b"]}}
+        ).parameter_ranges["mode"]["choices"] == ["a", "b"]
+
+    def test_an_unsupported_parameter_type_is_refused(self):
+        for spec in ({"type": "bool"}, {"type": "string"}, {"type": ""}, {}):
+            with pytest.raises(ValidationError, match="unsupported type"):
+                self._config(parameter_ranges={"window": spec})
+
+    def test_a_blank_parameter_name_is_refused(self):
+        with pytest.raises(ValidationError, match="must not be empty"):
+            self._config(parameter_ranges={"  ": {"type": "int", "min": 1, "max": 2}})
+
+        # A non-dict spec is refused too, but by Pydantic's own field-type check rather
+        # than by the validator's "must be an object" branch - so the message differs.
+        # Noted here because it is an equivalent mutation: narrowing that branch would
+        # change nothing, since the value never reaches it.
+        with pytest.raises(ValidationError):
+            self._config(parameter_ranges={"window": ["min", "max"]})
+
+    def test_zero_or_negative_trials_are_refused(self):
+        for n_trials in (0, -1):
+            with pytest.raises(ValidationError) as exc_info:
+                self._config(n_trials=n_trials)
+            assert exc_info.value.errors()[0]["loc"] == ("n_trials",)
+
+        assert self._config(n_trials=1).n_trials == 1
+
+    def test_an_unknown_field_is_refused_rather_than_dropped(self):
+        """`extra="forbid"` is what makes a misspelled field an error.
+
+        A typo like `n_trails` is silently discarded under `"ignore"`, so the study runs
+        at the default trial count and reports a valid-looking result. The failure is
+        invisible precisely because the misspelled field is *about* the trial count.
+        """
+        with pytest.raises(ValidationError, match="extra_forbidden|n_trails"):
+            self._config(n_trails=500)
+
+        # A correctly-spelled field still works, so the guard is not "reject everything".
+        assert self._config(n_trials=500).n_trials == 500
+
+
 def _optimization_config(*, train_split_pct: float) -> optimizer_module.OptimizationConfig:
     return optimizer_module.OptimizationConfig(
         base_backtest_id="base-demo",
