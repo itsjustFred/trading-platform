@@ -1458,3 +1458,241 @@ class TestCtraderWireProtocol:
         assert sock.requested == [], (
             f"the loop read from the socket with no budget left: {sock.requested}"
         )
+
+
+class TestCtraderAccountIdentityAndListRequest:
+    """Which account the broker payload describes, and how the list is requested.
+
+    Six mutations survived; all are now killed. This is the **"how many accounts were
+    found"** question, and it is the one that produces a silent-routing failure rather than an
+    error: a discovery helper that reports one account when the broker sent two routes a signal
+    through an account the operator did not choose, and every individual row looks plausible.
+
+    **The identity resolution has three distinct rules, and two of them are falsy traps.**
+
+    | payload | resolves to |
+    |---|---|
+    | `ctidTraderAccountId=111` | `111` |
+    | only `traderAccountId=222` | `222` - the fallback exists for this |
+    | both present and **differing** | `111` - the ctid wins |
+    | `ctidTraderAccountId=0`, `traderAccountId=222` | `222` - a falsy ctid falls through |
+    | neither | `0`, which the caller refuses |
+
+    The `or` chain means a **`ctidTraderAccountId` of `0` is treated as absent** rather than as
+    a real id. That is the same `or`-collapse that affects `moneyDigits` and `isLive` in this
+    module, and it is asserted from both sides here: `0` must fall through to the fallback, and
+    a genuine id must not.
+
+    A **negative** id resolves to itself and is *not* caught by the resolver - the `account_id
+    <= 0` refusal lives in the caller. Asserted as a pair deliberately, so the boundary between
+    "resolve" and "refuse" is visible rather than assumed to be in one place.
+
+    The access token going onto the request is asserted by decoding the serialised request, not
+    by inspecting the object: protobuf messages are mutable and the assertion has to be about
+    what actually reached the socket.
+    """
+
+    @staticmethod
+    def _item(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    # -------------------------------------------------------------- id resolution
+
+    def test_the_ctid_wins_and_the_trader_id_is_the_fallback(self) -> None:
+        """Precedence, asserted with the two ids deliberately different."""
+        from live_runner.account_discovery import _ctrader_resolved_account_id
+
+        assert (
+            _ctrader_resolved_account_id(
+                self._item(ctidTraderAccountId=111, traderAccountId=222)
+            )
+            == 111
+        ), "the trader id overrode the ctid"
+        assert _ctrader_resolved_account_id(self._item(ctidTraderAccountId=111)) == 111
+        assert _ctrader_resolved_account_id(self._item(traderAccountId=222)) == 222, (
+            "the fallback no longer resolves a payload that carries only a trader id"
+        )
+
+    def test_a_falsy_ctid_falls_through_to_the_fallback(self) -> None:
+        """`ctidTraderAccountId = 0` is the broker's "unset", so the fallback must apply.
+
+        The `or` chain treats a falsy ctid as absent. Asserted explicitly because it is the
+        third instance of that shape in this module - after `moneyDigits` and `isLive` - and
+        each one silently changes behaviour rather than raising.
+        """
+        from live_runner.account_discovery import _ctrader_resolved_account_id
+
+        assert _ctrader_resolved_account_id(
+            self._item(ctidTraderAccountId=0, traderAccountId=222)
+        ) == 222
+        assert _ctrader_resolved_account_id(
+            self._item(ctidTraderAccountId=0, traderAccountId=None)
+        ) == 0
+
+    def test_an_absent_id_resolves_to_zero_and_the_caller_refuses_it(self) -> None:
+        """`0` is the "no usable id" sentinel, and the refusal lives in the caller.
+
+        Asserted as a pair on purpose: the resolver does not refuse negatives or zeros, and
+        `_build_ctrader_live_account` does. Keeping the boundary visible stops someone later
+        adding a second refusal inside the resolver and wondering which one is in force.
+        """
+        from live_runner.account_discovery import _ctrader_resolved_account_id
+
+        assert _ctrader_resolved_account_id(self._item()) == 0
+        assert _ctrader_resolved_account_id(self._item(traderAccountId=0)) == 0
+        # A negative id passes straight through the resolver.
+        assert _ctrader_resolved_account_id(self._item(ctidTraderAccountId=-5)) == -5
+
+    def test_a_numeric_string_id_is_accepted(self) -> None:
+        """cTrader sends ids as strings in some payload versions, so the int() cast matters."""
+        from live_runner.account_discovery import _ctrader_resolved_account_id
+
+        assert _ctrader_resolved_account_id(self._item(ctidTraderAccountId="111")) == 111
+
+    # ------------------------------------------------------------- list request
+
+    def test_the_access_token_reaches_the_wire(self) -> None:
+        """Asserted through the real request function, on what actually reached the socket.
+
+        A protobuf message is mutable, so "the attribute is set" is not the claim - "this is
+        what went out" is. And the claim only becomes observable through
+        `_request_ctrader_account_list`, which builds the request, sets the token, sends it and
+        then type-checks the reply. Testing it any earlier asserts my own fixture rather than
+        the production path - and that is exactly why the first attempt at this test survived
+        the mutation: it built the request by hand, so setting the token to `""` in production
+        made no difference to what the test sent.
+
+        So the two ends are stubbed and the middle is real: the real request builder builds the
+        message, the real send path frames it, and only `_ctrader_wait_response` is replaced
+        (with a valid account-list reply, since the type check runs afterwards).
+        """
+        account_discovery._load_ctrader_protocol()
+        import live_runner.account_discovery as ad
+
+        sent: list[bytes] = []
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                sent.append(data)
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        reply = ad._ProtoOAGetAccountListByAccessTokenRes()
+        reply.accessToken = "t"
+        reply.ctidTraderAccount.add().ctidTraderAccountId = 4242
+
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: reply
+        try:
+            ad._request_ctrader_account_list(_Sock(), access_token="secret-token")
+        finally:
+            ad._ctrader_wait_response = original_wait
+
+        assert sent, "the request was never sent"
+        envelope = ad._ProtoMessage()
+        envelope.ParseFromString(sent[0][4:])
+        assert envelope.clientMsgId, "the request carried no client id"
+        request = ad._Protobuf.get(envelope.payloadType)
+        request.ParseFromString(envelope.payload)
+        assert request.accessToken == "secret-token", (
+            f"the access token that reached the wire was {request.accessToken!r}; the broker "
+            "would answer with the wrong list or none at all"
+        )
+
+    def test_a_wrong_response_type_is_refused_rather_than_iterated(self) -> None:
+        """The account list must be the list message, not any message.
+
+        Returning the wrong type here would be iterated as though it held accounts - and the
+        count that comes out is the number of accounts discovery believes exist.
+        """
+        account_discovery._load_ctrader_protocol()
+        from live_runner.account_discovery import _request_ctrader_account_list
+
+        # `_request_ctrader_account_list` sends, waits, then type-checks. Stubbing only the
+        # two ends keeps the type check itself under test.
+        sent: list[bytes] = []
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                sent.append(data)
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        wrong = account_discovery._ProtoOATraderRes()
+        monkey = original_wait = None
+        try:
+            import live_runner.account_discovery as ad
+
+            original_wait = ad._ctrader_wait_response
+            ad._ctrader_wait_response = lambda *a, **k: wrong
+            try:
+                ad._request_ctrader_account_list(
+                    _Sock(), access_token="secret-token"
+                )
+            except RuntimeError as exc:
+                assert "Unexpected account list response" in str(exc), str(exc)
+            else:
+                raise AssertionError(
+                    f"a {type(wrong).__name__} was accepted as an account list; iterating "
+                    "it would report a wrong account count"
+                )
+        finally:
+            if original_wait is not None:
+                ad._ctrader_wait_response = original_wait
+        assert sent, "the request was never sent"
+
+    def test_the_correct_response_type_is_returned(self) -> None:
+        """And the type check passes the right message through unchanged."""
+        account_discovery._load_ctrader_protocol()
+        import live_runner.account_discovery as ad
+
+        message = ad._ProtoOAGetAccountListByAccessTokenRes()
+        message.accessToken = "t"
+        message.ctidTraderAccount.add().ctidTraderAccountId = 4242
+
+        class _Sock:
+            def sendall(self, data: bytes) -> None:
+                pass
+
+            def settimeout(self, value: float) -> None:
+                pass
+
+        original_wait = ad._ctrader_wait_response
+        ad._ctrader_wait_response = lambda *a, **k: message
+        try:
+            returned = ad._request_ctrader_account_list(_Sock(), access_token="t")
+        finally:
+            ad._ctrader_wait_response = original_wait
+        assert returned is message
+        assert returned.ctidTraderAccount[0].ctidTraderAccountId == 4242
+
+    def test_an_account_with_no_usable_id_is_skipped_by_the_caller(self) -> None:
+        """The `<= 0` refusal in the builder, asserted through the real builder path.
+
+        This is the counterpart to the resolver returning `0`: an account the broker listed but
+        gave no id for must be dropped, not turned into a `LiveAccount` with id `"0"`.
+        """
+        from live_runner.account_discovery import _build_ctrader_live_account
+
+        monkeypatch = account_discovery
+        original_detail = monkeypatch._request_ctrader_account_detail
+        original_trader = monkeypatch._load_ctrader_trader_details
+        monkeypatch._request_ctrader_account_detail = lambda *_a, **_k: None
+        monkeypatch._load_ctrader_trader_details = lambda *_a, **_k: None
+        try:
+            for bad_id in (0, None, "0", -5):
+                item = SimpleNamespace(
+                    ctidTraderAccountId=bad_id, isLive=False, traderLogin="alice"
+                )
+                result = _build_ctrader_live_account(
+                    "demo-host", None, "token", item
+                )
+                assert result is None, (
+                    f"an account with id {bad_id!r} was turned into {result!r} instead of "
+                    "being skipped"
+                )
+        finally:
+            monkeypatch._request_ctrader_account_detail = original_detail
+            monkeypatch._load_ctrader_trader_details = original_trader
