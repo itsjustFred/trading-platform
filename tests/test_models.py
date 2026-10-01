@@ -550,6 +550,121 @@ class TestBacktestResult:
         assert d["drawings"][0]["type"] == "marker"
 
 
+class TestBacktestMetaDefaults:
+    """`BacktestMeta.to_dict` omits defaults, so `from_dict`'s defaults are never read.
+
+    Six mutations survive the whole suite: changing the default for
+    `allow_fallback_stop`, `reject_missing_stop`, `signal_exit_fill`,
+    `modeling_resolution`, `initial_capital`, or `currency`.
+
+    One root cause: `to_dict` writes a field only when it differs from its default, so
+    a default-valued field never appears in the payload — and `from_dict` is therefore
+    always exercised *with* the field present. The defaults are the code that decides
+    what an **older or hand-written artifact** means, and nothing read one.
+
+    That is the dangerous direction. A pre-2026 artifact, or any payload produced
+    before a field existed, relies entirely on these fallbacks, and the four safety
+    flags are not decorative:
+
+    - `allow_fallback_stop` — whether a signal without a stop may still be taken.
+    - `reject_missing_stop` — the opposite, stricter setting.
+    - `signal_exit_fill` — `close` versus the next open. This changes backtest PnL.
+    - `modeling_resolution` — how intra-bar moves were modelled.
+
+    Each default is asserted against a payload that omits the key, and paired with the
+    present case so a fix cannot be "always write it".
+    """
+
+    # Field name -> (default in from_dict, a non-default value).
+    _DEFAULTS = {
+        "allow_fallback_stop": (True, False),
+        "reject_missing_stop": (False, True),
+        "require_explicit_column_roles": (False, True),
+        "signal_exit_fill": ("close", "next_open"),
+        "modeling_resolution": ("main_timeframe", "1m"),
+        "initial_capital": (100_000.0, 250_000.0),
+        "currency": ("USD", "EUR"),
+    }
+
+    def _minimal_payload(self) -> dict:
+        """The four fields `from_dict` reads with `d[...]`, so it cannot fail on them."""
+        return {
+            "id": "old-artifact",
+            "created_at": "2026-01-01T00:00:00Z",
+            "engine": "vectorbt",
+        }
+
+    def test_every_omittable_field_falls_back_to_its_documented_default(self):
+        payload = self._minimal_payload()
+        meta = BacktestMeta.from_dict(payload)
+
+        for name, (expected, _) in self._DEFAULTS.items():
+            assert getattr(meta, name) == expected, (
+                f"an artifact omitting {name!r} resolved to "
+                f"{getattr(meta, name)!r}, not the documented default {expected!r}"
+            )
+
+    def test_every_field_is_read_when_present(self):
+        """Paired with the above: a fix cannot be "always write the key"."""
+        payload = self._minimal_payload()
+        for name, (_, non_default) in self._DEFAULTS.items():
+            payload[name] = non_default
+        meta = BacktestMeta.from_dict(payload)
+
+        for name, (_, non_default) in self._DEFAULTS.items():
+            assert getattr(meta, name) == non_default, (
+                f"{name!r} was not read from the payload: "
+                f"{getattr(meta, name)!r} != {non_default!r}"
+            )
+
+    def test_the_four_safety_flags_round_trip_at_both_settings(self):
+        """The flags where a wrong default changes whether an order may be taken."""
+        permissive = BacktestMeta.from_dict(self._minimal_payload())
+        assert permissive.allow_fallback_stop is True
+        assert permissive.reject_missing_stop is False
+        assert permissive.require_explicit_column_roles is False
+
+        strict_payload = self._minimal_payload()
+        strict_payload.update(
+            allow_fallback_stop=False,
+            reject_missing_stop=True,
+            require_explicit_column_roles=True,
+        )
+        strict = BacktestMeta.from_dict(strict_payload)
+        assert strict.allow_fallback_stop is False
+        assert strict.reject_missing_stop is True
+        assert strict.require_explicit_column_roles is True
+
+    def test_a_value_of_the_default_is_omitted_and_comes_back_identical(self):
+        """The omit-on-default scheme must be lossless for a default value."""
+        meta = BacktestMeta(
+            id="defaults",
+            created_at="2026-01-01T00:00:00Z",
+            engine="vectorbt",
+            **{
+                name: value
+                for name, (value, _) in self._DEFAULTS.items()
+            },
+        )
+        payload = meta.to_dict()
+        # `initial_capital` is in the always-written block, since a backtest with no
+        # recorded capital is meaningless rather than defaulted. The rest are omitted.
+        for name in self._DEFAULTS:
+            if name == "initial_capital":
+                assert payload.get(name) == 100_000.0
+                continue
+            assert name not in payload, (
+                f"{name!r} holds its default and should be omitted, but was written: "
+                + repr(payload.get(name))
+            )
+        restored = BacktestMeta.from_dict(payload)
+        for name, (expected, _) in self._DEFAULTS.items():
+            assert getattr(restored, name) == expected, (
+                f"{name!r} did not survive an omit-and-restore round trip: "
+                f"{getattr(restored, name)!r}"
+            )
+
+
 class TestStrategyMeta:
     def test_roundtrip(self):
         sm = StrategyMeta(
