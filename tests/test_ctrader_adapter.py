@@ -964,3 +964,120 @@ def test_an_explicit_demo_argument_still_wins_over_the_environment(monkeypatch) 
         env_values={"CTRADER_DEMO": ""},
     )
     assert adapter.demo is False
+
+
+# --------------------------------------------------------------------------
+# The connection gate, in all six of the places it appears
+# --------------------------------------------------------------------------
+#
+# Found by mutation testing `live_runner/ctrader_adapter.py`. The live bug this
+# file's own comments describe was a new connection inheriting `_authenticated`,
+# so `_authenticate` returned early and "every `not self._authenticated` gate
+# passed on a connection the broker never authenticated".
+#
+# The *source* of that bug is pinned - `_on_connected` clearing the flag is
+# caught - but the gate itself was not. Dropping `not self._authenticated` from
+# `submit_order`, or dropping `not self._connected`, each left all 519 collected
+# tests green. So the second line of defence, the one that would catch a stale
+# flag arriving by any other route, had no test at all.
+#
+# The gate appears **six** times in the file, which is this branch's recurring
+# "one rule, two implementations" shape at six. The structural test below covers
+# all of them and any future seventh.
+
+def test_submit_order_reconnects_when_the_socket_is_not_authenticated() -> None:
+    """Both halves of the gate, on the one method that places orders.
+
+    Driven through the real `submit_order` in the state a stale `_authenticated`
+    produces - connected, never authenticated - and the assertion is on whether
+    `connect()` ran. The send path is stubbed, so the call itself raises; the
+    mutation this catches skipped the re-authentication and reached the send.
+    """
+    from datetime import datetime, timezone
+
+    from shared.models import LiveSignal
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    calls: list[str] = []
+
+    async def fake_connect() -> None:
+        calls.append("connect")
+        adapter._connected = True
+        adapter._authenticated = True
+
+    async def fake_send(*args, **kwargs):
+        raise AssertionError("reached the send path without re-authenticating")
+
+    adapter.connect = fake_connect  # type: ignore[method-assign]
+    adapter._send_request = fake_send  # type: ignore[method-assign]
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+
+    # Connected, NOT authenticated - the state the documented live bug produced.
+    adapter._connected = True
+    adapter._authenticated = False
+
+    # Whatever happens next is not this test's business - the symbol cache is
+    # empty, so `submit_order` legitimately refuses during pre-persistence
+    # validation. What is under test is whether it re-authenticated *first*, and
+    # the mutation this catches skipped straight to that validation.
+    with pytest.raises(Exception):  # noqa: B017 - the type is not the subject
+        asyncio.run(adapter.submit_order(signal, qty=1.0))
+
+    assert calls == ["connect"], (
+        "submit_order proceeded without re-authenticating on a connected but "
+        "unauthenticated socket"
+    )
+
+
+def test_every_connection_gate_refuses_unless_both_flags_hold() -> None:
+    """All the refusal gates, structurally, so a new one cannot forget a half.
+
+    Scoped to *refusal* gates - an `if` whose body re-connects - rather than every
+    `if` mentioning the flags. A positive precondition such as `connect()`'s
+    `if self._connected and self._authenticated and self._client is not None` is the
+    opposite shape and is not what this rule is about.
+
+    A gate checking only `_connected` lets an unauthenticated socket through; one
+    checking only `_authenticated` lets a disconnected one through. The first is the
+    documented live bug; both were survivable until now.
+    """
+    import ast
+    import pathlib
+
+    import live_runner.ctrader_adapter as module
+
+    tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding="utf-8"))
+
+    refusal_gates: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        body = "\n".join(ast.unparse(stmt) for stmt in node.body)
+        if "self.connect()" not in body:
+            continue
+        refusal_gates.append((node.lineno, ast.unparse(node.test)))
+
+    assert len(refusal_gates) >= 6, (
+        f"expected at least six re-connecting gates, found {len(refusal_gates)}: "
+        f"{refusal_gates} - the adapter changed shape, so re-derive what these are"
+    )
+
+    incomplete = [
+        (line, test)
+        for line, test in refusal_gates
+        if "not self._connected" not in test or "not self._authenticated" not in test
+    ]
+    assert not incomplete, (
+        "every re-connecting gate must require both `not self._connected` and "
+        f"`not self._authenticated`; these do not: {incomplete}"
+    )
