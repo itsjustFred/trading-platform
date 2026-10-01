@@ -1266,8 +1266,6 @@ class TestCtraderWireProtocol:
         rather than returned.
         """
         from live_runner.account_discovery import (
-            _ProtoOAErrorRes,
-            _ProtoMessage,
             _ctrader_wait_response,
         )
 
@@ -1330,7 +1328,6 @@ class TestCtraderWireProtocol:
         """
         from live_runner.account_discovery import (
             _ProtoHeartbeatEvent,
-            _ProtoOAGetAccountListByAccessTokenRes,
             _ctrader_wait_response,
         )
 
@@ -1388,7 +1385,6 @@ class TestCtraderWireProtocol:
         """
         from live_runner.account_discovery import (
             _ProtoHeartbeatEvent,
-            _ProtoOAGetAccountListByAccessTokenRes,
             _ctrader_wait_response,
         )
 
