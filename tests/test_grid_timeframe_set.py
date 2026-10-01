@@ -246,3 +246,39 @@ def test_every_cli_alias_lands_on_a_valid_timeframe() -> None:
     assert not disagreements, (
         f"aliases present in both maps with different targets: {disagreements}"
     )
+
+
+def test_the_cli_alias_set_is_the_documented_one() -> None:
+    """Pin the *contents* of the CLI alias map, not only its consistency.
+
+    The existing invariants here are one-directional by design: every CLI target
+    must be a valid timeframe, and the strict map must be a subset with identical
+    targets. Neither says the CLI map must *contain* anything, so removing a
+    CLI-only spelling such as `min1` satisfies every check above while silently
+    stopping `--timeframes min1` from being understood.
+
+    That is a capability, not a safety property, which is why it is pinned by
+    exact content rather than derived. Found by mutation: dropping `min1` from
+    `GRID_TIMEFRAME_ALIASES` survived the whole selected suite.
+    """
+    from shared.constants import GRID_TIMEFRAME_ALIASES
+
+    assert GRID_TIMEFRAME_ALIASES == {
+        "m1": "1m",
+        "1min": "1m",
+        "min1": "1m",
+        "m5": "5m",
+        "m15": "15m",
+        "m30": "30m",
+        "h1": "1h",
+        "hour1": "1h",
+        "h4": "4h",
+        "hour4": "4h",
+        "d1": "1d",
+        "daily": "1d",
+        "day": "1d",
+    }, (
+        "the CLI alias set changed. These thirteen spellings are what both grid "
+        "entry points accept, and the module comment claims thirteen. If one is "
+        "being removed deliberately, update the comment too."
+    )
