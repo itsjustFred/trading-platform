@@ -1365,6 +1365,129 @@ def test_ctrader_get_positions_qty_matches_volume_contract():
 
 # ── B-8: validate symbol/action BEFORE the first persistence ──────────────────
 
+def test_both_broker_adapters_refuse_a_missing_qty(monkeypatch):
+    """The one rule, asserted on both copies at once.
+
+    `AlpacaLiveAdapter` and `CTraderLiveAdapter` each carry their own
+    "qty is binding, no default-config sizing here" guard. The Alpaca one was pinned;
+    cTrader's was not, which is why removing it left the suite green.
+
+    Asserting the pair together is deliberate. Pinning only one broker's copy is what
+    let this through in the first place, and the two messages differ, so a test on either
+    in isolation documents one implementation rather than the rule.
+
+    The two refusals are separate calls, not a shared helper, which is precisely why both
+    need pinning: nothing relates them, so a fix to one leaves the other on the old
+    behaviour. That is the same hazard `parse_bool_env`'s docstring records for four
+    private copies of a boolean parser - two of which became live bugs.
+    """
+    from live_runner import alpaca_adapter as alpaca_module
+
+    alpaca = alpaca_module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    alpaca._connected = True
+    alpaca._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=lambda **_kwargs: pytest.fail("order must not reach the broker"),
+    )
+    monkeypatch.setattr(alpaca_module, "save_live_signal", lambda _signal: None)
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"entry_price": 100.0, "stop_loss": 95.0},
+    )
+
+    with pytest.raises(ValueError, match="explicit risk-sized qty"):
+        asyncio.run(alpaca.submit_order(signal))
+
+    module, ctrader = _make_ctrader_adapter()
+    ctrader._symbol_name_to_id = {"EURUSD": 1}
+    ctrader._connected = True
+    ctrader._authenticated = True
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: None
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
+
+    # A separate signal, because this adapter's symbol map only knows EURUSD - and its
+    # pre-persistence symbol check correctly fires first for anything else. Asserting the
+    # qty guard therefore needs a symbol that broker would accept.
+    ctrader_signal = signal.model_copy(update={"symbol": "EURUSD"})
+
+    with pytest.raises(ValueError, match="explicit risk-sized qty"):
+        asyncio.run(ctrader.submit_order(ctrader_signal))
+
+    # And each broker refuses a non-positive qty too, on its own copy of that guard.
+    for target, sig in ((alpaca, signal), (ctrader, ctrader_signal)):
+        for invalid in (0.0, -1.0, float("nan"), False):
+            with pytest.raises(ValueError, match="finite and positive"):
+                asyncio.run(target.submit_order(sig, qty=invalid))
+
+
+def test_ctrader_submit_order_requires_an_explicit_risk_sized_qty(monkeypatch):
+    """cTrader's own qty guards, which the Alpaca test does not reach.
+
+    `test_alpaca_submit_order_blocks_non_positive_quantity` covers exactly this contract -
+    missing qty refused, non-positive and NaN refused - but for `AlpacaLiveAdapter`.
+    `CTraderLiveAdapter.submit_order` carries the *same two guards* independently, and
+    neither had a test: removing both leaves the whole suite green.
+
+    **The seam lesson again, and now the third distinct instance in this sweep:** a rule
+    pinned on one broker's adapter while the other broker's copy of it is untested. This
+    is exactly what `parse_bool_env`'s docstring records - four private copies of one
+    boolean parser, two of which produced live bugs - except here the copies still agree
+    and nothing relates them, so a fix to one would leave the other behind.
+
+    Two facets, both asserted:
+
+    - **A missing qty is refused.** Sizing happens once upstream in `RiskConfig`; a
+      default here would be a second, unconfigured sizing decision made at the last
+      possible moment, on a real order.
+    - **A non-positive or non-finite qty is refused**, including `False` - which is
+      `0.0`, and therefore a sell of nothing that some brokers accept as valid.
+
+    The mutation is killed by the *pair*: a `qty=None` call must raise before any broker
+    interaction, so `submit_order` is stubbed to fail loudly if it gets that far.
+    """
+    module, adapter = _make_ctrader_adapter()
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._connected = True
+    adapter._authenticated = True
+
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module, "get_live_signal_broker_order_id", lambda _sid: None
+    )
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: None)
+
+    def _fail_if_reached(*_args, **_kwargs):
+        pytest.fail("the order must be refused before any broker interaction")
+
+    monkeypatch.setattr(adapter, "_submit_to_broker", _fail_if_reached, raising=False)
+
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0},
+    )
+
+    # Facet one: no qty at all. Sizing belongs upstream, not here.
+    with pytest.raises(ValueError, match="explicit risk-sized qty"):
+        asyncio.run(adapter.submit_order(signal))
+
+    # Facet two: a qty that is not finite and positive. `False` is 0.0.
+    for invalid_qty in (0.0, -1.0, float("nan"), float("inf"), False, "not-a-number"):
+        with pytest.raises(ValueError, match="finite and positive"):
+            asyncio.run(adapter.submit_order(signal, qty=invalid_qty))
+
+
 def test_ctrader_invalid_symbol_never_persists_signal(monkeypatch):
     """An unknown symbol must be rejected before save_live_signal: otherwise the
     signal row exists with no broker order and every redelivery wedges on the

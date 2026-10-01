@@ -1108,12 +1108,27 @@ def test_start_missing_tasks_skips_ctrader_auth_blocked_accounts() -> None:
     assert active_tasks == {}
 
 
-def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(monkeypatch):
+def test_discord_poll_does_not_claim_live_signal_before_deployment_routing(
+    isolated_db, monkeypatch
+):
     """The execution adapter is the sole authority for the persisted order intent.
 
     Persisting at the source layer creates a canonical Discord signal with an empty
     deployment id. The cTrader adapter then mistakes the first routed delivery for
     crash recovery and fail-closes instead of submitting the first broker order.
+
+    **`isolated_db` is load-bearing, and its absence was a real defect in this test.**
+    Without it the assertion below reads the *production* database, so the test asserted
+    "the live_signals table is empty everywhere" rather than "this poll persisted
+    nothing". It passed only while production happened to hold no signal rows; once it
+    held seven - real rows from April to 2026-09-25, unrelated to this code - the test
+    failed with no change to any of its subject.
+
+    Worse than a false failure: had the regression this test guards actually been
+    reintroduced, the poll would have **written a Discord execution intent into the
+    production database** in the course of asserting that it must not. A test that
+    verifies a no-write property by touching the real store is not a safe place for that
+    property to be checked.
     """
     source = DiscordSignalSource(
         bot_name="ramjet",
