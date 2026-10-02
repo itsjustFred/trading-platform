@@ -300,3 +300,193 @@ deployments: []
 
     with pytest.raises(ValueError, match="no numeric broker identifier"):
         parse_live_deployments_config(config_path)
+
+
+class TestStockkitRouteNormalisationAndAccountLabelMatch:
+    """The normalisation that decides which broker account a StockKit signal routes to.
+
+    Two mutations survived, and both are the same shape: **a normaliser whose whole job is to
+    make two spellings of the same thing compare equal, tested only with spellings that already
+    compare equal.**
+
+    `_ALIASES` contains `ram_jet` and `rocket_fuel` with underscores. The route normaliser
+    therefore does `str(value or "").strip().lower().replace("-", "_")` before the lookup - so
+    `ram-jet` resolves only *because* the dash is replaced first. Remove that and `ram-jet` is a
+    silent miss: no route, so no account number, so the signal is refused. The same for
+    `rocket-fuel` and `rocketfuel-longsonly`.
+
+    `_normalize_account_label` strips everything outside `[a-z0-9]`, which is what lets the env
+    label `"Rocket Fuel"` match the route `rocket_fuel`. Remove it and the comparison becomes
+    `"rocket fuel" != "rocketfuel"` - again a silent miss, and again in the direction of *not
+    routing*, which is the safe direction to fail. That is worth stating plainly, because it is
+    the same asymmetry as the `1M` collision: **this class of bug is easy to miss precisely
+    because the failure is a refusal rather than a wrong order.**
+
+    The fallback-table behaviour is asserted alongside, since the whole point of the label
+    matching is that it beats a hardcoded account number when paper accounts are re-created.
+    """
+
+    def test_a_dashed_alias_resolves_because_the_dash_is_replaced_first(self) -> None:
+        """The exact spelling that needs the replacement - and the ones that do not."""
+        from live_runner.stockkit_routing import normalize_stockkit_route
+
+        for spelling in ("ram-jet", "ram_jet", "ram jet", "RAM-JET", "  ram-jet  "):
+            assert normalize_stockkit_route(spelling) == "ramjet", (
+                f"{spelling!r} did not resolve to ramjet; the alias table only holds the "
+                "underscore spelling, so this depends entirely on the dash replacement"
+            )
+        for spelling in ("rocket-fuel", "rocket_fuel", "rocket fuel", "rocketfuel-longsonly"):
+            expected = "rocketfuel"
+            assert normalize_stockkit_route(spelling) == expected, spelling
+
+    def test_an_unrecognised_route_resolves_to_nothing_at_all(self) -> None:
+        """`""`, not the input echoed back.
+
+        The distinction is what makes an unrecognised label *refusable* downstream rather than
+        a route that resolves to some account. Asserted on several near-misses.
+        """
+        from live_runner.stockkit_routing import normalize_stockkit_route
+
+        for unknown in ("", "   ", None, "main-account", "a-b", "banana", "nitro-fast"):
+            assert normalize_stockkit_route(unknown) == "", (
+                f"{unknown!r} resolved to {normalize_stockkit_route(unknown)!r} rather than "
+                "nothing, so an unrecognised label would look routable"
+            )
+
+    def test_the_account_label_is_compared_with_separators_and_case_removed(self) -> None:
+        """Every spelling of one label must normalise to the same string.
+
+        This is the property the function exists for, so it is asserted as a set rather than
+        case by case - the point is that they are *equal*, not that each works.
+        """
+        from live_runner.stockkit_routing import _normalize_account_label
+
+        spellings = ["Rocket Fuel", "rocket_fuel", "ROCKET-FUEL", "rocket.fuel", " rocket fuel "]
+        normalised = {_normalize_account_label(v) for v in spellings}
+        assert normalised == {"rocketfuel"}, normalised
+        for absent in (None, "", "   ", 0, False):
+            assert _normalize_account_label(absent) == "", repr(absent)
+
+    def test_a_separated_env_label_still_matches_its_route(self) -> None:
+        """**The end-to-end claim, and the one the mutation actually breaks.**
+
+        The env label is written by a human - `"Rocket Fuel"` - and the route is a token
+        - `rocket_fuel`. They only compare equal through the label normaliser, so this is the
+        assertion that distinguishes a working label match from a silently-refused one.
+        """
+        from live_runner.stockkit_routing import expected_account_number_for_route
+
+        for label in ("Rocket Fuel", "ROCKET-FUEL", "rocket_fuel", "  Rocket Fuel  "):
+            env = {
+                "ALPACA_ACCOUNT_NAME_ACC1": label,
+                "ALPACA_ACCOUNT_NUMBER_ACC1": "ACCOUNT-NUMBER-1",
+            }
+            assert expected_account_number_for_route("rocket_fuel", env) == "ACCOUNT-NUMBER-1", (
+                f"label {label!r} did not match route 'rocket_fuel'"
+            )
+
+    def test_the_label_match_beats_the_static_fallback_table(self) -> None:
+        """The re-created-paper-account case the label match exists for.
+
+        A hardcoded account number is invalidated silently when a paper account is
+        re-created, so the env label match is the mechanism that keeps routing correct. Asserted
+        by giving the label match a number that is obviously not the fallback one.
+        """
+        from live_runner.stockkit_routing import (
+            STOCKKIT_ACCOUNT_ROUTES,
+            expected_account_number_for_route,
+        )
+
+        env = {
+            "ALPACA_ACCOUNT_NAME_ACC1": "Rocket Fuel",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "FROM-ENV",
+        }
+        assert expected_account_number_for_route("rocket_fuel", env) == "FROM-ENV"
+        # With no env at all, the static table answers - and it is a different number.
+        assert expected_account_number_for_route("rocket_fuel", {}) == (
+            STOCKKIT_ACCOUNT_ROUTES["rocketfuel"]
+        )
+        assert STOCKKIT_ACCOUNT_ROUTES["rocketfuel"] != "FROM-ENV"
+
+    def test_both_rocketfuel_variants_deliberately_share_one_account(self) -> None:
+        """**My first version of this test asserted a separation the code does not make.**
+
+        I assumed `rocketfuel_longsonly` and `rocketfuel_longandshort` were distinct routes
+        resolving to distinct accounts, and wrote a test that a longer env label would not
+        capture a shorter route. It failed - because the alias table maps **both** to
+        `rocketfuel`:
+
+            'rocketfuel_longsonly':  'rocketfuel'
+            'rocketfuel_longandshort': 'rocketfuel'
+
+        So the two strategy variants share one broker account, and any env label matching
+        `rocketfuel` is the label for both. That looks deliberate, so it is pinned rather than
+        "fixed" - and the name says why it matters: **if a second RocketFuel account is ever
+        added, this table has no way to express it**, and the variants would keep sharing the
+        first one. That is a real constraint to know before adding an account, not a bug to
+        report now.
+
+        The related non-collision is asserted too: a label that normalises to something no route
+        ever produces cannot capture anything.
+        """
+        from live_runner.stockkit_routing import (
+            _ALIASES,
+            STOCKKIT_ACCOUNT_ROUTES,
+            expected_account_number_for_route,
+        )
+
+        assert _ALIASES["rocketfuel_longsonly"] == "rocketfuel"
+        assert _ALIASES["rocketfuel_longandshort"] == "rocketfuel"
+        assert len(STOCKKIT_ACCOUNT_ROUTES) == len(set(_ALIASES.values())), (
+            "the alias table now maps onto more accounts than exist; re-check what the "
+            "shared-route constraint in this test means"
+        )
+
+        env = {
+            "ALPACA_ACCOUNT_NAME_ACC1": "Rocket Fuel",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "ACCOUNT-1",
+            # A label no route normalises to. It must capture nothing.
+            "ALPACA_ACCOUNT_NAME_ACC2": "Rocket Fuel Long Only",
+            "ALPACA_ACCOUNT_NUMBER_ACC2": "ACCOUNT-2",
+        }
+        for route in ("rocketfuel", "rocket_fuel", "rocket-fuel",
+                      "rocketfuel_longsonly", "rocketfuel_longandshort"):
+            assert expected_account_number_for_route(route, env) == "ACCOUNT-1", (
+                f"route {route!r} did not resolve to the single RocketFuel account"
+            )
+
+    def test_the_first_matching_acc_index_wins(self) -> None:
+        """Two accounts carrying the same label: ACC1 is taken, deterministically.
+
+        Worth pinning because the alternative - last wins - depends on dict iteration order of
+        the env scan, so routing would change with the shape of the env file rather than with
+        its content.
+        """
+        from live_runner.stockkit_routing import expected_account_number_for_route
+
+        env = {
+            "ALPACA_ACCOUNT_NAME_ACC1": "Rocket Fuel",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "FIRST",
+            "ALPACA_ACCOUNT_NAME_ACC2": "Rocket Fuel",
+            "ALPACA_ACCOUNT_NUMBER_ACC2": "SECOND",
+        }
+        assert expected_account_number_for_route("rocket_fuel", env) == "FIRST"
+
+    def test_an_env_entry_with_a_blank_number_does_not_win(self) -> None:
+        """A label that matches but carries no number must not shadow the fallback.
+
+        Otherwise the routing silently loses the account entirely - the label claims the
+        route, and then supplies nothing.
+        """
+        from live_runner.stockkit_routing import (
+            STOCKKIT_ACCOUNT_ROUTES,
+            expected_account_number_for_route,
+        )
+
+        env = {
+            "ALPACA_ACCOUNT_NAME_ACC1": "Rocket Fuel",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "   ",
+        }
+        assert expected_account_number_for_route("rocket_fuel", env) == (
+            STOCKKIT_ACCOUNT_ROUTES["rocketfuel"]
+        ), "a blank env number shadowed the static fallback"
