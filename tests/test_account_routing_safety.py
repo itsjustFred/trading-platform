@@ -490,3 +490,170 @@ class TestStockkitRouteNormalisationAndAccountLabelMatch:
         assert expected_account_number_for_route("rocket_fuel", env) == (
             STOCKKIT_ACCOUNT_ROUTES["rocketfuel"]
         ), "a blank env number shadowed the static fallback"
+
+
+class TestCtraderRoutingRejectionAndRiskSettingsPrecedence:
+    """The routing rejection guard, and the one place two risk-setting spellings coexist.
+
+    Most of `validate_live_account_routes` was already covered - duplicate ids, the
+    non-positive cTID and two local accounts sharing a cTID were all killed on the first
+    attempt. The gap is narrower than it looks: **a non-numeric cTID** was unmeasured, and that
+    is the one that matters most, because a non-numeric identifier is exactly what a
+    mis-configured account looks like and it would otherwise route *somewhere*.
+
+    `_risk_config_for_deployment` reads `max_risk_per_trade` with a fallback to the legacy
+    `risk_per_trade_pct`. The precedence between them was unmeasured, and precedence here is a
+    **risk** decision rather than a naming convention: swapping the two would let a stale legacy
+    value override the one the operator actually set.
+
+    **The current spelling wins.** Asserted with both present, because that is the only case that
+    distinguishes the branches - a test with just one set passes under either order. And the
+    legacy spelling still works on its own, so an existing config is not silently ignored.
+
+    The defaults are asserted in full, since a default that silently changed would be a risk
+    posture change with no error: **1% risk per trade, 5% total exposure, 5 positions, 20%
+    notional, fallback stop allowed, missing stop not rejected.**
+    """
+
+    @staticmethod
+    def _account(account_id="a1", broker="ctrader", **kwargs):
+        from shared.models import LiveAccountConfig
+
+        base = {"id": account_id, "name": "n", "broker": broker}
+        base.update(kwargs)
+        return LiveAccountConfig(**base)
+
+    @pytest.mark.parametrize(
+        "identifier", ["abc", "", "1.5", "12 345", "0x10", "  ", "one-two"]
+    )
+    def test_a_non_numeric_ctrader_identifier_is_refused(self, identifier: str) -> None:
+        """**The one that matters most, and the one the suite did not see.**
+
+        A non-numeric cTID is what a mis-configured account looks like. The guard's own comment
+        says a missing or non-numeric identifier must fail *here* rather than surface at
+        preflight or, worse, route to the wrong account - so it is asserted at this layer.
+        """
+        from live_runner.account_routing import validate_live_account_routes
+
+        with pytest.raises(ValueError, match="no numeric broker identifier"):
+            validate_live_account_routes(
+                [self._account(ctid=identifier, broker_login=None)]
+            )
+
+    def test_a_ctrader_account_with_no_identifier_at_all_is_refused(self) -> None:
+        """Absent, not just malformed.
+
+        The identifier falls back through `ctid`, then `broker_login`, then `id` - so a
+        genuinely blank account still resolves to *something* from `id`, and that is what makes
+        the non-numeric check rather than a presence check the operative one.
+        """
+        from live_runner.account_routing import validate_live_account_routes
+
+        account = self._account(ctid="", broker_login="", id="not-a-number")
+        with pytest.raises(ValueError, match="no numeric broker identifier"):
+            validate_live_account_routes([account])
+
+    def test_a_numeric_ctrader_identifier_is_accepted(self) -> None:
+        """The pass case, so the guard is not simply always-firing.
+
+        A numeric string is the normal form cTrader uses, and the identifier is compared as an
+        *int* for the duplicate check - so `"00123"` and `123` are the same routing target.
+        """
+        from live_runner.account_routing import validate_live_account_routes
+
+        validate_live_account_routes([self._account(id="a1", ctid="12345")])
+        validate_live_account_routes([self._account(id="a1", broker_login="12345")])
+        # And a non-cTrader account needs no identifier at all.
+        validate_live_account_routes([self._account(id="a1", broker="alpaca")])
+
+    def test_the_current_risk_setting_wins_over_the_legacy_spelling(self) -> None:
+        """**Precedence, asserted with both present because that is the only distinguishing case.**
+
+        A test with only one setting passes under either order, which is exactly why the swap
+        mutation survived. Here the operator's current setting must win over a stale legacy value
+        left in the same config.
+        """
+        from live_runner.daemon import _risk_config_for_deployment
+        from shared.models import LiveDeploymentConfig
+        from uuid import uuid4
+
+        def _config(**settings):
+            return LiveDeploymentConfig(
+                id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+                timeframe="1h", status="ACTIVE", settings=settings,
+            )
+
+        both = _risk_config_for_deployment(
+            _config(max_risk_per_trade=0.02, risk_per_trade_pct=0.09)
+        )
+        assert both.max_risk_per_trade == pytest.approx(0.02), (
+            f"the legacy risk_per_trade_pct overrode max_risk_per_trade: "
+            f"{both.max_risk_per_trade}"
+        )
+
+        # And each spelling still works on its own, so an older config is not ignored.
+        assert _risk_config_for_deployment(
+            _config(risk_per_trade_pct=0.09)
+        ).max_risk_per_trade == pytest.approx(0.09)
+        assert _risk_config_for_deployment(
+            _config(max_risk_per_trade=0.02)
+        ).max_risk_per_trade == pytest.approx(0.02)
+
+    def test_the_default_risk_posture_is_pinned_in_full(self) -> None:
+        """**A default that changed silently would be a risk change with no error anywhere.**
+
+        Stated as a set rather than one at a time, because the posture is the point: 1% risk per
+        trade, 5% total exposure, 5 positions, a 2% fallback stop, 20% notional per trade,
+        fallback stop *allowed* and a missing stop *not* rejected.
+
+        The last two are booleans and the easy ones to flip in a refactor - and
+        `allow_fallback_stop=False` would refuse orders outright while
+        `reject_missing_stop=True` would refuse them too, so both directions are asserted by
+        the full-set check rather than individually.
+        """
+        from live_runner.daemon import _risk_config_for_deployment
+        from shared.models import LiveDeploymentConfig
+        from uuid import uuid4
+
+        config = _risk_config_for_deployment(
+            LiveDeploymentConfig(
+                id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+                timeframe="1h", status="ACTIVE",
+            )
+        )
+        assert config.max_risk_per_trade == pytest.approx(0.01)
+        assert config.max_total_exposure == pytest.approx(0.05)
+        assert config.max_positions == 5
+        assert config.fallback_stop_pct == pytest.approx(0.02)
+        assert config.max_notional_per_trade == pytest.approx(0.20)
+        assert config.allow_fallback_stop is True, (
+            "the default no longer allows a fallback stop, which would refuse orders outright"
+        )
+        assert config.reject_missing_stop is False, (
+            "the default now rejects a missing stop, which would refuse orders outright"
+        )
+
+    def test_an_explicit_setting_overrides_its_default(self) -> None:
+        """The non-boolean case, so the default-set test above is not the only thing asserted."""
+        from live_runner.daemon import _risk_config_for_deployment
+        from shared.models import LiveDeploymentConfig
+        from uuid import uuid4
+
+        config = _risk_config_for_deployment(
+            LiveDeploymentConfig(
+                id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+                timeframe="1h", status="ACTIVE",
+                settings={
+                    "max_total_exposure": 0.5,
+                    "max_positions": 2,
+                    "max_notional_per_trade": 0.9,
+                    "allow_fallback_stop": False,
+                    "reject_missing_stop": True,
+                },
+            )
+        )
+        assert config.max_total_exposure == pytest.approx(0.5)
+        assert config.max_positions == 2
+        assert config.max_notional_per_trade == pytest.approx(0.9)
+        assert config.allow_fallback_stop is False
+        assert config.reject_missing_stop is True
