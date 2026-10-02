@@ -24,7 +24,6 @@ from __future__ import annotations
 import pathlib
 import re
 import subprocess
-import sys
 
 ROOT = pathlib.Path("/home/ubuntu/perma-mut")
 HARNESS = ROOT / ".agents/session-files/2026-09-30-duplicate-rule-audit/mutate.sh"
