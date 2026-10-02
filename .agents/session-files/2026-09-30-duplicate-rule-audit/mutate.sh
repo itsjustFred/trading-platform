@@ -17,10 +17,25 @@
 #      non-zero exit from a pytest that never collected anything is not evidence
 #      that a mutation was caught, and the first version of this script made
 #      precisely that mistake.
+#   3. A non-zero exit from an UNRELATED failure is not evidence either. The
+#      third version decided the verdict from `rc != 0` alone, so a verified
+#      equivalent mutant was reported KILLED whenever any other test in the suite
+#      happened to fail. Proven: with one deliberately-failing unrelated test in
+#      the suite, a mutation that survives on its own printed KILLED.
+#      `--detector` now names the test that *should* fail, and a non-zero exit
+#      with no matching failure is reported KILLED-UNATTRIBUTED - which never
+#      satisfies `--expect killed`, so a misattributed kill fails loudly.
+#   4. A collection error in ONE file leaves the other files' tests collected,
+#      so the run is half-successful and rc is non-zero. That is INFRA.
 #
 # Usage:
 #   mutate.sh --file F --old 'T' --new 'T' --label 'what this should break' \
-#             [--suite 'pytest paths'] [--expect killed|survived]
+#             [--suite 'pytest paths'] [--expect killed|survived] \
+#             [--detector 'substring of the test that should fail']
+#
+# Pass --detector whenever you know which test is meant to catch the mutation.
+# Without it a KILLED is printed with `attributed=unknown`, which is honest but
+# is not a guarantee: it means "some test failed", not "this mutation was caught".
 #
 # Exit codes:
 #   0  applied, suite ran, verdict printed, and matched --expect if given
@@ -34,18 +49,19 @@ set -o nounset
 set -o pipefail
 
 PYTHON="${PYTHON:-/home/ubuntu/Desktop/trading-platform/.venv/bin/python}"
-FILE=""; OLD=""; NEW=""; LABEL=""; EXPECT=""
+FILE=""; OLD=""; NEW=""; LABEL=""; EXPECT=""; DETECTOR=""
 SUITE_ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --file)   FILE="$2"; shift 2 ;;
-    --old)    OLD="$2"; shift 2 ;;
-    --new)    NEW="$2"; shift 2 ;;
-    --label)  LABEL="$2"; shift 2 ;;
-    --expect) EXPECT="$2"; shift 2 ;;
-    --suite)  read -r -a SUITE_ARGS <<< "$2"; shift 2 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    --file)     FILE="$2"; shift 2 ;;
+    --old)      OLD="$2"; shift 2 ;;
+    --new)      NEW="$2"; shift 2 ;;
+    --label)    LABEL="$2"; shift 2 ;;
+    --expect)   EXPECT="$2"; shift 2 ;;
+    --detector) DETECTOR="$2"; shift 2 ;;
+    --suite)    read -r -a SUITE_ARGS <<< "$2"; shift 2 ;;
+    -h|--help)  sed -n '2,46p' "$0"; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -120,20 +136,48 @@ if printf '%s\n' "$OUT" | grep -qE '^ERROR: file or directory not found|^ERROR: 
   printf '%s\n' "$OUT" | grep -E '^ERROR' | head -2 | cut -c1-80 | sed 's/^/         /'
   exit 4
 fi
+# A collection error in ONE file leaves the other files' tests collected, so the run is
+# half-successful and rc is non-zero. That is INFRA, not KILLED: the non-zero exit says
+# something was wrong, not that this mutation was caught.
+if printf '%s\n' "$OUT" | grep -qE 'errors? during collection|^Interrupted:|INTERNALERROR'; then
+  printf '  %-52s INFRA - collection error, no verdict\n' "$LABEL"
+  printf '%s\n' "$OUT" | grep -E 'errors? during collection|^Interrupted:|INTERNALERROR' | head -2 | cut -c1-80 | sed 's/^/         /'
+  exit 4
+fi
 if [ -z "$COLLECTED" ]; then
   printf '  %-52s INFRA - no tests were collected, no verdict\n' "$LABEL"
   printf '%s\n' "$OUT" | tail -2 | cut -c1-80 | sed 's/^/         /'
   exit 4
 fi
 
-VERDICT="SURVIVED"
-[ "$RC" != "0" ] && VERDICT="KILLED"
-FAILURES="$(printf '%s\n' "$OUT" | grep -cE '^FAILED' || true)"
-SUMMARY="$(printf '%s\n' "$OUT" | tail -1 | cut -c1-52)"
+# --- attribute the failure -------------------------------------------------
+# A non-zero exit only says *some* test failed. Capturing every failing id lets a
+# caller name the test that ought to have caught this, and lets the harness refuse
+# to claim a kill it cannot attribute.
+FAILING_IDS="$(printf '%s\n' "$OUT" | sed -nE 's/^FAILED ([^ ]+).*/\1/p')"
+FAILURES="$(printf '%s' "$FAILING_IDS" | grep -c . || true)"
+SUMMARY="$(printf '%s\n' "$OUT" | tail -1 | cut -c1-44)"
 
-printf '  %-52s %-9s rc=%s collected=%s failed=%s  %s\n' \
-       "$LABEL" "$VERDICT" "$RC" "$COLLECTED" "$FAILURES" "$SUMMARY"
+VERDICT="SURVIVED"
+ATTRIBUTED="n/a"
+if [ "$RC" != "0" ]; then
+  if [ -z "$DETECTOR" ]; then
+    VERDICT="KILLED"; ATTRIBUTED="unknown"
+  elif printf '%s\n' "$FAILING_IDS" | grep -qF -- "$DETECTOR"; then
+    VERDICT="KILLED"; ATTRIBUTED="yes"
+  else
+    VERDICT="KILLED-UNATTRIBUTED"; ATTRIBUTED="no"
+  fi
+fi
+
+printf '  %-52s %-19s rc=%s collected=%s failed=%s attr=%s  %s\n' \
+       "$LABEL" "$VERDICT" "$RC" "$COLLECTED" "$FAILURES" "$ATTRIBUTED" "$SUMMARY"
 printf '%s\n' "$OUT" | grep -E '^FAILED' | head -2 | cut -c1-72 | sed 's/^/         /'
+if [ "$ATTRIBUTED" = "no" ]; then
+  printf '         every failing test, since none matched --detector %s:\n' "$DETECTOR"
+  printf '%s\n' "$FAILING_IDS" | head -8 | sed 's/^/           /'
+  printf '         this mutation is NOT proven caught; treat it as SURVIVED until it is\n'
+fi
 
 # Case-insensitive: the verdict is upper-case for the table, and an expectation
 # written lower-case in a shell command should not fail on spelling alone.
