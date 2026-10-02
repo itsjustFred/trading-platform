@@ -3798,3 +3798,242 @@ class TestNonDemoWarningAndAccountGrouping:
         finally:
             daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
             daemon._CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
+
+
+class TestAdapterAvailabilityAndTaskLifecycle:
+    """The retryable-vs-terminal decision, and the task bookkeeping around it.
+
+    Six mutations survived. `_adapter_never_available_reason` is the one that matters: its
+    return value is the **difference between "not connected yet" (retryable, INFO) and "can
+    never connect" (terminal, ERROR)**, so a wrong answer does not just log the wrong thing - it
+    decides whether the daemon keeps trying.
+
+    **Every branch returns a reason rather than `None`, and all three are asserted.** `None` means
+    "still may", so a branch returning `None` for a terminal condition converts a permanent
+    refusal into an infinite retry loop that will never succeed.
+
+    The three terminal conditions, in the order the function checks them:
+
+    | condition | why it is terminal |
+    |---|---|
+    | no lookup supplied | *absence of evidence is not evidence of a retryable condition* |
+    | account absent from the lookup | no adapter is ever built for it |
+    | account is non-demo | no adapter is ever built for it |
+
+    The first is the least obvious and the most worth pinning. "We could not check" is treated as
+    "cannot connect" rather than "try again" - which is the conservative direction, and the
+    opposite choice would retry forever on a lookup that was never going to arrive.
+
+    **The account id is stringified before the lookup.** A caller passing an `int` finds a
+    `str`-keyed lookup, which is what the daemon actually holds. Without the `str()` it would miss
+    and report the account as permanently absent - a **terminal** verdict from what is really a
+    type mismatch. That is the worst direction for this particular mistake, which is why it is
+    asserted with an int key rather than a string one.
+
+    The task helpers are the same shape: bookkeeping whose failure is silence. A finished task left
+    in the dict leaks; a running task for a deactivated account that is popped without cancelling
+    keeps running; and **calling `.exception()` on a cancelled task raises `CancelledError`**,
+    so the `if task.cancelled(): continue` guard is what stops a routine cancellation from
+    crashing the cleanup sweep.
+    """
+
+    @staticmethod
+    def _account(account_id="a1", *, is_demo=True):
+        from shared.models import LiveAccountConfig
+
+        return LiveAccountConfig(
+            id=account_id, name="n", broker="alpaca", is_demo=is_demo
+        )
+
+    def test_an_absent_lookup_is_terminal_not_retryable(self) -> None:
+        """**"We could not check" is "cannot connect", not "try again".**
+
+        The docstring's own reasoning, pinned because the opposite is the intuitive reading:
+        a missing lookup looks like a transient state, so returning `None` would retry forever on
+        something that was never going to arrive.
+        """
+        from live_runner.daemon import _adapter_never_available_reason
+
+        reason = _adapter_never_available_reason(None, "a1")
+        assert reason is not None, (
+            "a missing lookup was reported as retryable, so the daemon would retry forever "
+            "for an account it can never build an adapter for"
+        )
+        assert "not available" in reason, reason
+
+    def test_an_account_missing_from_the_lookup_is_terminal(self) -> None:
+        """No adapter is ever built for it, so no amount of retrying helps."""
+        from live_runner.daemon import _adapter_never_available_reason
+
+        reason = _adapter_never_available_reason({}, "a1")
+        assert reason is not None, "an absent account was reported as retryable"
+        assert "not in the account lookup" in reason, reason
+
+    def test_a_non_demo_account_is_terminal(self) -> None:
+        """Already covered through the dispatch path; pinned here for the reason it gives."""
+        from live_runner.daemon import _adapter_never_available_reason
+
+        reason = _adapter_never_available_reason(
+            {"a1": self._account(is_demo=False)}, "a1"
+        )
+        assert reason is not None
+        assert "non-demo" in reason, reason
+
+    def test_a_demo_account_in_the_lookup_is_still_may(self) -> None:
+        """`None`, and it is the only `None` - asserted so the other three are not always-firing."""
+        from live_runner.daemon import _adapter_never_available_reason
+
+        assert _adapter_never_available_reason(
+            {"a1": self._account(is_demo=True)}, "a1"
+        ) is None
+
+    def test_a_non_string_account_id_still_finds_a_string_keyed_lookup(self) -> None:
+        """**The `str()` is load-bearing, and the direction it fails in is the bad one.**
+
+        The daemon's lookup is keyed by string. A caller passing an `int` must still find it -
+        and without the `str()` it would miss, and report the account as *permanently absent*.
+        That converts a type mismatch into a terminal verdict, which is the worst possible
+        direction for this particular function.
+        """
+        from live_runner.daemon import _adapter_never_available_reason
+
+        assert _adapter_never_available_reason({"1": self._account("1")}, 1) is None, (
+            "an int account id did not find a string-keyed lookup, so it would be reported "
+            "as permanently absent"
+        )
+        # And an int-keyed lookup still works, because the id is normalised first.
+        assert (
+            _adapter_never_available_reason({1: self._account("1")}, 1) is not None
+        ), "an int-keyed lookup unexpectedly matched; the normalisation changed shape"
+
+    def test_an_inactive_account_listener_is_cancelled_not_merely_forgotten(self) -> None:
+        """Popping without cancelling leaves the coroutine running with no handle on it.
+
+        Both halves are asserted, because the mutation removes only the `cancel()` and leaves the
+        pop - so a test checking the dict alone would pass.
+
+        **The assertions run inside the coroutine, deliberately.** Asserting after
+        `asyncio.run` returns is a bug I made first: the loop shutdown cancels outstanding tasks,
+        so a pending task reads as `cancelled()` whether or not the code under test cancelled
+        it. That would have made this test pass for the wrong reason - and the sibling test
+        caught it, because an *active* account's task came back cancelled too.
+        """
+        import asyncio
+
+        from live_runner.daemon import _cancel_inactive_tasks
+
+        async def scenario():
+            live = asyncio.create_task(asyncio.sleep(60))
+            await asyncio.sleep(0)
+            tasks = {"a1": live}
+            _cancel_inactive_tasks(tasks, set())
+            await asyncio.sleep(0)
+            still_in_dict = "a1" in tasks
+            was_cancelled = live.cancelled()
+            live.cancel()
+            return still_in_dict, was_cancelled
+
+        still_in_dict, was_cancelled = asyncio.run(scenario())
+        assert not still_in_dict, "the task was not removed from the dict"
+        assert was_cancelled, (
+            "the task was removed but not cancelled, so the listener is still running with "
+            "nothing holding a handle to it"
+        )
+
+    def test_an_active_account_listener_is_untouched(self) -> None:
+        """The other half of the branch, so the cancel above is not unconditional.
+
+        Also asserted inside the coroutine, for the reason given on the test above: after the
+        loop closes, every outstanding task reports as cancelled.
+        """
+        import asyncio
+
+        from live_runner.daemon import _cancel_inactive_tasks
+
+        async def scenario():
+            live = asyncio.create_task(asyncio.sleep(60))
+            await asyncio.sleep(0)
+            tasks = {"a1": live}
+            _cancel_inactive_tasks(tasks, {"a1"})
+            await asyncio.sleep(0)
+            still_in_dict = "a1" in tasks
+            was_cancelled = live.cancelled()
+            live.cancel()
+            return still_in_dict, was_cancelled
+
+        still_in_dict, was_cancelled = asyncio.run(scenario())
+        assert still_in_dict, "an active account's listener was removed"
+        assert not was_cancelled, "an active account's listener was cancelled"
+
+    def test_a_finished_listener_is_cleaned_from_the_dict(self) -> None:
+        """A finished task left in the dict is a leak, and nothing reports it."""
+        import asyncio
+
+        from live_runner.daemon import _cleanup_finished_listener_tasks
+
+        async def scenario():
+            done = asyncio.create_task(asyncio.sleep(0))
+            await done
+            running = asyncio.create_task(asyncio.sleep(60))
+            await asyncio.sleep(0)
+            tasks = {"done": done, "running": running}
+            _cleanup_finished_listener_tasks(tasks)
+            running.cancel()
+            return tasks
+
+        tasks = asyncio.run(scenario())
+        assert "done" not in tasks, "a finished task was left in the dict"
+        assert "running" in tasks, "a still-running task was cleaned up"
+
+    def test_a_cancelled_listener_is_cleaned_without_reading_its_exception(self) -> None:
+        """**`.exception()` on a cancelled task raises `CancelledError`.**
+
+        Verified by direct call rather than assumed, because that is what makes the
+        `if task.cancelled(): continue` guard load-bearing rather than tidy. Without it, a
+        routine cancellation - which happens on every account deactivation - turns into a
+        `CancelledError` escaping the cleanup sweep.
+        """
+        import asyncio
+
+        from live_runner.daemon import _cleanup_finished_listener_tasks
+
+        async def scenario():
+            cancelled = asyncio.create_task(asyncio.sleep(60))
+            await asyncio.sleep(0)
+            cancelled.cancel()
+            try:
+                await cancelled
+            except asyncio.CancelledError:
+                pass
+            tasks = {"cancelled": cancelled}
+            # The real function must not raise here.
+            _cleanup_finished_listener_tasks(tasks)
+            # And the reason it can is visible directly.
+            raised = False
+            try:
+                cancelled.exception()
+            except BaseException:
+                raised = True
+            return tasks, raised
+
+        tasks, raises = asyncio.run(scenario())
+        assert "cancelled" not in tasks, "the cancelled task was not cleaned up"
+        assert raises, (
+            "task.exception() no longer raises on a cancelled task, so the guard this test "
+            "relies on may be removable - re-check before deleting it"
+        )
+
+    def test_the_deployment_task_name_includes_its_kind(self) -> None:
+        """Two kinds share an account, so the name has to carry the kind.
+
+        Dropping the kind makes `deployment-listener-a1` and `deployment-stream-a1`
+        identical, which is the collision a task name exists to prevent.
+        """
+        from live_runner.daemon import _deployment_task_name
+
+        listener = _deployment_task_name("acc-1", "listener")
+        stream = _deployment_task_name("acc-1", "stream")
+        assert listener == "deployment-listener-acc-1", listener
+        assert stream == "deployment-stream-acc-1", stream
+        assert listener != stream, "two task kinds produced the same name"
+        assert "acc-1" in listener, listener
