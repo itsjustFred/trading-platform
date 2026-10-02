@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import math
 import os
+import re
 import tempfile
 import time
 from collections import deque
@@ -320,6 +321,80 @@ def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCAL
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
+
+#: `str()` of the exception cTrader's client raises on a response timeout:
+#: ``(15, 'Deferred')`` - see `_classify_deferred_response_timeout`.
+_RESPONSE_TIMEOUT_SHAPE = re.compile(r"^\(\s*(\d+)\s*,\s*['\"]Deferred['\"]\s*\)$")
+
+
+def _twisted_deferred_timeout_class() -> type[BaseException] | None:
+    """`twisted.internet.defer.TimeoutError`, or None if Twisted cannot be imported.
+
+    Imported lazily and by name: this module is loaded by the test suite and by deployments
+    with no cTrader install, and a module-scope Twisted import would be a side effect this
+    file otherwise does not have.
+    """
+    try:
+        from twisted.internet import defer
+    except Exception:  # pragma: no cover - Twisted is absent
+        return None
+    return getattr(defer, "TimeoutError", None)
+
+
+def _classify_deferred_response_timeout(
+    exc: BaseException, error_text: str
+) -> tuple[bool, int | None]:
+    """Is `exc` cTrader's *response* timeout, and how long did it wait?
+
+    `(matched, seconds)`. The boolean is the classification; the seconds are best-effort and
+    may be None, which is why they are not the return value on their own - a bare
+    `defer.TimeoutError()` carries no duration and must still be classified, not dropped.
+
+    **What this actually is.** `ctrader_open_api/client.py` does
+
+        responseDeferred.addTimeout(responseTimeoutInSeconds, self._runningReactor)
+
+    and Twisted's `Deferred.addTimeout` responds to expiry with
+
+        raise TimeoutError(timeout, "Deferred")        # twisted/internet/defer.py
+
+    so `args == (15, "Deferred")`, `str(exc) == "(15, 'Deferred')"`, and the 15 is
+    `responseTimeoutInSeconds` (`_send_application_auth` passes `timeout_seconds=15`). It is
+    a *response* timeout: the request was written to a socket that accepted it, and no reply
+    arrived. It is therefore neither a credentials problem nor a TLS handshake failure.
+
+    **The bug this fixes.** Twisted's `TimeoutError` is its own class deriving straight from
+    `Exception` - it is *not* the builtin, and on 3.11+ the builtin is also
+    `asyncio.TimeoutError`. So the pre-existing `isinstance(exc, asyncio.TimeoutError)`
+    branch could never match a Twisted timeout; it was dead code for this exact failure. In
+    production the error fell past it, past the `"token" in message` test, and into a
+    *fallback* that named authentication as the cause - once per retry, forever, for
+    credentials that were simultaneously authenticating in 1.0s from a fresh process.
+
+    Two signals, because either alone is incomplete. The class is authoritative when
+    Twisted is importable; the `str()` shape covers the case where it is not, and is
+    deliberately narrow - anchored at both ends, and requiring the literal `Deferred`, so a
+    merely-similar message or any other parenthesised pair falls through to the other
+    branches. An over-strict guard is still a wrong guard, so whitespace inside the tuple is
+    tolerated.
+    """
+    seconds: int | None = None
+    match = _RESPONSE_TIMEOUT_SHAPE.match(str(error_text).strip())
+    if match:
+        seconds = int(match.group(1))
+
+    timeout_class = _twisted_deferred_timeout_class()
+    if timeout_class is None or not isinstance(exc, timeout_class):
+        # Either not a Twisted timeout, or Twisted is unavailable and the string is all
+        # there is. Only a full shape match may claim it - the weak signal must not carry
+        # the classification on its own.
+        return bool(match), seconds
+
+    if seconds is None:
+        args = getattr(exc, "args", ())
+        if args and isinstance(args[0], int) and not isinstance(args[0], bool):
+            seconds = int(args[0])
+    return True, seconds
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
 
@@ -1416,7 +1491,35 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
     ) -> None:
-        if "token" in message or "auth" in message:
+        # A response timeout is checked FIRST, and as its own case, because it is
+        # categorically not a credentials problem: the socket is up and the request was
+        # written to it. Routing it into the token branch is how an operator ends up
+        # refreshing a credential that works - demonstrated in production, where the same
+        # credentials authenticated in 1.0s from a fresh process while the long-lived daemon
+        # timed out at 15s with this exact text.
+        is_response_timeout, response_timeout_s = _classify_deferred_response_timeout(
+            exc, error_text
+        )
+        if is_response_timeout:
+            waited = (
+                f"within {response_timeout_s}s"
+                if response_timeout_s is not None
+                else "within the configured response timeout"
+            )
+            logger.info(
+                "cTrader request written but NO RESPONSE %s; the transport is up, so this "
+                "is not a credentials problem and not a TLS handshake failure. The request "
+                "reached the socket and nothing came back.",
+                waited,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                        "response_timeout_s": response_timeout_s,
+                    }
+                },
+            )
+        elif "token" in message or "auth" in message:
             logger.info(
                 "cTrader authentication unavailable; verify token/credentials, "
                 "daemon will retry",
@@ -1438,8 +1541,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
         else:
+            # **This message used to say "connect/auth unavailable".** That is a fallback: it
+            # fires precisely when the cause could not be classified, and then names a cause
+            # anyway. In production it printed once per retry, forever, for a transport that
+            # was demonstrably fine, and every one of those lines pointed an operator at a
+            # token that worked. A fallback that guesses is worse than one that says so. The
+            # `error` field carries the real text, so nothing is lost by pointing at it.
             logger.info(
-                "cTrader connect/auth unavailable; daemon will retry",
+                "cTrader connect failed; cause NOT CLASSIFIED - read the error field rather "
+                "than assuming credentials. daemon will retry",
                 extra={
                     "data": {
                         "account_id": self.ctid_trader_account_id,

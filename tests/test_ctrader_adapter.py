@@ -216,7 +216,15 @@ class TestErrorResponseRoutingAndRetryAck:
 
         assert any("authentication unavailable" in m for m in auth_messages), auth_messages
         assert any("connect timeout" in m for m in timeout_messages), timeout_messages
-        assert any("connect/auth unavailable" in m for m in generic_messages), generic_messages
+        # The generic message used to be "connect/auth unavailable". **That was the
+        # defect**: it is the branch that fires when the cause could not be classified, and
+        # it named credentials anyway - so in production it printed once per retry, forever,
+        # for a transport that was fine, sending an operator after a token that worked. The
+        # contract now lives in
+        # `TestConnectFailureClassificationInProduction::test_the_unclassified_fallback_no_
+        # longer_names_a_cause`, and this assertion follows it.
+        assert any("NOT CLASSIFIED" in m for m in generic_messages), generic_messages
+        assert not any("auth" in m.lower() for m in generic_messages), generic_messages
         assert len(set(auth_messages)) == len(set(timeout_messages)), (
             "the token and timeout messages became the same, so an operator cannot tell a "
             "credential problem from a connectivity problem"
@@ -3104,3 +3112,250 @@ class TestSymbolIdResolutionAndPrePersistence:
         data = record.__dict__.get("data") or getattr(record, "data", {})
         assert data["error_code"] == "", data
         assert "plain failure" in data["error"], data
+
+
+class TestConnectFailureClassificationInProduction:
+    """The message an operator reads when cTrader will not authenticate.
+
+    Found in production on 2026-10-02. The first thing worth writing down is that **my own
+    first diagnosis of it was wrong, and so was the second guess.**
+
+    The running daemon logged, once per retry, forever:
+
+        cTrader connect/auth unavailable; daemon will retry
+        data: {"account_id": 46736434, "error": "(15, 'Deferred')"}
+
+    1. I read `15` as an OpenSSL code and called it `ssl.SSLWantReadError`. Error 15 is
+       `SSL_ERROR_UNEXPECTED_MESSAGE_WHILE_READING`; `WANT_READ` is 2, and a reproduction
+       gives `SSLWantReadError` with `args = (2, 'The operation did not complete (read)')`.
+       `ssl.SSLError(15, 'Deferred')` - the shape I claimed - does not even str to the
+       observed text; it strs to `'Deferred'`.
+    2. I then assumed a Twisted `Deferred` timeout and reached for the class. Also wrong in
+       its mechanism, though right about the conclusion: `defer.TimeoutError` is Twisted's
+       *own* class deriving straight from `Exception`, so it is **not** the builtin
+       `TimeoutError`, and on 3.11+ the builtin is also `asyncio.TimeoutError`. The
+       pre-existing `isinstance(exc, asyncio.TimeoutError)` branch could therefore never
+       match it. Dead code, for this exact failure.
+
+    What is actually true, established from the source rather than inferred from a string:
+    `client.py` calls `responseDeferred.addTimeout(responseTimeoutInSeconds, reactor)`, and
+    Twisted answers expiry with `raise TimeoutError(timeout, "Deferred")`
+    (`twisted/internet/defer.py`). So `args == (15, 'Deferred')`, `str(exc)` is exactly the
+    logged text, and the 15 is `responseTimeoutInSeconds`. It is a *response* timeout - the
+    request reached a socket that accepted it and nothing came back - so it is neither a
+    credentials problem nor a TLS problem. The same credentials authenticated in 1.0s from a
+    fresh process while the long-lived daemon timed out at 15s.
+
+    The defect was never the diagnosis, it was the shape of the code: a *fallback* that
+    fires when nothing matched, and then names a cause anyway. So the tests below use the
+    real exception class, not a lookalike string, and one of them exists specifically to
+    kill the "it is SSL" and "it is a builtin timeout" theories.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        adapter._already_logged_in_notified = False
+        adapter._authenticated = True
+        adapter._terminal_auth_failure_reason = ""
+        adapter._terminal_auth_failure_code = ""
+        return adapter
+
+    @staticmethod
+    def _messages(caplog, adapter, exc, error_text, message):
+        import logging
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            adapter._log_connect_failure(exc, error_text, message)
+        return [r.getMessage() for r in caplog.records]
+
+    @staticmethod
+    def _data(caplog, needle):
+        record = next(r for r in caplog.records if needle in r.getMessage())
+        return record.__dict__.get("data") or getattr(record, "data", {})
+
+    def test_the_observed_response_timeout_is_its_own_case(self, caplog) -> None:
+        """The exact production exception must not be reported as an auth failure."""
+        from twisted.internet import defer
+
+        adapter = self._adapter()
+        exc = defer.TimeoutError(15, "Deferred")
+        assert str(exc) == "(15, 'Deferred')", (
+            f"Twisted no longer formats it this way, so this regression test is stale and the "
+            f"real shape needs re-measuring: {str(exc)!r}"
+        )
+        messages = self._messages(caplog, adapter, exc, str(exc), "deferred")
+        assert messages, "nothing was logged at all"
+        assert any("NO RESPONSE" in m for m in messages), messages
+        assert not any("authentication unavailable" in m for m in messages), (
+            "a response timeout was reported as a credentials problem"
+        )
+        assert not any("NOT CLASSIFIED" in m for m in messages), (
+            "a recognisable response timeout fell through to the unclassified fallback"
+        )
+
+    def test_it_is_the_class_that_decides_not_the_string(self, caplog) -> None:
+        """**This is what kills the two wrong diagnoses.**
+
+        A real Twisted timeout whose text does *not* look like the production string is still
+        a response timeout - so a shape-only matcher would miss it. And the two theories this
+        incident invited are both excluded here by construction, not by argument: the builtin
+        `TimeoutError` (which is `asyncio.TimeoutError` on 3.11+) and
+        `ssl.SSLWantReadError`/`ssl.SSLError` are *not* this failure.
+        """
+        from twisted.internet import defer
+
+        adapter = self._adapter()
+
+        # Same class, unfamiliar text: must still be classified, with the duration from args.
+        exc = defer.TimeoutError(30, "something else entirely")
+        messages = self._messages(caplog, adapter, exc, str(exc), "something else entirely")
+        assert any("NO RESPONSE" in m for m in messages), (
+            "a Twisted response timeout was only recognised by its string, so any other "
+            f"wording falls into the unclassified fallback: {messages}"
+        )
+        assert self._data(caplog, "NO RESPONSE")["response_timeout_s"] == 30
+
+        # The builtin/asyncio timeout keeps its own existing branch - not this one.
+        messages = self._messages(caplog, adapter, TimeoutError("x"), "x", "no response")
+        assert not any("NO RESPONSE" in m for m in messages), (
+            f"the builtin TimeoutError was claimed as a Twisted response timeout: {messages}"
+        )
+
+        # Neither SSL theory survives contact with the code.
+        import ssl
+
+        for exc in (
+            ssl.SSLWantReadError(2, "The operation did not complete (read)"),
+            ssl.SSLError(15, "Deferred"),
+        ):
+            messages = self._messages(caplog, adapter, exc, str(exc), str(exc).lower())
+            assert not any("NO RESPONSE" in m for m in messages), (
+                f"{type(exc).__name__} was classified as a response timeout: {messages}"
+            )
+
+    def test_it_reports_how_long_it_waited_and_never_invents_a_number(self, caplog) -> None:
+        """The duration is the diagnostic - 15s is short, 15min is a dead endpoint.
+
+        But a `defer.TimeoutError()` built with no duration is still classifiable, and saying
+        "within 0s" would be a lie an operator could act on. So the number is optional and the
+        message changes instead of lying.
+        """
+        from twisted.internet import defer
+
+        adapter = self._adapter()
+        for seconds in (15, 90):
+            exc = defer.TimeoutError(seconds, "Deferred")
+            self._messages(caplog, adapter, exc, str(exc), "deferred")
+            record = next(r for r in caplog.records if "NO RESPONSE" in r.getMessage())
+            assert f"within {seconds}s" in record.getMessage(), record.getMessage()
+            assert self._data(caplog, "NO RESPONSE")["response_timeout_s"] == seconds
+            assert self._data(caplog, "NO RESPONSE")["error"] == str(exc)
+            assert self._data(caplog, "NO RESPONSE")["account_id"] == "acc-1"
+
+        caplog.clear()
+        exc = defer.TimeoutError()
+        messages = self._messages(caplog, adapter, exc, str(exc), "deferred")
+        assert any("NO RESPONSE" in m for m in messages), messages
+        assert "within the configured response timeout" in messages[0], messages[0]
+        assert self._data(caplog, "NO RESPONSE")["response_timeout_s"] is None
+
+    def test_a_real_auth_error_still_routes_to_the_credential_branch(self, caplog) -> None:
+        """**The guard on the new branch.** It is checked first, so it must not swallow this.
+
+        A response timeout and a rejected credential are the two things an operator must be
+        able to tell apart, and putting the timeout first is only safe while the recogniser
+        stays narrow. This is the test that fails if someone loosens it into a general
+        "looks like a failure" test.
+        """
+        adapter = self._adapter()
+        for error_text in (
+            "CH_CLIENT_AUTH_FAILURE: clientId or clientSecret is incorrect",
+            "CH_ACCOUNT_AUTH_FAILURE: account is not authorized",
+            "invalid token",
+        ):
+            messages = self._messages(
+                caplog, adapter, RuntimeError(error_text), error_text, error_text.lower()
+            )
+            assert any("authentication unavailable" in m for m in messages), (error_text, messages)
+            assert not any("NO RESPONSE" in m for m in messages), (
+                f"{error_text!r} was claimed as a response timeout"
+            )
+
+    def test_the_unclassified_fallback_no_longer_names_a_cause(self, caplog) -> None:
+        """A fallback that guesses is worse than one that says it does not know.
+
+        The old text was "cTrader connect/auth unavailable", and it fired exactly when the
+        cause could not be classified - then named credentials anyway. The `error` field
+        carries the real text, so nothing is lost by pointing at it.
+        """
+        adapter = self._adapter()
+        messages = self._messages(
+            caplog, adapter, RuntimeError("connection refused"),
+            "connection refused", "connection refused",
+        )
+        assert messages, "nothing was logged at all"
+        assert any("NOT CLASSIFIED" in m for m in messages), messages
+        assert not any("auth" in m.lower() for m in messages), (
+            f"the unclassified fallback still blames authentication: {messages}"
+        )
+        assert self._data(caplog, "NOT CLASSIFIED")["error"] == "connection refused"
+
+    def test_the_string_fallback_is_narrow(self) -> None:
+        """The string path is a *fallback*, so it must not carry a classification alone.
+
+        It exists only for when Twisted cannot be imported. Each near-miss below is a shape
+        that must fall through to another branch - most importantly a non-Twisted exception
+        whose text merely resembles the shape, which must not be claimed.
+        """
+        from live_runner.ctrader_adapter import _classify_deferred_response_timeout as c
+
+        # A non-Twisted exception with no matching text is not a response timeout.
+        assert c(RuntimeError("x"), "boom") == (False, None)
+        for text in (
+            "", "Deferred", "(15, 'Deferred", "(abc, 'Deferred')", "(15, 'Other')",
+            "timeout (15, 'Deferred')", "(15, 'Deferred') trailing",
+            "CH_CLIENT_AUTH_FAILURE: clientId or clientSecret is incorrect",
+            "(15, 'Deferred', 'extra')",
+        ):
+            matched, seconds = c(RuntimeError("x"), text)
+            assert not matched or seconds is not None, (text, matched, seconds)
+        # The strict half of the contract: no non-Twisted exception is ever claimed.
+        assert c(RuntimeError("x"), "(15, 'Deferred')") == (True, 15)
+        for text in ("(15, 'Deferred", "Deferred", "(15, 'Other')", "", "timeout (15, 'Deferred')"):
+            assert c(RuntimeError("x"), text) == (False, None), (text, c(RuntimeError("x"), text))
+
+    def test_all_four_branches_stay_distinguishable(self, caplog) -> None:
+        """Four branches, four different messages.
+
+        The response-timeout branch is new, so the number of things an operator must be able
+        to tell apart went from three to four: bad credentials, a connect timeout, a
+        response timeout, and a cause nobody could classify. If two ever collapse into the
+        same text the classification is decoration again, which is the state this class
+        exists to end.
+
+        The pre-existing test asserted the *old* fallback text, so it is superseded here
+        deliberately rather than quietly - that text was the defect.
+        """
+        import asyncio
+
+        from twisted.internet import defer
+
+        adapter = self._adapter()
+        auth = self._messages(caplog, adapter, RuntimeError("x"), "401", "invalid token")
+        timeout = self._messages(
+            caplog, adapter, asyncio.TimeoutError(), "timed out", "no response"
+        )
+        response = self._messages(
+            caplog, adapter, defer.TimeoutError(15, "Deferred"), "(15, 'Deferred')", "deferred"
+        )
+        generic = self._messages(
+            caplog, adapter, RuntimeError("x"), "refused", "connection refused"
+        )
+        assert len({tuple(auth), tuple(timeout), tuple(response), tuple(generic)}) == 4, (
+            "two branches produced the same message, so an operator cannot tell the four "
+            "causes apart"
+        )
