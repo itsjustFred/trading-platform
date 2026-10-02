@@ -128,6 +128,45 @@ def test_modules(root: pathlib.Path):
     return out
 
 
+def alias_map(modules) -> dict[str, str]:
+    """Module-level `alias = <function name>` assignments, resolved to their target.
+
+    A fourth kind of indirection, found the hard way: `daemon.py` ends with
+
+        _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO = daemon._deployment_account_is_demo
+
+    a self-alias through the module's own name, so that the gate cannot be swapped by
+    monkeypatching the name the rest of the module calls. Tests therefore call
+    `_REAL_DEPLOYMENT_ACCOUNT_IS_DEMO`, and without resolving aliases the tool reports a
+    function that five killed mutations show is thoroughly pinned as unreached. That is the
+    worst kind of false report: it looks like a gap and invites duplicate work on a
+    safety-critical function that is in fact well covered.
+
+    Only module-level assignments of a bare name or a dotted attribute are resolved, and
+    only to a name that is a known function elsewhere - so this cannot invent reach out of
+    nothing.
+    """
+    aliases: dict[str, str] = {}
+    for _name, tree in modules:
+        for node in tree.body:
+            targets = None
+            value = None
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets, value = [node.target], node.value
+            if targets is None or value is None or len(targets) != 1:
+                continue
+            target = targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if isinstance(value, ast.Name):
+                aliases[target.id] = value.id
+            elif isinstance(value, ast.Attribute):
+                aliases[target.id] = value.attr
+    return aliases
+
+
 def build_graph(modules):
     """name -> set of names it can call, over the whole package (name-based, so a name
     defined in two modules merges their edges - over-approximating reach)."""
@@ -167,6 +206,41 @@ def main() -> int:
                 roots |= _call_targets(ast.Module(body=[node], type_ignores=[]))
 
     edges = build_graph(modules)
+    # The alias map must include the TEST modules, not just the source. My first fix
+    # scanned source only and the false report survived it, because the alias that hides
+    # `_deployment_account_is_demo` lives in the test file itself:
+    #
+    #     tests/test_live_daemon.py
+    #     _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO = daemon._deployment_account_is_demo
+    #
+    # which exists precisely so the gate cannot be swapped by monkeypatching the name the
+    # rest of the module calls. Collecting aliases from one side and roots from the other
+    # is how the report stayed wrong after a fix that looked right.
+    test_trees = []
+    for path in test_modules(root):
+        try:
+            test_trees.append((str(path), parse(path)))
+        except SyntaxError:
+            continue
+    aliases = alias_map(modules + test_trees)
+    known = set(edges) | set(aliases.values())
+
+    # Resolve the roots and the edges through the alias map, so a self-alias like
+    # `_REAL_X = module._X` is transparent. Iterated to a fixed point because aliases may
+    # chain, and a chain longer than one hop is not worth a cleverer algorithm than this.
+    def resolve(name: str) -> str:
+        seen = set()
+        while name in aliases and name not in seen:
+            seen.add(name)
+            name = aliases[name]
+        return name
+
+    roots = {resolve(n) for n in roots if resolve(n) in known}
+    edges = {
+        resolve(name): {resolve(n) for n in outs if resolve(n) in known}
+        for name, outs in edges.items()
+    }
+    edges = {k: v for k, v in edges.items() if v}
 
     # Transitive closure from the test roots.
     covered: set[str] = set()
