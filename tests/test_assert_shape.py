@@ -123,6 +123,21 @@ def test_the_banned_form_is_actually_detected() -> None:
 # (verified with the harness, not assumed). Banning no-raise tests outright would push
 # authors to assert on a boolean twin that nothing else uses, which is a worse trade than
 # the pattern it replaces.
+#
+# **What a no-raise test is actually worth, established by mutation rather than assumed.**
+# The two directions are not symmetric, which is not obvious from the syntax:
+#
+#   * It catches "the code started raising where it should not." Removing the non-discord
+#     early return from `validate_discord_deployment_signal_config` is killed by
+#     `test_non_discord_deployment_ignores_channel_config` - the no-raise test itself -
+#     because the exception propagates out of a test with nothing to catch it.
+#   * It does NOT catch "the code stopped refusing." That is the sibling's entire job, and
+#     a no-raise test contributes nothing to it.
+#
+# So the pairing is not two halves of one assertion; it is two tests covering two different
+# mutation directions, one of which a no-raise test covers alone. Which is also why
+# "shared a call" is a meaningful check: a sibling that tests other code leaves the
+# "stops refusing" direction uncovered, and nothing else in the file would notice.
 # ---------------------------------------------------------------------------
 
 #: Names that make a call an assertion regardless of where they are defined.
