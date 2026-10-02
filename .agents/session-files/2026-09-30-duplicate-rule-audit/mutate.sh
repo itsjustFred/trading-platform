@@ -185,6 +185,34 @@ FAILING_IDS="$(printf '%s\n' "$OUT" | sed -nE 's/^FAILED ([^ ]+).*/\1/p')"
 FAILURES="$(printf '%s' "$FAILING_IDS" | grep -c . || true)"
 SUMMARY="$(printf '%s\n' "$OUT" | tail -1 | cut -c1-44)"
 
+# **A kill requires a failing test.** `RC != 0` alone does not mean one.
+#
+# Measured before this check: a suite reporting `1 passed, 1 error` - the test passed, an
+# autouse fixture's teardown raised - exits 1, produces no `FAILED` lines, and this harness
+# printed `KILLED ... failed=0`. Nothing was caught. A non-zero pytest exit means "something
+# went wrong", and the ways it can go wrong are not limited to a test failing:
+#
+#   * a fixture teardown error   (`N passed, N error`)
+#   * a warning promoted to an error by config (`-W error`, `filterwarnings = error`), which
+#     exits non-zero with every test passing
+#   * a plugin's session finish hook returning non-zero
+#   * xdist or an `-p` plugin failing after the tests ran
+#
+# Each of those produces `rc=1` and no failing test id. Classifying them as KILLED is the
+# same failure as trusting a green summary: a printed word mistaken for a verified result,
+# one level further down. `FAILURES` was already computed two lines above this comment - for
+# the log line only - which is the reason this went unnoticed.
+#
+# This is INFRA, not SURVIVED: nothing was caught, but we also did not get a clean run, so
+# the honest verdict is "no verdict" rather than "this mutant lives".
+if [ "$RC" != "0" ] && [ "$FAILURES" -eq 0 ]; then
+    printf '  %-52s INFRA - pytest exited %s with ZERO failing tests, no verdict\n' "$LABEL" "$RC"
+    printf '         (something other than a test failure ended the run: a fixture teardown, a\n'
+    printf '          warning promoted to an error, or a plugin hook. Not a kill.)\n'
+    printf '%s\n' "$OUT" | tail -4 | cut -c1-88 | sed 's/^/         /'
+    exit 4
+fi
+
 VERDICT="SURVIVED"
 ATTRIBUTED="n/a"
 if [ "$RC" != "0" ]; then

@@ -22,11 +22,17 @@ So the exit codes are now part of the contract, not an implementation detail:
 | 0 | applied, suite ran, reverted, and the verdict is **backed by a named failing test** (or SURVIVED, which needs no attribution) |
 | 2 | the mutation text was not uniquely present - nothing was mutated |
 | 3 | applied but the file did not change |
-| 4 | the suite did not run, or a file failed to collect - no verdict |
+| 4 | no verdict: the suite did not run, a file failed to collect, **or pytest exited non-zero without any test failing** (fixture teardown, warning-as-error, plugin hook) - measured to have been reported `KILLED ... failed=0` |
 | 5 | the verdict did not match `--expect` |
 | 6 | the revert failed - working tree dirty |
 | 7 | KILLED-UNATTRIBUTED: a test failed but not the one that should have. **Wrong**, not merely unverified. Never masked by `--expect` |
-| 8 | KILLED with no `--detector`: some test failed, but nothing proves it was this mutation. **Unverified**. Never masked by `--expect` |
+| 8 | KILLED with no `--detector`: some test **did** fail, but nothing proves it was this mutation. **Unverified**. Never masked by `--expect` |
+
+A kill requires a failing test. `rc != 0` is not sufficient and never was sufficient: pytest
+also exits non-zero for a fixture teardown error, a warning promoted to an error, and a
+plugin hook failing after the tests ran - each of which has every test passing. Those were
+reported `KILLED`, which is the "green summary read as a pass" mistake one level further
+down.
 
 Each row below is proved on a throwaway repo copy, never on the real one, so a deliberate
 breakage can never be mistaken for a real failure in a test run. The cases that need a known
@@ -63,6 +69,27 @@ UNRELATED_TEST = '''"""Deliberately failing, unrelated to any mutation under tes
 
 def test_an_unrelated_failure() -> None:
     assert 1 == 2, "this failure has nothing to do with any mutation"
+'''
+
+
+#: A test that PASSES, plus a fixture whose teardown raises. pytest exits 1 and prints
+#: `1 passed, 1 error` with **no FAILED line**. This is the shape that must never be read as
+#: a kill: a non-zero exit means "something went wrong", and a teardown error is not a test
+#: failure. It is the class that also covers a warning promoted to an error by config and a
+#: plugin hook returning non-zero - all rc=1, all with every test passing.
+TEARDOWN_TEST = '''"""Passes, then fails on teardown."""
+
+import pytest
+
+
+@pytest.fixture
+def explodes_on_teardown():
+    yield "value"
+    raise RuntimeError("teardown exploded")
+
+
+def test_passes_first(explodes_on_teardown):
+    assert explodes_on_teardown == "value"
 '''
 
 
@@ -223,6 +250,48 @@ def main() -> int:
             "--label", "collection error", "--old", old, "--new", new,
         ))
         (root / "tests" / "test_broken.py").unlink()
+
+        # 7b - rc != 0 with ZERO failing tests is INFRA, not a kill.
+        #     Measured before this case existed: the harness printed
+        #     `KILLED ... rc=1 collected=1 failed=0` for this exact scenario. Nothing was
+        #     caught - the suite said `1 passed, 1 error` - and the printed word said KILLED.
+        #     `FAILURES` was computed two lines above the verdict and used only for the log.
+        (root / "tests" / "test_teardown.py").write_text(TEARDOWN_TEST, encoding="utf-8")
+        results.append(case(
+            "rc!=0 but no test failed -> INFRA", 4, root,
+            "--file", "probe_pkg/mod.py",
+            "--suite", "tests/test_mod.py tests/test_teardown.py",
+            "--label", "teardown error, not a failure", "--old", old, "--new", new,
+        ))
+        # The same suite WITH a detector is still INFRA (rc=4), not rc=7. That was the
+        # expectation I first wrote, and the harness was right and I was wrong: the
+        # zero-failures check runs before the attribution logic, so there is nothing to
+        # attribute and "no verdict" is more honest than "wrong test caught it". Recorded
+        # because "KILLED-UNATTRIBUTED" would have been a much worse answer here - it at
+        # least implies a test failed.
+        results.append(case(
+            "...and with --detector, still no verdict", 4, root,
+            "--file", "probe_pkg/mod.py",
+            "--suite", "tests/test_mod.py tests/test_teardown.py",
+            "--detector", "test_hint_matches",
+            "--label", "teardown error, detector given", "--old", old, "--new", new,
+        ))
+        (root / "tests" / "test_teardown.py").unlink()
+
+        # 7c - and the new check must NOT swallow real kills. A mutation that a test catches,
+        #      in a suite that also has a teardown error, is still a genuine kill: the failing
+        #      test is what makes it one.
+        (root / "tests" / "test_teardown.py").write_text(TEARDOWN_TEST, encoding="utf-8")
+        results.append(case(
+            "a real kill alongside a teardown error", 0, root,
+            "--file", "probe_pkg/mod.py",
+            "--suite", "tests/test_mod.py tests/test_teardown.py",
+            "--detector", "test_guarded_refuses_negative",
+            "--label", "real kill plus teardown error", "--expect", "killed",
+            "--old", "    if value < 0:\n        return False",
+            "--new", "    return True",
+        ))
+        (root / "tests" / "test_teardown.py").unlink()
 
         # 8 - a wrong expectation is reported: rc=5.
         results.append(case(
