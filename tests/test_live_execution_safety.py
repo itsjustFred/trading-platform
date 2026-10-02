@@ -7336,3 +7336,329 @@ def test_a_lookup_error_with_no_status_code_is_not_treated_as_absence():
     assert _is_order_not_found(
         SimpleNamespace(response=SimpleNamespace(status_code=404))
     ) is True
+
+
+class TestSignalIdempotencyKeyAndStalenessBudget:
+    """Signal identity, the staleness budget, and int coercion in the daemon.
+
+    These three are the same family of decision - *is this signal allowed through, and is it
+    the same signal as last time* - and all were unmeasured.
+
+    **The idempotency key is the closest thing to a primary key for a live signal.** A
+    redelivery returns the canonical row instead of placing a second broker order, so the key
+    has two properties that pull against each other: the *same* logical signal must produce
+    the *same* key, and two *different* signals must not. Both directions are asserted, and
+    the components are varied one at a time - symbol case, action case, entry price, levels,
+    deployment - because a key that ignores any of them will happily dedupe a distinct signal.
+
+    Two escape hatches matter and are asserted separately:
+
+    - **A signal with no producer timestamp gets no key at all.** Minting one from an empty
+      timestamp slot would make distinct timestamp-less signals share a key and *wrongly
+      dedupe* - trading one signal twice is worse than losing the dedupe protection.
+    - **An existing key or a Discord redelivery is left alone.** A Discord redelivery keys on
+      its `discord_message_id`, which is the strongest identity available; replacing it with a
+      minted key would trade redelivery protection for nothing.
+
+    **The staleness budget is a fail-closed default in both directions.** An unknown timeframe
+    gets 300s rather than infinity - trading a signal you could not age-check is worse than
+    refusing one you could. And `' 1D '` must resolve, because a timeframe arriving with
+    padding is normal and a 300s budget on a daily strategy refuses every valid signal.
+
+    That normalisation has a consequence worth recording: **lowercasing collapses `1M` (month)
+    into `1m` (minute)**, so `1M` gets a 60-second budget. Traded platforms use `1M` for
+    monthly, and the budget that comes out is 60 seconds. The failure direction is refusing
+    valid signals rather than trading stale ones, which is the safe direction - but it is
+    still a wrong answer to a plausible input. Recorded alongside the existing `1w` decision
+    rather than merged into it.
+    """
+
+    @staticmethod
+    def _deployment(**settings):
+        from tests.test_live_execution_safety import _deployment
+
+        return _deployment(**settings)
+
+    @staticmethod
+    def _signal(**kwargs):
+        from risk.models import TradeSignal
+
+        base = dict(
+            action="buy",
+            symbol="EURUSD",
+            entry_price=100.0,
+            stop_loss=98.0,
+            take_profit=104.0,
+            timeframe="1h",
+        )
+        base.update(kwargs)
+        return TradeSignal(**base)
+
+    def _key(self, metadata, *, signal=None, deployment=None):
+        from live_runner.daemon import _trade_signal_to_live_signal
+
+        signal = signal or self._signal(metadata=metadata)
+        converted = _trade_signal_to_live_signal(signal, deployment or self._deployment())
+        return converted.metadata.get("idempotency_key")
+
+    # ------------------------------------------------------------ idempotency key
+
+    def test_the_same_signal_mints_the_same_key(self) -> None:
+        """The redelivery case, which is the whole reason the key exists.
+
+        One deployment object is shared across both calls, because the key includes
+        `deployment.id` and the shared `_deployment()` helper mints a fresh `uuid4` on
+        every call. Two deployments are two different signals by definition - which is what
+        `test_every_key_component_actually_changes_the_key` asserts separately.
+        """
+        deployment = self._deployment()
+        stamp = {"signal_timestamp": "2026-07-15T10:00:00+00:00"}
+        first = self._key(dict(stamp), deployment=deployment)
+        second = self._key(dict(stamp), deployment=deployment)
+        assert first, "the baseline produced no key, so stability proves nothing"
+        assert first == second
+
+    def test_a_timestamp_less_signal_gets_no_key_at_all(self) -> None:
+        """No key, rather than a key shared by every timestamp-less signal.
+
+        The failure is a *wrong* dedupe: two distinct signals would resolve to one row and
+        only one would trade. Losing the protection is recoverable; trading one signal twice
+        is not.
+        """
+        assert self._key({}) is None
+        assert self._key({"signal_timestamp": ""}) is None
+        assert self._key({"signal_timestamp": None}) is None
+
+    def test_an_existing_idempotency_key_is_never_overwritten(self) -> None:
+        """The caller already decided this signal's identity; that wins."""
+        key = self._key(
+            {"signal_timestamp": "2026-07-15T10:00:00+00:00",
+             "idempotency_key": "chosen-by-the-caller"}
+        )
+        assert key == "chosen-by-the-caller", (
+            f"a minted key replaced the caller's: {key!r}"
+        )
+
+    def test_a_discord_redelivery_keeps_its_message_id_identity(self) -> None:
+        """A Discord redelivery keys on its message id, the strongest identity available."""
+        from live_runner.daemon import _mint_signal_idempotency_key
+
+        metadata = {
+            "discord_message_id": "12345",
+            "signal_timestamp": "2026-07-15T10:00:00+00:00",
+        }
+        deployment = self._deployment()
+        _mint_signal_idempotency_key(self._signal(metadata=metadata), deployment, metadata)
+        assert "idempotency_key" not in metadata, (
+            "a Discord redelivery was given a minted key, which trades redelivery "
+            "protection for nothing"
+        )
+
+    def test_every_key_component_actually_changes_the_key(self) -> None:
+        """Each component, varied one at a time.
+
+        A key that ignores any single component will happily dedupe a distinct signal - and
+        that is the expensive direction, because the second order is never placed and nothing
+        reports a miss. So all six are asserted rather than only the stability case.
+        """
+        stamp = {"signal_timestamp": "2026-07-15T10:00:00+00:00"}
+        base_deployment = self._deployment()
+        base = self._key(dict(stamp), deployment=base_deployment)
+        assert base, "the baseline produced no key, so nothing below is meaningful"
+
+        # Case is deliberately NOT in this list: case is *normalised*, so it must produce
+        # the same key. Asserting it here would contradict
+        # `test_case_is_normalised_so_case_alone_is_not_a_new_signal` - and an early version
+        # of this test did exactly that, so the two tests fought and the wrong one lost.
+        other_deployment = self._deployment()
+        object.__setattr__(other_deployment, "id", "a-different-deployment")
+        variants = {
+            "entry price": (self._signal(entry_price=100.5, metadata=dict(stamp)), base_deployment),
+            "stop loss": (self._signal(stop_loss=97.0, metadata=dict(stamp)), base_deployment),
+            "take profit": (self._signal(take_profit=105.0, metadata=dict(stamp)), base_deployment),
+            "symbol": (self._signal(symbol="GBPUSD", metadata=dict(stamp)), base_deployment),
+            "action": (self._signal(action="sell", metadata=dict(stamp)), base_deployment),
+            "deployment": (self._signal(metadata=dict(stamp)), other_deployment),
+            "timestamp": (self._signal(metadata={"signal_timestamp": "2026-07-15T10:01:00+00:00"}), base_deployment),
+        }
+        for label, (signal, deployment) in variants.items():
+            other = self._key(dict(stamp), signal=signal, deployment=deployment)
+            assert other != base, (
+                f"a different {label} produced the same idempotency key, so a distinct "
+                "signal would be silently deduped and never traded"
+            )
+
+    def test_the_keys_case_normalisation_is_redundant_because_the_model_already_did_it(self) -> None:
+        """**Two verified equivalent mutants**, recorded with the structural reason.
+
+        `_mint_signal_idempotency_key` normalises the symbol with `.upper()` and the action
+        with `.lower()`. Removing either survives, because `TradeSignal` **already normalises
+        both in its own validator** - verified by constructing signals directly:
+
+        | input | stored |
+        |---|---|
+        | `symbol="eurusd"` | `"EURUSD"` |
+        | `symbol=" gbpusd "` | `"GBPUSD"` |
+        | `action="BUY"` | `"buy"` |
+        | `action="Sell"` | `"sell"` |
+
+        So for every input the model accepts, the key's normalisation is a no-op. It is
+        defence in depth rather than dead code: it means the key stays correct if the key
+        material is ever built from something other than a `TradeSignal`, and it does not
+        depend on that model continuing to normalise.
+
+        **The reason this is worth writing down rather than deleting:** the property being
+        protected - *case must not split one signal into two keys* - is asserted by the
+        neighbouring test against the model, not against this function. So the guarantee
+        holds at two layers, and it is the model layer that would fail first. If `TradeSignal`
+        ever stops normalising, that test catches it immediately and this note becomes the
+        thing to revisit.
+        """
+
+    def test_case_is_normalised_so_case_alone_is_not_a_new_signal(self) -> None:
+        """The other half of normalisation: case must *not* split one signal in two.
+
+        `EURUSD` and `eurusd` are the same instrument and `buy`/`BUY` the same action, so
+        they must agree - otherwise a redelivery whose producer differed in case loses its
+        dedupe and places a second order.
+        """
+        stamp = {"signal_timestamp": "2026-07-15T10:00:00+00:00"}
+        deployment = self._deployment()
+        lower = self._key(dict(stamp), signal=self._signal(symbol="eurusd", action="buy", metadata=dict(stamp)), deployment=deployment)
+        upper = self._key(dict(stamp), signal=self._signal(symbol="EURUSD", action="BUY", metadata=dict(stamp)), deployment=deployment)
+        assert lower == upper, (
+            "case differences split one logical signal into two keys, so a redelivery "
+            "would place a second order"
+        )
+
+    # --------------------------------------------------------- staleness budget
+
+    def test_the_budget_table_is_seconds_for_every_timeframe(self) -> None:
+        """Stated rather than assumed, because a minutes-for-seconds slip is invisible."""
+        from live_runner.daemon import _timeframe_age_budget_seconds
+
+        expected = {
+            "1m": 60.0, "5m": 300.0, "15m": 900.0, "30m": 1800.0,
+            "1h": 3600.0, "4h": 14400.0, "1d": 86400.0, "1w": 604800.0,
+        }
+        for timeframe, seconds in expected.items():
+            assert _timeframe_age_budget_seconds(timeframe) == seconds, (
+                f"{timeframe} budget is {_timeframe_age_budget_seconds(timeframe)}, "
+                f"not {seconds}"
+            )
+
+    def test_a_padded_and_uppercase_timeframe_still_resolves(self) -> None:
+        """Padding and case are normal in config, and a miss here refuses valid signals."""
+        from live_runner.daemon import _timeframe_age_budget_seconds
+
+        for spelling in ("1d", " 1D ", "\t1D\n", "1D"):
+            assert _timeframe_age_budget_seconds(spelling) == 86400.0, (
+                f"{spelling!r} did not resolve to a daily budget, so a daily strategy's "
+                "signals would be refused as stale"
+            )
+
+    def test_a_blank_terminal_error_message_needs_no_explicit_guard(self) -> None:
+        """**A verified equivalent mutant**, with the reason in one line.
+
+        `_is_terminal_ctrader_runtime_error` guards with `if not message: return False` before
+        the marker scan. Removing that guard changes nothing, because `any(marker in message
+        for marker in ...)` is `False` for an empty string - a substring of `""` is never
+        found.
+
+        Verified directly rather than assumed. The guard is a cheap short-circuit and reads
+        clearly, so it stays; the note is here so nobody re-runs the mutation and re-derives
+        this. The behaviour that *is* load-bearing is asserted by the marker tests: a
+        non-terminal message like `"timeout"` must not match, and a blank one must not either.
+        """
+        from live_runner.daemon import _is_terminal_ctrader_runtime_error
+
+        assert not any(marker in "" for marker in ("not authorized", "unauthorized")), (
+            "a substring search over an empty string started matching, so the guard removal "
+            "would no longer be equivalent"
+        )
+        assert _is_terminal_ctrader_runtime_error(RuntimeError("")) is False
+        assert _is_terminal_ctrader_runtime_error(RuntimeError("   ")) is False
+
+    def test_an_unknown_timeframe_fails_closed_rather_than_never_expiring(self) -> None:
+        """300 seconds, not infinity.
+
+        An infinite budget would let a signal of unknown age through regardless of how stale
+        it is. The 300s default is the conservative choice: it refuses some signals a longer
+        timeframe would have allowed, rather than trading information that is no longer valid.
+        """
+        from live_runner.daemon import _timeframe_age_budget_seconds
+
+        for unknown in ("2h", "3d", "banana", "", None, "  "):
+            budget = _timeframe_age_budget_seconds(unknown)
+            assert budget == 300.0, f"{unknown!r} got a budget of {budget}, not the 300s default"
+            assert budget != float("inf"), "an unknown timeframe must not get an infinite budget"
+
+    def test_a_monthly_spelling_collides_with_a_minute_one_KNOWN_AMBIGUITY(self) -> None:
+        """`1M` means month on most platforms and minute here. Recorded, not changed.
+
+        `_timeframe_age_budget_seconds` lowercases before lookup, so `1M` and `1m` are the
+        same key and both get **60 seconds**. A monthly strategy therefore gets a one-minute
+        staleness budget and its signals are refused almost immediately.
+
+        The failure direction is the safe one - refusing valid signals rather than trading
+        stale ones - but it is still a wrong answer to a plausible input, and it sits next to
+        the existing `1w` grid question. Fixing it means deciding whether `1M` is a month or
+        a minute in this codebase, which is a product decision, so it is recorded rather than
+        guessed.
+        """
+        from live_runner.daemon import _timeframe_age_budget_seconds
+
+        assert _timeframe_age_budget_seconds("1M") == 60.0, (
+            "1M no longer collides with 1m; if monthly was added deliberately, drop the "
+            "KNOWN_AMBIGUITY marker and record the decision"
+        )
+        assert _timeframe_age_budget_seconds("1m") == 60.0
+
+    # ---------------------------------------------------------- int coercion
+
+    def test_a_bool_is_refused_rather_than_read_as_one_or_zero(self) -> None:
+        """`True` is an `int` in Python, so the guard is what stops `True` becoming 1."""
+        from live_runner.daemon import _coerce_live_int
+
+        for value in (True, False):
+            with pytest.raises(ValueError, match="Invalid"):
+                _coerce_live_int(value, field_name="qty")
+
+    def test_a_fractional_value_is_refused_rather_than_truncated(self) -> None:
+        """`int(7.5)` is 7 silently; a half-size order is a real mistake, not a rounding."""
+        from live_runner.daemon import _coerce_live_int
+
+        for value in (7.5, "7.5"):
+            with pytest.raises(ValueError, match="must be an integer"):
+                _coerce_live_int(value, field_name="qty")
+
+    def test_a_non_finite_value_is_refused(self) -> None:
+        from live_runner.daemon import _coerce_live_int
+
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="must be an integer"):
+                _coerce_live_int(value, field_name="qty")
+
+    def test_the_minimum_is_enforced_and_is_inclusive(self) -> None:
+        """`minimum` is a floor, so the value *at* it is allowed."""
+        from live_runner.daemon import _coerce_live_int
+
+        assert _coerce_live_int(5, field_name="qty", minimum=5) == 5
+        assert _coerce_live_int(0, field_name="qty", minimum=0) == 0
+        for value in (4, -1, 0):
+            with pytest.raises(ValueError, match="must be >= 5"):
+                _coerce_live_int(value, field_name="qty", minimum=5)
+
+    def test_an_accepted_integer_shape_is_pinned(self) -> None:
+        """int, float-with-zero-fraction, and numeric string all reach the same value.
+
+        Config arrives as YAML, JSON or env text, so all three spellings are normal input -
+        and the acceptance is asserted so the refusals above are not just always-firing.
+        """
+        from live_runner.daemon import _coerce_live_int
+
+        for value in (7, 7.0, "7"):
+            assert _coerce_live_int(value, field_name="qty") == 7
+        for value in (None, "abc", ""):
+            with pytest.raises(ValueError, match="Invalid"):
+                _coerce_live_int(value, field_name="qty")
