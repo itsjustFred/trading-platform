@@ -1982,3 +1982,113 @@ class TestCtraderAccountIdentityAndListRequest:
         finally:
             monkeypatch._request_ctrader_account_detail = original_detail
             monkeypatch._load_ctrader_trader_details = original_trader
+
+
+class TestCtraderMissingCtidIsLogged:
+    """A cTrader account silently dropped from discovery must at least say so.
+
+    The surviving mutation removed the log line entirely, which is the easy way to lose
+    it: it is a `debug` call, it takes no arguments beyond the host and the raw item, and
+    nothing fails when it disappears.
+
+    **The line is at `debug`, and that is the right level but only because of who reads
+    it.** Discovery skipping an account is normal - an account mid-provision, or one on a
+    different host - so this is not a warning. What makes it worth a test is that
+    "skipped" and "not there" look identical from outside otherwise: with the line gone,
+    a configuration problem in which every cTrader account is missing its ctid produces
+    a clean, empty, entirely unremarkable discovery run. The account fields are included
+    precisely so that case is diagnosable, and both halves are asserted.
+    """
+
+    @staticmethod
+    def _capture_debug(call):
+        """Run `call` and return its DEBUG records from the discovery logger.
+
+        **`caplog` cannot see this logger.** `trading.live-account-discovery` sets its own
+        level to INFO with `propagate=False`, exactly like `trading.live-runner` does, so
+        a DEBUG record is dropped before any handler and never reaches caplog no matter
+        what `caplog.at_level` is given. My first version of this test used caplog and
+        asserted `len(...) == 1` against an empty list - it failed, but the failure was
+        the assertion doing its job, not caplog cooperating.
+
+        So a handler is attached to the logger itself and its level is lowered for the
+        duration. The logger is restored afterwards so no later test inherits it.
+        """
+        import logging
+
+        from live_runner import account_discovery as discovery
+
+        captured = []
+        handler = logging.Handler()
+        handler.emit = captured.append
+        previous_level = discovery.logger.level
+        discovery.logger.addHandler(handler)
+        discovery.logger.setLevel(logging.DEBUG)
+        try:
+            call()
+        finally:
+            discovery.logger.removeHandler(handler)
+            discovery.logger.setLevel(previous_level)
+        return captured
+
+    def test_a_skipped_account_is_logged_with_its_host_and_fields(self) -> None:
+        from live_runner.account_discovery import _log_ctrader_account_missing_ctid
+
+        captured = self._capture_debug(
+            lambda: _log_ctrader_account_missing_ctid(
+                "live.ctrader.com:443", self._proto(login=1234, brokerName="cTrader Demo")
+            )
+        )
+        skipped = [r for r in captured if "without ctidTraderAccountId" in r.getMessage()]
+        assert len(skipped) == 1, [r.getMessage() for r in captured]
+        data = skipped[0].__dict__.get("data") or getattr(skipped[0], "data", {})
+        assert data["host"] == "live.ctrader.com:443", data
+        assert data["account_fields"], "the raw account fields are what make the skip diagnosable"
+        rendered = str(data["account_fields"])
+        assert "1234" in rendered, rendered
+
+    @staticmethod
+    def _proto(**fields):
+        """A minimal protobuf-shaped stand-in.
+
+        **`_message_to_debug_fields` only understands protobufs.** It returns `{}` for a
+        plain dict or a `SimpleNamespace`, because both branches require `DESCRIPTOR` or
+        `ListFields`. The real caller passes a decoded protobuf, so the test does too -
+        my first version passed a dict and asserted on the fields, which came back empty
+        and proved nothing about the code.
+
+        Worth knowing as a property of the code: the "diagnosable" value of this log line
+        depends entirely on the caller passing the protobuf shape. Anything else logs an
+        empty dict with no complaint.
+        """
+        class _Descriptor:
+            LABEL_REPEATED = 3
+
+            def __init__(self, name):
+                self.name = name
+                self.label = 1
+
+        return type(
+            "_Proto",
+            (),
+            {
+                "ListFields": staticmethod(
+                    lambda: [(_Descriptor(name), value) for name, value in fields.items()]
+                )
+            },
+        )()
+
+    def test_the_skip_is_not_escalated_above_debug(self) -> None:
+        """An account without a ctid is ordinary, so it must not train anyone to ignore
+        warnings. A missing ctid during provisioning is expected; a WARNING here would be
+        noise on every successful discovery run."""
+        import logging
+
+        from live_runner.account_discovery import _log_ctrader_account_missing_ctid
+
+        captured = self._capture_debug(
+            lambda: _log_ctrader_account_missing_ctid("host", self._proto(login=1))
+        )
+        assert captured, "nothing was logged at all"
+        for record in captured:
+            assert record.levelno < logging.WARNING, record.getMessage()

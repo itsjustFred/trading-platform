@@ -1009,3 +1009,166 @@ class TestBarStoreOwnershipAndNormalisation:
 
         # And a worker with no stream must not raise.
         _StreamWorker._subscribe_symbols(self._worker(None), ["AAPL"])
+
+
+class TestStreamWorkerFeedSelectionAndBarOwnership:
+    """Which feed a stream gets, which stream class a `kind` picks, and who owns a bar.
+
+    Five mutations survived. Three are about **choosing the wrong market data**, which is
+    the most consequential kind of quiet failure available in this file: nothing raises,
+    the service connects, and the numbers are simply wrong.
+
+    **The feed is deliberately inverted from the obvious reading.** `paper` gets IEX and
+    **live gets SIP**. That looks backwards until you know what the feeds are: SIP is the
+    full consolidated tape and IEX is one exchange. So the cheap, partial feed is given to
+    the account where mistakes cost nothing, and the complete one to the account trading
+    real money. Swapping them is the surviving mutation, and it fails in the expensive
+    direction - live trading that silently never sees trades occurring off-IEX. There is no
+    comment saying any of this, so the reasoning is recorded here.
+
+    **`kind` dispatches on one string and defaults to crypto.** `kind == "stock"` selects
+    a `StockDataStream`; **anything else** selects a `CryptoDataStream`. The caller
+    computes `stream_kind = "crypto" if _is_crypto_symbol(symbol) else "stock"`, so the
+    only two values are "stock" and "crypto" - but the fallback means a typo, a future
+    third kind, or a hand-built worker all reach a crypto stream with no complaint. A
+    stock symbol on a crypto stream fails at subscribe time with a broker error rather
+    than here, where the mistake is visible. Pinned as-is: changing the dispatch to a
+    whitelist would be a behaviour change, and the current shape is not unsafe for the
+    two values that exist.
+
+    **The append path stores the payload by reference, and the read path copies the
+    list.** The asymmetry is the finding. `_ingest_manual_bars_sync` stores `dict(bar)`,
+    so a caller reusing its dict in a backfill loop cannot rewrite history. The streaming
+    path appends the serializer's dict as-is, so the stored bar *is* the object the
+    serializer built. Today that object is freshly constructed per bar and nothing
+    mutates it, so this is a sharp edge rather than a live bug - but the guarantee the
+    manual path makes is not made here, and a future serializer that reuses a dict would
+    rewrite live history silently.
+
+    **`_bars` is a `defaultdict`, so appending allocates and reading does not.** That is
+    the exact complement of the read-path contract pinned earlier: `_bars_for_symbol`
+    will not create a key for an unknown symbol, but `_append_bar_sync` will. The
+    subscription filter in `_on_bar` is what prevents phantom keys, and it is checked
+    under the service lock and then *released* before the append runs in a worker thread -
+    so the guard is a check-then-act, and the `defaultdict` is what makes a lost race a
+    leaked key rather than a `KeyError`. Asserted as-is with the reasoning, so the day
+    someone changes `_bars` to a plain dict they learn that this was the safety net.
+
+    The lock is load-bearing for the same reason: `deque.append` is atomic, but
+    `defaultdict.__missing__` creating the deque is not, so the lock is what makes
+    create-and-append one step.
+    """
+
+    @staticmethod
+    def _worker(kind="stock", paper=True):
+        return _StreamWorker(
+            kind=kind, api_key="k", secret_key="s", paper=paper, bar_handler=lambda *_: None
+        )
+
+    def test_a_live_account_gets_the_full_tape_and_a_paper_one_does_not(self) -> None:
+        """The inversion that looks backwards and is not. Asserted on the real enums.
+
+        Paper -> IEX (one exchange, cheap, mistakes cost nothing).
+        Live  -> SIP (consolidated tape; missing a trade on live money is not acceptable).
+        """
+        live_stream = self._worker(paper=False)._create_stream()
+        paper_stream = self._worker(paper=True)._create_stream()
+        # The feed is not stored on the stream: alpaca-py bakes it into the endpoint URL,
+        # so that is the only place it can be observed. Asserted on the real URL suffix
+        # rather than a private attribute, which is the same string either way.
+        assert live_stream._endpoint.endswith("/v2/sip"), live_stream._endpoint
+        assert paper_stream._endpoint.endswith("/v2/iex"), paper_stream._endpoint
+        assert live_stream._endpoint != paper_stream._endpoint, (
+            "the feed no longer distinguishes live from paper"
+        )
+
+    def test_a_crypto_kind_gets_a_crypto_stream_and_a_stock_kind_a_stock_stream(self) -> None:
+        """The dispatch is on one string, and everything that is not "stock" is crypto."""
+        from alpaca.data.live import CryptoDataStream, StockDataStream
+
+        assert isinstance(self._worker(kind="stock")._create_stream(), StockDataStream)
+        assert isinstance(self._worker(kind="crypto")._create_stream(), CryptoDataStream)
+
+    def test_an_unrecognised_kind_falls_through_to_the_crypto_stream(self) -> None:
+        """Pinned as-is, and the reason it is worth pinning: there is no complaint here.
+
+        The caller only ever produces "stock" or "crypto", so this is unreachable today.
+        But a typo or a future third kind reaches a crypto stream silently, and the
+        failure surfaces at subscribe time as a broker error rather than here. Recorded
+        so that adding a kind is a deliberate act rather than an accident.
+        """
+        from alpaca.data.live import CryptoDataStream
+
+        for kind in ("crypto", "CRYPTO", "stocks", "typo", ""):
+            stream = self._worker(kind=kind)._create_stream()
+            assert isinstance(stream, CryptoDataStream), (kind, type(stream).__name__)
+
+    def test_the_append_stores_the_payload_by_reference(self) -> None:
+        """The manual-ingest copy is NOT applied on the streaming path. Asserted as-is.
+
+        `_ingest_manual_bars_sync` stores `dict(bar)`; this appends the serializer's dict
+        unchanged. Today each bar is freshly built by the serializer and nothing mutates
+        it, so there is no live bug - but the ownership guarantee the manual path makes is
+        simply absent here, and a serializer that reused its dict would rewrite live
+        history with no error and no change in the stored count.
+        """
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = threading.Lock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=service._max_bars_per_symbol))
+
+        payload = {"symbol": "AAPL", "close": 1.0}
+        service._append_bar_sync("AAPL", payload)
+        assert service._bars["AAPL"][0] is payload, (
+            "the streaming path now copies, which changes the ownership contract that "
+            "was pinned here; make that a deliberate change"
+        )
+
+    def test_appending_an_unknown_symbol_allocates_a_key_and_reading_does_not(self) -> None:
+        """The defaultdict is the safety net, and the complement of the read contract."""
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = threading.Lock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=service._max_bars_per_symbol))
+
+        assert "GHOST" not in service._bars
+        # Reading never allocates.
+        assert service._bars_for_symbol("GHOST") == []
+        assert "GHOST" not in service._bars, "a read created a store key"
+
+        # Appending always does. The subscription filter in _on_bar is the only guard.
+        service._append_bar_sync("GHOST", {"symbol": "GHOST"})
+        assert "GHOST" in service._bars, (
+            "_bars is no longer a defaultdict, so this lost-race window became a KeyError "
+            "instead of a leaked key; check _on_bar's check-then-act"
+        )
+
+    def test_the_append_is_taken_under_the_service_lock(self) -> None:
+        """Asserted structurally, because the race it prevents is not reliably testable.
+
+        `deque.append` is atomic on its own, so removing the lock looks harmless. It is
+        not: `defaultdict.__missing__` creating the deque is a check-then-act, and the
+        lock is what makes create-and-append a single step. Rather than write a flaky race
+        test, the lock is instrumented and asserted to be entered.
+        """
+        entered = []
+
+        class _RecordingLock:
+            def __enter__(self):
+                entered.append("enter")
+                return self
+
+            def __exit__(self, *exc_info):
+                entered.append("exit")
+                return False
+
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = _RecordingLock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=service._max_bars_per_symbol))
+
+        service._append_bar_sync("AAPL", {"symbol": "AAPL"})
+        assert entered == ["enter", "exit"], (
+            "the bar append did not take the service lock; deque.append is atomic but "
+            "defaultdict key creation is not, so this is create-and-append as one step"
+        )

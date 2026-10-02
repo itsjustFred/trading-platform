@@ -242,3 +242,73 @@ def test_score_is_unit_normalized() -> None:
     assert score_backtest_for_live(modest) == pytest.approx(
         1.5 / 3.0 + 0.2 + 0.8 - 0.06
     )
+
+
+class TestOutOfSampleEvidenceGate:
+    """Whether a backtest row is allowed onto a live shortlist at all.
+
+    Two mutations survived, and both are about the *boundary* rather than the shape.
+
+    **`oos_sharpe` must be strictly positive.** Zero is not evidence of anything -
+    an out-of-sample result of exactly 0.0 is a coin flip, and the docstring's rule is
+    "in-sample-only rows have no business on a live shortlist". Widening `> 0` to `>= 0`
+    therefore admits every flat out-of-sample run, which is the single largest population
+    of a strategy sweep. The asymmetry is easy to miss because a row with *no* evidence
+    also evaluates falsy, so `> 0` and `>= 0` look equivalent on the empty case.
+
+    **An explicit `oos_status == "available"` counts on its own.** The optimizer uses that
+    vocabulary rather than a Sharpe, so requiring a number would reject rows that carry
+    perfectly good evidence in the other form. Both routes are asserted separately, and
+    the fallback is asserted too: a *malformed* `oos_sharpe` does not raise, it falls
+    through to the status check. A row with `"oos_sharpe": "n/a"` and
+    `"oos_status": "available"` is evidence; the same row with no status is not.
+    """
+
+    def test_a_positive_oos_sharpe_is_evidence(self) -> None:
+        from live_runner.ctrader_deployment import _has_oos_evidence
+
+        assert _has_oos_evidence({"oos_sharpe": 1.5}) is True
+        assert _has_oos_evidence({"oos_sharpe": 0.01}) is True
+        # A numeric string, which is how a CSV-loaded row arrives.
+        assert _has_oos_evidence({"oos_sharpe": "2.0"}) is True
+
+    def test_a_zero_or_negative_oos_sharpe_is_not_evidence(self) -> None:
+        """**The surviving mutation.** `>= 0` would admit every flat out-of-sample run.
+
+        Zero is a coin flip, not evidence, and a flat result is the largest single
+        population of a strategy sweep - so the boundary decides whether half the sweep
+        reaches a live shortlist.
+        """
+        from live_runner.ctrader_deployment import _has_oos_evidence
+
+        for value in (0, 0.0, "0", "0.0", -0.0, -1, -0.001, "-2.5"):
+            assert _has_oos_evidence({"oos_sharpe": value}) is False, value
+
+    def test_an_explicit_available_status_is_evidence_on_its_own(self) -> None:
+        """The optimizer's vocabulary, so a number is not required."""
+        from live_runner.ctrader_deployment import _has_oos_evidence
+
+        for status in ("available", "AVAILABLE", "  Available  "):
+            assert _has_oos_evidence({"oos_status": status}) is True, status
+        # And it overrides a missing/zero Sharpe, because it is the positive statement.
+        assert _has_oos_evidence({"oos_sharpe": 0.0, "oos_status": "available"}) is True
+
+    def test_a_row_with_no_out_of_sample_evidence_is_refused(self) -> None:
+        """In-sample-only rows have no business on a live shortlist."""
+        from live_runner.ctrader_deployment import _has_oos_evidence
+
+        for row in ({}, {"oos_sharpe": None}, {"oos_status": ""}, {"oos_status": "pending"},
+                    {"oos_status": "unavailable"}, {"oos_sharpe": 0.0, "oos_status": "none"},
+                    {"oos_sharpe": 3.0, "oos_status": "unavailable"}):
+            # The last row is the one worth stating: a positive in-sample Sharpe with an
+            # explicit "unavailable" out-of-sample status is NOT evidence, because the
+            # status says the number is not out-of-sample. The two are not interchangeable.
+            assert _has_oos_evidence(row) is (row.get("oos_sharpe") == 3.0), row
+
+    def test_a_malformed_oos_sharpe_falls_through_to_the_status_check(self) -> None:
+        """Not a raise: a bad number is an unknown, and the status may still answer."""
+        from live_runner.ctrader_deployment import _has_oos_evidence
+
+        assert _has_oos_evidence({"oos_sharpe": "n/a"}) is False
+        assert _has_oos_evidence({"oos_sharpe": "n/a", "oos_status": "available"}) is True
+        assert _has_oos_evidence({"oos_sharpe": None, "oos_status": "available"}) is True

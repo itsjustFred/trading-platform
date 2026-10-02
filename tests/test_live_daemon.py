@@ -4335,3 +4335,296 @@ class TestBrokerLoginAndChannelResolution:
             assert daemon._live_deployment_channel_ids() == set()
         finally:
             monkey.undo()
+
+
+class TestStatusObservationLedgerAndAuthLog:
+    """The status-observation ledger, and the log line for a terminal balance-auth failure.
+
+    Three mutations survived. The ledger is the interesting one, because its job is to make
+    a *transition* visible, and the two things that make a transition visible are both
+    easy to drop silently.
+
+    **`previous_statuses.clear()` is load-bearing, and dropping it looks harmless.** Without
+    it, a deployment removed from the database leaves its status behind. The removed-id
+    log still fires - that is computed from a set difference *before* the clear - so the
+    removal is still announced and the mutation looks like a no-op in the log output. What
+    changes is later: if an id is re-added, its stale status is already in the ledger, so
+    a deployment that comes back `ACTIVE` where it used to be `PAUSED` is only logged if
+    the two happen to differ from the *stale* value rather than from nothing. Worse, the
+    ledger grows without bound for every id ever seen. The test therefore asserts the
+    ledger's *contents* after a removal, not merely that a line was logged.
+
+    **An UNKNOWN status warns at `warning`, not `debug`.** The `elif status == "UNKNOWN"`
+    arm is the only thing that tells an operator the database holds a status the daemon
+    does not understand. The debug arm below it is for the ordinary PAUSED/STOPPED
+    bookkeeping, which is genuinely uninteresting; an unrecognised status is not.
+
+    The terminal balance-auth failure is logged at `warning` with the account, the adapter
+    class and the error. It is a one-shot line, so anything lost is lost for the run - the
+    whole reason it names the adapter is that an operator seeing "not authorized" needs to
+    know *which* broker refused.
+    """
+
+    @staticmethod
+    def _deployment(status="ACTIVE", tag=1, account_id="acc-1"):
+        """`id` is a validated UUID, so the ledger keys below are built from a fixed int.
+
+        The first version of this used readable names like "dep-1" and pydantic rejected
+        them. Worth knowing: the ledger is keyed by `str(deployment.id)`, so ids in these
+        tests must be UUID-shaped even though the assertions read them as opaque strings.
+        """
+        from uuid import UUID
+
+        from shared.models import LiveDeploymentConfig
+
+        return LiveDeploymentConfig(
+            id=str(UUID(int=tag)), strategy_name="strat", account_id=account_id,
+            symbols=["X"], timeframe="1h", status=status,
+        )
+
+    @staticmethod
+    def _key(tag):
+        from uuid import UUID
+
+        return str(UUID(int=tag))
+
+    def test_the_ledger_is_replaced_not_merged_so_removed_ids_do_not_survive(self) -> None:
+        """**The surviving mutation.** Asserted on the ledger's contents, not on log output.
+
+        Without the clear, a removed deployment's status lingers, so an id re-added later
+        looks unchanged and its transition is never announced. The removal log still fires
+        either way, which is exactly why this is easy to miss by reading the logs.
+        """
+        keep, gone = self._key(1), self._key(2)
+        previous = {gone: "PAUSED", keep: "ACTIVE"}
+        deployments = [self._deployment("ACTIVE", tag=1)]
+
+        daemon._log_deployment_status_observations(deployments, previous)
+
+        assert set(previous) == {keep}, previous
+        assert previous == {keep: "ACTIVE"}, previous
+        assert gone not in previous, "a removed deployment survived in the ledger"
+
+    def test_a_re_added_deployment_with_a_changed_status_is_reported_as_a_transition(self, caplog) -> None:
+        """The consequence of the stale entry, asserted end to end through the log."""
+        import logging
+
+        key = self._key(1)
+        previous = {key: "PAUSED"}
+        deployments = [self._deployment("ACTIVE", tag=1)]
+
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            daemon._log_deployment_status_observations(deployments, previous)
+
+        transitions = [r for r in caplog.records if "status transition" in r.getMessage()]
+        assert len(transitions) == 1, [r.getMessage() for r in caplog.records]
+        data = transitions[0].__dict__.get("data") or getattr(transitions[0], "data", {})
+        assert data["previous_status"] == "PAUSED", data
+        assert data["status"] == "ACTIVE", data
+        assert data["deployment_id"] == key, data
+
+    def test_an_unchanged_status_is_not_reported_as_a_transition(self, caplog) -> None:
+        """A warning that fires every poll trains the operator to ignore it."""
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            caplog.clear()
+            daemon._log_deployment_status_observations(
+                [self._deployment("PAUSED", tag=1)], {self._key(1): "PAUSED"}
+            )
+        assert not [r for r in caplog.records if "status transition" in r.getMessage()], (
+            [r.getMessage() for r in caplog.records]
+        )
+
+    def test_an_unknown_status_warns_at_warning_level(self, caplog) -> None:
+        """**The surviving mutation.** The only signal that a status is not understood.
+
+        **Like the cTrader action allowlist, this arm is defence-in-depth that the model
+        already enforces.** `LiveDeploymentConfig.status` is a validated
+        `Literal["ACTIVE", "PAUSED", "STOPPED"]`, so a validated deployment cannot carry
+        "WHATEVER" - the first version of this test learned that from a pydantic
+        `literal_error`, exactly as the cTrader one did.
+
+        `_normalize_deployment_status` maps anything outside those three to "UNKNOWN", so
+        the arm is reachable only via a row that bypassed validation. It is kept and tested
+        with `model_construct` rather than left as an unreachable line: the daemon's whole
+        job here is noticing a status it does not understand, and an arm that cannot fire
+        is not evidence of that.
+        """
+        import logging
+
+        deployment = self._deployment("ACTIVE", tag=1).model_construct(
+            id=self._key(1), status="WHATEVER", account_id="acc-1", strategy_name="strat"
+        )
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            daemon._log_deployment_status_observations([deployment], {})
+        unknown = [r for r in caplog.records if "unknown status" in r.getMessage()]
+        assert len(unknown) == 1, [r.getMessage() for r in caplog.records]
+        assert unknown[0].levelno == logging.WARNING, (
+            f"an unrecognised status logged at {logging.getLevelName(unknown[0].levelno)}, "
+            "which is the same level as the uninteresting paused/stopped bookkeeping"
+        )
+        data = unknown[0].__dict__.get("data") or getattr(unknown[0], "data", {})
+        assert data["status"] == "WHATEVER", data
+        assert data["deployment_id"] == self._key(1), data
+
+    def test_paused_and_stopped_are_bookkeeping_not_warnings(self, caplog) -> None:
+        """Both are ordinary, so they are reported at debug - deliberately uninteresting.
+
+        **`caplog` cannot see this line, and the reason matters.** The
+        `trading.live-runner` logger sets its own level to INFO and has
+        `propagate=False`, so a DEBUG record is dropped *before* any handler and never
+        reaches caplog regardless of `caplog.at_level(logging.DEBUG)`. My first version of
+        this test asserted on the debug record via caplog and found zero of them, having
+        silently proved nothing.
+
+        Two consequences worth carrying: the negative assertion ("no warning or above")
+        goes through caplog and is genuine, while the content of the debug line needs a
+        handler attached to `daemon.logger` with its level lowered - done here. And in
+        production this line is likewise invisible at INFO, which is the intent.
+        """
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            daemon._log_deployment_status_observations(
+                [self._deployment("PAUSED", tag=1), self._deployment("STOPPED", tag=2)],
+                {},
+            )
+        # Genuine via caplog: neither ordinary status escalates.
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            [r.getMessage() for r in caplog.records]
+        )
+
+        # The debug line's content, reached only by handling the logger directly.
+        captured = []
+        handler = logging.Handler()
+        handler.emit = captured.append
+        previous_level = daemon.logger.level
+        daemon.logger.addHandler(handler)
+        daemon.logger.setLevel(logging.DEBUG)
+        try:
+            daemon._log_deployment_status_observations(
+                [self._deployment("PAUSED", tag=1), self._deployment("STOPPED", tag=2)], {}
+            )
+        finally:
+            daemon.logger.removeHandler(handler)
+            daemon.logger.setLevel(previous_level)
+
+        debug = [r for r in captured if "non-active deployments" in r.getMessage()]
+        assert len(debug) == 1, [r.getMessage() for r in captured]
+        data = debug[0].__dict__.get("data") or getattr(debug[0], "data", {})
+        assert data["paused_deployment_ids"] == [self._key(1)], data
+        assert data["stopped_deployment_ids"] == [self._key(2)], data
+
+    def test_a_terminal_balance_auth_failure_names_the_account_and_the_adapter(self, caplog) -> None:
+        """**The surviving mutation.** One-shot line; anything lost is lost for the run."""
+        import logging
+
+        class _FakeAdapter:
+            pass
+
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            daemon._log_terminal_balance_auth_failure(
+                "acc-9", _FakeAdapter(), RuntimeError("401 unauthorized")
+            )
+        records = [r for r in caplog.records if "not authorized" in r.getMessage().lower()]
+        assert len(records) == 1, [r.getMessage() for r in caplog.records]
+        assert records[0].levelno == logging.WARNING, records[0].levelname
+        data = records[0].__dict__.get("data") or getattr(records[0], "data", {})
+        assert data["account_id"] == "acc-9", data
+        assert data["adapter"] == "_FakeAdapter", data
+        assert "401 unauthorized" in data["error"], data
+        assert "acc-9" in records[0].getMessage(), records[0].getMessage()
+
+
+class TestTestSignalTriggerPriceFetch:
+    """The price a manual signal trigger submits against, and what a missing one must do.
+
+    The surviving mutation turned a missing symbol into `0.0`, and that is the finding:
+    this price feeds `theoretical_price` into a real order-sizing path, so returning a
+    number the broker never sent is worse than raising. `0.0` is a plausible value that
+    flows onward as a real figure; a `KeyError` stops the trigger and names the symbol.
+
+    **The stub has to patch the module the function imports from, not the calling module.**
+    `_fetch_latest_price` does `from alpaca.data.historical import
+    StockHistoricalDataClient` *inside* the function body, so setting an attribute on
+    `live_runner.test_signal_trigger` has no effect - the local import shadows it. My
+    first version did exactly that and made a **real network call** to
+    data.alpaca.markets, which returned 401. The patch target is
+    `alpaca.data.historical.StockHistoricalDataClient`.
+
+    Worth stating plainly: that call went out. It was a read against a public market-data
+    endpoint with placeholder credentials, it changed nothing, and it was not an account
+    or an order - but a test that silently reaches the network is a test that can hang or
+    pass for the wrong reason, so the target is pinned here.
+    """
+
+    @staticmethod
+    def _stub(monkeypatch, response):
+        import alpaca.data.historical as historical
+
+        class _Client:
+            def __init__(self, api_key, secret_key):
+                self.credentials = (api_key, secret_key)
+
+            def get_stock_latest_trade(self, request):
+                self.request = request
+                return response
+
+        monkeypatch.setattr(historical, "StockHistoricalDataClient", _Client)
+
+    def test_a_reported_price_is_returned(self, monkeypatch) -> None:
+        from live_runner.test_signal_trigger import _fetch_latest_price
+
+        class _Trade:
+            price = 187.65
+
+        self._stub(monkeypatch, {"AAPL": _Trade()})
+        assert _fetch_latest_price("AAPL", "key", "secret") == 187.65
+
+    def test_a_missing_symbol_raises_rather_than_reporting_zero(self, monkeypatch) -> None:
+        """**The surviving mutation.** A `0.0` here becomes a real price downstream."""
+        from live_runner.test_signal_trigger import _fetch_latest_price
+
+        class _Trade:
+            price = 187.65
+
+        # AAPL absent: the broker did not know the symbol.
+        self._stub(monkeypatch, {"MSFT": _Trade()})
+        with pytest.raises(KeyError):
+            _fetch_latest_price("AAPL", "key", "secret")
+
+    def test_a_missing_price_raises_rather_than_reporting_zero(self, monkeypatch) -> None:
+        """A trade with no price is a different absence, and it must be equally loud."""
+        from live_runner.test_signal_trigger import _fetch_latest_price
+
+        class _Trade:
+            price = None
+
+        self._stub(monkeypatch, {"AAPL": _Trade()})
+        with pytest.raises((TypeError, ValueError)):
+            _fetch_latest_price("AAPL", "key", "secret")
+
+    def test_a_missing_alpaca_py_names_the_script_that_needed_it(self, monkeypatch) -> None:
+        import builtins
+
+        from live_runner.test_signal_trigger import _fetch_latest_price
+
+        real_import = builtins.__import__
+
+        def _blocked(name, *args, **kwargs):
+            if name == "alpaca" or name.startswith("alpaca."):
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocked)
+        with pytest.raises(RuntimeError) as excinfo:
+            _fetch_latest_price("AAPL", "key", "secret")
+        message = str(excinfo.value)
+        assert "alpaca-py" in message, message
+        # It names the module that needed it, which is a different script from the adapter's.
+        assert "test_signal_trigger" in message, message
