@@ -105,12 +105,39 @@ lie are now closed:
 
 | exit | meaning |
 |---|---|
-| 0 | applied, suite ran, verdict printed, matched `--expect` |
+| 0 | applied, suite ran, reverted, and the verdict is **backed by a named failing test** (or SURVIVED, which needs no attribution) |
 | 2 | mutation text not uniquely present — **nothing was mutated**, never "survived" |
 | 3 | applied but the file did not change — aborted |
-| 4 | **the suite did not run** — usage error, missing path, or nothing collected. No verdict. |
+| 4 | **no verdict** — usage error, missing path, nothing collected, a file failed to collect, **or pytest exited non-zero without any test failing** |
 | 5 | verdict disagreed with `--expect` |
 | 6 | revert failed — working tree dirty |
+| 7 | KILLED-UNATTRIBUTED: a test failed, but not the one that should have. **Wrong**, not merely unverified. Never masked by `--expect` |
+| 8 | KILLED with no `--detector`: some test **did** fail, but nothing proves it was this mutation. **Unverified**. Never masked by `--expect` |
+
+### A kill requires a failing test
+
+The row for rc=4 was widened on 2026-10-02, and it is the most consequential line in the
+table. For most of its life the harness decided `KILLED` from `rc != 0` alone.
+`FAILURES` — the count of failing test ids — was computed two lines above the verdict and
+used **only for the log line**, which is why that survived three rounds of auditing this
+harness.
+
+Measured, against a suite reporting `1 passed, 1 error` — the test passed, an autouse
+fixture's teardown raised:
+
+```
+teardown error, not a test failure    KILLED   rc=1 collected=1 failed=0 attr=unknown
+```
+
+`failed=0`. Nothing was caught, and the printed word said KILLED. A non-zero pytest exit
+means "something went wrong", and besides a test failing it can be: a fixture teardown
+error, a warning promoted to an error by config (`-W error` exits non-zero with every test
+passing), a plugin session-finish hook returning non-zero, or an xdist plugin failing after
+the tests ran. All of those exit 1 with no failing test id.
+
+This matters more here than a misread would suggest. A mutation reported KILLED becomes a
+**committed test**; one reported SURVIVED becomes a **new test to write**. A wrong verdict
+does not merely mislead — it writes the wrong code.
 
 Exit 2 and exit 4 are the two that matter. A mutation that silently failed to apply,
 and a suite that never collected anything, both look like a verdict to a reader — and
@@ -172,3 +199,44 @@ permissive, one too strict — and both were found by running the thing rather t
   appears twice in the file — once in `_finite_float`, once in `_parse_bool`. The
   unapplied mutation was re-expressed with its following line to disambiguate
   rather than being reported as a pass.
+
+## The whole ledger re-verified under the new rule (2026-10-02)
+
+Because the kill rule changed, every verdict above is suspect until its evidence is
+re-derived — and no historical verdict recorded the evidence needed, because the harness
+did not compute it for the verdict. `reverify_ledger.py` re-applies all 14 mutations,
+reconstructed from the descriptions in this report, and requires each to come back
+**rc=0 (killed AND attributed) with `failed >= 1`**. Two passes each: the first proves a
+kill exists, the second sets `--detector` to the test the first found, which is the only
+value a caller may trust.
+
+| # | this report said | re-verified at `c7afca1` | failing tests |
+|---|---|---|---|
+| M1 | Killed (2) | KILLED + attributed | 2 |
+| M2 | Killed (1) | KILLED + attributed | 1 |
+| M3 | Killed (3) | KILLED + attributed | 5 |
+| M4 | Killed (5) | KILLED + attributed | 3 |
+| M5 | Killed (7) | KILLED + attributed | 4 |
+| M6 | Killed (41) | KILLED + attributed | **51** |
+| M7 | Killed (2) | KILLED + attributed | 2 |
+| M8 | Killed (7) | KILLED + attributed | 4 |
+| D1–D6 | Killed (1–2 each) | KILLED + attributed | 1, 1, 1, 2, 1, 1 |
+
+**All 14 hold.** No verdict in this report was a non-failure exit wearing a KILLED label.
+M6's count rose from 41 to 51 because the re-verification suite is wider than the one used
+here; that is a selection difference, not a change in the code.
+
+Two things worth recording about the re-verification itself:
+
+- **M6's anchor appears in two helpers**, so the first attempt reported ANCHOR-MISS rather
+  than a pass. Re-expressing it with the following line disambiguated it — the same fix this
+  report already describes for M4, and for the same reason: a mutation that cannot be
+  applied is not a pass, it is an absence of evidence.
+- **`reverify_ledger.py` was run by the gate suite and made it 94 minutes long**, which is
+  why it is now opt-in behind `FULL_GATES=1`. A gate nobody runs is not a gate — the same
+  argument as the check that a gate's own test file must exist. It had failed for a second
+  reason too: leaving `reverify_ledger.py` uncommitted made the forward worktree dirty, which
+  claim-check correctly flags.
+
+The ledger is now **checked by running it** rather than trusted because it once said "14/14
+killed".
