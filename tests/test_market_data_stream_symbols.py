@@ -1172,3 +1172,133 @@ class TestStreamWorkerFeedSelectionAndBarOwnership:
             "the bar append did not take the service lock; deque.append is atomic but "
             "defaultdict key creation is not, so this is create-and-append as one step"
         )
+
+
+class TestServiceStopTakesOwnershipOfItsWorkers:
+    """`_stop_sync` is three lines and every one of them was load-bearing.
+
+    All three mutations survived, which is a good sign about the shape rather than a bad
+    one: `snapshot -> clear -> stop-each` is a *take ownership* pattern, and each step can be
+    deleted without anything noticing at the time.
+
+    **The snapshot and the clear are one act, and both are needed.** `list(...)` copies the
+    workers out so the registry can be emptied, and `clear()` is what actually empties it.
+    Drop the clear and the dead workers stay in `_workers`, so the next refresh finds them,
+    believes they are running, and hands them a symbol list - which either resurrects a
+    stopped stream or leaves a worker subscribed to nothing while the service reports it
+    live. The drop is invisible until a *later* refresh, which is exactly why a test that
+    only calls `stop()` cannot see it: the assertion has to be about the registry's state
+    afterwards, not about what `stop()` returned.
+
+    **Dropping the snapshot turns a clear into a runtime error.** Iterating a dict while
+    clearing it raises `RuntimeError: dictionary changed size during iteration`. That is the
+    loud failure, so it is the one that is safe - but only because the snapshot is there,
+    and it is worth asserting the *behaviour* (every worker is stopped exactly once) rather
+    than relying on the exception as the test.
+
+    **The lock is what makes snapshot-and-clear atomic.** A refresh that interleaves between
+    the copy and the clear installs a new worker into a registry this method believes it now
+    owns exclusively - a worker nobody will ever stop, running a thread with no handle on it.
+    That is a leak rather than an error, so it cannot be caught by a retry or a log line.
+
+    A double `stop()` is asserted idempotent, because the daemon can stop a service during
+    shutdown while a refresh is in flight.
+    """
+
+    @staticmethod
+    def _service_with(*workers):
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = threading.Lock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=10))
+        service._workers = {}
+        for key, worker in workers:
+            service._workers[key] = worker
+        return service
+
+    @staticmethod
+    def _worker(name="w"):
+        worker = _StreamWorker(
+            kind="stock", api_key="key", secret_key="secret", paper=True, bar_handler=lambda *_: None
+        )
+        worker.stopped = 0
+        worker.stop = lambda: setattr(worker, "stopped", worker.stopped + 1)
+        worker.label = name
+        return worker
+
+    def test_stop_stops_every_worker_and_empties_the_registry(self) -> None:
+        """**All three surviving mutations in one assertion**: stop each, and clear."""
+        first, second = self._worker("a"), self._worker("b")
+        service = self._service_with((("k1", "stock"), first), (("k2", "crypto"), second))
+
+        service._stop_sync()
+
+        assert first.stopped == 1, "a registered worker was never stopped"
+        assert second.stopped == 1, "a registered worker was never stopped"
+        assert service._workers == {}, (
+            f"stopped workers survived in the registry: {list(service._workers)}; the next "
+            "refresh will find them, believe they are running, and hand them symbols"
+        )
+
+    def test_a_stopped_service_reports_no_workers_to_the_next_refresh(self) -> None:
+        """The consequence that makes the clear load-bearing, asserted through the registry.
+
+        A worker left registered is a worker a later refresh will treat as running. That is
+        the failure mode, so it is what the test states - not merely that `stop()` returned.
+        """
+        worker = self._worker()
+        service = self._service_with((("k1", "stock"), worker))
+
+        service._stop_sync()
+        assert list(service._workers.values()) == []
+        # Nothing is left for a refresh to adopt, and nothing is running behind its back.
+        assert worker.stopped == 1
+        assert worker._running is False or worker.stopped == 1
+
+    def test_stopping_an_empty_service_is_a_no_op(self) -> None:
+        service = self._service_with()
+        service._stop_sync()
+        assert service._workers == {}
+
+    def test_a_second_stop_does_not_stop_a_worker_again(self) -> None:
+        """The daemon can stop a service during shutdown while a refresh is in flight.
+
+        The registry is emptied, so the second pass has nothing to stop and cannot
+        double-stop a worker - asserted because "stopped twice" on a live stream is a
+        different failure from "not stopped at all".
+        """
+        worker = self._worker()
+        service = self._service_with((("k1", "stock"), worker))
+
+        service._stop_sync()
+        service._stop_sync()
+        assert worker.stopped == 1, "a worker was stopped more than once"
+
+    def test_the_snapshot_and_clear_are_taken_under_the_lock(self) -> None:
+        """A lock that is not held lets a refresh install a worker nobody will ever stop.
+
+        Asserted by instrumenting the lock rather than by racing a thread: the failure this
+        prevents is a leaked worker, which produces no error, no log line and no retry - so
+        there is nothing to catch after the fact.
+        """
+        events = []
+
+        class _RecordingLock:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, *exc_info):
+                events.append("exit")
+                return False
+
+        service = self._service_with((("k1", "stock"), self._worker()))
+        service._lock = _RecordingLock()
+
+        service._stop_sync()
+
+        assert events == ["enter", "exit"], (
+            f"the lock was not held across snapshot-and-clear: {events}; a refresh can "
+            "interleave and install a worker this method believes it exclusively owns"
+        )
+        assert service._workers == {}

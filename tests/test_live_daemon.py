@@ -10,6 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from decimal import Decimal
+from uuid import uuid4 as uuid4, UUID
+
 import live_runner.daemon as daemon
 import shared.database as database
 from live_runner.ctrader_adapter import CTraderAuthTerminalError
@@ -4628,3 +4631,39 @@ class TestTestSignalTriggerPriceFetch:
         assert "alpaca-py" in message, message
         # It names the module that needed it, which is a different script from the adapter's.
         assert "test_signal_trigger" in message, message
+
+
+def test_the_demo_gate_stringifies_the_account_id_before_looking_it_up(monkeypatch) -> None:
+    """The account id is stringified before the verdict lookup, and that is load-bearing.
+
+    The surviving mutation. Every other demo-gate test passes `"acc-live"`, so for them
+    `str(account_id)` is a no-op and removing it changes nothing - which is how a coercion
+    can sit in the most safety-critical function in the daemon untested.
+
+    It matters because the verdict comes from the database, which is keyed by text. A caller
+    passing a non-string - an int from a config file, a UUID object, a `Decimal` from a
+    settings parse - would miss the row, and a missed row is an *unverifiable* account. The
+    gate would still fail closed, so the damage is a refused order rather than a live one,
+    but the refusal would carry a reason about an account that in fact exists, which is
+    precisely the kind of misleading log line that costs an hour during an incident.
+
+    Asserted with three non-string types and by observing what the lookup was handed, not by
+    observing the verdict - the verdict is the same either way, which is the whole problem.
+    """
+    looked_up: list[object] = []
+
+    def _verdict(account_id):
+        looked_up.append(account_id)
+        return "refused: never verified as demo"
+
+    monkeypatch.setattr(daemon, "live_account_submission_block_reason", _verdict)
+
+    for account_id in (12345, UUID(int=1), Decimal("7")):
+        looked_up.clear()
+        assert _REAL_DEPLOYMENT_ACCOUNT_IS_DEMO(account_id) is False
+        assert len(looked_up) == 1, account_id
+        assert isinstance(looked_up[0], str), (
+            f"{type(account_id).__name__} was looked up as {type(looked_up[0]).__name__}, "
+            "not str; the database is keyed by text so this misses the row"
+        )
+        assert looked_up[0] == str(account_id), looked_up
