@@ -355,6 +355,27 @@ class TestAlpacaCredentialHintAmbiguity:
         identifies nothing"), it costs nothing, and removing it would make the intent
         implicit in the string comparison.
         """
+        # The table above was read off the code by hand, which is not a test. It is asserted
+        # here so the claim cannot rot: if `_matching_alpaca_block` ever gains a path where a
+        # blank login matches a non-blank hint, this fails instead of the docstring quietly
+        # becoming wrong.
+        from live_runner.alpaca_adapter import _matching_alpaca_block
+
+        block = {"api_key": "k", "secret_key": "s", "paper": True, "account_id_hint": "",
+                 "login_hint": "alice"}
+        # A non-blank hint with a blank login identifies nothing. The redundant term is
+        # load-bearing precisely here: without it, `login_hint == normalized_login` would
+        # still be compared against "".
+        assert _matching_alpaca_block([block], "", "") is None
+        # A blank hint is refused by the leading `if login_hint`, whether or not the login
+        # is blank.
+        assert _matching_alpaca_block([dict(block, login_hint="")], "", "") is None
+        assert _matching_alpaca_block([dict(block, login_hint="")], "", "alice") is None
+        # The real match, for contrast. The third argument arrives ALREADY normalised - the
+        # caller `resolve_alpaca_credentials` does the strip and lower - which is the whole
+        # reason the redundant term is a no-op: it is a second opinion on a value that has
+        # already been normalised.
+        assert _matching_alpaca_block([block], "", "alice") == ("k", "s", True)
 
 
 class TestExecutionFillPersistenceReporting:

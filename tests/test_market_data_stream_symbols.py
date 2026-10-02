@@ -751,6 +751,33 @@ class TestBarSerialisationAndReads:
         the next person to see B1 survive knows to check the mask before concluding the guard
         is dead code.
         """
+        # Asserted, because "there is a mask" is exactly the claim that decides whether the
+        # outer guard can be deleted - and it is a claim about `set_symbols`, which can change
+        # without this guard changing.
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = threading.Lock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=10))
+        service._workers = {}
+
+        worker = _StreamWorker(
+            kind="stock", api_key="key", secret_key="secret", paper=True,
+            bar_handler=lambda *_: None,
+        )
+        service._workers[("k", "stock")] = worker
+
+        # The mask: set_symbols normalises and drops blanks, so "" can never be subscribed.
+        worker.set_symbols({"  ", "", "AAPL"})
+        assert worker._symbols == {"AAPL"}, worker._symbols
+        assert service._worker_subscribes(worker, "") is False, (
+            "a blank symbol IS subscribable, so the mask is gone and the outer guard in "
+            "_on_bar is the only thing preventing a queue keyed by the empty string"
+        )
+        assert service._worker_subscribes(worker, "AAPL") is True
+        # And the guard is genuinely load-bearing given that mask: with no subscribed
+        # symbol, a blank bar is refused by the filter too - which is precisely why
+        # removing the outer guard is masked rather than equivalent.
+        assert not any(service._worker_subscribes(w, "") for w in list(service._workers.values()))
 
     def test_the_z_suffix_conversion_is_required_only_before_python_311(self) -> None:
         """**B3 is a version-dependent equivalent mutant**, verified on this interpreter.

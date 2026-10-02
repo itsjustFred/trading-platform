@@ -7514,6 +7514,30 @@ class TestSignalIdempotencyKeyAndStalenessBudget:
         ever stops normalising, that test catches it immediately and this note becomes the
         thing to revisit.
         """
+        # Asserted rather than described, because the claim is about the *model*, and the
+        # model can change without anything else in this file changing.
+        cases = [
+            ("eurusd", "EURUSD"),
+            (" gbpusd ", "GBPUSD"),
+            ("xauusd", "XAUUSD"),
+        ]
+        for supplied, expected in cases:
+            signal = TradeSignal(
+                action="buy", symbol=supplied, entry_price=1.0, stop_loss=0.9,
+                take_profit=1.1, timeframe="1h", metadata={},
+            )
+            assert signal.symbol == expected, (
+                f"TradeSignal stored {signal.symbol!r} for {supplied!r}; this note's whole "
+                "argument is that the model normalises, so if it stops, the key function's "
+                "normalisation stops being redundant and this needs revisiting"
+            )
+
+        for supplied, expected in (("BUY", "buy"), ("Sell", "sell")):
+            signal = TradeSignal(
+                action=supplied, symbol="EURUSD", entry_price=1.0, stop_loss=0.9,
+                take_profit=1.1, timeframe="1h", metadata={},
+            )
+            assert signal.action == expected, (supplied, signal.action)
 
     def test_case_is_normalised_so_case_alone_is_not_a_new_signal(self) -> None:
         """The other half of normalisation: case must *not* split one signal in two.

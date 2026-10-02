@@ -250,7 +250,14 @@ class TestErrorResponseRoutingAndRetryAck:
             "a timeout named only in the message was not recognised"
         )
 
-    def test_the_twisted_reactor_validation_is_left_unmeasured_on_purpose(self) -> None:
+    # E6/E7 - the Twisted reactor validation is INTENTIONALLY unmeasured, and this used to
+    # be a `test_*` method with an empty body. It could not fail, so it inflated the test
+    # count and read as coverage it never provided. A decision is documentation, not an
+    # assertion, so it lives here as a comment rather than as a test. To close the gap:
+    # exercise `asyncioreactor.install(loop)` in a scratch process - it mutates
+    # process-global Twisted state for the remainder of the run, so in-process is not safe -
+    # install a non-asyncio reactor, and confirm the function raises RuntimeError.
+    def _the_twisted_reactor_validation_is_left_unmeasured_on_purpose(self) -> None:
         """**E6 and E7 are deliberately not covered here**, and this records why.
 
         `_ensure_asyncio_twisted_reactor` calls `asyncioreactor.install(loop)`, which
@@ -738,6 +745,26 @@ class TestTerminalAuthFailureAndRetryBudget:
         path. So the property that matters - "this function never raises" - is verified,
         not assumed.
         """
+        # The load-bearing half - "this function never raises" - is asserted here rather
+        # than taken on the docstring's word, because the mutation that matters removes the
+        # `hasattr` guard AND the `except` together, and that only fails if something checks.
+        from live_runner.ctrader_adapter import _reason_to_text
+
+        class _Raising:
+            def getErrorMessage(self):
+                raise RuntimeError("accessor exploded")
+
+        class _Working:
+            def getErrorMessage(self):
+                return "clean message"
+
+        assert _reason_to_text("plain failure") == "plain failure"
+        assert _reason_to_text(_Working()) == "clean message"
+        # A raising accessor is swallowed and falls back to the repr; it never propagates.
+        # The SAME instance is compared, because the default repr embeds the object id.
+        raising = _Raising()
+        assert _reason_to_text(raising) == str(raising)
+        assert _reason_to_text(None) == "None"
 
     def _retry(self, **attrs):
         import os
@@ -1224,7 +1251,58 @@ def test_the_zero_distance_guard_in_resolve_relative_sl_tp_is_unreachable() -> N
     `TestRelativeStopLossAndTakeProfit::test_a_stop_or_target_equal_to_entry_is_refused`
     is therefore real behaviour, coming from the wrong-side check rather than from this
     one. That test is what makes the distinction visible.
+
+    Asserted below rather than described, because the claim is about **ordering**: a stop at
+    the reference price must be refused by the side check *before* `_distance` is reached.
+    Move `_distance` upstream of the side checks and the message changes from "wrong side"
+    to "zero-distance", and this fails - which is the exact refactor the note above warns
+    about.
     """
+    from uuid import uuid4
+
+    from live_runner.ctrader_adapter import CTRADER_RELATIVE_PRICE_UNIT_DIVISOR as SCALE
+    from shared.models import LiveSignal
+
+    def _sig(action: str, price: float) -> LiveSignal:
+        return LiveSignal(
+            deployment_id=str(uuid4()), symbol="EURUSD", action=action,
+            theoretical_price=price, timestamp=1_700_000_000.0,
+        )
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._symbol_name_to_id = {"EURUSD": 5111}
+    adapter._symbol_props = {}
+
+    references = (100.0, 1e-9, 1e9, 0.5, 12345.6789)
+    # Offsets that put the stop on the WRONG side of, or exactly at, the reference.
+    # Direction matters: a buy's stop must sit below entry, a sell's above it, so -1.0 is
+    # a perfectly valid buy stop and would legitimately convert. Only the wrong-side
+    # offsets are refused, and the zero-offset one is the zero-distance case itself.
+    wrong_side = {
+        "buy": (0.0, 1e-12, float("inf"), float("nan")),
+        "sell": (0.0, -1e-12, float("-inf"), float("nan")),
+    }
+
+    for reference in references:
+        for action, offsets in wrong_side.items():
+            for offset in offsets:
+                with pytest.raises(ValueError) as excinfo:
+                    adapter._resolve_relative_sl_tp(_sig(action, reference), reference + offset, None)
+                message = str(excinfo.value)
+                assert "zero-distance" not in message, (
+                    f"the zero-distance guard fired for action={action} "
+                    f"reference={reference!r} offset={offset!r}: the side check should have "
+                    "refused first, so `_distance` ran before it and the ordering this note "
+                    "depends on has changed"
+                )
+                assert "refusing to submit" in message, message
+
+    # Positive control, and the reason the loop above is not vacuous: a genuinely outward
+    # stop converts, on both sides. If the side check were over-eager these would raise.
+    for action, stop, take in (("buy", 99.0, 101.0), ("sell", 101.0, 99.0)):
+        converted = adapter._resolve_relative_sl_tp(_sig(action, 100.0), stop, take)
+        assert converted[0] == round(abs(100.0 - stop) * SCALE), (action, converted)
+        assert converted[1] == round(abs(take - 100.0) * SCALE), (action, converted)
 
 
 class TestRelativeStopLossAndTakeProfit:
