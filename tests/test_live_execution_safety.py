@@ -7667,3 +7667,217 @@ class TestSignalIdempotencyKeyAndStalenessBudget:
         for value in (None, "abc", ""):
             with pytest.raises(ValueError, match="Invalid"):
                 _coerce_live_int(value, field_name="qty")
+
+
+class TestExitOnlyAndUnboundedTpMarkers:
+    """The two single-definition metadata markers every broker order is routed by.
+
+    `base_adapter.py` holds these as two module constants and two functions, and the docstrings
+    say why they are the *single* definition - a pre-mortem finding that producer and consumers
+    had been comparing divergent spellings. So the property that matters is that they stay
+    **exact-match, dict-only, and case-sensitive**, and that is what these assert.
+
+    **`is_exit_only_metadata` decides whether the entry SL/TP guard is bypassed at all.** Its
+    docstring explains that the close side is derived from the broker book rather than from
+    `signal.action`, because a SHORT closes with a BUY - so an action test would invert the
+    meaning on exactly the orders that matter, refusing every stop-loss and take-profit on a
+    short. That reasoning is why this function is marker-only, and it is why the negative cases
+    below are the load-bearing half.
+
+    **The `isinstance(metadata, dict)` guard is what keeps a non-dict from crashing.** Without
+    it, `metadata.get(...)` raises `AttributeError` on `None`, a string or an int - and this is
+    called on the order path, so the failure would be an exception in routing rather than a
+    refused order. A non-dict must therefore be *not exit-only*, and that is asserted for
+    several types rather than one.
+
+    **The comparison is exact, not case-insensitive and not trimmed.** `"EXIT_ONLY"` and
+    `" exit_only "` are both refused. That is deliberate - the producer writes one spelling, and
+    a tolerant comparison would let a near-miss pass as the real marker - and it is asserted
+    because "should it be tolerant?" is exactly the question a future edit would ask.
+
+    **The unbounded-TP marker is the same shape, and the reason the class covers both** is the
+    finding: B9 (a non-dict accepted for the unbounded check) was *already killed* while B1 (the
+    identical change to the exit-only check) survived. Two functions written the same way, one
+    covered and one not - which is a stronger argument for asserting both than any amount of
+    reading either.
+
+    A note on my own mutation writing: my first attempt at B1 used
+    `getattr(metadata, "get", lambda _k: "")`, which is behaviourally *identical* to the real
+    code for every input - so it was a no-op dressed as a mutation. Rewritten to flip the guard
+    to `return True`, which is the dangerous direction and is actually observable.
+    """
+
+    @staticmethod
+    def _signal(metadata):
+        from risk.models import TradeSignal
+
+        return TradeSignal(
+            action="buy",
+            symbol="EURUSD",
+            entry_price=100.0,
+            stop_loss=98.0,
+            take_profit=104.0,
+            timeframe="1h",
+            metadata=metadata,
+        )
+
+    def test_the_exit_only_marker_is_an_exact_match(self) -> None:
+        """One spelling, and it is the one the producer writes."""
+        from live_runner.base_adapter import (
+            EXIT_ONLY_RISK_SIZING_MODE,
+            is_exit_only_metadata,
+        )
+
+        assert EXIT_ONLY_RISK_SIZING_MODE == "exit_only"
+        assert is_exit_only_metadata({"risk_sizing_mode": "exit_only"}) is True
+
+    def test_a_near_miss_marker_is_not_exit_only(self) -> None:
+        """Case, padding and a wrong mode are all refused.
+
+        This is the half that carries the safety weight. A tolerant comparison would let a
+        near-miss pass as the real marker, and the marker is what bypasses the entry SL/TP guard -
+        so a near-miss that slipped through would be an order submitted without its stop.
+        """
+        from live_runner.base_adapter import is_exit_only_metadata
+
+        for metadata in (
+            {"risk_sizing_mode": "EXIT_ONLY"},
+            {"risk_sizing_mode": "Exit_Only"},
+            {"risk_sizing_mode": " exit_only "},
+            {"risk_sizing_mode": "exit-only"},
+            {"risk_sizing_mode": "exit_only_v2"},
+            {"risk_sizing_mode": "not_exit_only"},
+            {"risk_sizing_mode": ""},
+            {"risk_sizing_mode": None},
+            {"risk_sizing_mode": 0},
+            {"risk_sizing_mode": True},
+            {},
+            {"some_other_key": "exit_only"},
+        ):
+            assert is_exit_only_metadata(metadata) is False, (
+                f"{metadata!r} was treated as an exit-only order, which would bypass the "
+                "entry stop-loss and take-profit guard"
+            )
+
+    @pytest.mark.parametrize(
+        "metadata", [None, "exit_only", 42, 0, ["exit_only"], ("exit_only",), object()]
+    )
+    def test_a_non_dict_is_never_exit_only(self, metadata) -> None:
+        """**The guard is what stops an `AttributeError` on the order path.**
+
+        Without the `isinstance` check, `metadata.get(...)` raises on `None`, a string and an
+        int alike - and this runs while routing an order, so the failure would be an exception
+        rather than a refused order. Asserted over several types because a guard that only
+        handles `None` is a weaker guard than it looks.
+        """
+        from live_runner.base_adapter import is_exit_only_metadata
+
+        try:
+            result = is_exit_only_metadata(metadata)
+        except AttributeError as exc:  # pragma: no cover - the failure this guards
+            raise AssertionError(
+                f"{metadata!r} raised instead of being refused: {exc}"
+            ) from exc
+        assert result is False, f"{metadata!r} was treated as an exit-only order"
+
+    def test_the_exit_only_marker_never_consults_the_signal_action(self) -> None:
+        """Documented as a deliberate design, so it is pinned rather than left implied.
+
+        The close side comes from the broker book: closing a SHORT is a BUY. So an action test
+        would invert the meaning on exactly the orders that matter - every stop-loss and
+        take-profit on a short would be refused while long exits passed. Asserted by showing
+        that the *same* action yields different results depending only on the marker.
+        """
+        from live_runner.base_adapter import is_exit_only_metadata
+
+        buy_without = self._signal({"risk_sizing_mode": None})
+        buy_with = self._signal({"risk_sizing_mode": "exit_only"})
+        assert buy_without.action == buy_with.action == "buy"
+        assert is_exit_only_metadata(buy_without.metadata) is False
+        assert is_exit_only_metadata(buy_with.metadata) is True
+
+    def test_the_unbounded_tp_marker_has_the_same_exactness(self) -> None:
+        """The twin function, asserted identically - which is the point of pairing them.
+
+        The pre-mortem that produced these two constants was about *divergent spellings*
+        between producer and consumers, so the two functions carrying the same contract should
+        carry the same tests. That reasoning is what caught the gap: the non-dict mutation on
+        this one was already killed while the identical change to `is_exit_only_metadata`
+        survived.
+        """
+        from live_runner.base_adapter import UNBOUNDED_TP_POLICY, is_unbounded_tp
+
+        assert UNBOUNDED_TP_POLICY == "unbounded_exit_on_opposite_signal"
+        assert is_unbounded_tp({"take_profit_policy": UNBOUNDED_TP_POLICY}) is True
+        for metadata in (
+            {"take_profit_policy": "UNBOUNDED_EXIT_ON_OPPOSITE_SIGNAL"},
+            {"take_profit_policy": " unbounded_exit_on_opposite_signal "},
+            {"take_profit_policy": "unbounded"},
+            {"take_profit_policy": ""},
+            {"take_profit_policy": None},
+            {},
+            {"risk_sizing_mode": "exit_only"},
+        ):
+            assert is_unbounded_tp(metadata) is False, (
+                f"{metadata!r} declared the unbounded-TP policy"
+            )
+
+    @pytest.mark.parametrize(
+        "metadata", [None, "unbounded", 42, ["unbounded"], object()]
+    )
+    def test_a_non_dict_declares_neither_marker(self, metadata) -> None:
+        """Neither marker can come from a non-dict, and neither may raise."""
+        from live_runner.base_adapter import is_exit_only_metadata, is_unbounded_tp
+
+        assert is_exit_only_metadata(metadata) is False
+        assert is_unbounded_tp(metadata) is False
+
+    def test_the_marker_stringification_is_a_verified_equivalent_mutation_target(self) -> None:
+        """**A verified equivalent mutant**, recorded with the reason rather than dropped.
+
+        `is_exit_only_metadata` reads:
+
+            str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE
+
+        Removing the `str()` changes nothing, because `EXIT_ONLY_RISK_SIZING_MODE` is the string
+        constant `"exit_only"`. A `str()` is the identity on a `str`, and the only way a
+        non-string could reach the comparison and stringify *to* `"exit_only"` is a custom
+        object whose `__str__` returns exactly that - at which point the stringification would
+        be doing something surprising rather than normalising.
+
+        So the `str()` is defence against a caller passing a non-string, not a conversion that
+        any current input needs. It stays for the same reason the `isinstance` guard stays: both
+        cost nothing, and both keep the function total for inputs nobody has written yet.
+
+        Recorded because the reasoning is not obvious from the line, and because "is that
+        `str()` needed?" is a reasonable question that would otherwise be re-derived from
+        scratch - or, worse, answered by deleting something load-bearing in a sibling
+        function.
+        """
+        from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+        assert isinstance(EXIT_ONLY_RISK_SIZING_MODE, str)
+        assert str(EXIT_ONLY_RISK_SIZING_MODE) == EXIT_ONLY_RISK_SIZING_MODE
+        # And the only way the str() could matter is a non-string, which the type guard in
+        # the same line sequence already excludes from reaching a comparison as a match.
+        for non_string in (1, 1.0, True, None, object(), ["exit_only"]):
+            assert str(non_string) != EXIT_ONLY_RISK_SIZING_MODE, (
+                f"{non_string!r} stringifies to the marker, so the str() is load-bearing "
+                "and this note is wrong"
+            )
+
+    def test_a_marker_does_not_imply_the_other(self) -> None:
+        """They are independent contracts, and conflating them would be a silent behaviour change.
+
+        The exit-only marker routes a *flatten* order; the unbounded-TP policy is about how a
+        strategy takes profit. A signal carrying one must not acquire the other, because the
+        two have different consequences in the adapters.
+        """
+        from live_runner.base_adapter import is_exit_only_metadata, is_unbounded_tp
+
+        exit_only = {"risk_sizing_mode": "exit_only"}
+        unbounded = {"take_profit_policy": "unbounded_exit_on_opposite_signal"}
+        assert is_exit_only_metadata(exit_only) is True
+        assert is_unbounded_tp(exit_only) is False
+        assert is_unbounded_tp(unbounded) is True
+        assert is_exit_only_metadata(unbounded) is False
