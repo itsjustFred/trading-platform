@@ -184,6 +184,30 @@ def _can_fail(node: ast.AST, helpers: dict[str, ast.AST], seen: set[str] | None 
 NO_RAISE_MARKER = "no-raise:"
 
 
+def _called_names(node: ast.AST, helpers: dict[str, ast.AST], seen: set[str] | None = None) -> set[str]:
+    """Every name called from `node`, following same-module helpers.
+
+    Used to check that a `no-raise:` marker names a test of the *same* code rather than any
+    test that happens to exist. Existence alone was the first version's condition and it was
+    too weak: it accepted a marker pointing at a test of a different function, so a
+    completely unjustified exemption passed. One of the seven markers added under the
+    existence-only rule named a config-file test that shares no call with the test claiming
+    it - caught by this check, not by reading.
+    """
+    seen = set() if seen is None else seen
+    out: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name:
+                out.add(name)
+            if name in helpers and name not in seen:
+                seen.add(name)
+                out |= _called_names(helpers[name], helpers, seen)
+    return out
+
+
 def _no_raise_marker(path: Path, node: ast.AST) -> str | None:
     lines = path.read_text(encoding="utf-8").splitlines()
     # Start AFTER the def line. The first version started on it, and the `def` matched the
@@ -261,6 +285,21 @@ def test_every_test_function_has_a_way_to_fail() -> None:
             # disappears when the sibling is renamed fails the next run.
             marker = _no_raise_marker(path, node)
             if marker and marker in helpers:
+                sibling = helpers[marker]
+                shared = _called_names(node, helpers) & _called_names(sibling, helpers)
+                if not shared:
+                    offenders.append(
+                        f"{path.relative_to(TESTS_DIR)}:{node.lineno} {node.name}\n"
+                        f"      claims sibling {marker!r}, which exists but shares no call "
+                        f"with it - so it is not a test of the same code"
+                    )
+                    continue
+                if not _can_fail(sibling, helpers):
+                    offenders.append(
+                        f"{path.relative_to(TESTS_DIR)}:{node.lineno} {node.name}\n"
+                        f"      claims sibling {marker!r}, which cannot fail either - so "
+                        f"nothing pins the refusal"
+                    )
                 continue
             suffix = f"  [claims sibling {marker!r}, which is not in this file]" if marker else ""
             offenders.append(
