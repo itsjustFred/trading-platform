@@ -87,6 +87,23 @@ if [ "${#SUITE_ARGS[@]}" -eq 0 ]; then
   SUITE_ARGS=(tests)
 fi
 
+# Restore by CONTENT, not by `git checkout`.
+#
+# `git checkout -- FILE` reverts the file to HEAD, which silently throws away any
+# *uncommitted* work in it. That is not hypothetical: running a mutation against
+# `live_runner/ctrader_adapter.py` while a production fix to it was still uncommitted
+# destroyed the fix. The harness printed REVERT-FAILED, which is how I found out - the
+# guard worked, but the damage was already done and the recovery was to retype the change.
+#
+# A tool that verifies the tree is clean must not be the thing that makes it dirty, and one
+# that snapshots content cannot lose anything. So: copy before mutating, copy back after.
+SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/mutate-snapshot.XXXXXX")"
+cp "$FILE" "$SNAPSHOT"
+cleanup_snapshot() { rm -f "$SNAPSHOT"; }
+trap cleanup_snapshot EXIT
+
+restore_file() { cp "$SNAPSHOT" "$FILE"; }
+
 BEFORE="$(md5sum "$FILE" | cut -d' ' -f1)"
 
 # --- apply, and prove it applied -------------------------------------------
@@ -114,14 +131,14 @@ PYEOF
 
 if [ "$APPLY_RC" -ne 0 ]; then
   printf '  %-52s APPLY-FAILED (nothing was mutated)\n' "$LABEL"
-  git checkout -- "$FILE" 2>/dev/null || true
+  restore_file
   exit 2
 fi
 
 AFTER="$(md5sum "$FILE" | cut -d' ' -f1)"
 if [ "$OLD" != "$NEW" ] && [ "$BEFORE" = "$AFTER" ]; then
   printf '  %-52s ABORTED - applied but file unchanged\n' "$LABEL"
-  git checkout -- "$FILE" 2>/dev/null || true
+  restore_file
   exit 3
 fi
 
@@ -131,7 +148,7 @@ OUT="$(env -u BASE_URL -u PERMA_ALLOW_LIVE_VIEWER_WRITES \
 RC=$?
 
 # --- revert before interpreting anything ----------------------------------
-git checkout -- "$FILE"
+restore_file
 REVERTED="$(md5sum "$FILE" | cut -d' ' -f1)"
 if [ "$BEFORE" != "$REVERTED" ]; then
   printf '  %-52s REVERT-FAILED - working tree is dirty\n' "$LABEL"
