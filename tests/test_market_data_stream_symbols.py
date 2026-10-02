@@ -812,3 +812,200 @@ class TestBarSerialisationAndReads:
                 f"{text!r} was treated as a connection limit, so the service would back off "
                 "for the wrong reason"
             )
+
+
+class TestBarStoreOwnershipAndNormalisation:
+    """Who owns a stored bar, and what a read is allowed to hand out. Seven survivors.
+
+    `_ingest_manual_bars_sync` stores `dict(bar)` - a **copy** - and `_bars_for_symbol` returns
+    `list(queue)` - also a copy. Both are one-token changes with no test, and both are about
+    **ownership** rather than values.
+
+    **The copy on ingest is the one that would matter.** If the store kept the caller's dict,
+    then a caller that reuses its bar dict - the obvious thing to do when backfilling a range in
+    a loop - would silently rewrite history that had already been stored. Verified directly:
+    mutate the caller's dict after handing it over, and the stored bar is unchanged. That is the
+    whole guarantee, and it costs one `dict()` call.
+
+    **The copy on read is shallow, and that asymmetry is the finding.** A consumer that appends
+    to the list it was given is safe; one that mutates a bar *element* is not, because the
+    dicts are the store's own. So ingest defends against the caller while read does not defend
+    against the consumer - and a deep copy per read would copy the whole window on every poll
+    of every symbol. Pinned as-is with both halves asserted.
+
+    **Reading an unknown symbol must not create one.** The natural-looking alternative -
+    `self._bars.setdefault(symbol, [])` - quietly allocates a queue for a symbol nobody is
+    streaming, so a consumer polling a symbol that does not exist grows the store one key at a
+    time. That is the kind of leak that only shows up as memory, never as an error, so it is
+    asserted both ways: the key is not created, and the returned list is not a live handle.
+
+    **Symbol normalisation happens on the way in**, so `"  aapl  "` is stored under `AAPL` and
+    blank symbols are dropped rather than stored under `""`. Storing un-normalised would split one
+    symbol's history across several keys, each of which any consumer would have to know to query.
+
+    The worker-side helpers are the same shape: an empty subscription must not call the SDK, and
+    a worker with no stream must not crash trying.
+    """
+
+    @staticmethod
+    def _service():
+        import threading
+        from collections import defaultdict, deque
+
+        service = LiveMarketDataStreamService.__new__(LiveMarketDataStreamService)
+        service._lock = threading.Lock()
+        service._max_bars_per_symbol = 10
+        service._bars = defaultdict(lambda: deque(maxlen=10))
+        return service
+
+    @staticmethod
+    def _worker(stream=None):
+        from live_runner.market_data_stream import _StreamWorker
+
+        worker = _StreamWorker(
+            kind="stock", api_key="k", secret_key="s", paper=True, bar_handler=None
+        )
+        worker.stream = stream
+        return worker
+
+    def test_an_ingested_bar_is_copied_so_the_caller_cannot_rewrite_history(self) -> None:
+        """**The guarantee the `dict(bar)` exists for, verified by mutation after the call.**
+
+        A caller backfilling a range in a loop reuses its dict. Without the copy, the second
+        iteration would overwrite the first bar already in the store - silently, with no error
+        and no count change.
+        """
+        service = self._service()
+        bar = {"symbol": "aapl", "close": 1.0}
+        service._ingest_manual_bars_sync([bar])
+
+        bar["close"] = 999.0
+        bar["symbol"] = "MUTATED"
+
+        stored = service._bars_for_symbol("AAPL")
+        assert len(stored) == 1, stored
+        assert stored[0]["close"] == 1.0, (
+            f"the store kept the caller's dict, so reuse rewrote history: {stored[0]!r}"
+        )
+        assert stored[0]["symbol"] == "aapl", stored[0]
+
+    def test_a_returned_bar_list_is_copied_but_its_bars_are_still_shared(self) -> None:
+        """**Shallow copy - the asymmetry with ingest is the finding.**
+
+        `list(queue)` protects the *list*: appending to it does not reach the live deque, and
+        that half is asserted. But the bar dicts inside are the store's own objects, so a reader
+        that mutates a bar *element* does change stored history.
+
+        That is worth knowing rather than assuming away, because it is the **complement** of
+        what `_ingest_manual_bars_sync` does. Ingest stores `dict(bar)`, so the *caller* cannot
+        rewrite history; a read hands out the *store's* dicts, so a *reader* can. One side of
+        the boundary is defended and the other is not.
+
+        No caller currently mutates a bar it was handed, so this is a sharp edge rather than a
+        live bug - and the fix would be a deep copy on every read, which would copy the whole
+        window on each poll of every symbol. So it is pinned as-is with the asymmetry named,
+        rather than "fixed" on speculation.
+
+        The test asserts the shallow behaviour explicitly so that a future change which *does*
+        deep-copy shows up here as a deliberate update rather than as a silent performance
+        regression in a hot path nobody was watching.
+        """
+        service = self._service()
+        service._bars["AAPL"].append({"symbol": "AAPL", "close": 1.0})
+
+        read = service._bars_for_symbol("AAPL")
+
+        # The list is a copy: appending to it does not reach the store.
+        read.append({"injected": True})
+        stored = service._bars_for_symbol("AAPL")
+        assert len(stored) == 1, f"a reader appended into the store: {stored}"
+
+        # The bars are shared: mutating one does reach the store, and that is pinned.
+        read[0]["close"] = 999.0
+        assert service._bars_for_symbol("AAPL")[0]["close"] == 999.0, (
+            "the read is now a deep copy, so a reader can no longer corrupt the store; "
+            "update this test and check what a deep copy on every read costs"
+        )
+
+    def test_reading_an_unknown_symbol_returns_empty_and_creates_nothing(self) -> None:
+        """`setdefault` would quietly allocate a queue for a symbol nobody is streaming.
+
+        That is a leak visible only as memory, so both halves are asserted: the key is not
+        created, and the returned list is not a handle into the store.
+        """
+        service = self._service()
+        unknown = service._bars_for_symbol("UNKNOWN")
+        assert unknown == [], unknown
+        assert "UNKNOWN" not in service._bars, (
+            "reading an unknown symbol created a store key, so a consumer polling a symbol "
+            "that does not exist grows the store one key at a time"
+        )
+        unknown.append({"injected": True})
+        assert not service._bars_for_symbol("UNKNOWN"), (
+            "the empty list handed to a caller is a live handle into the store"
+        )
+        assert "UNKNOWN" not in service._bars, "the store grew from a read"
+
+    def test_an_ingested_symbol_is_normalised_and_blanks_are_dropped(self) -> None:
+        """One key per symbol, and no `""` key.
+
+        Storing un-normalised would split a symbol's history across several keys, each of which a
+        consumer would have to know to query.
+        """
+        service = self._service()
+        service._ingest_manual_bars_sync(
+            [
+                {"symbol": "  aapl  ", "close": 1.0},
+                {"symbol": "AAPL", "close": 2.0},
+                {"symbol": "   ", "close": 3.0},
+                {"symbol": "", "close": 4.0},
+                {"close": 5.0},
+            ]
+        )
+        assert set(service._bars) == {"AAPL"}, sorted(service._bars)
+        assert [bar["close"] for bar in service._bars_for_symbol("AAPL")] == [1.0, 2.0]
+
+    def test_a_blank_symbol_quote_payload_names_nothing(self) -> None:
+        """`{"symbol": ""}` for a blank request, not the raw request echoed back.
+
+        A consumer that keys a cache on the returned symbol would otherwise file the result under
+        whatever whitespace was passed in.
+        """
+        import asyncio
+
+        service = self._service()
+        payload = asyncio.run(service.get_quote_payload("   "))
+        assert payload == {"symbol": "", "latest": None, "bars": []}, payload
+        # And a real symbol resolves, so the blank case is not the only one that works.
+        service._bars["AAPL"].append({"symbol": "AAPL", "close": 7.0})
+        good = asyncio.run(service.get_quote_payload("  aapl "))
+        assert good["symbol"] == "AAPL", good
+        assert good["latest"] == {"symbol": "AAPL", "close": 7.0}, good
+        assert len(good["bars"]) == 1, good
+
+    def test_an_empty_subscription_does_not_call_the_sdk(self) -> None:
+        """An empty subscribe is a no-op, and a missing stream does not crash.
+
+        `subscribe_bars(handler)` with no symbols is at best useless and at worst an SDK error,
+        and a worker that has not connected yet has no stream to call.
+        """
+
+        class _Stream:
+            def __init__(self):
+                self.subscribed = []
+
+            def subscribe_bars(self, handler, *symbols):
+                self.subscribed.append(symbols)
+
+        stream = _Stream()
+        worker = self._worker(stream)
+        _StreamWorker._subscribe_symbols(worker, [])
+        assert stream.subscribed == [], (
+            f"an empty subscription still called the SDK: {stream.subscribed!r}"
+        )
+
+        _StreamWorker._subscribe_symbols(worker, ["AAPL", "MSFT"])
+        assert stream.subscribed == [("AAPL", "MSFT")], stream.subscribed
+
+        # And a worker with no stream must not raise.
+        _StreamWorker._subscribe_symbols(self._worker(None), ["AAPL"])
