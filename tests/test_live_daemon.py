@@ -3566,3 +3566,235 @@ class TestEnvIdListAndServiceConfigString:
             timeframe="1h", status="ACTIVE", signal_config={"timeframe": "15m"},
         )
         assert _deployment_signal_timeframe(deployment) == "15m"
+
+
+class TestNonDemoWarningAndAccountGrouping:
+    """The live-money warning, the account grouping, and the auth-block ledger.
+
+    Eight mutations survived here, and the first group is the one that matters most: the
+    warning that names ACTIVE deployments pointing at accounts **not verified as demo**.
+
+    **A missing account counts as non-demo, and that is the fail-loud choice.** The lookup is
+    `getattr(account_lookup.get(id), "is_demo", False)`, so an account that is not in the map
+    resolves to `False` and is therefore an offender. Treating an unknown account as *demo*
+    would be the dangerous direction - a deployment whose account failed to load would look
+    verified and the warning would stay silent. Asserted explicitly, because it is the kind of
+    behaviour that looks like a bug until you read the docstring.
+
+    **Only `ACTIVE` counts.** `PAUSED` and `STOPPED` deployments on a non-demo account are not
+    named, which is the difference between "this is trading real money now" and "this is
+    configured for real money but is not running". A warning that fired for paused deployments
+    would be one an operator learns to ignore, and then it would not be doing its job when it
+    matters. So the status gate is asserted in both directions, and the *absence* of a warning
+    is asserted for the paused case - a test that only checked the positive would let the
+    inversion through.
+
+    The grouping functions are simpler but the same shape: **keep every deployment per account**.
+    A grouping that kept only the last would silently drop a deployment from the set the
+    adapter works on - and the surviving deployments would still be there, so nothing would
+    look wrong.
+
+    Two of the eleven mutations turned out to be **already covered** once applied properly -
+    `APPLY-FAILED` had hidden them because the same two-line clear exists in two places. That
+    is the third time this pass that treating an `APPLY-FAILED` as "not a verdict" turned a
+    false gap into a real measurement.
+    """
+
+    @staticmethod
+    def _deployment(status="ACTIVE", account_id="a1", **kwargs):
+        from uuid import uuid4
+
+        from shared.models import LiveDeploymentConfig
+
+        return LiveDeploymentConfig(
+            id=str(uuid4()),
+            strategy_name="s",
+            account_id=account_id,
+            symbols=["X"],
+            timeframe="1h",
+            status=status,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _account(account_id="a1", *, is_demo=False):
+        from shared.models import LiveAccountConfig
+
+        return LiveAccountConfig(
+            id=account_id, name="n", broker="ctrader", is_demo=is_demo
+        )
+
+    @staticmethod
+    def _warned(deployments, account_lookup):
+        """Run the warning with a capture handler and report whether anything was logged.
+
+        The handler is used rather than asserting on absence of output, because "no warning" is
+        a claim about a log line and `caplog` cannot express it as a positive assertion.
+        """
+        import logging
+
+        from live_runner import daemon
+
+        class _Capture(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def emit(self, record):
+                # `extra={"data": ...}` lands on the record as a plain attribute, so expose
+                # it under the name the test reads rather than reaching into `record.data`.
+                record.deployment_ids = (getattr(record, "data", {}) or {}).get(
+                    "deployment_ids", []
+                )
+                self.records.append(record)
+
+        handler = _Capture()
+        daemon.logger.addHandler(handler)
+        try:
+            daemon._warn_on_active_non_demo_deployments(deployments, account_lookup)
+        finally:
+            daemon.logger.removeHandler(handler)
+        return [r for r in handler.records if "not verified as demo" in r.getMessage()]
+
+    def test_an_active_deployment_on_a_non_demo_account_is_named(self) -> None:
+        """The case the warning exists for."""
+        warnings = self._warned(
+            [self._deployment()], {"a1": self._account(is_demo=False)}
+        )
+        assert warnings, "an ACTIVE deployment on a non-demo account was not named"
+
+    def test_a_demo_account_is_not_named(self) -> None:
+        """And the negative, so the warning is not simply always-firing."""
+        assert self._warned([self._deployment()], {"a1": self._account(is_demo=True)}) == []
+
+    def test_a_missing_account_counts_as_non_demo(self) -> None:
+        """**Fail-loud, and the reason to assert it.**
+
+        An account absent from the lookup resolves to `is_demo=False` and is therefore an
+        offender. The opposite - treating an unknown account as verified - would mean a
+        deployment whose account failed to load looks fine and the warning stays silent.
+        """
+        assert self._warned([self._deployment()], {}), (
+            "a deployment pointing at an account that is not in the lookup was not named; "
+            "an unverified account must not read as a verified one"
+        )
+        assert self._warned([self._deployment()], {"other": self._account()})
+
+    def test_only_an_active_deployment_is_named(self) -> None:
+        """`PAUSED` and `STOPPED` are not "trading real money now".
+
+        Asserted as the *absence* of a warning, which is the half that matters: a warning that
+        also fired for paused deployments would be one an operator learns to ignore, and then
+        it would not be doing its job on the deployment that does need it.
+        """
+        non_demo = {"a1": self._account(is_demo=False)}
+        for status in ("PAUSED", "STOPPED"):
+            assert self._warned([self._deployment(status=status)], non_demo) == [], (
+                f"a {status} deployment on a non-demo account was named; the warning is "
+                "meant to be about deployments that are actually running"
+            )
+        # ...and ACTIVE still is, on the same accounts, so the loop above is not vacuous.
+        assert self._warned([self._deployment(status="ACTIVE")], non_demo)
+
+    def test_the_warning_names_every_offending_deployment(self) -> None:
+        """All of them, so an operator can act on the whole list in one pass."""
+        deployments = [
+            self._deployment(account_id="a1"),
+            self._deployment(account_id="a2"),
+            self._deployment(account_id="a3"),
+            self._deployment(status="PAUSED", account_id="a4"),
+        ]
+        accounts = {
+            "a1": self._account("a1", is_demo=False),
+            "a2": self._account("a2", is_demo=True),
+            "a3": self._account("a3", is_demo=False),
+            "a4": self._account("a4", is_demo=False),
+        }
+        warnings = self._warned(deployments, accounts)
+        assert len(warnings) == 1, warnings
+        named = set(warnings[0].deployment_ids)
+        expected = {d.id for d in (deployments[0], deployments[2])}
+        assert named == expected, f"named {sorted(named)}, expected {sorted(expected)}"
+
+    def test_grouping_keeps_every_deployment_for_an_account(self) -> None:
+        """Two deployments on one account must both survive the grouping.
+
+        A grouping that kept only the last would drop a deployment from the set the adapter
+        works on - and the surviving ones would still look right, so nothing would report a
+        miss.
+        """
+        from live_runner.daemon import _group_deployments_by_account
+
+        deployments = [
+            self._deployment(account_id="a1"),
+            self._deployment(account_id="a1"),
+            self._deployment(account_id="a2"),
+        ]
+        grouped = _group_deployments_by_account(deployments)
+        assert set(grouped) == {"a1", "a2"}, sorted(grouped)
+        assert len(grouped["a1"]) == 2, len(grouped["a1"])
+        assert len(grouped["a2"]) == 1
+        assert {d.id for d in grouped["a1"]} == {deployments[0].id, deployments[1].id}
+
+    def test_only_active_deployments_contribute_an_account_id(self) -> None:
+        """The same status gate as the warning, on the set of accounts the runner acts on."""
+        from live_runner.daemon import _deployment_active_account_ids
+
+        assert _deployment_active_account_ids(
+            [self._deployment(status="ACTIVE", account_id="a1")]
+        ) == {"a1"}
+        for status in ("PAUSED", "STOPPED"):
+            assert _deployment_active_account_ids(
+                [self._deployment(status=status, account_id="a1")]
+            ) == set(), f"a {status} deployment contributed an account id"
+
+    def test_a_blank_block_reason_becomes_a_named_fallback(self) -> None:
+        """The ledger's reason is the only diagnostic the operator gets.
+
+        A terminal auth failure with a blank message stores a named fallback rather than an
+        empty string, so "the account is blocked" and "the account is blocked, because..." are
+        both answerable from the log.
+        """
+        from live_runner import daemon
+
+        account_id = "acct-blank-reason"
+        try:
+            daemon._block_ctrader_account(
+                account_id, daemon.CTraderAuthTerminalError("   ")
+            )
+            assert account_id in daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS
+            reason = daemon._CTRADER_AUTH_BLOCKED_REASONS.get(account_id)
+            assert reason == "cTrader authorization failed", repr(reason)
+        finally:
+            daemon._clear_ctrader_blocked_state(account_id)
+
+    def test_clearing_the_block_removes_both_halves_of_the_ledger(self) -> None:
+        """The account and its reason must go together.
+
+        A reason left behind after the account is unblocked would be reported to the operator
+        as the current cause of a block that no longer exists - so the two halves are asserted
+        as one, and clearing twice is a no-op rather than an error.
+        """
+        from live_runner import daemon
+
+        account_id = "acct-clear-roundtrip"
+        try:
+            daemon._block_ctrader_account(
+                account_id, daemon.CTraderAuthTerminalError("not authorized")
+            )
+            assert account_id in daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS
+            assert account_id in daemon._CTRADER_AUTH_BLOCKED_REASONS
+
+            daemon._clear_ctrader_blocked_state(account_id)
+            assert account_id not in daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS
+            assert account_id not in daemon._CTRADER_AUTH_BLOCKED_REASONS, (
+                "the account was unblocked but its stale reason remains, so an operator "
+                "would be told the current cause of a block that no longer exists"
+            )
+
+            # And clearing an account that was never blocked is harmless.
+            daemon._clear_ctrader_blocked_state(account_id)
+            daemon._clear_ctrader_blocked_state("never-seen-at-all")
+        finally:
+            daemon._CTRADER_AUTH_BLOCKED_ACCOUNTS.discard(account_id)
+            daemon._CTRADER_AUTH_BLOCKED_REASONS.pop(account_id, None)
