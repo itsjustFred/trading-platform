@@ -3410,3 +3410,159 @@ def test_an_unreadable_quantity_is_logged_rather_than_silently_assumed_flat(
     assert any("unreadable quantity" in message for message in messages), (
         f"an unreadable quantity was substituted without a word: {messages}"
     )
+
+
+class TestEnvIdListAndServiceConfigString:
+    """Two small parsers the daemon leans on for allowlists and ids. Two survivors.
+
+    Neither looks important, which is why both went unmeasured - and both end up in a place
+    where a wrong answer is **silently** wrong: an id allowlist, and a service config lookup.
+
+    **`_split_env_id_list` fails closed on a wrong type.** A non-string input yields an *empty*
+    set, which for a trusted-author allowlist means "nobody is trusted". The alternative -
+    coercing with `str(raw)` and splitting - turns a mis-typed config into a one-element
+    "allowlist" containing `12345` or `True`: a value that looks configured, matches nothing,
+    and is indistinguishable from a real id in a log line.
+
+    That asymmetry is the whole point of the type check, so it is asserted on every wrong type
+    rather than just one, including the falsy ones - `0` and `False` are the inputs most likely
+    to arrive from a `JSON` config that meant `false`.
+
+    **`_service_config_string` stringifies non-strings, and that is load-bearing.** A Discord
+    channel id written as a JSON *number* arrives as an `int`, and the real function turns it
+    into `"1234567890"`. Refusing it would mean a channel id that is perfectly valid in the
+    config file simply does not resolve. So the stringification is pinned in both directions -
+    numbers and booleans become their text, a `None` becomes empty - with the reasoning that
+    the alternative failure is "configured but silently inactive".
+    """
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("a", {"a"}),
+            ("a,b", {"a", "b"}),
+            ("a b\tc", {"a", "b", "c"}),
+            (" a , b ,, c ", {"a", "b", "c"}),
+            ("a,,b", {"a", "b"}),
+            ("12345", {"12345"}),
+        ],
+    )
+    def test_an_id_list_splits_on_commas_and_whitespace(self, raw, expected) -> None:
+        """Both separators, repeated separators, and surrounding padding.
+
+        The id list arrives as one env string, so `a, b  c` and `a,b,c` must agree - otherwise
+        the same allowlist written two ways authorises different people.
+        """
+        from live_runner.daemon import _split_env_id_list
+
+        assert _split_env_id_list(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw", [None, "", "   ", 12345, 0, True, False, ["a", "b"], {"a"}, object()]
+    )
+    def test_a_wrong_typed_id_list_is_empty_rather_than_coerced(self, raw) -> None:
+        """A mis-typed config yields *nobody*, not a one-element allowlist.
+
+        The distinction is the safety property: an empty allowlist authorises nothing, while a
+        coerced one contains a nonsense value that looks configured and matches nothing. Both
+        refuse in practice, but only one is legible in a log.
+        """
+        from live_runner.daemon import _split_env_id_list
+
+        assert _split_env_id_list(raw) == set(), (
+            f"{raw!r} produced {_split_env_id_list(raw)!r} instead of an empty set"
+        )
+
+    def test_a_numeric_config_value_is_stringified_because_ids_arrive_as_numbers(self) -> None:
+        """A JSON channel id arrives as an `int`, and refusing it would be the worse bug."""
+        from live_runner.daemon import _service_config_string
+
+        config = {"channel_id": 1234567890, "flag": True, "off": False, "ratio": 1.5}
+        assert _service_config_string(config, "channel_id") == "1234567890"
+        assert _service_config_string(config, "flag") == "True"
+        assert _service_config_string(config, "off") == "False"
+        assert _service_config_string(config, "ratio") == "1.5"
+
+    def test_an_absent_or_null_config_value_is_empty(self) -> None:
+        """And the two cases that must *not* become a string: absent, and explicitly null.
+
+        `None` becoming `"None"` would be the same class of bug as the env-file `str(None)`
+        this sweep already found, so it is asserted rather than assumed.
+        """
+        from live_runner.daemon import _service_config_string
+
+        assert _service_config_string({}, "missing") == ""
+        assert _service_config_string({"k": None}, "k") == ""
+        assert _service_config_string({"k": "  padded  "}, "k") == "padded"
+
+    def test_the_timeframe_fallback_is_unaffected_by_a_blank_override_KNOWN_EQUIVALENT(self) -> None:
+        """**A verified equivalent mutant**, proved across the shape space.
+
+        `_deployment_signal_timeframe` reads:
+
+            configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
+
+        The `or` runs **before** the `strip`, so a whitespace-only override is truthy, survives
+        the `or`, and is only then stripped to empty. Moving the fallback inside the `str()`
+        - the obvious-looking "simplification" - therefore changes nothing, because the
+        subsequent `if configured_tf:` already handles the empty result.
+
+        Verified across every combination that matters, including the one where both sides are
+        blank:
+
+        | deployment | `signal_config` | result |
+        |---|---|---|
+        | `1h` | absent | `1h` |
+        | `1h` | `5m` | `5m` |
+        | `1h` | `"   "` | `1h` |
+        | `1h` | `""` / `None` | `1h` |
+        | `""` | `"5m"` | `5m` |
+        | `""` | `"   "` / absent / `None` | `""` |
+
+        Recorded because the *behaviour* is what matters - a blank override falls back to the
+        deployment's own timeframe, and an entirely blank one yields an empty string rather
+        than inventing one - and because the equivalence is a property of the statement
+        **order**, which a future edit could change.
+        """
+        from live_runner.daemon import _deployment_signal_timeframe
+
+        def _deployment(timeframe, signal_config):
+            from uuid import uuid4
+
+            from shared.models import LiveDeploymentConfig
+
+            return LiveDeploymentConfig(
+                id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+                timeframe=timeframe, status="ACTIVE", signal_config=signal_config,
+            )
+
+        for timeframe, config, expected in [
+            ("1h", {}, "1h"),
+            ("1h", {"timeframe": "5m"}, "5m"),
+            ("1h", {"timeframe": "   "}, "1h"),
+            ("1h", {"timeframe": ""}, "1h"),
+            ("1h", {"timeframe": None}, "1h"),
+            ("", {"timeframe": "5m"}, "5m"),
+            ("", {"timeframe": "   "}, ""),
+            ("", {}, ""),
+            ("", {"timeframe": None}, ""),
+        ]:
+            deployment = _deployment(timeframe, config)
+            resolved = _deployment_signal_timeframe(deployment)
+            assert resolved == expected, (
+                f"deployment={timeframe!r} config={config!r} resolved to {resolved!r}, "
+                f"expected {expected!r}"
+            )
+
+    def test_a_signal_config_override_beats_the_deployment_timeframe(self) -> None:
+        """The precedence itself, so the fallback test above has a working baseline."""
+        from uuid import uuid4
+
+        from live_runner.daemon import _deployment_signal_timeframe
+        from shared.models import LiveDeploymentConfig
+
+        deployment = LiveDeploymentConfig(
+            id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+            timeframe="1h", status="ACTIVE", signal_config={"timeframe": "15m"},
+        )
+        assert _deployment_signal_timeframe(deployment) == "15m"
