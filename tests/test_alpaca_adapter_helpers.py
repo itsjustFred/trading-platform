@@ -890,3 +890,213 @@ class TestBulkResponseEntryReading:
         assert asyncio.run(adapter.cancel_open_orders()) == 0, (
             "a genuine empty response must report zero, not raise"
         )
+
+
+class TestAlpacaCredentialBlockAndOperationGate:
+    """The credential-block reader and the bulk-response gate, named directly.
+
+    Four mutations survived, and three of them are about **which field wins** or
+    **whether a block exists at all** - the family that decides whether an order reaches a
+    paper or a live endpoint.
+
+    **The endpoint outranks the paper flag.** `ALPACA_ENDPOINT_ACC{n}` containing "paper"
+    decides the mode, and `ALPACA_PAPER_ACC{n}` is only consulted when no endpoint is set.
+    So `{ENDPOINT: "paper", PAPER: "false"}` resolves to **paper**, silently ignoring the
+    flag an operator explicitly wrote. That precedence is undocumented in the function
+    body and had no test, and it is the safe direction when it is wrong - but "safe because
+    of an accident" is not the same as "safe because it is tested".
+
+    **A blank paper flag raises; an absent one defaults to paper.** Those are different
+    on purpose. Absent means "nobody said", and the default is the paper endpoint.
+    Explicitly blank means somebody wrote an empty value, and `_parse_bool_env` refuses it
+    rather than guessing. This is the same distinction the config parser draws, and
+    losing it here would mean `PAPER=` in a deploy file quietly started trading real money.
+
+    **An incomplete key/secret pair yields no block.** A block missing its secret returns
+    `None` rather than a half-populated credential, so a partially-written env file cannot
+    produce a key with an empty secret.
+
+    **`bool(block["paper"])` is load-bearing, not dead code.** The declared type is
+    `dict[str, str | bool]`, so a string value is *within contract* - and
+    `bool("false")` is `True`. That surprised answer is pinned as-is, with the reason
+    recorded: `_alpaca_credential_block` only ever produces a real bool, so the string case
+    is unreachable today. The `bool()` is kept because the signature invites the case, and
+    pinning it means a future caller passing a string finds the answer written down rather
+    than discovering `True` the hard way.
+    """
+
+    @staticmethod
+    def _values(idx=1, **env):
+        values = {
+            "ALPACA_API_KEY_ACC%d" % idx: "  key-%d  " % idx,
+            "ALPACA_SECRET_KEY_ACC%d" % idx: "  secret-%d  " % idx,
+        }
+        for key, value in env.items():
+            values["ALPACA_%s_ACC%d" % (key, idx)] = value
+        return values
+
+    def test_the_endpoint_outranks_the_paper_flag(self) -> None:
+        """The undocumented precedence, asserted with both fields set."""
+        from live_runner.alpaca_adapter import _alpaca_credential_block
+
+        # Endpoint says paper, flag says false - the endpoint wins.
+        block = _alpaca_credential_block(
+            self._values(ENDPOINT="https://paper-api.alpaca.markets", PAPER="false"), 1
+        )
+        assert block is not None
+        assert block["paper"] is True, block
+
+        # The live endpoint with the flag saying paper.
+        block = _alpaca_credential_block(
+            self._values(ENDPOINT="https://api.alpaca.markets", PAPER="true"), 1
+        )
+        assert block is not None
+        assert block["paper"] is False, block
+
+        # And any endpoint containing "paper" counts, matched case-insensitively.
+        block = _alpaca_credential_block(self._values(ENDPOINT="LIVE-PAPER"), 1)
+        assert block is not None
+        assert block["paper"] is True, block
+
+    def test_an_absent_paper_flag_defaults_to_paper_and_a_blank_one_raises(self) -> None:
+        """Absent means "nobody said" -> paper. Blank means somebody wrote nothing -> refuse."""
+        from live_runner.alpaca_adapter import _alpaca_credential_block
+
+        block = _alpaca_credential_block(self._values(), 1)
+        assert block is not None
+        assert block["paper"] is True, "an absent paper flag must not default to live"
+
+        with pytest.raises(ValueError) as excinfo:
+            _alpaca_credential_block(self._values(PAPER=""), 1)
+        message = str(excinfo.value)
+        assert "ALPACA_PAPER_ACC1" in message, message
+
+        # And the flag alone is honoured when no endpoint overrides it.
+        block = _alpaca_credential_block(self._values(PAPER="false"), 1)
+        assert block is not None
+        assert block["paper"] is False, block
+
+    def test_an_incomplete_key_or_secret_pair_yields_no_block(self) -> None:
+        """A half-written env file must not produce a key with an empty secret."""
+        from live_runner.alpaca_adapter import _alpaca_credential_block
+
+        assert _alpaca_credential_block({"ALPACA_API_KEY_ACC1": "k"}, 1) is None
+        assert _alpaca_credential_block({"ALPACA_SECRET_KEY_ACC1": "s"}, 1) is None
+        assert _alpaca_credential_block({"ALPACA_API_KEY_ACC1": "  ", "ALPACA_SECRET_KEY_ACC1": "s"}, 1) is None
+        assert _alpaca_credential_block({}, 1) is None
+        # The complete block, for contrast.
+        assert _alpaca_credential_block(self._values(), 1) is not None
+
+    def test_credentials_are_stringified_stripped_and_the_flag_is_coerced(self) -> None:
+        """The parser already strips; the reader stringifies and coerces. Asserted together.
+
+        A string `paper` is *within the declared type* and `bool("false")` is `True` -
+        pinned as-is, because the parser only ever produces a real bool and the surprising
+        answer should be written down rather than discovered.
+        """
+        from live_runner.alpaca_adapter import _alpaca_block_credentials
+
+        api_key, secret_key, paper = _alpaca_block_credentials(
+            {"api_key": "k", "secret_key": "s", "paper": True}
+        )
+        assert (api_key, secret_key, paper) == ("k", "s", True)
+
+        # Non-string credentials are stringified rather than passed through.
+        api_key, secret_key, paper = _alpaca_block_credentials(
+            {"api_key": 12345, "secret_key": 67890, "paper": False}
+        )
+        assert api_key == "12345" and isinstance(api_key, str), api_key
+        assert secret_key == "67890" and isinstance(secret_key, str), secret_key
+        assert paper is False, paper
+
+        # The declared type admits a string, and bool("false") is True. Unreachable from
+        # the parser today; documented here so it is a decision rather than a surprise.
+        assert _alpaca_block_credentials({"api_key": "k", "secret_key": "s", "paper": "false"})[2] is True
+
+    def test_a_block_missing_a_field_raises_rather_than_defaulting(self) -> None:
+        """Direct indexing, so a malformed block is loud instead of silently half-configured."""
+        from live_runner.alpaca_adapter import _alpaca_block_credentials
+
+        for incomplete in ({"api_key": "k", "secret_key": "s"}, {"api_key": "k", "paper": True}):
+            with pytest.raises(KeyError):
+                _alpaca_block_credentials(incomplete)
+
+    def test_the_operation_gate_names_the_operation_and_reports_every_failure(self) -> None:
+        """The gate the daemon relies on to decide a STOPPED deployment was enforced.
+
+        Called by name here rather than only through `cancel_open_orders`, because the
+        two failure modes are different in kind: an unreadable *shape* raises before any
+        counting, while a bad *status* raises after, and both must refuse to produce a
+        number.
+        """
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        with pytest.raises(RuntimeError) as excinfo:
+            AlpacaLiveAdapter._checked_response_operations(
+                {"orders": "not-a-list"}, operation="cancel_orders"
+            )
+        assert "cancel_orders" in str(excinfo.value), str(excinfo.value)
+        assert "refusing to report a count" in str(excinfo.value), str(excinfo.value)
+
+        # Every failing entry is named, not just the first - a partial cancel is still a
+        # partial cancel and the message has to show which orders are live.
+        with pytest.raises(RuntimeError) as excinfo:
+            AlpacaLiveAdapter._checked_response_operations(
+                [{"id": "a", "status": 404}, {"id": "b", "status": 500}],
+                operation="close_positions",
+            )
+        message = str(excinfo.value)
+        assert "close_positions" in message, message
+        assert "a=404" in message and "b=500" in message, message
+
+    def test_a_missing_status_is_assumed_successful_for_the_legacy_shape(self) -> None:
+        """The one documented assumption: absent means the legacy shape omitted it.
+
+        Deliberately asymmetric with the non-numeric case, which is a *failure*. Omitted
+        and malformed are different facts, and conflating them is what this gate exists to
+        prevent.
+        """
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        entries = AlpacaLiveAdapter._checked_response_operations(
+            [{"id": "a"}, {"id": "b", "status": 200}],
+            operation="cancel_orders",
+        )
+        assert [e["id"] for e in entries] == ["a", "b"], entries
+
+    def test_only_2xx_counts_as_success(self) -> None:
+        """A 3xx is a redirect, not a cancel. Widening the range to 400 is the trap."""
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        AlpacaLiveAdapter._checked_response_operations([{"id": "a", "status": 200}], operation="cancel_orders")
+        AlpacaLiveAdapter._checked_response_operations([{"id": "a", "status": 204}], operation="cancel_orders")
+        AlpacaLiveAdapter._checked_response_operations([{"id": "a", "status": 299}], operation="cancel_orders")
+        for bad in (199, 300, 302, 400, 422, 500):
+            with pytest.raises(RuntimeError):
+                AlpacaLiveAdapter._checked_response_operations(
+                    [{"id": "a", "status": bad}], operation="cancel_orders"
+                )
+
+    def test_a_missing_alpaca_py_is_reported_with_the_package_to_install(self, monkeypatch) -> None:
+        """A missing dependency must name itself; a bare ImportError is an hour lost."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _blocked(name, *args, **kwargs):
+            if name == "alpaca" or name.startswith("alpaca."):
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _blocked)
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        with pytest.raises(RuntimeError) as excinfo:
+            AlpacaLiveAdapter._load_alpaca_order_types(
+                AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+            )
+        message = str(excinfo.value)
+        assert "alpaca-py" in message, message
+        assert "required" in message, message
+        # The original cause is preserved, so the traceback still shows the real import error.
+        assert isinstance(excinfo.value.__cause__, ModuleNotFoundError), excinfo.value.__cause__
