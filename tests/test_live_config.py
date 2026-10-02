@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 from unittest.mock import patch
 
@@ -101,3 +103,164 @@ deployments:
     warning_mock.assert_called_once()
     _, kwargs = warning_mock.call_args
     assert kwargs["extra"]["data"]["account_id"] == "unknown-account"
+
+
+class TestEnvExpansionAndUnexpandedGate:
+    r"""The `${VAR}` expansion and the gate that refuses an unexpanded reference.
+
+    The `${...}` form is already well covered by `tests/live_runner/test_discord_ingestion_gates.py`
+    - all six mutations there were killed on the first attempt. This class covers the two things
+    that gate does not reach: **an explicitly blank value**, and **the bare `$VAR` form**.
+
+    **A blank value is a statement, not an absence.** `_expand_env_value` uses
+    `env.get(key, match.group(0))`, so a variable set to `""` expands to nothing while an
+    *unset* variable stays literal. That distinction is the whole point, and it is the exact
+    hazard this repo has already been bitten by twice - a blanked credential silently selecting
+    a default, once per broker, with the default being demo mode.
+
+    Writing it as `env.get(key) or match.group(0)` looks equivalent and is not: it turns an
+    explicit blank back into the literal text `${VAR}`. The failure would then be *loud* -
+    the unexpanded gate reports it - but **the cause is inverted**. The operator set the
+    variable on purpose and is told it was never set. Loud-and-wrong is still wrong when the
+    message sends someone to the wrong place.
+
+    **The bare `$VAR` form is a real gap, recorded rather than fixed.** `_expand_env_value`
+    expands both `${VAR}` and `$VAR`, and leaves either literal when unset. But
+    `assert_no_unexpanded_env` only matches `\$\{[A-Za-z_][A-Za-z0-9_]*\}`, so an unexpanded
+    **bare** reference passes the gate silently.
+
+    That is precisely the failure the gate was written for: its docstring says a literal
+    `"${DISCORD_BOT_X_CHANNEL_ID}"` "is a startup error, never a silent mute". The braced form
+    gets that guarantee and the bare form does not, and both are spellings the expander accepts.
+
+    The likely reason for the narrow pattern is a legitimate one - a config may legitimately
+    contain `cost $5`, and a blanket `\$[A-Za-z_]` pattern would not touch that but *would*
+    touch a literal `$USD` in a comment. So the trade-off is real, and closing it is a
+    decision rather than a fix. Tracked as `needs-decision`.
+    """
+
+    ENV = {"SET": "value", "BLANKED": "", "NUMERIC": "7"}
+
+    @pytest.mark.parametrize(
+        "template,expected",
+        [
+            ("${SET}", "value"),
+            ("$SET", "value"),
+            ("prefix ${SET} suffix", "prefix value suffix"),
+            ("prefix $SET suffix", "prefix value suffix"),
+            ("${NUMERIC}", "7"),
+            ("${SET}${SET}", "valuevalue"),
+            ("$SET-$NUMERIC", "value-7"),
+        ],
+    )
+    def test_both_reference_forms_expand_when_the_variable_is_set(
+        self, template: str, expected: str
+    ) -> None:
+        """`${VAR}` and `$VAR` are both accepted spellings, and both are expanded.
+
+        Asserted pairwise because they are separate alternatives in one regex, and dropping
+        either changes what a config file means.
+        """
+        from live_runner.config_parser import _expand_env_value
+
+        assert _expand_env_value(template, self.ENV) == expected
+
+    def test_a_variable_set_to_empty_expands_to_nothing(self) -> None:
+        """**The blanked-value contract, which is the one to protect.**
+
+        The variable *is* set; its value is empty. Expanding to the literal `${VAR}` would say
+        the opposite to the operator, and the unexpanded gate would then blame them for not
+        setting something they set deliberately.
+        """
+        from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
+
+        assert _expand_env_value("${BLANKED}", self.ENV) == ""
+        assert _expand_env_value("$BLANKED", self.ENV) == ""
+        assert _expand_env_value("x${BLANKED}y", self.ENV) == "xy"
+        # And because it expanded, there is nothing left for the gate to complain about.
+        assert_no_unexpanded_env({"channel": _expand_env_value("${BLANKED}", self.ENV)})
+
+    def test_an_unset_variable_stays_literal_so_the_gate_can_see_it(self) -> None:
+        """The other half of the contract: unset is *not* the same as blank.
+
+        Leaving the reference in place is what lets `assert_no_unexpanded_env` catch it. An
+        expander that substituted `""` for an unset variable would make the gate dead code.
+        """
+        from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
+
+        assert _expand_env_value("${UNSET}", self.ENV) == "${UNSET}"
+        with pytest.raises(ValueError, match="Unexpanded environment reference"):
+            assert_no_unexpanded_env({"id": _expand_env_value("${UNSET}", self.ENV)})
+
+    def test_a_bare_unset_reference_passes_the_gate_KNOWN_GAP(self) -> None:
+        """**A real gap, pinned as-is.** The bare form escapes the gate entirely.
+
+        `_UNEXPANDED_ENV_PATTERN` matches only the braced form, so an unexpanded `$VAR` sails
+        through `assert_no_unexpanded_env` - and it is one of the two spellings the expander
+        accepts. The gate's own docstring promises the opposite: *"is a startup error, never a
+        silent mute"*.
+
+        Asserted as-is so the gap stays visible. If this test starts failing, the gap was
+        closed and the backlog entry should go with it.
+        """
+        from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
+
+        left = _expand_env_value("$UNSET", self.ENV)
+        assert left == "$UNSET", f"the bare form now expands differently: {left!r}"
+        assert_no_unexpanded_env({"channel": left})  # no raise: this is the gap
+
+    def test_the_gate_walks_nested_structures_and_names_what_it_found(self) -> None:
+        """Nested dicts, lists and strings are all reached, and the message names the keys.
+
+        Asserted together because a gate that only checks the top level is the natural way to
+        write one - and #81's own payload is nested.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        payload = {
+            "a": {"b": ["${DEEP}", {"c": "${ALSO_DEEP}"}]},
+            "plain": "no references here",
+        }
+        with pytest.raises(ValueError) as exc:
+            assert_no_unexpanded_env(payload, context="live deployment config")
+        message = str(exc.value)
+        assert "${DEEP}" in message and "${ALSO_DEEP}" in message, message
+        assert "live deployment config" in message, message
+
+    def test_a_clean_payload_passes_and_non_strings_are_ignored(self) -> None:
+        """The pass case, so the gate is not simply always-firing.
+
+        Non-string leaves are skipped rather than crashing: a config may legitimately contain
+        numbers, booleans and nulls.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        assert_no_unexpanded_env(
+            {"n": 7, "f": 1.5, "b": True, "none": None, "s": "all set", "l": [1, "two"]}
+        )
+        assert_no_unexpanded_env({})
+        assert_no_unexpanded_env([])
+
+    def test_prices_and_malformed_references_are_not_mistaken_for_variables(self) -> None:
+        """What the narrow pattern buys, stated so the trade-off is visible.
+
+        `cost $5` and `$100` are legitimate config text. The current pattern cannot match them
+        because `$` must be followed by a letter or underscore, so currency survives - and
+        that is almost certainly why the pattern is as narrow as it is.
+
+        The malformed forms `${}`, `${1BAD}` and `${9}` are also not matched. Those are
+        ambiguous - a config could legitimately contain them as text - so the gate ignores
+        them, and the cost is that a genuinely misspelled `${1BAD}` also goes unnoticed.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        for text in ("cost $5", "$100 per month", "a${}b", "${1BAD}", "50% discount"):
+            assert_no_unexpanded_env({"text": text})
+
+        # Note what this test is *not*: `${SET}` in a raw template is refused, correctly.
+        # The gate runs on the **already-expanded** payload, so any `${NAME}` still present
+        # is unexpanded by definition - which is why an expanded template is not something
+        # it ever sees. Asserted here because my first version of this test got it backwards
+        # and expected a set variable to pass.
+        with pytest.raises(ValueError, match=re.escape("${SET}")):
+            assert_no_unexpanded_env({"text": "${SET}"})
