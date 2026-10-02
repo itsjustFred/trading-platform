@@ -4037,3 +4037,301 @@ class TestAdapterAvailabilityAndTaskLifecycle:
         assert stream == "deployment-stream-acc-1", stream
         assert listener != stream, "two task kinds produced the same name"
         assert "acc-1" in listener, listener
+
+
+class TestDeploymentIdentityHelpersAndAuthorAllowlist:
+    """The name/id resolvers, and one allowlist guard that is a security boundary.
+
+    Nine mutations survived, all in the "which value wins, and how is it shaped" family.
+
+    **The allowlist's `Mapping` exclusion is the one that matters.** `_trusted_author_ids_from_config`
+    accepts a list of ids or a single id string, and explicitly returns an empty set for a
+    `Mapping` - *before* the generic iterable branch. That ordering is the whole guard, because
+    **iterating a dict yields its keys**. Without it, a config shaped like
+    `{"123456": true}` - a perfectly natural "flags per author" form - would authorise
+    author `123456` from the key, silently turning a settings block into an allowlist.
+
+    The `str(item).strip().lower()` also matters beyond tidiness: ids are compared
+    case-insensitively, and a padded id that is not stripped simply never matches, so an
+    allowlist entry would look configured and authorise nobody.
+
+    **Casing is a resolver, not a convention.** `_deployment_signal_processor_name` lower-cases,
+    so `"RocketFuel"` and `"rocketfuel"` resolve to the same processor. Forgetting the
+    lower-case is a silent miss in the same family as the StockKit route normalisation, and
+    in the same direction: no processor match, so no trade.
+
+    The two name resolvers are precedence questions, asserted with both sources present
+    because that is the only case that distinguishes the branches - which is the third time
+    this session that a one-value test passed under either order.
+
+    The service name is stripped, so a padded name resolves; and the task name keeps its
+    `service-discord-` prefix, which is what stops a service task colliding with a
+    deployment task of the same id.
+    """
+
+    @staticmethod
+    def _deployment(signal_config=None, settings=None, source_id="svc-1"):
+        from uuid import uuid4
+
+        from shared.models import LiveDeploymentConfig
+
+        kwargs = {}
+        if signal_config is not None:
+            kwargs["signal_config"] = signal_config
+        if settings is not None:
+            kwargs["settings"] = settings
+        return LiveDeploymentConfig(
+            id=str(uuid4()), strategy_name="s", account_id="a", symbols=["X"],
+            timeframe="1h", status="ACTIVE", signal_source_id=source_id, **kwargs,
+        )
+
+    def test_a_mapping_never_becomes_a_set_of_trusted_authors(self) -> None:
+        """**Iterating a dict yields its keys, so this guard is a security boundary.**
+
+        A config shaped `{"123456": true}` is a natural "flags per author" block. Without
+        the `Mapping` exclusion it would be read as an allowlist of the single author
+        `123456` - a settings dict silently promoted to a trust decision.
+        """
+        from live_runner.daemon import _trusted_author_ids_from_config
+
+        for mapping in ({"123456": True}, {"alice": "on"}, {"1": None}, {}):
+            assert _trusted_author_ids_from_config(mapping) == set(), (
+                f"{mapping!r} produced {_trusted_author_ids_from_config(mapping)!r}; a "
+                "dict-of-flags config must not become an allowlist of its keys"
+            )
+
+    def test_author_ids_are_lower_cased_stripped_and_non_empty_only(self) -> None:
+        """Case-insensitive comparison is the contract, so a padded or blank entry is a miss.
+
+        **An alphabetic id in the single-string form is the case that distinguishes these.**
+        My first version of this used only digits, and digits have no case - so removing the
+        `.lower()` from the string branch changed nothing observable and the mutation
+        survived a test that looked like it covered it. The list branch lower-cases
+        separately, so a list assertion cannot see the string branch either.
+        """
+        from live_runner.daemon import _trusted_author_ids_from_config
+
+        assert _trusted_author_ids_from_config("  ALICE  ") == {"alice"}, (
+            "a single-string id is not lower-cased, so it will never match a "
+            "case-insensitive comparison"
+        )
+        assert _trusted_author_ids_from_config("  123456  ") == {"123456"}
+        assert _trusted_author_ids_from_config(["123", " 456 ", "ALICE"]) == {
+            "123", "456", "alice"
+        }
+        # Blank entries are dropped rather than becoming an id that matches nothing.
+        assert _trusted_author_ids_from_config(["", "  ", "123"]) == {"123"}
+        for absent in (None, "", "   ", 5, b"12"):
+            assert _trusted_author_ids_from_config(absent) == set(), repr(absent)
+
+    def test_the_explicit_mapping_guard_is_redundant_with_the_tuple_exclusion(self) -> None:
+        """**A verified equivalent mutant**, and the reason is a second path to the same answer.
+
+        The function guards a `Mapping` twice:
+
+            if isinstance(value, Mapping):
+                return set()
+            if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+                ...
+
+        Adding `Mapping` to that tuple exclusion reaches the same result by a different
+        route - the dict is skipped by the iterable branch and falls through to the final
+        `return set()`. So dropping the explicit guard changes nothing for any input, which
+        is what the mutation showed: with the guard replaced, `{"123456": True}` still
+        returned an empty set.
+
+        Verified by hand rather than assumed, because "equivalent" is a claim about all
+        inputs and the two paths do converge here only because the fallthrough is an empty
+        set. The explicit guard stays - it documents that a dict is *deliberately* not an
+        allowlist rather than incidentally falling through - and the note is here so the
+        next person to run this mutation does not re-derive it.
+        """
+        from live_runner.daemon import _trusted_author_ids_from_config
+
+        for mapping in ({"123456": True}, {"alice": "on"}, {}):
+            assert _trusted_author_ids_from_config(mapping) == set(), mapping
+
+    def test_the_signal_processor_name_is_lower_cased(self) -> None:
+        """`"RocketFuel"` and `"rocketfuel"` must resolve to the same processor.
+
+        The processor name is compared against registered names, so a missing lower-case is a
+        silent miss - no processor match, so no trade.
+        """
+        from live_runner.daemon import _deployment_signal_processor_name
+
+        deployment = self._deployment(signal_config={"signal_processor": "RocketFuel"})
+        assert _deployment_signal_processor_name(deployment) == "rocketfuel"
+        from_settings = self._deployment(settings={"signal_processor": "NITRO"})
+        assert _deployment_signal_processor_name(from_settings) == "nitro"
+        assert _deployment_signal_processor_name(self._deployment()) == ""
+
+    def test_the_signal_config_processor_wins_over_the_settings_one(self) -> None:
+        """Precedence, asserted with both present because one value cannot distinguish it."""
+        from live_runner.daemon import _deployment_signal_processor_name
+
+        deployment = self._deployment(
+            signal_config={"signal_processor": "FromConfig"},
+            settings={"signal_processor": "FromSettings"},
+        )
+        assert _deployment_signal_processor_name(deployment) == "fromconfig", (
+            "the settings-level processor overrode the signal_config one"
+        )
+
+    def test_the_signal_source_id_wins_for_the_service_name(self) -> None:
+        """The source id is authoritative; the config name is a fallback."""
+        from live_runner.daemon import _deployment_service_name
+
+        deployment = self._deployment(
+            signal_config={"service_name": "from-config"}, source_id="from-source"
+        )
+        assert _deployment_service_name(deployment) == "from-source", (
+            "the config service_name overrode the deployment's signal_source_id"
+        )
+
+    def test_the_service_name_falls_back_to_config_and_is_stripped(self) -> None:
+        """No source id means the config answers, and padding is removed either way."""
+        from live_runner.daemon import _deployment_service_name
+
+        assert (
+            _deployment_service_name(
+                self._deployment(signal_config={"service_name": "  cfg  "}, source_id="")
+            )
+            == "cfg"
+        )
+        assert _deployment_service_name(self._deployment(source_id="  svc  ")) == "svc"
+        assert _deployment_service_name(self._deployment(source_id="")) == ""
+
+    def test_the_service_task_name_keeps_its_namespace_prefix(self) -> None:
+        """`service-discord-` is what stops a service task colliding with a deployment task.
+
+        Dropped, `service-discord-1` and `deployment-listener-1` would still differ - but a
+        service id and a deployment id could then produce the same name for different
+        subsystems, and task names are what a human reads when something is stuck.
+        """
+        from live_runner.daemon import _service_task_name
+
+        name = _service_task_name("bot-1")
+        assert name == "service-discord-bot-1", name
+        assert name.startswith("service-"), name
+        assert "bot-1" in name, name
+
+
+class TestBrokerLoginAndChannelResolution:
+    """Two resolvers that read the database and are therefore uncovered until stubbed.
+
+    Both are **identity** functions, and both are used to decide *which account* or *which
+    channel* something belongs to. Both fail closed on an unknown input, which is the
+    property worth pinning: an empty string here means "no match", so the caller's routing
+    check rejects rather than proceeding against a guess.
+
+    `_live_account_broker_login` prefers `broker_login` over `ctid`, and the preference is
+    only observable on an account that carries both. That combination is the realistic
+    Alpaca case - an Alpaca account that also has a legacy `ctid` - so it is the case
+    asserted, not a convenience one.
+
+    `_live_deployment_channel_ids` collects the channels live deployments actually read.
+    A channel id is stripped, so a padded id still matches, and a blank one is dropped
+    rather than collected - a collected `""` would group every unconfigured deployment
+    into one phantom channel, and the grouping check is what prevents two bots sharing a
+    token from being pointed at the same channel.
+    """
+
+    @staticmethod
+    def _account(**fields):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**fields)
+
+    def test_the_broker_login_is_preferred_over_the_ctid(self) -> None:
+        """Both present, so the preference is observable. One value could not distinguish it."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(
+                daemon, "get_live_account",
+                lambda _account_id: self._account(broker_login="PA35HB6T7815", ctid="ctid-1"),
+            )
+            assert daemon._live_account_broker_login("acc-1") == "PA35HB6T7815", (
+                "the ctid overrode the broker_login for routing"
+            )
+        finally:
+            monkey.undo()
+
+    def test_the_ctid_is_used_when_no_broker_login_is_set(self) -> None:
+        """cTrader's identifier lives in `ctid`; an account with only one of the two resolves."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(
+                daemon, "get_live_account",
+                lambda _account_id: self._account(broker_login="", ctid="ctid-1"),
+            )
+            assert daemon._live_account_broker_login("acc-1") == "ctid-1"
+        finally:
+            monkey.undo()
+
+    def test_an_unknown_or_unreadable_account_resolves_to_no_broker_login(self) -> None:
+        """The fail-closed contract: absent account, and a database that refuses to answer."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(daemon, "get_live_account", lambda _account_id: None)
+            assert daemon._live_account_broker_login("acc-1") == ""
+
+            def _raise(_account_id):
+                raise RuntimeError("database is locked")
+
+            monkey.setattr(daemon, "get_live_account", _raise)
+            assert daemon._live_account_broker_login("acc-1") == "", (
+                "a database error produced a broker identity, so routing would "
+                "compare against a guess instead of failing closed"
+            )
+        finally:
+            monkey.undo()
+
+    @staticmethod
+    def _rows(*configs):
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(signal_config=c) for c in configs]
+
+    def test_channel_ids_are_collected_stripped_and_deduped(self) -> None:
+        """Stripped so a padded id still matches; deduped because a set is the contract."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(
+                daemon, "list_live_deployments",
+                lambda: self._rows(
+                    {"channel_id": " 111 "}, {"channel_id": "111"}, {"channel_id": "222"},
+                ),
+            )
+            channels = daemon._live_deployment_channel_ids()
+            assert channels == {"111", "222"}, channels
+        finally:
+            monkey.undo()
+
+    def test_a_blank_or_missing_channel_id_is_not_collected(self) -> None:
+        """A collected `""` would group every unconfigured deployment into a phantom channel."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            monkey.setattr(
+                daemon, "list_live_deployments",
+                lambda: self._rows(
+                    {"channel_id": ""}, {"channel_id": "   "}, {}, {"channel_id": None},
+                    {"channel_id": "333"},
+                ),
+            )
+            channels = daemon._live_deployment_channel_ids()
+            assert channels == {"333"}, channels
+            assert "" not in channels, channels
+        finally:
+            monkey.undo()
+
+    def test_an_unreadable_deployment_table_yields_no_channels(self) -> None:
+        """The same fail-closed direction: no rows readable means no channels claimed."""
+        monkey = pytest.MonkeyPatch()
+        try:
+            def _raise():
+                raise RuntimeError("database is locked")
+
+            monkey.setattr(daemon, "list_live_deployments", _raise)
+            assert daemon._live_deployment_channel_ids() == set()
+        finally:
+            monkey.undo()
