@@ -7596,15 +7596,20 @@ class TestSignalIdempotencyKeyAndStalenessBudget:
     def test_a_monthly_spelling_collides_with_a_minute_one_KNOWN_AMBIGUITY(self) -> None:
         """`1M` means month on most platforms and minute here. Recorded, not changed.
 
-        `_timeframe_age_budget_seconds` lowercases before lookup, so `1M` and `1m` are the
-        same key and both get **60 seconds**. A monthly strategy therefore gets a one-minute
-        staleness budget and its signals are refused almost immediately.
+        **The cause is not this function.** `_timeframe_age_budget_seconds` lowercases before
+        its own lookup, so `1M` and `1m` collide here - but the *root* cause is
+        `shared.constants.normalize_timeframe`, which lowercases and then consults
+        `TIMEFRAME_ALIASES`. That table holds exactly `m1`, `h1` and `d1`: with no monthly
+        entry, `1M` lowercases to `1m` and passes through as already-valid.
 
-        The failure direction is the safe one - refusing valid signals rather than trading
-        stale ones - but it is still a wrong answer to a plausible input, and it sits next to
-        the existing `1w` grid question. Fixing it means deciding whether `1M` is a month or
-        a minute in this codebase, which is a product decision, so it is recorded rather than
-        guessed.
+        I first attributed this to the daemon's own lowercasing, which is the surface where the
+        60 seconds became visible but not where a fix would go. Corrected after tracing it, and
+        the authoritative version - with the decision and the options - is recorded in
+        `tests/live_runner/test_execution_timing.py` next to the code that causes it.
+
+        Either way a monthly strategy gets a one-minute staleness budget and its signals are
+        refused almost immediately. The failure direction is the safe one - refusing valid
+        signals rather than trading stale ones - which is why it can sit unnoticed.
         """
         from live_runner.daemon import _timeframe_age_budget_seconds
 
