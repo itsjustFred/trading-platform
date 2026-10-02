@@ -44,6 +44,16 @@
 #   4  the suite did not run (infra failure) - no verdict
 #   5  the verdict did not match --expect
 #   6  the revert failed - working tree dirty, investigate immediately
+#   7  KILLED-UNATTRIBUTED - a test failed but not the one that should have. The
+#      verdict is WRONG, not merely unverified. Never masked by --expect.
+#   8  KILLED with no --detector - some test failed, but nothing proves it was
+#      this mutation. The verdict is UNVERIFIED. Never masked by --expect.
+#
+# rc=0 therefore means: the mutation applied, the suite ran, the file was
+# reverted, and the printed verdict is backed by a named failing test (or the
+# verdict was SURVIVED, which needs no attribution). Anything the harness cannot
+# prove exits non-zero, so a caller that checks rc - and every caller in this
+# audit does - is never handed a green result it should not trust.
 
 set -o nounset
 set -o pipefail
@@ -170,13 +180,65 @@ if [ "$RC" != "0" ]; then
   fi
 fi
 
+# --- is the code under test the code we think it is? -----------------------
+# The venv has an EDITABLE INSTALL of /home/ubuntu/Desktop/trading-platform, which
+# contains a SECOND, DIVERGENT copy of `live_runner` (114KB against 163KB here, different
+# md5). Inside pytest, the rootdir prepend puts this worktree first and the right copy
+# wins - verified. But a run rooted anywhere else, or any import that happens before
+# pytest's prepend, silently gets the stale one. A mutation run that measured the wrong
+# repo would report honest-looking KILLED verdicts about code nobody ships.
+#
+# So the harness resolves the package itself and refuses to continue if the import
+# does not come from this worktree. Cheap, and it turns a silent hazard into a loud one.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+PKG="${FILE%%/*}"
+if [ "$PKG" != "$FILE" ] && [ -n "$PKG" ]; then
+  # The worktree is put on PYTHONPATH explicitly: `python -c` resolves relative to the
+  # caller's cwd, and a harness invoked from elsewhere would otherwise fail to import the
+  # package it is about to mutate and report that as an import mismatch.
+  #
+  # `__file__` alone is not enough: a package with no `__init__.py` is a NAMESPACE package
+  # whose `__file__` is None, so it falls back to the first `__path__` entry. The real
+  # `live_runner` has an `__init__.py` and would have worked either way - found by the
+  # self-check's sandbox, which deliberately has no `__init__.py`.
+  IMPORTED="$(PYTHONPATH="$REPO_ROOT" "$PYTHON" -c "
+import importlib, sys
+m = importlib.import_module(sys.argv[1])
+print(getattr(m, '__file__', None) or (list(getattr(m, '__path__', [])) or [''])[0])
+" "$PKG" 2>/dev/null || true)"
+  case "$IMPORTED" in
+    "$REPO_ROOT"/*) ;;
+    *)
+      printf '  %-52s IMPORT-MISMATCH - not measuring this worktree\n' "$LABEL"
+      printf '         expected %s under %s\n' "$PKG" "$REPO_ROOT"
+      printf '         resolved %s\n' "${IMPORTED:-<not importable>}"
+      printf '         a second, divergent copy of %s is installed in this venv, so a run\n' "$PKG"
+      printf '         rooted elsewhere would mutate one repo and report on the other.\n'
+      exit 9
+      ;;
+  esac
+fi
+
 printf '  %-52s %-19s rc=%s collected=%s failed=%s attr=%s  %s\n' \
        "$LABEL" "$VERDICT" "$RC" "$COLLECTED" "$FAILURES" "$ATTRIBUTED" "$SUMMARY"
 printf '%s\n' "$OUT" | grep -E '^FAILED' | head -2 | cut -c1-72 | sed 's/^/         /'
+
+# --- rc must mean the claim is proven -------------------------------------
+# The whole point of this exit code is that a caller which checks it is not told
+# a verdict holds when the harness has just said it does not. A printed word is
+# not an exit status, and this script existed because a green summary was
+# mistaken for a passing run.
 if [ "$ATTRIBUTED" = "no" ]; then
   printf '         every failing test, since none matched --detector %s:\n' "$DETECTOR"
   printf '%s\n' "$FAILING_IDS" | head -8 | sed 's/^/           /'
-  printf '         this mutation is NOT proven caught; treat it as SURVIVED until it is\n'
+  printf '         this mutation is NOT proven caught; treat it as SURVIVED.\n'
+  printf '         rc=7: the verdict is wrong, not merely unverified.\n'
+  exit 7
+fi
+if [ "$ATTRIBUTED" = "unknown" ]; then
+  printf '         rc=8: some test failed, but nothing proves it was THIS mutation.\n'
+  printf '         Pass --detector <test id substring> to make the verdict checkable.\n'
+  exit 8
 fi
 
 # Case-insensitive: the verdict is upper-case for the table, and an expectation
