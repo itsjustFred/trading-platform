@@ -764,3 +764,129 @@ def test_an_uppercase_monthly_spelling_silently_becomes_one_minute() -> None:
     assert normalized == "1m"
     assert timeframe.amount_value == 1
     assert timeframe.unit_value == "Min"
+
+class TestBulkResponseEntryReading:
+    """How a bulk cancel/flatten response becomes a count. Two survivors, one dangerous.
+
+    `_response_entries` returns `None` -- **never `[]`** -- for a shape it could not read, and
+    that distinction is the whole point of the function. Its docstring says collapsing the two
+    made `cancel_open_orders()` report 0 for an unreadable response, which satisfies the daemon's
+    `cancelled is not None` check and **records a STOPPED deployment as enforced while its orders
+    and positions are still live**.
+
+    So the reader must be *strict about types*, because a loose reader invents a count. The
+    surviving mutation shows exactly what that looks like: relaxing the `isinstance(value, list)`
+    check so that any non-`None` value is accepted turns
+
+        {"orders": "two"}
+
+    into `['t', 'w', 'o']` - **a count of three for one order** - and `{"orders": 5}` into a
+    `TypeError`. Both are worse than refusing: one reports a wrong number of orders cancelled,
+    the other crashes mid-flatten.
+
+    **A tuple under a model attribute is read, and that is deliberate tolerance.** The
+    dict branch accepts only `list` while the model-attribute branch accepts `(list, tuple)`. The
+    asymmetry is a bit odd, but dropping the tuple would not produce a wrong count - it would
+    report the response as *unreadable*, which is the safe direction. So the tolerance is pinned
+    as behaviour, with the note that removing it costs a refusal rather than correctness.
+
+    Both directions of the `None` distinction are asserted, because "refuses" and "reports zero"
+    are the failure and the non-failure respectively, and only asserting one of them leaves the
+    other untested.
+    """
+
+    @staticmethod
+    def _entries(payload):
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        return AlpacaLiveAdapter._response_entries(payload)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"orders": "two"},
+            {"orders": {"id": 1}},
+            {"cancelled_orders": "abc"},
+            {"symbols": 5},
+        ],
+    )
+    def test_a_non_list_under_a_known_key_is_unreadable_not_a_count(self, payload) -> None:
+        """**A string under `orders` must not become a character list.**
+
+        That is what relaxing the type check produces, and it is the dangerous direction: a
+        count of three for one order, reported to the daemon as the number of orders
+        successfully cancelled. A non-list under a known key is a *malformed response*, not a
+        response listing one item per character.
+        """
+        assert self._entries(payload) is None, (
+            f"{payload!r} produced {self._entries(payload)!r} instead of None; a non-list "
+            "under a known key is a malformed response, not a count"
+        )
+
+    def test_a_list_under_any_known_key_is_read(self) -> None:
+        """The pass cases across all four keys, so the strictness above is not always-refusing."""
+        for key in ("cancelled_orders", "cancelled_order_ids", "orders", "symbols"):
+            payload = {key: [1, 2, 3]}
+            assert self._entries(payload) == [1, 2, 3], (key, self._entries(payload))
+
+    def test_a_present_key_holding_none_is_unreadable(self) -> None:
+        """`None` under a known key is not "the broker had nothing to do".
+
+        A list under the key is the only thing that means zero work; `None` means the broker
+        sent something we do not understand.
+        """
+        assert self._entries({"orders": None}) is None
+        assert self._entries({"orders": []}) == [], (
+            "an empty list is a genuine zero and must not become unreadable"
+        )
+
+    def test_a_tuple_under_a_model_attribute_is_read(self) -> None:
+        """Tolerated on the model branch, and the note says why removing it is survivable.
+
+        The dict branch accepts only `list` while this one accepts `(list, tuple)`. Dropping the
+        tuple would make such a response *unreadable* - a refusal, not a wrong count - so the
+        tolerance is pinned as behaviour rather than defended as necessary.
+        """
+
+        class _Model:
+            cancelled_orders = (1, 2, 3)
+
+        assert self._entries(_Model()) == [1, 2, 3], (
+            "a tuple under a model attribute is no longer read; that is a refusal rather "
+            "than a wrong count, so it is survivable - but update this test if intended"
+        )
+
+    def test_a_model_with_no_recognised_attribute_is_unreadable(self) -> None:
+        """The counterpart, so the tuple test above is not the only shape that works."""
+
+        class _Empty:
+            pass
+
+        assert self._entries(_Empty()) is None
+        assert self._entries(None) is None
+        assert self._entries("not a response") is None
+
+    def test_the_two_none_readings_reach_different_outcomes(self) -> None:
+        """Unreadable raises; an empty list reports zero. Asserted end to end.
+
+        The distinction is only worth maintaining if it changes the result, so this asserts
+        both outcomes through the public path rather than only through the reader.
+        """
+        import asyncio
+
+        from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+        adapter = AlpacaLiveAdapter.__new__(AlpacaLiveAdapter)
+        adapter._connected = True
+        adapter._trading_client = type(
+            "_Client", (), {"cancel_orders": staticmethod(lambda: {"orders": "two"})}
+        )()
+        with pytest.raises(RuntimeError, match="unrecognised response shape"):
+            asyncio.run(adapter.cancel_open_orders())
+
+        adapter._trading_client = type(
+            "_Client", (), {"cancel_orders": staticmethod(lambda: {"orders": []})}
+        )()
+        assert asyncio.run(adapter.cancel_open_orders()) == 0, (
+            "a genuine empty response must report zero, not raise"
+        )
