@@ -330,6 +330,8 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
 
         `M1`/`H1` are accepted via `TIMEFRAME_ALIASES`; the padding and casing cases go through
         `normalize_timeframe`'s own strip-and-lower.
+
+        no-raise: test_an_unrecognised_timeframe_is_refused_with_a_usable_message
         """
         from live_runner.signal_sources.execution_timing import _require_recognised_timeframe
 

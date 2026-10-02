@@ -558,6 +558,8 @@ class TestCtraderRoutingRejectionAndRiskSettingsPrecedence:
 
         A numeric string is the normal form cTrader uses, and the identifier is compared as an
         *int* for the duplicate check - so `"00123"` and `123` are the same routing target.
+
+        no-raise: test_live_config_rejects_non_numeric_ctrader_identifier
         """
         from live_runner.account_routing import validate_live_account_routes
 

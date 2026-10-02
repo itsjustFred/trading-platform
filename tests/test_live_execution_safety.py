@@ -5751,12 +5751,14 @@ def test_discord_deployment_accepts_plausible_snowflake_channel_id():
     from live_runner.stockkit_routing import validate_discord_deployment_signal_config
 
     # The real RocketFuel channel shape must pass.
+    # no-raise: test_discord_deployment_rejects_non_numeric_channel_id
     validate_discord_deployment_signal_config(
         _discord_deployment("1469353015738630206")
     )
 
 
 def test_non_discord_deployment_ignores_channel_config():
+    # no-raise: test_discord_deployment_rejects_non_numeric_channel_id
     from live_runner.stockkit_routing import validate_discord_deployment_signal_config
 
     internal = LiveDeploymentConfig(

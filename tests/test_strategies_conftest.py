@@ -115,6 +115,7 @@ def test_coverage_check_does_not_union_shard_extents(gate, tmp_path):
 
 def test_contiguous_year_shards_cover_the_window(gate, tmp_path):
     """Year-sharded datasets are legitimate: sorted extents must chain."""
+    # no-raise: test_gap_between_shards_is_reported_with_labels
     _write_shard(
         tmp_path / "ohlcv" / "US500" / "2024" / "1h.parquet",
         "2024-01-01",
@@ -180,6 +181,7 @@ def test_corrupt_parquet_fails_with_strict_mode(gate, monkeypatch, tmp_path):
 
 
 def test_fully_covering_single_file_passes(gate, tmp_path):
+    # no-raise: test_gap_between_shards_is_reported_with_labels
     _write_shard(
         tmp_path / "ohlcv" / "US500" / "1h.parquet", "2025-01-01", "2025-04-01"
     )

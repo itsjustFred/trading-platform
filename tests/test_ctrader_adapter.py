@@ -3015,7 +3015,10 @@ class TestSymbolIdResolutionAndPrePersistence:
         assert "int" in str(excinfo.value), str(excinfo.value)
 
     def test_a_lowercase_signal_symbol_is_accepted(self) -> None:
-        """The surviving mutation. Without `.upper()` a valid signal is refused as unknown."""
+        """The surviving mutation. Without `.upper()` a valid signal is refused as unknown.
+
+        no-raise: test_an_unknown_symbol_is_refused_before_persistence
+        """
         adapter = self._adapter()
         adapter._validate_pre_persistence(self._signal(symbol="eurusd"))
         adapter._validate_pre_persistence(self._signal(symbol="EURUSD"))
