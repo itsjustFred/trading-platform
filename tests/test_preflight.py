@@ -414,3 +414,87 @@ class TestCtraderAccountIdentifierAndEnvFile:
 
         assert _load_env_file(self._write_env(tmp_path, "")) == {}
         assert _load_env_file(self._write_env(tmp_path, "# only a comment\n")) == {}
+
+
+class TestPreflightAccountLiveModeWarning:
+    """The one branch that tells a human real money is in play, and both ways it can fail.
+
+    Two mutations survived here, and they are the same statement read in opposite
+    directions, which is what made the branch easy to get wrong:
+
+        if not paper:
+            warnings.append("Alpaca account resolves to live mode, not paper mode.")
+
+    Inverting the condition warns about a **paper** account and stays silent about a
+    **live** one. Escalating the append to `errors` blocks a live account outright.
+    Neither is caught by a test that only covers missing credentials, because that path
+    returns before this line.
+
+    **This branch is a warning, not a gate, and that is the design worth pinning.**
+    `_preflight_account` computes `ok=not errors`, so a live-mode account reports
+    `ok=True` and preflight *passes*. The single thing distinguishing real money from
+    paper is a line in a warning list that no boolean reflects. So the contract pinned
+    here is three-way and all of it matters:
+
+    - `paper=False` warns.
+    - `paper=True` does not, so the warning cannot become noise.
+    - The warning does not flip `ok` -- blocking live accounts is a policy decision, not
+      something to discover through a test.
+
+    Getting the third wrong in the *helpful* direction (blocking) would be safe; getting
+    it wrong in the other direction -- silently approving an unknown-mode account -- is
+    not, and `paper` stays `None` when credentials are missing, which is precisely when
+    the mode is unknown.
+    """
+
+    @staticmethod
+    def _account():
+        return LiveAccountConfig(
+            id="acc-1", name="acc", broker="alpaca", broker_login="PA35HB6T7815"
+        )
+
+    def _run(self, monkeypatch, *, paper, check_connectivity=False):
+        """Drive `_preflight_account` with credentials resolved and connectivity stubbed out."""
+        from live_runner import preflight as preflight_module
+
+        monkeypatch.setattr(
+            preflight_module, "resolve_alpaca_credentials",
+            lambda **_kwargs: ("key", "secret", paper),
+        )
+        monkeypatch.setattr(
+            preflight_module, "_run_broker_connectivity_check",
+            lambda *_a, **_k: (True, 1000.0, 1000.0, 0, {"AAPL"}),
+        )
+        return preflight_module._preflight_account(
+            self._account(),
+            env_values={},
+            check_connectivity=check_connectivity,
+            accounts_env_path=Path("/nonexistent/accounts.env"),
+        )
+
+    def test_a_live_account_warns_about_live_mode(self, monkeypatch) -> None:
+        """The surviving mutation: the warning is on the live account, not the paper one."""
+        result = self._run(monkeypatch, paper=False)
+        assert any("live mode" in w for w in result.warnings), result.warnings
+
+    def test_a_paper_account_does_not_warn_about_live_mode(self, monkeypatch) -> None:
+        """The other surviving mutation. A warning that also fires on paper is noise."""
+        result = self._run(monkeypatch, paper=True)
+        assert not any("live mode" in w for w in result.warnings), result.warnings
+
+    def test_the_live_mode_warning_does_not_block_the_account(self, monkeypatch) -> None:
+        """`ok=not errors`, so a live account still passes. Blocking it is a policy decision.
+
+        Pinned deliberately: escalating this warning to an error would make a live
+        account fail preflight, which is *safer* but is not what the code does, and a test
+        asserting the opposite would be asserting a change nobody asked for.
+        """
+        result = self._run(monkeypatch, paper=False)
+        assert result.errors == [], result.errors
+        assert result.ok is True, "the live-mode warning escalated into a blocking error"
+        assert result.paper is False, result.paper
+
+    def test_a_paper_account_reports_paper_and_a_live_one_does_not(self, monkeypatch) -> None:
+        """The mode is reported on the result, so the warning has a machine-readable twin."""
+        assert self._run(monkeypatch, paper=True).paper is True
+        assert self._run(monkeypatch, paper=False).paper is False
