@@ -2841,3 +2841,185 @@ def test_every_connection_gate_refuses_unless_both_flags_hold() -> None:
         "every re-connecting gate must require both `not self._connected` and "
         f"`not self._authenticated`; these do not: {incomplete}"
     )
+
+
+class TestSymbolIdResolutionAndPrePersistence:
+    """The fail-closed symbol resolver, the pre-persistence gate, and the auth log line.
+
+    Four mutations survived here, and the two that matter are both about a symbol
+    resolving to something it should not.
+
+    **`_symbol_name_for_id` refuses to guess, and the docstring says why in numbers:**
+    a fill for an unmapped id cannot be scaled, and "guessing FX would misstate exposure
+    by 10-1000x on XAU/indices". That is the sharpest statement in the adapter about what
+    a wrong symbol costs, and the `raise` that enforces it had no test - the natural
+    alternative (`return ""`) survived. An empty name is the dangerous version of this
+    bug rather than a loud one: the caller scales by symbol, so an unresolvable id that
+    quietly becomes "" reaches the quantity conversion as a *known* symbol with no
+    conversion factor, instead of stopping the fill.
+
+    **`_validate_pre_persistence` runs before the first write** (B-8) for the same reason
+    inverted: a signal persisted without a broker order wedges every redelivery on the
+    duplicate-persisted recovery path. The `.upper()` is load-bearing for a lowercase
+    symbol, and had no test - without it a perfectly valid signal is rejected as unknown
+    and never persisted at all, which is the safe direction but still a silent miss.
+
+    The `int()` coercion in the resolver is asserted with a *string* id, because that is
+    the only input where the two versions differ. Its rougher edge is also pinned: a
+    non-numeric id raises from `int()` with a bare message, not from the resolver's own
+    "not in the symbols cache" text. That is left as-is - the caller's handling is the
+    right place for that - but it should not be discovered by surprise.
+    """
+
+    @staticmethod
+    def _adapter(symbols=None):
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter._symbol_name_to_id = {"EURUSD": 5111, "XAUUSD": 5222} if symbols is None else symbols
+        return adapter
+
+    @staticmethod
+    def _signal(action="buy", symbol="EURUSD"):
+        from shared.models import LiveSignal
+
+        return LiveSignal(
+            deployment_id="dep-1", symbol=symbol, action=action,
+            theoretical_price=1.1, timestamp=1_700_000_000.0,
+        )
+
+    def test_a_known_symbol_id_resolves_to_its_upper_name(self) -> None:
+        """The happy path, and the direction of the mapping: id in, upper name out."""
+        adapter = self._adapter()
+        assert adapter._symbol_name_for_id(5111) == "EURUSD"
+        assert adapter._symbol_name_for_id(5222) == "XAUUSD"
+
+    def test_an_unmapped_symbol_id_refuses_rather_than_guessing(self) -> None:
+        """**The surviving mutation, and the one the docstring is written about.**
+
+        Resolving to `""` instead of raising reaches the quantity conversion as a known
+        symbol with no conversion factor - a silent exposure misstatement rather than a
+        refused fill. The message is asserted too, because "refusing to scale its volume
+        with a guessed symbol" is the part that tells an operator what happened.
+        """
+        adapter = self._adapter()
+        with pytest.raises(ValueError) as excinfo:
+            adapter._symbol_name_for_id(9999)
+        message = str(excinfo.value)
+        assert "9999" in message, message
+        assert "not in the symbols cache" in message, message
+        assert "guessed symbol" in message, message
+
+    def test_an_empty_cache_refuses_every_id(self) -> None:
+        """Symbols not yet loaded means no id resolves - it never falls back to a default."""
+        adapter = self._adapter(symbols={})
+        for symbol_id in (5111, 5222, 0, -1):
+            with pytest.raises(ValueError):
+                adapter._symbol_name_for_id(symbol_id)
+
+    def test_a_string_symbol_id_still_resolves(self) -> None:
+        """The `int()` coercion, asserted with a string because that is the only input
+        where removing it changes anything - and the only realistic one, since a fill id
+        read off the wire need not arrive as an `int`.
+        """
+        adapter = self._adapter()
+        assert adapter._symbol_name_for_id("5111") == "EURUSD"
+
+    def test_a_non_numeric_symbol_id_raises_from_the_coercion(self) -> None:
+        """Pinned as-is: the error is `int()`'s, not the resolver's explanatory one.
+
+        A caller gets "invalid literal for int() with base 10" instead of the sentence
+        explaining that a guessed symbol would be unscalable. Left unchanged deliberately
+        - the right place to translate this is the caller, which already handles
+        `ValueError` - but it must not be discovered by surprise during an incident.
+        """
+        adapter = self._adapter()
+        with pytest.raises(ValueError) as excinfo:
+            adapter._symbol_name_for_id("not-a-number")
+        assert "int" in str(excinfo.value), str(excinfo.value)
+
+    def test_a_lowercase_signal_symbol_is_accepted(self) -> None:
+        """The surviving mutation. Without `.upper()` a valid signal is refused as unknown."""
+        adapter = self._adapter()
+        adapter._validate_pre_persistence(self._signal(symbol="eurusd"))
+        adapter._validate_pre_persistence(self._signal(symbol="EURUSD"))
+
+    def test_the_pre_persistence_gate_accepts_both_actions_and_refuses_the_rest(self) -> None:
+        """The action allowlist is exactly buy and sell - widened, an order could be sent.
+
+        **The typed model already forbids anything else**, so this guard is
+        defence-in-depth and can only be reached by a caller that bypasses validation.
+        `LiveSignal.action` is a pydantic `Literal["buy", "sell"]`, and the first version
+        of this test learned that the hard way: constructing the signal with
+        `action="hold"` raises a pydantic `literal_error` long before the adapter is
+        reached, and the assertion then failed on the wrong message.
+
+        That is worth recording rather than working around. It means the branch is
+        reachable only via `LiveSignal.model_construct` (which skips validation) or a
+        duck-typed stand-in - both used below deliberately, so the guard is tested at all
+        rather than left as an unreachable line that would still be read as load-bearing.
+        """
+        adapter = self._adapter()
+        for action in ("buy", "sell"):
+            adapter._validate_pre_persistence(self._signal(action=action))
+
+        from types import SimpleNamespace
+
+        for action in ("hold", "close", "BUY", "", "flat", None):
+            stand_in = SimpleNamespace(action=action, symbol="EURUSD")
+            with pytest.raises(ValueError) as excinfo:
+                adapter._validate_pre_persistence(stand_in)
+            assert "Unsupported action" in str(excinfo.value), (action, str(excinfo.value))
+
+        # And through the model's own escape hatch, so the guard is proven to hold for a
+        # signal that really did skip validation rather than only for a stand-in.
+        bypassed = self._signal().model_copy(update={"action": "hold"})
+        with pytest.raises(ValueError) as excinfo:
+            adapter._validate_pre_persistence(bypassed)
+        assert "Unsupported action" in str(excinfo.value), str(excinfo.value)
+
+    def test_an_unknown_symbol_is_refused_before_persistence(self) -> None:
+        """B-8: refuse before the write, because a persisted signal with no broker order
+        wedges every redelivery on the duplicate-persisted recovery path."""
+        adapter = self._adapter()
+        with pytest.raises(ValueError) as excinfo:
+            adapter._validate_pre_persistence(self._signal(symbol="NOSUCH"))
+        message = str(excinfo.value)
+        assert "Unknown cTrader symbol" in message, message
+        assert "refusing to persist" in message, message
+
+    def test_the_terminal_auth_failure_is_logged_with_its_account_and_code(self, caplog) -> None:
+        """The surviving mutation: the log line carries what a human needs to act.
+
+        This is the line that explains a listener dying, and it is emitted exactly once on
+        the way out. `error_code` is read with a `getattr` default because a plain
+        `RuntimeError` reaching this path must still produce a usable record.
+        """
+        import logging
+
+        from live_runner.ctrader_adapter import CTraderAuthTerminalError
+
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "ctid-1"
+        adapter.account_config_id = "acc-1"
+
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            adapter._log_listener_terminal_auth_failure(
+                CTraderAuthTerminalError("token rejected", error_code="401")
+            )
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("terminal auth failure" in m for m in messages), messages
+        record = next(r for r in caplog.records if "terminal auth failure" in r.getMessage())
+        data = record.__dict__.get("data") or getattr(record, "data", {})
+        assert data["account_id"] == "ctid-1", data
+        assert data["account_config_id"] == "acc-1", data
+        assert data["error_code"] == "401", data
+        assert "token rejected" in data["error"], data
+
+        # A bare RuntimeError still logs, with an empty code rather than crashing.
+        with caplog.at_level(logging.WARNING):
+            caplog.clear()
+            adapter._log_listener_terminal_auth_failure(RuntimeError("plain failure"))
+        record = next(r for r in caplog.records if "terminal auth failure" in r.getMessage())
+        data = record.__dict__.get("data") or getattr(record, "data", {})
+        assert data["error_code"] == "", data
+        assert "plain failure" in data["error"], data
