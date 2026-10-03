@@ -371,6 +371,17 @@ class TestCancelEligibilityAndIdCoercion:
         cancel the unsafe direction is leaving it resting, so the caller cancels on type
         alone."* By that rule an unparseable status should cancel. It does not.
 
+        > **Corrected 2026-10-02 by measurement against the installed client** - see
+        > `TestWorkingOrderStatusOnRealProtoMessages`. The three rows above were measured
+        > with `SimpleNamespace` doubles, and a real `ProtoOAOrder` cannot take two of
+        > them: `orderStatus` has presence, so reading it always yields an `int`. So
+        > `return False` is unreachable for broker data, and the option below described as
+        > "a genuinely working order whose status arrived as a proto enum object rather
+        > than an int stays resting" **cannot happen**. What the reachable case actually
+        > is makes the hazard worse, not better: an absent or unrecognised status is read
+        > as `ACCEPTED` and therefore cancelled. The test stands; the reasoning around it
+        > did not survive measurement.
+
         So this is a **known inconsistency, not a verified policy**, and it is left
         unmodified because either resolution changes live cancel behaviour:
 
@@ -571,6 +582,215 @@ class TestCancelEligibilityAndIdCoercion:
         assert blank_messages != malformed_messages, (
             "the two cases now log the same thing, so an operator can no longer tell a "
             "broker behaviour change from a malformed payload"
+        )
+
+
+class TestWorkingOrderStatusOnRealProtoMessages:
+    """What `_is_working_order` does on the messages cTrader actually delivers.
+
+    The "cannot tell" rows pinned in `TestCancelEligibilityAndIdCoercion` were all
+    measured with `SimpleNamespace` doubles, which can hold any object at all. A real
+    `ProtoOAOrder` cannot: `orderStatus` has presence, so reading it always yields an
+    `int` - never `None`, never an enum wrapper. Measured against the installed
+    `ctrader_open_api`:
+
+    | what the broker sent | the adapter reads | cancels? |
+    |---|---|---|
+    | ACCEPTED (1) | 1 | yes |
+    | FILLED (2) | 2 | no |
+    | REJECTED / EXPIRED / CANCELLED (3/4/5) | 3/4/5 | no |
+    | **nothing at all** | **1** | **yes** |
+    | **a number this client has no name for** | **1** | **yes** |
+
+    So the `return False` branch is dead code for broker data, and the docstring's
+    "cannot tell -> cancel" policy *is* what every reachable path does. That is not the
+    reassuring half. The last two rows are the hazard, and the trigger is **silent**: the
+    field's declared default is the first enum value, `ORDER_STATUS_ACCEPTED` = 1, and
+    protobuf drops an unrecognised enum number on parse without raising or logging. A
+    future *terminal* status would therefore be read as working, sent for cancellation,
+    rejected by cTrader - and `cancel_open_orders` does not catch that rejection, so the
+    sweep aborts and every other resting order is left behind. That is the incident the
+    docstring warns about, reachable by a client upgrade rather than by bad data.
+
+    All of it is pinned rather than changed. Which way an unreadable status *should*
+    resolve is a trading decision about which failure is cheaper, it is backlog item 2,
+    and it is not this class's to make.
+    """
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        adapter.ctid_trader_account_id = "acc-1"
+        adapter.account_config_id = "cfg-1"
+        return adapter
+
+    @staticmethod
+    def _real():
+        """The installed message module, or skip this test alone.
+
+        Scoped to a helper rather than a module-level `importorskip` so that a missing
+        protobuf package cannot skip the whole file.
+        """
+        mod = pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+        return mod
+
+    @staticmethod
+    def _varint(value: int) -> bytes:
+        out = bytearray()
+        while True:
+            chunk = value & 0x7F
+            value >>= 7
+            out.append(chunk | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    def _order_with_wire_status(self, mod, wire_value: int):
+        """A real order as the broker's bytes would produce it.
+
+        Hand-rolled varint rather than protobuf's private encoder, so this does not
+        break when an internal helper is renamed - the point is the wire, not the API.
+        """
+        number = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"].number
+        order = mod.ProtoOAOrder()
+        order.ParseFromString(
+            self._varint((number << 3) | 0) + self._varint(wire_value)
+        )
+        return order
+
+    def test_the_declared_default_is_ACCEPTED_which_is_why_absence_cancels(self) -> None:
+        """Pin the coincidence the whole reachable behaviour rests on.
+
+        proto3 reads an unset field as its declared default. If the first enum value
+        were `UNKNOWN`, absence would be visible as unknown and this would be a smaller
+        problem. It happens to be `ACCEPTED`, so absence is indistinguishable from a
+        working order.
+        """
+        mod = self._real()
+        accepted = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+        field = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"]
+        by_number = {v.number: v.name for v in field.enum_type.values}
+
+        assert by_number.get(accepted) == "ORDER_STATUS_ACCEPTED"
+        assert 0 not in by_number, (
+            "an explicit zero/UNKNOWN enum value now exists; if the adapter reads an "
+            "absent status as that instead of ACCEPTED, this pin is stale"
+        )
+        order = mod.ProtoOAOrder()
+        assert order.HasField("orderStatus") is False
+        assert order.orderStatus == accepted, (
+            "an unset orderStatus no longer reads as ACCEPTED, so this class's "
+            "conclusions about absence no longer hold"
+        )
+
+    @pytest.mark.parametrize("wire_value", [1, 2, 3, 4, 5])
+    def test_a_named_status_is_read_as_itself(self, wire_value: int) -> None:
+        """The ordinary path, pinned on real messages rather than doubles."""
+        mod = self._real()
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+        accepted = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+
+        order = self._order_with_wire_status(mod, wire_value)
+        assert adapter._is_working_order(order) is (wire_value == accepted)
+
+    def test_no_real_status_value_is_ever_none_or_unconvertible(self) -> None:
+        """The `except (TypeError, ValueError): return False` branch is dead code.
+
+        Sweeping every value a one-byte varint can carry, because the branch is only
+        justified by a path real messages cannot take, and that is worth proving rather
+        than asserting once.
+        """
+        mod = self._real()
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+
+        for wire_value in range(0, 256):
+            order = self._order_with_wire_status(mod, wire_value)
+            raw = getattr(order, "orderStatus", None)
+            assert raw is not None, f"status {wire_value} read back as None"
+            assert isinstance(raw, int), f"status {wire_value} read back as {type(raw)}"
+            int(raw)  # must not raise: this is the branch the doubles exercised
+
+    @pytest.mark.parametrize("wire_value", [6, 9, 255])
+    def test_a_status_this_client_cannot_name_silently_becomes_ACCEPTED(
+        self, wire_value: int
+    ) -> None:
+        """The forward-compatibility hazard, and it raises nothing.
+
+        Protobuf drops an enum number it has no name for, so the value never becomes an
+        object and never fails to convert - it is simply replaced by the field default,
+        which is ACCEPTED. A future terminal status is therefore indistinguishable from a
+        working one, and the order gets cancelled.
+        """
+        mod = self._real()
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+        accepted = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+
+        order = self._order_with_wire_status(mod, wire_value)
+        assert order.orderStatus == accepted, (
+            f"an unrecognised status {wire_value} is no longer read as ACCEPTED, so the "
+            "silent-cancel hazard has changed shape - re-measure it"
+        )
+        assert adapter._is_working_order(order) is True
+
+    def test_an_absent_status_is_treated_as_working_and_would_be_cancelled(self) -> None:
+        """Absence is the same hazard by a different route: nothing arrived at all."""
+        mod = self._real()
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+
+        order = mod.ProtoOAOrder()
+        order.orderId = 4242
+        assert order.HasField("orderStatus") is False
+        assert adapter._is_working_order(order) is True
+
+    def test_a_rejected_cancel_aborts_the_sweep_and_leaves_other_orders_resting(
+        self,
+    ) -> None:
+        """Pin the cost side of the decision, which no test covered.
+
+        `cancel_open_orders` awaits `_cancel_order_id` unguarded, so the first rejected
+        cancel propagates and ends the loop - the remaining orders are never attempted.
+        This is the damage that makes the `return True` policy expensive, and it is the
+        reason the backlog calls the choice a trading decision rather than a style one.
+
+        Pinned as current behaviour. Whether one order's rejection should end the sweep
+        is part of backlog item 2, and changing it here would decide that question by
+        accident.
+        """
+        mod = self._real()
+        adapter = self._adapter()
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+        adapter._ProtoOAOrderType = mod.ProtoOAOrderType
+
+        orders = []
+        for order_id in (11, 22, 33):
+            order = mod.ProtoOAOrder()
+            order.orderId = order_id
+            order.orderType = int(mod.ProtoOAOrderType.LIMIT)
+            order.orderStatus = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+            orders.append(order)
+
+        async def _reconcile():
+            return SimpleNamespace(order=orders)
+
+        attempted = []
+
+        async def _cancel(order_id: int) -> None:
+            attempted.append(order_id)
+            raise CTraderApiError("CH_ORDER_NOT_FOUND", "already filled")
+
+        adapter._reconcile_state = _reconcile
+        adapter._cancel_order_id = _cancel
+
+        with pytest.raises(CTraderApiError):
+            asyncio.run(adapter.cancel_open_orders())
+
+        assert attempted == [11], (
+            f"the sweep attempted {attempted}, so a rejected cancel no longer aborts the "
+            "remaining orders - the cost that made this a decision has been removed, and "
+            "backlog item 2 should be revisited"
         )
 
 
