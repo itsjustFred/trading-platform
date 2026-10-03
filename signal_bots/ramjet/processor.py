@@ -90,7 +90,26 @@ class RamJetSignalProcessor:
         frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
         frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
         frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
-        frame["atr"] = frame["tr"].ewm(span=period, adjust=False).mean()
+        # `min_periods` is the strategies' own contract, not a new one: every ATR in
+        # `strategies/` is `tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False)`,
+        # which is NaN until `period` bars exist, so a signal built on it is impossible
+        # rather than merely unreliable. Omitting it here produced a finite positive ATR
+        # from the *first* bar, which the guard below cannot see - it only rejects a
+        # non-finite or non-positive value, and an under-warmed one is neither. Measured on
+        # a growing-range series at period 14: the 3-bar ATR is 89.6% of the warmed 14-bar
+        # ATR, so the stop was materially tighter, from the same signal, in exactly the
+        # regime where the backtest declines to produce a number at all.
+        #
+        # The alpha is deliberately left alone. Span-based smoothing and Wilder's differ by
+        # a few percent with an unstable sign, and no backtest characterised it - adopting
+        # Wilder's would change sizing on the strength of a ratio measurement has already
+        # shown is noise. Backlog item 5, option 1 only.
+        #
+        # Confined by construction: `min_periods` only gates *whether* a value is produced,
+        # not which observations feed the recursion, so every bar from `period - 1` onward
+        # is bit-identical to before. Only the warm-up window changes, and it now lands in
+        # the guard's existing fail-closed path rather than inventing a new one.
+        frame["atr"] = frame["tr"].ewm(span=period, min_periods=period, adjust=False).mean()
         frame = frame.drop(columns=["h_l", "h_pc", "l_pc", "tr"])
         return frame
 

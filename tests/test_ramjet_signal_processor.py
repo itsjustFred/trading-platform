@@ -193,56 +193,125 @@ def _signal() -> dict:
     }
 
 
-def test_a_frame_shorter_than_atr_period_still_places_a_stop_KNOWN_GAP():
-    """**Pinned as-is: the live ATR is defined on bars the backtest never had.**
+def test_a_frame_shorter_than_atr_period_is_refused_instead_of_stopping_on_it():
+    """**The warm-up gap is closed: a short frame is now refused, fail-closed.**
 
-    The strategies compute `tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False)`, so
-    their ATR is `NaN` until `period` bars exist and a signal built on it is impossible. The
-    live `_calculate_atr` omits `min_periods`, so an EWM yields a finite, positive number from
-    the very first bar - and the guard at `processor.py:224` only rejects a non-finite or
-    non-positive ATR, which this is not.
+    This used to be pinned as-is, asserting the opposite. The strategies compute
+    `tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False)`, so their ATR is `NaN` until
+    `period` bars exist and a signal built on it is *impossible*. The live `_calculate_atr`
+    omitted `min_periods`, so an EWM yielded a finite, positive number from the very first bar -
+    and the guard only rejects a non-finite or non-positive ATR, which an under-warmed one is
+    not. Measured on a growing-range series at `atr_period=14`, a 3-bar frame yielded an ATR of
+    89.6% of the warmed value, so a materially tighter stop was placed from the same signal, in
+    exactly the regime where the backtest declines to produce a number at all.
 
-    Measured on a series whose bar range grows (so an early ATR is genuinely too small), with
-    `atr_period=14`: a 3-bar frame yields an ATR of 89.6% of the fully warmed value, and a
-    1-bar frame yields the first bar's true range outright. So a stop and a target get placed
-    from an ATR the corresponding backtest would have refused to produce.
-
-    That is the larger half of this inconsistency - the `alpha` difference is a few percent,
-    this is a different quantity entirely - and it is latent rather than live only because
-    RAMJET and ROCKETFUEL are the two services that are `failed`. Nothing here was changed:
-    whether the live path should refuse a short frame, and how, is backlog item 5.
+    `min_periods` is the strategies' own contract rather than a new rule, and the refusal lands
+    in the guard that was already there - no new failure mode was invented. The `alpha`
+    difference is untouched and remains the open half of item 5.
     """
     processor = RamJetSignalProcessor(_config(period=14))
 
     for rows in (1, 3, 13):
         short = _sample_market_data(rows=rows)
-        signal = processor.process_signal(_signal(), short)
-        atr = float(signal.metadata["atr"])
-        assert np.isfinite(atr) and atr > 0, (
-            f"a {rows}-bar frame no longer yields a usable ATR, so the warm-up gap this test "
-            "pins has been closed - update it and backlog item 5 together"
-        )
-        entry = float(short["Close"].iloc[-1])
-        assert signal.stop_loss == pytest.approx(entry - (atr * 2.0)), (
-            "the stop is no longer sized off the short frame's ATR"
-        )
-        assert signal.stop_loss < entry < signal.take_profit, "the bracket must still straddle entry"
+        with pytest.raises(ValueError, match="Latest ATR value is invalid"):
+            processor.process_signal(_signal(), short)
 
-    # And the strategies' own form really does refuse those frames, which is the asymmetry.
-    tr = pd.concat(
-        [
-            _sample_market_data(rows=13)["High"] - _sample_market_data(rows=13)["Low"],
-            (_sample_market_data(rows=13)["High"]
-             - _sample_market_data(rows=13)["Close"].shift()).abs(),
-            (_sample_market_data(rows=13)["Low"]
-             - _sample_market_data(rows=13)["Close"].shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    wilder = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    assert not np.isfinite(float(wilder.iloc[-1])), (
-        "Wilder's ATR is now defined on a 13-bar frame, so the two paths no longer disagree "
-        "about warm-up and item 5's larger half is gone"
+    # Exactly `period` bars is the first frame that can produce an ATR, and it must.
+    exact = _sample_market_data(rows=14)
+    signal = processor.process_signal(_signal(), exact)
+    atr = float(signal.metadata["atr"])
+    assert np.isfinite(atr) and atr > 0, (
+        "a frame of exactly atr_period bars no longer yields an ATR; `min_periods=period` "
+        "should gate the first `period - 1` bars and no more, so this pin is now wrong"
+    )
+    entry = float(exact["Close"].iloc[-1])
+    assert signal.stop_loss == pytest.approx(entry - (atr * 2.0))
+    assert signal.stop_loss < entry < signal.take_profit, "the bracket must still straddle entry"
+
+
+def test_the_refusal_is_the_pre_existing_guard_not_a_new_one():
+    """A short frame must reach the guard that already refused an invalid ATR.
+
+    The change is `min_periods`, nothing else. If the refusal arrived by some new route, a caller
+    catching this exception would be relying on machinery that did not exist before, and the
+    message would no longer be the one that documents the failure.
+    """
+    processor = RamJetSignalProcessor(_config(period=14))
+    with pytest.raises(ValueError) as excinfo:
+        processor.process_signal(_signal(), _sample_market_data(rows=3))
+    assert "Latest ATR value is invalid for SL/TP calculation" in str(excinfo.value), (
+        f"the short-frame refusal is no longer the established guard's: {excinfo.value}"
+    )
+
+
+def test_every_warmed_atr_value_is_bit_identical_to_before():
+    """The change must be confined to the warm-up window, and that is checkable.
+
+    `min_periods` gates *whether* a value is produced, not which observations feed the
+    recursion, so from bar `period - 1` onward the recursion is untouched. If this fails, the
+    edit changed sizing on every signal rather than only refusing the unsupported ones - the
+    difference between fixing a warm-up hole and silently re-tuning a strategy.
+    """
+    period = 14
+    frame = _sample_market_data(rows=120).copy()
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
+    frame["h_l"] = frame["high"] - frame["low"]
+    frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
+    frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
+    frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
+
+    as_was = frame["tr"].ewm(span=period, adjust=False).mean()
+    as_now = frame["tr"].ewm(span=period, min_periods=period, adjust=False).mean()
+
+    assert as_now.iloc[: period - 1].isna().all(), (
+        "the warm-up window no longer produces NaN, so short frames are being sized off an "
+        "unwarmed ATR again"
+    )
+    assert np.array_equal(
+        as_was.iloc[period - 1:].to_numpy(), as_now.iloc[period - 1:].to_numpy()
+    ), "a warmed ATR value changed, so this edit altered sizing beyond the warm-up window"
+
+
+def test_both_signal_bots_refuse_a_short_frame_identically():
+    """RAMJET and ROCKETFUEL carry identical copies, and only one of them being fixed is worse
+    than neither.
+
+    A copy that still sizes off an unwarmed ATR would keep placing the too-tight stop while the
+    other refuses, and the divergence would be invisible from the outside.
+
+    This compares the two *behaviours* rather than their source text. An earlier version read
+    `inspect.getsource` and asserted the string `min_periods=period` appeared - and a mutation
+    that removed it from ROCKETFUEL **survived**, because `inspect.getsource` goes through
+    `linecache`, which had already cached the file and kept serving the original text. A test that
+    can be fooled by a cache is not a test, so this one calls both and compares what they return.
+    """
+    from signal_bots.rocketfuel.processor import RocketFuelSignalProcessor
+
+    def frame_with(rows: int):
+        frame = _sample_market_data(rows=rows).copy()
+        frame.columns = [str(c).strip().lower() for c in frame.columns]
+        return frame
+
+    bots = (RamJetSignalProcessor, RocketFuelSignalProcessor)
+
+    for rows in (1, 3, 13):
+        values = [bot._calculate_atr(frame_with(rows), 14)["atr"].iloc[-1] for bot in bots]
+        for value in values:
+            assert pd.isna(value), (
+                f"a {rows}-bar frame still yields a usable ATR ({value!r}) in one of the two "
+                "signal bots, so a short frame is being sized off an unwarmed ATR there"
+            )
+
+    # And on a warm frame they must still agree with each other, exactly. `equal_nan` because
+    # the warm-up prefix is NaN in both, and NaN != NaN would make this fail for the wrong reason
+    # - a comparison that is always false teaches you nothing.
+    warm = [bot._calculate_atr(frame_with(40), 14)["atr"].to_numpy() for bot in bots]
+    assert np.array_equal(warm[0], warm[1], equal_nan=True), (
+        "the two bots disagree on a warm frame, so the copies have drifted beyond this change"
+    )
+    assert np.isfinite(warm[0][13:]).all(), (
+        "no ATR is produced from bar `period - 1` onward, so the warm-up gate is wider than the "
+        "strategies' own contract"
     )
 
 
