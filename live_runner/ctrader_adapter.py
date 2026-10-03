@@ -2435,6 +2435,44 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         return reconcile_res
 
+    @staticmethod
+    def _unrecognised_status_wire_value(order: Any) -> int | None:
+        """The status number the broker sent, when this client has no name for it.
+
+        An enum value this build does not know is *not* lost. Protobuf keeps it in the
+        message's unknown fields, so the information behind `orderStatus` reading back as the
+        first enum value - ACCEPTED - is still recoverable. Measured against the installed
+        protos: a wire value of 6, 9 or 255 parses without error, reads back as 1 with
+        `HasField` false, and leaves exactly one unknown field, this field's own number, with
+        the original value in it. A status the broker genuinely did not send leaves no
+        unknown field at all.
+
+        That is the whole reason this function exists. Without it, "the broker sent nothing"
+        and "the broker sent a status this client cannot name" are the same observation, and a
+        future terminal status is read as ACCEPTED and cancelled. The two are in fact
+        distinguishable, so this asks the question that can be asked and leaves the policy to
+        the human. Backlog item 2.
+
+        Returns None for anything that cannot carry the fingerprint - a test double, or a
+        proto build without explicit presence - so the ordinary path is unaffected.
+        """
+        unknown_fields = getattr(order, "UnknownFields", None)
+        fields_by_name = getattr(getattr(order, "DESCRIPTOR", None), "fields_by_name", None)
+        if unknown_fields is None or fields_by_name is None:
+            return None
+        wanted = {
+            fields_by_name[name].number
+            for name in ("orderStatus", "status")
+            if name in fields_by_name
+        }
+        if not wanted:
+            return None
+        for unknown in unknown_fields():
+            # Wire type 0 is varint, which is how an enum arrives on the wire.
+            if unknown.field_number in wanted and unknown.wire_type == 0:
+                return int(unknown.data)
+        return None
+
     def _is_working_order(self, order: Any) -> bool:
         """Whether an order is still ACCEPTED, i.e. a cancel would be legal.
 
@@ -2446,7 +2484,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         If the status enum is unavailable we cannot tell, and for an order we
         are about to cancel the unsafe direction is leaving it resting, so the
         caller cancels on type alone.
+
+        A status this client has *no name for* is also a "cannot tell", but it arrives
+        looking exactly like ACCEPTED. It is detected and logged - see
+        :meth:`_unrecognised_status_wire_value` - while the decision stays as it was,
+        because which failure is cheaper here is a trading judgement, not a test one.
         """
+        unrecognised = self._unrecognised_status_wire_value(order)
+        if unrecognised is not None:
+            logger.warning(
+                "cTrader sent order status %s, which this client has no name for. It reads as "
+                "ACCEPTED, so this order is being cancelled on a status nobody here could "
+                "interpret; if that status is terminal the broker will reject the cancel and "
+                "abort the rest of the sweep.",
+                unrecognised,
+            )
         status_enum = getattr(self, "_ProtoOAOrderStatus", None)
         if status_enum is None:
             return True

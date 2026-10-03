@@ -912,15 +912,22 @@ class TestWorkingOrderStatusOnRealProtoMessages:
             int(raw)  # must not raise: this is the branch the doubles exercised
 
     @pytest.mark.parametrize("wire_value", [6, 9, 255])
-    def test_a_status_this_client_cannot_name_silently_becomes_ACCEPTED(
+    def test_a_status_this_client_cannot_name_becomes_ACCEPTED_but_leaves_a_fingerprint(
         self, wire_value: int
     ) -> None:
         """The forward-compatibility hazard, and it raises nothing.
 
-        Protobuf drops an enum number it has no name for, so the value never becomes an
-        object and never fails to convert - it is simply replaced by the field default,
-        which is ACCEPTED. A future terminal status is therefore indistinguishable from a
-        working one, and the order gets cancelled.
+        Protobuf replaces an enum number it has no name for with the field default, which is
+        ACCEPTED. A future terminal status is therefore *read* as a working one, and the order
+        gets cancelled.
+
+        The docstring here used to say the value is dropped **silently** and that a future
+        terminal status is therefore **indistinguishable** from a working one. Both claims were
+        wrong, and measurably so. Protobuf parks the unrecognised value in the message's
+        unknown fields, keeping this field's own number and the original value, so the two
+        cases *are* distinguishable - by a fingerprint the adapter did not know to look for.
+        The hazard is real; "undetectable" was not. See
+        `TestAnUnnamedStatusLeavesARecoverableFingerprint`.
         """
         mod = self._real()
         adapter = self._adapter()
@@ -930,9 +937,12 @@ class TestWorkingOrderStatusOnRealProtoMessages:
         order = self._order_with_wire_status(mod, wire_value)
         assert order.orderStatus == accepted, (
             f"an unrecognised status {wire_value} is no longer read as ACCEPTED, so the "
-            "silent-cancel hazard has changed shape - re-measure it"
+            "cancel-on-unknown-status hazard has changed shape - re-measure it"
         )
-        assert adapter._is_working_order(order) is True
+        assert adapter._is_working_order(order) is True, (
+            "an unrecognised status no longer cancels; if that is now deliberate, this pin is "
+            "stale and the policy needs recording rather than a quiet edit"
+        )
 
     def test_an_absent_status_is_treated_as_working_and_would_be_cancelled(self) -> None:
         """Absence is the same hazard by a different route: nothing arrived at all."""
@@ -3851,3 +3861,145 @@ class TestTheDegenerateDedupeKeyIsLoud:
             "warned for a deal-id-less fill that still carries a millisecond timestamp; the "
             "collision needs *both* to be missing"
         )
+
+
+class TestAnUnnamedStatusLeavesARecoverableFingerprint:
+    """Item 2's hazard is real, but it is not the *undetectable* one that was recorded.
+
+    The backlog held that an unrecognised order status is "silently dropped on parse" and that
+    "the broker sent no status" and "the broker sent a status this client has no name for" are
+    the same observation. Measured against the installed protos, that is not what protobuf
+    does. An enum value with no name in this build is retained in the message's **unknown
+    fields**, under this field's own number, with the original value intact. A status that was
+    never sent leaves no unknown field at all.
+
+    So the distinction the adapter needed was available all along and was simply not being
+    asked for. These tests pin the fingerprint - including the protobuf behaviour it depends
+    on, so an upgrade that changes it fails here rather than quietly turning detection back
+    into a no-op - and pin that the cancel decision itself is unchanged.
+    """
+
+    @staticmethod
+    def _real():
+        return pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what make the fingerprint meaningful",
+        )
+
+    @staticmethod
+    def _varint(n: int) -> bytes:
+        out = bytearray()
+        while True:
+            b, n = n & 0x7F, n >> 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    def _order_with_wire_status(self, mod, wire_value: int):
+        number = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"].number
+        order = mod.ProtoOAOrder()
+        order.ParseFromString(self._varint((number << 3) | 0) + self._varint(wire_value))
+        return order
+
+    @staticmethod
+    def _adapter():
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        mod = pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+        return adapter
+
+    @pytest.mark.parametrize("wire_value", [6, 9, 255])
+    def test_the_unnamed_status_is_recovered_from_the_unknown_fields(self, wire_value) -> None:
+        mod = self._real()
+        order = self._order_with_wire_status(mod, wire_value)
+        assert self._adapter()._unrecognised_status_wire_value(order) == wire_value, (
+            f"the broker sent status {wire_value}, which this client cannot name, and it is no "
+            "longer recoverable from the message - so 'did the broker name a status we do not "
+            "know' has become unanswerable again and the detection is dead code"
+        )
+
+    def test_an_absent_status_is_not_mistaken_for_an_unnamed_one(self) -> None:
+        """The distinction only earns its keep if the two cases stay apart.
+
+        Both read as ACCEPTED and both have `HasField` false. If a status that was never sent
+        also produced a fingerprint, the detection would fire on every order whose status
+        simply did not arrive, and the warning would be noise covering the real case.
+        """
+        mod = self._real()
+        assert self._adapter()._unrecognised_status_wire_value(mod.ProtoOAOrder()) is None, (
+            "an order whose status was never sent is being reported as carrying a status this "
+            "client cannot name; the two are different situations and conflating them is the "
+            "error this function exists to avoid"
+        )
+
+    @pytest.mark.parametrize("named", [1, 2, 3, 4, 5])
+    def test_a_status_we_can_name_leaves_no_fingerprint(self, named) -> None:
+        mod = self._real()
+        order = mod.ProtoOAOrder()
+        order.orderStatus = named
+        assert self._adapter()._unrecognised_status_wire_value(order) is None, (
+            f"status {named} is one this client can name, so it must not report a fingerprint; "
+            "otherwise the warning fires on the overwhelmingly common path"
+        )
+
+    def test_an_object_without_the_fingerprint_carries_no_opinion(self) -> None:
+        """Test doubles must not trip it, or the guard would be untestable and noisy.
+
+        The existing characterisation tests build orders out of `SimpleNamespace`, which has
+        neither `UnknownFields` nor `DESCRIPTOR`. Absence of the ability to ask is not evidence
+        of an unnamed status, and must not be reported as one.
+        """
+        assert self._adapter()._unrecognised_status_wire_value(
+            SimpleNamespace(orderStatus=1)
+        ) is None
+        assert self._adapter()._unrecognised_status_wire_value(SimpleNamespace()) is None
+
+    def test_the_warning_names_the_status_nobody_could_interpret(self, caplog) -> None:
+        """The number is the whole point: it is what a human needs to look the value up."""
+        mod = self._real()
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            self._adapter()._is_working_order(self._order_with_wire_status(mod, 6))
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "6" in joined, f"the warning does not name the unrecognised status: {joined!r}"
+        assert "no name for" in joined, (
+            f"the warning does not say the status was unrecognisable: {joined!r}"
+        )
+
+    def test_the_cancel_decision_is_unchanged_by_the_detection(self) -> None:
+        """Instrumentation only. Which way this should resolve stays a human decision.
+
+        The detection exists so that the case is *visible*. It deliberately does not change
+        whether the order is cancelled, because that is the question of which failure is
+        cheaper for live trading, and answering it is not a test's job.
+        """
+        mod = self._real()
+        adapter = self._adapter()
+        assert adapter._is_working_order(self._order_with_wire_status(mod, 6)) is True, (
+            "detecting an unnamed status now changes whether the order is cancelled; that is a "
+            "policy change and needs its own decision, not a side effect of the instrumentation"
+        )
+
+    def test_the_protobuf_behaviour_this_depends_on_is_still_true(self) -> None:
+        """Name the exact protobuf guarantee, so an upgrade that changes it fails here.
+
+        Detection is only as good as this: that an unrecognised enum survives in the unknown
+        fields under its own field number and wire type. If protobuf ever starts discarding it,
+        this helper silently becomes a no-op and the warning stops firing - which is precisely
+        the failure mode this test exists to prevent.
+        """
+        mod = self._real()
+        field = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"]
+        order = self._order_with_wire_status(mod, 6)
+        unknown = list(order.UnknownFields())
+        assert len(unknown) == 1, (
+            f"expected exactly one unknown field, got {unknown!r}; protobuf has changed how it "
+            "retains an unrecognised enum, so re-measure whether detection still works"
+        )
+        assert unknown[0].field_number == field.number, (
+            "the retained unknown field is no longer under orderStatus's own field number"
+        )
+        assert unknown[0].wire_type == 0, (
+            "the retained unknown field is no longer a varint; wire type 0 is what an enum "
+            "arrives as, and the detection keys on it"
+        )
+        assert int(unknown[0].data) == 6
