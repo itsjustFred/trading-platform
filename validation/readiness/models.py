@@ -78,9 +78,25 @@ class ReadinessConfig(BaseModel):
     # (as produced by validation/stats/calculator.py); the gate compares
     # stored fields and cannot re-derive the risk-free rate. Runner-produced
     # stats must be recomputed with risk_free_rate=0.0 before validation.
-    # Pass when the absolute drift fits max(10% relative, 0.1 absolute).
+    # Pass when the absolute drift fits max(10% relative, 0.05 absolute).
+    #
+    # The absolute floor was 0.1, and it is the floor that governs whenever the expectation
+    # is small - which is the common case, not an edge case: 97.9% of the backtest corpus
+    # stores `sharpe_ratio` exactly 0.0. At 0.1 the gate was ~15x looser in relative terms
+    # at zero than at a typical Sharpe of 1.5, so a drift of 0.09 against an expectation of
+    # 0.15 - a 60% proportional regression - passed.
+    #
+    # Halved to 0.05 because it is the cheapest fix with a measured scope: modelling the gate
+    # as reference-vs-platform over the 1,028 corpus pairs that actually differ, 0.05 flips
+    # **7** of 2,655 rows and 0.02 flips 9, so 0.05 captures most of the tightening at the
+    # smallest blast radius. Reversible: this is a config default, not logic.
+    #
+    # Deliberately NOT changed here: the fact that `expected == 0` should arguably be
+    # "not comparable" rather than pass or fail. That is a policy question, it would remove
+    # 1,572 of 2,655 rows (59.2%) from the verdict - all of which pass today - and
+    # `ReadinessCheck` has no state to express it. Tracked in the backlog, not decided here.
     stats_sharpe_tolerance_pct: float = 0.10
-    stats_sharpe_tolerance_abs: float = 0.1
+    stats_sharpe_tolerance_abs: float = 0.05
     # #83: max-drawdown gate — 2pp absolute on max_drawdown_pct.
     stats_max_drawdown_tolerance_pp: float = 0.02
 
