@@ -192,6 +192,75 @@ class TestEnvExpansionAndUnexpandedGate:
         with pytest.raises(ValueError, match="Unexpanded environment reference"):
             assert_no_unexpanded_env({"id": _expand_env_value("${UNSET}", self.ENV)})
 
+    def test_a_bare_reference_that_IS_set_expands_today(self) -> None:
+        """Pins the half of the trade-off that is not free.
+
+        Item 4's remaining decision is whether a bare `$NAME` should keep expanding.
+        Today it does, and that is the only reason narrowing expansion would be a
+        behaviour change at all. Measured blast radius of narrowing is zero: none of the
+        7 live deployments contains a `$` anywhere, all 4 env references in
+        `live_deployments.example.yaml` are braced, and none of the 27 active assignments
+        in the real `.accounts.env` contains a `$` - which matters because the guard runs
+        *after* expansion (`config_parser.py:119` then `120`), so an env value is exactly
+        how a `$` could appear in an already-expanded payload.
+
+        So nothing today depends on this, and a change here would be deliberate rather than
+        a rescue.
+        """
+        from live_runner.config_parser import _expand_env_value
+
+        env = {"SET_VAR": "value"}
+        assert _expand_env_value("$SET_VAR", env) == "value", (
+            "a bare reference that IS set no longer expands, so the cost side of item 4 "
+            "has changed - re-measure which configs use the bare form before narrowing it"
+        )
+
+    def test_requiring_braces_would_reject_a_literal_dollar_amount(self) -> None:
+        """The measured cost of the fix, stated as a fact rather than a worry.
+
+        Both surviving options for closing the bare-`$VAR` gap work by rejecting a bare
+        `$NAME`, and that rejection is indiscriminate: it cannot tell an unresolved
+        reference from a currency amount in free text. So whichever way item 4 goes, this
+        is what an operator hits:
+
+            costs $USD per month   -> rejected
+
+        Pinned with a widened pattern defined *here*, so the cost is re-evaluated if the
+        pattern is ever changed rather than being rediscovered when a config fails to
+        load. This asserts nothing about production code - it documents the trade-off.
+        """
+        import re
+
+        widened = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+        # Caught: a `$` immediately followed by an identifier-shaped name.
+        for literal, why in (
+            ("costs $USD per month", "a currency code"),
+            ("pnl in $GBP", "another currency code"),
+            ("benchmark $SPX", "an index ticker"),
+        ):
+            assert widened.findall(literal), (
+                f"{literal!r} ({why}) would no longer be matched by a widened guard, so the "
+                "measured cost of requiring braces has changed - update item 4"
+            )
+        # NOT caught, which narrows the cost considerably and is worth knowing: the pattern
+        # needs a name after the `$`, so a plain amount is unaffected. Asserted because the
+        # natural assumption is the opposite, and this test was written assuming that.
+        for safe, why in (
+            ("$5 notional", "a numeric amount"),
+            ("target 100$ per trade", "a trailing currency symbol"),
+            ("cost is 5 dollars", "a spelled-out amount"),
+        ):
+            assert not widened.findall(safe), (
+                f"{safe!r} ({why}) would now be rejected by a widened guard, so its cost is "
+                "broader than documented - re-measure before requiring braces"
+            )
+        # And the case the guard exists for is still caught, braced or bare.
+        for reference in ("${DISCORD_BOT_X_CHANNEL_ID}", "$DISCORD_BOT_X_CHANNEL_ID"):
+            assert widened.findall(reference), (
+                f"{reference!r} would not be caught by a widened guard, which would defeat "
+                "the entire point of the change"
+            )
+
     def test_a_bare_unset_reference_passes_the_gate_KNOWN_GAP(self) -> None:
         """**A real gap, pinned as-is.** The bare form escapes the gate entirely.
 
