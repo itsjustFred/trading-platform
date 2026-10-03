@@ -832,6 +832,81 @@ class TestCtraderNameAndBalanceExtraction:
             _ctrader_extract_login(self._msg(traderLogin="0", login="alice")) == "alice"
         )
 
+    def test_a_negative_login_slips_past_the_zero_guard_KNOWN_ASYMMETRY(self) -> None:
+        """**Pinned as-is: the guard refuses `0` but accepts `-1`.**
+
+        The guard is `if candidate.isdigit() and int(candidate) <= 0: continue`, and
+        `isdigit()` is checked *first*. `"-1".isdigit()` is `False`, so the `<= 0` half never
+        runs for a negative value and `"-1"` is returned as the broker login.
+
+        This is the reachable half of the defect the backlog recorded. It needs no exotic
+        input: `traderLogin` is a protobuf **int64** on every message that carries it, so a
+        negative login is an ordinary wire value, and `str(-1)` is exactly what line 371
+        builds. The companion case the backlog found - `"\u00b2"` raising `ValueError` -
+        cannot happen at all, for the same reason int64 rules it out.
+
+        `0` is refused because `"0".isdigit()` is `True`, so the two ends of the same
+        `<= 0` intent behave differently. Left unmodified: tightening it changes which
+        logins are published as `broker_login`, which is a trading decision, and it is
+        backlog item 3.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        for negative in (-1, -99, "-1", "-99"):
+            assert _ctrader_extract_login(self._msg(traderLogin=negative)) == str(negative), (
+                f"a negative login {negative!r} is no longer accepted as {str(negative)!r}; "
+                "the asymmetry documented here has changed - re-measure it and update the "
+                "backlog entry together"
+            )
+
+        # And the zero case the guard was written for still holds.
+        assert _ctrader_extract_login(self._msg(traderLogin="0")) == ""
+
+    def test_the_superscript_that_started_this_cannot_arrive_from_the_broker(self) -> None:
+        """The recorded hazard, and the proto field type that rules it out.
+
+        The backlog's item 3 rests on `"\u00b2".isdigit()` being `True` while
+        `int("\u00b2")` raises. Both halves are true, and the `ValueError` is real - but the
+        value cannot come from cTrader, because `traderLogin` is a protobuf `int64` on every
+        message that declares it. A superscript is not a number the wire can carry in an
+        int64 field; protobuf rejects it at parse time, exactly as it silently drops an
+        unrecognised enum number in item 2.
+
+        So this stays pinned as a characterisation of a branch that broker data cannot reach,
+        with the field types asserted alongside it. If a future proto build turns the field
+        into a string, the assertion below fails and the hazard becomes live.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        with pytest.raises(ValueError):
+            _ctrader_extract_login(self._msg(traderLogin="\u00b2"))
+
+        mod = pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what rule this hazard out",
+        )
+        seen = {}
+        for name in dir(mod):
+            message = getattr(mod, name)
+            descriptor = getattr(message, "DESCRIPTOR", None)
+            if descriptor is None or not hasattr(descriptor, "fields"):
+                continue
+            for field in descriptor.fields:
+                if field.name in ("traderLogin", "login", "traderAccountId"):
+                    seen.setdefault(field.name, set()).add(field.type)
+        assert seen, (
+            "no message declares traderLogin/login/traderAccountId any more, so the "
+            "argument that the superscript cannot arrive no longer holds and this hazard "
+            "needs re-measuring"
+        )
+        string_type = 9  # google.protobuf.descriptor.FieldDescriptor.TYPE_STRING
+        for field_name, types in sorted(seen.items()):
+            assert string_type not in types, (
+                f"{field_name} is now string-typed on at least one message, so arbitrary "
+                "Unicode - including a superscript - can reach _ctrader_extract_login and "
+                "the ValueError becomes reachable from broker data"
+            )
+
     def test_login_fields_are_tried_in_order_and_blank_ones_skipped(self) -> None:
         from live_runner.account_discovery import _ctrader_extract_login
 
@@ -841,6 +916,37 @@ class TestCtraderNameAndBalanceExtraction:
         assert _ctrader_extract_login(self._msg(traderLogin=None, login="carol")) == "carol"
         assert _ctrader_extract_login(None, self._msg(login="dave")) == "dave"
         assert _ctrader_extract_login() == ""
+
+    def test_an_account_context_failure_discards_every_account(self, monkeypatch) -> None:
+        """**Pinned as-is: the per-account loop has no `try` of its own.**
+
+        `_build_ctrader_live_account` calls `_ctrader_account_context` at line 772 and only
+        opens its `try:` on line 773, so anything that call raises escapes the builder
+        entirely. The caller's loop then has no guard either:
+
+            for account_item in account_items:
+                account = _build_ctrader_live_account(...)
+
+        One account failing therefore discards every account found before it, including the
+        ones that were perfectly fine, and the caller gets an error rather than a short list.
+        That blast radius is real and is why the backlog rates this item above the guard gap
+        - it is only the *trigger* that turned out to be unreachable, not the fragility.
+
+        Pinned rather than fixed. Making the loop skip a failing account changes discovery
+        from all-or-nothing to partial, which is a judgement about whether a partial account
+        list is safe to act on, and that is backlog item 3.
+        """
+        monkeypatch.setattr(account_discovery, "_ctrader_resolved_account_id", lambda _i: 4242)
+
+        def _boom(*_args, **_kwargs):
+            raise ValueError("int() argument must be a string, not 'NoneType'")
+
+        monkeypatch.setattr(account_discovery, "_ctrader_account_context", _boom)
+
+        with pytest.raises(ValueError):
+            account_discovery._build_ctrader_live_account(
+                "demo.ctraderapi.com", None, "tok", SimpleNamespace()
+            )
 
     # ---------------------------------------------------------- ignored labels
 
