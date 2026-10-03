@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import socket
 import ssl
@@ -292,6 +293,25 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
     ]
 
 
+def _honour_zero_money_digits() -> bool:
+    """Whether a broker-sent `moneyDigits` of 0 is honoured. Default: no.
+
+    Read from the environment on every call rather than cached at import, so a test can exercise
+    both settings and an operator can change it without a code change.
+
+    Why a flag and not simply the fix: `HasField` separates "the broker sent nothing" from "the
+    broker means zero decimals", and honouring the second is what the range guard below already
+    implies. But if some cTrader build *always sets* the field to 0 rather than omitting it, every
+    account would read as 0-decimal and every balance would be 100x too *large* instead of too
+    small - the mirror of today's bug, and worse, because it would hit every account rather than
+    none. The log distinguishes the two cases at runtime; this flag turns on the behaviour once
+    that evidence exists. Backlog item 6.
+    """
+    return os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _resolve_money_digits(trader: Any, *, context: str) -> int:
     """The broker's decimal-place count, defaulting to 2, and saying so when it guesses.
 
@@ -326,6 +346,13 @@ def _resolve_money_digits(trader: Any, *, context: str) -> int:
         except (TypeError, ValueError):
             present = None
     if not raw:  # the `or 2` collapse is about to happen
+        if present and _honour_zero_money_digits():
+            logger.info(
+                "moneyDigits explicitly 0 (field present); honouring it, so no scaling is "
+                "applied - %s",
+                context,
+            )
+            return 0
         logger.warning(
             "moneyDigits is %r (field present: %s); falling back to 2 decimal places. If the "
             "broker sent a genuine 0 this balance is 100x too small - %s",

@@ -2366,7 +2366,12 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
             for line in text[start:end].splitlines()
             if line.strip()
         ]
-        return "\n".join(lines)
+        # One legitimate difference: the adapter's copy is a static method, so it is called
+        # through the class. Normalising it keeps the comparison about behaviour rather than
+        # about where the function happens to live.
+        joined = "\n".join(lines)
+        return joined.replace("CTraderLiveAdapter._honour_zero_money_digits",
+                              "_honour_zero_money_digits")
 
     assert body(discovery) == body(adapter), (
         "the two _resolve_money_digits copies have drifted. Both must apply the same fix, and "
@@ -2380,4 +2385,83 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
         )
         assert "logger.warning(" in body(text) or "logger.warning(" in text, (
             f"{name} no longer logs the ambiguous moneyDigits case"
+        )
+
+
+class TestTheZeroDecimalPlacesFlag:
+    """The honouring behaviour is a flag, because turning it on unobserved is not safe.
+
+    `HasField` can tell "the broker sent nothing" from "the broker means zero decimals", and
+    honouring the second is what the range guard below the collapse already implies. But if some
+    cTrader build *always sets* the field to 0 rather than omitting it, then with the flag on
+    every account reads as 0-decimal and every balance becomes 100x too **large** instead of too
+    small - the mirror of today's bug, and worse, because it would hit every account rather than
+    none.
+
+    So the flag is off by default and the log distinguishes the cases at runtime. Turning it on
+    becomes a decision made with evidence rather than a code change made on a guess.
+    """
+
+    @staticmethod
+    def _trader(explicit_zero: bool):
+        mod = pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what make presence meaningful",
+        )
+        trader = mod.ProtoOATrader()
+        trader.balance = 123456
+        if explicit_zero:
+            trader.moneyDigits = 0
+        return trader
+
+    @pytest.fixture(autouse=True)
+    def _flag_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", raising=False)
+
+    def test_with_the_flag_off_a_broker_sent_zero_is_still_scaled_by_100(self) -> None:
+        """Today's behaviour, pinned: the flag must be inert until it is turned on."""
+        from live_runner.account_discovery import _trader_balance
+
+        omitted = self._trader(explicit_zero=False)
+        explicit = self._trader(explicit_zero=True)
+        assert omitted.HasField("moneyDigits") is False
+        assert explicit.HasField("moneyDigits") is True
+        assert _trader_balance(omitted) == pytest.approx(1234.56)
+        assert _trader_balance(explicit) == pytest.approx(1234.56), (
+            "a broker-sent zero is being honoured with the flag off; the default must be inert"
+        )
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_with_the_flag_on_only_a_broker_sent_zero_changes(self, value, monkeypatch) -> None:
+        """The asymmetry is the whole point: omitted stays at the default either way."""
+        from live_runner.account_discovery import _trader_balance
+
+        monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", value)
+        assert _trader_balance(self._trader(explicit_zero=False)) == pytest.approx(1234.56), (
+            "honouring a broker-sent zero must not change the omitted case; the two are "
+            "different situations and the flag exists to tell them apart"
+        )
+        assert _trader_balance(self._trader(explicit_zero=True)) == pytest.approx(123456.0), (
+            "with the flag on, a broker-sent zero should mean no scaling at all - 10**0 == 1, "
+            "which is what the range guard below the collapse has always implied"
+        )
+
+    def test_an_unrelated_value_leaves_the_flag_off(self, monkeypatch) -> None:
+        """Only the documented truthy spellings count. A typo must not enable a money path."""
+        from live_runner.account_discovery import _trader_balance
+
+        for value in ("", "0", "false", "no", "off", "maybe", "2"):
+            monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", value)
+            assert _trader_balance(self._trader(explicit_zero=True)) == pytest.approx(1234.56), (
+                f"CTRADER_HONOUR_ZERO_MONEY_DIGITS={value!r} was treated as enabled; a typo in "
+                "this variable would silently rescale every balance"
+            )
+
+    def test_the_flag_defaults_to_off_without_the_variable(self, monkeypatch) -> None:
+        from live_runner.account_discovery import _honour_zero_money_digits
+
+        monkeypatch.delenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", raising=False)
+        assert _honour_zero_money_digits() is False, (
+            "the flag reads as enabled with no environment variable set, which would make the "
+            "safe behaviour the accidental one"
         )

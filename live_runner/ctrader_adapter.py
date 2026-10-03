@@ -2863,6 +2863,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return 0.0
 
     @staticmethod
+    @staticmethod
+    def _honour_zero_money_digits() -> bool:
+        """Whether a broker-sent `moneyDigits` of 0 is honoured. Default: no.
+
+        A copy of `account_discovery._honour_zero_money_digits`; see that one for why this is a
+        flag rather than the fix. Held identical by
+        `test_both_copies_of_the_money_digits_resolution_are_identical`.
+        """
+        return os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
     def _resolve_money_digits(trader: Any, *, context: str) -> int:
         """The broker's decimal-place count, defaulting to 2, and saying so when it guesses.
 
@@ -2889,6 +2901,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             except (TypeError, ValueError):
                 present = None
         if not raw:  # the `or 2` collapse is about to happen
+            if present and CTraderLiveAdapter._honour_zero_money_digits():
+                logger.info(
+                    "moneyDigits explicitly 0 (field present); honouring it, so no scaling is "
+                    "applied - %s",
+                    context,
+                )
+                return 0
             logger.warning(
                 "moneyDigits is %r (field present: %s); falling back to 2 decimal places. If the "
                 "broker sent a genuine 0 this balance is 100x too small - %s",
