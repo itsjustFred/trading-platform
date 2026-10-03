@@ -443,7 +443,16 @@ def _ctrader_extract_login(*sources: Any) -> str:
             candidate = str(raw_value).strip()
             if not candidate:
                 continue
-            if candidate.isdigit() and int(candidate) <= 0:
+            # `int(candidate) <= 0` cannot be tested as written, because a negative login
+            # carries a sign and `"-1".isdigit()` is False - so the `<= 0` half never ran for
+            # the values it was written for, and the guard refused `0` while passing `-1`.
+            # That is not a judgement call: `traderLogin` is an int64, so a negative is an
+            # ordinary wire value, and every validator downstream of here (`preflight`,
+            # `account_routing`) already rejects a non-positive identifier with a bare
+            # `int(...) <= 0` and no `isdigit()` conjunct. Test the magnitude and keep the
+            # sign out of it. Backlog item 3.
+            magnitude = candidate.lstrip("+-")
+            if magnitude.isdigit() and (int(magnitude) == 0 or candidate.startswith("-")):
                 continue
             return candidate
     return ""

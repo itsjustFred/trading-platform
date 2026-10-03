@@ -832,35 +832,70 @@ class TestCtraderNameAndBalanceExtraction:
             _ctrader_extract_login(self._msg(traderLogin="0", login="alice")) == "alice"
         )
 
-    def test_a_negative_login_slips_past_the_zero_guard_KNOWN_ASYMMETRY(self) -> None:
-        """**Pinned as-is: the guard refuses `0` but accepts `-1`.**
+    def test_a_negative_login_is_refused_by_the_non_positive_guard(self) -> None:
+        """**The guard refuses `0` *and* `-1`.** Fixed; the asymmetry it documented is gone.
 
-        The guard is `if candidate.isdigit() and int(candidate) <= 0: continue`, and
-        `isdigit()` is checked *first*. `"-1".isdigit()` is `False`, so the `<= 0` half never
-        runs for a negative value and `"-1"` is returned as the broker login.
+        It used to read `if candidate.isdigit() and int(candidate) <= 0: continue`, with
+        `isdigit()` checked *first*. `"-1".isdigit()` is `False`, so the `<= 0` half never ran
+        for a negative value and `"-1"` was returned as the broker login - the two ends of the
+        same intent behaving differently.
 
-        This is the reachable half of the defect the backlog recorded. It needs no exotic
-        input: `traderLogin` is a protobuf **int64** on every message that carries it, so a
-        negative login is an ordinary wire value, and `str(-1)` is exactly what line 371
-        builds. The companion case the backlog found - `"\u00b2"` raising `ValueError` -
-        cannot happen at all, for the same reason int64 rules it out.
+        This was the reachable half of backlog item 3, and it needed no exotic input:
+        `traderLogin` is a protobuf **int64** on every message that carries it, so a negative
+        login is an ordinary wire value and `str(-1)` is exactly what this function builds.
+        It was previously left alone on the grounds that tightening it changes which logins
+        are published as `broker_login`, and that is a trading decision. That decision has
+        now been taken, and it went the way the guard's own condition already said.
 
-        `0` is refused because `"0".isdigit()` is `True`, so the two ends of the same
-        `<= 0` intent behave differently. Left unmodified: tightening it changes which
-        logins are published as `broker_login`, which is a trading decision, and it is
-        backlog item 3.
+        The companion case the backlog found - `"\u00b2"` raising `ValueError` - still cannot
+        happen, for the same reason int64 rules it out, and is still left raising on purpose.
         """
         from live_runner.account_discovery import _ctrader_extract_login
 
-        for negative in (-1, -99, "-1", "-99"):
-            assert _ctrader_extract_login(self._msg(traderLogin=negative)) == str(negative), (
-                f"a negative login {negative!r} is no longer accepted as {str(negative)!r}; "
-                "the asymmetry documented here has changed - re-measure it and update the "
-                "backlog entry together"
+        for negative in (-1, -99, "-1", "-99", -0, "-0"):
+            assert _ctrader_extract_login(self._msg(traderLogin=negative)) == "", (
+                f"a negative login {negative!r} is being accepted as a broker login again; "
+                "`traderLogin` is an int64, so a negative is an ordinary wire value and every "
+                "downstream validator already rejects a non-positive identifier"
             )
 
         # And the zero case the guard was written for still holds.
         assert _ctrader_extract_login(self._msg(traderLogin="0")) == ""
+
+    @pytest.mark.parametrize("positive", [1, 5, 99, "1", "12345", "007", "+5"])
+    def test_a_positive_login_is_still_accepted(self, positive) -> None:
+        """The other half of the guard's intent, which must not have been caught by the fix."""
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(self._msg(traderLogin=positive)) == str(positive), (
+            f"a positive login {positive!r} is being refused; the guard rejects non-positive "
+            "identifiers, not all of them"
+        )
+
+    @pytest.mark.parametrize("non_numeric", ["alice", "L-99", "\u0663", "\u00bd"])
+    def test_a_non_numeric_login_is_still_accepted(self, non_numeric) -> None:
+        """A login this guard cannot judge is none of its business.
+
+        The guard exists to refuse a *non-positive number*. Refusing everything non-numeric
+        would reject broker logins that are not account ids at all, which the surrounding code
+        deliberately passes through.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(self._msg(traderLogin=non_numeric)) == non_numeric
+
+    def test_a_refused_negative_falls_through_to_the_next_source(self) -> None:
+        """Refusing a value must mean *try the next field*, not *lose the account*.
+
+        The three field names are a fallback chain, so a refused negative has to fall through
+        to the next one rather than ending discovery - otherwise the fix would trade a bad
+        login for a missing account.
+        """
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        assert _ctrader_extract_login(
+            self._msg(traderLogin=-5, login="alice")
+        ) == "alice", "a refused negative login ended the chain instead of falling through"
 
     def test_the_superscript_that_started_this_cannot_arrive_from_the_broker(self) -> None:
         """The recorded hazard, and the proto field type that rules it out.
