@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from shared.atomic_io import write_text_atomically
 
@@ -171,6 +172,53 @@ class VerificationEvidenceSummary(BaseModel):
     manual_validation_required: bool = False
 
 
+# `<n>M` - digits followed by an uppercase M. On TradingView, MT5 and most other
+# platforms that is the *monthly* candle; here it would be read as minutes.
+#
+# The collision is a casing one, so it has to be caught before anything lowercases.
+# `normalize_timeframe` lowercases at `shared/constants.py:76`, which turns `1M` into
+# `1m` and makes the two indistinguishable - and then `_timeframe_seconds` returns 60
+# for both, so `_require_recognised_timeframe` is never reached and has nothing to catch.
+# The measured consequences were not in the safe direction: `_next_candle_close("1M", 60)`
+# returns *the next minute*, so a "monthly" candle closes 30 seconds later and the
+# strategy enters at a price it was never validated against, and `_alpaca_timeframe("1M")`
+# returns `1m`, so minute bars reach the signal processor and ATR/stops are computed from
+# minute-scale data. cTrader is immune - it has no `get_market_data`, so it fails closed.
+#
+# `BacktestConfig` already refuses it (`runner/engines/base.py:190` requires the canonical,
+# case-sensitive spelling), so the backtester is strict where the live path was not. This
+# makes the live path agree with code that already existed, rather than choosing a policy.
+#
+# Scoped to digits-then-uppercase-M on purpose:
+#   * `1m`, `5m`, `15m`, `30m` are the canonical minute spellings and must keep working;
+#   * `m1`, `m5`, `min1` are minute *aliases* (letter first) with the same intent, so the
+#     casing carries no meaning and they must keep working;
+#   * `M15` is letter-then-digit and is not matched either;
+#   * `1D` is left alone, because an uppercase D means *day* on every platform that
+#     distinguishes it from a month.
+_MONTH_TIMEFRAME_PATTERN = re.compile(r"^\d+M$")
+
+
+def _reject_month_timeframe_collision(value: str) -> str:
+    """Refuse a `<n>M` timeframe rather than silently trading it as minutes.
+
+    Measured exposure was zero - no config, no database row, and no file on disk uses it -
+    so this closes a latent path rather than fixing a live one. That is why it can be the
+    strict answer: there is nothing to migrate and nothing that was relying on it.
+    """
+    candidate = str(value or "").strip()
+    if _MONTH_TIMEFRAME_PATTERN.match(candidate):
+        raise ValueError(
+            f"Timeframe {candidate!r} is the monthly candle on TradingView, MT5 and most other "
+            "platforms, but this system has no monthly timeframe and would read it as "
+            f"{candidate[:-1]} *minutes* - sizing stops from minute-scale bars and closing the "
+            f"candle a minute later. Write {candidate[:-1]}m for a {candidate[:-1]}-minute "
+            "timeframe, or 1d/1w if a longer bar was intended. (BacktestConfig has always "
+            "refused this spelling.)"
+        )
+    return candidate
+
+
 class LiveAccountConfig(BaseModel):
     """Live account configuration stored in DB and used by API payloads."""
 
@@ -229,6 +277,18 @@ class LiveDeploymentConfig(BaseModel):
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("timeframe")
+    @classmethod
+    def _reject_monthly_spelling(cls, v: str) -> str:
+        """A `<n>M` timeframe is refused rather than traded as minutes.
+
+        On its own this is not a policy choice: `BacktestConfig` has always required the
+        canonical, case-sensitive spelling, so the live path refusing the same input is the
+        two agreeing rather than one being newly strict.
+        """
+        return _reject_month_timeframe_collision(v)
+
+
 
 class LiveDeploymentCreateRequest(BaseModel):
     """Payload for creating a live deployment via API."""
@@ -237,6 +297,19 @@ class LiveDeploymentCreateRequest(BaseModel):
     account_id: str
     symbols: list[str]
     timeframe: str
+
+    @field_validator("timeframe")
+    @classmethod
+    def _reject_monthly_spelling(cls, v: str) -> str:
+        """Guarded here too, because the UI is a `<select>`.
+
+        Measured: the viewer offers a dropdown, so a mistyped timeframe cannot come from the
+        screen - it arrives through the API or through YAML. Guarding only the persisted model
+        would leave the API as a way in, which is the path the exposure analysis actually
+        named.
+        """
+        return _reject_month_timeframe_collision(v)
+
     signal_source_type: Literal["internal", "discord"] | None = None
     signal_source_id: str | None = None
     symbol_filter: list[str] = Field(default_factory=list)

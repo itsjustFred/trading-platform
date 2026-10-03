@@ -7907,3 +7907,131 @@ class TestExitOnlyAndUnboundedTpMarkers:
         assert is_unbounded_tp(exit_only) is False
         assert is_unbounded_tp(unbounded) is True
         assert is_exit_only_metadata(unbounded) is False
+
+
+class TestAMonthlySpellingIsRefusedAtTheConfigBoundary:
+    """Item 8: `1M` is a month nearly everywhere, and here it was being traded as a minute.
+
+    `normalize_timeframe` lowercases, so `1M` and `1m` become the same string and
+    `_timeframe_seconds` returns 60 for both - which means `_require_recognised_timeframe` is
+    never reached and the guard that exists has nothing to catch.
+
+    The two measured consequences were **not** in the safe direction. `_next_candle_close("1M", 60)`
+    returns *the next minute*, so a "monthly" candle closes 30 seconds later and the strategy
+    enters at a price it was never validated against. `_alpaca_timeframe("1M")` returns `1m`, so
+    minute bars reach the signal processor and ATR/stops are computed from minute-scale data.
+    (cTrader is immune: no `get_market_data`, so it fails closed.)
+
+    **This is not a new policy.** `BacktestConfig` has always required the canonical,
+    case-sensitive spelling - `runner/engines/base.py:190` - so the backtester refused `1M` while
+    the live path accepted it. Refusing it at the live boundary makes the two agree.
+
+    Measured exposure was zero - no config row, no database row, no file on disk - so this closes
+    a latent path with nothing to migrate.
+    """
+
+    @staticmethod
+    def _config(timeframe: str):
+        from shared.models import LiveDeploymentConfig
+
+        return LiveDeploymentConfig(
+            strategy_name="s", account_id="a", symbols=["AAPL"], timeframe=timeframe
+        )
+
+    @pytest.mark.parametrize("spelling", ["1M", "5M", "15M", "30M", " 1M ", "1M\n"])
+    def test_a_monthly_spelling_is_refused(self, spelling) -> None:
+        with pytest.raises(ValueError, match="monthly candle"):
+            self._config(spelling)
+
+    def test_the_error_explains_the_collision_rather_than_just_refusing(self) -> None:
+        """The person who typed this is the one who has to understand the refusal.
+
+        A bare "invalid timeframe" would send them looking for a spelling table. What they need
+        to know is that `1M` means something *else* where they came from, and what to write here.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            self._config("1M")
+        message = str(excinfo.value)
+        assert "1m" in message, f"the error does not give the spelling to use instead: {message}"
+        assert "minutes" in message, (
+            f"the error does not say what it would have been read as: {message}"
+        )
+
+    @pytest.mark.parametrize(
+        "spelling",
+        ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "s1", "tick"],
+    )
+    def test_every_canonical_timeframe_still_works(self, spelling) -> None:
+        """The guard refuses one spelling. It must not quietly narrow the accepted set."""
+        assert self._config(spelling).timeframe == spelling
+
+    @pytest.mark.parametrize("alias", ["m1", "min1", "m5", "m15", "m30", "h1", "d1", "daily", "hour1"])
+    def test_minute_aliases_are_unaffected(self, alias) -> None:
+        """Letter-first aliases carry no casing meaning, so they must keep working.
+
+        `m1` is OANDA's minute spelling and `min1` is the grid downloader's. Both mean one
+        minute here, exactly as the uppercase `1M` did - but the *intent* is unambiguous, which is
+        what separates them from `<n>M`.
+        """
+        assert self._config(alias).timeframe == alias
+
+    @pytest.mark.parametrize("spelling", ["1D", "1W", "1H"])
+    def test_uppercase_day_and_hour_are_left_alone(self, spelling) -> None:
+        """Only `M` is dangerous, and only after a digit.
+
+        `1D` is *day* on every platform that distinguishes it from a month, so refusing it would
+        break a legitimate spelling in order to fix an illegitimate one. `1W` and `1H` likewise
+        carry no competing meaning.
+        """
+        assert self._config(spelling).timeframe == spelling
+
+    def test_the_api_payload_is_guarded_too(self) -> None:
+        """The UI is a `<select>`, so a typo arrives via the API or via YAML.
+
+        The exposure analysis named exactly those two routes, so guarding only the persisted
+        model would leave the API as a way in.
+        """
+        from shared.models import LiveDeploymentCreateRequest
+
+        with pytest.raises(ValueError, match="monthly candle"):
+            LiveDeploymentCreateRequest(
+                account_id="a", symbols=["AAPL"], timeframe="1M"
+            )
+
+    def test_the_backtester_already_refused_the_same_spelling(self) -> None:
+        """If `BacktestConfig` ever accepts `1M`, this pin is what says the two have diverged."""
+        from runner.engines.base import BacktestConfig
+
+        with pytest.raises(ValueError, match="Invalid timeframe"):
+            BacktestConfig(
+                strategy_name="s", symbols=["AAPL"], timeframe="1M",
+                start_date="2021-01-01", end_date="2025-06-30",
+            )
+
+    def test_the_helpers_below_the_boundary_still_measure_as_documented(self) -> None:
+        """These are unchanged, and that is the point.
+
+        `_next_candle_close` and `_alpaca_timeframe` still treat `1M` as a minute. They are not
+        fixed here because the right place to refuse it is the boundary, where a person finds out.
+        This test records that the refusal is *upstream* of them, so nobody later "fixes" these
+        two and thinks the boundary has been handled.
+        """
+        from live_runner.alpaca_adapter import _alpaca_timeframe
+        from live_runner.signal_sources.execution_timing import _next_candle_close
+
+        _, normalized = _alpaca_timeframe("1M")
+        assert normalized == "1m", (
+            f"_alpaca_timeframe now normalizes 1M to {normalized!r}; the boundary refusal is "
+            "where this is meant to be handled, and if this changed it needs re-measuring"
+        )
+        # The reference comes first; `timeframe` is keyword-only and is what carries the spelling,
+        # since `timeframe_seconds` is already the normalised 60 for both "1m" and "1M".
+        from datetime import datetime, timezone
+
+        moment = datetime(2024, 1, 3, 12, 0, 30, tzinfo=timezone.utc)
+        assert _next_candle_close(moment, 60, timeframe="1M") == datetime(
+            2024, 1, 3, 12, 1, 0, tzinfo=timezone.utc
+        ), (
+            "_next_candle_close no longer resolves 1M to the next minute; the documented "
+            "consequence of the collision has changed"
+        )
