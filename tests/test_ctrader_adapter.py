@@ -14,6 +14,167 @@ from live_runner.ctrader_adapter import (
 )
 
 
+class TestExecutionPriceIsWeakerThanVolume:
+    """The price resolver has no guard where the volume resolver, 3 lines below, has one.
+
+    `_resolve_execution_price` tests truthiness only, so it returns whatever is there.
+    `_resolve_filled_volume` tests `math.isfinite(value) and value > 0`. Measured, side by side
+    on the same deal objects:
+
+    | deal attribute | `_resolve_execution_price` | `_resolve_filled_volume` |
+    |---|---|---|
+    | price 261.7, volume 5 | 261.7 | 5.0 |
+    | **price omitted** | **0.0** | 5.0 |
+    | **price -5.0** | **-5.0** | 5.0 |
+    | **price NaN** | **NaN** | 5.0 |
+    | **volume -3** | 261.7 | **0.0** (guarded) |
+
+    Three bad prices reach the caller, and one bad volume does not. The asymmetry is not
+    deliberate: nothing in either docstring explains why price is treated differently, and the
+    money path persists the result.
+
+    `executionPrice` is a protobuf `double` **with presence** whose unset value is `0.0`, so
+    "the broker sent no price" and "the broker sent zero" are the same number by the time the
+    truthiness test sees them - the same shape as the unreachable enum case in item 2.
+
+    NaN is the one worth naming separately: `if value:` is **true** for NaN, so a NaN price does
+    not even fall through to the order-level fallback, and any downstream `> 0` guard rejects it
+    while any truthiness guard accepts it. A single NaN row makes `avg(actual_price)` NaN and
+    makes `WHERE actual_price > x` silently skip that row, which is harder to notice than a 0.0.
+
+    All pinned as-is. What should happen instead - refuse the execution, record it with a flag,
+    or fall back to the signal's intended price - is a trading decision, and it is backlog item 10.
+    """
+
+    @staticmethod
+    def _deal(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    @pytest.mark.parametrize(
+        ("label", "deal", "expected"),
+        [
+            ("price present", _deal(executionPrice=261.7, filledVolume=5), 261.7),
+            ("price omitted reads 0.0", _deal(filledVolume=5), 0.0),
+            ("negative price passes through", _deal(executionPrice=-5.0, filledVolume=5), -5.0),
+        ],
+    )
+    def test_a_bad_price_is_returned_unchanged_KNOWN_ASYMMETRY(
+        self, label: str, deal, expected: float
+    ) -> None:
+        """Pin what the resolver does today, including the two values it should not return."""
+        price = CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal)
+        assert price == expected or (expected != expected and price != price), (
+            f"_resolve_execution_price({label}) now returns {price!r} rather than "
+            f"{expected!r}; the asymmetry documented in this class has changed - update it and "
+            "backlog item 10 together"
+        )
+
+    def test_a_nan_price_is_returned_and_never_falls_through_to_the_order(self) -> None:
+        """NaN is truthy, so the fallback that would otherwise rescue it is skipped.
+
+        This is the asymmetry that makes NaN worse than a zero: the code path that catches a
+        missing price cannot catch a nonsensical one.
+        """
+        nan = float("nan")
+        deal = self._deal(executionPrice=nan, filledVolume=5)
+        order = self._deal(executionPrice=261.7)  # a perfectly good order-level price
+
+        price = CTraderLiveAdapter._resolve_execution_price(order=order, deal=deal)
+        assert price != price, (
+            f"_resolve_execution_price now returns {price!r} for a NaN deal price instead of "
+            "NaN; if it now skips to the order's price, NaN is contained and this test's whole "
+            "argument is obsolete"
+        )
+        assert bool(nan) is True, (
+            "NaN is no longer truthy in this interpreter, which is the assumption the "
+            "no-fallthrough behaviour rests on"
+        )
+
+    def test_the_volume_resolver_guards_what_the_price_resolver_does_not(self) -> None:
+        """The contrast that makes this an asymmetry rather than a style preference.
+
+        Both resolvers read the same kind of field off the same objects and run 3 lines apart.
+        One checks `isfinite(...) and > 0`; the other checks truthiness. Pinned together so the
+        difference cannot be closed by accident in one direction only.
+        """
+        for bad in (-3.0, float("nan"), float("inf")):
+            deal = self._deal(executionPrice=261.7, filledVolume=bad)
+            volume = CTraderLiveAdapter._resolve_filled_volume(order=None, deal=deal)
+            assert volume == 0.0, (
+                f"_resolve_filled_volume returned {volume!r} for filledVolume={bad!r}; the "
+                "volume guard this contrasts against has changed, so the price asymmetry is no "
+                "longly a like-for-like comparison"
+            )
+
+
+class TestLiveExecutionAcceptsAnyPriceAtAll:
+    """The model that persists the resolver's output constrains nothing.
+
+    `LiveExecution.actual_price` is a bare `float` with empty field metadata, so it accepts
+    `0.0`, a negative price, `NaN` and `inf` alike. Measured with a complete, otherwise-valid
+    instance, so this is the price field being permissive and not some other required field
+    masking it.
+
+    That closes the loop with `TestExecutionPriceIsWeakerThanVolume`: the resolver can emit a
+    zero, a negative or a NaN, and the model will store any of them. The only thing standing
+    between a broker payload and a poisoned `live_executions` row is the truthiness test in the
+    resolver - which is exactly the check that NaN passes.
+
+    No live row is affected today: all 3 rows in production have `actual_price` between 1.13978
+    and 261.7, with none null or <= 0. So this is latent, not realised.
+
+    Pinned rather than fixed. A constraint here is the fix, and adding one is a decision about
+    what should happen to an execution whose price cannot be read - reject the row, record it
+    with a flag, or substitute the signal's intended price. That is backlog item 10.
+    """
+
+    @staticmethod
+    def _base() -> dict:
+        import uuid
+
+        return {
+            "signal_id": str(uuid.uuid4()),
+            "actual_price": 261.7,
+            "filled_qty": 1.0,
+            "commission": 0.0,
+            "timestamp": 1_700_000_000_000,
+            "broker_order_id": "ord-1",
+        }
+
+    @pytest.mark.parametrize(
+        "bad", [0.0, -1.5, float("nan"), float("inf")], ids=["zero", "negative", "nan", "inf"]
+    )
+    def test_the_model_stores_any_price_KNOWN_UNCONSTRAINED(self, bad: float) -> None:
+        from shared.models import LiveExecution
+
+        payload = self._base()
+        payload["actual_price"] = bad
+        execution = LiveExecution(**payload)
+        stored = execution.actual_price
+        assert stored == bad or (bad != bad and stored != stored), (
+            f"actual_price={bad!r} is now rejected or altered (stored {stored!r}); the model has "
+            "gained a constraint, so this file's argument about the unguarded persistence is "
+            "obsolete and backlog item 10 should be revisited"
+        )
+
+    def test_the_field_declares_no_constraint_at_all(self) -> None:
+        """Assert the absence directly, so the parametrised test cannot pass by accident."""
+        from shared.models import LiveExecution
+
+        field = LiveExecution.model_fields["actual_price"]
+        # Emptiness, not a specific container: pydantic represents "no constraints" as a falsy
+        # metadata value whose type has changed between versions (dict vs list), so asserting
+        # `== {}` would fail on a version bump rather than on a real constraint appearing.
+        assert not field.metadata, (
+            f"actual_price now carries metadata {field.metadata!r}, so a constraint has been "
+            "added; update this test and backlog item 10 together"
+        )
+        assert field.annotation is float, (
+            f"actual_price is annotated {field.annotation!r} rather than float, which may be a "
+            "deliberate tightening - re-measure rather than assume"
+        )
+
+
 def test_is_already_logged_in_error_detects_code() -> None:
     assert _is_already_logged_in_error("ALREADY_LOGGED_IN", "")
 
