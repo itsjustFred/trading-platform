@@ -2347,7 +2347,6 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
     So the bodies are compared textually. If they drift, one of them is not logging the ambiguous
     case, and the log is what settles whether the broker ever sends a genuine zero.
     """
-    import re as _re
     from pathlib import Path as _Path
 
     root = _Path(__file__).resolve().parents[1]
