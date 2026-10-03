@@ -264,3 +264,111 @@ class TestEnvExpansionAndUnexpandedGate:
         # and expected a set variable to pass.
         with pytest.raises(ValueError, match=re.escape("${SET}")):
             assert_no_unexpanded_env({"text": "${SET}"})
+
+
+class TestUnexpandedConfigReferencesAreRecorded:
+    """A reference that never resolved must not be silent.
+
+    `_expand_env_value` left an unresolved `$VAR` in the value and said nothing. That is the
+    failure mode the guard next door exists for: a channel id of `${DISCORD_BOT_X_CHANNEL_ID}`
+    matches no channel, and the notification vanishes with nothing recorded anywhere.
+
+    **This does not close the guard's gap, and deliberately so.** `assert_no_unexpanded_env`
+    still only matches the braced form, because widening it would refuse a legitimate literal
+    `$USD` in free text - and, measured, an unresolved `$UNSET` and a deliberate `$USD` both
+    survive as the *same string*, so nothing downstream (including a report of which keys
+    failed to resolve) can tell them apart. Choosing between "silent", "refuse" and "opt-in"
+    per field is a design decision and stays with the human.
+
+    What is free of that trade-off is exactly what landed here: the expansion result is
+    unchanged, and the unresolved key is **recorded** instead of vanishing.
+    """
+
+    def _expand(self, value, env, caplog):
+        import logging
+
+        from live_runner.config_parser import _expand_env_value
+
+        with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+            caplog.clear()
+            return _expand_env_value(value, env)
+
+    @pytest.mark.parametrize(
+        ("payload", "env", "expected"),
+        [
+            ("${SET}", {"SET": "value"}, "value"),
+            ("$SET", {"SET": "value"}, "value"),
+            # **Unchanged behaviour.** These are the exact results from before the change.
+            ("${UNSET}", {}, "${UNSET}"),
+            ("$UNSET", {}, "$UNSET"),
+            ("costs $USD per month", {"SET": "x"}, "costs $USD per month"),
+            ("price $5", {}, "price $5"),
+            ("$$USD", {}, "$$USD"),
+            # A variable that is set but empty is RESOLVED, and must not be called missing.
+            ("$EMPTY", {"EMPTY": ""}, ""),
+            ("${EMPTY}", {"EMPTY": ""}, ""),
+        ],
+    )
+    def test_the_expansion_result_is_byte_identical_to_before(
+        self, payload, env, expected, caplog
+    ) -> None:
+        """The fix must not change a single expanded value.
+
+        A refactor that "also" tightened expansion would refuse a valid config, so the values
+        are pinned rather than reasoned about.
+        """
+        assert self._expand(payload, env, caplog) == expected
+
+    def test_an_unresolved_reference_is_now_logged(self, caplog) -> None:
+        self._expand("${DISCORD_BOT_X_CHANNEL_ID}", {}, caplog)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("DISCORD_BOT_X_CHANNEL_ID" in m for m in messages), (
+            f"an unresolved reference is still silent: {messages}"
+        )
+        assert any("not present in the environment" in m for m in messages), messages
+
+    def test_the_bare_form_is_logged_too(self, caplog) -> None:
+        """The bare spelling is the one the guard misses, so it is the one that must be loud."""
+        self._expand("$DISCORD_BOT_X_CHANNEL_ID", {}, caplog)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("DISCORD_BOT_X_CHANNEL_ID" in m for m in messages), (
+            f"the bare form is silent, which is the whole gap: {messages}"
+        )
+
+    def test_a_resolved_reference_is_not_logged(self, caplog) -> None:
+        self._expand("${SET}", {"SET": "value"}, caplog)
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+    def test_a_set_but_empty_reference_is_not_reported_missing(self, caplog) -> None:
+        """`key in env`, not truthiness - an empty value is a value the operator chose."""
+        assert self._expand("$EMPTY", {"EMPTY": ""}, caplog) == ""
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+    def test_one_line_per_value_not_per_occurrence(self, caplog) -> None:
+        """A config repeating a reference should not produce a log line per repetition."""
+        self._expand("$UNSET and $UNSET and $UNSET", {}, caplog)
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].count("UNSET") == 1, f"the key is listed once: {messages}"
+
+    def test_a_literal_dollar_name_in_free_text_is_still_accepted(self, caplog) -> None:
+        """The reason this logs rather than refuses.
+
+        A literal `$USD` in a note is indistinguishable from an unset `$USD` variable after
+        expansion, so refusing either would break a valid config. It must expand unchanged -
+        and being *told* there is a `$USD` in there is the useful part.
+        """
+        assert self._expand("costs $USD per month", {}, caplog) == "costs $USD per month"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("USD" in m for m in messages), (
+            f"a literal $USD should still be pointed out, just not refused: {messages}"
+        )
+
+    def test_the_guard_gap_is_still_open_and_still_pinned(self) -> None:
+        """The human's decision is untouched, and the tripwire still trips on a fix."""
+        text = Path(__file__).read_text(encoding="utf-8")
+        assert "test_a_bare_unset_reference_passes_the_gate_KNOWN_GAP" in text, (
+            "the tripwire that fails when the gap is closed has been removed. Either the gap "
+            "is closed - in which case the decision was taken and should be recorded - or the "
+            "tripwire is gone and nobody will notice the gap closing."
+        )

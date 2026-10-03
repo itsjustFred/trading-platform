@@ -18,14 +18,42 @@ _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
-    """Expand ``$VAR``/``${VAR}`` in *value* using *env* (no silent mute)."""
+    """Expand ``$VAR``/``${VAR}`` in *value* using *env*, and say when it could not.
+
+    The expansion behaviour is deliberately unchanged - an unresolved reference is left in
+    place exactly as before - but it is now **recorded** instead of silent. That matters
+    because the value left behind is the failure mode this exists for: a channel id of
+    ``${DISCORD_BOT_X_CHANNEL_ID}`` matches no channel, and the notification is dropped with
+    nothing anywhere saying the reference never resolved.
+
+    Note what this deliberately does *not* do: it does not refuse the value. An unresolved
+    ``$UNSET`` and a deliberate literal ``$USD`` in free text both survive as the same string,
+    so nothing downstream can tell them apart - not this function, and not a report of which
+    keys failed to resolve. Refusing either would break a legitimate config; accepting both is
+    why the reference is logged rather than rejected.
+
+    Resolution is tested with ``key in env`` rather than truthiness, so a variable that is
+    set-but-empty is *resolved* (to "") and is not reported as missing.
+    """
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+    unresolved: list[str] = []
 
     def _replace(match: re.Match[str]) -> str:
         key = match.group(1) or match.group(2)
-        return str(env.get(key, match.group(0)))
+        if key not in env:
+            unresolved.append(key)
+            return match.group(0)
+        return str(env[key])
 
-    return pattern.sub(_replace, value)
+    expanded = pattern.sub(_replace, value)
+    if unresolved:
+        # One line per value, not per occurrence: a config that repeats a reference should
+        # not produce a log line per repetition.
+        logger.warning(
+            "config reference(s) not present in the environment and left unexpanded: %s",
+            ", ".join(sorted(set(unresolved))),
+        )
+    return expanded
 
 
 def expand_env_mapping(payload: Any, env: Mapping[str, str] | None = None) -> Any:
