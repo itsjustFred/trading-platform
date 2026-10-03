@@ -1161,8 +1161,12 @@ class TestCtraderNameAndBalanceExtraction:
         without standing up a live session.
         """
         root = Path(__file__).resolve().parents[1]
-        needle = 'int(getattr(trader, "moneyDigits", 2) or 2)'
-        guard = "0 <= money_digits <= 12"
+        # Full statements, not bare expressions: the resolver's docstring quotes the guard while
+        # explaining that it contradicts the `or 2`, so counting the expression alone found two
+        # and failed for the wrong reason.
+        needle = 'money_digits = self._resolve_money_digits('
+        discovery_needle = 'money_digits = _resolve_money_digits('
+        guard = "scale = 10**money_digits if 0 <= money_digits <= 12 else 100"
 
         # Scan the tree rather than checking two known paths. Checking the two paths makes
         # `len(found) == 2` vacuous - `found` is built by iterating a literal 2-tuple, so it
@@ -1175,7 +1179,13 @@ class TestCtraderNameAndBalanceExtraction:
             if rel.startswith("tests/") or "__pycache__" in rel:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            n_needle, n_guard = text.count(needle), text.count(guard)
+            n_needle = text.count(needle) + text.count(discovery_needle)
+            # Count code lines only: the resolver's docstring quotes the guard statement verbatim
+            # while explaining that it contradicts the `or 2`, so a substring count finds the
+            # explanation too.
+            n_guard = sum(
+                1 for line in text.splitlines() if line.strip().startswith(guard)
+            )
             if n_needle or n_guard:
                 carriers[rel] = (n_needle, n_guard)
 
@@ -2324,3 +2334,51 @@ class TestCtraderMissingCtidIsLogged:
         assert captured, "nothing was logged at all"
         for record in captured:
             assert record.levelno < logging.WARNING, record.getMessage()
+
+
+def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
+    """The duplicated-line problem grew a second duplicated line, and it is now guarded.
+
+    Item 6 found two copies of `int(getattr(trader, "moneyDigits", 2) or 2)`. Both now call a
+    `_resolve_money_digits` helper - itself copied, because importing `account_discovery` into the
+    cTrader adapter would drag in the Alpaca dependency chain. Two copies of a *fix* is two
+    chances to apply it once.
+
+    So the bodies are compared textually. If they drift, one of them is not logging the ambiguous
+    case, and the log is what settles whether the broker ever sends a genuine zero.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1]
+    discovery = (root / "live_runner" / "account_discovery.py").read_text(encoding="utf-8")
+    adapter = (root / "live_runner" / "ctrader_adapter.py").read_text(encoding="utf-8")
+
+    def body(text: str) -> str:
+        """The helper's executable lines, whitespace-normalised.
+
+        One copy is a module-level function and the other a static method, so they differ by
+        eight columns of indentation and nothing else. Comparing raw text reported that as drift.
+        """
+        start = text.index("raw = getattr(trader, \"moneyDigits\", 2)")
+        end = text.index("return int(raw)", start) + len("return int(raw)")
+        lines = [
+            " ".join(line.split())
+            for line in text[start:end].splitlines()
+            if line.strip()
+        ]
+        return "\n".join(lines)
+
+    assert body(discovery) == body(adapter), (
+        "the two _resolve_money_digits copies have drifted. Both must apply the same fix, and "
+        "both must log the ambiguous case with its presence flag."
+    )
+
+    for name, text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
+        assert 'has_field("moneyDigits")' in text, (
+            f"{name} lost the presence check; without it the log cannot distinguish an omitted "
+            "field from a genuine zero, which is the only thing that makes it decisive"
+        )
+        assert "logger.warning(" in body(text) or "logger.warning(" in text, (
+            f"{name} no longer logs the ambiguous moneyDigits case"
+        )

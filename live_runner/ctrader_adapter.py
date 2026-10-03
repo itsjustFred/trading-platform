@@ -2353,7 +2353,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
 
         trader = trader_res.trader
-        money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
+        money_digits = self._resolve_money_digits(trader, context="account refresh")
         scale = 10**money_digits if 0 <= money_digits <= 12 else 100
         balance = _to_float(getattr(trader, "balance", 0)) / scale
         equity = balance
@@ -2861,6 +2861,43 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if math.isfinite(value) and value > 0:
                 return value
         return 0.0
+
+    @staticmethod
+    def _resolve_money_digits(trader: Any, *, context: str) -> int:
+        """The broker's decimal-place count, defaulting to 2, and saying so when it guesses.
+
+        Deliberately a copy of `account_discovery._resolve_money_digits` rather than an import of
+        it: this adapter runs without the Alpaca adapter loaded, and importing the discovery
+        module here would pull that dependency chain into every cTrader import. The duplication is
+        the lesser evil, and
+        `test_both_copies_of_the_money_digits_resolution_are_identical` holds the two in sync.
+
+        `moneyDigits` is a `uint32` **with presence**, so an unset field reads as `0`. The
+        `or 2` collapse therefore cannot tell a genuine zero (this account has no minor units, and
+        dividing by 100 makes the balance a hundred times too small) from the broker simply not
+        sending the field (where 2 is the right conventional default). `HasField` can, so the
+        ambiguous case is logged with the presence flag - which settles it on the next successful
+        broker call without changing a computed value. Honouring a real zero is backlog item 6
+        and needs that answer first.
+        """
+        raw = getattr(trader, "moneyDigits", 2)
+        has_field = getattr(trader, "HasField", None)
+        present = None
+        if has_field is not None:
+            try:
+                present = bool(has_field("moneyDigits"))
+            except (TypeError, ValueError):
+                present = None
+        if not raw:  # the `or 2` collapse is about to happen
+            logger.warning(
+                "moneyDigits is %r (field present: %s); falling back to 2 decimal places. If the "
+                "broker sent a genuine 0 this balance is 100x too small - %s",
+                raw,
+                "unknown" if present is None else present,
+                context,
+            )
+            return 2
+        return int(raw)
 
     @staticmethod
     def _resolve_filled_volume(*, order: Any | None, deal: Any | None) -> float:

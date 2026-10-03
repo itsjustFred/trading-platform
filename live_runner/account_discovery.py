@@ -292,8 +292,53 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
     ]
 
 
+def _resolve_money_digits(trader: Any, *, context: str) -> int:
+    """The broker's decimal-place count, defaulting to 2, and saying so when it guesses.
+
+    `moneyDigits` is a protobuf `uint32` **with presence**, so an unset field reads as `0`, not
+    `None`. `int(getattr(trader, "moneyDigits", 2) or 2)` therefore cannot tell two situations
+    apart:
+
+    - the broker sent **no** `moneyDigits` at all, and 2 is the right conventional default, and
+    - the broker sent a genuine **0**, meaning this account has no minor units, in which case
+      dividing the balance by 100 makes it a hundred times too small.
+
+    The line below it, `scale = 10**money_digits if 0 <= money_digits <= 12 else 100`, **admits
+    zero** - so the range guard and the `or 2` above it contradict each other, and the guard's
+    acceptance of zero is dead code.
+
+    Which of the two is happening is not knowable from the value alone, but it *is* knowable from
+    `HasField`. So the ambiguous case is logged with the presence flag, which settles it on the
+    next successful broker call without changing a single computed value. That is the whole of
+    what this function does beyond the arithmetic; honouring a real zero is backlog item 6 and
+    needs the answer first.
+
+    Duplicated deliberately in `ctrader_adapter.py` rather than shared, because importing
+    `account_discovery` from the cTrader adapter would drag in the Alpaca adapter's dependency
+    chain. `test_both_copies_of_the_balance_scaling_are_identical` holds the two in sync.
+    """
+    raw = getattr(trader, "moneyDigits", 2)
+    has_field = getattr(trader, "HasField", None)
+    present = None
+    if has_field is not None:
+        try:
+            present = bool(has_field("moneyDigits"))
+        except (TypeError, ValueError):
+            present = None
+    if not raw:  # the `or 2` collapse is about to happen
+        logger.warning(
+            "moneyDigits is %r (field present: %s); falling back to 2 decimal places. If the "
+            "broker sent a genuine 0 this balance is 100x too small - %s",
+            raw,
+            "unknown" if present is None else present,
+            context,
+        )
+        return 2
+    return int(raw)
+
+
 def _trader_balance(trader: Any) -> float:
-    money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
+    money_digits = _resolve_money_digits(trader, context="account discovery")
     scale = 10**money_digits if 0 <= money_digits <= 12 else 100
     return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / scale
 
