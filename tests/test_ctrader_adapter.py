@@ -24,14 +24,19 @@ class TestExecutionPriceIsWeakerThanVolume:
     | deal attribute | `_resolve_execution_price` | `_resolve_filled_volume` |
     |---|---|---|
     | price 261.7, volume 5 | 261.7 | 5.0 |
-    | **price omitted** | **0.0** | 5.0 |
-    | **price -5.0** | **-5.0** | 5.0 |
-    | **price NaN** | **NaN** | 5.0 |
-    | **volume -3** | 261.7 | **0.0** (guarded) |
+    | price omitted | 0.0 | 5.0 |
+    | price -5.0 | 0.0 | 5.0 |
+    | price NaN | 0.0 | 5.0 |
+    | volume -3 | 261.7 | **0.0** |
 
-    Three bad prices reach the caller, and one bad volume does not. The asymmetry is not
-    deliberate: nothing in either docstring explains why price is treated differently, and the
-    money path persists the result.
+    **This asymmetry has been fixed.** Price used to test truthiness alone and returned whatever
+    the payload held, so three bad values reached the caller while volume's guard rejected the
+    same three on its own field. It now carries the identical `isfinite and > 0` check, and the two
+    resolvers agree.
+
+    NaN was the one that mattered: `if value:` is true for NaN, so it did not fall through to the
+    order-level fallback and no downstream `> 0` guard would catch it either. A NaN deal price
+    beside a perfectly good order price now resolves to the order's price instead of poisoning it.
 
     `executionPrice` is a protobuf `double` **with presence** whose unset value is `0.0`, so
     "the broker sent no price" and "the broker sent zero" are the same number by the time the
@@ -42,8 +47,10 @@ class TestExecutionPriceIsWeakerThanVolume:
     while any truthiness guard accepts it. A single NaN row makes `avg(actual_price)` NaN and
     makes `WHERE actual_price > x` silently skip that row, which is harder to notice than a 0.0.
 
-    All pinned as-is. What should happen instead - refuse the execution, record it with a flag,
-    or fall back to the signal's intended price - is a trading decision, and it is backlog item 10.
+    What remains open is the **zero**, and only the zero. It is not a price: it is the resolver's
+    "could not be read" answer, produced when the broker sends no `executionPrice` at all. Whether
+    such a row should be refused, flagged, or stored as-is is a trading decision - backlog item 10
+    - and answering it needs the broker behaviour, which is not knowable from here.
     """
 
     @staticmethod
@@ -55,39 +62,58 @@ class TestExecutionPriceIsWeakerThanVolume:
         [
             ("price present", _deal(executionPrice=261.7, filledVolume=5), 261.7),
             ("price omitted reads 0.0", _deal(filledVolume=5), 0.0),
-            ("negative price passes through", _deal(executionPrice=-5.0, filledVolume=5), -5.0),
+            ("negative price is refused, not passed through", _deal(executionPrice=-5.0), 0.0),
+            ("NaN price is refused, not passed through", _deal(executionPrice=float("nan")), 0.0),
+            ("infinite price is refused", _deal(executionPrice=float("inf")), 0.0),
         ],
     )
-    def test_a_bad_price_is_returned_unchanged_KNOWN_ASYMMETRY(
+    def test_an_unusable_price_becomes_the_unreadable_sentinel_not_a_value(
         self, label: str, deal, expected: float
     ) -> None:
-        """Pin what the resolver does today, including the two values it should not return."""
-        price = CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal)
-        assert price == expected or (expected != expected and price != price), (
-            f"_resolve_execution_price({label}) now returns {price!r} rather than "
-            f"{expected!r}; the asymmetry documented in this class has changed - update it and "
-            "backlog item 10 together"
-        )
+        """The impossible values are now refused rather than handed to the money path.
 
-    def test_a_nan_price_is_returned_and_never_falls_through_to_the_order(self) -> None:
-        """NaN is truthy, so the fallback that would otherwise rescue it is skipped.
-
-        This is the asymmetry that makes NaN worse than a zero: the code path that catches a
-        missing price cannot catch a nonsensical one.
+        0.0 is the point of the table: every unusable input collapses onto the same
+        "could not be read" answer the resolver already used for an omitted price, so a caller
+        cannot mistake a nonsense price for a real one.
         """
-        nan = float("nan")
-        deal = self._deal(executionPrice=nan, filledVolume=5)
-        order = self._deal(executionPrice=261.7)  # a perfectly good order-level price
-
-        price = CTraderLiveAdapter._resolve_execution_price(order=order, deal=deal)
-        assert price != price, (
-            f"_resolve_execution_price now returns {price!r} for a NaN deal price instead of "
-            "NaN; if it now skips to the order's price, NaN is contained and this test's whole "
-            "argument is obsolete"
+        price = CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal)
+        assert price == expected, (
+            f"_resolve_execution_price({label}) returns {price!r} rather than {expected!r}. If an "
+            "impossible price is flowing again, the model constraint should have rejected it and "
+            "this resolver is not the last line of defence - re-check both."
         )
-        assert bool(nan) is True, (
-            "NaN is no longer truthy in this interpreter, which is the assumption the "
-            "no-fallthrough behaviour rests on"
+
+    def test_a_nan_deal_price_falls_through_to_the_orders_real_price(self) -> None:
+        """NaN is truthy, so before the fix the fallback that would rescue it was skipped.
+
+        The deal said NaN and the order said 261.7. The resolver returned NaN, and no downstream
+        `> 0` guard would have caught it: one NaN row makes `avg(actual_price)` NaN and makes
+        `WHERE actual_price > x` silently skip that row.
+
+        Now the unusable deal price is refused and the order-level price is used, which is what
+        the missing-price path always did.
+        """
+        assert bool(float("nan")) is True, (
+            "NaN is no longer truthy in this interpreter, which is why the old code skipped the "
+            "fallback; if this ever becomes false the historical explanation needs revisiting"
+        )
+        price = CTraderLiveAdapter._resolve_execution_price(
+            order=self._deal(executionPrice=261.7), deal=self._deal(executionPrice=float("nan"))
+        )
+        assert price == pytest.approx(261.7), (
+            f"a NaN deal price resolved to {price!r} instead of falling through to the order's "
+            "261.7; NaN is contained by the guard again"
+        )
+
+    def test_a_nan_price_with_no_usable_order_price_is_the_sentinel(self) -> None:
+        """With nothing readable anywhere, the answer is 0.0 - never NaN."""
+        price = CTraderLiveAdapter._resolve_execution_price(
+            order=self._deal(executionPrice=float("nan")),
+            deal=self._deal(executionPrice=float("nan")),
+        )
+        assert price == 0.0, (
+            f"both sources unreadable produced {price!r}; the sentinel must be 0.0 so the model "
+            "constraint sees a value it can reason about"
         )
 
     def test_the_volume_resolver_guards_what_the_price_resolver_does_not(self) -> None:
@@ -107,25 +133,25 @@ class TestExecutionPriceIsWeakerThanVolume:
             )
 
 
-class TestLiveExecutionAcceptsAnyPriceAtAll:
-    """The model that persists the resolver's output constrains nothing.
+class TestLiveExecutionRefusesImpossiblePrices:
+    """The model now constrains what no broker can legitimately report for a fill.
 
-    `LiveExecution.actual_price` is a bare `float` with empty field metadata, so it accepts
-    `0.0`, a negative price, `NaN` and `inf` alike. Measured with a complete, otherwise-valid
-    instance, so this is the price field being permissive and not some other required field
-    masking it.
+    `LiveExecution.actual_price` used to be a bare `float`, accepting `0.0`, a negative price,
+    `NaN` and `inf` alike, so the resolver's output went straight to the database. It is now
+    `Field(ge=0, allow_inf_nan=False)`.
 
-    That closes the loop with `TestExecutionPriceIsWeakerThanVolume`: the resolver can emit a
-    zero, a negative or a NaN, and the model will store any of them. The only thing standing
-    between a broker payload and a poisoned `live_executions` row is the truthiness test in the
-    resolver - which is exactly the check that NaN passes.
+    The distinction is deliberate and is the whole point:
 
-    No live row is affected today: all 3 rows in production have `actual_price` between 1.13978
-    and 261.7, with none null or <= 0. So this is latent, not realised.
+    - **Rejected** - negative, `NaN`, `+/-inf`. None of these is a price any broker can report
+      for a fill, so rejecting them cannot reject a real execution.
+    - **Still accepted** - `0.0`. Not because zero is a price, but because it is
+      `_resolve_execution_price`'s "could not be read" sentinel: `executionPrice` is a protobuf
+      double *with presence* whose unset value is `0.0`, so an omitted price arrives as zero.
+      Whether such a row should be refused, flagged or stored is the open half of backlog item 10
+      and needs the broker's behaviour, which is not knowable from here.
 
-    Pinned rather than fixed. A constraint here is the fix, and adding one is a decision about
-    what should happen to an execution whose price cannot be read - reject the row, record it
-    with a flag, or substitute the signal's intended price. That is backlog item 10.
+    So this closes the impossible values and deliberately leaves the ambiguous one. No live row is
+    affected either way: all 3 production rows have `actual_price` between 1.13978 and 261.7.
     """
 
     @staticmethod
@@ -142,19 +168,34 @@ class TestLiveExecutionAcceptsAnyPriceAtAll:
         }
 
     @pytest.mark.parametrize(
-        "bad", [0.0, -1.5, float("nan"), float("inf")], ids=["zero", "negative", "nan", "inf"]
+        "bad", [-1.5, float("nan"), float("inf"), float("-inf")],
+        ids=["negative", "nan", "inf", "-inf"],
     )
-    def test_the_model_stores_any_price_KNOWN_UNCONSTRAINED(self, bad: float) -> None:
+    def test_the_model_refuses_an_impossible_price(self, bad: float) -> None:
         from shared.models import LiveExecution
 
         payload = self._base()
         payload["actual_price"] = bad
-        execution = LiveExecution(**payload)
-        stored = execution.actual_price
-        assert stored == bad or (bad != bad and stored != stored), (
-            f"actual_price={bad!r} is now rejected or altered (stored {stored!r}); the model has "
-            "gained a constraint, so this file's argument about the unguarded persistence is "
-            "obsolete and backlog item 10 should be revisited"
+        with pytest.raises(Exception) as caught:
+            LiveExecution(**payload)
+        assert "actual_price" in str(caught.value), (
+            f"actual_price={bad!r} was rejected for an unrelated reason: {caught.value}"
+        )
+
+    def test_the_model_still_accepts_the_unreadable_sentinel(self) -> None:
+        """Zero is the open decision, so it must still pass - for now.
+
+        If this fails, the constraint has been tightened past what the evidence supports, or the
+        open half of backlog item 10 has been decided somewhere. Either way the backlog entry and
+        this test need to change together.
+        """
+        from shared.models import LiveExecution
+
+        payload = self._base()
+        payload["actual_price"] = 0.0
+        assert LiveExecution(**payload).actual_price == 0.0, (
+            "a zero price is now refused. That is the decision backlog item 10 has been waiting "
+            "for - do not let it arrive by accident."
         )
 
     def test_the_field_declares_no_constraint_at_all(self) -> None:
@@ -162,12 +203,9 @@ class TestLiveExecutionAcceptsAnyPriceAtAll:
         from shared.models import LiveExecution
 
         field = LiveExecution.model_fields["actual_price"]
-        # Emptiness, not a specific container: pydantic represents "no constraints" as a falsy
-        # metadata value whose type has changed between versions (dict vs list), so asserting
-        # `== {}` would fail on a version bump rather than on a real constraint appearing.
-        assert not field.metadata, (
-            f"actual_price now carries metadata {field.metadata!r}, so a constraint has been "
-            "added; update this test and backlog item 10 together"
+        assert field.metadata, (
+            "actual_price carries no constraints again, so impossible prices are persistable; "
+            "update this test and backlog item 10 together"
         )
         assert field.annotation is float, (
             f"actual_price is annotated {field.annotation!r} rather than float, which may be a "
@@ -1959,16 +1997,18 @@ class TestFillRecordResolution:
             "downstream and this test should be revisited"
         )
 
-    def test_a_negative_price_is_not_refused(self) -> None:
-        """The `if value:` check is truthiness, not positivity.
+    def test_a_negative_price_is_refused_rather_than_returned(self) -> None:
+        """Was `test_a_negative_price_is_not_refused`, which characterised the truthiness check.
 
-        A negative price is truthy, so it is returned as an execution price. This is
-        pinned so the truthiness check cannot be mistaken for a positivity check.
+        A negative price is truthy, so it used to be returned as an execution price and then
+        persisted. It now collapses onto the unreadable sentinel, like every other value a broker
+        cannot legitimately report for a fill. Kept as a test rather than deleted, because the
+        guard regressing back to `if value:` is exactly the mistake this file documents.
         """
         adapter = self._adapter()
         assert adapter._resolve_execution_price(
             order=None, deal=SimpleNamespace(executionPrice=-1.5)
-        ) == -1.5
+        ) == 0.0
 
     def test_the_deal_volume_wins_and_the_order_fallback_must_be_positive(self) -> None:
         adapter = self._adapter()

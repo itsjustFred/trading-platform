@@ -301,7 +301,23 @@ class LiveExecution(BaseModel):
 
     id: UUID = Field(default_factory=uuid4)
     signal_id: UUID
-    actual_price: float
+    # A fill price is finite and non-negative. `allow_inf_nan=False` rejects NaN and +/-inf and
+    # `ge=0` rejects a negative price - none of which any broker can legitimately report for a
+    # fill, so neither can reject a real one. Deliberately `ge` and not `gt`: zero is kept, because
+    # zero is not a price but this model's "could not be read" sentinel, and whether such a row
+    # should be refused is the open question below.
+    #
+    # NaN was the dangerous one: `if value:` is *true* for NaN, so it slipped past both the
+    # resolver's truthiness test and any downstream `> 0` guard, and one NaN row makes
+    # `avg(actual_price)` NaN while making `WHERE actual_price > x` silently skip that row.
+    #
+    # Zero is deliberately still accepted. It is not a price; it is `_resolve_execution_price`'s
+    # "could not be read" sentinel, produced when the broker sends no `executionPrice` at all
+    # (the field is a protobuf double *with presence* whose unset value is 0.0). Whether such a
+    # row should be refused, flagged, or stored as-is is the open question in backlog item 10,
+    # and answering it here would be guessing. Constraining the impossible values does not
+    # require that answer.
+    actual_price: float = Field(ge=0, allow_inf_nan=False)
     filled_qty: float
     commission: float
     timestamp: datetime

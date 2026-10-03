@@ -2838,13 +2838,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
+        """The best readable execution price, or 0.0 when none is readable.
+
+        Guarded exactly as `_resolve_filled_volume` three lines below: finite and positive. It
+        used to test truthiness alone, so it returned whatever the payload held - including a
+        negative price and NaN. NaN was the worse of the two, because `if value:` is *true* for
+        NaN: it did not even fall through to the order-level fallback, and no downstream `> 0`
+        guard would catch it either. One NaN row makes `avg(actual_price)` NaN and makes
+        `WHERE actual_price > x` silently skip that row.
+
+        0.0 remains the "could not be read" answer rather than an error. `executionPrice` is a
+        protobuf double *with presence* whose unset value is 0.0, so an omitted price and a
+        genuine zero arrive identically. Whether that row should be refused, flagged or stored is
+        the open decision in backlog item 10; this only stops the impossible values through.
+        """
         if deal is not None:
             value = _to_float(getattr(deal, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         if order is not None:
             value = _to_float(getattr(order, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         return 0.0
 
