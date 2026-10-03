@@ -441,3 +441,126 @@ class TestUnexpandedConfigReferencesAreRecorded:
             "is closed - in which case the decision was taken and should be recorded - or the "
             "tripwire is gone and nobody will notice the gap closing."
         )
+
+
+class TestAnUnclosedReferenceIsATypo:
+    r"""An unclosed `${` has no reading as text, which is what makes this decidable.
+
+    `assert_no_unexpanded_env` matches `\$\{[A-Za-z_][A-Za-z0-9_]*\}`, which insists on the
+    closing brace. So `${FOO` matched nothing, survived expansion, passed the guard, and delivered
+    its literal to a Discord `channel_id` — measured end to end. That is the silent mute #81
+    exists to prevent, reached by a route the existing pattern cannot see.
+
+    **The scope is deliberately one case.** `${}`, `${1BAD}` and `${9}` are also malformed, but
+    they were recorded as ambiguous — a config could plausibly contain them as text — and that
+    decision is left exactly as it was. An unclosed brace has no such reading.
+
+    **This is not the bare-form question.** Bare `$NAME` stays open (backlog item 4) because
+    `$USD` and `$SPX` collide with real currency codes and tickers. Unclosed bracing has no such
+    collision, which is why this could land without reopening it.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "${DISCORD_X",       # the form measured end to end
+            "${FOO",
+            "${FOO and more",    # unclosed, mid-sentence
+            "prefix ${DISCORD_BOT_X_CHANNEL_ID",
+            "${a.b}",            # unclosed *and* dotted - still an unclosed brace
+        ],
+    )
+    def test_an_unclosed_reference_is_rejected(self, text) -> None:
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError, match="Unclosed environment reference"):
+            assert_no_unexpanded_env({"channel_id": text})
+
+    def test_it_quotes_the_offending_token_rather_than_a_bare_brace(self) -> None:
+        """`${DISCORD_X` and `${FOO` are different typos; both reporting as `${` helps nobody."""
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env({"channel_id": "${DISCORD_X"})
+        assert "${DISCORD_X" in str(excinfo.value)
+
+    def test_the_message_asks_for_the_brace_not_for_the_variable(self) -> None:
+        """The operator's fix differs between the two failures, so the message must differ.
+
+        A well-formed `${FOO}` means *set the variable*. An unclosed `${FOO` means *you missed a
+        brace* — and nothing was expanded at all. Sending someone to the environment when the
+        answer is a missing character in the file in front of them wastes the one signal they get.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as unclosed:
+            assert_no_unexpanded_env({"channel_id": "${FOO"})
+        with pytest.raises(ValueError) as unexpanded:
+            assert_no_unexpanded_env({"channel_id": "${FOO}"})
+
+        assert "closing brace" in str(unclosed.value)
+        assert "Unclosed" not in str(unexpanded.value), (
+            "a well-formed unset reference is being reported as unclosed; the two failures have "
+            "different fixes and must not be conflated"
+        )
+        assert "set them via environment" in str(unexpanded.value)
+
+    @pytest.mark.parametrize(
+        "text",
+        ["${}", "${1BAD}", "${9}", "${ VAR}", "${VAR-NAME}"],
+    )
+    def test_the_recorded_ambiguous_forms_are_still_left_alone(self, text) -> None:
+        """The prior decision stands, and this pins it from the new pattern's side.
+
+        A guard widened for one typo must not quietly take the neighbouring cases with it. If one
+        of these ever starts being rejected, that is a decision to make on purpose.
+
+        Note that all five are *closed*. `${a.b}` is not in this list even though a dot is not a
+        legal identifier character, because it has no closing brace either - and an unclosed brace
+        is the case this class is about, not the ambiguity the original entry recorded.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        assert_no_unexpanded_env({"text": text})
+
+    @pytest.mark.parametrize(
+        "text", ["$USD", "$SPX", "$5", "100$", "costs $USD per month", "pnl in $GBP", "$", "SPY"]
+    )
+    def test_a_literal_dollar_amount_is_still_accepted(self, text) -> None:
+        """Zero false positives is why this is safe to land.
+
+        Measured on this system: 0 of the 7 live deployments contain a `$` in any column, all 4
+        references in the operator-facing template are well-formed and braced, and 0 of the 27
+        active `.accounts.env` values contain one.
+        """
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        assert_no_unexpanded_env({"note": text})
+
+    def test_the_bare_form_is_still_untouched(self) -> None:
+        """Item 4's open one-bit question survives this untouched, so narrowing it later is deliberate."""
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        assert_no_unexpanded_env({"channel_id": "$DISCORD_X"})
+
+    def test_a_well_formed_reference_that_expanded_leaves_nothing_behind(self) -> None:
+        """The guard runs *after* expansion, so a resolved reference must not trip it."""
+        from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
+
+        assert_no_unexpanded_env({"channel_id": _expand_env_value("${SET_VAR}", {"SET_VAR": "123"})})
+
+    def test_the_unclosed_case_is_found_at_depth(self) -> None:
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError, match="Unclosed environment reference"):
+            assert_no_unexpanded_env({"deployments": [{"signal_config": {"ids": ["${A"]}}]})
+
+    def test_several_unclosed_references_are_all_reported(self) -> None:
+        """An operator fixing a config should see every one of them at once."""
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env({"a": "${ONE", "b": ["${TWO", "${THREE"]})
+        message = str(excinfo.value)
+        for name in ("${ONE", "${TWO", "${THREE"):
+            assert name in message, f"{name} missing from {message!r}"

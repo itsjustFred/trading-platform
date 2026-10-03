@@ -15,6 +15,19 @@ from shared.models import LiveAccountConfig, LiveDeploymentConfig
 logger = get_logger("live-runner")
 
 _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# The existing pattern insists on the closing brace, so an *unclosed* reference is invisible to
+# it. Measured: `${FOO` survived expansion, passed this guard, and delivered its literal to a
+# Discord channel_id - which is the silent mute #81 exists to prevent.
+#
+# The scope is deliberately narrow. `${}`, `${1BAD}` and `${9}` are also malformed, but they were
+# recorded as ambiguous - a config could plausibly contain them as text - and that decision is
+# left alone. An unclosed brace has no such reading: there is no text that is `${FOO`. Requiring
+# the identifier run to end at a boundary keeps a hyphen out of it too, so `${VAR-NAME}` is still
+# not this pattern's business.
+#
+# Bare `$NAME` remains the separate, still-open question (backlog item 4), because `$USD` and
+# `$SPX` collide with real currency codes and tickers.
+_UNCLOSED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?=$|[^\w}-])")
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
@@ -79,6 +92,7 @@ def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment co
     — that is a startup error, never a silent mute.
     """
     leftovers: list[str] = []
+    malformed: list[str] = []
 
     def _walk(node: Any) -> None:
         if isinstance(node, dict):
@@ -90,8 +104,16 @@ def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment co
         elif isinstance(node, str):
             for match in _UNEXPANDED_ENV_PATTERN.findall(node):
                 leftovers.append(match)
+            for match in _UNCLOSED_ENV_PATTERN.findall(node):
+                malformed.append(match)
 
     _walk(payload)
+    if malformed:
+        raise ValueError(
+            f"Unclosed environment reference(s) {sorted(set(malformed))} in {context}: a '$' "
+            "followed by '{' is always meant to be a reference, and this one has no closing "
+            "brace. Add the '}' rather than setting a variable - nothing was expanded."
+        )
     if leftovers:
         raise ValueError(
             f"Unexpanded environment reference(s) {sorted(set(leftovers))} in "
