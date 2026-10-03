@@ -628,3 +628,129 @@ def test_known_session_parsing_divergence_pending_decision(label: str, session: 
         f"needs-decision entry in /home/ubuntu/perma-runner/notes/backlog.md to "
         f"match; do not delete this test."
     )
+
+
+class TestMalformedAndAbsentSessionsStoppedSharingAValue:
+    """Item 7's decidable half: make the difference *observable*, and decide nothing.
+
+    `validate._session_window` returned `None` for three distinct situations - nothing configured,
+    a value with no `start`/`end` separator, and a clock that would not parse - so the caller could
+    not tell them apart. That matters because for equity-like assets the caller does not merely
+    shrug at `None`: it substitutes an *observed* window, so a configured session that never parsed
+    was silently replaced by a guess. `auto_download._parse_session_clock` raises for the same
+    inputs, so the two copies disagreed about what malformed means.
+
+    A sentinel separates the cases without choosing a policy. The caller still maps malformed to
+    exactly today's behaviour, so no gap classification changes and the mislabelling pin above
+    stays valid - what changes is that the difference is now visible, and that the substitution is
+    logged instead of silent.
+    """
+
+    @staticmethod
+    def _window(value):
+        from data_tools.validate import _session_window
+
+        return _session_window(value)
+
+    @pytest.mark.parametrize(
+        "value", ["25:00-23:00", "abc-def", "09:30", ("09:30", "bad"), {"start": "bad", "end": "16:00"}]
+    )
+    def test_a_configured_but_unparseable_session_is_marked_malformed(self, value) -> None:
+        from data_tools.validate import MALFORMED_SESSION
+
+        assert self._window(value) is MALFORMED_SESSION, (
+            f"{value!r} is configured but unparseable, and is no longer distinguishable from an "
+            "absent session - so the substitution below is silent again"
+        )
+
+    @pytest.mark.parametrize("value", [None, "", {}, {"start": None, "end": None}])
+    def test_an_absent_session_is_still_absent_not_malformed(self, value) -> None:
+        """An empty configuration is not a broken one.
+
+        `{}` and `{"start": None, "end": None}` say nothing at all, and reporting them as typos
+        would train an operator to ignore this warning - which is the only reason it exists.
+        """
+        from data_tools.validate import MALFORMED_SESSION
+
+        assert self._window(value) is None, f"{value!r} is an absent session, not a malformed one"
+        assert self._window(value) is not MALFORMED_SESSION
+
+    @pytest.mark.parametrize(
+        "value", ["09:30-16:00", ("09:30", "16:00"), {"start": "09:30", "end": "16:00"}]
+    )
+    def test_a_valid_session_still_resolves_to_a_window(self, value) -> None:
+        assert self._window(value) == (570, 960)
+
+    def test_the_substitution_is_logged_rather_than_silent(self, caplog) -> None:
+        """The equity-like fallback is the case that matters: a guess replaces the user's value."""
+        import logging
+
+        import pandas as pd
+        from data_tools import validate
+
+        with caplog.at_level(logging.WARNING, logger="data_tools.validate"):
+            validate._gap_classification(
+                pd.Timestamp("2023-01-03 09:30", tz="UTC"),
+                pd.Timestamp("2023-01-04 09:30", tz="UTC"),
+                "equity", "1h", session="25:00-23:00", observed_session=(570, 960),
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "could not be parsed" in joined, (
+            f"a configured session that never parsed produced no warning: {joined!r}"
+        )
+        assert "replaced by an observed one" in joined, (
+            "the warning does not say the configured session was replaced by an observed one, which "
+            f"is the part that misleads triage: {joined!r}"
+        )
+
+    def test_the_warning_points_at_the_downloader_that_would_have_refused_it(self, caplog) -> None:
+        """The two copies disagree, so the log is the only place that says so."""
+        import logging
+
+        import pandas as pd
+        from data_tools import validate
+
+        with caplog.at_level(logging.WARNING, logger="data_tools.validate"):
+            validate._gap_classification(
+                pd.Timestamp("2023-01-03 09:30", tz="UTC"),
+                pd.Timestamp("2023-01-04 09:30", tz="UTC"),
+                "forex", "1h", session="abc-def", observed_session=None,
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "downloader" in joined, (
+            f"the warning does not mention that the downloader raises on this input: {joined!r}"
+        )
+        assert "replaced by an observed one" not in joined, (
+            "a non-equity asset has no observed fallback, so claiming one was substituted would be "
+            f"false: {joined!r}"
+        )
+
+    def test_a_valid_session_logs_nothing(self, caplog) -> None:
+        import logging
+
+        import pandas as pd
+        from data_tools import validate
+
+        with caplog.at_level(logging.WARNING, logger="data_tools.validate"):
+            validate._gap_classification(
+                pd.Timestamp("2023-01-03 09:30", tz="UTC"),
+                pd.Timestamp("2023-01-04 09:30", tz="UTC"),
+                "equity", "1h", session="09:30-16:00", observed_session=(570, 960),
+            )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a correctly-configured session warned; the warning has to stay rare to be read"
+        )
+
+    def test_the_downloader_still_raises_on_the_same_input(self) -> None:
+        """Unchanged on purpose: making the two copies agree is the open half of item 7."""
+        from data_tools.auto_download import _explicit_session_window
+
+        # Note the shape: the downloader takes the two clocks separately, and only parses them
+        # once both are present. A bare string in the first position is not parsed at all - it
+        # returns None without ever looking at it, which is why an earlier version of this test
+        # asserted a raise that could not happen.
+        with pytest.raises(ValueError):
+            _explicit_session_window(None, "25:00", "23:00")
+        with pytest.raises(ValueError):
+            _explicit_session_window(None, "bad", "16:00")
+        assert _explicit_session_window(None, "09:30", "16:00") == (570, 960)

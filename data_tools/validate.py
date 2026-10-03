@@ -76,6 +76,31 @@ def _utc_timestamp(value: object) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
+class _MalformedSession:
+    """A session was configured but could not be parsed. Not the same thing as *absent*.
+
+    `_session_window` used to return `None` for both, from three distinct causes: nothing was
+    configured, the value had no `start`/`end` separator, or a clock would not parse. The caller
+    could not tell them apart - and for equity-like assets it does not merely shrug, it substitutes
+    an *observed* window, so a configured session that never parsed was being silently replaced by
+    a guess. `data_tools/auto_download.py::_parse_session_clock` raises for the same inputs, so the
+    two copies disagreed about what malformed means.
+
+    This sentinel separates them without deciding anything: the caller below still maps malformed
+    to exactly today's behaviour, so no gap classification changes and the mislabelling pin stays
+    valid. What changes is that the difference is now *observable*, which is the precondition for
+    anyone choosing a policy. Backlog item 7.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "<malformed session>"
+
+
+MALFORMED_SESSION = _MalformedSession()
+
+
 def _parse_session_clock(value: object) -> int | None:
     if value is None:
         return None
@@ -90,7 +115,12 @@ def _parse_session_clock(value: object) -> int | None:
     return int(parsed.hour * 60 + parsed.minute)
 
 
-def _session_window(value: object) -> tuple[int, int] | None:
+def _session_window(value: object) -> tuple[int, int] | None | _MalformedSession:
+    """Resolve a session to `(start_minutes, end_minutes)`.
+
+    Returns `None` when **no** session was configured, `MALFORMED_SESSION` when one was configured
+    but could not be parsed, and the window otherwise. The three cases used to share `None`.
+    """
     if value is None:
         return None
     if isinstance(value, Mapping):
@@ -101,15 +131,18 @@ def _session_window(value: object) -> tuple[int, int] | None:
     else:
         text = str(value).strip()
         if not text:
+            # An empty string is an *empty* configuration, not a broken one.
             return None
         separator = "-" if "-" in text else (" to " if " to " in text else None)
         if separator is None:
-            return None
+            return MALFORMED_SESSION
         start, end = text.split(separator, 1)
+    if start is None and end is None:
+        return None
     start_minutes = _parse_session_clock(start)
     end_minutes = _parse_session_clock(end)
     if start_minutes is None or end_minutes is None:
-        return None
+        return MALFORMED_SESSION
     if end_minutes <= start_minutes:
         end_minutes += 1440
     return start_minutes, end_minutes
@@ -251,6 +284,24 @@ def _gap_classification(
     if session_value is None and isinstance(calendar, Mapping):
         session_value = calendar.get("session", calendar.get("trading_session"))
     resolved_session = _session_window(session_value)
+    if resolved_session is MALFORMED_SESSION:
+        # Preserved deliberately: a malformed session still behaves as no session, so every gap
+        # classification is unchanged and the mislabelling pin stays valid. What is new is that
+        # the substitution below is no longer silent - and for equity-like assets it *is* a
+        # substitution, because an observed window is used in its place.
+        logger.warning(
+            "Configured trading session %r could not be parsed, so it is being treated as if no "
+            "session were configured%s. The downloader raises on the same input, so this config "
+            "would fail at download time - which is worth knowing before triaging a coverage "
+            "warning as missing market data.",
+            session_value,
+            (
+                " and replaced by an observed one"
+                if normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES
+                else ""
+            ),
+        )
+        resolved_session = None
     if resolved_session is None and normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
         resolved_session = observed_session
     holiday_value = holidays
