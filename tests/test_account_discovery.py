@@ -1070,6 +1070,132 @@ class TestCtraderNameAndBalanceExtraction:
             "changed - check whether the broker can actually send it before relying on it"
         )
 
+    def test_the_range_guard_admits_the_zero_that_or_two_makes_unreachable(self) -> None:
+        """**The next line contradicts the one above it.** Pinned, because it answers the
+        backlog's open broker-behaviour question from the code's own intent.
+
+        The line after the `or 2` is:
+
+            scale = 10**money_digits if 0 <= money_digits <= 12 else 100
+
+        `0 <= money_digits` **explicitly admits zero** as a legitimate decimal count, and would
+        scale by `10**0 == 1`, i.e. no scaling at all - which is exactly what a 0-decimal
+        account needs. So the author who wrote that bound already decided that zero is a real
+        value, and the `or 2` three lines above makes it unreachable. The acceptance of zero in
+        the guard is dead code.
+
+        The backlog had recorded "whether `0` can occur is a broker-behaviour question", and
+        proposed that if the human confirms it cannot, the fix is to make the intent explicit.
+        That resolution is unnecessary: the intent *is* explicit here, and it says zero is valid.
+        """
+        for money_digits, admitted in ((0, True), (2, True), (12, True), (13, False), (-1, False)):
+            assert (0 <= money_digits <= 12) is admitted, (
+                f"the range guard's verdict on money_digits={money_digits} changed, so its "
+                "agreement with `or 2` about zero has changed - re-measure item 6"
+            )
+        assert 0 <= 0 <= 12, (
+            "the range guard no longer admits zero, so the self-contradiction this documents "
+            "has been resolved one way or the other - update this test and item 6 together"
+        )
+
+        # And the consequence, measured: a 0-decimal balance comes out 100x too small.
+        from live_runner.account_discovery import _trader_balance
+
+        raw = 1_234_567
+        assert _trader_balance(SimpleNamespace(moneyDigits=0, balance=raw)) == pytest.approx(
+            raw / 100
+        ), "moneyDigits=0 is now honoured; the 100x mis-scale no longer reproduces"
+        assert _trader_balance(SimpleNamespace(moneyDigits=0, balance=raw)) != pytest.approx(
+            float(raw)
+        ), "moneyDigits=0 now leaves the balance unscaled, which is the fix - item 6 can close"
+
+    def test_an_omitted_money_digits_reaches_the_function_as_zero(self) -> None:
+        """`or 2` cannot tell "zero decimal places" from "the broker sent nothing".
+
+        `ProtoOATrader.moneyDigits` is a `uint32` **with presence**, so an unset field reads as
+        `0` rather than `None` - verified against the installed protos. Which means the two cases
+        the guard is meant to distinguish arrive at `getattr(..., "moneyDigits", 2)` as the *same*
+        value, and `or 2` collapses them together with a third: a genuine `None`.
+
+        Pinned on the real message type, so this is a fact about the wire format rather than a
+        guess. The consequence is that "honour zero" is not a one-line change either: honouring a
+        real zero means also deciding what an *omitted* field should mean, and the answer is
+        different for a 0-decimal account than for a broker that stopped sending the field.
+        """
+        mod = pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what establish the unset-value behaviour",
+        )
+        field = mod.ProtoOATrader.DESCRIPTOR.fields_by_name["moneyDigits"]
+        assert field.has_presence, (
+            "moneyDigits no longer has presence, so an unset field would read as the declared "
+            "default rather than 0 and this reasoning needs redoing"
+        )
+
+        omitted = mod.ProtoOATrader()
+        omitted.balance = 1_234_567
+        assert omitted.HasField("moneyDigits") is False
+        assert omitted.moneyDigits == 0, (
+            "an unset moneyDigits no longer reads as 0, so 'omitted' and 'zero decimal places' "
+            "are distinguishable and the ambiguity item 6 rests on has changed shape"
+        )
+
+        from live_runner.account_discovery import _trader_balance
+
+        explicit_zero = SimpleNamespace(moneyDigits=0, balance=1_234_567)
+        assert _trader_balance(omitted) == _trader_balance(explicit_zero), (
+            "an omitted moneyDigits and an explicit 0 no longer produce the same balance, so "
+            "the two cases are now distinguishable - item 6's options have changed"
+        )
+
+    def test_both_copies_of_the_balance_scaling_are_identical(self) -> None:
+        """There are two copies of this line, and fixing one must not leave the other behind.
+
+        `_trader_balance` in `account_discovery.py:296` and the inline computation in
+        `ctrader_adapter.py:2356` carry the same `int(getattr(trader, "moneyDigits", 2) or 2)` and
+        the same `0 <= money_digits <= 12` guard. They were found separately and neither imports
+        the other, so a fix applied to one leaves the other with the old behaviour and no test
+        failure - the adapter path is the one that runs on every reconcile.
+
+        Asserted at source level because the two functions are not reachable from one test
+        without standing up a live session.
+        """
+        root = Path(__file__).resolve().parents[1]
+        needle = 'int(getattr(trader, "moneyDigits", 2) or 2)'
+        guard = "0 <= money_digits <= 12"
+
+        # Scan the tree rather than checking two known paths. Checking the two paths makes
+        # `len(found) == 2` vacuous - `found` is built by iterating a literal 2-tuple, so it
+        # can never fail, and a mutation to `>=` survived because of it. A third copy of this
+        # scaling is exactly the failure this test exists to catch, so the count has to come
+        # from somewhere that can disagree.
+        carriers = {}
+        for path in sorted(root.rglob("*.py")):
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith("tests/") or "__pycache__" in rel:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            n_needle, n_guard = text.count(needle), text.count(guard)
+            if n_needle or n_guard:
+                carriers[rel] = (n_needle, n_guard)
+
+        assert sorted(carriers) == [
+            "live_runner/account_discovery.py",
+            "live_runner/ctrader_adapter.py",
+        ], (
+            "the moneyDigits scaling is no longer carried by exactly those two files: "
+            f"{sorted(carriers)}. Either a copy was added - which would need the same fix - "
+            "or one was consolidated, in which case this list should be updated deliberately."
+        )
+        for rel, (n_needle, n_guard) in carriers.items():
+            assert n_needle == 1, (
+                f"{rel} now contains {n_needle} copies of the moneyDigits collapse "
+                f"({needle!r}); one of them has been changed without the other"
+            )
+            assert n_guard == 1, (
+                f"{rel} now contains {n_guard} copies of the range guard ({guard!r})"
+            )
+
     @pytest.mark.parametrize("money_digits", [None, 13, 20, -1, -5])
     def test_an_unusable_money_digits_count_falls_back_to_two(self, money_digits) -> None:
         """Out of range falls back to the conventional 2, rather than scaling by nonsense.
