@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -3779,4 +3780,74 @@ class TestConnectFailureClassificationInProduction:
         assert len({tuple(auth), tuple(timeout), tuple(response), tuple(generic)}) == 4, (
             "two branches produced the same message, so an operator cannot tell the four "
             "causes apart"
+        )
+
+
+class TestTheDegenerateDedupeKeyIsLoud:
+    """The collision in item 1 cannot be fixed without a trading decision, but it can stop
+    being silent.
+
+    Two equal-sized fills on one order build the same key when the broker sends neither a deal
+    id nor a timestamp, and the second is dropped as a "duplicate" that was not one - leaving
+    the position short, with a log line arguing against that conclusion.
+
+    Replacing the key is a behaviour change on the live fill path and was left to a human. What
+    needed no decision is that the degenerate case should be *remarked*: the log is where the
+    evidence for that decision comes from, exactly as the zero-decimal log was for item 6.
+    """
+
+    @staticmethod
+    def _adapter():
+        return CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+
+    def test_a_fill_with_no_deal_id_and_no_timestamp_warns(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            self._adapter()._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=123, timestamp_ms=0, filled_volume=500.0
+            )
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("neither a deal id nor a timestamp" in m for m in messages), (
+            "a fill that cannot be identified is passing unremarked; this is the one moment the "
+            f"evidence for the item 1 decision can be gathered, and it logged {messages!r}"
+        )
+
+    def test_the_warning_names_the_order_and_volume_that_decide_the_key(self, caplog) -> None:
+        """The two fields are the whole collision surface, so they must be in the log line."""
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            self._adapter()._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=77, timestamp_ms=0, filled_volume=12.5
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "77" in joined and "12.5" in joined, (
+            f"the warning does not say which order and volume collide the key: {joined!r}"
+        )
+
+    def test_a_real_deal_id_is_not_warned_about(self, caplog) -> None:
+        """The overwhelmingly common path must stay quiet, or the warning is worthless."""
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            key = self._adapter()._build_dedupe_key(
+                SimpleNamespace(dealId=26533115), order_id=1, timestamp_ms=0, filled_volume=1.0
+            )
+        assert key == "ctrader:deal:26533115"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a fill carrying a real deal id warned; the key cannot collide when the broker "
+            "supplies the one field that makes it unique"
+        )
+
+    def test_a_missing_deal_id_with_a_real_timestamp_is_not_warned_about(self, caplog) -> None:
+        """No deal id alone does not collide.
+
+        The key still carries a millisecond timestamp and a volume, so two distinct fills would
+        have to agree to the millisecond *and* to the volume. Warning here would be crying wolf
+        at a case the evidence says is fine.
+        """
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            key = self._adapter()._build_dedupe_key(
+                SimpleNamespace(dealId=0), order_id=9, timestamp_ms=1757000000123,
+                filled_volume=3.0,
+            )
+        assert key == "ctrader:order:9:1757000000123:3.0"
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "warned for a deal-id-less fill that still carries a millisecond timestamp; the "
+            "collision needs *both* to be missing"
         )

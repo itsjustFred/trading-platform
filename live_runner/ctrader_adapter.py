@@ -2955,6 +2955,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         deal_id = int(getattr(deal, "dealId", 0) or 0) if deal is not None else 0
         if deal_id > 0:
             return f"ctrader:deal:{deal_id}"
+        if not timestamp_ms:
+            # Loud on purpose. Without a deal id *and* without a usable timestamp the key is
+            # decided entirely by order and volume, so two equal-sized fills on one order build
+            # the same key and the second is dropped as a "duplicate" that was not one - the
+            # position goes short and the log argues against that conclusion.
+            #
+            # The neighbouring fields in this path all refuse to guess: a non-positive volume is
+            # rejected, an unresolvable symbol is rejected. This key was the only one that
+            # degraded silently. Which policy replaces it is a trading decision, so nothing here
+            # changes the key - but the degenerate case can no longer pass unremarked, so the
+            # evidence for that decision arrives on its own. Backlog item 1.
+            logger.warning(
+                "cTrader fill has neither a deal id nor a timestamp, so its dedupe key is "
+                "decided only by order %s and volume %s. Two equal-sized fills on this order "
+                "would collide and the second would be dropped as a duplicate that was not one.",
+                order_id or "<none>",
+                filled_volume,
+            )
         return f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
 
     def _requeue_execution_event(self, event: Any) -> bool:
