@@ -499,8 +499,14 @@ def test_both_signal_processors_compute_the_same_atr() -> None:
 # returns `None` either way, its caller at :254 substitutes an observed session
 # only for equity-like assets, and :266 then skips the whole
 # session/holiday/weekend/overnight classification. For forex, metals and crypto a
-# configured session can therefore stop being applied to the coverage check with
-# nothing recorded - the silent-failure signature this branch has been removing.
+# configured session therefore stops being applied to the coverage check, so the same
+# gap is labelled "data" instead of "session".
+#
+# > **Corrected 2026-10-03: that is a mislabelling, not a silence.** `"session"` is
+# > not in `_EXPECTED_GAP_CLASSIFICATIONS` (`validate.py:69`), so a gap inside a valid
+# > session is *already* reported; the malformed case is reported too, just under a
+# > different label. The harm is triage in the wrong direction, not a hidden problem.
+# > See `test_a_malformed_session_mislabels_a_gap_rather_than_silencing_it`.
 #
 # **This test asserts the divergence exists.** That is deliberate, and it is the
 # point: the alternative was no pin at all, where fixing one copy would leave the
@@ -520,6 +526,68 @@ _SESSION_CASES = [
     ("one side malformed", {"start": "09:30", "end": "oops"}),
     ("reversed", {"start": "16:00", "end": "09:30"}),
 ]
+
+
+@pytest.mark.parametrize(
+    ("label", "session"),
+    [("malformed hour", {"start": "25:00", "end": "23:00"}),
+     ("malformed text", {"start": "abc", "end": "def"})],
+    ids=["malformed hour", "malformed text"],
+)
+def test_a_malformed_session_mislabels_a_gap_rather_than_silencing_it(label, session) -> None:
+    """**Correction to the comment above: this is a mislabelling, not a silent failure.**
+
+    That comment said a configured session "can therefore stop being applied to the coverage
+    check with nothing recorded - the silent-failure signature". Measured, it does not. The
+    classification only decides the *label*:
+
+        _EXPECTED_GAP_CLASSIFICATIONS == {"overnight", "weekend", "holiday"}
+
+    `"session"` is **not** in that set, so a gap inside a correctly-configured session is already
+    reported as unexpected. With a malformed session the same gap is classified `"data"` instead -
+    still reported, still counted in `unexpected_gaps`, still producing the
+    `"N data gaps detected"` warning at `validate.py:636`. Verified against a real week-wide gap:
+    valid session -> `"session"`, malformed -> `"data"`, both reported.
+
+    So the failure direction is the opposite of what the comment claimed. The practical harm is
+    **triage in the wrong direction**: a reader sees missing-data warnings caused by their own
+    session typo and goes looking for a market-data problem. Still worth fixing - the two copies
+    should agree - but it is a noise-and-confusion bug, not a silent one, and treating it as urgent
+    on the strength of "nothing recorded" would itself be a misdiagnosis.
+
+    Pinned so the direction cannot be restated wrongly. If a future change makes a malformed
+    session *suppress* a report, the last assertion fails - and that genuinely would be a silent
+    failure, worth fixing rather than reassuring.
+    """
+    import pandas as pd
+    from data_tools import validate
+
+    gap_start = pd.Timestamp("2023-01-03 00:00", tz="UTC")
+    gap_end = pd.Timestamp("2023-01-14 00:00", tz="UTC")
+
+    mislabelled = validate._gap_classification(gap_start, gap_end, "fx", "1h", session=session)
+    correctly_labelled = validate._gap_classification(
+        gap_start, gap_end, "fx", "1h", session={"start": "09:30", "end": "16:00"}
+    )
+    assert mislabelled == "data", (
+        f"a malformed session now classifies as {mislabelled!r} rather than 'data'; the comment "
+        "this test corrects describes the failure direction and must be updated with it"
+    )
+    assert correctly_labelled == "session", (
+        f"a valid session now classifies as {correctly_labelled!r}, so this test's premise - "
+        "that only the label differs - no longer holds"
+    )
+    expected = validate._EXPECTED_GAP_CLASSIFICATIONS
+    assert "session" not in expected and "data" not in expected, (
+        f"_EXPECTED_GAP_CLASSIFICATIONS changed to {sorted(expected)}; if 'session' is now "
+        "expected then a valid session IS silenced, and whether a malformed one is too becomes "
+        "the thing to measure - re-read this test before trusting it"
+    )
+    assert mislabelled not in expected, (
+        "a malformed session is now classified as an EXPECTED gap, so it IS silently skipped - "
+        "that is the silent failure the old comment predicted, and it now needs fixing rather "
+        "than reassuring"
+    )
 
 
 @pytest.mark.parametrize(
