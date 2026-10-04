@@ -40,7 +40,13 @@ TIMEFRAME_MAP = {
     "1h": "1h",
     "4h": "4h",
     "1d": "1D",
-    "1w": "1W",
+    # `W-MON`, not `1W`. They are the same frequency but not the same *labelling*: `1W` is
+    # W-SUN **right-closed**, so pandas labels a weekly bar with the Sunday its week *ends* on.
+    # `shared/market_calendar.py` states the rule this repo works to - "A bar's timestamp is the
+    # *start* of the interval it summarises" - and says a weekly bar is "stamped on Monday".
+    # `live_runner/signal_sources/execution_timing.py::_next_candle_close` anchors weeks on
+    # Monday for the same reason. `1W` was the single outlier on all three counts.
+    "1w": "W-MON",
 }
 
 # Ordering for validation (lower index = smaller timeframe)
@@ -110,7 +116,15 @@ def resample_with_origin(
     frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True)
     frame = frame.set_index(timestamp_col).sort_index()
     had_zero_volume_flag = "zero_volume_bar" in frame.columns
-    resampled = frame.resample(rule, origin=origin).agg(
+    # `label`/`closed` are pinned rather than left to pandas, because the defaults are *per
+    # frequency*: intraday and daily offsets default to left/left, while weekly, monthly, quarterly
+    # and yearly default to right/right. Left alone, this one function labelled daily bars by
+    # their first day and weekly bars by their last - so a daily bar and a weekly bar in the same
+    # frame could not be read with the same expression, against the documented rule above.
+    #
+    # Measured: forcing left/left is bit-identical for 1min/5min/15min/30min/1h/4h/1D. Only `1w`
+    # changes, which is the point.
+    resampled = frame.resample(rule, origin=origin, label="left", closed="left").agg(
         _aggregation_for([str(column) for column in frame.columns])
     )
     if had_zero_volume_flag:
@@ -122,7 +136,9 @@ def resample_with_origin(
             )
         else:
             resampled["zero_volume_bar"] = (
-                frame[["zero_volume_bar"]].resample(rule, origin=origin).min()
+                frame[["zero_volume_bar"]]
+                .resample(rule, origin=origin, label="left", closed="left")
+                .min()
             )
     empty_buckets = int(resampled["open"].isna().sum()) if "open" in resampled else 0
     if empty_buckets:
