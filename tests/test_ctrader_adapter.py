@@ -4003,3 +4003,134 @@ class TestAnUnnamedStatusLeavesARecoverableFingerprint:
             "arrives as, and the detection keys on it"
         )
         assert int(unknown[0].data) == 6
+
+
+class TestAnExplicitlySentZeroPriceIsDistinguishable:
+    """Item 10's remaining ambiguity did not exist.
+
+    The backlog recorded that the decision about a zero execution price "needs the broker's
+    behaviour, which is not knowable from here", and gave a reason: `executionPrice` is a protobuf
+    double *with presence* whose unset value is `0.0`, "so an omitted price and a genuine zero
+    arrive identically".
+
+    Those two clauses contradict each other, and `optional double` settles it — the field really
+    does carry presence:
+
+        unset        -> HasField=False, value 0.0
+        set 0.0      -> HasField=True,  value 0.0
+
+    So the two cases *are* separable, and the blocker was an assumption rather than a limit. This
+    detects which one occurred and logs it. **The returned value is unchanged** — whether such a
+    row should be refused, flagged or corrected is still a trading decision, and one test pins that
+    the detection has not quietly become one.
+    """
+
+    @staticmethod
+    def _protos():
+        return pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what make presence meaningful",
+        )
+
+    @staticmethod
+    def _deal(explicit_zero: bool):
+        mod = TestAnExplicitlySentZeroPriceIsDistinguishable._protos()
+        deal = mod.ProtoOADeal()
+        deal.dealId = 7
+        if explicit_zero:
+            deal.executionPrice = 0.0
+        return deal
+
+    def test_the_presence_that_separates_the_cases_is_the_one_the_protos_actually_have(self) -> None:
+        """Name the guarantee, so a proto build that drops `optional` fails here.
+
+        Without presence, an omitted price and a sent zero are the same number and the detection
+        becomes a no-op - which is exactly the state the backlog believed was already true.
+        """
+        mod = self._protos()
+        field = mod.ProtoOADeal.DESCRIPTOR.fields_by_name["executionPrice"]
+        assert field.has_presence, (
+            "executionPrice no longer carries presence, so an omitted price and a sent zero are "
+            "again indistinguishable and this class's premise is gone - re-measure before trusting "
+            "the warning"
+        )
+        assert self._deal(explicit_zero=True).HasField("executionPrice") is True
+        assert self._deal(explicit_zero=False).HasField("executionPrice") is False
+
+    def test_a_deal_that_sent_zero_is_reported_as_having_spoken(self) -> None:
+        order = self._protos().ProtoOAOrder()
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(order, self._deal(True)) == ["deal"]
+
+    def test_a_deal_that_sent_nothing_is_not(self) -> None:
+        order = self._protos().ProtoOAOrder()
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(order, self._deal(False)) == []
+
+    def test_a_real_price_is_never_reported(self) -> None:
+        mod = self._protos()
+        deal = mod.ProtoOADeal()
+        deal.executionPrice = 261.7
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(mod.ProtoOAOrder(), deal) == []
+
+    def test_the_warning_names_which_source_sent_the_zero(self, caplog) -> None:
+        """A reader needs to know it was the deal and not the order to act on it."""
+        mod = self._protos()
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            CTraderLiveAdapter._resolve_execution_price(
+                order=mod.ProtoOAOrder(), deal=self._deal(True)
+            )
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "on the deal" in joined, f"the warning does not name the source: {joined!r}"
+        assert "actual_price=0" in joined, (
+            f"the warning does not say what the stored row will look like: {joined!r}"
+        )
+
+    def test_an_omitted_price_stays_silent(self, caplog) -> None:
+        """The warning must stay rare enough to be read.
+
+        A deal that sent no price at all is the pre-existing, already-characterised path. It is
+        still `0.0` and still an open question, but warning on it here would drown the one case
+        that looks like a real price and is not.
+        """
+        mod = self._protos()
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            CTraderLiveAdapter._resolve_execution_price(
+                order=mod.ProtoOAOrder(), deal=self._deal(False)
+            )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "an omitted price warned; only an explicitly-sent zero is the surprising case"
+        )
+
+    def test_a_resolvable_price_does_not_warn_even_when_the_deel_said_zero(self, caplog) -> None:
+        """The order-level fallback still wins, so the row is not poisoned and there is nothing
+        to report."""
+        mod = self._protos()
+        order = mod.ProtoOAOrder()
+        order.executionPrice = 261.7
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            price = CTraderLiveAdapter._resolve_execution_price(order=order, deal=self._deal(True))
+        assert price == pytest.approx(261.7)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "warned even though the order-level fallback produced a real price, so the row is fine"
+        )
+
+    def test_the_returned_value_is_unchanged_by_the_detection(self) -> None:
+        """Instrumentation only. The policy stays a human decision.
+
+        Both cases still resolve to 0.0 exactly as before. What changed is that the log can now say
+        which of the two produced it.
+        """
+        mod = self._protos()
+        for deal in (self._deal(True), self._deal(False)):
+            assert CTraderLiveAdapter._resolve_execution_price(
+                order=mod.ProtoOAOrder(), deal=deal
+            ) == 0.0
+
+    def test_a_non_proto_object_carries_no_opinion(self) -> None:
+        """The `SimpleNamespace` doubles used throughout these tests must not trip it.
+
+        Absence of the ability to ask is not evidence of a sent zero.
+        """
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(
+            None, SimpleNamespace(executionPrice=0.0)
+        ) == []
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(None, None) == []

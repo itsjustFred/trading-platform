@@ -2889,6 +2889,36 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
 
     @staticmethod
+    def _explicitly_sent_zero_prices(order: Any | None, deal: Any | None) -> list[str]:
+        """Which sources carried a price of exactly zero that the broker *did* send.
+
+        `executionPrice` is a proto3 `optional double`, so it has presence and an omitted field is
+        distinguishable from a field set to 0.0. Measured on the installed protos:
+
+            unset        -> HasField=False, value 0.0
+            set 0.0      -> HasField=True,  value 0.0
+
+        Only the second is interesting, because only the second looks like a price while being one.
+        Returns the names of the sources that spoke so the caller can log which; empty when nothing
+        was sent, or when the object cannot answer (`SimpleNamespace` doubles and other non-proto
+        objects), so the existing characterisation tests are unaffected. Backlog item 10.
+        """
+        sent: list[str] = []
+        for label, source in (("deal", deal), ("order", order)):
+            if source is None:
+                continue
+            has_field = getattr(source, "HasField", None)
+            if has_field is None:
+                continue
+            try:
+                present = bool(has_field("executionPrice"))
+            except (TypeError, ValueError):
+                continue
+            if present and _to_float(getattr(source, "executionPrice", 0.0)) == 0.0:
+                sent.append(label)
+        return sent
+
+    @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
         """The best readable execution price, or 0.0 when none is readable.
 
@@ -2899,10 +2929,25 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         guard would catch it either. One NaN row makes `avg(actual_price)` NaN and makes
         `WHERE actual_price > x` silently skip that row.
 
-        0.0 remains the "could not be read" answer rather than an error. `executionPrice` is a
-        protobuf double *with presence* whose unset value is 0.0, so an omitted price and a
-        genuine zero arrive identically. Whether that row should be refused, flagged or stored is
-        the open decision in backlog item 10; this only stops the impossible values through.
+        0.0 remains the "could not be read" answer rather than an error. What should happen to
+        such a row - refuse it, flag it, or store the signal's intended price - is the open
+        decision in backlog item 10, and it needs the broker's behaviour, which is not knowable
+        from here.
+
+        That decision was blocked on an ambiguity that turned out not to exist. The docstring here
+        used to say: "`executionPrice` is a protobuf double *with presence* whose unset value is
+        0.0, so an omitted price and a genuine zero arrive identically." Those two clauses
+        contradict each other, and the measurement settles which is wrong - `optional double` does
+        carry presence:
+
+            unset        -> HasField=False, value 0.0
+            set 0.0      -> HasField=True,  value 0.0
+            set 261.7    -> HasField=True,  value 261.7
+
+        So an omitted price and an explicitly-sent zero *are* distinguishable, and
+        `_explicitly_sent_zero_prices` now asks which one produced the 0.0 and says so. The value
+        returned is unchanged; this only makes the ambiguity visible, which is what lets the
+        remaining question be answered on evidence rather than by assumption.
         """
         if deal is not None:
             value = _to_float(getattr(deal, "executionPrice", 0.0))
@@ -2912,9 +2957,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             value = _to_float(getattr(order, "executionPrice", 0.0))
             if math.isfinite(value) and value > 0:
                 return value
+        sent_zeros = CTraderLiveAdapter._explicitly_sent_zero_prices(order, deal)
+        if sent_zeros:
+            # Loud on purpose. This is the one case a reader cannot otherwise notice: the broker
+            # stated a price, and stated it as zero, so nothing looks missing. Whether such a row
+            # should be refused, flagged or corrected is still a trading decision - but it cannot
+            # be made from a value that hides whether the broker spoke at all.
+            logger.warning(
+                "cTrader sent an execution price of exactly 0 on the %s, which this resolver reads "
+                "as 'could not be read' and returns as 0.0. The field was present, so this is not "
+                "an omitted price; if the row is stored as-is it will carry actual_price=0.",
+                " and the ".join(sent_zeros),
+            )
         return 0.0
 
-    @staticmethod
     @staticmethod
     def _honour_zero_money_digits() -> bool:
         """Whether a broker-sent `moneyDigits` of 0 is honoured. Default: no.
