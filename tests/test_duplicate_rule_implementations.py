@@ -494,10 +494,11 @@ def test_both_signal_processors_compute_the_same_atr() -> None:
 #   abc/def     (malformed)      MALFORMED_SESSION               ValueError
 #   16:00-09:30  (reversed)      (960, 2010)        ValueError
 #
-# So the downloader treats a malformed session as fatal and the validator treats
-# it as absent. In `validate.py` those are the same value: `_session_window`
-# returns `None` either way, its caller at :286 substitutes an observed session
-# only for equity-like assets, and the resolved window then skips the whole
+# So the downloader treats a malformed session as fatal. The validator *did* treat
+# it as absent - `_session_window` returned the same `None` for both - which is the ambiguity
+# `1bfba63` removed with a sentinel, so the two are now distinguishable. Its caller
+# substitutes an observed session for equity-like assets and logs that it has done so; the
+# resolved window then skips the whole
 # session/holiday/weekend/overnight classification. For forex, metals and crypto a
 # configured session therefore stops being applied to the coverage check, so the same
 # gap is labelled "data" instead of "session".
