@@ -22,6 +22,40 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from runner.engines.base import BacktestConfig
+# --- import-origin guard -------------------------------------------------
+# Running a script puts `scripts/` on `sys.path[0]`, not the repo root, so `import shared` does not
+# find the checkout this file lives in: it falls through to the installed package, which points at a
+# *different* tree. Measured on 2026-10-04 - the two are genuinely different revisions (md5
+# 6a72c6cb4dd4 vs 3b3f3d27182e), and the installed one has a *shorter migration set*, so a script
+# run
+# this way applies an older schema than the code believes and then reports success.
+#
+# This is the failure `continuation/merge-rehearsal.sh` exists to catch - its own header calls it
+# "passed against the wrong data" - and the rehearsal guards itself while the scripts did not.
+# Refused rather than silently corrected: quietly importing a different tree than the one being
+# edited is the hazard, not the fix. Run from the repo root as `python -m
+# scripts.overnight_strategy_discovery` to use this
+# checkout.
+import shared as _shared_package
+
+_EXPECTED_PKG = Path(__file__).resolve().parent.parent / "shared"
+_ACTUAL_PKG = Path(next(iter(_shared_package.__path__))).resolve()
+if _ACTUAL_PKG != _EXPECTED_PKG:
+    print(
+        "refusing to run: `shared` was imported from the wrong tree.\n"
+        f"  this script lives in : {Path(__file__).resolve().parent.parent}\n"
+        f"  expected shared/     : {_EXPECTED_PKG}\n"
+        f"  actually imported    : {_ACTUAL_PKG}\n"
+        "\n"
+        "Running a script puts scripts/ on sys.path[0], not the repo root, so `import shared`\n"
+        "falls through to the installed package - a different revision, with a\n"
+        "different migration set. To run against the checkout being edited, from the repo root:\n"
+        "    python -m scripts.overnight_strategy_discovery\n"
+        "continuation/merge-rehearsal.sh already refuses this for itself; this is the same check.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)# --- end import-origin guard ---------------------------------------------
+
 from shared.logging import get_logger
 
 try:

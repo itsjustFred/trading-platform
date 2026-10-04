@@ -462,11 +462,20 @@ def test_regenerate_keeps_json_backup_outside_backtests_dir(isolated_db, monkeyp
 
 
 def _run_recalculate(data_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Invoke the script the documented way: ``python -m scripts.<name>`` from the repo root.
+
+    It used to be invoked as ``scripts/recalculate_backtest_stats.py``, and that was quietly testing
+    the wrong thing. Running a script puts `scripts/` on `sys.path[0]`, not the repo root, so
+    `import shared` fell through to the installed package - a *different revision* of
+    `shared/database.py`. So these cases exercised this file's code against someone else's `shared`,
+    and passed anyway. The import-origin guard now refuses that combination outright; see
+    `tests/test_script_import_origin.py`.
+    """
     env = dict(os.environ)
     env["DATA_DIR"] = str(data_dir)
     env["TRADING_DATA_DIR"] = str(data_dir)
     return subprocess.run(
-        [sys.executable, "scripts/recalculate_backtest_stats.py", *args],
+        [sys.executable, "-m", "scripts.recalculate_backtest_stats", *args],
         capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, timeout=900,
     )
 
