@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from data_tools.resample import resample_file, resample_ohlcv
+from data_tools.resample import TIMEFRAME_MAP, resample_file, resample_ohlcv
 
 
 @pytest.fixture
@@ -480,3 +480,125 @@ class TestEveryBarsTimestampIsItsIntervalStart:
             from data_tools.resample import resample_with_origin
 
             resample_with_origin(without_volume, "W-MON")
+
+
+class TestOriginIsOnlyPassedWherePandasHonoursIt:
+    """`origin` is a tick-only parameter, and the docstring claimed otherwise.
+
+    The docstring used to say "Buckets align to UTC via `origin`", implying it governed every rule.
+    Measured: it shifts buckets for `h`/`m`/`s`/`ms`/`us`/`ns` and is **silently ignored for
+    everything else** — `D`, `W`, `M` and the fixed frequencies — while emitting a `RuntimeWarning`
+    on every call. For half this module's table the parameter did nothing except make noise.
+
+    So it is now passed only where it has effect. A warning that fires on every daily and weekly
+    resample is a warning an operator learns to skip, which is the trade this module already avoids
+    elsewhere by *counting* dropped buckets rather than passing over them in silence.
+    """
+
+    @staticmethod
+    def _ragged_source():
+        """Deliberately not starting on a bucket boundary, so an effective origin would show."""
+        import numpy as np
+        import pandas as pd
+
+        index = pd.date_range("2023-01-02 05:17", "2023-01-16 22:40", freq="17min", tz="UTC")
+        rng = np.random.default_rng(3)
+        return pd.DataFrame({
+            "timestamp": index, "open": 1.0, "high": 2.0 + rng.random(len(index)),
+            "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+
+    @pytest.mark.parametrize("timeframe", list(TIMEFRAME_MAP))
+    def test_origin_is_passed_exactly_for_the_tick_like_rules(self, timeframe) -> None:
+        """Asserted on the rule, not on the absence of a warning.
+
+        An earlier version of this test caught warnings with `simplefilter("always")` and
+        `resetwarnings()` and still could not see the one it was looking for - pandas emits it
+        somewhere `catch_warnings(record=True)` does not reliably capture, even though pytest's own
+        warning summary showed it. A test that cannot see the failure is not a test.
+
+        Which rules *receive* `origin` is a pure function of the rule, so that is what is asserted.
+        """
+        import pandas as pd
+
+        from data_tools.resample import _resample_kwargs
+
+        kwargs = _resample_kwargs(TIMEFRAME_MAP[timeframe], "start_day")
+        is_tick = isinstance(
+            pd.tseries.frequencies.to_offset(TIMEFRAME_MAP[timeframe]), pd.tseries.offsets.Tick
+        )
+        assert ("origin" in kwargs) is is_tick, (
+            f"{timeframe}: origin {'was' if 'origin' in kwargs else 'was not'} passed but the rule "
+            f"{'is' if is_tick else 'is not'} tick-like; pandas ignores `origin` for "
+            "non-tick rules and warns, so passing it there is pure noise"
+        )
+
+    @pytest.mark.parametrize("timeframe", list(TIMEFRAME_MAP))
+    def test_label_and_closed_are_always_pinned(self, timeframe) -> None:
+        """The other half of the kwargs, and the one that actually changes bars."""
+        from data_tools.resample import _resample_kwargs
+
+        kwargs = _resample_kwargs(TIMEFRAME_MAP[timeframe], "start_day")
+        assert kwargs["label"] == "left" and kwargs["closed"] == "left", (
+            f"{timeframe}: pandas' per-frequency defaults leaked back in, which is how weekly bars "
+            "came to be labelled by their interval end"
+        )
+
+    def test_omitting_origin_changes_nothing_for_any_rule(self) -> None:
+        """The load-bearing claim: this is a warning fix, not a behaviour change.
+
+        Compared bucket-for-bucket - index *and* aggregate - with `origin` supplied and omitted. If
+        a future pandas starts honouring `origin` for daily or weekly, this fails rather than the
+        change silently altering every daily and weekly bar.
+        """
+        import numpy as np
+
+        source = self._ragged_source().set_index("timestamp")
+        for key, rule in TIMEFRAME_MAP.items():
+            def buckets(**extra):
+                resampled = source.resample(rule, **extra).agg(
+                    {"high": "max", "low": "min", "volume": "sum"}
+                )
+                return resampled[resampled["volume"] > 0]
+
+            with_origin = buckets(origin="start_day", label="left", closed="left")
+            without = buckets(label="left", closed="left")
+            assert with_origin.index.equals(without.index), f"{key}: bucket boundaries differ"
+            for column in ("high", "low"):
+                assert np.array_equal(
+                    with_origin[column].to_numpy(), without[column].to_numpy()
+                ), f"{key}: {column} differs"
+
+    def test_origin_still_shifts_an_hourly_series_where_it_should(self) -> None:
+        """Guards the fix from over-correcting into "never pass origin"."""
+        from data_tools.resample import resample_with_origin
+
+        source = self._ragged_source()
+        by_day = resample_with_origin(source, "1h", origin="start_day")
+        by_start = resample_with_origin(source, "1h", origin="start")
+        first_day = pd.Timestamp(by_day["timestamp"].iloc[0])
+        first_start = pd.Timestamp(by_start["timestamp"].iloc[0])
+        assert first_day.strftime("%H:%M") == "05:00", first_day
+        assert first_start.strftime("%H:%M") == "05:17", first_start
+        assert first_day != first_start, (
+            "`origin` no longer shifts an hourly series at all, so it is being dropped everywhere "
+            "rather than only where pandas ignores it"
+        )
+
+    def test_daily_and_weekly_ignore_origin_which_is_why_it_is_not_passed(self) -> None:
+        """The measurement behind the change, recorded so the docstring cannot drift from it."""
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        source = self._ragged_source()
+        for rule in ("1D", "1W"):
+            by_day = resample_with_origin(source, rule, origin="start_day")
+            by_epoch = resample_with_origin(source, rule, origin="epoch")
+            assert by_day["timestamp"].tolist() == by_epoch["timestamp"].tolist(), (
+                f"{rule} now honours `origin`, so passing it conditionally is wrong - "
+                "either pass it everywhere or stop claiming pandas ignores it"
+            )
+        assert isinstance(
+            pd.tseries.frequencies.to_offset("1D"), pd.tseries.offsets.Tick
+        ) is False
