@@ -3,17 +3,44 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
 from shared.database import (
+    DB_PATH,
     init_db,
     list_backtest_ids,
     load_backtest_result,
     save_result_to_sqlite,
 )
+
+
+def _schema_fingerprint() -> tuple[frozenset[str], frozenset[str]]:
+    """The database's schema: its objects, and those objects' definitions.
+
+    Used to hold a dry run to its claim. It is deliberately a *schema* comparison and not a file
+    hash: the only writes reachable on this path are the DDL in `init_db` (`create_all` plus
+    `_migrate_schema`), because both persisted-stats writes sit behind `if not dry_run`. A missing
+    database reads as an empty schema, so "it did not exist before" is distinguishable from
+    "it existed and is unchanged".
+    """
+    if not DB_PATH.exists():
+        return frozenset(), frozenset()
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    finally:
+        conn.close()
+    return (
+        frozenset(f"{r[0]} {r[1]}" for r in rows),
+        frozenset(f"{r[0]} {r[1]}: {r[2]}" for r in rows),
+    )
 
 
 def _iter_json_backtests(backtests_dir: Path) -> list[Path]:
@@ -147,10 +174,46 @@ def main() -> None:
         )
 
     backtests_dir = data_dir / "backtests"
+
+    # **A dry run is only allowed to claim what it has checked.**
+    #
+    # `init_db()` is unavoidable on this path even in a dry run: `list_backtest_ids` and
+    # `load_backtest_result` both call it internally, so removing the top-level call would change
+    # nothing. And `init_db` runs `create_all` and `_migrate_schema` - which write DDL. Measured, on
+    # an empty directory:
+    #
+    #     $ recalculate_backtest_stats.py --dry-run
+    #     Dry run: yes
+    #     SQLite: scanned=0 updated=0 failed=0
+    #     $ ls
+    #     backtests.db            <- 479 KB, 17 tables, created by the dry run
+    #
+    # So "Dry run: yes" and "updated=0" together read as *nothing changed*, and against production
+    # that would mean the one thing an operator used `--dry-run` to avoid: applying a pending schema
+    # migration. The writes themselves are unavoidable without reworking how every reader obtains
+    # its schema, so the claim is made verifiable instead - the schema is fingerprinted either side
+    # of the run and a change is reported and failed, rather than passed off as `updated=0`.
+    schema_before = _schema_fingerprint() if args.dry_run else None
     init_db()
 
     print(f"Recalculating backtest stats in DATA_DIR={data_dir}")
     print(f"Dry run: {'yes' if args.dry_run else 'no'}")
+
+    if schema_before is not None:
+        names_after, defs_after = _schema_fingerprint()
+        created = sorted(names_after - schema_before[0])
+        if created or defs_after != schema_before[1]:
+            print(
+                "❌ this dry run CHANGED the database schema, so it was not a dry run:\n"
+                f"     database : {DB_PATH}\n"
+                f"     created  : {', '.join(created) if created else '(none)'}\n"
+                "     `init_db` runs create_all and _migrate_schema, and the read helpers call\n"
+                "     it internally, so this cannot be avoided by not calling it here. Re-run\n"
+                "     against a database whose schema is already current.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        print("  dry run verified: schema unchanged by this run")
 
     sqlite_scanned = sqlite_updated = sqlite_failed = 0
     json_scanned = json_updated = json_failed = 0

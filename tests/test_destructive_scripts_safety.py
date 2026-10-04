@@ -8,7 +8,10 @@ and swap the new state in atomically.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,6 +22,8 @@ from sqlmodel import select
 
 import shared.database as database
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -424,3 +429,205 @@ def test_regenerate_keeps_json_backup_outside_backtests_dir(isolated_db, monkeyp
     backups = [p for p in tmp_path.rglob("*.trades.json") if p.parent != backtests_dir]
     assert any(p.name == "bt-seed.trades.json" for p in backups)
     assert (backtests_dir / "bt-seed.trades.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# `recalculate_backtest_stats.py --dry-run` wrote to the database.
+#
+# This file already holds `test_consolidate_dry_run_leaves_tree_untouched`, so "a dry run leaves
+# things alone" is a contract this module owns rather than a new idea. The stats recalculator broke
+# it, and did so in the most misleading way available.
+#
+# `init_db()` runs `create_all` and `_migrate_schema` - both write DDL - and it cannot be avoided on
+# this path, because `list_backtest_ids` and `load_backtest_result` each call it internally.
+# Measured
+# on an empty directory:
+#
+#     $ recalculate_backtest_stats.py --dry-run
+#     Dry run: yes
+#     SQLite: scanned=0 updated=0 failed=0
+#     $ ls
+#     backtests.db            # 479 KB, 17 tables, created by the dry run
+#
+# "Dry run: yes" above "updated=0" reads as *nothing changed*, and against production that is
+# the one thing an operator used `--dry-run` to avoid: applying a pending schema migration.
+#
+# So the claim is now verified rather than assumed - the schema is fingerprinted either side of the
+# run and a change is reported and failed with exit 2. The writes themselves remain, because
+# removing them means reworking how every reader obtains its schema; what does not remain is the
+# script's ability to assert something it never checked.
+#
+# Driven as a subprocess with `DATA_DIR` pointed at a scratch directory, so the real CLI, the real
+# argument parsing and the real `init_db` all run and production is never opened.
+
+
+def _run_recalculate(data_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["DATA_DIR"] = str(data_dir)
+    env["TRADING_DATA_DIR"] = str(data_dir)
+    return subprocess.run(
+        [sys.executable, "scripts/recalculate_backtest_stats.py", *args],
+        capture_output=True, text=True, cwd=str(REPO_ROOT), env=env, timeout=900,
+    )
+
+
+def _tables(db_path: Path) -> set[str]:
+    if not db_path.exists():
+        return set()
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_recalculate_dry_run_refuses_to_claim_it_changed_nothing(tmp_path: Path) -> None:
+    """The regression.
+
+    A dry run against a database that does not exist yet cannot be a dry run, because `init_db`
+    builds the schema. It must say so and fail, rather than report `updated=0`.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    result = _run_recalculate(data_dir, "--dry-run")
+
+    assert result.returncode == 2, (
+        f"a dry run that created the schema reported rc={result.returncode}\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert "CHANGED the database schema" in result.stderr, result.stderr
+    # It must name what it created, not merely carry the label. claim-check.sh learned this the
+    # hard way - a gate that only says "wrong" makes the reader re-derive the figure by hand, which
+    # is how its Size row went stale in the first place. Emptying the `created` list while keeping
+    # the line survived my first version of this test.
+    assert "created  :" in result.stderr, result.stderr
+    assert "(none)" not in result.stderr.split("created  :", 1)[1].splitlines()[0], (
+        "the report says nothing was created, but the run created the whole schema:\n"
+        + result.stderr
+    )
+    assert "backtests" in result.stderr, (
+        "the report does not name a single created object: " + result.stderr
+    )
+    assert "not a dry run" in result.stderr, result.stderr
+    # And it must not also claim the run was verified clean.
+    assert "schema unchanged by this run" not in result.stdout, result.stdout
+
+
+def test_recalculate_dry_run_on_a_current_schema_is_unaffected(tmp_path: Path) -> None:
+    """The control, and the reason the fix is a verification rather than a refusal.
+
+    A fix that made every dry run fail would be useless: the legitimate case is a dry run against a
+    database whose schema is already current, which must still succeed and say it verified.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    assert _run_recalculate(data_dir, "--skip-json").returncode == 0
+
+    result = _run_recalculate(data_dir, "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "schema unchanged by this run" in result.stdout, result.stdout
+
+
+def test_the_schema_check_applies_only_to_dry_runs(tmp_path: Path) -> None:
+    """A real run is *supposed* to create the schema, so it must not be failed for doing so.
+
+    Without this, the obvious "fix" - refuse whenever the schema changes - would break the script's
+    actual purpose.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    result = _run_recalculate(data_dir, "--skip-json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "schema unchanged by this run" not in result.stdout, result.stdout
+    assert _tables(data_dir / "backtests.db"), "a real run should still create the schema"
+
+
+def test_a_dry_run_on_a_current_schema_writes_no_rows(tmp_path: Path) -> None:
+    """The other half of "dry run": no row content either.
+
+    The fingerprint is deliberately schema-only, which is sound because both persisted-stats writes
+    sit behind `if not dry_run`. This is the test that keeps that assumption honest - if a write
+    path ever lost its guard, a schema comparison would not notice, and only this would.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    assert _run_recalculate(data_dir, "--skip-json").returncode == 0
+    db_path = data_dir / "backtests.db"
+    before = _tables(db_path)
+    digest_before = db_path.read_bytes()
+
+    assert _run_recalculate(data_dir, "--dry-run").returncode == 0
+
+    assert _tables(db_path) == before
+    assert db_path.read_bytes() == digest_before, (
+        "a dry run modified the database file's bytes; the schema-only fingerprint would not "
+        "have caught it"
+    )
+
+
+def test_the_fingerprint_sees_an_ALTER_that_adds_no_new_object(tmp_path: Path) -> None:
+    """The half a name-only comparison cannot see - tested directly, and honestly.
+
+    `_migrate_schema` delegates to `_add_*_column` helpers, so on a populated production database -
+    which already has every table - the dry run's only write is `ALTER TABLE ... ADD COLUMN`. That
+    adds **no new row to `sqlite_master`**; it rewrites the `sql` of a table already listed.
+            Comparing
+    object names alone would pass, `updated=0` would print, and a schema migration would have been
+    applied to production by the command meant to prevent exactly that.
+
+    **Production is in that state right now.** Measured read-only: `services` has no
+    `last_attempt_at` and `live_deployments` no `stopped_enforced_at`, so both migrations
+            are pending
+    there. So this is not a hypothetical branch.
+
+    Why this test pokes `_schema_fingerprint` rather than driving the script end to end: I could not
+    get `_migrate_schema` to apply the ALTER through the script's own path on a seeded scratch
+    database - it created the tables via `create_all` and returned OK, yet the column never
+            appeared,
+    while calling `init_db()` directly in the same directory added it every time. I did not
+            find that
+    discrepancy, so I am not going to write a test that asserts a mechanism I could not observe. The
+    property under test - *does the fingerprint notice a definition change?* - is stated here
+    directly, which is both decidable and independent of `_migrate_schema`'s behaviour.
+    """
+    script = _load_recalculate_module()
+    db_path = tmp_path / "fp.db"
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(script, "DB_PATH", db_path)
+    try:
+        # A missing database reads as an empty schema, so "absent" is distinguishable from
+        # "changed".
+        assert script._schema_fingerprint() == (frozenset(), frozenset())
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE services (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.commit()
+        before = script._schema_fingerprint()
+        assert before[0], "the seeded table should appear in the object-name half"
+
+        conn.execute("ALTER TABLE services ADD COLUMN last_attempt_at DATETIME")
+        conn.commit()
+        conn.close()
+        after = script._schema_fingerprint()
+
+        assert after[0] == before[0], (
+            "an ALTER that adds a column adds no sqlite_master row, so the name half must be "
+            "unchanged - that is the whole reason the definition half exists"
+        )
+        assert after[1] != before[1], (
+            "the fingerprint did not notice a column being added to an existing table; a dry run "
+            "would migrate the schema and still report updated=0"
+        )
+    finally:
+        monkey.undo()
+
+
+def _load_recalculate_module():
+    """Import `scripts/recalculate_backtest_stats.py` by path - `scripts/` is not a package."""
+    import importlib.util
+
+    path = REPO_ROOT / "scripts" / "recalculate_backtest_stats.py"
+    spec = importlib.util.spec_from_file_location("recalculate_backtest_stats_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
