@@ -20,6 +20,7 @@ from uuid import uuid5 as _uuid5
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
     Float,
     String,
@@ -305,13 +306,18 @@ class BacktestRecord(SQLModel, table=True):
     parameters: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     tags_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("tags", JSON, nullable=False),
+        sa_column=Column("tags", JSON, nullable=False, server_default=text("'[]'")),
     )
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
     equity_curve: list[dict[str, Any]] = Field(
-        default_factory=list, sa_column=Column("equity_curve", JSON, nullable=False)
+        default_factory=list,
+        # Production has this column NULLABLE with DEFAULT '[]'; the model says NOT NULL. The
+        # nullability difference is left alone on purpose - narrowing it is a separate decision, and
+        # a model that claimed NOT NULL where production allows NULL is a much smaller problem than
+        # one that writes where it cannot.
+        sa_column=Column("equity_curve", JSON, nullable=False, server_default=text("'[]'")),
     )
     # These four columns have existed in the physical table for some time - NOT NULL, with defaults
     # 0.0/0.0/0.0/1.0 - but the model never mapped them. Two consequences, both live:
@@ -574,8 +580,19 @@ class LiveSignalModel(SQLModel, table=True):
     action: str = Field(index=True)
     theoretical_price: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
-    source: str = Field(default="internal", index=True)
-    broker_order_id: str = Field(default="", index=True)
+    # Production stores DEFAULT 'internal' on this column; the model declared only the Python-side
+    # default, so a fresh install produced a NOT NULL column with no database default. `index` moves
+    # onto the Column because SQLAlchemy rejects it on Field when `sa_column` is given.
+    source: str = Field(
+        default="internal",
+        sa_column=Column("source", String, nullable=False, index=True,
+                         server_default=text("'internal'")),
+    )
+    broker_order_id: str = Field(
+        default="",
+        sa_column=Column("broker_order_id", String, nullable=False, index=True,
+                         server_default=text("''")),
+    )
     discord_message_id: str | None = Field(
         default=None,
         sa_column=Column("discord_message_id", String, nullable=True, index=True),
@@ -716,7 +733,11 @@ class LiveAccountModel(SQLModel, table=True):
     name: str = Field(default="", index=True)
     ctid: str | None = Field(default=None, index=True)
     broker_login: str | None = Field(default=None, index=True)
-    is_demo: bool = Field(default=False, index=True)
+    is_demo: bool = Field(
+        default=False,
+        sa_column=Column("is_demo", Boolean, nullable=False, index=True,
+                         server_default=text("0")),
+    )
     # When is_demo was last confirmed against the broker. ACTIVE transitions are
     # only allowed while this is fresh, so a demo flag cannot be trusted forever
     # after the account is re-pointed or the credentials are rotated.
@@ -862,20 +883,32 @@ class LiveDeploymentModel(SQLModel, table=True):
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
     stopped_enforced_at: datetime | None = Field(default=None, index=True)
-    signal_source: str = Field(default="internal", index=True)
-    signal_source_type: str = Field(default="internal", index=True)
-    signal_source_id: str = Field(default="", index=True)
+    signal_source: str = Field(
+        default="internal",
+        sa_column=Column("signal_source", String, nullable=False, index=True,
+                         server_default=text("'internal'")),
+    )
+    signal_source_type: str = Field(
+        default="internal",
+        sa_column=Column("signal_source_type", String, nullable=False, index=True,
+                         server_default=text("'internal'")),
+    )
+    signal_source_id: str = Field(
+        default="",
+        sa_column=Column("signal_source_id", String, nullable=False, index=True,
+                         server_default=text("''")),
+    )
     symbol_filter_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("symbol_filter", JSON, nullable=False),
+        sa_column=Column("symbol_filter", JSON, nullable=False, server_default=text("'[]'")),
     )
     signal_config_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("signal_config", JSON, nullable=False),
+        sa_column=Column("signal_config", JSON, nullable=False, server_default=text("'{}'")),
     )
     settings_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("settings", JSON, nullable=False),
+        sa_column=Column("settings", JSON, nullable=False, server_default=text("'{}'")),
     )
     created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
     updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
