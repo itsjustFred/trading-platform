@@ -2506,6 +2506,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         status_enum = getattr(self, "_ProtoOAOrderStatus", None)
         if status_enum is None:
+            # "Cannot tell", resolved in the unsafe direction - and previously silent. The decision
+            # is unchanged and stays a trading judgement; what changes is that it is now countable,
+            # because a sweep here sends a cancel for *every* order it can see.
+            logger.warning(
+                "cTrader client exposes no order-status enum, so every order is treated as working "
+                "and a cancel sweep will send a cancel for each",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
             return True
         working_statuses = {int(status_enum.ORDER_STATUS_ACCEPTED)}
         # Newer protos expose `orderStatus`; older ones only `status`.
@@ -2513,6 +2521,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if raw_status is None:
             raw_status = getattr(order, "status", None)
         if raw_status is None:
+            # Also "cannot tell", also resolved by cancelling, and also silent. The named-status case
+            # is already logged by `_unrecognised_status_wire_value`; this is the *absent field* case,
+            # which looks identical on the wire (both read back as ACCEPTED) and is logged nowhere.
+            logger.warning(
+                "cTrader order carries no status field; treating it as ACCEPTED, so it will be "
+                "cancelled if a sweep runs",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                    }
+                },
+            )
             return True
         try:
             return int(raw_status) in working_statuses
