@@ -467,13 +467,13 @@ class TestAnUnclosedReferenceIsATypo:
             "${FOO",
             "${FOO and more",    # unclosed, mid-sentence
             "prefix ${DISCORD_BOT_X_CHANNEL_ID",
-            "${a.b}",            # unclosed *and* dotted - still an unclosed brace
+            "${a.b}",            # brace present, name dotted - malformed name, same guard
         ],
     )
     def test_an_unclosed_reference_is_rejected(self, text) -> None:
         from live_runner.config_parser import assert_no_unexpanded_env
 
-        with pytest.raises(ValueError, match="Unclosed environment reference"):
+        with pytest.raises(ValueError, match="Malformed environment reference"):
             assert_no_unexpanded_env({"channel_id": text})
 
     def test_it_quotes_the_offending_token_rather_than_a_bare_brace(self) -> None:
@@ -498,8 +498,8 @@ class TestAnUnclosedReferenceIsATypo:
         with pytest.raises(ValueError) as unexpanded:
             assert_no_unexpanded_env({"channel_id": "${FOO}"})
 
-        assert "closing brace" in str(unclosed.value)
-        assert "Unclosed" not in str(unexpanded.value), (
+        assert "closing brace is missing" in str(unclosed.value)
+        assert "Malformed" not in str(unexpanded.value), (
             "a well-formed unset reference is being reported as unclosed; the two failures have "
             "different fixes and must not be conflated"
         )
@@ -516,8 +516,11 @@ class TestAnUnclosedReferenceIsATypo:
         of these ever starts being rejected, that is a decision to make on purpose.
 
         Note that all five are *closed*. `${a.b}` is not in this list even though a dot is not a
-        legal identifier character, because it has no closing brace either - and an unclosed brace
-        is the case this class is about, not the ambiguity the original entry recorded.
+        legal identifier character, because its brace **is** present - it is caught by the same
+        guard, for the other of the guard's two reasons. That distinction was previously stated
+        backwards here: an earlier version of this comment said `${a.b}` "has no closing brace
+        either", which was false, and it is why the error message once claimed a missing brace for
+        a reference that had one.
         """
         from live_runner.config_parser import assert_no_unexpanded_env
 
@@ -538,7 +541,7 @@ class TestAnUnclosedReferenceIsATypo:
         assert_no_unexpanded_env({"note": text})
 
     def test_the_bare_form_is_still_untouched(self) -> None:
-        """Item 4's open one-bit question survives this untouched, so narrowing it later is deliberate."""
+        """Item 4's open one-bit question survives this untouched."""
         from live_runner.config_parser import assert_no_unexpanded_env
 
         assert_no_unexpanded_env({"channel_id": "$DISCORD_X"})
@@ -547,12 +550,14 @@ class TestAnUnclosedReferenceIsATypo:
         """The guard runs *after* expansion, so a resolved reference must not trip it."""
         from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
 
-        assert_no_unexpanded_env({"channel_id": _expand_env_value("${SET_VAR}", {"SET_VAR": "123"})})
+        assert_no_unexpanded_env(
+            {"channel_id": _expand_env_value("${SET_VAR}", {"SET_VAR": "123"})}
+        )
 
-    def test_the_unclosed_case_is_found_at_depth(self) -> None:
+    def test_the_malformed_case_is_found_at_depth(self) -> None:
         from live_runner.config_parser import assert_no_unexpanded_env
 
-        with pytest.raises(ValueError, match="Unclosed environment reference"):
+        with pytest.raises(ValueError, match="Malformed environment reference"):
             assert_no_unexpanded_env({"deployments": [{"signal_config": {"ids": ["${A"]}}]})
 
     def test_several_unclosed_references_are_all_reported(self) -> None:

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import types
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -4041,7 +4042,7 @@ class TestAnExplicitlySentZeroPriceIsDistinguishable:
             deal.executionPrice = 0.0
         return deal
 
-    def test_the_presence_that_separates_the_cases_is_the_one_the_protos_actually_have(self) -> None:
+    def test_the_presence_that_separates_the_cases_is_what_the_protos_actually_have(self) -> None:
         """Name the guarantee, so a proto build that drops `optional` fails here.
 
         Without presence, an omitted price and a sent zero are the same number and the detection
@@ -4211,3 +4212,56 @@ class TestTheZeroDetectionsDoNotOverreach:
         order = mod.ProtoOAOrder()
         order.ParseFromString(self._varint((999 << 3) | 0) + self._varint(6))
         assert CTraderLiveAdapter._unrecognised_status_wire_value(order) is None
+
+
+class TestTheMoneyDigitsHelpersAreActuallyCallableAsProductionCallsThem:
+    """A regression test for a live-money bug this batch introduced and the suite could not see.
+
+    `be97e67` inserted `_honour_zero_money_digits` *between* the `@staticmethod` that belonged to
+    `_resolve_money_digits` and the `def` it decorated. `_resolve_money_digits` was left as a plain
+    function, so the production call
+
+        self._resolve_money_digits(trader, context="account refresh")
+
+    passed `self` as `trader` and raised `TypeError` on the live balance-refresh path.
+
+    **Nothing caught it**, for two reasons worth keeping in mind:
+
+    * every test reached the helper through the class (`CTraderLiveAdapter._resolve_money_digits`),
+      which still works for an unbound plain function; and
+    * both sync guards compare the *body* between `raw = getattr(...)` and `return int(raw)` - and a
+      decorator sits above that slice, so the signature and the body were both unchanged.
+
+    Hence the structural assertion below, and hence the instance-call test. A text comparison of a
+    function cannot see whether it is still a staticmethod.
+    """
+
+    @pytest.mark.parametrize(
+        "name", ["_resolve_money_digits", "_honour_zero_money_digits"]
+    )
+    def test_both_helpers_are_still_static_methods(self, name) -> None:
+        entry = CTraderLiveAdapter.__dict__[name]
+        assert isinstance(entry, staticmethod), (
+            f"CTraderLiveAdapter.{name} is a {type(entry).__name__}, not a staticmethod. Without "
+            "the decorator, `self.<helper>(...)` binds self to the first parameter and raises "
+            "TypeError. A decorator lives *above* any body-slice comparison, so the sync tests "
+            "cannot see this - only this assertion can."
+        )
+
+    def test_the_instance_call_shape_production_uses_actually_works(self) -> None:
+        """`get_balance` calls it through `self`; that is the shape that was broken."""
+        adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+        resolved = adapter._resolve_money_digits(
+            SimpleNamespace(moneyDigits=2), context="account refresh"
+        )
+        assert resolved == 2, f"the instance call returned {resolved!r}"
+
+    def test_the_account_discovery_copy_is_still_a_plain_module_function(self) -> None:
+        """The other half of the copy: called as `_resolve_money_digits(...)`, not `self.`."""
+        from live_runner import account_discovery
+
+        entry = account_discovery.__dict__["_resolve_money_digits"]
+        assert isinstance(entry, types.FunctionType), (
+            f"account_discovery._resolve_money_digits is a {type(entry).__name__}; it is called "
+            "as a module-level function at account_discovery.py:368, so it must stay one"
+        )

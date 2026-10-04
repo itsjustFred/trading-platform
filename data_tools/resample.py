@@ -124,7 +124,12 @@ def resample_with_origin(
     #
     # Measured: forcing left/left is bit-identical for 1min/5min/15min/30min/1h/4h/1D. Only `1w`
     # changes, which is the point.
-    resampled = frame.resample(rule, origin=origin, label="left", closed="left").agg(
+    # Named once and used at both call sites below, because the two have to agree: if the
+    # `zero_volume_bar` fallback resampled on different boundaries its flags would silently stop
+    # lining up with the bars they describe. That call is currently unreachable, so nothing
+    # enforces the pairing except this.
+    resample_kwargs: dict[str, object] = {"origin": origin, "label": "left", "closed": "left"}
+    resampled = frame.resample(rule, **resample_kwargs).agg(
         _aggregation_for([str(column) for column in frame.columns])
     )
     if had_zero_volume_flag:
@@ -137,7 +142,7 @@ def resample_with_origin(
         else:
             resampled["zero_volume_bar"] = (
                 frame[["zero_volume_bar"]]
-                .resample(rule, origin=origin, label="left", closed="left")
+                .resample(rule, **resample_kwargs)
                 .min()
             )
     empty_buckets = int(resampled["open"].isna().sum()) if "open" in resampled else 0

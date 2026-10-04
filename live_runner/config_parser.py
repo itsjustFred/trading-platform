@@ -21,13 +21,17 @@ _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 #
 # The scope is deliberately narrow. `${}`, `${1BAD}` and `${9}` are also malformed, but they were
 # recorded as ambiguous - a config could plausibly contain them as text - and that decision is
-# left alone. An unclosed brace has no such reading: there is no text that is `${FOO`. Requiring
-# the identifier run to end at a boundary keeps a hyphen out of it too, so `${VAR-NAME}` is still
-# not this pattern's business.
+# left alone. Requiring the identifier run to end at a boundary keeps a hyphen out of it too, so
+# `${VAR-NAME}` is still not this pattern's business.
 #
-# Bare `$NAME` remains the separate, still-open question (backlog item 4), because `$USD` and
-# `$SPX` collide with real currency codes and tickers.
-_UNCLOSED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?=$|[^\w}-])")
+# **This catches two different faults, not one, and the error message says so.** It fires both
+# when the closing brace is missing (`${FOO`) *and* when the brace is present but the name is
+# not a valid identifier (`${a.b}`, `${FOO BAR}`). An earlier version of the comment here claimed
+# the second case did not exist - "there is no text that is `${FOO`" - which was simply false:
+# `${a.b}` is text, and it is refused. The pattern is named for the condition it actually detects
+# rather than the one it was first written for.
+#
+_MALFORMED_BRACED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?=$|[^\w}-])")
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
@@ -104,15 +108,17 @@ def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment co
         elif isinstance(node, str):
             for match in _UNEXPANDED_ENV_PATTERN.findall(node):
                 leftovers.append(match)
-            for match in _UNCLOSED_ENV_PATTERN.findall(node):
+            for match in _MALFORMED_BRACED_ENV_PATTERN.findall(node):
                 malformed.append(match)
 
     _walk(payload)
     if malformed:
         raise ValueError(
-            f"Unclosed environment reference(s) {sorted(set(malformed))} in {context}: a '$' "
-            "followed by '{' is always meant to be a reference, and this one has no closing "
-            "brace. Add the '}' rather than setting a variable - nothing was expanded."
+            f"Malformed environment reference(s) {sorted(set(malformed))} in {context}: a '$' "
+            "followed by '{' is always meant to be a reference, and this one is not a complete "
+            "${NAME} - either the closing brace is missing, or the name contains something other "
+            "than letters, digits and underscores. Nothing was expanded, so setting the variable "
+            "will not help until the reference itself is well-formed."
         )
     if leftovers:
         raise ValueError(

@@ -7965,7 +7965,9 @@ class TestAMonthlySpellingIsRefusedAtTheConfigBoundary:
         """The guard refuses one spelling. It must not quietly narrow the accepted set."""
         assert self._config(spelling).timeframe == spelling
 
-    @pytest.mark.parametrize("alias", ["m1", "min1", "m5", "m15", "m30", "h1", "d1", "daily", "hour1"])
+    @pytest.mark.parametrize(
+        "alias", ["m1", "min1", "m5", "m15", "m30", "h1", "d1", "daily", "hour1"]
+    )
     def test_minute_aliases_are_unaffected(self, alias) -> None:
         """Letter-first aliases carry no casing meaning, so they must keep working.
 

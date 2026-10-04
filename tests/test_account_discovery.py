@@ -2419,16 +2419,22 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
     # the live adapter. Two copies of a fix are two chances to apply it once - including the
     # switch that turns the fix on.
     def flag_body(text: str) -> str:
-        start = text.index('os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS"')
-        end = text.index("}", text.index('"on",', start)) + 1
-        return " ".join(" ".join(text[start:end].split()).split())
+        start = text.index("configured = _HONOUR_ZERO_FLAG in os.environ")
+        end = text.index("default=False,", start) + len("default=False,")
+        joined = " ".join(" ".join(text[start:end].split()).split())
+        # A second legitimate difference: the adapter reaches the canonical parser through its own
+        # one-line `_parse_bool_env` wrapper, while discovery imports `parse_bool_env` directly.
+        # Both delegate to `credential_env.parse_bool_env`, which
+        # `test_the_flag_and_the_repo_canonical_parser_agree_exactly` pins behaviourally - so
+        # normalising the name here does not weaken what this comparison is for.
+        return joined.replace("_parse_bool_env(", "parse_bool_env(")
 
     assert flag_body(discovery) == flag_body(adapter), (
         "the two _honour_zero_money_digits copies have drifted - most importantly the variable "
         "they read. A mismatch would make the flag work in discovery and silently do nothing in "
         "the live adapter, which is the copy that runs every reconcile."
     )
-    assert "CTRADER_HONOUR_ZERO_MONEY_DIGITS" in flag_body(discovery)
+    assert "_HONOUR_ZERO_FLAG in os.environ" in flag_body(discovery)
 
     for name, text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
         assert 'has_field("moneyDigits")' in text, (
@@ -2483,7 +2489,7 @@ class TestTheZeroDecimalPlacesFlag:
             "a broker-sent zero is being honoured with the flag off; the default must be inert"
         )
 
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "y", "on"])
     def test_with_the_flag_on_only_a_broker_sent_zero_changes(self, value, monkeypatch) -> None:
         """The asymmetry is the whole point: omitted stays at the default either way."""
         from live_runner.account_discovery import _trader_balance
@@ -2498,16 +2504,53 @@ class TestTheZeroDecimalPlacesFlag:
             "which is what the range guard below the collapse has always implied"
         )
 
-    def test_an_unrelated_value_leaves_the_flag_off(self, monkeypatch) -> None:
-        """Only the documented truthy spellings count. A typo must not enable a money path."""
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "n"])
+    def test_a_valid_falsy_value_leaves_the_flag_off(self, value, monkeypatch) -> None:
+        """The canonical parser's falsy half. A typo must not enable a money path."""
         from live_runner.account_discovery import _trader_balance
 
-        for value in ("", "0", "false", "no", "off", "maybe", "2"):
+        monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", value)
+        assert _trader_balance(self._trader(explicit_zero=True)) == pytest.approx(1234.56), (
+            f"CTRADER_HONOUR_ZERO_MONEY_DIGITS={value!r} was treated as enabled; a typo in this "
+            "variable would silently rescale every balance"
+        )
+
+    @pytest.mark.parametrize("value", ["treu", "maybe", "2", "", "enabled"])
+    def test_an_unparseable_value_is_rejected_rather_than_silently_ignored(
+        self, value, monkeypatch
+    ) -> None:
+        """**This test used to assert the opposite**, and the review is why it changed.
+
+        It previously grouped `""`, `"maybe"` and `"2"` with `0`/`false`/`no`/`off` and required
+        them all to be *silently* treated as off. That was the hand-rolled parser's behaviour, and
+        `live_runner/credential_env.py` says in terms why it is the wrong one:
+
+            This is the only definition. It was previously written out four times [...] Four
+            copies that agree today is the same hazard as every other duplicate this audit has
+            found, and it is the one shape that has already produced two live bugs in this
+            repository.
+
+        Failing safe is right for a money rescale - a typo must not turn honouring *on*. But
+        silently is not: `=treu` looks like it did something, and the operator has no way to learn
+        it did not. Absent means the default; present-but-blank or unrecognised is an error, which
+        is the split `CTRADER_DEMO` already uses.
+        """
+        from live_runner.account_discovery import _honour_zero_money_digits
+
+        monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", value)
+        with pytest.raises(ValueError, match="Invalid boolean value"):
+            _honour_zero_money_digits()
+
+    def test_the_flag_and_the_repo_canonical_parser_agree_exactly(self, monkeypatch) -> None:
+        """No second token set, anywhere. That is the whole point of `credential_env`."""
+        from live_runner.account_discovery import _honour_zero_money_digits
+        from live_runner.credential_env import parse_bool_env
+
+        for value in ("1", "true", "y", "on", "0", "no", "off"):
             monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", value)
-            assert _trader_balance(self._trader(explicit_zero=True)) == pytest.approx(1234.56), (
-                f"CTRADER_HONOUR_ZERO_MONEY_DIGITS={value!r} was treated as enabled; a typo in "
-                "this variable would silently rescale every balance"
-            )
+            assert _honour_zero_money_digits() is parse_bool_env(
+                "CTRADER_HONOUR_ZERO_MONEY_DIGITS", value, default=False
+            ), f"the two disagree on {value!r}"
 
     def test_the_flag_defaults_to_off_without_the_variable(self, monkeypatch) -> None:
         from live_runner.account_discovery import _honour_zero_money_digits

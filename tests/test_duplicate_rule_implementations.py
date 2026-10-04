@@ -490,14 +490,14 @@ def test_both_signal_processors_compute_the_same_atr() -> None:
 #   absent                       None               None
 #   09:30-16:00                  (570, 960)         (570, 960)
 #   09:30-24:00                  (570, 1440)        (570, 1440)
-#   25:00-23:00  (malformed)     None               ValueError
-#   abc/def     (malformed)      None               ValueError
+#   25:00-23:00  (malformed)     MALFORMED_SESSION               ValueError
+#   abc/def     (malformed)      MALFORMED_SESSION               ValueError
 #   16:00-09:30  (reversed)      (960, 2010)        ValueError
 #
 # So the downloader treats a malformed session as fatal and the validator treats
 # it as absent. In `validate.py` those are the same value: `_session_window`
-# returns `None` either way, its caller at :254 substitutes an observed session
-# only for equity-like assets, and :266 then skips the whole
+# returns `None` either way, its caller at :286 substitutes an observed session
+# only for equity-like assets, and the resolved window then skips the whole
 # session/holiday/weekend/overnight classification. For forex, metals and crypto a
 # configured session therefore stops being applied to the coverage check, so the same
 # gap is labelled "data" instead of "session".
@@ -653,7 +653,8 @@ class TestMalformedAndAbsentSessionsStoppedSharingAValue:
         return _session_window(value)
 
     @pytest.mark.parametrize(
-        "value", ["25:00-23:00", "abc-def", "09:30", ("09:30", "bad"), {"start": "bad", "end": "16:00"}]
+        "value",
+        ["25:00-23:00", "abc-def", "09:30", ("09:30", "bad"), {"start": "bad", "end": "16:00"}],
     )
     def test_a_configured_but_unparseable_session_is_marked_malformed(self, value) -> None:
         from data_tools.validate import MALFORMED_SESSION
@@ -699,8 +700,8 @@ class TestMalformedAndAbsentSessionsStoppedSharingAValue:
             f"a configured session that never parsed produced no warning: {joined!r}"
         )
         assert "replaced by an observed one" in joined, (
-            "the warning does not say the configured session was replaced by an observed one, which "
-            f"is the part that misleads triage: {joined!r}"
+            "the warning does not say the configured session was replaced by an observed one, "
+            f"which is the part that misleads triage: {joined!r}"
         )
 
     def test_the_warning_points_at_the_downloader_that_would_have_refused_it(self, caplog) -> None:

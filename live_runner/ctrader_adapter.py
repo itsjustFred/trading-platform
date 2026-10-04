@@ -23,11 +23,11 @@ from live_runner.base_adapter import (
     is_exit_only_metadata,
     is_unbounded_tp,
 )
-from live_runner.credential_env import resolve_env_value
 from live_runner.credential_env import (
     FALSE_BOOL_TOKENS,
     TRUE_BOOL_TOKENS,
     parse_bool_env,
+    resolve_env_value,
 )
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -49,6 +49,8 @@ from shared.models import (
 )
 
 logger = get_logger("live-runner")
+
+_HONOUR_ZERO_FLAG = "CTRADER_HONOUR_ZERO_MONEY_DIGITS"
 
 _ASYNCIO_REACTOR_VALIDATED = False
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -2978,11 +2980,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         A copy of `account_discovery._honour_zero_money_digits`; see that one for why this is a
         flag rather than the fix. Held identical by
         `test_both_copies_of_the_money_digits_resolution_are_identical`.
-        """
-        return os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS", "").strip().lower() in {
-            "1", "true", "yes", "on",
-        }
 
+        Parsed with the repo's single boolean parser (`live_runner/credential_env.py`) rather than
+        a hand-rolled token set, for the reason that file gives: it was previously written out four
+        times, and "four copies that agree today is the same hazard as every other duplicate this
+        audit has found". A hand-rolled version here also disagreed with
+        `TRUE_BOOL_TOKENS` - it dropped `y` - and silently treated a typo as *off* rather than
+        raising. Failing safe is right for a money rescale, but silently is not: the whole point of
+        the canonical parser is that `=treu` is a loud error.
+
+        The absent/present split mirrors `CTRADER_DEMO`: absent means the default, present-but-blank
+        is an error.
+
+        **Known limitation:** only the process environment is consulted, not `.accounts.env`,
+        because `_resolve_money_digits` deliberately takes no env mapping (it is copied rather than
+        imported, and threading one through would change the signature the sync test compares).
+        An operator who sets this in `.accounts.env` gets the default, not an error. Recorded rather
+        than hidden; see backlog item 6.
+        """
+        configured = _HONOUR_ZERO_FLAG in os.environ
+        return _parse_bool_env(
+            _HONOUR_ZERO_FLAG,
+            resolve_env_value(None, _HONOUR_ZERO_FLAG) if configured else None,
+            default=False,
+        )
+
+    @staticmethod
     def _resolve_money_digits(trader: Any, *, context: str) -> int:
         """The broker's decimal-place count, defaulting to 2, and saying so when it guesses.
 

@@ -18,7 +18,11 @@ from live_runner.alpaca_adapter import (
     _alpaca_credential_blocks,
     _default_alpaca_credentials,
 )
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import (
+    load_accounts_env_values,
+    parse_bool_env,
+    resolve_env_value,
+)
 from shared.database import (
     demo_verification_age_seconds,
     record_live_account_demo_verification,
@@ -27,6 +31,8 @@ from shared.logging import get_logger
 from shared.models import LiveAccount
 
 logger = get_logger("live-account-discovery")
+
+_HONOUR_ZERO_FLAG = "CTRADER_HONOUR_ZERO_MONEY_DIGITS"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
@@ -299,6 +305,12 @@ def _honour_zero_money_digits() -> bool:
     Read from the environment on every call rather than cached at import, so a test can exercise
     both settings and an operator can change it without a code change.
 
+    Parsed with the repo's single boolean parser rather than a hand-rolled token set: this was
+    already written out by hand once, and it disagreed with `TRUE_BOOL_TOKENS` (dropping `y`) while
+    treating a typo as *off* rather than raising. `parse_bool_env` is documented as the only
+    definition precisely because four agreeing copies once cost this repository two live bugs.
+    Absent means the default; present-but-blank is an error.
+
     Why a flag and not simply the fix: `HasField` separates "the broker sent nothing" from "the
     broker means zero decimals", and honouring the second is what the range guard below already
     implies. But if some cTrader build *always sets* the field to 0 rather than omitting it, every
@@ -307,9 +319,12 @@ def _honour_zero_money_digits() -> bool:
     none. The log distinguishes the two cases at runtime; this flag turns on the behaviour once
     that evidence exists. Backlog item 6.
     """
-    return os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    configured = _HONOUR_ZERO_FLAG in os.environ
+    return parse_bool_env(
+        _HONOUR_ZERO_FLAG,
+        resolve_env_value(None, _HONOUR_ZERO_FLAG) if configured else None,
+        default=False,
+    )
 
 
 def _resolve_money_digits(trader: Any, *, context: str) -> int:

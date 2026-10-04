@@ -90,15 +90,30 @@ class RamJetSignalProcessor:
         frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
         frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
         frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
-        # `min_periods` is the strategies' own contract, not a new one: every ATR in
-        # `strategies/` is `tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False)`,
-        # which is NaN until `period` bars exist, so a signal built on it is impossible
-        # rather than merely unreliable. Omitting it here produced a finite positive ATR
-        # from the *first* bar, which the guard below cannot see - it only rejects a
-        # non-finite or non-positive value, and an under-warmed one is neither. Measured on
-        # a growing-range series at period 14: the 3-bar ATR is 89.6% of the warmed 14-bar
-        # ATR, so the stop was materially tighter, from the same signal, in exactly the
-        # regime where the backtest declines to produce a number at all.
+        # `min_periods` is the dominant contract in `strategies/`, and this was the outlier.
+        #
+        # Measured across all 13 ATR computations under `strategies/`:
+        #   * 5 use `tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False)`
+        #     (trend_following, cross_asset_momentum, sector_rotation, stat_arb_pairs,
+        #     gold_momentum);
+        #   * 7 use `tr.rolling(period).mean()`, which is likewise NaN until `period` bars
+        #     exist (channel_breakout, risk_parity, ema_crossoiver_conversion_test,
+        #     pine_supertrend_dema, pine_superosc_vumanchu x2, pynecore_sma_crossover);
+        #   * 1 does not: `volatility_breakout` calls `_wilder_rma`, an `ewm(alpha=1/length)`
+        #     **without** `min_periods`, so it is finite from the first bar - verified.
+        #
+        # So 12 of 13 refuse to produce a number in the warm-up regime, and this live path was
+        # producing one anyway. An earlier version of this comment claimed *every* strategy ATR
+        # used the `min_periods` form and that the backtest "declines to produce a number at
+        # all"; both halves were wrong - the universal quantifier, and the claim about
+        # volatility_breakout.
+        #
+        # The consequence of omitting it here was still real: a finite positive ATR from the
+        # *first* bar, which the guard below cannot see - it only rejects a non-finite or
+        # non-positive value, and an under-warmed one is neither. Measured on a growing-range
+        # series at period 14: the 3-bar ATR is 89.6% of the warmed 14-bar ATR, so the stop was
+        # materially tighter, from the same signal, in exactly the regime where most of the
+        # backtested strategies produce no number to compare against.
         #
         # The alpha is deliberately left alone. Span-based smoothing and Wilder's differ by
         # a few percent with an unstable sign, and no backtest characterised it - adopting
