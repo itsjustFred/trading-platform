@@ -106,7 +106,8 @@ def test_the_model_declares_every_default_production_has(model_built_db: Path) -
     hand", and those need opposite responses.
     """
     # Both sets, not just the first. Collecting only `PRODUCTION_DEFAULTS` left
-    # `MUST_NOT_HAVE_A_DEFAULT` looking at a table that was never read, so `.get()` returned None and
+    # `MUST_NOT_HAVE_A_DEFAULT` looking at a table that was never read, so `.get()` returned None
+    # and
     # the negative guard could not fire - a check that cannot fail, found by mutation.
     tables = {table for table, _ in PRODUCTION_DEFAULTS}
     tables |= {table for table, _ in MUST_NOT_HAVE_A_DEFAULT}
@@ -186,3 +187,57 @@ def test_the_scalar_stat_defaults_are_still_declared(model_built_db: Path) -> No
             f"backtests.{column} has model default {defaults.get(('backtests', column))!r}, "
             f"expected {expected!r}"
         )
+
+
+def test_migrations_run_once_per_process_and_never_again(isolated_db: tuple) -> None:
+    """Why the production drift persisted - and why one restart is all it takes.
+
+    # init_db()` runs `create_all` and `_migrate_schema` **once per process** and then
+    # short-circuits on
+    a module-level `_DB_INITIALIZED` flag. Proven by dropping a column and calling it again:
+
+        1. init_db() ran; _DB_INITIALIZED = True
+        2. dropped backtests.sharpe_ratio to simulate a pre-migration database
+        3. called init_db() again - migrations should run
+        4. sharpe_ratio present after the second init_db(): False
+
+    So a long-lived process never picks up a migration added to the code after it started. That is a
+    # efensible design - a process should not run migrations its own code does not know about - but
+    # it
+    has a consequence worth writing down, because it is the whole explanation for the four pending
+    production changes: **no process has started with code that contains them.**
+
+    The only thing that resets the flag is `reset_initialized()`, whose own docstring says it is a
+    "test isolation helper". There is no `set_data_dir` and no other reset, so nothing re-arms
+    migrations in a running process.
+
+    This is asserted on behaviour rather than on the flag, because the behaviour is what matters: a
+    second `init_db()` must not claim to have migrated when it did not.
+    """
+    import shared.database as database
+
+    # The fixture deliberately leaves `_DB_INITIALIZED = False` so tests *can* run migrations, so
+    # the flag has to be armed first - otherwise the second `init_db()` is the first one and runs
+    # migrations, which is exactly what this test is not about.
+    database.init_db()
+    assert database._DB_INITIALIZED, "init_db did not arm the flag; this test cannot run"
+
+    db_path = Path(database.DB_PATH)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE backtests DROP COLUMN sharpe_ratio")
+        conn.commit()
+    finally:
+        conn.close()
+
+    database.init_db()
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(backtests)")}
+    finally:
+        conn.close()
+    assert "sharpe_ratio" not in columns, (
+        "a second init_db() re-ran the migrations; if that ever becomes true this test's premise "
+        "is stale and the once-per-process note in the backlog needs revisiting"
+    )
