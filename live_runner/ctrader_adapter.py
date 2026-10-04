@@ -2557,6 +2557,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._ProtoOAOrderType.STOP_LIMIT,
         }
         cancelled = 0
+        refused: list[int] = []
         # ProtoOAOrderListRes names the repeated field `order`, not `orders`.
         for order in getattr(reconcile_res, "order", []) or []:
             order_type = int(getattr(order, "orderType", 0) or 0)
@@ -2572,8 +2573,47 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 continue
             if order_id <= 0:
                 continue
-            await self._cancel_order_id(order_id)
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                # One order's rejection must not strand the others.
+                #
+                # This is not a new policy - it is `_is_working_order`'s own premise. That
+                # docstring justifies filtering out filled and cancelled orders precisely because
+                # "cTrader rejects it, and because that rejection propagates it would abort the
+                # loop and leave the *other* orders resting". The filter is a best-effort
+                # inference from a status the client may not be able to name (an unrecognised
+                # enum reads as ACCEPTED - item 2), so the abort the filter exists to prevent is
+                # reachable anyway. Leaving orders resting is strictly worse than attempting
+                # them: this function's contract is to cancel *every* working detached order,
+                # and a rejection on one says nothing about the next.
+                #
+                # `CTraderAuthTerminalError` is a `RuntimeError`, **not** a `CTraderApiError`,
+                # so this cannot swallow it: an auth-terminal failure still propagates and still
+                # ends the sweep, which is correct - the connection is no longer usable and the
+                # remaining cancels would fail anyway. `_raise_terminal_auth_from_api_error` is
+                # called for completeness and raises if the error is auth-terminal by code or by
+                # text.
+                self._raise_terminal_auth_from_api_error(exc)
+                refused.append(order_id)
+                logger.warning(
+                    "cTrader refused to cancel order %s: %s. Continuing the sweep - the remaining "
+                    "orders still need cancelling.",
+                    order_id,
+                    exc,
+                )
+                continue
             cancelled += 1
+        if refused:
+            # Reported rather than swallowed: an operator has to be able to tell a complete sweep
+            # from a partial one, and a caller seeing a lower count should be able to find out why.
+            logger.warning(
+                "Cancel sweep completed with %d of %d working orders refused by the broker: %s. "
+                "Those orders may still be resting.",
+                len(refused),
+                len(refused) + cancelled,
+                sorted(refused),
+            )
         return cancelled
 
     async def cancel_orphaned_protections(self) -> int:

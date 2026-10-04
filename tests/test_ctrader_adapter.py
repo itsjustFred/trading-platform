@@ -956,53 +956,111 @@ class TestWorkingOrderStatusOnRealProtoMessages:
         assert order.HasField("orderStatus") is False
         assert adapter._is_working_order(order) is True
 
-    def test_a_rejected_cancel_aborts_the_sweep_and_leaves_other_orders_resting(
-        self,
-    ) -> None:
-        """Pin the cost side of the decision, which no test covered.
-
-        `cancel_open_orders` awaits `_cancel_order_id` unguarded, so the first rejected
-        cancel propagates and ends the loop - the remaining orders are never attempted.
-        This is the damage that makes the `return True` policy expensive, and it is the
-        reason the backlog calls the choice a trading decision rather than a style one.
-
-        Pinned as current behaviour. Whether one order's rejection should end the sweep
-        is part of backlog item 2, and changing it here would decide that question by
-        accident.
-        """
-        mod = self._real()
+    def _orders(self, mod, *order_ids):
         adapter = self._adapter()
         adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
         adapter._ProtoOAOrderType = mod.ProtoOAOrderType
-
         orders = []
-        for order_id in (11, 22, 33):
+        for order_id in order_ids:
             order = mod.ProtoOAOrder()
             order.orderId = order_id
             order.orderType = int(mod.ProtoOAOrderType.LIMIT)
             order.orderStatus = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
             orders.append(order)
-
         async def _reconcile():
             return SimpleNamespace(order=orders)
+        adapter._reconcile_state = _reconcile
+        return adapter
 
+    def test_a_rejected_cancel_no_longer_strands_the_other_orders(
+        self, caplog
+    ) -> None:
+        """**The abort is gone.** It was `_is_working_order`'s premise that made it a bug.
+
+        That docstring justifies filtering out filled and cancelled orders precisely because
+        "cTrader rejects it, and because that rejection propagates it would abort the loop and
+        leave the *other* orders resting". So the code already named the abort as the harm - and
+        then relied on a status filter to prevent it. The filter is a best-effort inference from a
+        status the client may not be able to name (an unrecognised enum reads as ACCEPTED, item 2),
+        so the abort it exists to prevent is reachable anyway.
+
+        Continuing is not a new policy so much as declining to act on a rejection as if it were a
+        statement about every *later* order: this function's contract is to cancel every working
+        detached order, and one refusal says nothing about the next. What would be a new policy is
+        swallowing the refusal, which is why the count of refusals is reported below.
+
+        The test used to assert the opposite, and said so deliberately: "changing it here would
+        decide that question by accident". It has now been decided, so the pin is inverted rather
+        than deleted.
+        """
+        mod = self._real()
+        adapter = self._orders(mod, 11, 22, 33)
         attempted = []
 
         async def _cancel(order_id: int) -> None:
             attempted.append(order_id)
             raise CTraderApiError("CH_ORDER_NOT_FOUND", "already filled")
 
-        adapter._reconcile_state = _reconcile
         adapter._cancel_order_id = _cancel
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            assert asyncio.run(adapter.cancel_open_orders()) == 0
 
-        with pytest.raises(CTraderApiError):
-            asyncio.run(adapter.cancel_open_orders())
-
-        assert attempted == [11], (
-            f"the sweep attempted {attempted}, so a rejected cancel no longer aborts the "
-            "remaining orders - the cost that made this a decision has been removed, and "
-            "backlog item 2 should be revisited"
+        assert attempted == [11, 22, 33], (
+            f"the sweep attempted {attempted}; one rejection must not end it, because the orders "
+            "left resting are exactly the harm the status filter exists to prevent"
         )
+
+    def test_a_partial_sweep_is_reported_rather_than_swallowed(self, caplog) -> None:
+        """An operator has to be able to tell a complete sweep from a partial one."""
+        mod = self._real()
+        adapter = self._orders(mod, 11, 22)
+        attempted = []
+
+        async def _cancel(order_id: int) -> None:
+            attempted.append(order_id)
+            if order_id == 22:
+                raise CTraderApiError("CH_ORDER_NOT_FOUND", "already filled")
+
+        adapter._cancel_order_id = _cancel
+        with caplog.at_level(logging.WARNING, logger="live-runner"):
+            cancelled = asyncio.run(adapter.cancel_open_orders())
+
+        assert cancelled == 1, "one cancel succeeded, so the count must say one, not two"
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "1 of 2" in joined, (
+            f"the incomplete sweep was not reported, so a caller cannot tell it from a clean run: "
+            f"{joined!r}"
+        )
+        assert "22" in joined, "the report must name which orders may still be resting"
+
+    def test_an_auth_terminal_failure_still_ends_the_sweep(self) -> None:
+        """The one case where stopping is correct, and the reason the guard is narrow.
+
+        `CTraderAuthTerminalError` is a `RuntimeError`, **not** a `CTraderApiError`, so the
+        per-order handler cannot swallow it. That inheritance is load-bearing: if it were ever made
+        a subclass of `CTraderApiError`, an auth-terminal failure would be logged and the sweep
+        would carry on against a connection the broker has already rejected.
+        """
+        mod = self._real()
+        adapter = self._orders(mod, 11, 22)
+        attempted = []
+
+        async def _cancel(order_id: int) -> None:
+            attempted.append(order_id)
+            raise CTraderAuthTerminalError("credentials revoked")
+
+        adapter._cancel_order_id = _cancel
+        with pytest.raises(CTraderAuthTerminalError):
+            asyncio.run(adapter.cancel_open_orders())
+        assert attempted == [11], f"the sweep continued past an auth-terminal failure: {attempted}"
+
+    def test_the_exception_hierarchy_is_what_makes_the_guard_work(self) -> None:
+        """Pinned separately so a refactor cannot quietly widen the `except`."""
+        assert not issubclass(CTraderAuthTerminalError, CTraderApiError), (
+            "CTraderAuthTerminalError is now a CTraderApiError, so the per-order refusal handler "
+            "swallows it and the sweep continues against a dead connection"
+        )
+        assert issubclass(CTraderAuthTerminalError, RuntimeError)
 
 
 class TestTerminalAuthFailureAndRetryBudget:
@@ -4264,4 +4322,75 @@ class TestTheMoneyDigitsHelpersAreActuallyCallableAsProductionCallsThem:
         assert isinstance(entry, types.FunctionType), (
             f"account_discovery._resolve_money_digits is a {type(entry).__name__}; it is called "
             "as a module-level function at account_discovery.py:368, so it must stay one"
+        )
+
+
+class TestTheSweepHandlerConvertsAuthTerminalApiErrorsItself:
+    """Defensive depth on a money path, and the reason one mutation survived.
+
+    `_cancel_order_id` already calls `_raise_terminal_auth_from_api_error(exc)` before re-raising,
+    so in production an auth-terminal `CTraderApiError` has become a `CTraderAuthTerminalError` -
+    a `RuntimeError` - before the sweep's per-order handler could see it. The handler calls the
+    converter again anyway, and that call is redundant on that path.
+
+    It is not redundant on every path. Anything that reaches the handler without going through
+    `_cancel_order_id`'s own conversion - a subclass override, a test double, a future refactor
+    that inlines the request - would deliver a plain `CTraderApiError` carrying an auth-terminal
+    code, and without the second call it would be logged and the sweep would carry on against a
+    connection the broker has already rejected.
+
+    Removing the call survived the suite for exactly that reason: every test stubs
+    `_cancel_order_id`, so the inner conversion never ran. This test closes it.
+    """
+
+    def test_a_plain_api_error_with_an_auth_terminal_code_still_ends_the_sweep(self) -> None:
+        from live_runner.ctrader_adapter import CTraderApiError
+
+        class _Adapter:
+            def __init__(self):
+                self.attempted = []
+                self._terminal = None
+
+            def _raise_terminal_auth_from_api_error(self, exc):
+                from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+                CTraderLiveAdapter._raise_terminal_auth_from_api_error(self, exc)
+
+            def _mark_terminal_auth_failure(self, reason, *, error_code=None):
+                self._terminal = (reason, error_code)
+
+            @staticmethod
+            def _is_working_order(order):
+                """Minimal stand-in: this test is about the handler, not the status filter."""
+                return True
+
+        mod = pytest.importorskip(
+            "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+            reason="the installed protos are what make a real working order",
+        )
+        adapter = _Adapter()
+        orders = []
+        for order_id in (11, 22):
+            order = mod.ProtoOAOrder()
+            order.orderId = order_id
+            order.orderType = int(mod.ProtoOAOrderType.LIMIT)
+            order.orderStatus = int(mod.ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+            orders.append(order)
+
+        async def _reconcile():
+            return SimpleNamespace(order=orders)
+
+        async def _cancel(order_id: int) -> None:
+            adapter.attempted.append(order_id)
+            raise CTraderApiError("CH_ACCESS_TOKEN_INVALID", "token invalid")
+
+        adapter._reconcile_state = _reconcile
+        adapter._cancel_order_id = _cancel
+        adapter._ProtoOAOrderStatus = mod.ProtoOAOrderStatus
+        adapter._ProtoOAOrderType = mod.ProtoOAOrderType
+
+        with pytest.raises(CTraderAuthTerminalError):
+            asyncio.run(CTraderLiveAdapter.cancel_open_orders(adapter))
+        assert adapter.attempted == [11], (
+            f"the sweep continued past an auth-terminal API error: {adapter.attempted}"
         )
