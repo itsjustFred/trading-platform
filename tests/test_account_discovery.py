@@ -2413,6 +2413,23 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
         "both must log the ambiguous case with its presence flag."
     )
 
+    # The *flag helper* is a second duplicated line, and comparing only the resolver left it
+    # unguarded: a mutation that changed the environment variable name in one copy survived the
+    # sweep, which would have meant turning the flag on working in discovery and doing nothing in
+    # the live adapter. Two copies of a fix are two chances to apply it once - including the
+    # switch that turns the fix on.
+    def flag_body(text: str) -> str:
+        start = text.index('os.environ.get("CTRADER_HONOUR_ZERO_MONEY_DIGITS"')
+        end = text.index("}", text.index('"on",', start)) + 1
+        return " ".join(" ".join(text[start:end].split()).split())
+
+    assert flag_body(discovery) == flag_body(adapter), (
+        "the two _honour_zero_money_digits copies have drifted - most importantly the variable "
+        "they read. A mismatch would make the flag work in discovery and silently do nothing in "
+        "the live adapter, which is the copy that runs every reconcile."
+    )
+    assert "CTRADER_HONOUR_ZERO_MONEY_DIGITS" in flag_body(discovery)
+
     for name, text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
         assert 'has_field("moneyDigits")' in text, (
             f"{name} lost the presence check; without it the log cannot distinguish an omitted "
@@ -2499,4 +2516,52 @@ class TestTheZeroDecimalPlacesFlag:
         assert _honour_zero_money_digits() is False, (
             "the flag reads as enabled with no environment variable set, which would make the "
             "safe behaviour the accidental one"
+        )
+
+
+class TestASignedZeroLoginIsStillZero:
+    """`+0` is zero. The guard has to notice, and only the sign-handling side of `lstrip` does.
+
+    The guard reads `magnitude = candidate.lstrip("+-")` and then tests the magnitude. That is
+    deliberate: `"0"` and `"-0"` both reduce to `"0"` and are refused, while `"alice"` and
+    `"L-99"` are not digits and pass through.
+
+    A mutation that narrowed `lstrip("+-")` to `lstrip("-")` survived everything else in this file.
+    It is invisible for `"+5"` - `"+5".isdigit()` is `False` either way, so the guard does not fire
+    and the value is accepted - but **`"+0"` then slips through**, because `"+0".isdigit()` is
+    False while `"0".isdigit()` is True. A broker login of zero refused one way and accepted the
+    other is exactly the asymmetry item 3 was about.
+    """
+
+    @staticmethod
+    def _login(value):
+        from live_runner.account_discovery import _ctrader_extract_login
+
+        return _ctrader_extract_login(SimpleNamespace(traderLogin=value))
+
+    @pytest.mark.parametrize("value", ["0", "+0", "-0", " 0 ", "+00"])
+    def test_every_spelling_of_zero_is_refused(self, value) -> None:
+        assert self._login(value) == "", (
+            f"{value!r} is zero and is being accepted as a broker login; a signed zero must be "
+            "refused the same way an unsigned one is"
+        )
+
+    @pytest.mark.parametrize("value", ["+5", "+15", "15", "5"])
+    def test_a_signed_positive_is_still_accepted(self, value) -> None:
+        assert self._login(value) == value, (
+            f"{value!r} is a positive login and is being refused; the guard judges non-positive "
+            "numbers, not signs"
+        )
+
+    @pytest.mark.parametrize("value", ["-5", "-1", "-99"])
+    def test_a_negative_is_refused_on_both_spellings_of_the_guard(self, value) -> None:
+        """The item 3 fix itself, pinned next to the signed-zero case.
+
+        Listed separately because a negative is *not* zero: `"0"` exercises the
+        `int(magnitude) == 0` half and `"-5"` exercises the `startswith("-")` half. Both have to
+        hold, and each is a different line.
+        """
+        assert self._login(value) == "", (
+            f"{value!r} is a negative login and is being accepted; item 3's whole point is that "
+            "the guard refuses non-positive identifiers"
         )

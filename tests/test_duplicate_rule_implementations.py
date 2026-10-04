@@ -754,3 +754,28 @@ class TestMalformedAndAbsentSessionsStoppedSharingAValue:
         with pytest.raises(ValueError):
             _explicit_session_window(None, "bad", "16:00")
         assert _explicit_session_window(None, "09:30", "16:00") == (570, 960)
+
+
+def test_the_malformed_session_warning_names_the_session_that_failed(caplog) -> None:
+    """The whole value of the warning is *which* session, and the sweep proved it untested.
+
+    Replacing `session_value` with a placeholder in the log survived every other test in the file.
+    That is the difference between a warning an operator can act on and one they have to
+    reverse-engineer, and it is the only thing distinguishing this from a generic "check your
+    config" message.
+    """
+    import logging
+
+    import pandas as pd
+    from data_tools import validate
+
+    with caplog.at_level(logging.WARNING, logger="data_tools.validate"):
+        validate._gap_classification(
+            pd.Timestamp("2023-01-03 09:30", tz="UTC"),
+            pd.Timestamp("2023-01-04 09:30", tz="UTC"),
+            "equity", "1h", session="25:00-23:00", observed_session=(570, 960),
+        )
+    joined = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    assert "25:00-23:00" in joined, (
+        f"the warning does not quote the session that failed to parse: {joined!r}"
+    )

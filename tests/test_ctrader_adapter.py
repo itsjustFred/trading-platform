@@ -4134,3 +4134,80 @@ class TestAnExplicitlySentZeroPriceIsDistinguishable:
             None, SimpleNamespace(executionPrice=0.0)
         ) == []
         assert CTraderLiveAdapter._explicitly_sent_zero_prices(None, None) == []
+
+
+class TestTheZeroDetectionsDoNotOverreach:
+    """Both detections key on something specific, and each over-reach survived the sweep.
+
+    The mutation sweep found that loosening either check broke nothing. Both are narrow on
+    purpose - `_explicitly_sent_zero_prices` reports a *zero*, and
+    `_unrecognised_status_wire_value` reports an *enum* - so a looser check would name the wrong
+    thing in a log an operator is being asked to act on.
+    """
+
+    @staticmethod
+    def _protos():
+        return pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+
+    @staticmethod
+    def _varint(n: int) -> bytes:
+        out = bytearray()
+        while True:
+            b, n = n & 0x7F, n >> 7
+            out.append(b | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    def test_an_explicitly_sent_negative_price_is_not_reported_as_a_sent_zero(self) -> None:
+        """A negative price is item 10's *other* half, not this one.
+
+        `-5.0` sent explicitly is a different problem from a zero sent explicitly: the zero might
+        be a broker convention, while a negative is not a price any broker reports for a fill. The
+        log names the situation, so it must not conflate them.
+        """
+        mod = self._protos()
+        deal = mod.ProtoOADeal()
+        deal.executionPrice = -5.0
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(mod.ProtoOAOrder(), deal) == [], (
+            "an explicitly-sent -5.0 is being reported as a sent zero; the log says 'exactly 0', "
+            "so a negative must not appear under that description"
+        )
+
+    def test_an_explicitly_sent_nan_price_is_not_reported_either(self) -> None:
+        mod = self._protos()
+        deal = mod.ProtoOADeal()
+        deal.executionPrice = float("nan")
+        assert CTraderLiveAdapter._explicitly_sent_zero_prices(mod.ProtoOAOrder(), deal) == []
+
+    def test_an_unknown_field_of_another_wire_type_is_not_an_unnamed_status(self) -> None:
+        """The status fingerprint must be an enum, and an enum arrives as a varint.
+
+        Dropping the `wire_type == 0` check survived the sweep, because no message in the test
+        suite carries an unknown field of any other kind. A length-delimited unknown field under
+        `orderStatus`'s own number would then be reported as an unnameable status - a fabrication,
+        and one an operator would go and look up.
+        """
+        mod = self._protos()
+        number = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"].number
+        order = mod.ProtoOAOrder()
+        # Wire type 2 (length-delimited) at orderStatus's own field number, with a payload.
+        order.ParseFromString(self._varint((number << 3) | 2) + self._varint(3) + b"abc")
+        assert CTraderLiveAdapter._unrecognised_status_wire_value(order) is None, (
+            "a length-delimited unknown field under orderStatus's number is being reported as an "
+            "unrecognised enum; only a varint can be one"
+        )
+
+    def test_a_genuine_unnamed_status_is_still_detected_after_that(self) -> None:
+        """The over-reach guard must not have cost the real detection."""
+        mod = self._protos()
+        number = mod.ProtoOAOrder.DESCRIPTOR.fields_by_name["orderStatus"].number
+        order = mod.ProtoOAOrder()
+        order.ParseFromString(self._varint((number << 3) | 0) + self._varint(6))
+        assert CTraderLiveAdapter._unrecognised_status_wire_value(order) == 6
+
+    def test_an_unknown_field_under_a_different_number_is_ignored(self) -> None:
+        """The fingerprint keys on *this* field's number, not on any unknown field."""
+        mod = self._protos()
+        order = mod.ProtoOAOrder()
+        order.ParseFromString(self._varint((999 << 3) | 0) + self._varint(6))
+        assert CTraderLiveAdapter._unrecognised_status_wire_value(order) is None
