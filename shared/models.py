@@ -407,6 +407,19 @@ class LiveExecution(BaseModel):
     broker_order_id: str
     dedupe_key: str | None = None
 
+    # The broker's own per-fill identifier, where it has one. cTrader calls it `dealId`; Alpaca's
+    # equivalent is not populated yet.
+    #
+    # Stored because the dedupe key alone cannot answer the question it was built to answer. The key
+    # is a string our own code assembled, so "were these two rows the same broker fill?" cannot be
+    # answered afterwards without parsing it back out of that string - and when two equal-sized fills
+    # on one order collide, that parse is the only evidence there is. Measured: one stored signal
+    # produced two execution rows 2 ms apart at an identical price, and `live_executions` carried
+    # nothing that could distinguish two real partial fills from one fill counted twice.
+    #
+    # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
+    broker_fill_id: int | None = None
+
 
 class LiveBalanceRecord(BaseModel):
     """Periodic balance/equity snapshot for a live broker account."""
