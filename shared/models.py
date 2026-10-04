@@ -186,8 +186,18 @@ class VerificationEvidenceSummary(BaseModel):
 # minute-scale data. cTrader is immune - it has no `get_market_data`, so it fails closed.
 #
 # `BacktestConfig` already refuses it (`runner/engines/base.py:190` requires the canonical,
-# case-sensitive spelling), so the backtester is strict where the live path was not. This
-# makes the live path agree with code that already existed, rather than choosing a policy.
+# case-sensitive spelling), so for `<n>M` the live path now agrees with code that already
+# existed rather than choosing a policy.
+#
+# **That parity argument holds for `<n>M` and nothing else, and an earlier version of this
+# comment implied otherwise.** Measured, `BacktestConfig` refuses *every* non-canonical spelling -
+# `1M`, `1D`, `1W`, `1H`, `5M`, `M15` and the `m5`-style aliases - while this guard refuses only
+# `<n>M`. So the live path is deliberately *more* permissive than the backtester for `1D`, `1W`,
+# `1H`, `M15` and `m5`, and that divergence is recorded rather than closed: an uppercase `D` means
+# *day* on every platform that distinguishes it from a month, so refusing it would break a
+# legitimate spelling, and `m5` is the grid downloader's own minute alias. Tightening those to
+# match the backtester is a real decision about which spellings the platform accepts, not a
+# consequence of the `1M` fix.
 #
 # Scoped to digits-then-uppercase-M on purpose:
 #   * `1m`, `5m`, `15m`, `30m` are the canonical minute spellings and must keep working;

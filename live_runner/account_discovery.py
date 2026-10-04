@@ -311,6 +311,10 @@ def _honour_zero_money_digits() -> bool:
     definition precisely because four agreeing copies once cost this repository two live bugs.
     Absent means the default; present-but-blank is an error.
 
+    **Same known limitation as the adapter's copy:** only the process environment is
+    consulted, not `.accounts.env`, so a flag set there is silently the default. Recorded
+    as an open item in backlog item 6.
+
     Why a flag and not simply the fix: `HasField` separates "the broker sent nothing" from "the
     broker means zero decimals", and honouring the second is what the range guard below already
     implies. But if some cTrader build *always sets* the field to 0 rather than omitting it, every

@@ -31,7 +31,15 @@ _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 # `${a.b}` is text, and it is refused. The pattern is named for the condition it actually detects
 # rather than the one it was first written for.
 #
-_MALFORMED_BRACED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?=$|[^\w}-])")
+# The trailing `[^\s-]*\}?` is what makes the quoted token *whole*. Without it the match stopped
+# at the end of the identifier run, so `${a.b}` was reported as `${a` and `${order.price}` as
+# `${order` - a truncated string that appears nowhere in the config, which is worse for an
+# operator than quoting a bare `${`. Whitespace still ends the token (there is no way to know
+# where a name stops inside `${FOO BAR}`), and `-` is still excluded so `${VAR-NAME}` remains
+# out of scope, as the recorded decision requires.
+_MALFORMED_BRACED_ENV_PATTERN = re.compile(
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_-]*\})[^\s-]*\}?"
+)
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:

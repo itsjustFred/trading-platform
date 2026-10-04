@@ -243,6 +243,49 @@ def _weekend_boundary(start: pd.Timestamp, end: pd.Timestamp) -> bool:
     return False
 
 
+_MALFORMED_SESSION_WARNED: set[str] = set()
+
+
+def reset_malformed_session_warnings() -> None:
+    """Forget which malformed sessions have been warned about. For tests."""
+    _MALFORMED_SESSION_WARNED.clear()
+
+
+def _warn_malformed_session_once(session_value: object, asset_class: str) -> None:
+    """Say once that a configured session could not be parsed.
+
+    Hoisted out of `_gap_classification` deliberately. The warning used to sit at the top of that
+    function, which the gap loop calls once per gap examined - and the examination is explicitly
+    *not* capped: the file notes that "the report is capped below and the examination is not: a
+    verdict computed from the first 20 of 130 gaps is a claim about the first 20". Measured before
+    this change: three calls produced three identical warnings, so a typo'd session on a multi-year
+    intraday file produced one per gap.
+
+    That is precisely the crying wolf the same batch refused for item 1's dedupe warning, and it
+    would have trained an operator to ignore the only signal that their own typo caused the
+    coverage warnings they were reading. The wording is unchanged and malformed still maps to
+    exactly today's classification, so no gap verdict moves - only the volume changed.
+
+    **Memoised per session value**, because hoisting the call out of the body is not enough on its
+    own: `_gap_classification` resolves the session itself, so the caller still reaches this once
+    per gap. A repeated value warns once per process. `reset_malformed_session_warnings()` clears
+    the record, which is what the tests use so they do not depend on each other's ordering.
+    Backlog item 7.
+    """
+    key = repr(session_value)
+    if key in _MALFORMED_SESSION_WARNED:
+        return
+    _MALFORMED_SESSION_WARNED.add(key)
+    logger.warning(
+        "Configured trading session %r could not be parsed, so it is being treated as if no "
+        "session were configured%s. The downloader raises on the same input, so this config "
+        "would fail at download time - which is worth knowing before triaging a coverage warning "
+        "as missing market data.",
+        session_value,
+        " and replaced by an observed one" if asset_class in _EQUITY_LIKE_ASSET_CLASSES else "",
+    )
+
+
 def _is_intraday_timeframe(timeframe: str) -> bool:
     return str(timeframe).strip().lower() not in {
         "",
@@ -286,21 +329,10 @@ def _gap_classification(
     resolved_session = _session_window(session_value)
     if resolved_session is MALFORMED_SESSION:
         # Preserved deliberately: a malformed session still behaves as no session, so every gap
-        # classification is unchanged and the mislabelling pin stays valid. What is new is that
-        # the substitution below is no longer silent - and for equity-like assets it *is* a
+        # classification is unchanged and the mislabelling pin stays valid. What is new is that the
+        # substitution below is no longer silent - and for equity-like assets it *is* a
         # substitution, because an observed window is used in its place.
-        logger.warning(
-            "Configured trading session %r could not be parsed, so it is being treated as if no "
-            "session were configured%s. The downloader raises on the same input, so this config "
-            "would fail at download time - which is worth knowing before triaging a coverage "
-            "warning as missing market data.",
-            session_value,
-            (
-                " and replaced by an observed one"
-                if normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES
-                else ""
-            ),
-        )
+        _warn_malformed_session_once(session_value, normalized_asset_class)
         resolved_session = None
     if resolved_session is None and normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
         resolved_session = observed_session

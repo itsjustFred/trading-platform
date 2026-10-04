@@ -108,10 +108,14 @@ class RocketFuelSignalProcessor:
         #
         # The consequence of omitting it here was still real: a finite positive ATR from the
         # *first* bar, which the guard below cannot see - it only rejects a non-finite or
-        # non-positive value, and an under-warmed one is neither. Measured on a growing-range
-        # series at period 14: the 3-bar ATR is 89.6% of the warmed 14-bar ATR, so the stop was
-        # materially tighter, from the same signal, in exactly the regime where most of the
-        # backtested strategies produce no number to compare against.
+        # non-positive value, and an under-warmed one is neither.
+        #
+        # On the growing-range series tabulated in `notes/backlog.md` (item 5) at period 14 the
+        # 3-bar live ATR is 2.4060 against a warmed 14-bar Wilder ATR of 2.6942 - **89.3%** - so
+        # the stop was ~11% tighter, from the same signal, in exactly the regime where most of the
+        # backtested strategies produce no number to compare against. The figure quoted here
+        # earlier read 89.6%, which does not reconcile with that table; 89.3% is the ratio the
+        # published numbers actually give.
         #
         # The alpha is deliberately left alone. Span-based smoothing and Wilder's differ by
         # a few percent with an unstable sign, and no backtest characterised it - adopting

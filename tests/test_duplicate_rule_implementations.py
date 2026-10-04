@@ -646,6 +646,19 @@ class TestMalformedAndAbsentSessionsStoppedSharingAValue:
     logged instead of silent.
     """
 
+    @pytest.fixture(autouse=True)
+    def _forget_prior_warnings(self):
+        """The warning is memoised per session value, so each test starts from a clean record.
+
+        Without this, the second test in this class to use a given malformed session would see no
+        warning at all and fail for a reason that has nothing to do with what it is testing.
+        """
+        from data_tools.validate import reset_malformed_session_warnings
+
+        reset_malformed_session_warnings()
+        yield
+        reset_malformed_session_warnings()
+
     @staticmethod
     def _window(value):
         from data_tools.validate import _session_window
@@ -780,3 +793,58 @@ def test_the_malformed_session_warning_names_the_session_that_failed(caplog) -> 
     assert "25:00-23:00" in joined, (
         f"the warning does not quote the session that failed to parse: {joined!r}"
     )
+
+
+def test_a_repeated_malformed_session_is_only_warned_about_once(caplog) -> None:
+    """The volume fix, pinned.
+
+    `_gap_classification` resolves the session itself and the gap loop calls it once per gap
+    examined - and that examination is explicitly uncapped. Before this, three calls produced three
+    identical warnings, so a typo'd session on a multi-year intraday file produced one per gap: the
+    exact crying wolf this batch refused for item 1's dedupe warning, and it would have trained an
+    operator to ignore the only signal that their own typo caused the coverage warnings.
+    """
+    import logging
+
+    import pandas as pd
+    from data_tools import validate
+
+    validate.reset_malformed_session_warnings()
+    try:
+        with caplog.at_level(logging.WARNING, logger="data_tools.validate"):
+            for _ in range(5):
+                validate._gap_classification(
+                    pd.Timestamp("2023-01-03 09:30", tz="UTC"),
+                    pd.Timestamp("2023-01-04 09:30", tz="UTC"),
+                    "equity", "1h", session="25:00-23:00", observed_session=(570, 960),
+                )
+        warnings = [r for r in caplog.records if "could not be parsed" in r.getMessage()]
+        assert len(warnings) == 1, (
+            f"five gap classifications produced {len(warnings)} identical warnings; this one "
+            "has to stay rare or operators learn to ignore it"
+        )
+    finally:
+        validate.reset_malformed_session_warnings()
+
+
+def test_the_gap_verdicts_themselves_are_unchanged_by_the_hoist(caplog) -> None:
+    """Only the volume changed. The classification a malformed session produces must not move."""
+    import pandas as pd
+    from data_tools import validate
+
+    validate.reset_malformed_session_warnings()
+    try:
+        malformed = validate._gap_classification(
+            pd.Timestamp("2023-01-03 00:00", tz="UTC"),
+            pd.Timestamp("2023-01-14 00:00", tz="UTC"),
+            "equity", "1h", session="25:00-23:00",
+        )
+        valid = validate._gap_classification(
+            pd.Timestamp("2023-01-03 00:00", tz="UTC"),
+            pd.Timestamp("2023-01-14 00:00", tz="UTC"),
+            "equity", "1h", session={"start": "09:30", "end": "16:00"},
+        )
+    finally:
+        validate.reset_malformed_session_warnings()
+    assert malformed == "data", f"a malformed session now classifies as {malformed!r}"
+    assert valid == "session", f"a valid session now classifies as {valid!r}"

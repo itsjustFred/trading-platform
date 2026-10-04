@@ -7922,9 +7922,14 @@ class TestAMonthlySpellingIsRefusedAtTheConfigBoundary:
     minute bars reach the signal processor and ATR/stops are computed from minute-scale data.
     (cTrader is immune: no `get_market_data`, so it fails closed.)
 
-    **This is not a new policy.** `BacktestConfig` has always required the canonical,
+    **For `<n>M` this is not a new policy.** `BacktestConfig` has always required the canonical,
     case-sensitive spelling - `runner/engines/base.py:190` - so the backtester refused `1M` while
-    the live path accepted it. Refusing it at the live boundary makes the two agree.
+    the live path accepted it, and refusing it at the live boundary makes those two agree.
+
+    **That parity argument covers `<n>M` only.** `BacktestConfig` also refuses `1D`, `1W`, `1H`,
+    `5M`, `M15` and `m5`; this guard does not, so the live path remains more permissive for those.
+    The divergence is deliberate and recorded - see `_MONTH_TIMEFRAME_PATTERN`'s comment - and a
+    test below pins it so it stays visible rather than being closed by accident.
 
     Measured exposure was zero - no config row, no database row, no file on disk - so this closes
     a latent path with nothing to migrate.
@@ -7979,13 +7984,41 @@ class TestAMonthlySpellingIsRefusedAtTheConfigBoundary:
 
     @pytest.mark.parametrize("spelling", ["1D", "1W", "1H"])
     def test_uppercase_day_and_hour_are_left_alone(self, spelling) -> None:
-        """Only `M` is dangerous, and only after a digit.
+        """Only `M` is dangerous, and only after a digit - and this is a *known divergence*.
 
         `1D` is *day* on every platform that distinguishes it from a month, so refusing it would
-        break a legitimate spelling in order to fix an illegitimate one. `1W` and `1H` likewise
-        carry no competing meaning.
+        break a legitimate spelling in order to fix an illegitimate one.
+
+        This test deliberately freezes a live/backtest **disagreement**, so it is worth being precise
+        about that: `BacktestConfig` refuses all three of these, because it accepts only canonical
+        spellings. This guard accepts them. The disagreement is recorded rather than closed, because
+        widening the guard to match would reject `1D` - a legitimate spelling - on the strength of a
+        change made about months. If a future change does widen it, this test is what should fail
+        loudly and say why.
         """
         assert self._config(spelling).timeframe == spelling
+
+    @pytest.mark.parametrize("spelling", ["1D", "1W", "1H", "M15", "m5"])
+    def test_the_live_path_is_still_more_permissive_than_the_backtester_for_these(self, spelling) -> None:
+        """The parity claim is scoped to `<n>M`; this is the test that keeps it scoped.
+
+        `BacktestConfig` accepts only canonical, case-sensitive spellings, so it refuses every one of
+        these. The live guard refuses `<n>M` and nothing else on the list. Anyone widening the guard
+        to match the backtester will break this test, which is the intended moment to decide whether
+        rejecting `1D` is really wanted.
+        """
+        from runner.engines.base import BacktestConfig
+
+        with pytest.raises(ValueError, match="Invalid timeframe"):
+            BacktestConfig(
+                strategy_name="s", symbols=["AAPL"], timeframe=spelling,
+                start_date="2021-01-01", end_date="2025-06-30",
+            )
+        assert self._config(spelling).timeframe == spelling, (
+            f"{spelling!r} is no longer accepted live; if the guard was widened to match "
+            "BacktestConfig, update the reasoning in _MONTH_TIMEFRAME_PATTERN rather than only "
+            "this assertion"
+        )
 
     def test_the_api_payload_is_guarded_too(self) -> None:
         """The UI is a `<select>`, so a typo arrives via the API or via YAML.
