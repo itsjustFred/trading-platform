@@ -1745,6 +1745,7 @@ def _backfill_backtest_equity_curves(connection: Connection) -> None:
             "WHERE equity_curve IS NULL OR equity_curve = '[]' OR equity_curve = ''"
         )
     ).fetchall()
+    filled = 0
     for (bt_id,) in backtests_to_fill:
         equity_curve = _equity_points_curve(connection, bt_id)
         if not equity_curve and Path(str(bt_id)).name == str(bt_id):
@@ -1754,6 +1755,34 @@ def _backfill_backtest_equity_curves(connection: Connection) -> None:
                 text("UPDATE backtests SET equity_curve = :eq WHERE id = :id"),
                 {"eq": json.dumps(equity_curve), "id": bt_id},
             )
+            filled += 1
+
+    # **Report having resolved nothing.**
+    #
+    # This backfill selects every backtest with an empty curve, tries `equity_points` and then a
+    # legacy JSON artifact, and moves on when neither yields anything. It kept no count, so "1,211
+    # rows in scope, 0 written" was indistinguishable from "nothing needed doing" - and on
+    # production it is the first. Measured: 1,211 rows have `equity_curve='[]'`, none have matching
+    # `equity_points`, and the artifact fallback reads `DATA_DIR/backtests/{id}.trades.json` - where
+    # this repo's DATA_DIR holds **0** artifacts against 2,377 under the production data dir. So every
+    # row resolved to nothing, nothing was written, and the migration reported success.
+    #
+    # A migration that did no work while saying it did is the failure this repo keeps auditing for,
+    # one level down. Logged rather than raised: a deployment whose artifacts genuinely live
+    # elsewhere should not have every process start fail, and the counts say which case this is.
+    in_scope = len(backtests_to_fill)
+    if in_scope and not filled:
+        logger.warning(
+            "backtests.equity_curve backfill resolved nothing: %d rows had an empty curve and no "
+            "source produced one. Looked for equity_points rows and for %s. If the artifacts live "
+            "elsewhere this migration is a no-op on every run and those rows stay empty.",
+            in_scope,
+            str(Path(DATA_DIR) / "backtests"),
+        )
+    elif in_scope:
+        logger.info(
+            "backtests.equity_curve backfill filled %d of %d empty rows", filled, in_scope
+        )
 
 
 def _migrate_backtests_equity_curve(connection: Connection) -> None:
