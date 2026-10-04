@@ -1325,6 +1325,8 @@ def _backfill_live_signal_discord_message_ids(connection: Connection) -> None:
             "WHERE discord_message_id IS NULL OR discord_message_id = ''"
         )
     ).fetchall()
+    written = 0
+    unreadable_metadata = 0
     for sig_id, meta_json in signals_to_fill:
         if not meta_json:
             continue
@@ -1332,6 +1334,7 @@ def _backfill_live_signal_discord_message_ids(connection: Connection) -> None:
             metadata = json.loads(meta_json) if isinstance(meta_json, str) else meta_json
             discord_msg_id = metadata.get("discord_message_id")
         except (TypeError, ValueError, AttributeError):
+            unreadable_metadata += 1
             continue
         if discord_msg_id:
             connection.execute(
@@ -1341,6 +1344,38 @@ def _backfill_live_signal_discord_message_ids(connection: Connection) -> None:
                 ),
                 {"discord_message_id": str(discord_msg_id), "id": sig_id},
             )
+            written += 1
+
+    # **Report what a data migration wrote.** Same reasoning as the equity-curve backfill: no count was
+    # kept, so "rows in scope, 0 written" read the same as "nothing needed doing".
+    #
+    # Measured read-only on production, because an audit had claimed this migration would **UPDATE 6
+    # rows** and that claim turned out to be half wrong in the direction that matters:
+    #
+    #   rows the migration SELECTS : 6
+    #   rows it would UPDATE      : 0
+    #
+    # Six rows have an empty `discord_message_id` and so are selected - but **none** carries a
+    # `discord_message_id` in its `metadata` JSON, including the one `source: discord` row, whose
+    # metadata holds `discord_channel_id` and `discord_content` but no message id. So it is a genuine
+    # no-op on production, which is worth knowing precisely because it was recorded as a silent write.
+    #
+    # Incidentally: the column holds two distinct values across the 7 rows - `NULL` and the literal
+    # **string** `'None'`. The latter is not selected (it matches neither `IS NULL` nor `= ''`), so it
+    # is inert here, but a stored `'None'` is a value no reader should have to interpret.
+    in_scope = len(signals_to_fill)
+    if written:
+        logger.info(
+            "live_signals.discord_message_id backfill wrote %d of %d rows with an empty id",
+            written,
+            in_scope,
+        )
+    if unreadable_metadata:
+        logger.warning(
+            "live_signals.discord_message_id backfill skipped %d rows whose metadata could not be "
+            "read; those rows keep an empty discord_message_id",
+            unreadable_metadata,
+        )
 
 
 def _raise_on_duplicate_live_signal_discord_ids(connection: Connection) -> None:

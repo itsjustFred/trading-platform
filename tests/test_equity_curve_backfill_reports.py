@@ -144,3 +144,102 @@ def test_the_report_names_the_directory_it_looked_in(
     assert expected in message, (
         f"the warning does not name the artifact directory it consulted ({expected}): {message}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The same defect, second instance: a migration that selects rows, resolves nothing,
+# writes nothing, and reported none of it.
+#
+# An audit recorded this one as "would UPDATE 6 rows on production". Measured read-only, that is
+# half wrong in the direction that matters - it selects 6 rows and would update **0**, because
+# none carries a `discord_message_id` in its metadata JSON. So it is a genuine no-op on
+# production, and the write count nobody could name turned out to be zero. The counts are still
+# the fix: "0" is a fact worth recording, and the day a metadata field does appear, the number
+# will say so.
+
+
+def _seed_signal(message_id: str | None) -> None:
+    import json as _json
+
+    payload = {"source": "discord", "discord_channel_id": "1", "qty": 1}
+    if message_id is not None:
+        payload["discord_message_id"] = message_id
+    with database.get_engine().connect() as connection:
+        connection.execute(
+            database.text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price, "
+                "timestamp, source, broker_order_id, metadata, discord_message_id) "
+                "VALUES (:id, 'dep-1', 'AAPL', 'BUY', 1.0, '2026-01-01', 'discord', '', "
+                ":meta, :dmid)"
+            ),
+            {
+                "id": f"sig-{message_id}",
+                "meta": _json.dumps(payload),
+                "dmid": message_id,
+            },
+        )
+        connection.commit()
+
+
+def test_the_discord_backfill_reports_how_many_rows_it_wrote(
+    isolated_db: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rows in scope, nothing resolvable, and it now says so."""
+    _seed_signal(message_id=None)
+    with caplog.at_level("INFO", logger="database"):
+        with Session(database.get_engine()) as session:
+            database._backfill_live_signal_discord_message_ids(session.connection())
+
+    assert not _messages(caplog, "INFO"), (
+        "a backfill that wrote nothing still reported a write count"
+    )
+
+
+def test_the_discord_backfill_reports_a_real_write(
+    isolated_db: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other direction, so the count cannot be hardcoded to zero."""
+    _seed_signal(message_id=None)
+    with database.get_engine().connect() as connection:
+        connection.execute(
+            database.text(
+                "UPDATE live_signals SET metadata = json_set(metadata, "
+                "'$.discord_message_id', 'm-1')"
+            )
+        )
+        connection.commit()
+
+    with caplog.at_level("INFO", logger="database"):
+        with Session(database.get_engine()) as session:
+            database._backfill_live_signal_discord_message_ids(session.connection())
+
+    infos = _messages(caplog, "INFO")
+    assert any("wrote 1" in m for m in infos), infos
+
+
+def test_unreadable_metadata_is_warned_about_rather_than_skipped_silently(
+    isolated_db: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row whose metadata cannot be parsed is a different case from one with no id in it.
+
+    Both end with an empty `discord_message_id`, so without a count they are indistinguishable - and
+    the first suggests data loss rather than an absent field.
+    """
+    with database.get_engine().connect() as connection:
+        connection.execute(
+            database.text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price, "
+                "timestamp, source, broker_order_id, metadata, discord_message_id) "
+                "VALUES ('sig-broken', 'dep-1', 'AAPL', 'BUY', 1.0, '2026-01-01', 'discord', '', "
+                "'not json at all', '')"
+            )
+        )
+        connection.commit()
+
+    with caplog.at_level("WARNING", logger="database"):
+        with Session(database.get_engine()) as session:
+            database._backfill_live_signal_discord_message_ids(session.connection())
+
+    warnings = _messages(caplog, "WARNING")
+    assert warnings, "a row with unparseable metadata was skipped silently"
+    assert "could not be read" in warnings[-1], warnings[-1]
