@@ -103,36 +103,44 @@ def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment co
     A literal ``"${DISCORD_BOT_X_CHANNEL_ID}"`` never matches a real channel
     — that is a startup error, never a silent mute.
     """
-    leftovers: list[str] = []
-    malformed: list[str] = []
+    # (token, field-path) rather than a bare token. Backlog item 4 deferred widening this guard
+    # until the logging had been observed, on the stated ground that "the error message names the
+    # reference but not the field it came from". That part is decidable, and it is fixed here rather
+    # than used as a reason to wait: an operator holding a seven-deployment YAML cannot act on a
+    # token alone, because the same variable can appear in several places and only one of them is
+    # wrong.
+    leftovers: list[tuple[str, str]] = []
+    malformed: list[tuple[str, str]] = []
 
-    def _walk(node: Any) -> None:
+    def _walk(node: Any, path: str) -> None:
         if isinstance(node, dict):
-            for item in node.values():
-                _walk(item)
+            for key, item in node.items():
+                _walk(item, f"{path}.{key}" if path else str(key))
         elif isinstance(node, list):
-            for item in node:
-                _walk(item)
+            for index, item in enumerate(node):
+                _walk(item, f"{path}[{index}]")
         elif isinstance(node, str):
             for match in _UNEXPANDED_ENV_PATTERN.findall(node):
-                leftovers.append(match)
+                leftovers.append((match, path or "<root>"))
             for match in _MALFORMED_BRACED_ENV_PATTERN.findall(node):
-                malformed.append(match)
+                malformed.append((match, path or "<root>"))
 
-    _walk(payload)
+    def _describe(found: list[tuple[str, str]]) -> str:
+        return ", ".join(f"{token!r} at {path}" for token, path in sorted(set(found)))
+
+    _walk(payload, "")
     if malformed:
         raise ValueError(
-            f"Malformed environment reference(s) {sorted(set(malformed))} in {context}: a '$' "
-            "followed by '{' is always meant to be a reference, and this one is not a complete "
-            "${NAME} - either the closing brace is missing, or the name contains something other "
-            "than letters, digits and underscores. Nothing was expanded, so setting the variable "
-            "will not help until the reference itself is well-formed."
+            f"Malformed environment reference(s): {_describe(malformed)} - in {context}. A '$' "
+            "followed by '{' is always meant to be a reference, and each of these is not a "
+            "complete ${NAME}: either the closing brace is missing, or the name contains "
+            "something other than letters, digits and underscores. Nothing was expanded, so "
+            "setting the variable will not help until the reference itself is well-formed."
         )
     if leftovers:
         raise ValueError(
-            f"Unexpanded environment reference(s) {sorted(set(leftovers))} in "
-            f"{context}; set them via environment or .accounts.env instead of "
-            "shipping a literal '${...}' channel id."
+            f"Unexpanded environment reference(s): {_describe(leftovers)} - in {context}; set "
+            "them via environment or .accounts.env instead of shipping a literal '${...}' there."
         )
 
 

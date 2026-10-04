@@ -691,3 +691,101 @@ class TestFlagResolutionIsFileFirst:
         reset_flag_env_cache()
         assert _honour_zero_money_digits() is False, "the default must still be off"
         reset_flag_env_cache()
+
+
+class TestTheRefusalSaysWhichFieldIsWrong:
+    """Backlog item 4 deferred widening this guard on a stated ground that is decidable.
+
+    The note said the widened guard should land only after the logging had been observed, because
+    "the error message names the reference but not the field it came from". That part needed no
+    judgement: an operator holding a seven-deployment YAML cannot act on a token alone, because the
+    same variable can appear in several places and only one of them is wrong.
+
+    So the field path is now reported, and the reason for deferring is gone rather than pending.
+    """
+
+    @staticmethod
+    def _payload(reference: str):
+        return {
+            "deployments": [
+                {
+                    "strategy_name": "fx_breakout",
+                    "signal_config": {"channel_id": reference, "wait_candle_close": True},
+                },
+                {"strategy_name": "us_equities", "signal_config": {"channel_id": "${A_REAL_ONE}"}},
+            ],
+        }
+
+    def test_the_field_path_is_named_for_a_malformed_reference(self) -> None:
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env(self._payload("${DISCORD_FX"))
+        message = str(excinfo.value)
+        assert "deployments[0].signal_config.channel_id" in message, (
+            f"the error does not say which field is wrong: {message}"
+        )
+
+    def test_the_field_path_is_named_for_an_unexpanded_reference(self) -> None:
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env(self._payload("${DISCORD_FX}"))
+        message = str(excinfo.value)
+        assert "deployments[0].signal_config.channel_id" in message, (
+            f"the unexpanded-reference error does not say which field is wrong: {message}"
+        )
+
+    def test_the_index_distinguishes_two_occurrences_in_different_deployments(self) -> None:
+        """The point of a path: two deployments can both be wrong, differently."""
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env({
+                "deployments": [
+                    {"signal_config": {"channel_id": "${FIRST"}},
+                    {"signal_config": {"channel_id": "${SECOND"}},
+                ],
+            })
+        message = str(excinfo.value)
+        assert "deployments[0].signal_config.channel_id" in message
+        assert "deployments[1].signal_config.channel_id" in message, (
+            "both offending fields must be named, not just the first: " f"{message}"
+        )
+
+    def test_a_top_level_string_reports_the_root(self) -> None:
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError, match="<root>"):
+            assert_no_unexpanded_env("${BROKEN")
+
+    def test_a_repeated_reference_is_reported_once_per_path(self) -> None:
+        """Same token, same field, twice - one problem, not two."""
+        from live_runner.config_parser import assert_no_unexpanded_env
+
+        with pytest.raises(ValueError) as excinfo:
+            assert_no_unexpanded_env({"a": "${SAME", "b": "${SAME"})
+        message = str(excinfo.value)
+        assert message.count("'${SAME'") == 2, (
+            f"expected one mention per field path, got: {message}"
+        )
+
+
+def test_a_reference_repeated_inside_one_value_is_reported_once() -> None:
+    """De-duplication is only observable when the same token appears twice in one value.
+
+    Two different fields each holding `${SAME` are two findings and are both reported either way, so
+    a test written that way cannot tell `set(found)` from `found`. One *value* containing the same
+    reference twice is the case that can: the operator still has one thing to fix, in one field, and
+    the message should not read as though there were two problems.
+    """
+    from live_runner.config_parser import assert_no_unexpanded_env
+
+    with pytest.raises(ValueError) as excinfo:
+        assert_no_unexpanded_env({"channel_id": "${A_REF and again ${A_REF"})
+    message = str(excinfo.value)
+    assert message.count("'${A_REF'") == 1, (
+        f"the same reference twice in one value was reported {message.count(chr(39) + '${A_REF' + chr(39))} "
+        f"times: {message}"
+    )
+    assert "channel_id" in message
