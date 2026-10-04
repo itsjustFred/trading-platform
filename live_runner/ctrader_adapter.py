@@ -28,6 +28,7 @@ from live_runner.credential_env import (
     TRUE_BOOL_TOKENS,
     parse_bool_env,
     resolve_env_value,
+    resolve_flag_env,
 )
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -3007,11 +3008,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         one through both copies and re-pinning them, which changes the duplication guarantee
         rather than being a one-liner. Recorded as an open item in backlog item 6.
         """
-        configured = _HONOUR_ZERO_FLAG in os.environ
         return _parse_bool_env(
-            _HONOUR_ZERO_FLAG,
-            resolve_env_value(None, _HONOUR_ZERO_FLAG) if configured else None,
-            default=False,
+            _HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False
         )
 
     @staticmethod

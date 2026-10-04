@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import socket
 import ssl
@@ -21,7 +20,7 @@ from live_runner.alpaca_adapter import (
 from live_runner.credential_env import (
     load_accounts_env_values,
     parse_bool_env,
-    resolve_env_value,
+    resolve_flag_env,
 )
 from shared.database import (
     demo_verification_age_seconds,
@@ -323,12 +322,7 @@ def _honour_zero_money_digits() -> bool:
     none. The log distinguishes the two cases at runtime; this flag turns on the behaviour once
     that evidence exists. Backlog item 6.
     """
-    configured = _HONOUR_ZERO_FLAG in os.environ
-    return parse_bool_env(
-        _HONOUR_ZERO_FLAG,
-        resolve_env_value(None, _HONOUR_ZERO_FLAG) if configured else None,
-        default=False,
-    )
+    return parse_bool_env(_HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False)
 
 
 def _resolve_money_digits(trader: Any, *, context: str) -> int:

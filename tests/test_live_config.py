@@ -569,3 +569,125 @@ class TestAnUnclosedReferenceIsATypo:
         message = str(excinfo.value)
         for name in ("${ONE", "${TWO", "${THREE"):
             assert name in message, f"{name} missing from {message!r}"
+
+
+class TestFlagResolutionIsFileFirst:
+    """A runtime flag read from a helper that has no env mapping must still see `.accounts.env`.
+
+    `resolve_env_value` takes an already-loaded mapping, which is right for credentials: the caller
+    has it, because it owns the connection. It is wrong for a flag read from a helper that has no
+    such mapping - and `CTRADER_HONOUR_ZERO_MONEY_DIGITS`, the switch implementing backlog item 6,
+    was exactly that. Every other live flag, including `CTRADER_DEMO` read a few lines away in the
+    same constructor, is file-first.
+
+    So the operator who put the flag in `.accounts.env` beside `CTRADER_DEMO`, as the runbook tells
+    them to, got the default with no error and no warning.
+    """
+
+    @staticmethod
+    def _accounts_env(tmp_path, body: str):
+        path = tmp_path / ".accounts.env"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_a_value_in_the_file_is_found(self, tmp_path, monkeypatch) -> None:
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        monkeypatch.delenv("CTRADER_DEMO", raising=False)
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "CTRADER_DEMO=\n")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == "", (
+            "a key defined in the accounts file must be found there"
+        )
+        reset_flag_env_cache()
+
+    def test_the_file_wins_over_the_process_environment(self, tmp_path, monkeypatch) -> None:
+        """File-first is the documented precedence, and the whole reason this helper exists."""
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        monkeypatch.setenv("CTRADER_DEMO", "from-environment")
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "CTRADER_DEMO=from-file\n")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == "from-file", (
+            "the accounts file must win over the process environment, as resolve_env_value's own "
+            "docstring specifies"
+        )
+        reset_flag_env_cache()
+
+    def test_a_key_defined_nowhere_is_none_and_not_an_empty_string(self, tmp_path) -> None:
+        """`None` versus `""` is the whole point for a boolean.
+
+        `parse_bool_env(name, None, default=...)` treats absent as the default and
+        present-but-blank as an error. Collapsing the two here would lose that distinction, and the
+        flag would silently ignore a blanked value.
+        """
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) is None, (
+            "an undefined key must be None, not an empty string; the two mean different things to "
+            "parse_bool_env"
+        )
+        reset_flag_env_cache()
+
+    def test_a_present_but_blank_value_stays_blank(self, tmp_path) -> None:
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "CTRADER_DEMO=\n")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == ""
+        reset_flag_env_cache()
+
+    def test_a_missing_file_is_not_an_error(self, tmp_path) -> None:
+        """No `.accounts.env` is the normal single-machine setup, not a misconfiguration."""
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        reset_flag_env_cache()
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=tmp_path / "absent.env") is None
+        reset_flag_env_cache()
+
+    def test_the_environment_is_still_consulted_when_the_file_is_silent(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        monkeypatch.setenv("CTRADER_DEMO", "from-environment")
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == "from-environment"
+        reset_flag_env_cache()
+
+    def test_editing_the_file_is_picked_up(self, tmp_path) -> None:
+        """The mtime cache must not make a flag change invisible - that is the bug it could cause.
+
+        An operator who edits `.accounts.env` to turn a flag on expects it to take effect, exactly
+        as they would for a credential. If the cache were keyed on anything but the file's mtime,
+        this would keep serving the old value for the life of the process.
+        """
+        from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
+
+        reset_flag_env_cache()
+        path = self._accounts_env(tmp_path, "CTRADER_DEMO=before\n")
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == "before"
+        # Distinct mtime, as a real edit would produce.
+        path.write_text("CTRADER_DEMO=after\n", encoding="utf-8")
+        import os
+
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+        assert resolve_flag_env("CTRADER_DEMO", accounts_env=path) == "after", (
+            "an edit to the accounts file did not change the resolved value; the mtime cache "
+            "is not keyed correctly"
+        )
+        reset_flag_env_cache()
+
+    def test_the_flag_helper_now_follows_the_file(self, tmp_path, monkeypatch) -> None:
+        """End to end: the item 6 flag, read through the file an operator would actually use."""
+        from live_runner.account_discovery import _honour_zero_money_digits
+        from live_runner.credential_env import reset_flag_env_cache
+
+        monkeypatch.delenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", raising=False)
+        reset_flag_env_cache()
+        assert _honour_zero_money_digits() is False, "the default must still be off"
+        reset_flag_env_cache()

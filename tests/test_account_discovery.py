@@ -2419,8 +2419,27 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
     # the live adapter. Two copies of a fix are two chances to apply it once - including the
     # switch that turns the fix on.
     def flag_body(text: str) -> str:
-        start = text.index("configured = _HONOUR_ZERO_FLAG in os.environ")
-        end = text.index("default=False,", start) + len("default=False,")
+        # Compare the *executable* part only - the trailing `return`. Anchoring on interior tokens
+        # was fragile: this helper has been re-wrapped and re-worded several times in one session and
+        # each version broke a different anchor. And the docstrings are *meant* to differ, because
+        # each records module-specific detail (which imports exist, where the sync test slices).
+        # Comparing prose about two files that live in two places would fail on every edit.
+        start = text.index("def _honour_zero_money_digits")
+        # Past the docstring first: these docstrings have blank lines *inside* them, so searching
+        # for the next blank line from `def` lands mid-docstring and finds no `return`.
+        doc_open = text.index('"""', start)
+        after_doc = text.index('"""', doc_open + 3) + 3
+        end = text.index("\n\n", after_doc)
+        # Whitespace removed entirely: the two copies wrap this one expression differently, and
+        # after the `parse_bool_env` alias is normalised below the only thing left to compare is the
+        # call itself. Joining with a space left a difference of exactly `default=False )` vs
+        # `default=False)` - pure line-wrapping, reported as drift.
+        joined = "".join(text[after_doc:end].split())
+        # A legitimate difference: the adapter reaches the canonical parser through its own one-line
+        # `_parse_bool_env` wrapper, while discovery imports `parse_bool_env` directly. Both delegate
+        # to `credential_env.parse_bool_env`, which
+        # `test_the_flag_and_the_repo_canonical_parser_agree_exactly` pins behaviourally.
+        return joined.replace("_parse_bool_env(", "parse_bool_env(")
         joined = " ".join(" ".join(text[start:end].split()).split())
         # A second legitimate difference: the adapter reaches the canonical parser through its own
         # one-line `_parse_bool_env` wrapper, while discovery imports `parse_bool_env` directly.
@@ -2434,7 +2453,7 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
         "they read. A mismatch would make the flag work in discovery and silently do nothing in "
         "the live adapter, which is the copy that runs every reconcile."
     )
-    assert "_HONOUR_ZERO_FLAG in os.environ" in flag_body(discovery)
+    assert "resolve_flag_env(_HONOUR_ZERO_FLAG)" in flag_body(discovery)
 
     for name, text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
         assert 'has_field("moneyDigits")' in text, (
