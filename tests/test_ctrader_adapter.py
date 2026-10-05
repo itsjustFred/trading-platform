@@ -4143,20 +4143,47 @@ class TestAnExplicitlySentZeroPriceIsDistinguishable:
             f"the warning does not say what the stored row will look like: {joined!r}"
         )
 
-    def test_an_omitted_price_stays_silent(self, caplog) -> None:
-        """The warning must stay rare enough to be read.
+    def test_an_omitted_price_is_reported_too(self, caplog) -> None:
+        """**Changed from `test_an_omitted_price_stays_silent`, and the reason is a measurement.**
 
-        A deal that sent no price at all is the pre-existing, already-characterised path. It is
-        still `0.0` and still an open question, but warning on it here would drown the one case
-        that looks like a real price and is not.
+        This test previously asserted the omitted case stayed silent, on the reasoning that warning
+        This test previously asserted the omitted case stayed silent, on the reasoning that
+        warning on it "would drown the one case that looks like a real price and is not".
+        That is a reasonable cry-wolf argument, and it was never measured.
+        cry-wolf argument, and it was never measured.
+
+        Measured, against production: **0 of the 3 stored `live_executions` rows have a zero
+        price.** The sentinel branch has not fired once in recorded history, so it cannot
+        drown anything.
+        The sentinel branch has not fired once in the recorded history, so it cannot drown
+        Meanwhile the cost of staying silent was that a row with `actual_price = 0` carries
+        nothing explaining why - a reader cannot tell a missing price from a price of zero
+        without re-deriving it from the wire, which is the invisible case the
+        explicitly-sent zero was loud about precisely because it is invisible.
+        nothing in the payload explaining why - a reader cannot tell a missing price from a price of
+        zero without re-deriving it from the wire, which is the invisible case the explicitly-sent
+        zero was loud about precisely because it is invisible.
+
+        So the sentinel's *value* is unchanged and the remaining question is still a trading
+        decision; what changed is that both causes are countable. The flood risk was real in
+        principle and absent in fact.
+
+        The guarantee this file was really protecting is kept in
+        `tests/test_omitted_price_is_logged.py`: an ordinary price still logs nothing, and the two
+        causes still report distinctly.
         """
         mod = self._protos()
         with caplog.at_level(logging.WARNING, logger="live-runner"):
             CTraderLiveAdapter._resolve_execution_price(
                 order=mod.ProtoOAOrder(), deal=self._deal(False)
             )
-        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-            "an omitted price warned; only an explicitly-sent zero is the surprising case"
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, (
+            "an omitted price resolves to 0.0 and the stored row carries no explanation for it"
+        )
+        assert any("no execution price at all" in r.getMessage() for r in warnings), (
+            "the omitted price reported something other than an omitted price: "
+            f"{[r.getMessage() for r in warnings]}"
         )
 
     def test_a_resolvable_price_does_not_warn_even_when_the_deel_said_zero(self, caplog) -> None:

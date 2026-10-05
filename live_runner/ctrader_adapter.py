@@ -2521,8 +2521,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if raw_status is None:
             raw_status = getattr(order, "status", None)
         if raw_status is None:
-            # Also "cannot tell", also resolved by cancelling, and also silent. The named-status case
-            # is already logged by `_unrecognised_status_wire_value`; this is the *absent field* case,
+            # Also "cannot tell", also resolved by cancelling, and also silent. The
+            # named-status case is already logged by `_unrecognised_status_wire_value`; this
+            # is the *absent field* case, which looks identical on the wire (both read back
+            # as ACCEPTED) and was logged nowhere.
             # which looks identical on the wire (both read back as ACCEPTED) and is logged nowhere.
             logger.warning(
                 "cTrader order carries no status field; treating it as ACCEPTED, so it will be "
@@ -3040,6 +3042,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "as 'could not be read' and returns as 0.0. The field was present, so this is not "
                 "an omitted price; if the row is stored as-is it will carry actual_price=0.",
                 " and the ".join(sent_zeros),
+            )
+        else:
+            # **And the omitted case, which was the quieter of the two.**
+            #
+            # The warning above covers the broker stating a price of exactly zero. This covers the
+            # broker stating none at all - `executionPrice` absent on both the deal and the order.
+            # Both resolve to `0.0`, both land in the row as `actual_price = 0.0`, and both make any
+            # PnL derived from that row meaningless. Only one of them used to say anything.
+            #
+            # The sent-zero warning says "this is the one case a reader cannot otherwise notice,
+            # because the broker spoke and said zero". That is true of it, and it is precisely why
+            # the *other* case needs the warning too: an omitted price leaves nothing in the payload
+            # at all, so the row simply carries 0.0 and a reader cannot tell a missing price from a
+            # price of zero without re-deriving it from the wire.
+            #
+            # The stored value is unchanged, and whether such a row should be refused, flagged or
+            # corrected remains a trading decision. What changes is that both causes are now
+            # countable, so that decision can be made on evidence rather than on a guess.
+            logger.warning(
+                "cTrader sent no execution price at all (absent on both deal and order); this "
+                "resolver returns 0.0 as its 'could not be read' sentinel, so a row stored as-is "
+                "carries actual_price=0 with nothing in the payload to explain it"
             )
         return 0.0
 
