@@ -2108,6 +2108,29 @@ def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
     )
 
 
+def _same_quantity(stored: object, incoming: object) -> bool:
+    """True when the incoming fill is byte-for-byte the quantity already stored.
+
+    Compared as floats with a tolerance rather than by equality, because a redelivery
+    arrives through a decimal round-trip and `0.1 + 0.2 != 0.3`. A tolerance of zero
+    would classify ordinary redeliveries as different fills and warn about every one.
+    """
+    try:
+        return math.isclose(
+            float(stored or 0.0), float(incoming or 0.0), rel_tol=1e-9, abs_tol=1e-12
+        )
+    except (TypeError, ValueError):
+        return stored == incoming
+
+
+def _quantity_gap(stored: object, incoming: object) -> str:
+    """How much the stored position size is short by, for the warning's last clause."""
+    try:
+        return f"{abs(float(stored or 0.0) - float(incoming or 0.0)):.8f}"
+    except (TypeError, ValueError):
+        return "an unknown amount"
+
+
 def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) -> bool:
     """Insert-or-skip one execution under a write lock (C1: single path).
 
@@ -2120,9 +2143,36 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         .limit(1)
     ).first()
     if existing is not None:
-        logger.info(
-            "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
-        )
+        # A skip is only a *redelivery* - the same fill reported twice - when the
+        # quantity matches the row already stored. A different quantity under the same
+        # dedupe_key is a **different fill** being discarded, which means the recorded
+        # position size is wrong, and that is worth a warning rather than an info line.
+        #
+        # Measured on a synthetic database: cTrader's key is `ctrader:deal:<dealId>`,
+        # which is per-DEAL. Three partial fills reported under one deal id store the
+        # first and drop the other two - so if the broker ever reports a partial-fill
+        # sequence as one deal, real fills are lost and nothing above INFO says so.
+        #
+        # Whether cTrader reports one deal id per fill or one per deal is a broker
+        # question that cannot be answered from here, so this does not change what is
+        # stored. It only makes the two cases distinguishable in the log, which is what
+        # lets an operator tell a redelivery from a lost fill.
+        same_quantity = _same_quantity(existing.filled_qty, record.filled_qty)
+        if same_quantity:
+            logger.info(
+                "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
+            )
+        else:
+            logger.warning(
+                "Skipping live execution with dedupe_key=%s whose quantity %s differs from the "
+                "stored %s: this is NOT a redelivery, it is a second fill on a key already "
+                "recorded, so the stored position size is short by %s. Decide item 1 before "
+                "trusting this row's filled_qty.",
+                record.dedupe_key,
+                record.filled_qty,
+                existing.filled_qty,
+                _quantity_gap(existing.filled_qty, record.filled_qty),
+            )
         return False
     session.add(record)
     try:
