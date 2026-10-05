@@ -206,7 +206,35 @@ class VerificationEvidenceSummary(BaseModel):
 #   * `M15` is letter-then-digit and is not matched either;
 #   * `1D` is left alone, because an uppercase D means *day* on every platform that
 #     distinguishes it from a month.
-_MONTH_TIMEFRAME_PATTERN = re.compile(r"^\d+M$")
+# The monthly spellings that are unambiguous, and therefore safe to refuse.
+#
+# Three families, because monthly is spelled three ways and only ONE of them was caught:
+#
+#   1M, 5M, 60M   TradingView and most web platforms - digit then capital M
+#   MN1, mn1      MetaTrader's monthly convention - the only spelling that is never minutes
+#   1mo, 12mo     pandas/TV "mo" convention
+#
+# `MN<n>` and `<n>mo` used to pass this guard and were caught much later, by
+# `_require_recognised_timeframe` at execution time, with a generic message about an unrecognised
+# label. That is fail-closed but it is also late: the deployment loads, sits in the database, and
+# only refuses when a signal arrives. Refusing at config load names the actual mistake instead.
+#
+# Deliberately NOT matched, and the reason matters:
+#
+#   `1m`, `5m`, `15m`   the system's own minute spellings. The `\d+M` branch is case-SENSITIVE and
+#                       carries no IGNORECASE flag, because adding one would match `1m` and refuse
+#                       every minute deployment on the platform.
+#   `1min`              unrecognised here and downstream; left as it was, since this guard is about
+#                       the month/minute collision, not about validating labels generally.
+_MONTH_TIMEFRAME_PATTERN = re.compile(r"^(?:\d+M|[Mm][Nn]\d+|\d+[Mm][Oo])$")
+
+# `M1`/`m1` is a genuine coin-flip and is NOT decided here. The same token is the
+# *monthly* candle on TradingView and the *1-minute* candle on MetaTrader, and this
+# system has no monthly timeframe in `VALID_TIMEFRAMES`. Today it resolves to 60
+# seconds - the MetaTrader reading, chosen silently. Refusing it would block an
+# operator who means one minute; allowing it keeps a monthly typo tradingable at
+# 1/100th the intended size. That is a trading decision, so the ambiguity is pinned
+# by a test instead of resolved here. See the `M1` entry in notes/backlog.md.
 
 
 def _reject_month_timeframe_collision(value: str) -> str:
@@ -217,14 +245,22 @@ def _reject_month_timeframe_collision(value: str) -> str:
     strict answer: there is nothing to migrate and nothing that was relying on it.
     """
     candidate = str(value or "").strip()
-    if _MONTH_TIMEFRAME_PATTERN.match(candidate):
+    matched = _MONTH_TIMEFRAME_PATTERN.match(candidate)
+    if matched:
+        # The suggestion has to name the right spelling for the family, because `candidate[:-1]` -
+        # which is right for `1M` - produces "MN" for `MN1` and "1m" is right for `1mo`.
+        if re.fullmatch(r"\d+M", candidate):
+            alternative = f"{candidate[:-1]}m"
+            would_read = f"{candidate[:-1]} *minutes*"
+        else:
+            alternative = "1d or 1w"
+            would_read = "an uninterpretable label (no seconds)"
         raise ValueError(
             f"Timeframe {candidate!r} is the monthly candle on TradingView, MT5 and most other "
-            "platforms, but this system has no monthly timeframe and would read it as "
-            f"{candidate[:-1]} *minutes* - sizing stops from minute-scale bars and closing the "
-            f"candle a minute later. Write {candidate[:-1]}m for a {candidate[:-1]}-minute "
-            "timeframe, or 1d/1w if a longer bar was intended. (BacktestConfig has always "
-            "refused this spelling.)"
+            "platforms, but live execution has no monthly timeframe - "
+            f"{would_read}, so sizing would stop from bars that are "
+            f"{candidate} and not the ones you meant. Write {alternative}, or 1d/1w if a "
+            "longer bar was intended. (BacktestConfig has always refused this spelling.)"
         )
     return candidate
 
