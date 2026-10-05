@@ -67,8 +67,6 @@ def test_smoke_signal_gets_a_parent_deployment(strict_session):
 
 
 def test_deployment_creation_is_idempotent(strict_session):
-    from shared.database import LiveDeploymentModel
-
     for _ in range(3):
         _ensure_ctrader_smoke_deployment(account_id=ACCOUNT_ID, symbol="XAUUSD")
 
