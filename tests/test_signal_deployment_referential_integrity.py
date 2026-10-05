@@ -68,16 +68,30 @@ def test_live_signals_still_declares_no_foreign_key_on_deployment_id() -> None:
     )
 
 
-def test_the_smoke_tooling_still_writes_a_deployment_id_that_cannot_exist() -> None:
-    """The cost of the FK, written down where someone would add it."""
+def test_the_smoke_tooling_no_longer_writes_an_unresolvable_deployment_id() -> None:
+    """The cost of the FK, retired.
+
+    This file originally asserted the opposite: that ``LiveDeploymentModel(`` appears nowhere in
+    the smoke tooling, so that nobody would add the FK without seeing the breakage. The tripwire has
+    fired - ``live_smoke._ensure_ctrader_smoke_deployment`` now inserts the parent deployment row
+    before writing the signal, so the FK no longer breaks smoke runs. The cost is gone, and the
+    remaining question is no longer "is this safe" but "when".
+    """
     text = SMOKE.read_text(encoding="utf-8")
     assert SMOKE_ID in text, (
-        "the smoke tooling no longer names a synthetic deployment id, so the cost of "
-        "adding the FK has changed and this file needs re-measuring"
+        "the smoke tooling no longer names a synthetic deployment id, so re-measure this file"
     )
-    assert "LiveDeploymentModel(" not in text, (
-        "the smoke tooling now inserts a deployment row, so an FK on "
-        "live_signals.deployment_id would no longer break it - and should be added"
+    assert "LiveDeploymentModel(" in text, (
+        "the smoke tooling stopped inserting a deployment row, so the FK on "
+        "live_signals.deployment_id would break it again"
+    )
+    ensure_call = "_ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)"
+    signal_construction = (
+        'signal = LiveSignal(\n        deployment_id=f"ctrader-demo-smoke-{account_id}"'
+    )
+    assert ensure_call in text
+    assert text.index(ensure_call) < text.index(signal_construction), (
+        "the deployment must be ensured before the signal that depends on it"
     )
 
 

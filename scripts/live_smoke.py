@@ -394,6 +394,38 @@ async def _wait_for_ctrader_position(
     return latest
 
 
+def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> None:
+    """Give the cTrader smoke signal a parent deployment so it is visible and FK-addable.
+
+    Mirrors the existing ``discord::`` synthetic-deployment convention: a ``namespace::name``
+    ``strategy_name`` and PAUSED, so the daemon never trades it. Idempotent.
+
+    ``live_deployments.account_id`` already carries a foreign key to ``live_accounts``, so this
+    fails closed when the account row is absent instead of writing a second orphan. That is the
+    whole point: an orphan signal is invisible to every deployment-scoped query, which is how seven
+    of them went unnoticed.
+    """
+    from shared.database import LiveDeploymentModel, get_session
+
+    deployment_id = f"ctrader-demo-smoke-{account_id}"
+    with get_session() as session:
+        if session.get(LiveDeploymentModel, deployment_id) is not None:
+            return
+        session.add(
+            LiveDeploymentModel(
+                id=deployment_id,
+                strategy_name=deployment_id,
+                account_id=account_id,
+                symbols_json=[symbol.upper()],
+                timeframe="1m",
+                status="PAUSED",
+                signal_source="smoke",
+                signal_source_type="internal",
+            )
+        )
+        session.commit()
+
+
 async def _ctrader_order_worker(
     *,
     account_id: str,
@@ -422,6 +454,7 @@ async def _ctrader_order_worker(
     if before_position is not None:
         raise RuntimeError(f"Refusing smoke order because {symbol} already has an open position.")
 
+    _ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)
     signal = LiveSignal(
         deployment_id=f"ctrader-demo-smoke-{account_id}",
         symbol=symbol.upper(),
