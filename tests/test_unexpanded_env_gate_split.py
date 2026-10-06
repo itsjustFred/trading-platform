@@ -135,3 +135,54 @@ def test_a_widened_gate_would_break_these_two_and_only_these_two() -> None:
         f"the collision set changed: {would_break}. Amounts are safe because no name follows the "
         f"dollar sign; currency codes and tickers are not, because a name does."
     )
+
+
+def test_a_bare_reference_resolves_so_the_braced_only_gate_is_not_hiding_misses() -> None:
+    """The reason item 4 is narrower than it looks.
+
+    The gate refuses only *braced* references. That reads like a fail-open gap, but the expander
+    expands **both** forms, so a bare `$CTRADER_DEMO_CTID` resolves exactly like
+    `${CTRADER_DEMO_CTID}` and the gate has nothing to catch.
+
+    What the gate genuinely misses is a bare reference whose variable is *absent*: the expander logs
+    it, leaves it in place, and the gate accepts the result. So it is visible in the log rather than
+    silent - which makes this a policy choice about fail-closed-vs-tolerant, not an undetected defect.
+    """
+    from live_runner.config_parser import _expand_env_value, assert_no_unexpanded_env
+
+    env = {"CTRADER_DEMO_CTID": "46736434"}
+
+    # A bare reference that resolves: expanded correctly, and the gate has nothing to say.
+    assert _expand_env_value("$CTRADER_DEMO_CTID", env) == "46736434"
+    assert_no_unexpanded_env({"ctid": "46736434"}, context="probe")
+
+    # A bare reference whose variable is absent: left in place and logged, and the gate accepts it.
+    assert _expand_env_value("$CTRADER_MISSING", env) == "$CTRADER_MISSING"
+    assert_no_unexpanded_env({"ctid": "$CTRADER_MISSING"}, context="probe")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"jobs": {"py": {"runs-on": "${{ matrix.os }}"}}}, id="github-actions"),
+        pytest.param({"note": "costs $USD per month"}, id="prose-dollar"),
+        pytest.param({"ctid": "$CTRADER_DEMO_CTID"}, id="bare-reference"),
+    ],
+)
+def test_everything_a_widened_bare_dollar_gate_would_refuse(payload: dict) -> None:
+    """The full collision set, so item 4's cost is enumerated rather than asserted.
+
+    Widening the gate to bare `$NAME` is one regex. This is what it would refuse today, and every
+    entry is a legitimate value - a GitHub Actions expression, prose containing a currency symbol, and
+    a bare reference that resolved correctly during expansion and so is a fully-expanded config by the
+    time the gate runs.
+
+    That last one is the important row: the gate runs *after* expansion, so a bare reference that
+    resolved is no longer present as `$NAME` in the payload at all. Widening would therefore refuse
+    only unresolved bare references and the two false-positive shapes - which is a narrower blast
+    radius than it first appears, and a real decision rather than a coin flip.
+    """
+    from live_runner.config_parser import assert_no_unexpanded_env
+
+    # All three are accepted today, so widening is what would change.
+    assert_no_unexpanded_env(payload, context="probe")
