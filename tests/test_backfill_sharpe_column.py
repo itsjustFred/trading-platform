@@ -8,6 +8,7 @@ operator.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
@@ -28,20 +29,24 @@ def _load():
 @pytest.fixture
 def conn(tmp_path):
     db = sqlite3.connect(tmp_path / "probe.db")
+    # The four scalar stat columns with the same sentinels production carries: 0.0 for sharpe_ratio,
+    # psr and cagr, and 1.0 for p_value, whose 1.0 is a deliberate "never computed" value.
     db.execute(
         "create table backtests (id text primary key, sharpe_ratio real not null default 0.0, "
-        "stats text)"
+        "psr real not null default 0.0, cagr real not null default 0.0, "
+        "p_value real not null default 1.0, stats text)"
     )
     db.executemany(
-        "insert into backtests (id, sharpe_ratio, stats) values (?, ?, ?)",
+        "insert into backtests (id, sharpe_ratio, psr, cagr, p_value, stats) "
+        "values (?, ?, ?, ?, ?, ?)",
         [
-            ("stale-column", 0.0, '{"sharpe_ratio": -37.6644}'),
-            ("agreeing", 1.5, '{"sharpe_ratio": 1.5}'),
-            ("both-zero", 0.0, '{"sharpe_ratio": 0.0}'),
-            ("no-stats", 0.0, None),
-            ("unparseable-stats", 0.0, "{not json"),
-            ("legacy-key", 0.0, '{"sharpe": -2.5}'),
-            ("payload-missing", 0.0, '{"cagr": 0.1}'),
+            ("stale-column", 0.0, 0.0, 0.0, 1.0, '{"sharpe_ratio": -37.6644}'),
+            ("agreeing", 1.5, 0.0, 0.0, 1.0, '{"sharpe_ratio": 1.5}'),
+            ("both-zero", 0.0, 0.0, 0.0, 1.0, '{"sharpe_ratio": 0.0}'),
+            ("no-stats", 0.0, 0.0, 0.0, 1.0, None),
+            ("unparseable-stats", 0.0, 0.0, 0.0, 1.0, "{not json"),
+            ("legacy-key", 0.0, 0.0, 0.0, 1.0, '{"sharpe": -2.5}'),
+            ("payload-missing", 0.0, 0.0, 0.0, 1.0, '{"total_trades": 3}'),
         ],
     )
     db.commit()
@@ -50,77 +55,157 @@ def conn(tmp_path):
 
 
 def test_it_finds_exactly_the_disagreeing_rows(conn):
+    """Only stale sentinels. The agreeing, absent, unparseable and both-zero rows stay out."""
     module = _load()
     rows = module.find_disagreements(conn)
 
-    assert {r[0] for r in rows} == {"stale-column", "legacy-key"}, (
-        "the finder must report exactly the rows where the two sides differ - including the legacy "
-        "'sharpe' key - and stay silent for agreeing, both-zero, absent and unparseable stats"
+    found = {(r[0], r[1]) for r in rows}
+    assert ("stale-column", "sharpe_ratio") in found
+    assert ("legacy-key", "sharpe_ratio") in found, "the legacy 'sharpe' key must be honoured"
+    assert ("agreeing", "sharpe_ratio") not in found, "an agreeing row is not a disagreement"
+    assert ("both-zero", "sharpe_ratio") not in found
+    assert ("no-stats", "sharpe_ratio") not in found
+    assert ("unparseable-stats", "sharpe_ratio") not in found
+    assert ("payload-missing", "sharpe_ratio") not in found
+
+
+def test_each_column_is_reconciled_independently(conn):
+    """A row can be stale in one column and healthy in another, so cells are the unit, not rows."""
+    conn.execute(
+        "update backtests set sharpe_ratio = 2.0, psr = 0.0, cagr = 0.0, p_value = 1.0, "
+        "stats = '{\"sharpe_ratio\": 2.0, \"psr\": 0.33, \"cagr\": -0.67, \"p_value\": 0.75}' "
+        "where id = 'agreeing'"
+    )
+    conn.commit()
+
+    module = _load()
+    rows = module.find_disagreements(conn)
+    columns = {column for _id, column, _c, _p in rows if _id == "agreeing"}
+
+    assert columns == {"psr", "cagr", "p_value"}, (
+        f"expected the three sentinel columns, got {sorted(columns)}"
+    )
+    assert "sharpe_ratio" not in columns, "sharpe_ratio agrees at 2.0 and must not be touched"
+
+    module._reconcile(conn, rows)
+    conn.commit()
+    values = dict(
+        conn.execute("select id, psr from backtests where id = 'agreeing'").fetchall()
+    )
+    assert values["agreeing"] == pytest.approx(0.33)
+
+
+def test_p_value_uses_its_own_sentinel_of_one_not_zero(conn):
+    """p_value defaults to 1.0, not 0.0 - a 0.0 column there is a real value and must be left alone."""
+    conn.execute("update backtests set p_value = 0.0, stats = '{\"p_value\": 0.75}' where id = 'both-zero'")
+    conn.commit()
+
+    module = _load()
+    rows = module.find_disagreements(conn)
+    assert not any(column == "p_value" for _id, column, _c, _p in rows), (
+        "a p_value column of 0.0 was treated as a sentinel. It is not - p_value's sentinel is 1.0, so "
+        "0.0 is a real value and reconciling it would overwrite real data"
     )
 
 
-def test_dry_run_is_the_default_and_writes_nothing(conn):
-    """The property that makes this safe to hand over: preview requires no flag, and previews do nothing."""
+def test_a_column_holding_a_real_value_is_never_reconciled(conn):
+    """Recomputation drift is not staleness, and reconciling it would destroy information."""
+    conn.execute(
+        "insert into backtests (id, sharpe_ratio, psr, cagr, p_value, stats) "
+        "values ('drift', 0.0, 0.0, 0.1803, 1.0, '{\"cagr\": 0.1786}')"
+    )
+    conn.commit()
+
     module = _load()
     rows = module.find_disagreements(conn)
+    assert not any(r[0] == "drift" for r in rows), (
+        "a row whose cagr column holds a real 0.1803 against a payload 0.1786 must not be reported - "
+        "that is recomputation drift, and overwriting a real value with a different real value "
+        "destroys information rather than restoring it"
+    )
 
-    assert not conn.execute("update backtests set sharpe_ratio = -1").rowcount == 1, "sanity"
-    conn.rollback()
 
-    # The script's write path is gated behind --apply, asserted structurally rather than by invoking
-    # main(), because main() resolves the real DATA_DIR.
+def test_declared_undefined_rows_are_reported_and_never_applied(conn):
+    """A sentinel the producer deliberately set is a real marker, not staleness."""
+    conn.execute(
+        "insert into backtests (id, sharpe_ratio, psr, cagr, p_value, stats) "
+        "values ('withheld', 0.0, 0.0, 0.0, 1.0, "
+        "'{\"sharpe_ratio\": -5.0, \"undefined_metrics\": [\"sharpe_ratio\"]}')"
+    )
+    conn.commit()
+
+    module = _load()
+    withheld = module.find_declared_undefined(conn)
+    assert ("withheld", "sharpe_ratio") in withheld, (
+        "a producer-declared undefined metric must be reported so the script can refuse to overwrite it"
+    )
+    rows = module.find_disagreements(conn)
+    module._reconcile(conn, rows)
+    conn.commit()
+
+    value = conn.execute("select sharpe_ratio from backtests where id = 'withheld'").fetchone()[0]
+    assert value == 0.0, "the deliberate 'never computed' marker was overwritten"
+
+
+def test_the_corpus_has_no_declared_undefined_sentinels_today():
+    """Zero today, measured. This is the check that makes the refusal path worth keeping."""
+    import sqlite3 as _sqlite3
+
+    db = Path("/home/ubuntu/data/backtests.db")
+    if not db.exists():
+        pytest.skip(f"{db} is absent, so there is no corpus to inspect")
+    with _sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        rows = connection.execute("select sharpe_ratio, psr, cagr, p_value, stats from backtests").fetchall()
+
+    withheld = 0
+    for *values, stats in rows:
+        if not stats:
+            continue
+        try:
+            payload = json.loads(stats)
+        except (TypeError, ValueError):
+            continue
+        undefined = payload.get("undefined_metrics")
+        if not isinstance(undefined, list):
+            continue
+        for column, value in zip(("sharpe_ratio", "psr", "cagr", "p_value"), values):
+            if column in undefined and payload.get(column) is not None:
+                withheld += 1
+    assert withheld == 0, (
+        f"{withheld} cells now declare their metric undefined while publishing a value. The refusal "
+        f"path in this script is no longer hypothetical and the operator must be told before any apply."
+    )
+
+
+def test_dry_run_is_the_default_and_the_write_targets_columns_only():
     source = (REPO / "scripts" / "backfill_sharpe_column.py").read_text(encoding="utf-8")
-    assert 'if not args.apply:' in source
+    assert "if not args.apply:" in source
     assert "Dry run: nothing written" in source
-    assert rows, "fixture lost its disagreement"
-
-
-def test_apply_corrects_the_column_from_the_payload(conn):
-    module = _load()
-    rows = module.find_disagreements(conn)
-
-    corrected = module._reconcile(conn, rows)
-    conn.commit()
-
-    assert corrected == 2, f"corrected {corrected} rows, expected both disagreements"
-    assert conn.execute(
-        "select sharpe_ratio from backtests where id = 'stale-column'"
-    ).fetchone()[0] == pytest.approx(-37.6644)
-    # The legacy key is honoured too.
-    assert conn.execute(
-        "select sharpe_ratio from backtests where id = 'legacy-key'"
-    ).fetchone()[0] == pytest.approx(-2.5)
-
-
-def test_it_refuses_the_reverse_case_instead_of_overwriting(conn):
-    """A row where the column holds a real value is a different problem, and must not be overwritten.
-
-    Every production disagreement has the column at 0.0. If one ever disagreed the other way, writing
-    the payload's value would destroy the number the platform displays - the exact damage this whole
-    exercise exists to prevent, so the tool refuses rather than guessing.
-    """
-    conn.execute("update backtests set sharpe_ratio = 2.0, stats = '{\"sharpe_ratio\": 0.0}' "
-                 "where id = 'agreeing'")
-    conn.commit()
-
-    module = _load()
-    rows = module.find_disagreements(conn)
-    assert any(r[0] == "agreeing" for r in rows), "fixture did not create the reverse disagreement"
-
-    corrected = module._reconcile(conn, rows)
-    conn.commit()
-
-    assert corrected == 2, "the reverse row must be skipped, not applied"
-    assert conn.execute(
-        "select sharpe_ratio from backtests where id = 'agreeing'"
-    ).fetchone()[0] == pytest.approx(2.0), "the displayed value was overwritten"
-
-
-def test_it_never_writes_the_payload(conn):
-    """The irreversible direction is not merely unused - it does not exist in the script."""
-    source = (REPO / "scripts" / "backfill_sharpe_column.py").read_text(encoding="utf-8")
     lowered = source.lower()
-    assert "update backtests set stats" not in lowered
-    assert "update backtests set sharpe_ratio" in lowered
-    # The only write targets the column.
-    assert lowered.count("conn.execute(\n            \"update backtests") == 1
+    assert "update backtests set stats" not in lowered, "the payload must never be written"
+    assert "update backtests set {column}" in lowered
+
+
+def test_production_corpus_is_what_the_script_reports():
+    """The headline number, asserted so a corpus change surfaces instead of silently altering scope."""
+    import sqlite3 as _sqlite3
+
+    db = Path("/home/ubuntu/data/backtests.db")
+    if not db.exists():
+        pytest.skip(f"{db} is absent")
+    with _sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        found = _load().find_disagreements(connection)
+    counts = {}
+    for _id, column, _c, _p in found:
+        counts[column] = counts.get(column, 0) + 1
+    assert len(found) == 3065, f"the script now reports {len(found)} stale cells, not 3065"
+    assert counts.get("sharpe_ratio") == 53
+    assert counts.get("cagr") == 1046, (
+        "cagr's sentinel count moved; note that its 54 drift rows are excluded by design, so this "
+        "figure should be the sentinel population only"
+    )
+
+
+def test_the_irreversible_direction_does_not_exist_in_the_script():
+    source = (REPO / "scripts" / "backfill_sharpe_column.py").read_text(encoding="utf-8")
+    assert "update backtests set stats" not in source.lower()
