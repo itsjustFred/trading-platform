@@ -591,18 +591,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
             return False
+        raw_filled_avg_price = getattr(order, "filled_avg_price", None)
+        resolved_price = _to_float(raw_filled_avg_price, default=0.0)
+        AlpacaLiveAdapter._warn_unreadable_price(
+            resolved_price,
+            raw_price=raw_filled_avg_price,
+            account_id=self.account_id,
+            broker_order_id=broker_order_id,
+            source="order_reconcile",
+        )
         execution = LiveExecution(
             signal_id=UUID(signal_id),
-            actual_price=_to_float(
-                getattr(order, "filled_avg_price", None), default=0.0
-            ),
+            actual_price=resolved_price,
             filled_qty=missing_filled_qty,
-            commission=0.0,
-            timestamp=_to_datetime(getattr(order, "filled_at", None)),
-            broker_order_id=broker_order_id,
-            dedupe_key=(
-                f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
-            ),
+        commission=0.0,
+        timestamp=_to_datetime(getattr(order, "filled_at", None)),
+        broker_order_id=broker_order_id,
+        dedupe_key=(
+            f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+        ),
         )
         persisted_qty = await asyncio.to_thread(
             save_live_execution_up_to_cumulative, execution, broker_filled_qty
@@ -1298,6 +1305,50 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         persisted = await asyncio.to_thread(save_live_execution, execution)
         return execution.filled_qty if persisted else 0.0
 
+    @staticmethod
+    def _warn_unreadable_price(
+        resolved: float,
+        *,
+        raw_price: Any,
+        account_id: str | None,
+        broker_order_id: str | None,
+        source: str,
+    ) -> None:
+        """Warn when a stored execution price is not a usable number, and say why.
+
+        ``_to_float`` coerces an absent or unparseable price to ``0.0``, which is the same value a
+        genuine zero produces. The cTrader resolver already logs that case; this is the Alpaca
+        equivalent, and it was silent on both paths.
+
+        The value is **unchanged** - still stored as-is. What to do with a zero price is backlog item
+        10 and needs the broker's behaviour to answer, which is not knowable from here. All this does
+        is make a row that will carry ``actual_price=0`` visible, so the decision can be made on
+        evidence: 0/3 executions in production currently have a non-positive price, and any future
+        one will be counted rather than hiding in an aggregate where one 0.0 silently drags a mean.
+        """
+        if math.isfinite(resolved) and resolved > 0:
+            return
+        try:
+            raw_repr = repr(raw_price)
+        except Exception:  # pragma: no cover - repr of a hostile object
+            raw_repr = "<unrepresentable>"
+        reason = "absent" if raw_price is None else f"unreadable as a number ({raw_repr})"
+        logger.warning(
+            f"Alpaca {source} price is {reason}, so the execution will be stored with "
+            "actual_price=0.0, which is indistinguishable from a genuine zero price. This is "
+            "visibility only: the value is stored unchanged, and what should happen to a zero-price "
+            "execution is the open decision in backlog item 10.",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "broker_order_id": broker_order_id,
+                    "source": source,
+                    "raw_price": raw_repr,
+                    "resolved_price": float(resolved) if math.isfinite(resolved) else repr(resolved),
+                }
+            },
+        )
+
     async def _on_trade_update(self, data: Any) -> None:
         try:
             parsed = self._parse_trade_update_event(data)
@@ -1336,6 +1387,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 commission_value = getattr(order, "commission", None)
 
             actual_price = _to_float(fill_price)
+            AlpacaLiveAdapter._warn_unreadable_price(
+                actual_price,
+                raw_price=fill_price,
+                account_id=self.account_id,
+                broker_order_id=broker_order_id,
+                source="trade_update",
+            )
             filled_qty = _to_float(filled_qty_value)
             commission = _to_float(commission_value)
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
