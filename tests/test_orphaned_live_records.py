@@ -48,33 +48,27 @@ PRODUCTION_DB = Path("/home/ubuntu/data/backtests.db")
 # production - an earlier draft of this file carried a hand-written signal UUID that did not exist,
 # which is exactly how a fixture ends up asserting a fiction. Emptying this after a reconciliation
 # is the intended way to retire the finding.
+# APPLIED 2026-10-06 by _backfill_smoke_deployments, which runs inside init_db().
+#
+# The corpus held 7 orphaned signals across 6 distinct deployment ids. Six were smoke ids whose
+# accounts all existed in live_accounts, so the backfill recreated the parent deployment row exactly as
+# _ensure_ctrader_smoke_deployment writes on new runs - namespaced strategy_name, PAUSED,
+# signal_source 'smoke'. Five rows for six signals, because two signals shared ctrader-demo-smoke-47644617.
+#
+# One orphan remains, and it is the one that was never mechanically fixable: deployment
+# 4e9bbdab-0d15-4232-91e1-cc459166b764 was a real deployment that has since been deleted by hand. It
+# holds the only in-production instance of the item 1 double-count - execution rows 43.07822 and
+# 0.07822 summing to 43.15644 for one fill - so deleting it to clear the last violation would destroy
+# the evidence. Its disposition is still the operator's call.
 EXPECTED_ORPHANED_SIGNALS = {
     "9eb8eb2f-a094-4836-9886-ce1abe6baffc": (
-        "dep 4e9bbdab, a real deployment since deleted; buy AAPL, theoretical 170.0. Carries TWO "
-        "execution rows (43.07822 and 0.07822) for one fill - the double-count."
-    ),
-    "ee6f9d82-ccea-4dce-acb6-1049f1b7b2c0": (
-        "dep ctrader-demo-smoke-47644617, a smoke id never inserted into live_deployments"
-    ),
-    "a5149558-edf6-4039-ac77-49978343719f": (
-        "dep ctrader-demo-smoke-44695443 - the account holding the one real broker order"
-    ),
-    "a9d8884d-cc32-429a-9e54-b97100907196": "dep ctrader-demo-smoke-46736434, a smoke id",
-    "785090d1-f579-4086-ad03-bf1262e5c458": "dep ctrader-demo-smoke-46736452, a smoke id",
-    "0ada90d8-7742-4d4b-8ca9-7e2cca081aa5": (
-        "dep ctrader-demo-smoke-46736456, a smoke id; the one signal that DID get an execution"
-    ),
-    "07ea676a-b19b-48d7-b983-13ad6818478b": (
-        "dep ctrader-demo-smoke-47644617 again - a second signal on the same smoke id"
+        "dep 4e9bbdab, a real deployment since deleted; buy AAPL, theoretical 170.0. Carries "
+        "execution rows (43.07822 and 0.07822) for one fill - the double-count. NOT resolvable "
+        "mechanically: the deployment is gone and reinserting it would fabricate a trading record."
     ),
 }
 EXPECTED_MISSING_DEPLOYMENT_IDS = {
     "4e9bbdab-0d15-4232-91e1-cc459166b764": "a real deployment that has since been deleted",
-    "ctrader-demo-smoke-44695443": "smoke id; account 44695443 is the one with a real broker order",
-    "ctrader-demo-smoke-46736434": "smoke id",
-    "ctrader-demo-smoke-46736452": "smoke id",
-    "ctrader-demo-smoke-46736456": "smoke id",
-    "ctrader-demo-smoke-47644617": "smoke id, and it carries TWO signals - see 07ea676a",
 }
 # One signal, two rows, and the sum that double-counts.
 EXPECTED_SIGNALS_WITH_MULTIPLE_EXECUTIONS = {

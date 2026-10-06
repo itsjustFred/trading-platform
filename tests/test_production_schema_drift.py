@@ -49,25 +49,22 @@ _CLAIM_UNIQUENESS = (
     ".uq_live_deployment_submission_claims_deployment"
 )
 
-EXPECTED_PENDING = {
-    "column services.last_attempt_at": (
-        "viewer/main.py and shared/models.py both read it; the query fails today"
-    ),
-    "column live_deployments.stopped_enforced_at": (
-        "written by the STOPPED-enforcement ledger in shared/database.py"
-    ),
-    "column live_executions.broker_fill_id": (
-        "written on EVERY cTrader fill by from_live_execution, so the first fill after a "
-        "restart fails with 'no such column' until this is applied"
-    ),
-    "table live_control_audit": (
-        "self-healing - the control path creates it on first use - but the audit trail is "
-        "absent until then"
-    ),
-    _CLAIM_UNIQUENESS: (
-        "without it two claims can race for one deployment; a bookkeeping risk, not a data risk"
-    ),
-}
+# APPLIED 2026-10-06 against production with the operator's authorisation, after a 703 MB backup.
+#
+#     services.last_attempt_at                      added
+#     live_deployments.stopped_enforced_at         added
+#     live_executions.broker_fill_id               added
+#     live_control_audit                           table created
+#     uq_live_deployment_submission_claims        index created
+#
+# init_db() applied all five and returned cleanly, `pragma foreign_key_check` reported 0 violations, and
+# the row counts held: 2,655 backtests, 309,886 trades, 202,183 balances, 9 accounts, 3 executions.
+#
+# Empty on purpose now. The point of this file was to make the count the operator plans a window around
+# an asserted number rather than a transcription. That window has closed, so the assertion inverts: a
+# non-empty measurement now means a model change landed without a migration, which is the drift this
+# file exists to catch.
+EXPECTED_PENDING: dict[str, str] = {}
 
 # Only live-facing and timer-written tables: drift in a reporting table cannot stop a trade.
 RELEVANT_PREFIXES = ("live_", "services", "trades", "background")
@@ -95,7 +92,13 @@ def _production_drift() -> set[str]:
                 cols = tuple(getattr(c, "name", "") for c in getattr(constraint, "columns", ()))
                 if not cname or len(cols) != 1:
                     continue
-                listed = {r[0] for r in conn.execute(f"pragma index_list({name})")}
+                # `pragma index_list` columns are (seq, name, unique, origin, partial) - column 0
+                # is a sequence number, not a name. Reading r[0] compared the constraint name against
+                # {0,1,2,...}, which can never match, so this check reported every named unique
+                # constraint as missing and would have reported it as missing even after the migration
+                # created it. It only ever looked right by accident, while the index genuinely was
+                # absent. r[1] is the name.
+                listed = {r[1] for r in conn.execute(f"pragma index_list({name})")}
                 if cname not in listed:
                     drift.add(f"unique {name}.{cname}")
         return drift
@@ -129,16 +132,23 @@ def test_the_documented_count_matches_what_is_measured() -> None:
     )
 
 
-def test_the_fill_path_column_is_still_pending_so_nobody_migrates_half_of_it() -> None:
-    """The one item that fails on the very next fill gets its own assertion.
+def test_the_fill_path_column_is_present_so_the_next_fill_cannot_fail() -> None:
+    """The one item that failed on the very next fill, inverted.
 
-    It is separable from the rest: a migration that adds the three columns and the audit
-    table but not this one still breaks live trading, and does so on a *write*, which is the
-    worst moment to find out. Pinning it means a partial migration fails here rather than in
-    production.
+    `broker_fill_id` is written on every cTrader fill, so a partial migration - the three columns and
+    the audit table but not this one - breaks live trading on a *write*, which is the worst moment to
+    find out. That was why it had its own assertion while pending.
+
+    Applied 2026-10-06, so the assertion now checks the opposite and for the same reason: if the
+    column ever disappears, the next fill fails in production, and this is where that should be
+    noticed first. The error message says which direction the test was written for, because a future
+    reader seeing "is no longer pending" on a column that is genuinely absent needs to know it should
+    be re-added to EXPECTED_PENDING rather than deleted.
     """
     key = "column live_executions.broker_fill_id"
-    assert key in _production_drift(), (
-        "broker_fill_id is no longer pending; if that was deliberate, update EXPECTED_PENDING "
-        "and the notes' schema count in the same change"
+    drift = _production_drift()
+    assert key not in drift, (
+        f"broker_fill_id has vanished from production ({sorted(drift)}). It is written on every cTrader "
+        f"fill, so the next fill will fail on a write. If the column was dropped deliberately, add it "
+        f"back to EXPECTED_PENDING in the same change so the count and reality agree."
     )
