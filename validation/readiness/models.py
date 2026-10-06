@@ -90,8 +90,8 @@ class ReadinessConfig(BaseModel):
     # Pass when the absolute drift fits max(10% relative, 0.05 absolute).
     #
     # The absolute floor was 0.1, and it is the floor that governs whenever the expectation
-    # is small - which is the common case, not an edge case: **61.2%** of the backtest corpus
-    # (1,625 of 2,655) stores `sharpe_ratio` exactly 0.0. At 0.1 the gate was ~15x looser in
+    # is small - which is the common case, not an edge case: **59.2%** of the backtest corpus
+    # (1,572 of 2,655) stores `sharpe_ratio` exactly 0.0. At 0.1 the gate was ~15x looser in
     # relative terms at zero than at a typical Sharpe of 1.5, so a drift of 0.09 against an
     # expectation of 0.15 - a 60% proportional regression - passed.
     #
@@ -100,24 +100,26 @@ class ReadinessConfig(BaseModel):
     # flips **7** of 2,655 rows and 0.02 flips 9, so 0.05 captures most of the tightening at the
     # smallest blast radius. Reversible: this is a config default, not logic.
     #
-    # The proportions here were re-measured 2026-10-06 and two figures in an earlier version of
-    # this comment were wrong: it said 97.9% of the corpus was 0.0 and cited 1,028 non-zero pairs.
-    # Measured is 61.2% and 1,030. The 97.9% claim overstated the zero population by more than a
-    # third, which matters here because this comment is the argument for why the floor governs the
-    # common case.
+    # The proportions here were re-measured 2026-10-06. An earlier version claimed 97.9% of the
+    # corpus was 0.0 and cited 1,028 non-zero pairs; measured then was 61.2% and 1,030. The 97.9% claim
+    # overstated the zero population by more than a third, which matters because this comment is the
+    # argument for why the floor governs the common case. After the backfill the population returned to
+    # the 1,572 an earlier version of this comment had recorded - so that figure was right for a prior
+    # state, and 1,625 was right for the moment it was measured.
     #
     # Deliberately NOT changed here: the fact that `expected == 0` should arguably be
     # "not comparable" rather than pass or fail. That is a policy question, it would remove
-    # **1,625 of 2,655 rows (61.2%)** from the verdict - all of which pass today - and
+    # **1,572 of 2,655 rows (59.2%)** from the verdict - all of which pass today - and
     # `ReadinessCheck` has no state to express it. Tracked in the backlog, not decided here.
     #
-    # Those 1,625 rows are also not *recomputable*, which is a second reason not to treat them as a
+    # Those 1,572 rows are also not *recomputable*, which is a second reason not to treat them as a
     # clean cohort - and the reason is sharper than "the curves are too short". Measured from their own
-    # equity_curve: **1,208 of 1,625 store no usable curve at all**, so no policy can recover a Sharpe
-    # from them because there is nothing to recompute. Only 156 (9.6%) are genuinely short - 11 with
-    # one point, 145 with two - and 261 have three or more, of which 209 are flat (correctly zero) and
-    # 52 move while storing 0.0. For 46 of those 52 the stored `stats.sharpe_ratio` disagrees with the
-    # 0.0 column, which is the 53-row cohort the backlog entry discusses.
+    # equity_curve: **1,219 of 1,572 store no usable curve at all**, so no policy can recover a Sharpe
+    # from them because there is nothing to recompute. Only 155 (9.9%) are genuinely short - 11 with
+    # one point, 144 with two - and 209 have three or more, all flat and so
+    # correctly zero. The 52 rows that moved while storing 0.0 were reconciled on 2026-10-06 by
+    # `scripts/backfill_sharpe_column.py --apply`, which corrected 3,065 stale sentinel cells across
+    # this and the three sibling columns. See test_sharpe_column_vs_payload_disagreement.py.
     #
     # So the cohort is not homogeneous: it is mostly rows with no curve, a minority with too few
     # points, and 53 rows whose Sharpe is ambiguous between two columns. Any verdict rule has to say

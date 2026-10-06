@@ -58,6 +58,7 @@ def _disagreeing() -> list[tuple[str, float, float]]:
         return out
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_the_corpus_still_holds_exactly_53_disagreeing_rows() -> None:
     """Anchors the count so a future backfill makes this fail loudly rather than silently pass."""
     assert len(_disagreeing()) == 53, (
@@ -66,6 +67,65 @@ def test_the_corpus_still_holds_exactly_53_disagreeing_rows() -> None:
         f"test that they stay reconciled"
     )
 
+
+
+def _payload_value(payload: dict, column: str) -> float | None:
+    raw = payload.get(column, payload.get(column.replace("_ratio", "")))
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cagr_drift_rows() -> list[tuple[str, float, float]]:
+    """Rows where cagr's column holds a real value differing from a real payload value."""
+    with sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        rows = conn.execute("select id, cagr, stats from backtests").fetchall()
+    out = []
+    for backtest_id, column, stats in rows:
+        if not stats:
+            continue
+        try:
+            payload = json.loads(stats)
+        except (TypeError, ValueError):
+            continue
+        value = _payload_value(payload, "cagr")
+        if value is None:
+            continue
+        try:
+            if abs(float(column) - value) <= 1e-9:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if abs(float(column)) > 1e-9 and abs(value) > 1e-9:
+            out.append((backtest_id, float(column), value))
+    return out
+
+
+def _declared_undefined_cells() -> list[tuple[str, str]]:
+    """Cells where the producer withheld the metric yet published a value."""
+    columns = ("sharpe_ratio", "psr", "cagr", "p_value")
+    with sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "select id, " + ", ".join(columns) + ", stats from backtests"
+        ).fetchall()
+    out = []
+    for row in rows:
+        if not row[-1]:
+            continue
+        try:
+            payload = json.loads(row[-1])
+        except (TypeError, ValueError):
+            continue
+        undefined = payload.get("undefined_metrics")
+        if not isinstance(undefined, list):
+            continue
+        for index, name in enumerate(columns, start=1):
+            if name in undefined and _payload_value(payload, name) is not None:
+                out.append((row[0], name))
+    return out
 
 def test_the_viewer_reads_the_payload_not_the_column() -> None:
     """The decisive claim, asserted against source rather than described in a docstring.
@@ -90,6 +150,7 @@ def test_the_viewer_reads_the_payload_not_the_column() -> None:
     )
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_only_the_column_is_stale_so_the_correction_direction_is_one_sided() -> None:
     """For every disagreeing row the column is 0.0 and the payload is not.
 
@@ -196,6 +257,7 @@ def test_the_recalc_script_is_manual_only_so_the_hazard_is_not_active() -> None:
     )
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_the_backfill_restores_the_zero_population_to_the_count_models_py_recorded() -> None:
     """A coincidence worth recording honestly, without over-reading it.
 
@@ -238,6 +300,7 @@ def test_the_backfill_restores_the_zero_population_to_the_count_models_py_record
     )
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_the_divergence_is_a_persistent_class_not_a_single_event() -> None:
     """Why the fix is written as a general reconciliation rather than a named incident's repair."""
     import sqlite3 as _sqlite3
@@ -267,6 +330,7 @@ def test_the_divergence_is_a_persistent_class_not_a_single_event() -> None:
     )
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_the_same_sentinel_divergence_exists_in_three_more_scalar_columns() -> None:
     """The 53 are not a Sharpe quirk. Three sibling columns carry the same shape, far larger.
 
@@ -347,6 +411,7 @@ def test_the_same_sentinel_divergence_exists_in_three_more_scalar_columns() -> N
     )
 
 
+@pytest.mark.skip(reason="historical: asserts the pre-backfill corpus of 2026-10-06. Kept because it records why the correction was safe; the live check is the post-backfill section of this file.")
 def test_no_disagreeing_row_declares_its_metric_undefined_in_any_column() -> None:
     """Which settles whether widening the backfill is the same operation in every column.
 
@@ -408,4 +473,103 @@ def test_no_disagreeing_row_declares_its_metric_undefined_in_any_column() -> Non
         f"{declared_undefined} rows now declare their metric undefined while publishing a value. In "
         f"those the sentinel is deliberate and backfilling WOULD destroy a 'never computed' marker - "
         f"the script must skip them rather than overwrite."
+    )
+
+
+# ── POST-BACKFILL ────────────────────────────────────────────────────────────
+#
+# scripts/backfill_sharpe_column.py --apply ran against production on 2026-10-06 with the operator's
+# authorisation, correcting 3,065 stale sentinel cells across the four scalar stat columns:
+#
+#     sharpe_ratio   53      sharpe_ratio 0.0  1,625 -> 1,572
+#     psr           925      psr          0.0  2,603 -> 1,678
+#     cagr        1,046      cagr         0.0  2,600 -> 1,554
+#     p_value     1,041      p_value      1.0  2,601 -> 1,560
+#
+# The tests above describe the corpus as it was *before* that, and they now fail on purpose. They are
+# kept rather than deleted because they record why the correction was safe - which is the part a future
+# reader needs - and the assertions below replace their role as live checks.
+#
+# What is deliberately NOT reconciled: cagr's 54 rows where both sides hold a real value and differ by a
+# median of 0.00055. That is recomputation drift, not staleness, and overwriting a real value with a
+# different real value would destroy information rather than restore it.
+
+
+def test_the_backfill_left_no_column_payload_disagreement_behind() -> None:
+    """The regression check that replaces "there are exactly 53 disagreeing rows".
+
+    If this ever goes non-zero, something is still failing to write these columns - which is a more
+    interesting finding than the original mismatch, because it would mean the writer regressed rather
+    than the corpus having drifted.
+    """
+    rows = _disagreeing()
+    assert rows == [], (
+        f"{len(rows)} rows disagree between a column and the payload again: {rows[:5]}. The backfill "
+        f"is not durable - something is still failing to write the scalar stat columns."
+    )
+
+
+def test_only_cagrs_recomputation_drift_remains_and_is_deliberate() -> None:
+    """54 rows, all cagr, all both-sides-real. This is the exclusion working, not a leak.
+
+    Asserted positively so that if the count ever moves, it is visible which direction it moved: a
+    rise means new drift has appeared and the exclusion needs re-examining; a fall to zero means the
+    drift resolved itself and cagr can be folded into the backfill.
+    """
+    drift = _cagr_drift_rows()
+    assert len(drift) == 54, (
+        f"cagr drift rows are now {len(drift)}, not 54. A rise means new recomputation drift needs "
+        f"deciding; a fall to zero means cagr can join the backfill."
+    )
+    assert all(abs(column) > 1e-9 and abs(payload) > 1e-9 for _id, column, payload in drift), (
+        "a cagr drift row has a sentinel on one side, which would make it stale rather than drift and "
+        "would belong in the backfill"
+    )
+
+
+def test_no_producer_declared_a_metric_undefined_while_publishing_it() -> None:
+    """Still zero after the backfill, which is what made the single-direction correction safe."""
+    withheld = _declared_undefined_cells()
+    assert len(withheld) == 0, (
+        f"{len(withheld)} cells declare their metric undefined while publishing a value. Those "
+        f"sentinels are deliberate, and the script refuses to overwrite them - so if this is "
+        f"non-empty the population needs re-examining before any further apply."
+    )
+
+
+def test_the_zero_sharpe_population_is_now_the_1572_the_code_recorded() -> None:
+    """Closure, and a useful coincidence.
+
+    validation/readiness/models.py originally cited "1,572 of 2,655 rows (59.2%)" as the zero-Sharpe
+    population. I corrected that to 1,625 (61.2%) when I measured the pre-backfill corpus, and the
+    backfill has now restored exactly 1,572. So the recorded figure was right for a prior state and my
+    correction was right for the moment I measured it - they described different moments rather than
+    competing claims, which is why this closes rather than conflicting.
+    """
+    with sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        total = conn.execute(
+            "select count(*) from backtests where sharpe_ratio is not null"
+        ).fetchone()[0]
+        zeros = conn.execute(
+            "select count(*) from backtests where sharpe_ratio = 0.0"
+        ).fetchone()[0]
+
+    assert total == 2655, (
+        f"the corpus now holds {total} rows with a Sharpe; every proportion in "
+        f"validation/readiness/models.py must be re-measured rather than inherited"
+    )
+    assert zeros == 1572, f"the zero-Sharpe population is {zeros}, not the 1,572 the backfill restored"
+
+
+def test_the_extreme_value_the_backfill_was_measured_against_survived() -> None:
+    """The -37.6644 row was the reason the direction mattered, so it is checked by name."""
+    with sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        value = conn.execute(
+            "select sharpe_ratio from backtests where id = 'vbt-example_sma-20260331-212522'"
+        ).fetchone()
+
+    assert value is not None, "the probe row is gone; pick another and re-derive"
+    assert value[0] == pytest.approx(-37.6644), (
+        f"that row now stores {value[0]}, not -37.6644. A production run of "
+        f"recalculate_backtest_stats.py would have zeroed it - see the hazard test in the sibling file"
     )

@@ -186,8 +186,15 @@ def test_dry_run_is_the_default_and_the_write_targets_columns_only():
     assert "update backtests set {column}" in lowered
 
 
-def test_production_corpus_is_what_the_script_reports():
-    """The headline number, asserted so a corpus change surfaces instead of silently altering scope."""
+def test_the_production_corpus_is_reconciled_and_stays_that_way():
+    """Post-backfill regression: the script now reports nothing to do.
+
+    Before 2026-10-06 this asserted the script would find 3,065 cells. That was the scope check, and it
+    did its job - it moved to 0 on the day the backfill ran, which is how we knew the apply had done
+    what the clone rehearsal promised. Now it guards that it stays at 0. A non-zero return means the
+    scalar stat columns have started disagreeing with their payloads again, which is a writer
+    regression rather than a corpus change.
+    """
     import sqlite3 as _sqlite3
 
     db = Path("/home/ubuntu/data/backtests.db")
@@ -195,14 +202,8 @@ def test_production_corpus_is_what_the_script_reports():
         pytest.skip(f"{db} is absent")
     with _sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
         found = _load().find_disagreements(connection)
-    counts = {}
-    for _id, column, _c, _p in found:
-        counts[column] = counts.get(column, 0) + 1
-    assert len(found) == 3065, f"the script now reports {len(found)} stale cells, not 3065"
-    assert counts.get("sharpe_ratio") == 53
-    assert counts.get("cagr") == 1046, (
-        "cagr's sentinel count moved; note that its 54 drift rows are excluded by design, so this "
-        "figure should be the sentinel population only"
+    assert found == [], (
+        f"{len(found)} stale cells have reappeared, e.g. {found[:3]}. The backfill was not durable."
     )
 
 
