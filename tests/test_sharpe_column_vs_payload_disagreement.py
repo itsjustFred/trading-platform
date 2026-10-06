@@ -194,3 +194,74 @@ def test_the_recalc_script_is_manual_only_so_the_hazard_is_not_active() -> None:
         "recalculate_backtest_stats.py no longer merges recomputed stats over existing ones; if the "
         "order changed, re-derive whether this hazard still exists before relying on it"
     )
+
+
+def test_the_backfill_restores_the_zero_population_to_the_count_models_py_recorded() -> None:
+    """A coincidence worth recording honestly, without over-reading it.
+
+    `validation/readiness/models.py` originally cited "1,572 of 2,655 rows (59.2%)" as the
+    zero-Sharpe population. Measured today that population is 1,625. Applying the backfill on a clone
+    moves it to exactly 1,572 - so the original figure was a real observed state of this corpus, and
+    the 53 rows are the difference between then and now.
+
+    What this does NOT establish: that the divergence was a single event. The 53 rows' created_at spans
+    2026-03-09 to 2026-09-25 - seven months, and 51 of them are `vbt-` prefixed - so it is a persistent
+    class of divergence across many saves, not one bad write. That is why I did not write the fix as a
+    one-off repair of a known incident: there is no single incident to name.
+
+    Recorded as a consistency check rather than proof. If a future state makes the backfill land on a
+    different count, that is worth knowing - either the population moved or the recorded figure was
+    wrong - so this asserts the arithmetic and lets the number diverge visibly.
+    """
+    import sqlite3 as _sqlite3
+
+    with _sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        total = conn.execute(
+            "select count(*) from backtests where sharpe_ratio is not null"
+        ).fetchone()[0]
+        zeros = conn.execute(
+            "select count(*) from backtests where sharpe_ratio = 0.0"
+        ).fetchone()[0]
+
+    assert len(_disagreeing()) == 53, "the premise - 53 disagreeing rows - has moved"
+    # The 53 are a subset of the zero population, not of the corpus: correcting them removes them from
+    # the zeros and leaves the total untouched. My first version of this asserted `total - 53 == 1572`,
+    # which is arithmetically nonsense - 2655 - 53 is 2602 - and the test caught it.
+    assert zeros - len(_disagreeing()) == 1572, (
+        f"correcting the disagreeing rows leaves {zeros - len(_disagreeing())} zeros, not the 1,572 "
+        f"recorded in models.py. Either the corpus moved or that figure was wrong; both are worth "
+        f"knowing before relying on it."
+    )
+    assert total == 2655, (
+        f"the corpus now holds {total} rows with a Sharpe; the proportions derived from it in "
+        f"validation/readiness/models.py must be re-measured rather than inherited"
+    )
+
+
+def test_the_divergence_is_a_persistent_class_not_a_single_event() -> None:
+    """Why the fix is written as a general reconciliation rather than a named incident's repair."""
+    import sqlite3 as _sqlite3
+
+    ids = [bid for bid, _, _ in _disagreeing()]
+    with _sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        created = [
+            row[0]
+            for row in conn.execute(
+                "select created_at from backtests where id in (%s)"
+                % ",".join("?" * len(ids)),
+                ids,
+            )
+            if row[0]
+        ]
+
+    assert created, "no created_at recorded; the span cannot be measured"
+    months = sorted({value[:7] for value in created})
+    assert len(months) > 1, (
+        f"all {len(ids)} disagreeing rows now fall in {months}, so this looks like a single event "
+        f"after all and could be named as one"
+    )
+    vbt = sum(1 for bid in ids if bid.startswith("vbt-"))
+    assert vbt > len(ids) // 2, (
+        f"only {vbt} of {len(ids)} disagreeing rows are vbt-prefixed; the population has become "
+        f"mixed and the vbt-specific explanation no longer holds"
+    )
