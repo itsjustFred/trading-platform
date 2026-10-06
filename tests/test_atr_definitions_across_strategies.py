@@ -321,3 +321,89 @@ def test_the_gap_does_not_scale_with_volatility() -> None:
         f"a 4x volatility change moved the median gap from {quiet:.2f}% to {wild:.2f}%, so the gap "
         f"does scale with volatility after all and the tail explanation above is incomplete"
     )
+
+
+def test_the_gap_measured_on_stored_bars_matches_the_synthetic_claim() -> None:
+    """Item 5's remaining limit, closed: the arithmetic now runs over real stored XAUUSD daily bars.
+
+    The earlier tests used synthetic series, and this file said so explicitly - the production stop
+    measurement was unavailable. That is now partly untrue, and it should not stay that way in prose
+    when it is untrue in fact.
+
+    What this does *not* do is claim the production impact. `trades` cannot answer it: its `mae` column
+    is not comparable across symbols - EEM shows ratios over 4,000% against its own entry price - so a
+    corpus-wide stop-sensitivity figure computed from it would be meaningless. What real bars give is
+    the *distance* disagreement, which is the input to the impact:
+
+      atr_period 14: median 5.01%, p95 17.17%, max 55.31%
+      atr_period 20: median 4.86%, p95 15.67%, max 39.77%
+
+    Close to the synthetic ~7% median, so the synthetic result was representative rather than
+    convenient - worth knowing, since a synthetic series chosen to show a big gap would not have
+    generalised. The impact still needs a strategy-specific stop-distance record.
+    """
+    from pathlib import Path
+
+    import pandas as pd
+
+    parquet = Path("/home/ubuntu/data/ohlcv/dukascopy/metals/XAUUSD/1m.parquet")
+    if not parquet.exists():
+        pytest.skip(f"{parquet} is absent, so there are no stored bars to measure")
+
+    frame = pd.read_parquet(parquet)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    daily = (
+        frame.set_index("timestamp")
+        .resample("1D")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+        .dropna()
+    )
+    assert len(daily) > 4000, f"only {len(daily)} stored daily bars; the series has been truncated"
+
+    high, low, close = daily["high"], daily["low"], daily["close"]
+    tr = pd.concat(
+        [(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1
+    ).max(axis=1)
+    tr.iloc[0] = high.iloc[0] - low.iloc[0]
+
+    for period in (14, 20):
+        simple = tr.rolling(period).mean()  # channel_breakout and risk_parity
+        wilder = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+        tail = slice(period + 60, None)
+        gap = ((wilder[tail] - simple[tail]) / simple[tail] * 100).abs()
+        assert 1.0 < gap.median() < 12.0, (
+            f"atr_period {period}: on real stored bars the median gap is {gap.median():.2f}%, well "
+            f"outside the range the synthetic tests bound, so they do not represent this data and "
+            f"their thresholds need widening"
+        )
+        assert gap.quantile(0.95) > 8.0, (
+            f"atr_period {period}: the real p95 gap is only {gap.quantile(0.95):.2f}%, so on stored "
+            f"data the tail is tighter than the synthetic case claimed"
+        )
+
+
+def test_trades_cannot_supply_the_production_impact_because_mae_is_not_comparable() -> None:
+    """Why item 5's *impact* is still unmeasured, recorded so the limit is explicit.
+
+    `trades.mae` is a price distance, and dividing it by `entry_price` gives a percentage - which
+    looks like the natural normalisation and is not, because the column is not comparable across
+    symbols. Measured: EEM rows show MAE at 4,456% to 6,716% of their own entry price, and DBC reaches
+    41,343%. Whatever unit or scaling produced that, it means a corpus-wide stop-sensitivity figure
+    built from `trades` would be an average of incomparable numbers.
+    """
+    import sqlite3
+
+    db = Path("/home/ubuntu/data/backtests.db")
+    if not db.exists():
+        pytest.skip(f"{db} is absent, so there is no corpus to inspect")
+
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+        worst = conn.execute(
+            "select max(abs(mae) / entry_price) from trades "
+            "where mae is not null and entry_price > 0"
+        ).fetchone()[0]
+
+    assert worst > 1.0, (
+        f"the worst mae/entry ratio is now {worst:.3f}, so mae may have been fixed and the production "
+        f"impact measurement becomes possible - worth doing rather than leaving this as a limit"
+    )
