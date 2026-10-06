@@ -36,6 +36,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 STRATEGIES = Path(__file__).resolve().parents[1] / "strategies"
 ADAPTER = Path(__file__).resolve().parents[1] / "live_runner" / "ctrader_adapter.py"
 
