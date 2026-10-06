@@ -129,3 +129,68 @@ def test_readiness_reads_neither_stored_value() -> None:
         "the readiness calculator now reads the database directly; if it reads the stored column, "
         "the 53 rows DO affect readiness verdicts and item 14 is coupled to this disposition"
     )
+
+
+def test_the_recalc_script_would_destroy_the_payload_values_the_53_depend_on() -> None:
+    """The hazard: the obvious tool to "fix a wrong Sharpe" is the one that would erase these 53.
+
+    `scripts/recalculate_backtest_stats.py` merges `{**existing, **recalculated}`, so recomputed values
+    win. For any of the 53 rows whose curve is absent or too short to yield a Sharpe, the recomputation
+    returns 0.0 and the merge writes 0.0 over a real payload value - one of them -37.66.
+
+    Measured directly: with `trades=[]`, `equity_curve=[]` and `stats.sharpe_ratio = -37.66`,
+    `compute_stats_for_result` returns 0.0 and the merge yields 0.0.
+
+    The script is manual-only today - no service, timer or workflow invokes it - so this is a trap for
+    whoever reaches for it next, not an active data loss. And the fix it looks like it performs is the
+    opposite of the correct direction established above: it moves the payload toward the column, when
+    the column is the stale side.
+
+    Asserted rather than documented so that fixing the merge order, or restricting the script to rows
+    that actually have a curve, makes this fail and say what changed.
+    """
+    import sys
+
+    sys.path.insert(0, str(REPO))
+    from runner.stats import compute_stats_for_result
+    from shared.models import BacktestMeta, BacktestResult
+
+    meta = BacktestMeta(
+        id="probe",
+        strategies=["probe"],
+        engine="probe",
+        created_at="2026-01-01",
+        initial_capital=100000,
+    )
+    result = BacktestResult(meta=meta, trades=[], equity_curve=[], stats={"sharpe_ratio": -37.66})
+
+    recomputed = compute_stats_for_result(result)
+    merged = {**result.stats, **recomputed}
+
+    assert merged["sharpe_ratio"] == 0.0, (
+        "compute_stats_for_result now preserves or derives a non-zero Sharpe from an empty curve, so "
+        "recalculate_backtest_stats.py no longer overwrites these payload values with 0.0 and this "
+        "hazard has gone - worth recording either way, since the hazard was the reason not to run it"
+    )
+    assert result.stats["sharpe_ratio"] == -37.66, (
+        "the fixture changed: this test exists to prove the ORIGINAL payload value is what a "
+        "recalculation would destroy, so a mutated fixture would make it vacuous"
+    )
+
+
+def test_the_recalc_script_is_manual_only_so_the_hazard_is_not_active() -> None:
+    """No service, timer or workflow invokes it - so this is a trap, not a running data loss."""
+    repo_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in REPO.rglob("*.service")
+    )
+    assert "recalculate_backtest_stats" not in repo_text, (
+        "a systemd unit now invokes recalculate_backtest_stats, so the hazard above is ACTIVE rather "
+        "than a trap for a manual run, and the merge order needs fixing before it fires"
+    )
+
+    script = (REPO / "scripts" / "recalculate_backtest_stats.py").read_text(encoding="utf-8")
+    assert "{**existing_stats, **recalculated_stats}" in script, (
+        "recalculate_backtest_stats.py no longer merges recomputed stats over existing ones; if the "
+        "order changed, re-derive whether this hazard still exists before relying on it"
+    )
