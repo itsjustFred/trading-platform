@@ -135,6 +135,12 @@ def test_the_decision_is_unchanged_for_every_status(
         (SimpleNamespace(orderId=4, status=1), True, "older proto: `status` is honoured"),
         (SimpleNamespace(orderId=5, status=2), False, "older proto: `status` FILLED"),
         (SimpleNamespace(orderId=6), True, "absent status resolves to cancel"),
+        (
+            SimpleNamespace(orderId=9, orderStatus="not-a-number"),
+            False,
+            "unparseable status resolves against cancelling - the opposite of every other "
+            "cannot-tell path",
+        ),
     ]
     for order, expected, why in cases:
         assert adapter._is_working_order(order) is expected, f"{why}: order_id={order.orderId}"
@@ -143,4 +149,51 @@ def test_the_decision_is_unchanged_for_every_status(
     assert enumless._is_working_order(SimpleNamespace(orderId=7, orderStatus=2)) is True, (
         "with no enum even a FILLED order is treated as working; that is the pre-existing policy "
         "and this test pins it so it cannot drift unnoticed"
+    )
+
+
+def test_an_unparseable_status_is_logged_rather_than_silently_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one cannot-tell path that was silent, and it resolved the other way.
+
+    Three sibling paths assume working and log a warning naming the consequence. This one returned
+    ``False`` with no log at all, so an order whose status could not be parsed would be left resting
+    with no trace - indistinguishable on the wire and in the log from an order the broker had
+    already settled. The direction is item 2's decision and is pinned unchanged; only the visibility
+    is fixed.
+    """
+    adapter = _adapter(monkeypatch, with_enum=True)
+
+    with caplog.at_level("WARNING", logger="live-runner"):
+        assert adapter._is_working_order(
+            SimpleNamespace(orderId=9, orderStatus="not-a-number")
+        ) is False
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings, "an unparseable status is still silent"
+    assert "not an integer" in warnings[-1]
+    # It must name the consequence and the disagreement, not merely that parsing failed.
+    assert "will not be cancelled" in warnings[-1]
+    assert "opposite direction" in warnings[-1]
+
+
+def test_the_message_names_the_value_that_failed_to_parse(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The offending value has to appear, or the field cannot be debugged from the log.
+
+    Deliberately asserted against the message text rather than a structured payload: this logger
+    serialises ``extra`` into a JSON string, so asserting on ``record.data`` would pin the logging
+    internals instead of the behaviour.
+    """
+    adapter = _adapter(monkeypatch, with_enum=True)
+
+    with caplog.at_level("WARNING", logger="live-runner"):
+        adapter._is_working_order(SimpleNamespace(orderId=9, orderStatus="not-a-number"))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings
+    assert "'not-a-number'" in warnings[-1], (
+        "the log must carry the value that could not be parsed"
     )

@@ -2540,6 +2540,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         try:
             return int(raw_status) in working_statuses
         except (TypeError, ValueError):
+            # The one "cannot tell" path that resolves *against* cancelling, and the only one of the
+            # four that was silent. Item 2's decision is which direction is right; that is unchanged.
+            # What is fixed here is that it disagreed with the other three paths without saying so, so
+            # an order whose status could not be parsed would be left resting with no trace at all -
+            # indistinguishable, on the wire and in the log, from an order the broker had settled.
+            logger.warning(
+                f"cTrader order status {raw_status!r} is not an integer, so it is treated as NOT "
+                "working and will not be cancelled by a sweep; this resolves in the opposite "
+                "direction from the other unrecognised-status paths, which assume working",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                        "raw_status": repr(raw_status),
+                        "raw_status_type": type(raw_status).__name__,
+                    }
+                },
+            )
             return False
 
     async def _cancel_order_id(self, order_id: int) -> None:
