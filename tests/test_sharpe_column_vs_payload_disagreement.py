@@ -345,3 +345,67 @@ def test_the_same_sentinel_divergence_exists_in_three_more_scalar_columns() -> N
         f"cagr's both-non-zero differences now have a median of {median:.4f}, which is too large to "
         f"call recomputation drift - re-derive before treating them as benign"
     )
+
+
+def test_no_disagreeing_row_declares_its_metric_undefined_in_any_column() -> None:
+    """Which settles whether widening the backfill is the same operation in every column.
+
+    Card L103 held `p_value` back on the grounds that its 1.0 sentinel has documented meaning, so
+    writing over it might destroy a deliberate "never computed" marker. That caution was half right
+    and half wrong, and this is the measurement that separates them.
+
+    The writer gates the column on the producer's `undefined_metrics`
+    (`_scalar_stats_for_save` uses `resolve_defined_stat`), so the two situations are distinguishable
+    in the stored payload:
+
+      declared undefined  - the producer withheld the metric, so the sentinel is deliberate and the
+                            payload value is a bug in its own right;
+      no such declaration - the producer published the value and the column simply was never written,
+                            so the sentinel is staleness and backfilling restores intent.
+
+    Measured across all four columns and every disagreeing row: **zero** declare their metric
+    undefined. All 53 / 925 / 1,100 / 1,041 carry no `undefined_metrics` key naming the metric at all.
+
+    So the sentinel means "never computed" in every case, and in every case it is factually wrong -
+    the payload proves the value was computed. Widening is therefore the same operation throughout,
+    which reverses L103's caution about `p_value` specifically.
+    """
+    import sqlite3 as _sqlite3
+
+    columns = ("sharpe_ratio", "psr", "cagr", "p_value")
+    with _sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "select id, sharpe_ratio, psr, cagr, p_value, stats from backtests"
+        ).fetchall()
+
+    declared_undefined = 0
+    disagreements = 0
+    for row in rows:
+        if not row[5]:
+            continue
+        try:
+            parsed = json.loads(row[5])
+        except (TypeError, ValueError):
+            continue
+        for index, name in enumerate(columns, start=1):
+            raw = parsed.get(name, parsed.get(name.replace("_ratio", "")))
+            if raw is None:
+                continue
+            try:
+                if abs(float(raw) - float(row[index])) <= 1e-9:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            disagreements += 1
+            undefined = parsed.get("undefined_metrics")
+            if isinstance(undefined, list) and name in undefined:
+                declared_undefined += 1
+
+    assert disagreements > 3000, (
+        f"only {disagreements} disagreements remain; the four-column finding needs re-measuring"
+    )
+    assert declared_undefined == 0, (
+        f"{declared_undefined} rows now declare their metric undefined while publishing a value. In "
+        f"those the sentinel is deliberate and backfilling WOULD destroy a 'never computed' marker - "
+        f"the script must skip them rather than overwrite."
+    )
