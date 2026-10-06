@@ -47,10 +47,27 @@ REPO = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO / "validation" / "readiness" / "validator.py"
 PRODUCTION_DB = Path("/home/ubuntu/data/backtests.db")
 
-RELATIVE_FRACTION = 0.10
-ABSOLUTE_FLOOR = 0.1
-# Above this the absolute term is the smaller of the two, so the relative branch governs.
-FLAT_REGIME_CEILING = 1.0
+def _live_tolerance() -> tuple[float, float]:
+    """Read the tolerance from the live config rather than restating it.
+
+    These two constants used to be hardcoded here as 0.10 and 0.1 while the validator's own default
+    for the absolute floor is 0.05. So this file measured a population that production no longer had,
+    and still passed - because its assertions are loose bounds rather than exact figures. The numbers
+    it reported were real but for the wrong floor: 832/1030 in the flat regime at 0.1, against 59/1030
+    at the 0.05 actually in use.
+
+    Deriving them means a config change shows up as a failing measurement rather than as a stale
+    dashboard number.
+    """
+    from validation.readiness.models import ReadinessConfig
+
+    cfg = ReadinessConfig()
+    return cfg.stats_sharpe_tolerance_pct, cfg.stats_sharpe_tolerance_abs
+
+
+RELATIVE_FRACTION, ABSOLUTE_FLOOR = _live_tolerance()
+# The crossover is where the two terms are equal: above it the relative branch governs.
+FLAT_REGIME_CEILING = ABSOLUTE_FLOOR / RELATIVE_FRACTION
 
 
 def test_the_tolerance_still_takes_the_max_of_relative_and_absolute() -> None:
@@ -79,18 +96,33 @@ def _abs_sharpes() -> list[float]:
         conn.close()
 
 
-def test_the_flat_branch_governs_four_rows_in_five() -> None:
-    """The size of the population the proportional branch never reaches."""
+def test_the_flat_branch_is_now_a_minority_regime_not_the_common_case() -> None:
+    """Re-measured against the live floor, which reverses this file's original premise.
+
+    This test used to assert that four rows in five sat in the flat regime, and it passed - while
+    measuring a hardcoded 0.1 floor that the validator's own default (0.05) had already moved past.
+    Against the floor actually in use the flat branch governs 59 of 1030 rows, 5.7%, not 80.8%.
+
+    So item 14's premise needs restating rather than defending: the absolute floor is no longer what
+    most rows experience. It is still the entire story for those 59, which is why the rule cannot be
+    simply deleted - but "the tolerance is effectively flat for the corpus" is no longer true, and the
+    dashboard carried that claim.
+    """
     values = _abs_sharpes()
     assert values, "no rows hold a real sharpe_ratio; re-measure rather than inherit"
     flat = [v for v in values if v < FLAT_REGIME_CEILING]
-    assert len(flat) / len(values) > 0.5, (
-        f"only {len(flat)} of {len(values)} rows now fall in the flat regime. If the Sharpe "
-        f"scale moved, item 14's premise needs re-measuring."
+    assert flat, (
+        f"no row falls in the flat regime at floor {ABSOLUTE_FLOOR}; the floor and the corpus have "
+        f"moved apart and the analysis below is moot"
     )
-    assert statistics.median(values) < FLAT_REGIME_CEILING, (
-        f"the median |Sharpe| is now {statistics.median(values):.3f}, so the typical row "
-        f"uses the proportional branch and the flat floor is a minority concern"
+    assert len(flat) / len(values) < 0.10, (
+        f"{len(flat)} of {len(values)} rows ({100 * len(flat) / len(values):.1f}%) fall in the flat "
+        f"regime. If the absolute floor was tightened further, re-measure - and note that the "
+        f"proportional branch now governs the great majority of rows."
+    )
+    assert statistics.median(values) > FLAT_REGIME_CEILING, (
+        f"the median |Sharpe| is {statistics.median(values):.3f}, at or below the crossover, so the "
+        f"flat floor governs the typical row after all"
     )
 
 
@@ -99,13 +131,20 @@ def test_the_same_rule_is_looser_at_the_bottom_and_tighter_at_the_top() -> None:
     values = _abs_sharpes()
     small = [v for v in values if 0 < v < 0.10]
     large = [v for v in values if v >= 2.0]
-    assert small, "no very small Sharpes remain; the 16x claim needs re-measuring"
+    assert small, "no very small Sharpes remain; the looseness claim needs re-measuring"
     assert large, "no large Sharpes remain; the tight-at-the-top claim needs re-measuring"
     at_small = ABSOLUTE_FLOOR / (RELATIVE_FRACTION * statistics.median(small))
     at_large = ABSOLUTE_FLOOR / (RELATIVE_FRACTION * statistics.median(large))
-    assert at_small > 10, (
-        f"the flat rule is only {at_small:.1f}x looser for the smallest Sharpes, which "
-        f"contradicts this file's recorded 16x"
+    # The direction of both claims holds at the live floor, but the magnitudes are smaller than this
+    # file recorded: 8.3x rather than 16x at the bottom, 0.12x rather than 0.24x at the top. Both
+    # earlier figures came from the same hardcoded 0.1 the retune replaced.
+    assert at_small > 5, (
+        f"the flat rule is only {at_small:.1f}x looser for the smallest Sharpes; the floor has been "
+        f"tightened so far that it is barely disproportionate, and the item 14 claim needs restating"
+    )
+    assert at_small > 1, (
+        f"the flat rule is {at_small:.1f}x for the smallest Sharpes, i.e. no longer looser than "
+        f"proportional - the asymmetry this file exists to record has been abolished"
     )
     assert at_large < 1.0, (
         f"the flat rule is {at_large:.1f}x looser for the largest Sharpes, so it is tighter "

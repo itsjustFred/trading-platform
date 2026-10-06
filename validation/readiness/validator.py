@@ -787,7 +787,10 @@ class ReadinessValidator:
             )
 
         # #83: Sharpe gate (canonical rf=0 on both sides). Pass when the
-        # absolute drift fits max(10% relative, 0.1 absolute).
+        # absolute drift fits max(10% relative, 0.05 absolute). The 0.1 in an older comment here
+        # was stale: models.py has defaulted the absolute floor to 0.05, so the comment described a
+        # tolerance the validator did not apply. The defaults are named rather than restated below so
+        # the comment cannot drift away from cfg a second time.
         expected_sharpe = float(expected_stats.sharpe_ratio)
         actual_sharpe = float(actual_stats.sharpe_ratio)
         sharpe_abs_diff = abs(expected_sharpe - actual_sharpe)
