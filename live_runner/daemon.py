@@ -72,6 +72,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.constants import normalize_timeframe
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -601,7 +602,13 @@ def _deployment_matches_stockkit_route(
 
 
 def _timeframe_age_budget_seconds(timeframe: str) -> float:
-    normalized = str(timeframe or "").strip().lower()
+    # Through `normalize_timeframe`, not a bare `.lower()`. It used to lower-case only, so `M1`/`m1`
+    # missed the `1m` entry and fell through to the 300.0 default: the same 1-minute candle got a
+    # 600s effective staleness budget under `M1` and 300s under `1m`, because the daemon's caller
+    # computes `max(300.0, 2.0 * budget)`. `normalize_timeframe` is what every other consumer uses -
+    # `execution_timing._timeframe_seconds` routes through it - so the two halves of the same signal
+    # path disagreed on what `M1` means. Two spellings of one timeframe must not buy two policies.
+    normalized = normalize_timeframe(timeframe)
     seconds_by_timeframe = {
         "1m": 60.0,
         "5m": 300.0,
