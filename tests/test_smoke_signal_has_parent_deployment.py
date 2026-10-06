@@ -105,7 +105,6 @@ def test_missing_account_fails_closed_instead_of_orphaning(strict_session):
 def test_worker_calls_the_helper_before_writing_the_signal():
     """Pin the call site: a helper nobody invokes cannot prevent anything."""
     source = SOURCE.read_text(encoding="utf-8")
-    helper_call = "_ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)"
     signal_construction = (
         'signal = LiveSignal(\n        deployment_id=smoke_deployment_id'
     )
