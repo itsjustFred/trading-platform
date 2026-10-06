@@ -233,6 +233,43 @@ def _live_deployment_channel_ids() -> set[str]:
     return channels
 
 
+def _active_discord_service_names() -> set[str]:
+    """Service names whose Discord deployment is currently ACTIVE.
+
+    Bot discovery reads `.accounts.env`, so it finds a token for every configured bot regardless of
+    whether that bot is meant to be running. Discovery and deployment state are separate systems, and
+    only one of them was consulted - so a paused deployment still had its bot started, and starting a
+    bot is a connection.
+
+    Gating on deployment status makes the two agree: a bot whose deployment is PAUSED, STOPPED or absent
+    is not started at all. Note the distinction this preserves - a disabled deployment means "do not
+    trade this", and a bot that is not started means "do not talk to Discord on its behalf", which is
+    the stronger and correct reading for a disabled source.
+
+    Failure here fails *closed*: if the deployments cannot be read, no bot is started.
+    """
+    try:
+        deployments = list_live_deployments()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not read live deployments to decide which Discord bots may start; starting none "
+            "because failing open would connect to a disabled source: %r",
+            exc,
+        )
+        return set()
+
+    active: set[str] = set()
+    for deployment in deployments:
+        if str(getattr(deployment, "signal_source_type", "") or "").strip().lower() != "discord":
+            continue
+        if str(getattr(deployment, "status", "") or "").strip().upper() != "ACTIVE":
+            continue
+        name = _deployment_service_name(deployment)
+        if name:
+            active.add(name.upper())
+    return active
+
+
 def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
     discovered = discover_discord_bots_from_env()
     # The (token, channel) grouping is inferred from naming, so it is checked
@@ -261,11 +298,27 @@ def _discover_and_register_discord_services(*, log_summary: bool = True) -> list
         else:
             logger.info("Discovered 0 Discord bots")
 
+    # Only bots whose Discord deployment is ACTIVE may start. See _active_discord_service_names for
+    # why this is a connection and not a trading decision, and why an unreadable deployment set fails
+    # closed rather than open.
+    may_start = _active_discord_service_names()
+    if log_summary:
+        skipped = sorted(
+            name for name in discovered_names if name and name not in may_start
+        )
+        if skipped:
+            logger.info(
+                "Not starting Discord bot(s) with no ACTIVE deployment: %s",
+                ", ".join(skipped),
+            )
+
     existing_services = list_services(service_type=ServiceType.DISCORD_BOT)
     existing_names = {str(service.name or "").strip().upper() for service in existing_services}
     for item in discovered:
         bot_name = str(item.get("name") or "").strip().upper()
         if not bot_name or bot_name in existing_names:
+            continue
+        if bot_name not in may_start:
             continue
         token_env_key = str(item.get("token_env_key") or "").strip()
         channel_id = str(item.get("channel_id") or "").strip()
