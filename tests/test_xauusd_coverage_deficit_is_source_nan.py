@@ -117,3 +117,82 @@ def test_weekly_coverage_is_not_evidence_that_weekly_data_is_better(close_series
         f"the 1m source was repaired - good news, but then weekly stops looking flattering and the "
         f"notes need updating rather than inheriting these numbers"
     )
+
+
+def test_the_tail_is_entirely_nan_so_every_timeframe_is_short_not_just_weekly() -> None:
+    """Why the last bar is ~83 days back on 1h, 1d AND 1w - so this is not a weekly problem.
+
+    `resample_with_origin` ends with `dropna(subset=["open"])`, which is correct: it drops buckets
+    that contain no data. But the source's final months are 100% NaN, so those buckets are dropped
+    too and every resampled series ends at the last real bar rather than at the source's last row.
+
+    Measured on XAUUSD 1m: the source runs to 2026-06-24, and NaN close is 98.2% since 2026-04-01 and
+    100% since 2026-05-01. So 1h's last bar is 2026-04-02, 1d's is 2026-04-02 and 1w's is 2026-03-30 -
+    all short by 83-86 days for the same reason.
+
+    This matters for item 9: the weekly coverage advantage measured earlier is not evidence that
+    weekly data is better. And a tail that reads as "83 days of missing data" on a chart is really
+    "the last 83 days were downloaded as NaN", which is a different defect with a different fix.
+    """
+    import sys
+
+    import pandas as pd
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+    from data_tools.resample import resample_ohlcv
+
+    source = pd.read_parquet(SOURCE)
+    ts = pd.to_datetime(source["timestamp"], utc=True)
+    source_end = ts.max()
+
+    for cutoff, minimum_nan in (("2026-05-01", 100.0), ("2026-06-01", 100.0)):
+        mask = ts >= pd.Timestamp(cutoff, tz="UTC")
+        if not mask.any():
+            continue
+        nan_pct = 100 * source.loc[mask, "close"].isna().mean()
+        assert nan_pct >= minimum_nan, (
+            f"rows since {cutoff} are only {nan_pct:.1f}% NaN close, so the source tail is real data "
+            f"and the short-tail finding above needs re-deriving"
+        )
+
+    shortfalls = {}
+    for tf in ("1h", "1d", "1w"):
+        out = resample_ohlcv(source, tf)
+        last = pd.to_datetime(out["timestamp"], utc=True).max()
+        shortfalls[tf] = (source_end - last).days
+
+    # Every timeframe is short, and by a comparable number of days.
+    assert all(v > 60 for v in shortfalls.values()), (
+        f"only some timeframes are short ({shortfalls}); if one timeframe now reaches the source's "
+        f"end, the NaN-tail explanation is incomplete"
+    )
+    assert max(shortfalls.values()) - min(shortfalls.values()) <= 7, (
+        f"the shortfalls differ a lot across timeframes ({shortfalls}), so this is not one shared "
+        f"NaN tail and per-timeframe gaps need investigating separately"
+    )
+
+
+def test_weekly_thin_weeks_are_early_history_not_a_recent_regression() -> None:
+    """Of 26 weeks below half the median row count, 24 are in 2003-2004.
+
+    So the enablement question for 1w is largely a **data-range** question: the recent weekly series
+    is dense, and the thin weeks are the first years of a 2003 start. That is a different decision
+    from "weekly data is broken", and it is answerable by restricting the range rather than by
+    repairing the aggregation.
+    """
+    import pandas as pd
+
+    source = pd.read_parquet(SOURCE)
+    ts = pd.to_datetime(source["timestamp"], utc=True)
+    weeks = ts.dt.tz_localize(None).dt.to_period("W-MON").dt.start_time
+    per_week = weeks.value_counts()
+    median = per_week.median()
+    thin = per_week[per_week < median * 0.5]
+
+    assert len(thin), "no thin weeks remain; the early-history claim needs re-measuring"
+    by_year = thin.groupby(thin.index.year).size()
+    early = int(by_year.loc[[y for y in by_year.index if y <= 2005]].sum())
+    assert early / len(thin) > 0.85, (
+        f"only {early} of {len(thin)} thin weeks are from 2005 or earlier ({by_year.to_dict()}), so "
+        f"this is a recent regression rather than early-history sparsity"
+    )
