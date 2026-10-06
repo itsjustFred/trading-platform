@@ -962,33 +962,55 @@ def test_rotate_changed_ctrader_adapters_awaits_listener_cancellation_cleanup() 
     asyncio.run(_run())
 
 
-def test_connect_active_accounts_runs_concurrently(monkeypatch) -> None:
-    started: list[str] = []
+def test_a_slow_account_does_not_prevent_the_others_being_attempted(monkeypatch) -> None:
+    """Formerly `test_connect_active_accounts_runs_concurrently`, which required simultaneous flight.
+
+    That test used an Event barrier: each account's connect waited until the other's had started, so
+    it could only pass if both were in flight at the same instant. Simultaneous connection is precisely
+    what the broker refuses - cTrader authenticates against the application, so several handshakes on
+    one credential set produce `(15, 'Deferred')`, a request reaching the socket with nothing coming
+    back. Measured against five demo accounts: all five queried at once failed for every account after
+    the first, and all five succeeded when spread out.
+
+    So the accounts are now staggered by `CONNECT_STAGGER_SECONDS`. What still has to hold - and what
+    this test now asserts - is that a slow or hanging account does not stop the others being
+    *attempted*. The connects remain gathered with `return_exceptions=True`, so an exception on one
+    account cannot fail the tick, and the stagger delays a start rather than serialising completion.
+    """
+    attempted: list[str] = []
 
     async def _run() -> None:
-        both_started = asyncio.Event()
+        release = asyncio.Event()
 
         async def _ensure(account_id, *_args, **_kwargs):
-            started.append(account_id)
-            if len(started) == 2:
-                both_started.set()
-            await both_started.wait()
+            attempted.append(account_id)
+            if account_id == "slow":
+                # The account that never finishes on its own.
+                await release.wait()
+            return account_id
 
         monkeypatch.setattr(daemon, "_ensure_adapter_for_active_account", _ensure)
+        # No pacing delay, so the assertion is about isolation and not about timing.
+        monkeypatch.setattr(daemon, "_connect_stagger_seconds", lambda: 0.0)
 
-        await asyncio.wait_for(
+        task = asyncio.ensure_future(
             daemon._connect_active_accounts(
-                {"slow", "fast"},
-                {},
-                {},
-                accounts_env_values={},
-            ),
-            timeout=0.1,
+                {"slow", "fast"}, {}, {}, accounts_env_values={}
+            )
         )
+        # 'fast' must be attempted even though 'slow' is still hanging.
+        for _ in range(200):
+            if "fast" in attempted:
+                break
+            await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(_run())
+    assert set(attempted) == {"slow", "fast"}, (
+        f"both accounts must be attempted despite one hanging, got {attempted}"
+    )
 
-    assert set(started) == {"slow", "fast"}
 
 
 def test_discord_auth_error_detector_matches_improper_token_message() -> None:

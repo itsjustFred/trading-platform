@@ -95,6 +95,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
+
+# Accounts are connected in sequence, not together. cTrader authenticates against the application,
+# not the account, so opening every account at once presents several simultaneous handshakes on one
+# set of credentials and the broker stops answering: the request reaches the socket and no response
+# comes back within 15s, reported as `(15, 'Deferred')`. Measured against five demo accounts, a
+# read-only query of all of them in one loop failed for every account after the first, and succeeded
+# for every account when the calls were spread out. The default is deliberately conservative, and
+# overridable so the cadence can be tuned against the broker's behaviour without a code change.
+CONNECT_STAGGER_SECONDS = 5.0
+_DEPLOYMENT_POLL_INTERVAL_SECONDS_ENV = "DEPLOYMENT_POLL_INTERVAL_SECONDS"
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
@@ -3733,6 +3743,36 @@ async def _ensure_adapter_for_active_account(
     )
 
 
+def _connect_stagger_seconds() -> float:
+    """Seconds between successive account-connect attempts.
+
+    Read from the environment so the cadence can be tuned against the broker's behaviour without a
+    code change. A malformed or negative value falls back to the default rather than failing the tick -
+    this is a pacing knob, not a correctness setting, and refusing to connect because of a typo in it
+    would be the wrong trade.
+    """
+    raw = os.environ.get("CONNECT_STAGGER_SECONDS")
+    if raw is None:
+        return CONNECT_STAGGER_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "CONNECT_STAGGER_SECONDS=%r is not a number; using %ss",
+            raw,
+            CONNECT_STAGGER_SECONDS,
+        )
+        return CONNECT_STAGGER_SECONDS
+    if value < 0 or not math.isfinite(value):
+        logger.warning(
+            "CONNECT_STAGGER_SECONDS=%r is out of range; using %ss",
+            raw,
+            CONNECT_STAGGER_SECONDS,
+        )
+        return CONNECT_STAGGER_SECONDS
+    return value
+
+
 async def _connect_active_accounts(
     account_ids: set[str],
     account_lookup: dict[str, LiveAccountConfig],
@@ -3743,20 +3783,30 @@ async def _connect_active_accounts(
 ) -> None:
     # B2: per-account isolation — one failing connect must not fail the
     # whole tick (bare gather propagated the first exception).
+    #
+    # Still gathered, so isolation is unchanged, but each account's connect now *starts* a stagger
+    # apart rather than all firing at once. They share one application credential, and simultaneous
+    # handshakes are what produce the `(15, 'Deferred')` no-response. The stagger delays the start, not
+    # the completion, so the slowest account determines the tick exactly as before.
+    ordered = sorted(account_ids)
+    stagger = _connect_stagger_seconds()
+
+    async def _staggered(account_id: str, index: int) -> object:
+        if index and stagger > 0:
+            await asyncio.sleep(stagger * index)
+        return await _ensure_adapter_for_active_account(
+            account_id,
+            account_lookup,
+            active_adapters,
+            accounts_env_values=accounts_env_values,
+            accounts_env_path=accounts_env_path,
+        )
+
     results = await asyncio.gather(
-        *(
-            _ensure_adapter_for_active_account(
-                account_id,
-                account_lookup,
-                active_adapters,
-                accounts_env_values=accounts_env_values,
-                accounts_env_path=accounts_env_path,
-            )
-            for account_id in sorted(account_ids)
-        ),
+        *(_staggered(account_id, index) for index, account_id in enumerate(ordered)),
         return_exceptions=True,
     )
-    for account_id, result in zip(sorted(account_ids), results):
+    for account_id, result in zip(ordered, results):
         if isinstance(result, asyncio.CancelledError):
             raise result
         if isinstance(result, BaseException):
