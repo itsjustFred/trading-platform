@@ -265,3 +265,83 @@ def test_the_divergence_is_a_persistent_class_not_a_single_event() -> None:
         f"only {vbt} of {len(ids)} disagreeing rows are vbt-prefixed; the population has become "
         f"mixed and the vbt-specific explanation no longer holds"
     )
+
+
+def test_the_same_sentinel_divergence_exists_in_three_more_scalar_columns() -> None:
+    """The 53 are not a Sharpe quirk. Three sibling columns carry the same shape, far larger.
+
+    Each scalar column has a physically-carried default that means "never computed":
+    `sharpe_ratio`, `psr` and `cagr` default to 0.0, and `p_value` defaults to 1.0 because "no
+    evidence against the null hypothesis" is the correct value for an uncomputed p-value. Where the
+    payload holds a real computed value and the column still holds its sentinel, that is the same
+    defect as the 53 - the column is stale because nothing wrote a number into it.
+
+    Measured, counting only rows where both sides are present:
+
+      sharpe_ratio   53 of 2,570   disagree, all with column == 0.0
+      psr           925 of   984   disagree, all with column == 0.0
+      cagr        1,046 of 2,488   disagree with column == 0.0   (plus 54 more, see below)
+      p_value     1,041 of 2,488   disagree with column == 1.0
+
+    So `scripts/backfill_sharpe_column.py` currently covers 53 rows of a population closer to 3,065.
+    That is recorded rather than fixed here: extending the script to `p_value` means writing over a
+    sentinel that has documented meaning, which deserves its own decision even though the direction is
+    the same.
+
+    `cagr`'s remaining 54 rows are a different question and deliberately excluded: there both sides are
+    non-zero and differ by a median of 0.00055 with a maximum of 0.0133, which is recomputation drift,
+    not staleness. Overwriting a real column value with a slightly different real payload value is not
+    the same operation as replacing a sentinel, and lumping them together would destroy information
+    rather than restore it.
+    """
+    import sqlite3 as _sqlite3
+
+    with _sqlite3.connect(f"file:{PRODUCTION_DB}?mode=ro", uri=True) as conn:
+        rows = conn.execute("select id, sharpe_ratio, psr, cagr, p_value, stats from backtests").fetchall()
+
+    sentinels = {"sharpe_ratio": 0.0, "psr": 0.0, "cagr": 0.0, "p_value": 1.0}
+    sentinel_counts: dict[str, int] = {}
+    cagr_both_nonzero = 0
+    cagr_diffs: list[float] = []
+
+    for row in rows:
+        stats = row[5]
+        if not stats:
+            continue
+        try:
+            parsed = json.loads(stats)
+        except (TypeError, ValueError):
+            continue
+        for index, name in enumerate(("sharpe_ratio", "psr", "cagr", "p_value"), start=1):
+            raw = parsed.get(name, parsed.get(name.replace("_ratio", "")))
+            if raw is None:
+                continue
+            try:
+                column_value = float(row[index])
+                payload_value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if abs(payload_value - column_value) <= 1e-9:
+                continue
+            if abs(column_value - sentinels[name]) <= 1e-9:
+                sentinel_counts[name] = sentinel_counts.get(name, 0) + 1
+            elif name == "cagr":
+                cagr_both_nonzero += 1
+                cagr_diffs.append(abs(payload_value - column_value))
+
+    assert sentinel_counts.get("sharpe_ratio") == 53, (
+        f"sharpe sentinel divergences are now {sentinel_counts.get('sharpe_ratio')}, not 53"
+    )
+    for name in ("psr", "cagr", "p_value"):
+        assert sentinel_counts.get(name, 0) > 100, (
+            f"{name} now shows only {sentinel_counts.get(name, 0)} sentinel divergences; the "
+            f"cross-column finding needs re-measuring before it is reported again"
+        )
+
+    # cagr's non-sentinel disagreements are drift, and must stay distinguishable from staleness.
+    assert cagr_both_nonzero > 0, "cagr's both-non-zero disagreements have vanished; re-derive"
+    median = sorted(cagr_diffs)[len(cagr_diffs) // 2]
+    assert median < 1e-2, (
+        f"cagr's both-non-zero differences now have a median of {median:.4f}, which is too large to "
+        f"call recomputation drift - re-derive before treating them as benign"
+    )
