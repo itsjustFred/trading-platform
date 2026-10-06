@@ -394,27 +394,40 @@ async def _wait_for_ctrader_position(
     return latest
 
 
-def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> None:
-    """Give the cTrader smoke signal a parent deployment so it is visible and FK-addable.
+def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
+    """Give the cTrader smoke signal a parent deployment row, and return that row's id.
 
-    Mirrors the existing ``discord::`` synthetic-deployment convention: a ``namespace::name``
-    ``strategy_name`` and PAUSED, so the daemon never trades it. Idempotent.
+    The row's ``id`` is a fresh UUID and the descriptive name lives in ``strategy_name``. It used to be
+    the other way round - ``id`` was ``ctrader-demo-smoke-<account>`` - and that broke the daemon.
+    ``live_deployments.id`` is typed ``uuid.UUID`` on ``LiveDeploymentConfig``, so the daemon's
+    deployment sync failed validation on these rows and stopped syncing *every* deployment, armed ones
+    included. A descriptive primary key is only safe if the model allows it, and this one does not.
 
-    ``live_deployments.account_id`` already carries a foreign key to ``live_accounts``, so this
-    fails closed when the account row is absent instead of writing a second orphan. That is the
-    whole point: an orphan signal is invisible to every deployment-scoped query, which is how seven
-    of them went unnoticed.
+    Mirrors the existing ``discord::`` synthetic-deployment convention: a namespaced
+    ``strategy_name`` and PAUSED, so no runner trades it. Idempotent by ``strategy_name``, because that
+    is what a readable lookup can key on.
+
+    ``live_deployments.account_id`` carries a foreign key to ``live_accounts``, so this fails closed when
+    the account row is absent rather than writing another orphan.
     """
+    from sqlmodel import select
+
     from shared.database import LiveDeploymentModel, get_session
 
-    deployment_id = f"ctrader-demo-smoke-{account_id}"
+    strategy_name = f"ctrader-demo-smoke-{account_id}"
     with get_session() as session:
-        if session.get(LiveDeploymentModel, deployment_id) is not None:
-            return
+        existing = session.exec(
+            select(LiveDeploymentModel).where(
+                LiveDeploymentModel.strategy_name == strategy_name
+            )
+        ).first()
+        if existing is not None:
+            return str(existing.id)
+        deployment_id = str(uuid4())
         session.add(
             LiveDeploymentModel(
                 id=deployment_id,
-                strategy_name=deployment_id,
+                strategy_name=strategy_name,
                 account_id=account_id,
                 symbols_json=[symbol.upper()],
                 timeframe="1m",
@@ -424,6 +437,7 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> None:
             )
         )
         session.commit()
+        return deployment_id
 
 
 async def _ctrader_order_worker(
@@ -454,9 +468,11 @@ async def _ctrader_order_worker(
     if before_position is not None:
         raise RuntimeError(f"Refusing smoke order because {symbol} already has an open position.")
 
-    _ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)
+    smoke_deployment_id = _ensure_ctrader_smoke_deployment(
+        account_id=account_id, symbol=symbol
+    )
     signal = LiveSignal(
-        deployment_id=f"ctrader-demo-smoke-{account_id}",
+        deployment_id=smoke_deployment_id,
         symbol=symbol.upper(),
         action="buy",
         theoretical_price=1.0,

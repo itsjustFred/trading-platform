@@ -57,25 +57,39 @@ def test_smoke_signal_gets_a_parent_deployment(strict_session):
 
     _ensure_ctrader_smoke_deployment(account_id=ACCOUNT_ID, symbol="XAUUSD")
 
+    returned = _ensure_ctrader_smoke_deployment(account_id=ACCOUNT_ID, symbol="XAUUSD")
+
+    import uuid as _uuid
+
+    _uuid.UUID(returned), "the helper must return a UUID, since LiveDeploymentConfig.id is a UUID"
     with Session(strict_session) as session:
-        row = session.get(LiveDeploymentModel, DEPLOYMENT_ID)
+        from sqlmodel import select as _select
+
+        row = session.exec(
+            _select(LiveDeploymentModel).where(
+                LiveDeploymentModel.strategy_name == DEPLOYMENT_ID
+            )
+        ).first()
         assert row is not None, "smoke signal would be orphaned again"
+        assert str(row.id) == returned, "the signal must be pointed at the row the helper returned"
         assert row.strategy_name == DEPLOYMENT_ID
         # Mirrors the discord:: synthetic convention so the daemon never trades it.
         assert row.status == "PAUSED"
         assert row.symbols_json == ["XAUUSD"]
 
 
-def test_deployment_creation_is_idempotent(strict_session):
+def test_deployment_creation_is_idempotent(strict_session, monkeypatch):
+    monkeypatch.setattr("shared.database.get_session", lambda: Session(strict_session))
     for _ in range(3):
         _ensure_ctrader_smoke_deployment(account_id=ACCOUNT_ID, symbol="XAUUSD")
 
     with Session(strict_session) as session:
         count = session.exec(
-            text("select count(*) from live_deployments where id = :i").bindparams(i=DEPLOYMENT_ID)
-        ).all()
-        rows = [tuple(r) for r in count]
-    assert rows == [(1,)]
+            text("select count(*) from live_deployments where strategy_name = :n").bindparams(
+                n=DEPLOYMENT_ID
+            )
+        ).one()
+    assert tuple(count) == (1,), "repeated calls must not create a second deployment"
 
 
 def test_missing_account_fails_closed_instead_of_orphaning(strict_session):
@@ -93,12 +107,19 @@ def test_worker_calls_the_helper_before_writing_the_signal():
     source = SOURCE.read_text(encoding="utf-8")
     helper_call = "_ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)"
     signal_construction = (
-        'signal = LiveSignal(\n        deployment_id=f"ctrader-demo-smoke-{account_id}"'
+        'signal = LiveSignal(\n        deployment_id=smoke_deployment_id'
     )
 
-    assert source.count(helper_call) == 1
-    assert source.count(signal_construction) == 1
-    assert source.index(helper_call) < source.index(signal_construction)
+    assert source.count("_ensure_ctrader_smoke_deployment(") >= 2, (
+        "the helper must be defined and called, or the signal is orphaned again"
+    )
+    assert source.count(signal_construction) == 1, (
+        "the signal no longer takes the helper's return value; if it went back to building its own "
+        "deployment_id it would point at the descriptive label rather than the UUID row id"
+    )
+    assert source.index("_ensure_ctrader_smoke_deployment(\n        account_id=account_id") < source.index(
+        signal_construction
+    ), "the deployment must be ensured before the signal that depends on it"
 
 
 def test_orphan_check_would_now_be_clean_for_a_smoke_signal(strict_session):

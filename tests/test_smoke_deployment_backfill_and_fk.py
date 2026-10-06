@@ -108,17 +108,22 @@ def test_backfill_creates_the_parent_row_for_a_smoke_orphan(conn):
 
     row = conn.execute(
         text(
-            "select strategy_name, account_id, symbols, timeframe, status, signal_source "
-            "from live_deployments where id = 'ctrader-demo-smoke-44695443'"
+            "select id, strategy_name, account_id, symbols, timeframe, status, signal_source "
+            "from live_deployments where strategy_name = 'ctrader-demo-smoke-44695443'"
         )
     ).fetchone()
     assert row is not None
-    assert row[0] == "ctrader-demo-smoke-44695443"
-    assert row[1] == "44695443"
+    # The key is a UUID because LiveDeploymentConfig.id is typed uuid.UUID; the readable label lives in
+    # strategy_name. A descriptive primary key here stopped the daemon syncing every deployment.
+    import uuid as _uuid
+
+    _uuid.UUID(row[0])
+    assert row[1] == "ctrader-demo-smoke-44695443"
+    assert row[2] == "44695443"
     # Mirrors the discord:: synthetic convention: PAUSED, so no runner trades it.
-    assert row[3] == "1m"
-    assert row[4] == "PAUSED"
-    assert row[5] == "smoke"
+    assert row[4] == "1m"
+    assert row[5] == "PAUSED"
+    assert row[6] == "smoke"
 
 
 def test_backfill_is_idempotent(conn):
@@ -127,8 +132,7 @@ def test_backfill_is_idempotent(conn):
 
     assert _backfill_smoke_deployments(conn) == 1
     assert _backfill_smoke_deployments(conn) == 0
-    count = conn.execute(text("select count(*) from live_deployments")).scalar_one()
-    assert count == 1
+    assert conn.execute(text("select count(*) from live_deployments")).scalar() == 1
 
 
 def test_backfill_never_deletes_and_leaves_unknown_accounts_alone(conn):
@@ -137,7 +141,7 @@ def test_backfill_never_deletes_and_leaves_unknown_accounts_alone(conn):
     _add_signal(conn, "s2", "a-real-deployment-uuid")
 
     assert _backfill_smoke_deployments(conn) == 0
-    assert conn.execute(text("select count(*) from live_deployments")).scalar_one() == 0
+    assert conn.execute(text("select count(*) from live_deployments")).scalar() == 0
     assert conn.execute(text("select count(*) from live_signals")).scalar_one() == 2
 
 
@@ -298,3 +302,28 @@ def test_probe_agrees_with_the_migration_on_production_shaped_data(conn):
         text("select count(*) from live_signals where deployment_id not in (select id from live_deployments)")
     ).scalar_one()
     assert remaining == 1
+
+
+def test_the_backfill_repoints_the_signal_at_the_new_uuid(conn):
+    """Creating the parent is not enough on its own.
+
+    The signal names the descriptive label, which after the fix is `strategy_name` rather than `id`. If
+    the parent is created with a fresh UUID and the signal is left pointing at the label, every signal
+    stays orphaned - the state this function exists to leave behind - while the deployment exists and
+    looks fine. So the repoint is asserted, not assumed.
+    """
+    _add_account(conn, "44695443")
+    _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
+    _backfill_smoke_deployments(conn)
+
+    row = conn.execute(
+        text(
+            "select s.deployment_id, d.strategy_name from live_signals s "
+            "join live_deployments d on d.id = s.deployment_id where s.id = 's1'"
+        )
+    ).fetchone()
+    assert row is not None, (
+        "the signal still points at the descriptive label rather than the deployment's UUID id, so it "
+        "remains an orphan even though its parent row exists"
+    )
+    assert row[1] == "ctrader-demo-smoke-44695443"

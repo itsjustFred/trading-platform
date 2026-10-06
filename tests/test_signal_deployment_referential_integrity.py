@@ -85,13 +85,18 @@ def test_the_smoke_tooling_no_longer_writes_an_unresolvable_deployment_id() -> N
         "the smoke tooling stopped inserting a deployment row, so the FK on "
         "live_signals.deployment_id would break it again"
     )
-    ensure_call = "_ensure_ctrader_smoke_deployment(account_id=account_id, symbol=symbol)"
-    signal_construction = (
-        'signal = LiveSignal(\n        deployment_id=f"ctrader-demo-smoke-{account_id}"'
-    )
+    ensure_call = "_ensure_ctrader_smoke_deployment("
+    signal_construction = 'signal = LiveSignal(\n        deployment_id=smoke_deployment_id'
     assert ensure_call in text
-    assert text.index(ensure_call) < text.index(signal_construction), (
+    assert text.index("smoke_deployment_id = " + ensure_call) < text.index(signal_construction), (
         "the deployment must be ensured before the signal that depends on it"
+    )
+    # The label is a strategy_name, never a primary key: live_deployments.id is typed uuid.UUID, so a
+    # descriptive id stopped the daemon syncing every deployment including the armed ones.
+    assert 'strategy_name=strategy_name' in text or "strategy_name" in text
+    assert 'id=strategy_name' not in text, (
+        "the smoke deployment went back to using the descriptive label as its primary key, which is not "
+        "a UUID and will stop the daemon syncing every deployment again"
     )
 
 

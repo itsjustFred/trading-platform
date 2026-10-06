@@ -1989,7 +1989,7 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             "SELECT DISTINCT s.deployment_id, s.symbol "
             "FROM live_signals s "
             "WHERE s.deployment_id LIKE :prefix "
-            "AND s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+            "AND s.deployment_id NOT IN (SELECT strategy_name FROM live_deployments)"
         ),
         {"prefix": _SMOKE_DEPLOYMENT_PREFIX + "%"},
     ).fetchall()
@@ -2013,21 +2013,40 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             )
             continue
         now = datetime.now(timezone.utc).isoformat(sep=" ")
+        # `live_deployments.id` is a UUID on LiveDeploymentConfig, so the descriptive smoke label
+        # belongs in `strategy_name` and the key must be a UUID. It used to be the other way round and
+        # the daemon's deployment sync failed validation on these rows, which stopped it syncing every
+        # deployment including the armed ones. A readable lookup keys on `strategy_name`.
+        existing = connection.execute(
+            text("select id from live_deployments where strategy_name = :name"),
+            {"name": deployment_id},
+        ).first()
+        if existing is not None:
+            continue
+        new_id = str(uuid4())
         connection.execute(
             text(
                 "INSERT INTO live_deployments "
                 "(id, strategy_name, account_id, symbols, timeframe, status, "
                 " signal_source, signal_source_type, signal_source_id, symbol_filter, "
                 " signal_config, settings, created_at, updated_at) "
-                "VALUES (:id, :id, :account_id, :symbols, '1m', 'PAUSED', "
+                "VALUES (:new_id, :name, :account_id, :symbols, '1m', 'PAUSED', "
                 " 'smoke', 'internal', '', '[]', '{}', '{}', :now, :now)"
             ),
             {
-                "id": deployment_id,
+                "new_id": new_id,
+                "name": deployment_id,
                 "account_id": account_id,
                 "symbols": json.dumps([str(symbol).upper()] if symbol else []),
                 "now": now,
             },
+        )
+        # The signals still name the descriptive label, which is now `strategy_name` rather than `id`.
+        # Repoint them at the new UUID, or creating the parent would leave every one of them orphaned -
+        # the state this whole function exists to leave behind.
+        connection.execute(
+            text("UPDATE live_signals SET deployment_id = :new WHERE deployment_id = :old"),
+            {"new": new_id, "old": deployment_id},
         )
         created += 1
     if created:
