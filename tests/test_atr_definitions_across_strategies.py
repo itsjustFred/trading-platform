@@ -163,3 +163,161 @@ def test_the_viewer_charts_atr_with_wilder_regardless_of_the_strategy() -> None:
         "the viewer now smooths ATR itself; if that is Wilder's it should agree with "
         "the strategies, and this test should be replaced by an assertion that it does"
     )
+
+
+def test_the_two_definitions_diverge_enough_to_change_a_stop() -> None:
+    """Quantified, because item 5 is a trading judgement and needs a number, not a shrug.
+
+    The chart draws Wilder's whatever the strategy used. If the two agree to within a rounding
+    artefact, the mismatch is cosmetic and item 5 can stay closed. They do not: on a synthetic but
+    realistic series, after warmup, the median gap is around 7% and the tail reaches ~40%.
+
+    That is the size of the disagreement item 5 turns on - the same order as the "~10%" in the item's
+    original title. It is measured here against synthetic data rather than production, because no
+    production equity curve carries a stop distance this can be checked against, so this pins the
+    arithmetic and the direction rather than a production figure.
+    """
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(7)
+    n = 600
+    close = pd.Series(100 + np.cumsum(rng.normal(0, 0.35, n)))
+    high = (close + rng.uniform(0.05, 0.5, n)).clip(upper=close)
+    low = (close - rng.uniform(0.05, 0.5, n)).clip(lower=close)
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+    ).max(axis=1)
+
+    for period in (14, 20):
+        simple = tr.rolling(period).mean()
+        wilder = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+        tail = slice(period + 150, None)
+        gap = ((wilder[tail] - simple[tail]) / simple[tail] * 100).abs()
+        assert gap.median() > 3.0, (
+            f"period {period}: the two definitions now differ by only {gap.median():.2f}% at the "
+            f"median, so the chart/strategy mismatch is cosmetic and item 5 can be closed"
+        )
+        assert gap.max() > 20.0, (
+            f"period {period}: the tail gap is only {gap.max():.2f}%, so a stop placed on one "
+            f"definition would rarely be touched by the other"
+        )
+
+
+def test_the_gap_carries_a_consistent_sign_so_it_is_not_noise() -> None:
+    """Pins the sign of the gap across seeds, which is the honest form of the direction claim.
+
+    An earlier draft of this test asserted Wilder's ATR sits below the simple mean more than 90% of
+    the tail on a rising-volatility series. It measured **69%**, and re-running three seeds gave 69%,
+    72% and 72% - so the sign is real but the overwhelming-frequency claim was an artefact of how I
+    built the series, not a property of the two smoothings. Asserting the 90% figure would have been
+    inventing a threshold to fit, so it is replaced by the claim that survives: the *median* gap is
+    negative, consistently, across seeds.
+
+    The magnitude here (~1.5%) is much smaller than the 7% median in the test above, because this
+    series ramps gently and its true range is dominated by the close's own drift. That difference is
+    the point worth recording: how far apart the two definitions sit depends on the series, so item
+    5's cost is not a fixed percentage and cannot be quoted without naming the data.
+    """
+    import numpy as np
+    import pandas as pd
+
+    median_gaps = []
+    for seed in (3, 7, 11):
+        rng = np.random.default_rng(seed)
+        n = 600
+        vol = np.linspace(0.1, 1.2, n)
+        close = pd.Series(100 + np.cumsum(rng.normal(0, 0.35, n)))
+        high = close + vol * rng.uniform(0.5, 1.5, n)
+        low = close - vol * rng.uniform(0.5, 1.5, n)
+        tr = pd.concat(
+            [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+        ).max(axis=1)
+        period = 14
+        simple = tr.rolling(period).mean()
+        wilder = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+        tail = slice(period + 300, None)
+        median_gaps.append(float(((wilder[tail] - simple[tail]) / simple[tail] * 100).median()))
+
+    assert all(g < 0 for g in median_gaps), (
+        f"the median gap is no longer consistently negative across seeds ({median_gaps}), so the "
+        f"two definitions no longer have a directional relationship and item 5's cost has to be "
+        f"re-derived from scratch"
+    )
+
+
+def test_the_median_gap_is_modest_but_the_tail_is_where_a_stop_breaks() -> None:
+    """The shape of the disagreement, which is what a stop actually feels.
+
+    A first draft of this test claimed the gap scales with the series' volatility, on the reasoning
+    that a more volatile series should separate the two smoothings more. Measured, it does not: a 4x
+    more volatile series gave **1.84%** against a quiet one's **1.85%** - identical. Scale is not the
+    driver, and asserting it would have been a plausible-sounding claim with no measurement behind it.
+
+    What is true is the *distribution*: the median gap stays in the low single digits to ~7% while the
+    95th percentile and the maximum reach roughly 24% and 41%. So the typical bar is only mildly
+    misplaced, and the occasional one is badly misplaced - which is the case that matters, because a
+    stop is a hard level rather than an average. This is the honest shape of item 5's cost, and it is
+    why the earlier per-figure claims are replaced rather than restated.
+    """
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(7)
+    n = 600
+    close = pd.Series(100 + np.cumsum(rng.normal(0, 0.35, n)))
+    high = (close + rng.uniform(0.05, 0.5, n)).clip(upper=close)
+    low = (close - rng.uniform(0.05, 0.5, n)).clip(lower=close)
+    tr = pd.concat(
+        [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+    ).max(axis=1)
+    period = 14
+    simple = tr.rolling(period).mean()
+    wilder = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    tail = slice(period + 150, None)
+    gap = ((wilder[tail] - simple[tail]) / simple[tail] * 100).abs()
+
+    assert gap.median() < 10.0, (
+        f"the median gap is now {gap.median():.1f}%, so a typical stop is only slightly "
+        f"misplaced and item 5's cost is dominated by a few outliers rather than every bar"
+    )
+    assert float(np.percentile(gap, 95)) > 15.0, (
+        f"the 95th percentile is only {np.percentile(gap, 95):.1f}%, so the tail has closed up and "
+        f"a stop drawn from one definition would now be close to the other throughout"
+    )
+    assert gap.max() > 25.0, (
+        f"the worst-case gap is only {gap.max():.1f}%, so the mismatch no longer produces a badly "
+        f"misplaced stop and the chart/strategy difference is cosmetic"
+    )
+
+
+def test_the_gap_does_not_scale_with_volatility() -> None:
+    """Pins the negative result, because it is the one a reader would most naturally assume.
+
+    Scaling a series 4x changed the median gap by 0.01 percentage points. Anyone reasoning
+    "more volatile means the two definitions diverge more" would be wrong, and the divergence that
+    does exist comes from the shape of the tail rather than the level of volatility.
+    """
+    import numpy as np
+    import pandas as pd
+
+    def gap_for(scale: float) -> float:
+        rng = np.random.default_rng(5)
+        n = 600
+        close = pd.Series(100 + np.cumsum(rng.normal(0, 0.35 * scale, n)))
+        high = close + rng.uniform(0.05, 0.5, n) * scale
+        low = close - rng.uniform(0.05, 0.5, n) * scale
+        tr = pd.concat(
+            [high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1
+        ).max(axis=1)
+        period = 14
+        simple = tr.rolling(period).mean()
+        wilder = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+        tail = slice(period + 150, None)
+        return float(((wilder[tail] - simple[tail]) / simple[tail] * 100).abs().median())
+
+    quiet, wild = gap_for(1.0), gap_for(4.0)
+    assert abs(wild - quiet) < 1.0, (
+        f"a 4x volatility change moved the median gap from {quiet:.2f}% to {wild:.2f}%, so the gap "
+        f"does scale with volatility after all and the tail explanation above is incomplete"
+    )
