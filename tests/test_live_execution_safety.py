@@ -23,6 +23,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pandas as pd
 import pytest
 
+from tests.conftest import seed_synthetic_deployment_parents
+
 from live_runner.base_adapter import BaseLiveAdapter
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
@@ -1809,7 +1811,7 @@ def test_signal_processor_uses_broker_market_data():
 
 
 @pytest.fixture
-def isolated_db(monkeypatch, tmp_path: Path):
+def isolated_db(monkeypatch, tmp_path: Path, request):
     import shared.database as database
 
     engine = database.create_engine(
@@ -1820,6 +1822,10 @@ def isolated_db(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+    # These tests persist signals that point at synthetic parents such as "dep-1". Tests marked
+    # `owns_legacy_schema` hand-build the very tables this would create first, so they opt out.
+    if not request.node.get_closest_marker("owns_legacy_schema"):
+        seed_synthetic_deployment_parents(database)
     yield database
     engine.dispose()
 
@@ -1972,6 +1978,7 @@ def _discord_unique_indexes(database: Any) -> dict[str, list[str]]:
         }
 
 
+@pytest.mark.owns_legacy_schema
 def test_migration_replaces_global_discord_index_with_deployment_scope(isolated_db):
     database = isolated_db
     _legacy_live_signal_table(database)
@@ -2002,6 +2009,7 @@ def test_migration_replaces_global_discord_index_with_deployment_scope(isolated_
     assert "WHERE discord_message_id IS NOT NULL" in sql
 
 
+@pytest.mark.owns_legacy_schema
 def test_migration_allows_legacy_fanout_across_deployments(isolated_db):
     database = isolated_db
     _legacy_live_signal_table(database)
@@ -2036,6 +2044,7 @@ def test_migration_allows_legacy_fanout_across_deployments(isolated_db):
     assert rows == [("dep-1", "fanout-message"), ("dep-2", "fanout-message")]
 
 
+@pytest.mark.owns_legacy_schema
 def test_migration_fails_closed_for_duplicate_composite_claim(isolated_db):
     database = isolated_db
     _legacy_live_signal_table(database)
@@ -2087,6 +2096,7 @@ def test_migration_fails_closed_for_duplicate_composite_claim(isolated_db):
     }
 
 
+@pytest.mark.owns_legacy_schema
 def test_migration_rebuilds_table_backed_global_unique_constraint(isolated_db):
     database = isolated_db
     _legacy_live_signal_table(database, table_unique=True)
@@ -2124,6 +2134,7 @@ def test_migration_rebuilds_table_backed_global_unique_constraint(isolated_db):
     ]
 
 
+@pytest.mark.owns_legacy_schema
 def test_migration_rebuild_preserves_live_execution_foreign_key(isolated_db):
     database = isolated_db
     _legacy_live_signal_table(database, table_unique=True)

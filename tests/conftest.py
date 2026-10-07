@@ -199,3 +199,60 @@ def _never_start_a_real_jvm_during_tests():
         yield
     finally:
         patch.undo()
+
+
+def seed_synthetic_deployment_parents(database, deployment_ids=("dep-1", "dep-2")) -> None:
+    """Create the parent `live_deployments` rows that synthetic test signals point at.
+
+    `live_signals.deployment_id` is headed for a foreign key onto `live_deployments.id`. A large body
+    of tests writes signals with placeholder ids such as `"dep-1"` and no parent row, which the
+    constraint correctly rejects - those failures are the FK doing its job on rows that would otherwise
+    be invisible.
+
+    Seeding the parents once per test, here, is far better than rewriting the ~66 inline
+    `LiveSignal(deployment_id="dep-1")` constructions at their call sites, and far better than a
+    blanket autouse fixture: this is called from the `isolated_db` fixtures that already opt in to a
+    temporary database, so it never forces isolation onto a test that legitimately uses the configured
+    database.
+
+    The insert is raw SQL on purpose. `LiveDeploymentConfig.id` is typed `UUID`, so `"dep-1"` is not a
+    value the API would accept - but the column itself is VARCHAR, and these parents exist only to
+    satisfy referential integrity for tests that are about something else entirely (fills, dedupe,
+    concurrency claims). Tests that assert the constraint itself keep building real parents through
+    `create_live_deployment`.
+    """
+    from datetime import datetime, timezone
+
+    import json
+
+    now = datetime.now(timezone.utc)
+    database.init_db()
+    with database.get_session() as session:
+        # `live_deployments.account_id` is itself a foreign key onto `live_accounts.id`, so a parent
+        # deployment needs an account above it or the insert fails on its own constraint. These
+        # parents exist only to satisfy referential integrity for signals, so the account is a bare
+        # placeholder too.
+        session.execute(
+            database.text(
+                "INSERT OR IGNORE INTO live_accounts (id, broker, name, is_demo)"
+                " VALUES ('fk-parent-acct', 'ctrader', 'fk-parent', 1)"
+            )
+        )
+        for deployment_id in deployment_ids:
+            session.execute(
+                database.text(
+                    "INSERT OR IGNORE INTO live_deployments ("
+                    "id, strategy_name, account_id, symbols, timeframe, status,"
+                    " signal_source, signal_source_type, signal_source_id, symbol_filter,"
+                    " signal_config, settings, created_at, updated_at"
+                    ") VALUES (:id, 'fk-parent', 'fk-parent-acct', :symbols, '1h', 'PAUSED',"
+                    " 'discord', 'discord', 'fk-parent', :symbol_filter, '{}', '{}', :now, :now)"
+                ),
+                {
+                    "id": str(deployment_id),
+                    "symbols": json.dumps(["EURUSD"]),
+                    "symbol_filter": json.dumps([]),
+                    "now": now,
+                },
+            )
+        session.commit()
