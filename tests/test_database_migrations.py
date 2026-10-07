@@ -172,7 +172,7 @@ def test_from_live_signal_missing_discord_id_is_real_null() -> None:
     assert model.discord_message_id is None  # not the literal string "None"
 
 
-def test_two_signals_without_discord_id_both_saved(isolated_db) -> None:
+def test_two_signals_without_discord_id_both_saved(isolated_db, dep_parents) -> None:
     save_live_signal(_make_live_signal())
     save_live_signal(_make_live_signal())
     with get_session() as session:
@@ -180,7 +180,7 @@ def test_two_signals_without_discord_id_both_saved(isolated_db) -> None:
     assert count == 2
 
 
-def test_empty_string_discord_id_treated_as_missing(isolated_db) -> None:
+def test_empty_string_discord_id_treated_as_missing(isolated_db, dep_parents) -> None:
     save_live_signal(_make_live_signal(discord_message_id=""))
     save_live_signal(_make_live_signal(discord_message_id="   "))
     with get_session() as session:
@@ -190,7 +190,7 @@ def test_empty_string_discord_id_treated_as_missing(isolated_db) -> None:
     assert all(r.discord_message_id is None for r in rows)
 
 
-def test_two_signals_same_discord_id_deduped(isolated_db) -> None:
+def test_two_signals_same_discord_id_deduped(isolated_db, dep_parents) -> None:
     save_live_signal(_make_live_signal(discord_message_id="discord-42"))
     save_live_signal(_make_live_signal(discord_message_id="discord-42"))
     with get_session() as session:
@@ -205,7 +205,7 @@ def test_two_signals_same_discord_id_deduped(isolated_db) -> None:
 # ─── Finding 6: concurrent / IntegrityError race ─────────────────────────────
 
 
-def test_concurrent_same_discord_id_yields_one_record(isolated_db) -> None:
+def test_concurrent_same_discord_id_yields_one_record(isolated_db, dep_parents) -> None:
     """Simulate the race: pre-check sees nothing, then commit hits the unique index."""
     database, engine, _data_dir, _bt = isolated_db
 
@@ -257,7 +257,7 @@ def test_concurrent_same_discord_id_yields_one_record(isolated_db) -> None:
 # ─── Finding 7: broker_order_id top-up on dedupe ─────────────────────────────
 
 
-def test_dedupe_fills_missing_broker_order_id(isolated_db) -> None:
+def test_dedupe_fills_missing_broker_order_id(isolated_db, dep_parents) -> None:
     save_live_signal(_make_live_signal(discord_message_id="ord-1"))
     save_live_signal(
         _make_live_signal(discord_message_id="ord-1", broker_order_id="BRK-999")
@@ -273,7 +273,7 @@ def test_dedupe_fills_missing_broker_order_id(isolated_db) -> None:
     assert rows[0].metadata_json.get("broker_order_id") == "BRK-999"
 
 
-def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db) -> None:
+def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db, dep_parents) -> None:
     save_live_signal(
         _make_live_signal(discord_message_id="ord-2", broker_order_id="BRK-AAA")
     )
@@ -293,8 +293,41 @@ def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db) -> None
 # ─── Finding 5: migration backfill of discord_message_id ─────────────────────
 
 
+def _legacy_parent_deployments(engine) -> None:
+    """Give the legacy rows the parent deployments they point at.
+
+    These tests build a pre-schema legacy `live_signals` table and then exercise `init_db()`'s
+    migration path. Once the `live_signals.deployment_id` foreign key is in the migration set, legacy
+    rows naming a deployment that does not exist are orphans and the migration refuses - blocking every
+    migration, not just this one. Refusing is the intended fail-closed behaviour and belongs in its own
+    explicit test; these tests are about the discord id backfill and the dedupe index, so their legacy
+    data is modelled as internally consistent.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS live_deployments ("
+                "id TEXT PRIMARY KEY, strategy_name TEXT NOT NULL, symbols TEXT NOT NULL,"
+                " timeframe TEXT NOT NULL, status TEXT NOT NULL, signal_source TEXT NOT NULL,"
+                " signal_source_type TEXT NOT NULL, symbol_filter TEXT NOT NULL,"
+                " signal_config TEXT NOT NULL, settings TEXT NOT NULL)"
+            )
+        )
+        for deployment_id in ("dep", "dep-1"):
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO live_deployments (id, strategy_name, symbols, timeframe,"
+                " status, signal_source, signal_source_type, symbol_filter, signal_config, settings)"
+                " VALUES (:id, 'legacy', :symbols, '1h', 'PAUSED', 'discord', 'discord',"
+                " '[]', '{}', '{}')"
+            ),
+            {"id": deployment_id, "symbols": json.dumps(["EURUSD"])},
+        )
+
+
 def _legacy_signals_db(engine) -> None:
     """Create a live_signals table WITHOUT discord_message_id / unique index."""
+    _legacy_parent_deployments(engine)
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -316,6 +349,21 @@ def _insert_legacy_signal(engine, *, row_id, timestamp, metadata) -> None:
             ),
             {"id": row_id, "ts": timestamp, "md": json.dumps(metadata)},
         )
+
+
+@pytest.fixture
+def dep_parents(isolated_db):
+    """Seed the synthetic parents for tests that write signals against `isolated_db`.
+
+    Deliberately opt-in rather than added to the shared `isolated_db` fixture: this file also has
+    tests that assert on deployment listings and counts, and seeding parents there for everything would
+    change what they see.
+    """
+    database = isolated_db[0]
+    from tests.conftest import seed_synthetic_deployment_parents
+
+    seed_synthetic_deployment_parents(database)
+    return database
 
 
 @pytest.fixture

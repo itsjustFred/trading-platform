@@ -72,6 +72,11 @@ def _fill(signal_id: str, *, fill_id: int | None, dedupe_key: str | None) -> Liv
 @pytest.fixture
 def signal_id(isolated_db: Any) -> str:
     _verified_demo_account(database, "acc-1", "ctrader")
+    # "acc-1" is this fixture's synthetic deployment, so it needs a parent row for the
+    # live_signals.deployment_id foreign key.
+    from tests.conftest import seed_synthetic_deployment_parents
+
+    seed_synthetic_deployment_parents(database, ("acc-1",))
     return _seed_signal("acc-1")
 
 

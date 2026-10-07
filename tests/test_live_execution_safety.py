@@ -563,7 +563,8 @@ def test_alpaca_regular_market_orders_carry_bracket_legs(monkeypatch):
     assert market_kwargs["order_class"] is module.OrderClass.BRACKET
 
 
-def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeypatch):
+def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     from live_runner import alpaca_adapter as module
 
     adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
@@ -628,7 +629,8 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     assert persisted_order_ids == [(canonical_signal_id, _alpaca_order_id("order-1"))]
 
 
-def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """A timeout after broker acceptance must recover by canonical client order id."""
     from live_runner import alpaca_adapter as module
 
@@ -1906,8 +1908,46 @@ def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
     }
 
 
+def _legacy_parent_deployments(database: Any) -> None:
+    """Give the legacy fixtures the parent deployments their signals point at.
+
+    These tests build a hand-written legacy `live_signals` table. Once the
+    `live_signals.deployment_id` foreign key is part of the migration set, rows in that table whose
+    `deployment_id` names nothing are orphans, and the migration refuses to run - which blocks every
+    other migration too, not just this one. Production genuinely had such orphans, and refusing is the
+    intended fail-closed behaviour, but that is its own explicitly tested case rather than something
+    every unrelated legacy test should be tripping over.
+
+    So the legacy rows here model legacy data that was internally consistent, which is the case these
+    tests are about: the discord index scope, the fan-out rule, the unique constraint, and the
+    `live_executions` foreign key.
+    """
+    with database.ENGINE.begin() as connection:
+        connection.execute(
+            database.text(
+                "CREATE TABLE IF NOT EXISTS live_deployments ("
+                "id TEXT PRIMARY KEY, strategy_name TEXT NOT NULL, account_id TEXT,"
+                " symbols TEXT NOT NULL, timeframe TEXT NOT NULL, status TEXT NOT NULL,"
+                " signal_source TEXT NOT NULL, signal_source_type TEXT NOT NULL,"
+                " symbol_filter TEXT NOT NULL, signal_config TEXT NOT NULL,"
+                " settings TEXT NOT NULL)"
+            )
+        )
+        for deployment_id in ("dep-1", "dep-2"):
+            connection.execute(
+                database.text(
+                    "INSERT OR IGNORE INTO live_deployments (id, strategy_name, symbols, timeframe,"
+                    " status, signal_source, signal_source_type, symbol_filter, signal_config,"
+                    " settings) VALUES (:id, 'legacy', :symbols, '1h', 'PAUSED', 'discord',"
+                    " 'discord', '[]', '{}', '{}')"
+                ),
+                {"id": deployment_id, "symbols": json.dumps(["EURUSD"])},
+            )
+
+
 def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
     unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
+    _legacy_parent_deployments(database)
     with database.ENGINE.begin() as connection:
         connection.execute(
             database.text(
@@ -2823,6 +2863,11 @@ def test_save_live_execution_skips_duplicate_dedupe_key(isolated_db):
 def test_live_signal_timestamp_lookup_normalizes_to_utc(isolated_db):
     database = isolated_db
 
+    # `dep-naive` and `dep-aware` are this test's own signals, so they need parents too.
+    from tests.conftest import seed_synthetic_deployment_parents
+
+    seed_synthetic_deployment_parents(database, ("dep-naive", "dep-aware"))
+
     assert database.get_live_signal_timestamp("") is None
     assert database.get_live_signal_timestamp(str(uuid4())) is None
 
@@ -3503,7 +3548,8 @@ def test_ctrader_reconcile_pages_past_candidate_limit(monkeypatch):
     ]
 
 
-def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(monkeypatch):
+def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """Restart recovery finds an accepted order by the stable signal client id."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
@@ -3664,7 +3710,8 @@ def test_ctrader_redelivery_with_persisted_order_id_needs_no_broker_connection(
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
 
 
-def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
+def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """A persisted signal with an accepted broker order must not submit twice."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
@@ -3746,7 +3793,8 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
 
 
-def test_ctrader_submit_order_fails_closed_when_broker_id_is_missing(monkeypatch):
+def test_ctrader_submit_order_fails_closed_when_broker_id_is_missing(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """#77: an order response without a usable order id must raise, not
     return the success-shaped "" that downstream treats as accepted."""
     module, adapter = _make_ctrader_adapter()
@@ -3804,7 +3852,8 @@ def test_ctrader_submit_order_fails_closed_when_broker_id_is_missing(monkeypatch
     assert adapter._order_id_to_signal_id == {}
 
 
-def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
+def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """#77 companion: an order WITH an id still persists and returns it."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
@@ -3977,7 +4026,8 @@ def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
     assert recovered is None
 
 
-def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch):
+def test_ctrader_reconcile_skips_signals_without_broker_order_id(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """cTrader reconcile must skip signals that have no broker_order_id persisted."""
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
@@ -4168,7 +4218,8 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
         builder(bad_signal, **kwargs)
 
 
-def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
+def test_ctrader_rejects_unknown_signal_action_instead_of_selling(isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True

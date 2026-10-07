@@ -14,7 +14,10 @@ from viewer.main import app  # noqa: E402
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
+def client(monkeypatch, tmp_path, isolated_db_sandbox):
+    # `isolated_db_sandbox` is required, not incidental: this fixture patches DATA_DIR on
+    # `viewer.core` but `shared.database` holds its own reference, so schema initialisation
+    # was opening the configured database - the live trading one.
     # Scoped to the tests that actually drive an HTTP client.
     #
     # This used to be a module-level `pytest.importorskip("fastapi.testclient")`, which
