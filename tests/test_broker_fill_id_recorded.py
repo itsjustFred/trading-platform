@@ -30,6 +30,8 @@ from typing import Any
 
 import pytest
 
+REPO = Path(__file__).resolve().parents[1]
+
 import shared.database as database
 from shared.models import LiveExecution
 from tests.test_live_execution_safety import _verified_demo_account  # noqa: I001
@@ -217,3 +219,58 @@ def test_the_migration_adds_the_column_and_is_idempotent(isolated_db: Any) -> No
     with database.get_engine().connect() as writable:
         database._add_live_executions_broker_fill_id(writable)
         writable.commit()
+
+class TestTheFillAsymmetryBetweenAdaptersIsIntentional:
+    """Alpaca and cTrader persist fills differently, and that difference is the design.
+
+    Alpaca call sites use `save_live_execution_up_to_cumulative`; cTrader uses `save_live_execution`.
+    That reads like an oversight - one adapter was hardened and the other was missed - and it was
+    proposed as such twice in this backlog before being checked.
+
+    It is not an oversight. The two brokers report fills differently:
+
+      * Alpaca's broker quantities are **cumulative** for an order, while local execution rows are
+        stored as event deltas, so reconciling them means persisting only the positive difference.
+        That is what the cumulative variant does.
+      * cTrader emits **discrete deals**, each carrying its own `dealId` and `filledVolume`. A deal is
+        an independent fill, not a running total, so there is nothing to reconcile against and the
+        dealId-keyed dedupe on the plain path is correct.
+
+    Calling the cumulative variant with a per-deal volume would treat a single fill as if it were an
+    order-level running total and under-record it. Harmonising the two would introduce a fill-loss bug
+    to remove an inconsistency that was never one.
+
+    The assertions below are source-level on purpose: the distinction is which persistence function each
+    adapter calls, and that is not observable from the database once a row is written.
+    """
+
+    ADAPTERS = REPO / "live_runner"
+
+    def _call_sites(self, filename: str, function: str) -> list:
+        source = (self.ADAPTERS / filename).read_text(encoding="utf-8")
+        return [
+            line for line in source.splitlines()
+            if function in line and "import" not in line and not line.strip().startswith("#")
+        ]
+
+    def test_alpaca_uses_the_cumulative_variant(self) -> None:
+        sites = self._call_sites("alpaca_adapter.py", "save_live_execution_up_to_cumulative")
+        assert sites, "alpaca no longer calls save_live_execution_up_to_cumulative"
+
+    def test_ctrader_does_not(self) -> None:
+        """The assertion that stops the 'fix'."""
+        assert not self._call_sites("ctrader_adapter.py", "save_live_execution_up_to_cumulative"), (
+            "ctrader_adapter now calls save_live_execution_up_to_cumulative. cTrader deals are discrete "
+            "per-deal fills carrying their own filledVolume, not cumulative order-level quantities, so "
+            "the cumulative path would under-record them. If the broker's reporting has genuinely "
+            "changed, say so here rather than letting this fail be 'fixed' away."
+        )
+
+    def test_ctrader_still_dedupes_on_the_deal_id(self) -> None:
+        """The property that makes the plain path safe here."""
+        source = (self.ADAPTERS / "ctrader_adapter.py").read_text(encoding="utf-8")
+        assert "ctrader:deal:" in source, (
+            "cTrader's dedupe key no longer prefers the deal id, which is what distinguishes two "
+            "discrete fills on one order from a redelivery of the same fill"
+        )
+
