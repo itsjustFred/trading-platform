@@ -34,6 +34,8 @@ the smoke path must then insert a deployment row.
 from __future__ import annotations
 
 import re
+
+import pytest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -118,4 +120,133 @@ def test_the_two_orphan_stories_are_recorded_separately() -> None:
     assert DELETED_REAL_DEPLOYMENT.startswith("4e9bbdab"), (
         "the deleted real deployment id must stay recorded; it is the only orphan whose "
         "cause is not the smoke tooling"
+    )
+
+def _schema_without_the_key(monkeypatch, tmp_path: Path, name: str):
+    """Build a real schema with the deployment key deliberately NOT applied.
+
+    The key is gated off during `init_db()` and can be released afterwards. Without the gate these
+    tests only describe the current wiring: with the key wired the orphan cannot be inserted at all,
+    and with it unwired `init_db()` silently skips the migration. They are about the migration's
+    behaviour during the enablement window, so they set that up explicitly instead of inheriting
+    whatever the tree happens to do.
+    """
+    import shared.database as database
+
+    engine = database.create_engine(f"sqlite:///{(tmp_path / name).as_posix()}")
+    database.event.listen(engine, "connect", database._configure_sqlite_connection)
+    monkeypatch.setattr(database, "ENGINE", engine)
+    monkeypatch.setattr(database, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+
+    real_migration = database._migrate_live_signal_deployment_fk
+    gate = {"released": False}
+
+    def _gated(connection):
+        return real_migration(connection) if gate["released"] else False
+
+    monkeypatch.setattr(database, "_migrate_live_signal_deployment_fk", _gated)
+    database.init_db()
+    return database, engine, gate, real_migration
+
+
+def _insert_orphan_signal(database, engine, deployment_id: str = "no-such-deployment") -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            database.text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price,"
+                " timestamp, source, metadata) VALUES"
+                " ('sig-orphan', :deployment_id, 'AAPL', 'buy', 170.0,"
+                " '2026-04-10 15:16:17', 'discord', '{}')"
+            ),
+            {"deployment_id": deployment_id},
+        )
+
+
+def _declared_keys(database, engine):
+    with engine.connect() as connection:
+        return [
+            row[2]
+            for row in connection.execute(
+                database.text("PRAGMA foreign_key_list(live_signals)")
+            ).fetchall()
+        ]
+
+
+def test_the_migration_refuses_on_an_orphan_and_leaves_the_schema_alone(monkeypatch, tmp_path) -> None:
+    """The behaviour production depends on, pinned.
+
+    `_schema_migration_connection` runs `PRAGMA foreign_key_check` after the migration body and raises
+    if anything still violates, rolling back. That refusal is the only reason the key can be enabled
+    against a database that has real orphans in it - without it, enabling would either drop rows or
+    leave signals pointing at nothing.
+    """
+    database, engine, gate, _real = _schema_without_the_key(monkeypatch, tmp_path, "orphan.db")
+    _insert_orphan_signal(database, engine)
+
+    gate["released"] = True
+    with pytest.raises(RuntimeError, match="foreign key violations remain"):
+        with database._schema_migration_connection() as connection:
+            database._migrate_live_signal_deployment_fk(connection)
+
+    # Nothing half-applied: the rebuild rolled back, so no key landed and the row is intact.
+    assert _declared_keys(database, engine) == [], (
+        "the key landed despite the orphan, so the migration is not failing closed"
+    )
+    with engine.connect() as connection:
+        survived = connection.execute(
+            database.text("SELECT COUNT(*) FROM live_signals WHERE id = 'sig-orphan'")
+        ).scalar()
+    assert survived == 1, "the orphaned signal was dropped by the refused migration"
+
+
+def test_the_key_lands_when_no_orphan_remains(monkeypatch, tmp_path) -> None:
+    """The enablement path itself: clean schema, migration applies, orphan inserts are rejected."""
+    database, engine, gate, _real = _schema_without_the_key(monkeypatch, tmp_path, "clean.db")
+
+    gate["released"] = True
+    with database._schema_migration_connection() as connection:
+        assert database._migrate_live_signal_deployment_fk(connection), (
+            "the migration reported it had nothing to do on a schema without the key"
+        )
+
+    assert _declared_keys(database, engine) == ["live_deployments"]
+
+    with pytest.raises(Exception) as caught:
+        _insert_orphan_signal(database, engine)
+    assert "FOREIGN KEY" in str(caught.value).upper(), (
+        f"the key did not reject the orphan insert: {caught.value}"
+    )
+
+
+def test_the_orphan_block_is_transitional_not_permanent(monkeypatch, tmp_path) -> None:
+    """Corrects an earlier claim in this repository.
+
+    It was recorded here that a single orphan would keep blocking unrelated schema migrations
+    indefinitely. That is wrong, and wrong in a way that matters: once the key is applied an orphaned
+    `deployment_id` cannot be written, so the orphan cannot recur and cannot go on blocking anything.
+    The orphan has to be resolved once, before the key lands, and after that the window closes.
+
+    What *can* still break the guarantee is deleting a parent deployment that signals reference, which
+    is why `test_no_code_path_deletes_a_deployment` in this file matters more once the key is live.
+    """
+    database, engine, gate, _real = _schema_without_the_key(monkeypatch, tmp_path, "transitional.db")
+    _insert_orphan_signal(database, engine)
+    gate["released"] = True
+
+    def _apply():
+        with database._schema_migration_connection() as connection:
+            return database._migrate_live_signal_deployment_fk(connection)
+
+    with pytest.raises(RuntimeError, match="foreign key violations remain"):
+        _apply()
+
+    # Resolve the orphan, then the very same call runs clean.
+    with engine.begin() as connection:
+        connection.execute(database.text("DELETE FROM live_signals WHERE id = 'sig-orphan'"))
+
+    assert _apply(), "after the orphan was resolved the migration still reported nothing to do"
+
+    assert _declared_keys(database, engine) == ["live_deployments"], (
+        "after the orphan was resolved the migration still did not land"
     )
