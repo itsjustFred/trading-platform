@@ -18,6 +18,21 @@ class _CaptureHandler(logging.Handler):
         self.records.append(record)
 
 
+
+@pytest.fixture(autouse=True)
+def _hermetic_db(isolated_db_sandbox):
+    """Keep these tests off the configured database.
+
+    They import `viewer.main`, which initialises the schema on import, so without this they read -
+    and migrate - whatever `DATA_DIR` points at. That is invisible while the schema migrations are
+    inert, and it is the reason the `live_signals.deployment_id` foreign key broke them: the migration
+    correctly refused to run against a database that still has orphaned rows, which turned a latent
+    production read into a test failure.
+
+    Being explicit here is the fix rather than a workaround: a unit test that parses a log line has
+    no business opening the live trading database.
+    """
+
 @pytest.fixture
 def _capture_viewer_logs() -> Iterator[_CaptureHandler]:
     handler = _CaptureHandler()

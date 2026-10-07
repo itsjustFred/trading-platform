@@ -223,7 +223,8 @@ def test_grid_tester_loads_results_from_sqlite(monkeypatch) -> None:
     assert grid_tester_module.load_grid_results(limit=1) == expected
 
 
-def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, tmp_path) -> None:
+def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, tmp_path, isolated_db) -> None:
+    # Isolated: this test reaches the schema on the configured database.
     """Regression (F2/F40): engine gets strategy_path, canonical stats keys, error cells."""
     import runner.grid_tester as grid_tester_module
     from shared.models import BacktestMeta, BacktestResult
@@ -296,7 +297,8 @@ def test_run_strategy_grid_passes_strategy_path_and_reports_errors(monkeypatch, 
     assert "net_profit_pct" not in cells["1h"]
 
 
-def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, tmp_path) -> None:
+def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, tmp_path, isolated_db) -> None:
+    # Isolated: this test reaches the schema on the configured database.
     """Pre-mortem 16-B #11, batch-review follow-up: total_trades precedence —
     an explicit stats count wins; the observed-trades fallback surfaces the
     REAL number of trades on the result, never a fabricated zero, minimum (1)

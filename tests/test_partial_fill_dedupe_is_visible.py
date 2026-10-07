@@ -45,6 +45,14 @@ OTHER_DEAL = 9002
 def wired_db(isolated_db):
     """The sandbox plus one signal, since `live_executions.signal_id` is a real foreign key."""
     database = isolated_db[0]
+
+    # This file's signals point at a synthetic deployment; the FK under construction needs the
+    # parent to exist, and it is only three lines here rather than at each call site.
+    from tests.conftest import seed_synthetic_deployment_parents
+
+    seed_synthetic_deployment_parents(
+        database, ("ctrader-demo-smoke-dedupe-test",)
+    )
     signal_id = str(uuid.uuid4())
     with database.get_session() as session:
         session.add(

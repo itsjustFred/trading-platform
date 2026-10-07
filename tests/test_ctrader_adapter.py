@@ -3322,7 +3322,8 @@ def test_an_explicit_demo_argument_still_wins_over_the_environment(monkeypatch) 
 # "one rule, two implementations" shape at six. The structural test below covers
 # all of them and any future seventh.
 
-def test_submit_order_reconnects_when_the_socket_is_not_authenticated() -> None:
+def test_submit_order_reconnects_when_the_socket_is_not_authenticated(isolated_db) -> None:
+    # Isolated: this test reaches the schema on the configured database.
     """Both halves of the gate, on the one method that places orders.
 
     Driven through the real `submit_order` in the state a stale `_authenticated`

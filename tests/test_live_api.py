@@ -22,7 +22,8 @@ from shared.models import (
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def test_live_endpoints_return_expected_payloads(monkeypatch):
+def test_live_endpoints_return_expected_payloads(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     import viewer.main as viewer_main_module
 
     account_id = "PA3T0MQAGQ51"
@@ -255,7 +256,8 @@ def test_live_account_discovery_persists_demo_identity(monkeypatch):
     assert persisted[0].broker_login == "login-1"
 
 
-def test_live_deployments_crud_endpoints(monkeypatch):
+def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     import viewer.main as viewer_main_module
 
     # Local account id is a UUID; the Alpaca account number is broker identity.
@@ -2222,7 +2224,8 @@ def test_a_refused_status_change_is_still_recorded_as_an_attempt(isolated_db_san
     )
 
 
-def test_a_live_control_audit_row_records_who_asked(monkeypatch):
+def test_a_live_control_audit_row_records_who_asked(monkeypatch, isolated_db):
+    # Isolated: without a database fixture this reached the configured database.
     """`X-Operator` has to reach the audit row, not just the helper.
 
     `_live_control_actor` reads the header and has always been tested - with a

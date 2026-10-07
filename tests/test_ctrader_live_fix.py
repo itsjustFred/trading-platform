@@ -285,6 +285,10 @@ def isolated_db(isolated_db_sandbox):
     directly, so these persistence tests keep their ``database = isolated_db``
     style."""
     database, _engine, _data_dir = isolated_db_sandbox
+
+    from tests.conftest import seed_synthetic_deployment_parents
+
+    seed_synthetic_deployment_parents(database)
     return database
 
 

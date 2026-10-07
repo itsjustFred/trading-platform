@@ -1,10 +1,27 @@
 """Unit tests for the extracted backtest-runner helpers (pre-mortem hardening)."""
 
+import pytest
+
 from viewer.main import (
     _backtest_runner_stage,
     _consume_backtest_line,
 )
 
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_db(isolated_db_sandbox):
+    """Keep these tests off the configured database.
+
+    They import `viewer.main`, which initialises the schema on import, so without this they read -
+    and migrate - whatever `DATA_DIR` points at. That is invisible while the schema migrations are
+    inert, and it is the reason the `live_signals.deployment_id` foreign key broke them: the migration
+    correctly refused to run against a database that still has orphaned rows, which turned a latent
+    production read into a test failure.
+
+    Being explicit here is the fix rather than a workaround: a unit test that parses a log line has
+    no business opening the live trading database.
+    """
 
 def test_consume_backtest_line_tracks_latest_saved_to():
     out_path, backtest_id = "", ""

@@ -46,8 +46,13 @@ def _make_parquet(path: Path) -> None:
 
 
 @pytest.fixture
-def security_client(monkeypatch, tmp_path) -> TestClient:
-    """Viewer client with DATA_DIR pointed at an isolated tmp tree."""
+def security_client(monkeypatch, tmp_path, isolated_db_sandbox) -> TestClient:
+    """Viewer client with DATA_DIR pointed at an isolated tmp tree.
+
+    `isolated_db_sandbox` is required, not incidental: this fixture patches `DATA_DIR` on the
+    viewer modules but `shared.database` holds its own reference, so without it schema
+    initialisation opened the configured database instead of `tmp_path`.
+    """
     import viewer.main as viewer_app_module
     from viewer import core as legacy_module
 
