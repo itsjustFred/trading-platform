@@ -345,6 +345,14 @@ class BacktestRecord(SQLModel, table=True):
                                                       server_default="0.0"))
     p_value: float = Field(default=1.0, sa_column=Column("p_value", Float, nullable=False,
                                                        server_default="1.0"))
+    # Nullable on purpose, and deliberately *not* a fix to `sharpe_ratio`. See
+    # `_add_backtests_sharpe_recomputed_column` for the measurements. NULL means "not computed"; a value
+    # means recomputed under the documented convention, so the disagreement with the stored column is
+    # visible rather than hidden inside one number. `sharpe_ratio` keeps its NOT NULL DEFAULT 0.0, which
+    # is what makes 0.0 ambiguous today.
+    sharpe_recomputed: float | None = Field(
+        default=None, sa_column=Column("sharpe_recomputed", Float, nullable=True)
+    )
 
 
 class PortfolioRecord(SQLModel, table=True):
@@ -1616,6 +1624,46 @@ def _add_backtests_stat_columns(connection: Connection) -> None:
             )
 
 
+
+def _add_backtests_sharpe_recomputed_column(connection: Connection) -> None:
+    """Add a *nullable* shadow column for a canonically-recomputed Sharpe.
+
+    Why a shadow column and not a fix to `sharpe_ratio`:
+
+    `sharpe_ratio` is `REAL NOT NULL DEFAULT 0.0`, so "not computed" cannot be represented in it.
+    Making it nullable needs a table rebuild of a 668 MB production table that `trades`,
+    `equity_points`, `drawings` and `indicators` all reference by foreign key - and it would not change
+    the display, because `viewer/main.py` computes its sort key as
+    `float(item.get("sharpe_ratio", 0.0) or 0.0)` and a NULL comes straight back as `0.0`.
+
+    A separate nullable column carries both missing facts without either cost:
+
+    * **NULL means not computed.** Of the 2,655 production rows, 1,487 hold a genuine `0.0` in their
+      stats JSON and only **85** have no Sharpe value at all. Those 85 are the only rows where
+      "not computed" is the honest answer, and this column is where that becomes expressible.
+    * **A value means recomputed under the documented convention**, so disagreement with the stored
+      column becomes *visible* instead of hidden behind one number.
+
+    That second point is not hypothetical. Recomputing from each row's own stored `daily_returns`,
+    restricted to the 212 rows carrying at least 100 observations, the repository's own
+    `runner/stats.py:_sharpe_manual` reproduces 59 bit-exactly and **disagrees with 113 (53.3%)**. The
+    stored values split three ways *within the `native` engine alone*: 97 annualise by `sqrt(252)`, 50
+    by `sqrt(n)`, and 62 match neither. So the corpus cannot currently verify its own Sharpe, and the
+    engine field is not the discriminator.
+
+    This adds a column and writes nothing into `sharpe_ratio`. Backfilling it is a separate, explicit
+    step, and the comparison it enables is the evidence the convention decision needs.
+
+    No-ops when the column is already present, so this is safe on production and on repeat runs.
+    """
+    column_names = _table_column_names(connection, "backtests")
+    if not column_names:
+        return
+    if "sharpe_recomputed" not in column_names:
+        connection.execute(
+            text("ALTER TABLE backtests ADD COLUMN sharpe_recomputed REAL")
+        )
+
 def _add_backtests_tags_column(connection: Connection) -> None:
     """Add the tags column to legacy backtests tables."""
     column_names = _table_column_names(connection, "backtests")
@@ -2146,6 +2194,7 @@ def _migrate_schema() -> None:
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
+        _add_backtests_sharpe_recomputed_column(connection)
         _add_backtests_tags_column(connection)
         _add_backtests_stat_columns(connection)
         _add_live_account_columns(connection)
