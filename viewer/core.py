@@ -1534,6 +1534,9 @@ def _indicator_payload(
     }
 
 
+_PANDAS_TA_MISSING_WARNED = False
+
+
 def _compute_indicators(
     df: pd.DataFrame, indicator_list: list[dict], ohlcv_times: list[float]
 ) -> list[dict]:
@@ -1541,6 +1544,20 @@ def _compute_indicators(
     try:
         import pandas_ta as ta
     except ImportError:
+        # Every indicator panel - RSI, ATR, Bollinger, MACD - is produced by this one import, and a
+        # missing `pandas_ta` therefore removes all of them at once while leaving the rest of the chart
+        # intact. That failure is invisible: the panels are simply absent.
+        #
+        # `pandas_ta` is declared in no dependency file, so a fresh install lands here, and the bare
+        # `return []` said nothing about why. Warned once rather than per call, because this runs per
+        # chart request.
+        global _PANDAS_TA_MISSING_WARNED
+        if not _PANDAS_TA_MISSING_WARNED:
+            _PANDAS_TA_MISSING_WARNED = True
+            logger.warning(
+                "pandas_ta is not installed, so no chart indicators can be computed; "
+                "RSI, ATR, Bollinger and MACD panels will be absent rather than wrong"
+            )
         return []
 
     results = []
