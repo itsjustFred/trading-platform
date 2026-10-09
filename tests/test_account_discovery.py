@@ -2453,7 +2453,16 @@ def test_both_copies_of_the_money_digits_resolution_are_identical() -> None:
         "they read. A mismatch would make the flag work in discovery and silently do nothing in "
         "the live adapter, which is the copy that runs every reconcile."
     )
-    assert "resolve_flag_env(_HONOUR_ZERO_FLAG)" in flag_body(discovery)
+    # Previously this pinned the *no-`accounts_env`* form, which incidentally froze the documented
+    # limitation as well as the drift. It now asserts the direction that actually matters: the flag must
+    # be resolved file-first in both copies, so an operator who follows the runbook and sets it in
+    # `.accounts.env` is not silently ignored. The copies-are-identical assertion above is unchanged and
+    # remains the drift guard this test was written for.
+    for _name, _text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
+        assert "resolve_flag_env(_HONOUR_ZERO_FLAG,accounts_env=DEFAULT_ACCOUNTS_ENV)" in flag_body(_text), (
+            f"{_name} reads the honour-zero flag from the process environment only. It must be file-first "
+            f"like every other live flag, so a value set in `.accounts.env` is not silently the default."
+        )
 
     for name, text in (("account_discovery", discovery), ("ctrader_adapter", adapter)):
         assert 'has_field("moneyDigits")' in text, (

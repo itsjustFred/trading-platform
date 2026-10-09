@@ -310,9 +310,18 @@ def _honour_zero_money_digits() -> bool:
     definition precisely because four agreeing copies once cost this repository two live bugs.
     Absent means the default; present-but-blank is an error.
 
-    **Same known limitation as the adapter's copy:** only the process environment is
-    consulted, not `.accounts.env`, so a flag set there is silently the default. Recorded
-    as an open item in backlog item 6.
+    **Resolved on 2026-10-09 (backlog item 6):** this used to consult only the process
+    environment, so a flag written into `.accounts.env` beside `CTRADER_DEMO` - where the
+    runbook tells operators to put it - was silently the default, with no error and no
+    warning. It is now **file-first** via `resolve_flag_env(..., accounts_env=...)`, the same
+    resolution `CTRADER_DEMO` uses.
+
+    **Remaining limitation, stated rather than hidden:** the path is this module's
+    `DEFAULT_ACCOUNTS_ENV`, not a caller-supplied one. Threading a caller's path would mean
+    carrying it through four call sites to reach this helper; both copies of this function must
+    stay byte-identical for `test_both_copies_of_the_balance_scaling_are_identical`, so
+    whatever is done here must be done identically in both. Verified behaviour-neutral today:
+    the flag is set in neither `.accounts.env` nor the running daemon's environment.
 
     Why a flag and not simply the fix: `HasField` separates "the broker sent nothing" from "the
     broker means zero decimals", and honouring the second is what the range guard below already
@@ -322,7 +331,11 @@ def _honour_zero_money_digits() -> bool:
     none. The log distinguishes the two cases at runtime; this flag turns on the behaviour once
     that evidence exists. Backlog item 6.
     """
-    return parse_bool_env(_HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False)
+    return parse_bool_env(
+        _HONOUR_ZERO_FLAG,
+        resolve_flag_env(_HONOUR_ZERO_FLAG, accounts_env=DEFAULT_ACCOUNTS_ENV),
+        default=False,
+    )
 
 
 def _resolve_money_digits(trader: Any, *, context: str) -> int:

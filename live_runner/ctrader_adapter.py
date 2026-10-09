@@ -3104,23 +3104,24 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         The absent/present split mirrors `CTRADER_DEMO`: absent means the default, present-but-blank
         is an error.
 
-        **Known limitation, and it is a real one.** Only the process environment is consulted,
-        not `.accounts.env`. Every other live flag is read file-first, and `CTRADER_DEMO` in this
-        very constructor uses `resolve_env_value(env_values, ...)`, so an operator who follows the
-        runbook and puts this beside `CTRADER_DEMO` gets the default, with no error and no warning.
+            **Resolved on 2026-10-09 (backlog item 6).** This consulted only the process environment,
+            so an operator who follows the runbook and puts this flag beside `CTRADER_DEMO` in
+            `.accounts.env` got the default, with no error and no warning. It is now **file-first**
+            through `resolve_flag_env(..., accounts_env=...)` - the same resolution `CTRADER_DEMO` uses.
 
-        An earlier version of this note gave a reason that does not hold: it claimed threading an
-        env mapping through would "change the signature the sync test compares". The sync test
-        slices the *body* between `raw = getattr(...)` and `return int(raw)` and never looks at a
-        signature, so that was simply wrong.
-
-        The real obstacle is narrower: `_resolve_money_digits` is a staticmethod deliberately
-        copied rather than imported, and has no env mapping to consult. Fixing it means threading
-        one through both copies and re-pinning them, which changes the duplication guarantee
-        rather than being a one-liner. Recorded as an open item in backlog item 6.
+            **The remaining limitation is narrower and stated rather than hidden:** the path is this
+            module's `DEFAULT_ACCOUNTS_ENV`, not a caller-supplied one. Honouring a caller's own
+            `accounts_env_path` would mean threading it from the constructor through
+            `_resolve_relative_sl_tp`, `_resolve_money_digits` and `_trader_balance`-equivalent
+            frames into both copies, and re-pinning them - which changes the duplication guarantee
+            rather than being a one-liner. Verified behaviour-neutral today: measured 2026-10-06, the
+            flag is present in neither `.accounts.env` nor the running daemon's environment, so
+            reading the file cannot change any current behaviour.
         """
         return _parse_bool_env(
-            _HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False
+            _HONOUR_ZERO_FLAG,
+            resolve_flag_env(_HONOUR_ZERO_FLAG, accounts_env=DEFAULT_ACCOUNTS_ENV),
+            default=False,
         )
 
     @staticmethod
