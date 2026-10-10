@@ -20,10 +20,44 @@ already fails for `1d`, and that `1w` "looks *healthier*". Measured, the mechani
 problem: a bucket survives if **any** minute in it is valid, so the *same* 32.7% NaN share
 yields a 41.6% empty-bucket rate at daily and only 22.3% at weekly.
 
-So weekly's better coverage number is an artefact of aggregation, not better data. Enabling
-`1w` would put a timeframe in front of the operator whose coverage figure is roughly 2.7x
-better than daily's for the identical underlying defect - the misleading green that item 14's
-not-comparable gate exists to catch, in a different guise.
+So weekly's better coverage number is an artefact of aggregation, not better data.
+
+**Correction, 2026-10-10: the "2.7x" in this docstring was wrong, and re-measuring it exposed two
+further errors of mine in the same paragraph - including a dramatic one that had already been copied
+into the backlog.**
+
+Recomputed from the measured columns rather than from the ratio remembered: 77.7 / 58.4 = **1.33x**,
+not 2.7x. No pair of columns yields 2.7; the closest is the *empty-bucket* rate, 41.6 / 22.3 = 1.87x.
+The earlier version overstated the gap by roughly double, in a document whose entire purpose is to
+stop someone over-reading a coverage number.
+
+**The scale-free metric that looks like the fix does not work here.** Reporting each bucket's
+valid-minute *fraction* rather than whether it has any data looks aggregation-invariant, and the means
+agree (68.7% at 1d vs 68.5% at 1w, against the ~67.3% implied by the raw NaN share) - which is exactly
+why it would have passed review. But the distributions are degenerate: **85.6% of weekly buckets are
+exactly 0.0 or exactly 1.0**, across only 53 distinct values in 1,208 buckets. The reason is that the
+NaNs are **contiguous blocks, not scattered minutes** - 192 runs, median **3.92 days**, p90 25.6 days,
+and **97.3% of all NaN minutes sit inside runs of at least one full day**. A block gap leaves each
+bucket it touches either complete or empty, so fill-fraction collapses back into the same any-data
+indicator it was meant to replace.
+
+**A third error, and the one worth recording: I reported a "1,782-day hole" spanning 2019-03-14 to
+2026-06-24 - roughly seven years - and wrote it into the backlog as the root cause. It does not
+exist.** I measured gaps between *consecutive index rows* and read the missing weekends as missing
+data. The index is sparse by design: 7,850,420 rows span 12,170,879 minutes, so only **64.5%** of the
+clock has rows at all, and a naive row-gap detector reports every weekend as a hole. The true maximal
+NaN run is **83.03 days**. Every year from 2015 through 2025 holds ~354,000 rows - the series is
+continuous, not gappy. The largest *row-absence* gap and the largest *NaN* gap are different
+phenomena, and I conflated them.
+
+So the corrected picture: the deficit is real (32.7% NaN, 192 contiguous runs, max 83 days, 57 of
+them a week or longer) but it is **not** one dominant hole, and weekly's better coverage is the
+aggregation artefact it was always claimed to be - nothing more dramatic than that. The 1.33x gap
+stands, the scale-free metric does not, and the seven-year hole was mine.
+
+Nothing here decides whether to enable `1w`. Comparing coverage across aggregation levels remains
+untrustworthy - a ratio gate would mislead here, and no ratio gate is shipped - so compare over a
+common span or count NaN runs, and fix the defect at the 1m source either way.
 
 Nothing here decides whether to enable `1w`. It establishes that the daily-versus-weekly
 coverage comparison is not a comparison of data quality, and that repairing the NaN placeholders
