@@ -69,6 +69,9 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
+import sys
+
 import pytest
 
 pd = pytest.importorskip("pandas", reason="pandas is needed to read the parquet store")
@@ -110,6 +113,101 @@ def close_series():
 def _empty_rate(series, rule: str) -> tuple[int, float]:
     buckets = series.resample(rule, label="left", closed="left").first().isna()
     return len(buckets), float(buckets.mean())
+
+
+NAN_RUN_COUNT = 192
+MEASURED_NAN_SHARE = 32.7
+MEDIAN_NAN_RUN_DAYS = 3.92
+MAX_NAN_RUN_DAYS = 83.03
+NAN_IN_RUNS_OVER_1D_PCT = 97.3
+WEEKLY_OVER_DAILY_COVERAGE_RATIO = 1.33
+
+
+def _nan_runs(series) -> "np.ndarray":
+    """Lengths, in minutes, of the *maximal* runs of NaN.
+
+    Counted on the boolean mask, never on gaps between index rows. That distinction is the whole
+    point: this index is sparse by design (weekends carry no rows at all), so a row-gap detector
+    reports every weekend as a hole and will happily invent a multi-year "gap" out of ordinary
+    market closures. That mistake was made here once and reached the backlog before it was caught -
+    it reported 1,782 days where the true figure is 83.
+    """
+    nan = series.isna()
+    groups = (~nan).cumsum()[nan]
+    return nan.groupby(groups).sum().to_numpy()
+
+
+def test_the_docstring_figures_match_the_numbers_below_it() -> None:
+    """The prose is pinned to the tables, because prose is what drifted.
+
+    Three separate numbers in this file's docstring were wrong at one point - a 1,782-day "hole",
+    a 2.7x ratio, an 86.2% degeneracy - and every one of them was in *prose*, so pytest had nothing
+    to assert against and reported this file green. Tests that re-measure the store cannot catch
+    that: the store did not change, the sentence did. So the sentences themselves are checked
+    against the values computed below, which is the only comparison that can fail.
+    """
+    # `__doc__` inside a function is the *function's* docstring, not the module's - which is why
+    # the first version of this test silently compared the text against itself and passed.
+    # Only the MODULE docstring. Concatenating the sibling test's docstring here made the check
+    # satisfiable from the wrong text: mutating the module prose left the numbers intact a few
+    # lines down in another docstring, so the assertion still passed. Verified by mutation - this
+    # version is killed by editing the prose and nothing else.
+    doc = sys.modules[__name__].__doc__ or ""
+    checks = {
+        "NaN share 32.7%":      f"{MEASURED_NAN_SHARE:.1f}",
+        "median run 3.92 days": f"{MEDIAN_NAN_RUN_DAYS:.2f}",
+        "max run 83.03 days":   f"{MAX_NAN_RUN_DAYS:.2f}",
+        "97.3% of NaN minutes": f"{NAN_IN_RUNS_OVER_1D_PCT:.1f}",
+        "1.33x ratio":          f"{WEEKLY_OVER_DAILY_COVERAGE_RATIO:.2f}",
+    }
+    for label, rendered in checks.items():
+        assert rendered in doc, (
+            f"docstring no longer contains {rendered!r} ({label}); the prose has drifted from the "
+            f"values asserted below. Update both together - this is the failure mode this file "
+            f"has already produced three times."
+        )
+
+
+def test_the_recorded_nan_run_inventory_matches_the_store(close_series) -> None:
+    """Pins the numbers in the docstring's gap-inventory paragraph.
+
+    Every other test here re-derives an *empty-bucket rate*, which is a different quantity. The
+    run inventory - 192 runs, median 3.92 days, max 83.03 days, 97.3% inside runs of a day or more -
+    was prose with nothing asserting it, which is how a wrong version of it survived a green suite.
+    """
+    import numpy as np
+
+    runs = _nan_runs(close_series)
+    assert len(runs) == NAN_RUN_COUNT, f"NaN runs changed: {len(runs)} (recorded: {NAN_RUN_COUNT})"
+    median_days = float(np.median(runs)) / 1440.0
+    assert math.isclose(median_days, MEDIAN_NAN_RUN_DAYS, abs_tol=0.01), (
+        f"median NaN run moved: {median_days:.2f} days (docstring says 3.92)"
+    )
+    max_days = float(runs.max()) / 1440.0
+    assert math.isclose(max_days, MAX_NAN_RUN_DAYS, abs_tol=0.01), (
+        f"max NaN run moved: {max_days:.2f} days (docstring says 83.03)"
+    )
+    share = float(runs[runs >= 1440].sum() / runs.sum() * 100)
+    assert math.isclose(share, NAN_IN_RUNS_OVER_1D_PCT, abs_tol=0.1), (
+        f"share of NaN inside >=1d runs moved: {share:.1f}% (docstring says 97.3%)"
+    )
+
+
+def test_the_coverage_ratio_is_1_33x_not_2_7x() -> None:
+    """Pins the corrected ratio from arithmetic, so "2.7x" cannot reappear.
+
+    The original docstring overstated the daily-vs-weekly gap by roughly double. No pair of the
+    measured columns yields 2.7; the closest is the empty-bucket rate at 41.6/22.3 = 1.87.
+    """
+    daily, weekly = MEASURED["1d"], MEASURED["1w"]
+    daily_cov = (daily[0] - daily[1]) / daily[0]
+    weekly_cov = (weekly[0] - weekly[1]) / weekly[0]
+    assert math.isclose(daily_cov, 0.584, abs_tol=0.005), f"daily coverage moved: {daily_cov:.3f}"
+    assert math.isclose(weekly_cov, 0.777, abs_tol=0.005), f"weekly coverage moved: {weekly_cov:.3f}"
+    ratio = weekly_cov / daily_cov
+    assert math.isclose(ratio, WEEKLY_OVER_DAILY_COVERAGE_RATIO, abs_tol=0.02), (
+        f"weekly/daily coverage ratio is {ratio:.2f}, not the 2.7x the docstring once claimed"
+    )
 
 
 def test_the_empty_bucket_rate_falls_as_the_timeframe_grows(close_series) -> None:
