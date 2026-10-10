@@ -7,8 +7,14 @@ all, and the verdict computed from those gaps returns "ok".
 Measured on the real XAUUSD 1m store (`/home/ubuntu/data/ohlcv/dukascopy/metals/XAUUSD/1m.parquet`):
 
     NaN runs                192
-    longest NaN run         119,566 bars = 83.0 days
+    longest NaN run         119,566 bars = 121.1 days wall-clock
     total NaN bars          2,565,404  (32.7% of the store)
+
+**Bar counts are not days.** 119,566 bars at 1min each is 83.0 days only if the bars are contiguous,
+and this index is sparse - weekends carry no rows. The wall-clock span of that same run is 121.1 days,
+because 38 of its days are weekends. The coverage gate compares in calendar days, so the day figure is
+the one that matters; the bar count is only useful for locating the run in the file. Dividing a bar count
+by 1440 understates every gap here, and understates the worst one by 1.46x.
     index gaps the finder reports   1,220, largest 6.1 days
 
 So the shipped gap finder under-reports the worst real hole by ~14x, and 1,733 days of missing
@@ -61,7 +67,9 @@ def test_the_store_really_does_contain_nan_runs(nan_runs) -> None:
     """Pins the premise. If this fails, the store changed and the numbers above are stale."""
     assert len(nan_runs) == 192, f"NaN runs changed: {len(nan_runs)} (recorded 192)"
     longest = max(length for _, length in nan_runs)
-    assert longest == 119_566, f"longest NaN run changed: {longest} (recorded 119,566 = 83.0 days)"
+    assert longest == 119_566, (
+        f"longest NaN run changed: {longest} bars (recorded 119,566)"
+    )
     total = sum(length for _, length in nan_runs)
     assert total == 2_565_404, f"total NaN bars changed: {total} (recorded 2,565,404)"
 
@@ -77,7 +85,17 @@ def test_the_index_gap_finder_cannot_see_the_worst_hole() -> None:
     from data_tools.auto_download import _find_gaps_inside_file
 
     runs = find_nan_runs(SOURCE)
-    worst_nan_days = max(length for _, length in runs) / 1440.0
+    # Wall-clock, not bars/1440: the index skips weekends, so the two differ by 1.46x here.
+    import pandas as pd
+
+    stamps = pd.to_datetime(
+        pd.read_parquet(SOURCE, columns=["timestamp"])["timestamp"], utc=True
+    )
+    worst_nan_days = max(
+        (stamps.iloc[min(start + length, len(stamps) - 1)] - stamps.iloc[start]).total_seconds()
+        / 86400.0
+        for start, length in runs
+    )
     index_gaps = _find_gaps_inside_file(SOURCE)
     worst_index_days = max((gap.gap_days for gap in index_gaps), default=0.0)
     assert worst_nan_days > worst_index_days * 5, (

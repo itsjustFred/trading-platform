@@ -36,17 +36,18 @@ valid-minute *fraction* rather than whether it has any data looks aggregation-in
 agree (68.7% at 1d vs 68.5% at 1w, against the ~67.3% implied by the raw NaN share) - which is exactly
 why it would have passed review. But the distributions are degenerate: **85.6% of weekly buckets are
 exactly 0.0 or exactly 1.0**, across only 53 distinct values in 1,208 buckets. The reason is that the
-NaNs are **contiguous blocks, not scattered minutes** - 192 runs, median **3.92 days**, p90 25.6 days,
-and **97.3% of all NaN minutes sit inside runs of at least one full day**. A block gap leaves each
-bucket it touches either complete or empty, so fill-fraction collapses back into the same any-data
-indicator it was meant to replace.
+NaNs are **contiguous blocks, not scattered minutes** - 192 runs, median **6.46 days**, p90 **37.1 days**, max **121.1 days** wall-clock, and **190 of the 192**
+runs span at least a full day. A block gap leaves each bucket it touches either complete or empty, so fill-fraction collapses back into the same any-data indicator
+it was meant to replace.
+either complete or empty, so fill-fraction collapses back into the same any-data indicator it was
+meant to replace.
 
 **A third error, and the one worth recording: I reported a "1,782-day hole" spanning 2019-03-14 to
 2026-06-24 - roughly seven years - and wrote it into the backlog as the root cause. It does not
 exist.** I measured gaps between *consecutive index rows* and read the missing weekends as missing
 data. The index is sparse by design: 7,850,420 rows span 12,170,879 minutes, so only **64.5%** of the
 clock has rows at all, and a naive row-gap detector reports every weekend as a hole. The true maximal
-NaN run is **83.03 days**. Every year from 2015 through 2025 holds ~354,000 rows - the series is
+NaN run is **121.1 days wall-clock**. Every year from 2015 through 2025 holds ~354,000 rows - the
 continuous, not gappy. The largest *row-absence* gap and the largest *NaN* gap are different
 phenomena, and I conflated them.
 
@@ -117,14 +118,17 @@ def _empty_rate(series, rule: str) -> tuple[int, float]:
 
 NAN_RUN_COUNT = 192
 MEASURED_NAN_SHARE = 32.7
-MEDIAN_NAN_RUN_DAYS = 3.92
-MAX_NAN_RUN_DAYS = 83.03
-NAN_IN_RUNS_OVER_1D_PCT = 97.3
+MEDIAN_NAN_RUN_DAYS = 6.46
+MAX_NAN_RUN_DAYS = 121.1
+NAN_RUNS_OVER_1D = 190
+P90_NAN_RUN_DAYS = 37.1
+WEEKLY_FILL_DEGENERATE_PCT = 85.6
+WEEKLY_FILL_DISTINCT = 53
 WEEKLY_OVER_DAILY_COVERAGE_RATIO = 1.33
 
 
 def _nan_runs(series) -> "np.ndarray":
-    """Lengths, in minutes, of the *maximal* runs of NaN.
+    """Lengths, in **wall-clock days**, of the maximal runs of NaN.
 
     Counted on the boolean mask, never on gaps between index rows. That distinction is the whole
     point: this index is sparse by design (weekends carry no rows at all), so a row-gap detector
@@ -132,9 +136,18 @@ def _nan_runs(series) -> "np.ndarray":
     market closures. That mistake was made here once and reached the backlog before it was caught -
     it reported 1,782 days where the true figure is 83.
     """
-    nan = series.isna()
-    groups = (~nan).cumsum()[nan]
-    return nan.groupby(groups).sum().to_numpy()
+    values = series.isna().to_numpy()
+    # Start and end must both come from *mask boundaries*. An earlier version paired
+    # `nonzero()[0]` (every NaN position, 2.5M of them) against the 192 run ends, which zips
+    # mismatched lengths and silently measures the wrong rows - it reported a 6.08-day median
+    # where the real figure is 6.46.
+    at_start = np.flatnonzero(values & ~np.concatenate(([False], values[:-1])))
+    at_end = np.flatnonzero(values & ~np.concatenate((values[1:], [False]))) + 1
+    runs = [
+        (series.index[min(end, len(series) - 1)] - series.index[start]).total_seconds() / 86400.0
+        for start, end in zip(at_start, at_end)
+    ]
+    return np.asarray(runs, dtype=float)
 
 
 def test_the_docstring_figures_match_the_numbers_below_it() -> None:
@@ -156,9 +169,13 @@ def test_the_docstring_figures_match_the_numbers_below_it() -> None:
     checks = {
         "NaN share 32.7%":      f"{MEASURED_NAN_SHARE:.1f}",
         "median run 3.92 days": f"{MEDIAN_NAN_RUN_DAYS:.2f}",
-        "max run 83.03 days":   f"{MAX_NAN_RUN_DAYS:.2f}",
-        "97.3% of NaN minutes": f"{NAN_IN_RUNS_OVER_1D_PCT:.1f}",
+        "max run 121.1 days":   f"{MAX_NAN_RUN_DAYS:.1f}",
         "1.33x ratio":          f"{WEEKLY_OVER_DAILY_COVERAGE_RATIO:.2f}",
+        # Present in the prose, previously unpinned - a mutation of each survived.
+        "p90 run 37.1 days":    f"{P90_NAN_RUN_DAYS:.1f}",
+        "190 runs a day+":      f"{NAN_RUNS_OVER_1D}",
+        "85.6% degenerate":     f"{WEEKLY_FILL_DEGENERATE_PCT:.1f}",
+        "53 distinct":          f"{WEEKLY_FILL_DISTINCT}",
     }
     for label, rendered in checks.items():
         assert rendered in doc, (
@@ -166,30 +183,42 @@ def test_the_docstring_figures_match_the_numbers_below_it() -> None:
             f"values asserted below. Update both together - this is the failure mode this file "
             f"has already produced three times."
         )
+    # `in` is satisfied by a single surviving occurrence, so a figure stated twice (once in the
+    # inventory, once in the retraction narrative) can drift in one place and still pass. Two figures
+    # survived mutations for exactly that reason, so the expected count is asserted too.
+    for label, rendered, expected in (
+        ("max run 121.1 days", "121.1", 2),
+        ("1.33x ratio", "1.33x", 2),
+    ):
+        assert doc.count(rendered) == expected, (
+            f"{label}: expected {expected} occurrences of {rendered!r} in the docstring, found "
+            f"{doc.count(rendered)}. Change both together or re-state the figure once."
+        )
 
 
 def test_the_recorded_nan_run_inventory_matches_the_store(close_series) -> None:
     """Pins the numbers in the docstring's gap-inventory paragraph.
 
     Every other test here re-derives an *empty-bucket rate*, which is a different quantity. The
-    run inventory - 192 runs, median 3.92 days, max 83.03 days, 97.3% inside runs of a day or more -
+    run inventory - 192 runs, median 6.46 days, max 121.1 days, 190 of them a day or more -
     was prose with nothing asserting it, which is how a wrong version of it survived a green suite.
     """
     import numpy as np
 
     runs = _nan_runs(close_series)
     assert len(runs) == NAN_RUN_COUNT, f"NaN runs changed: {len(runs)} (recorded: {NAN_RUN_COUNT})"
-    median_days = float(np.median(runs)) / 1440.0
+    median_days = float(np.median(runs))
     assert math.isclose(median_days, MEDIAN_NAN_RUN_DAYS, abs_tol=0.01), (
-        f"median NaN run moved: {median_days:.2f} days (docstring says 3.92)"
+        f"median NaN run moved: {median_days:.2f} days (docstring says 6.46)"
     )
-    max_days = float(runs.max()) / 1440.0
-    assert math.isclose(max_days, MAX_NAN_RUN_DAYS, abs_tol=0.01), (
-        f"max NaN run moved: {max_days:.2f} days (docstring says 83.03)"
+    max_days = float(runs.max())
+    assert math.isclose(max_days, MAX_NAN_RUN_DAYS, abs_tol=0.1), (
+        f"max NaN run moved: {max_days:.2f} days (docstring says 121.1)"
     )
-    share = float(runs[runs >= 1440].sum() / runs.sum() * 100)
-    assert math.isclose(share, NAN_IN_RUNS_OVER_1D_PCT, abs_tol=0.1), (
-        f"share of NaN inside >=1d runs moved: {share:.1f}% (docstring says 97.3%)"
+    share = float(runs[runs >= 1.0].sum() / runs.sum() * 100)
+    over_a_day = int((runs >= 1.0).sum())
+    assert over_a_day == 190, (
+        f"runs spanning a day or more changed: {over_a_day} (docstring says 190 of 192)"
     )
 
 
