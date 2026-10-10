@@ -3104,24 +3104,26 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         The absent/present split mirrors `CTRADER_DEMO`: absent means the default, present-but-blank
         is an error.
 
-            **Resolved on 2026-10-09 (backlog item 6).** This consulted only the process environment,
-            so an operator who follows the runbook and puts this flag beside `CTRADER_DEMO` in
-            `.accounts.env` got the default, with no error and no warning. It is now **file-first**
-            through `resolve_flag_env(..., accounts_env=...)` - the same resolution `CTRADER_DEMO` uses.
+    **Correction, 2026-10-09: the limitation described above was not real.** It claimed
+    "only the process environment is consulted, not `.accounts.env`", and offered that as the
+    reason this flag was an open backlog item. But `resolve_flag_env`'s `accounts_env` parameter
+    defaults to `None`, and `None` means *use `<repo>/.accounts.env`* - not *read no file*. The
+    flag has been file-first since `d4d135e` introduced the helper. That commit's message is
+    accurate; the note written alongside it was not, and it was the note that misled the audit.
 
-            **The remaining limitation is narrower and stated rather than hidden:** the path is this
-            module's `DEFAULT_ACCOUNTS_ENV`, not a caller-supplied one. Honouring a caller's own
-            `accounts_env_path` would mean threading it from the constructor through
-            `_resolve_relative_sl_tp`, `_resolve_money_digits` and `_trader_balance`-equivalent
-            frames into both copies, and re-pinning them - which changes the duplication guarantee
-            rather than being a one-liner. Verified behaviour-neutral today: measured 2026-10-06, the
-            flag is present in neither `.accounts.env` nor the running daemon's environment, so
-            reading the file cannot change any current behaviour.
+    The paragraphs above also reasoned about a "real obstacle" - threading an env mapping through
+    `_resolve_money_digits` - to justify an item that needed no fixing. There is no such obstacle
+    because there is no such bug.
+
+    **What actually remains, stated so the next reader is not misled again:** the path is the
+    repository default, since this copy takes no `accounts_env` argument. Were a caller ever to
+    resolve its accounts file from a different path, the flag would be read from the repo's
+    `.accounts.env` instead and that caller's setting would be ignored. No caller does that today -
+    both copies are statics invoked with no arguments. Recorded here as a constraint on future
+    edits, not as an open defect.
         """
         return _parse_bool_env(
-            _HONOUR_ZERO_FLAG,
-            resolve_flag_env(_HONOUR_ZERO_FLAG, accounts_env=DEFAULT_ACCOUNTS_ENV),
-            default=False,
+            _HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False
         )
 
     @staticmethod

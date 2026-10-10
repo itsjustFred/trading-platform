@@ -590,6 +590,35 @@ class TestFlagResolutionIsFileFirst:
         path.write_text(body, encoding="utf-8")
         return path
 
+    def test_the_default_path_is_the_repo_accounts_env_file(self, tmp_path, monkeypatch) -> None:
+        """No-arg lookups must read `<repo>/.accounts.env`, not fall back to the process env.
+
+        Every other test in this class passes `accounts_env=` explicitly, so the default path had
+        **no coverage at all**. That is not academic: `_honour_zero_money_digits` in
+        `account_discovery` and `ctrader_adapter` calls `resolve_flag_env` with no path argument,
+        and a docstring beside both claimed they consulted "only the process environment". They did
+        not - `accounts_env=None` means *use the repo's file* - so the claim was false, the backlog
+        item it justified did not exist, and an audit "fixed" a bug by adding an argument whose
+        default already did what the fix claimed to add. Pin the default so the next reader is not
+        misled by prose again.
+        """
+        from live_runner import credential_env
+
+        fake_repo = tmp_path / "repo"
+        (fake_repo / "live_runner").mkdir(parents=True)
+        (fake_repo / ".accounts.env").write_text("CTRADER_HONOUR_ZERO_MONEY_DIGITS=true\n", encoding="utf-8")
+        monkeypatch.setattr(credential_env, "__file__", str(fake_repo / "live_runner" / "credential_env.py"))
+        monkeypatch.delenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", raising=False)
+        monkeypatch.setenv("CTRADER_HONOUR_ZERO_MONEY_DIGITS", "false")
+        credential_env.reset_flag_env_cache()
+        try:
+            assert credential_env.resolve_flag_env("CTRADER_HONOUR_ZERO_MONEY_DIGITS") == "true", (
+                "with no accounts_env argument the repo's .accounts.env must win over the process "
+                "environment - that is what makes the flag file-first for both call sites that omit it"
+            )
+        finally:
+            credential_env.reset_flag_env_cache()
+
     def test_a_value_in_the_file_is_found(self, tmp_path, monkeypatch) -> None:
         from live_runner.credential_env import reset_flag_env_cache, resolve_flag_env
 

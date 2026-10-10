@@ -310,18 +310,18 @@ def _honour_zero_money_digits() -> bool:
     definition precisely because four agreeing copies once cost this repository two live bugs.
     Absent means the default; present-but-blank is an error.
 
-    **Resolved on 2026-10-09 (backlog item 6):** this used to consult only the process
-    environment, so a flag written into `.accounts.env` beside `CTRADER_DEMO` - where the
-    runbook tells operators to put it - was silently the default, with no error and no
-    warning. It is now **file-first** via `resolve_flag_env(..., accounts_env=...)`, the same
-    resolution `CTRADER_DEMO` uses.
+    **Correction, 2026-10-09.** An earlier version of this note claimed "only the process
+    environment is consulted, not `.accounts.env`". That was **false**, and it was false here for
+    the same reason it was false in `ctrader_adapter`: `resolve_flag_env`'s `accounts_env`
+    parameter defaults to `None`, and `None` means *use `<repo>/.accounts.env`* - not *read no
+    file*. The flag was already file-first, so the "limitation" it described could not occur, and
+    the backlog item it pointed at was chasing a bug that did not exist.
 
-    **Remaining limitation, stated rather than hidden:** the path is this module's
-    `DEFAULT_ACCOUNTS_ENV`, not a caller-supplied one. Threading a caller's path would mean
-    carrying it through four call sites to reach this helper; both copies of this function must
-    stay byte-identical for `test_both_copies_of_the_balance_scaling_are_identical`, so
-    whatever is done here must be done identically in both. Verified behaviour-neutral today:
-    the flag is set in neither `.accounts.env` nor the running daemon's environment.
+    **The one real limitation, stated plainly:** the path is the repository default, because this
+    copy takes no `accounts_env` argument. A caller that resolved its own accounts file elsewhere
+    would have that path ignored, and the flag would be read from the repo's `.accounts.env`
+    instead. No caller does that today - both copies are statics called with no arguments - so
+    this is a constraint on future edits, not a live defect.
 
     Why a flag and not simply the fix: `HasField` separates "the broker sent nothing" from "the
     broker means zero decimals", and honouring the second is what the range guard below already
@@ -331,11 +331,7 @@ def _honour_zero_money_digits() -> bool:
     none. The log distinguishes the two cases at runtime; this flag turns on the behaviour once
     that evidence exists. Backlog item 6.
     """
-    return parse_bool_env(
-        _HONOUR_ZERO_FLAG,
-        resolve_flag_env(_HONOUR_ZERO_FLAG, accounts_env=DEFAULT_ACCOUNTS_ENV),
-        default=False,
-    )
+    return parse_bool_env(_HONOUR_ZERO_FLAG, resolve_flag_env(_HONOUR_ZERO_FLAG), default=False)
 
 
 def _resolve_money_digits(trader: Any, *, context: str) -> int:
