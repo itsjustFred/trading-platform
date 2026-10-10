@@ -2525,7 +2525,6 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # named-status case is already logged by `_unrecognised_status_wire_value`; this
             # is the *absent field* case, which looks identical on the wire (both read back
             # as ACCEPTED) and was logged nowhere.
-            # which looks identical on the wire (both read back as ACCEPTED) and is logged nowhere.
             logger.warning(
                 "cTrader order carries no status field; treating it as ACCEPTED, so it will be "
                 "cancelled if a sweep runs",
