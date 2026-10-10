@@ -215,7 +215,6 @@ def test_the_recorded_nan_run_inventory_matches_the_store(close_series) -> None:
     assert math.isclose(max_days, MAX_NAN_RUN_DAYS, abs_tol=0.1), (
         f"max NaN run moved: {max_days:.2f} days (docstring says 121.1)"
     )
-    share = float(runs[runs >= 1.0].sum() / runs.sum() * 100)
     over_a_day = int((runs >= 1.0).sum())
     assert over_a_day == 190, (
         f"runs spanning a day or more changed: {over_a_day} (docstring says 190 of 192)"
