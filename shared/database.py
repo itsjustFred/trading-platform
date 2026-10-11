@@ -2117,11 +2117,23 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
       migration back. So this is safe to attempt while orphans remain: it either lands or changes
       nothing.
 
-    NOT CALLED from _migrate_schema yet, deliberately. Measured blast radius: enabling it breaks
-    48 tests plus 8 errors, because test fixtures write signals with synthetic deployment ids such as
-    ``acc-1`` and no parent deployment row. Those failures are correct - they are the FK doing its job
-    on rows that would now be invisible. Landing it therefore requires first making every synthetic
-    writer create its parent, which is a wider change than the 7 production orphans suggest.
+    CALLED from _migrate_schema as of 2026-10-11 (`20f1d30` and the commit that wired it).
+
+    It was previously left uncalled on a measured blast radius of "48 tests plus 8 errors", from test
+    fixtures writing signals with synthetic deployment ids and no parent row. That figure was taken
+    against a migration that could not run at all: `live_executions.signal_id` already references
+    `live_signals(id)`, so with enforcement on the rebuild's DROP was refused on any database carrying
+    executions - which is every real one. Fixed first, then re-measured: **wiring it now passes the full
+    suite, 4953 passed / 96 skipped / 1 xfailed, exit 0**, with no fixture changes required. The fixtures
+    that would have failed are covered by the backfill and by their own parent-seeding.
+
+    Verified that the wiring is genuinely exercised rather than a no-op: removing the
+    `PRAGMA foreign_keys=OFF` guard while leaving the call in place produces 2 failures.
+
+    On production this is still fail-closed. `_schema_migration_connection` runs `foreign_key_check` and
+    raises, so with the one synthetic orphan present the rebuild lands and the surrounding validator
+    rolls the whole migration back - measured on a 703 MB clone: FK created, 1 violation, rolled back,
+    production unchanged. It will land for real once that orphan is disposed of.
 
     Returns True when the rebuild ran.
     """
@@ -2226,6 +2238,7 @@ def _migrate_schema() -> None:
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
 
+        _migrate_live_signal_deployment_fk(connection)
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
 

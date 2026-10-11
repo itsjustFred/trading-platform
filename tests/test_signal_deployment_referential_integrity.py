@@ -348,3 +348,28 @@ class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
             )
         finally:
             conn.close()
+
+
+def test_the_fk_migration_is_actually_wired_into_the_schema_migration() -> None:
+    """`_migrate_schema` must call it.
+
+    It was left uncalled for months on a measured blast radius of "48 tests plus 8 errors" - a figure
+    taken against a migration that could not run at all, because `live_executions.signal_id` already
+    referenced the table it drops. After that was fixed the same wiring passes the whole suite, so the
+    original measurement no longer describes reality.
+
+    This asserts the call is present in `_migrate_schema` by *source*, deliberately: the alternative -
+    running the whole schema migration and checking `PRAGMA foreign_key_list` - would be a far heavier
+    test, and would still be satisfied by a call inside a branch that never executes for these fixtures.
+    It is the one place in this file where reading source is the honest instrument, and it says so.
+    """
+    import inspect
+
+    from shared.database import _migrate_schema
+
+    source = inspect.getsource(_migrate_schema)
+    assert "_migrate_live_signal_deployment_fk(connection)" in source, (
+        "_migrate_schema no longer calls the FK migration. It was previously omitted deliberately; "
+        "if it is being removed again, delete or update this test rather than letting the "
+        "constraint go missing without a record."
+    )
