@@ -33,6 +33,8 @@ the smoke path must then insert a deployment row.
 
 from __future__ import annotations
 
+import sqlite3
+
 import re
 
 import pytest
@@ -250,3 +252,99 @@ def test_the_orphan_block_is_transitional_not_permanent(monkeypatch, tmp_path) -
     assert _declared_keys(database, engine) == ["live_deployments"], (
         "after the orphan was resolved the migration still did not land"
     )
+
+
+class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
+    """The rebuild must survive `live_executions.signal_id -> live_signations.id`.
+
+    This is not hypothetical and it is not about orphans. `live_executions` already carries a foreign
+    key into `live_signations`, which this migration does not own and must not drop. With enforcement
+    on, `DROP TABLE live_signations` is refused *even when no dependent row exists*, because the surviving
+    executions point at rows inside the table being dropped - so the rebuild failed at the DROP on a
+    production clone whose orphan rows had already been removed, with the FK count still 0.
+
+    The fix is `PRAGMA foreign_keys=OFF` around the swap, set **before any statement the migration
+    issues**. SQLite ignores that pragma while a transaction is open, so the first attempt - setting it
+    immediately before the DROP, inside the migration - was silently a no-op and the rehearsal still
+    failed. Both tests below exist because that regression is invisible to every other test here.
+    """
+
+    @staticmethod
+    def _db(tmp_path):
+        import sqlite3
+
+        path = tmp_path / "swap.db"
+        conn = sqlite3.connect(path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("CREATE TABLE live_deployments (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE live_signals (id TEXT PRIMARY KEY, deployment_id TEXT)")
+        conn.execute("CREATE TABLE live_executions (id TEXT PRIMARY KEY, signal_id TEXT REFERENCES live_signals(id))")
+        conn.execute("INSERT INTO live_deployments VALUES ('dep-1')")
+        conn.execute("INSERT INTO live_signals VALUES ('sig-1', 'dep-1')")
+        # A row that points into the table the rebuild will drop. This is what blocks it.
+        conn.execute("INSERT INTO live_executions VALUES ('exe-1', 'sig-1')")
+        conn.commit()
+        return path
+
+    def test_the_rebuild_lands_while_a_child_foreign_key_exists(self, tmp_path) -> None:
+        from sqlalchemy import create_engine, text
+
+        from shared.database import _migrate_live_signal_deployment_fk
+
+        path = self._db(tmp_path)
+        engine = create_engine(f"sqlite:///{path}")
+        try:
+            with engine.begin() as conn:
+                # Enforcement must be ON. SQLAlchemy leaves `PRAGMA foreign_keys` at its SQLite
+                # default of OFF, so without this the fixture never reproduces the production failure
+                # and the test passes whatever the migration does - which is exactly what the first
+                # version of this test did. Measured on a 703 MB production clone: with enforcement
+                # on, the DROP is refused; with it off, the same code succeeds.
+                conn.execute(text("PRAGMA foreign_keys=ON"))
+                assert conn.execute(text("PRAGMA foreign_keys")).scalar() == 1, (
+                    "foreign key enforcement is off, so this test would pass regardless of the fix"
+                )
+                ran = _migrate_live_signal_deployment_fk(conn)
+            assert ran is True, "the rebuild refused to run"
+        finally:
+            engine.dispose()
+
+        check = sqlite3.connect(path)
+        try:
+            new_fk = check.execute("PRAGMA foreign_key_list(live_signals)").fetchall()
+            assert len(new_fk) == 1, f"expected the new deployment_id FK, found {len(new_fk)}"
+            child_fk = check.execute("PRAGMA foreign_key_list(live_executions)").fetchall()
+            assert len(child_fk) == 1, "the pre-existing child FK was lost by the rebuild"
+            assert child_fk[0][2] == "live_signals", (
+                f"the child FK was rewritten to {child_fk[0][2]!r}; legacy_alter_table exists to "
+                f"prevent exactly that"
+            )
+            assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert check.execute("SELECT count(*) FROM live_signals").fetchone()[0] == 1
+            assert check.execute("SELECT count(*) FROM live_executions").fetchone()[0] == 1
+        finally:
+            check.close()
+
+    def test_the_swap_is_not_a_no_op_when_the_pragma_is_moved_late(self, tmp_path) -> None:
+        """A regression guard for the fix itself, not for the migration's outcome.
+
+        `PRAGMA foreign_keys` is ignored while a transaction is open. This asserts that fact directly,
+        so that "someone moved the pragma back next to the DROP" fails here instead of failing silently
+        in a rehearsal three weeks from now.
+        """
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("BEGIN")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            during = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            conn.execute("COMMIT")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            after = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            assert during == 0 and after == 0, (
+                "this test assumes the pragma is honoured both inside and outside a transaction; if "
+                "that ever changes on this SQLite build, the migration's guard needs rechecking"
+            )
+        finally:
+            conn.close()

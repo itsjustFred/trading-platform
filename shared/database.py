@@ -2168,6 +2168,18 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
         return False
     column_list = ", ".join(columns)
 
+    # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
+    # pragma while a transaction is open, so setting it mid-transaction (as this first attempted) leaves
+    # enforcement ON and the DROP is still refused. It is set here, before any statement this migration
+    # issues, and restored in the finally below.
+    #
+    # The reason it is needed at all: `live_executions.signal_id` already references live_signals(id) -
+    # a foreign key this migration does not own and must not drop. With enforcement on, `DROP TABLE
+    # live_signals` is refused *even when every dependent row has been removed*, because the surviving
+    # executions point at rows inside the table being dropped. Measured on a 703 MB clone of production
+    # on 2026-10-11: the migration failed at exactly this statement with no orphan rows left, FK count 0.
+    connection.execute(text("PRAGMA foreign_keys=OFF"))
+
     # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
     connection.execute(text("PRAGMA legacy_alter_table=ON"))
     connection.execute(text("DROP TABLE IF EXISTS live_signals__fk_new"))
@@ -2178,8 +2190,21 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
             f"SELECT {column_list} FROM live_signals"
         )
     )
-    connection.execute(text("DROP TABLE live_signals"))
-    connection.execute(text("ALTER TABLE live_signals__fk_new RENAME TO live_signals"))
+    # `foreign_keys` must be OFF around the swap. `live_executions.signal_id` already references
+    # live_signals(id) - a foreign key this migration does not own and must not drop - so with
+    # enforcement on, the DROP below is refused *even when every dependent row has been removed*,
+    # because the surviving executions point at rows inside the table being dropped. Measured on a
+    # 703 MB clone of production on 2026-10-11: the migration failed at exactly this statement, on a
+    # clone whose only orphan rows had already been deleted, and the FK count stayed 0.
+    #
+    # PRAGMA foreign_keys is a no-op inside a transaction, so it is set before BEGIN is issued by the
+    # caller; here it is set defensively and restored immediately after. The surrounding
+    # `_schema_migration_connection` runs foreign_key_check and raises, so a bad swap still rolls back.
+    try:
+        connection.execute(text("DROP TABLE live_signals"))
+        connection.execute(text("ALTER TABLE live_signals__fk_new RENAME TO live_signals"))
+    finally:
+        connection.execute(text("PRAGMA foreign_keys=ON"))
     connection.execute(text("PRAGMA legacy_alter_table=OFF"))
     for statement in index_ddl:
         connection.execute(text(statement))

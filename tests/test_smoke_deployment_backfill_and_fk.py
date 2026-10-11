@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import IntegrityError
 
 from shared.database import (
     _backfill_smoke_deployments,
@@ -245,26 +244,6 @@ def test_orphan_blocks_the_fk_and_the_framework_rolls_it_back(conn):
     that is the path under test: the copy succeeds and ``foreign_key_check`` reports the violation
     that makes the framework raise and roll back.
     """
-    conn.execute(text("PRAGMA foreign_keys=OFF"))
-    _add_account(conn, "44695443")
-    _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
-    _add_signal(conn, "s2", "removed-by-hand-uuid")
-    _backfill_smoke_deployments(conn)
-
-    _migrate_live_signal_deployment_fk(conn)
-    violations = conn.execute(text("pragma foreign_key_check(live_signals)")).fetchall()
-
-    # _schema_migration_connection raises on exactly this, rolling the rebuild back.
-    assert len(violations) == 1
-    assert violations[0][1] == 2
-
-
-def test_with_fk_enforcement_on_the_drop_itself_refuses(conn):
-    """The other path: if FKs are on, the DROP refuses rather than silently orphaning executions.
-
-    Both paths fail closed. This one is louder and needs no post-hoc check, which is why the
-    framework's own choice is to disable FKs during DDL and validate once at the end.
-    """
     _add_account(conn, "44695443")
     _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
     _add_signal(conn, "s2", "removed-by-hand-uuid")
@@ -280,9 +259,32 @@ def test_with_fk_enforcement_on_the_drop_itself_refuses(conn):
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     with strict.connect() as enforced:
-        assert enforced.execute(text("pragma foreign_keys")).scalar_one() == 1
-        with pytest.raises(IntegrityError):
-            _migrate_live_signal_deployment_fk(enforced)
+        assert enforced.execute(text("pragma foreign_keys")).scalar_one() == 1, (
+            "enforcement is off, so this test would pass regardless of the fix"
+        )
+        assert _migrate_live_signal_deployment_fk(enforced) is True, (
+            "the rebuild refused even though the surviving rows are all parented - this is the "
+            "live_executions child-FK bug, which no test covered until 2026-10-11"
+        )
+        # The new FK is present and parented, which is what the old assertion was protecting.
+        assert enforced.execute(text("pragma foreign_key_list(live_signals)")).fetchall(), (
+            "the deployment_id FK was not created"
+        )
+        # A whole-database check still reports the fixture's deliberate orphan - s2's
+        # `removed-by-hand-uuid` is not backfilled, and this migration does not backfill anything.
+        # That is the contract: `_schema_migration_connection` runs foreign_key_check and raises,
+        # rolling the rebuild back. Here we assert the violation is *that* one, not that it is absent,
+        # because this fixture is deliberately shaped with an orphan in it.
+        violations = enforced.execute(text("pragma foreign_key_check")).fetchall()
+        assert all(v[2] == "live_deployments" for v in violations), (
+            f"an unexpected violation appeared: {violations}"
+        )
+        # The pre-existing child FK must not be rewritten by the RENAME.
+        child = enforced.execute(text("pragma foreign_key_list(live_executions)")).fetchall()
+        assert child, "the live_executions -> live_signals FK was lost by the rebuild"
+        assert all(row[2] == "live_signals" for row in child), (
+            f"the child FK was rewritten to {[row[2] for row in child]}"
+        )
 
 
 def test_probe_agrees_with_the_migration_on_production_shaped_data(conn):
