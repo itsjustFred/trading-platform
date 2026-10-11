@@ -4,19 +4,38 @@ Pinned as characterisation, not endorsement. The arithmetic at
 `validation/readiness/validator.py:786-793` is
 
     sharpe_abs_diff = abs(expected - actual)
-    sharpe_threshold = max(0.10 * abs(expected), 0.1)
-    sharpe_passed = sharpe_abs_diff <= sharpe_threshold
+    sharpe_threshold = max(pct * abs(expected), floor)   # defaults: pct=0.10, floor=0.05
+  sharpe_passed = sharpe_abs_diff <= sharpe_threshold
 
-which behaves very differently depending on where `expected` sits, and the
-interesting case is the one nobody wrote down: **at `expected == 0.0` the
-relative term vanishes and the tolerance becomes a flat 0.1 in Sharpe units.**
-So an expectation of zero accepts any drift up to 0.1 - not an unbounded pass,
-and not an unconditional one either. Earlier notes in this repo described it as
-both, which is why the real behaviour is pinned here.
+  **Correction, 2026-10-10: this note restated the defaults as literals, and they had already moved.**
+  It said `max(0.10 * abs(expected), 0.1)` and a flat 0.1 - both from a time when the floor was 0.1. The
+  floor is **0.05** (`validation/readiness/models.py:128`), and the assertions below already read it from
+  `ReadinessConfig()` rather than restating it, which is why the tests kept passing while this prose went
+  stale. Exactly the drift this file was written to prevent, reintroduced through its own docstring.
+
+  The corrected statement: at `expected == 0.0` the relative term vanishes and the tolerance becomes a
+  **flat 0.05** in Sharpe units. An expectation of zero accepts any drift up to 0.05 - not an unbounded
+  pass, and not an unconditional one. The crossover is `floor / pct = 0.5`, so every `|expected| <= 0.5` is
+  governed by the constant rather than proportionally.
+
+  **And the decision this note says does not exist, does.** It argues `ReadinessCheck` "cannot express
+  cannot-compare" and that an honest answer needs a model change. Both are now untrue: `ReadinessCheck` has
+  an `applicable: bool = True` field, and `stats_sharpe_zero_expectation_is_not_comparable` is a config
+  switch defaulting to `False`. The policy question was moved out of the arithmetic into configuration, and
+  the tests below pin the default precisely so it cannot be flipped silently.
 
 The stake started large. **97.9% of the 2,655 rows in the backtest corpus store
 `sharpe_ratio` exactly 0.0** (`native` 99.0%), so "expected Sharpe is zero" is
 the common case rather than an edge case.
+
+
+  **Superseded 2026-10-10 - the corpus this paragraph measures no longer exists.** Production holds
+  **2** `backtests` rows, both with a non-null `sharpe_ratio`, exactly one of them at 0.0; the single
+  non-zero value is 2.85, well outside the flat band. So "97.9% of 2,655" describes a corpus that has
+  since been pruned or rebuilt, and the ratio is not measurable from production at this size. The figures
+  in this docstring and the tables below are kept as the record of what was measured then - they are not
+  current numbers. Whether a zero-expectation policy is worth a code change now depends on the corpus
+  being repopulated first, which is a data question rather than a code one.
 
 That measurement turned out to argue for a *small* change rather than a large one,
 which is why this file now tracks the config instead of a hardcoded constant. A
@@ -177,6 +196,31 @@ def test_the_not_comparable_state_exists_but_is_off_by_default() -> None:
     ), (
         "the zero-expectation policy is now ON by default. That would change what the platform "
         "certifies for 1,572 of 2,655 rows and is a decision, not a default - set it explicitly."
+    )
+
+
+def test_the_docstring_states_the_configured_defaults_not_restated_ones() -> None:
+    """The prose is pinned to the config, because the prose is what drifts.
+
+    This file's docstring restated the tolerance as `max(0.10 * abs(expected), 0.1)` while the floor
+    was 0.05, and every assertion below kept passing - because the assertions read `ReadinessConfig()`
+    and nothing read the docstring. That is precisely the gap card L148 closed elsewhere in this repo:
+    a figure in prose with no assertion behind it is not a finding, it is decoration.
+
+    So the check is that the docstring's stated floor matches the config's actual one. Restating a
+    literal here is the mistake being guarded against, which is why the assertion compares against
+    `ReadinessConfig()` rather than against `0.05` written out again.
+    """
+    from validation.readiness.models import ReadinessConfig
+
+    doc = __doc__ or ""
+    cfg = ReadinessConfig()
+    assert f"floor={cfg.stats_sharpe_tolerance_abs}" in doc, (
+        f"docstring no longer names floor={cfg.stats_sharpe_tolerance_abs}; it has drifted from the "
+        f"config again. Update both together - this file has already done it once."
+    )
+    assert f"pct={cfg.stats_sharpe_tolerance_pct}" in doc, (
+        f"docstring no longer names pct={cfg.stats_sharpe_tolerance_pct}; drifted from the config"
     )
 
 
