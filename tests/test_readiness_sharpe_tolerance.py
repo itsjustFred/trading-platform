@@ -29,13 +29,26 @@ The stake started large. **97.9% of the 2,655 rows in the backtest corpus store
 the common case rather than an edge case.
 
 
-  **Superseded 2026-10-10 - the corpus this paragraph measures no longer exists.** Production holds
-  **2** `backtests` rows, both with a non-null `sharpe_ratio`, exactly one of them at 0.0; the single
-  non-zero value is 2.85, well outside the flat band. So "97.9% of 2,655" describes a corpus that has
-  since been pruned or rebuilt, and the ratio is not measurable from production at this size. The figures
-  in this docstring and the tables below are kept as the record of what was measured then - they are not
-  current numbers. Whether a zero-expectation policy is worth a code change now depends on the corpus
-  being repopulated first, which is a data question rather than a code one.
+  **Corrected 2026-10-10, against production rather than a local copy.** The paragraph above reads
+  "97.9% of the 2,655 rows", and that figure was itself wrong in a way that made the decision look bigger
+  than it is. Measured against `/mnt/block-volume-data/backtests.db`:
+
+      backtests total                      2,655
+      sharpe_ratio non-null                2,655   (no nulls)
+      sharpe_ratio exactly 0.0             1,572  = 59.2%
+        native                             1,563 / 2,564  = 61.0%
+        vectorbt                               9 /    88  = 10.2%
+
+  So the real share is **59.2%, not 97.9%** - the 97.9% counts something else, most likely zeros over all
+  rows rather than over non-null ones, or an earlier snapshot. "Expected Sharpe is zero" is still the
+  majority case, which is what the decision turns on, but it is a majority rather than near-universal.
+
+  A process note, because it is the same error twice: an earlier version of this note claimed the corpus
+  "no longer exists" and that production held 2 rows. That was wrong, and the cause is worth stating
+  precisely because it is a trap rather than a slip. `shared.database.DB_PATH` resolves to
+  `/home/ubuntu/perma-mut/data/backtests.db` - an **8.1 MB copy inside this worktree**. Production is a
+  **703.4 MB** file at `/mnt/block-volume-data/backtests.db`. Every count in this file must therefore state
+  which file it read, and the honest default is to import `DB_PATH` rather than hardcode a path.
 
 That measurement turned out to argue for a *small* change rather than a large one,
 which is why this file now tracks the config instead of a hardcoded constant. A
