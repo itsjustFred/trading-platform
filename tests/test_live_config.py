@@ -215,6 +215,69 @@ class TestEnvExpansionAndUnexpandedGate:
             "has changed - re-measure which configs use the bare form before narrowing it"
         )
 
+    def test_a_resolvable_only_gate_rejects_the_corrupting_cases_and_nothing_else(self) -> None:
+        """A third option the backlog's binary framing never allowed.
+
+        The entry weighed *accept bare `$VAR`* against *refuse bare `$VAR`*, and recorded that
+        refusing "cannot tell an unresolved reference from a currency amount in free text". Measured
+        against the real expander on 2026-10-11, that is true only of an **indiscriminate** gate - one
+        that rejects every identifier-shaped `$`. Resolution changes the answer:
+
+            costs $USD per month          USD is set    -> caught (currently expands to "dollars")
+            leak $ALPACA_API_KEY_ACC1     set          -> caught (credential in prose)
+            pnl in $GBP                   GBP not set  -> NOT caught, correctly a literal
+            $5 notional                                 -> NOT caught
+            target 100$ per trade                       -> NOT caught
+
+        Against production this rejects **0 of 21** config values, so it is behaviour-neutral today
+        while closing the silent-corruption path - which the indiscriminate version cannot claim
+        without also rejecting `costs $USD per month`.
+
+        The residual ambiguity, stated rather than hidden: a bare `$NAME` that resolves is still
+        ambiguous between a deliberate reference and a currency code colliding with a variable name.
+        `USD` is not in `.accounts.env` today, so `costs $USD` is harmless *now*; adding `USD=...`
+        would make this gate reject a currently-harmless config. That is a narrower and more
+        explicable failure than a credential silently landing in prose.
+
+        This asserts the option exists and what it catches, not that production code does it - the
+        decision remains the operator's.
+        """
+        import re
+
+        from live_runner.config_parser import _expand_env_value
+
+        env = {"USD": "dollars", "ALPACA_API_KEY_ACC1": "SECRET"}
+        bare = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+        def caught(value: str) -> bool:
+            return any(key in env for key in bare.findall(value))
+
+        for corrupting, why in (
+            ("costs $USD per month", "a set variable inside prose silently becomes its value"),
+            ("leak $ALPACA_API_KEY_ACC1 here", "a credential lands in prose with no error"),
+        ):
+            assert caught(corrupting), f"{why} - the gate must catch {corrupting!r}"
+            # And the corruption being prevented is real, not hypothetical.
+            assert _expand_env_value(corrupting, env) != corrupting, (
+                f"{corrupting!r} no longer expands, so the hazard it represents is gone and this "
+                f"test's premise has changed"
+            )
+
+        for safe, why in (
+            ("pnl in $GBP", "an unset ticker is text, not a reference"),
+            ("$5 notional", "a numeric amount"),
+            ("target 100$ per trade", "a trailing currency symbol"),
+            ("100$", "a bare amount"),
+            ("fee $ 5", "a spaced amount"),
+        ):
+            assert not caught(safe), (
+                f"{why}: a resolvable-only gate must NOT reject {safe!r}, or it has become the "
+                f"indiscriminate gate this option exists to avoid"
+            )
+            assert _expand_env_value(safe, env) == safe, (
+                f"{safe!r} changed under expansion; re-measure before trusting the gate's premise"
+            )
+
     def test_requiring_braces_would_reject_a_literal_dollar_amount(self) -> None:
         """The measured cost of the fix, stated as a fact rather than a worry.
 
