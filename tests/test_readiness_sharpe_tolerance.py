@@ -363,3 +363,86 @@ def test_a_not_applicable_check_is_counted_neither_as_error_nor_warning() -> Non
     assert errors_real == baseline + 1, (
         "an applicable failure stopped being counted once the switch existed"
     )
+
+
+def test_a_computed_zero_and_an_never_computed_one_are_the_same_row_to_the_gate() -> None:
+    """Characterisation: the gate cannot tell a computed Sharpe of 0.0 from no data at all.
+
+    Measured against production on 2026-10-12 and recorded in the backlog under "the readiness Sharpe
+    gate's tolerance". Of 2,655 backtests, 1,487 have a computed `sharpe_ratio` of exactly 0.0, 1,083
+    have a non-zero value, and **85 carry no Sharpe at all** - their `stats` payload is `{}`, zero keys
+    against a normal row's twenty, with no `total_trades` either.
+
+    Those two populations are not distinguishable to the validator, and the reason is specific rather
+    than incidental:
+
+    * `TradeStatistics.sharpe_ratio` is `float = 0.0` and `total_trades` is `int = 0`, so
+      `TradeStatistics()` (nothing computed) and `TradeStatistics(sharpe_ratio=0.0)` (a computed zero)
+      have **byte-identical `model_dump()`**.
+    * `validator.py:794` then does `float(expected_stats.sharpe_ratio)`, which has already collapsed both
+      cases to `0.0` before any comparison can ask which it was.
+
+    So `expected_sharpe == 0.0` is currently true both for "the strategy genuinely produced Sharpe 0.0"
+    and "the platform never computed one", and the gate applies the flat 0.05 floor to both.
+
+    **This test asserts the conflation exists, so it fails the moment it is fixed** rather than being
+    silently deleted as an obsolete expectation - the treatment the dedupe-key collision gets in
+    `test_two_fills_without_a_deal_id_or_a_timestamp_collide_KNOWN_DEFECT`.
+
+    The distinction is recoverable, which is why this is a fixable defect rather than a modelling
+    constraint: Sharpe is `mean(excess)/std` over returns and is undefined with zero trades, so
+    `total_trades == 0` cannot coexist with a computed Sharpe. Keying the not-comparable branch on
+    absence rather than on the value `0.0` would keep the 1,487 computed zeros gated and stop the 85
+    absent rows being reported as Sharpe agreement.
+
+    That fix is **not** made here because it changes gate semantics for 85 rows and would require
+    re-deriving the pinned table above - every row of which is built with `TradeStatistics(**kwargs)`
+    and therefore carries `total_trades = 0` by default. Under this repo's rule that a test must not be
+    weakened to reach a passing result, changing deliberately-written expectations is a deliberate
+    operator decision. So this pins the current behaviour, names the fix, and fails when it lands.
+    """
+    from validation.readiness.validator import ReadinessValidator
+    from validation.stats.calculator import TradeStatistics
+
+    recommendations: list[str] = []
+
+    # The information is present in the model and is discarded at the comparison.
+    uncomputed = TradeStatistics()
+    computed_zero = TradeStatistics(sharpe_ratio=0.0)
+    assert uncomputed.model_dump() == computed_zero.model_dump(), (
+        "TradeStatistics() and TradeStatistics(sharpe_ratio=0.0) are no longer indistinguishable; if "
+        "this now differs, the gate may already be able to tell absence from a computed zero and the "
+        "conflation documented here no longer holds"
+    )
+    # ...and `model_fields_set` proves it was provenance, not coincidence, that differed.
+    assert "sharpe_ratio" not in uncomputed.model_fields_set
+    assert "sharpe_ratio" in computed_zero.model_fields_set
+
+    absent_result = ReadinessValidator._check_stats(
+        (TradeStatistics(), TradeStatistics(sharpe_ratio=0.0)),
+        ReadinessConfig(),
+        recommendations,
+    )
+    zero_result = ReadinessValidator._check_stats(
+        (
+            TradeStatistics(total_trades=50, sharpe_ratio=0.0),
+            TradeStatistics(total_trades=50, sharpe_ratio=0.0),
+        ),
+        ReadinessConfig(),
+        recommendations,
+    )
+    absent_check = next(c for c in absent_result if c.name == "stats_sharpe")
+    zero_check = next(c for c in zero_result if c.name == "stats_sharpe")
+
+    # `passed` is the wrong thing to compare, and comparing it is exactly what made the first draft of
+    # this test survive a mutation that fixed the conflation: marking a check not-applicable still
+    # leaves it "passing", so both paths agree on `passed` either way. `applicable` is the field that
+    # actually separates "compared and agreed" from "never compared".
+    assert absent_check.applicable is True, (
+        "an expectation with no data is now reported as not-applicable; the conflation this test "
+        "characterises has been fixed, and this test and the note behind it should be updated"
+    )
+    assert zero_check.applicable is True, (
+        "a computed zero from 50 trades must remain a real comparison - if this is not applicable the "
+        "proposed fix has over-reached and is gating rows that do have data"
+    )
