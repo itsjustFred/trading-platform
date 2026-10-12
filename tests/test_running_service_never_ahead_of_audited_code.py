@@ -106,3 +106,32 @@ def test_the_running_checkout_is_clean_so_the_tree_matches_the_commit() -> None:
         "the checkout the services run from has uncommitted changes:\n"
         f"{dirty}\nthe running process loaded these bytes, not the commit"
     )
+
+
+def test_the_credential_lock_file_is_gitignored() -> None:
+    """A running service's own bookkeeping must not read as a dirty checkout.
+
+    The guard above fails when the checkout the services run from is dirty, which is the right
+    behaviour - it means "the running process loaded these bytes, not the commit". But the
+    credential writer creates `<name>.lock` beside the file it is rewriting
+    (`live_runner/ctrader_adapter.py`), so a live service drops a 0-byte file into its own
+    checkout on every credential write.
+
+    That file is a transient advisory lock: no data, no content, recreated each write. Treating it
+    as a change makes the guard fail for a reason that has nothing to do with code, and the fix has
+    to be deliberate rather than "rm the file" - because the service creates it again on its next
+    write, and the next run of this suite fails for the same reason.
+
+    So the rule is pinned rather than left to a well-meaning future deletion: if `.accounts.env.lock`
+    is ever un-ignored, this fails here with the reason, instead of the clean-checkout guard
+    failing later with a confusing message about "uncommitted changes" that are not changes.
+    """
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", ".accounts.env.lock"],
+        capture_output=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert ignored.returncode == 0, (
+        ".accounts.env.lock is not gitignored, so a running service's transient credential "
+        "lock will make the clean-checkout guard fail on a 0-byte file that is not a code change"
+    )

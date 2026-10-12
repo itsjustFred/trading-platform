@@ -41,6 +41,17 @@ _MALFORMED_BRACED_ENV_PATTERN = re.compile(
     r"\$\{[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_-]*\})[^\s-]*\}?"
 )
 
+# A bare `$NAME` - the braced spelling's silent sibling. `_expand_env_value` expands this shape
+# whenever the name resolves, so it cannot be caught after expansion: by then `costs $USD per
+# month` has already become `costs dollars per month`, and the evidence is gone. This pattern
+# exists so `assert_no_bare_env_references` can look at the payload *before* that happens.
+#
+# Only names that actually resolve are refused, which is what separates this from the
+# indiscriminate gate the backlog weighed and rejected. `pnl in $GBP` (GBP unset), `$5` and
+# `100$ per trade` have no identifier run and no resolvable name, so they stay literals - a gate
+# that rejected those would reject legitimate free text.
+_BARE_ENV_PATTERN = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
     """Expand ``$VAR``/``${VAR}`` in *value* using *env*, and say when it could not.
@@ -95,6 +106,65 @@ def expand_env_mapping(payload: Any, env: Mapping[str, str] | None = None) -> An
     if isinstance(payload, str):
         return _expand_env_value(payload, source)
     return payload
+
+
+def assert_no_bare_env_references(
+    payload: Any,
+    env: Mapping[str, str],
+    *,
+    context: str = "live deployment config",
+) -> None:
+    """Refuse bare ``$NAME`` references whose name **resolves** in *env* (#81).
+
+    The braced spelling is refused by :func:`assert_no_unexpanded_env`, but it is refused for the
+    opposite reason: ``${VAR}`` never matches anything, so leaving it in place silently mutes the
+    thing it names. A bare ``$NAME`` fails differently - it is indistinguishable from a currency
+    amount or a price, so it is *legitimately ambiguous*, and that is why it used to be expanded
+    quietly instead of refused.
+
+    Quiet expansion is the actual defect. ``costs $USD per month`` with ``USD`` set becomes
+    ``costs dollars per month``; a credential-shaped name in prose expands the secret into a
+    config value. Neither errors, and neither leaves a trace once expansion has run.
+
+    **Why resolution is the discriminator.** A name that is *not* in *env* cannot have been
+    expanded, so it was never a reference to anything - treating it as one would reject currency
+    amounts and prices, which are ordinary config text. A name that *is* in *env* resolved, and
+    the author either meant the reference or meant the literal; the two are no longer
+    distinguishable afterwards, so this refuses and says so rather than guessing.
+
+    The residual ambiguity is stated rather than hidden: a bare ``$NAME`` that resolves is still
+    ambiguous between a deliberate reference and a currency code that collides with a variable
+    name (``USD`` is not in ``.accounts.env`` today). Adding ``USD=...`` would make this gate
+    reject a config that is harmless today. That is a narrower and more explicable failure than a
+    credential landing in prose, and an operator hitting it gets an error naming the exact token
+    and field path.
+    """
+    found: list[tuple[str, str]] = []
+
+    def _walk(node: Any, path: str) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                _walk(item, f"{path}.{key}" if path else str(key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                _walk(item, f"{path}[{index}]")
+        elif isinstance(node, str):
+            for name in _BARE_ENV_PATTERN.findall(node):
+                if name in env:
+                    found.append((f"${name}", path or "<root>"))
+
+    _walk(payload, "")
+    if found:
+        described = ", ".join(
+            f"{token!r} at {path}" for token, path in sorted(set(found))
+        )
+        raise ValueError(
+            f"Bare environment reference(s) that resolve to a defined variable: {described} - in "
+            f"{context}. A '$' followed by a name expands silently, so a currency amount or price "
+            "in prose can be replaced by a variable's value with no error. Each of these names is "
+            "defined in the environment, so it was expanded rather than treated as text. Use the "
+            "braced spelling '${NAME}' where a reference is genuinely intended."
+        )
 
 
 def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment config") -> None:
@@ -160,6 +230,17 @@ def parse_live_deployments_config(
     payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     # #81: env expansion at parse time (centrally here); unexpanded refs
     # are a startup error, never a silent mute.
+    #
+    # The bare-reference gate runs BEFORE expansion, and the ordering is load-bearing rather than
+    # stylistic: `_expand_env_value` substitutes a bare `$NAME` whenever the name resolves, so once
+    # expansion has run there is nothing left to find. Checking afterwards would pass silently on
+    # every input it exists to catch, including `costs $USD per month` arriving as
+    # `costs dollars per month`. The same `env` mapping the expander will use is resolved here, so
+    # "resolves" means the same thing on both sides of the call.
+    assert_no_bare_env_references(
+        payload,
+        env_values if env_values is not None else os.environ,
+    )
     payload = expand_env_mapping(payload, env_values)
     assert_no_unexpanded_env(payload)
     if not isinstance(payload, dict):

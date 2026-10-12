@@ -881,3 +881,88 @@ def test_a_reference_repeated_inside_one_value_is_reported_once() -> None:
         f"times: {message}"
     )
     assert "channel_id" in message
+
+
+def test_the_bare_gate_is_wired_before_expansion_so_it_can_still_see_the_evidence(tmp_path: Path) -> None:
+    """The option is now production code, and the ordering is what makes it work.
+
+    The test above specifies the gate's behaviour against a locally-defined `caught()`. This
+    asserts that `parse_live_deployments_config` actually applies it, and specifically that it
+    applies it *before* `expand_env_mapping` rather than after.
+
+    That ordering is the whole difference between a gate that works and one that silently
+    passes on every input it exists to catch. `_expand_env_value` substitutes a bare `$NAME`
+    whenever the name resolves, so by the time expansion has run there is no `$USD` left to
+    find - a post-expansion check would see clean text and pass, while the config on disk had
+    already said `costs dollars per month`.
+
+    So both directions are pinned: the corrupting config must be refused, and the refusal must
+    quote the original token rather than the expanded value. If someone moves the call below
+    the expansion, the second assertion fails rather than the gate quietly going blind.
+    """
+    import textwrap
+
+    from live_runner.config_parser import parse_live_deployments_config
+
+    env = {"USD": "dollars", "ALPACA_API_KEY_ACC1": "SECRET"}
+    tmp = tmp_path / "live.yaml"
+    tmp.write_text(
+        textwrap.dedent(
+            """
+            accounts: []
+            deployments:
+              - name: leaky
+                strategy: trend_following
+                note: costs $USD per month
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as caught_ctx:
+        parse_live_deployments_config(tmp, env_values=env)
+    message = str(caught_ctx.value)
+
+    # Quotes the token as written in the file...
+    assert "$USD" in message
+    # ...and the field path, so an operator holding a multi-deployment YAML can find it.
+    assert "note" in message
+    # And never quotes the expanded value: seeing "dollars" here would mean the gate ran
+    # after expansion and only got lucky.
+    assert "dollars" not in message
+
+def test_the_bare_gate_admits_the_literals_the_indiscriminate_gate_would_reject(tmp_path: Path) -> None:
+    """A config of ordinary free text must still load.
+
+    The gate refuses a bare `$NAME` only when that name resolves. Free text that merely looks
+    like a reference - an unset ticker, a price, a trailing currency symbol - has to survive,
+    or the gate has become the indiscriminate version the backlog rejected. Pinned against
+    production code rather than a local helper, so a widened pattern is caught here.
+    """
+    import textwrap
+
+    from live_runner.config_parser import parse_live_deployments_config
+
+    tmp = tmp_path / "live.yaml"
+    tmp.write_text(
+        textwrap.dedent(
+            """
+            accounts: []
+            deployments:
+              - strategy_name: trend_following
+                account_id: "1"
+                symbols: ["XAUUSD"]
+                timeframe: "1h"
+                note: pnl in $GBP, notional $5, target 100$ per trade
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _accounts, deployments = parse_live_deployments_config(
+        tmp,
+        env_values={"USD": "dollars"},
+    )
+    assert len(deployments) == 1

@@ -45,6 +45,12 @@ Thumbs.db
 .env.*
 !*.env.example
 .accounts.env
+# Transient advisory lock the credential writer creates beside the file it is about to rewrite
+# (`<name>.lock`, see live_runner/ctrader_adapter.py). It is 0 bytes, holds no data, and is
+# recreated on every write - so its appearance in `git status` is not a change to the tree, and
+# without this rule the "running checkout is clean" guard fails on a running service's own
+# bookkeeping rather than on a real edit.
+.accounts.env.lock
 /live_deployments.yaml
 /reports/
 live_integration_report.json
