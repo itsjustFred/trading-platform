@@ -222,3 +222,66 @@ class TestExecutionPricePresence:
                 assert presence in {"sent_bad", "absent"}, (
                     f"resolver returned the 0.0 sentinel but presence said {presence!r} for {payloads}"
                 )
+
+
+def test_the_presence_states_map_onto_the_column_values_the_decision_names() -> None:
+    """Pin the mapping, because the column's migration will have to use it and cannot re-derive it.
+
+    The decision (backlog item 10) specifies `actual_price_observed` as a nullable bool, and its three
+    values have to come from somewhere specific:
+
+        observed -> TRUE     a real price was read
+        sent_bad -> FALSE    the broker sent a price and it was unusable
+        absent   -> NULL     nothing was sent at all
+
+    **The `absent -> NULL` mapping is the one that is easy to get wrong**, and it is the reason this test
+    exists rather than leaving the mapping in a note. `FALSE` is a *claim*: it asserts the broker spoke.
+    For a row that never carried a price there is nothing to assert either way, and writing `FALSE` would
+    claim a broker spoke when it did not - which is exactly the conflation a nullable column was chosen to
+    avoid over a plain boolean.
+
+    The backlog recorded this decision twice with contradictory answers about the writer. An earlier note
+    said "let the existing `logger.warning` on the omitted-price branch write `False`"; the decision proper
+    did not name a writer. Both cannot hold: a logger cannot write a column, and the resolver has only two
+    exits, so a logger-driven flag could only ever say `False` - for both non-observed causes, which is the
+    conflation the column exists to remove.
+
+    So the mapping is asserted here, against the real classifier, and named in the note beside it. If the
+    column's migration is written from this test rather than from memory, it will be right.
+    """
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    # Spelled out as data rather than as a dict comprehension so a reader sees the intent per state.
+    column_for = {
+        "observed": True,    # a real price was read
+        "sent_bad": False,   # sent, and unusable
+        "absent": None,      # nothing was sent - unknown, not a negative claim
+    }
+    assert set(column_for) == {"observed", "sent_bad", "absent"}
+
+    cases = [
+        ("observed", {"deal": _Field(executionPrice=261.7)}),
+        ("sent_bad", {"deal": _Field(executionPrice=0.0)}),
+        ("sent_bad", {"deal": _Field(executionPrice=-3.5)}),
+        ("absent", {"deal": _Field()}),
+        ("absent", {}),
+    ]
+
+    for expected_state, payloads in cases:
+        presence = CTraderLiveAdapter._execution_price_presence(
+            order=payloads.get("order"), deal=payloads.get("deal")
+        )
+        assert presence == expected_state, f"{payloads} gave {presence!r}, expected {expected_state!r}"
+        value = column_for[presence]
+        assert value == column_for[expected_state], (
+            f"presence {presence!r} maps to {value!r}, which is not the value the decision names for it"
+        )
+
+    # And the two negatives are genuinely different values - the whole point of a nullable column.
+    assert column_for["sent_bad"] is False
+    assert column_for["absent"] is None
+    assert column_for["sent_bad"] != column_for["absent"], (
+        "'sent but unusable' and 'never sent' collapsed to the same column value; the column would then "
+        "record a broker speaking for rows where nothing was sent, which is the conflation it exists to "
+        "prevent"
+    )
