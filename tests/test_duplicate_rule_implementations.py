@@ -622,6 +622,24 @@ def test_known_session_parsing_divergence_pending_decision(label: str, session: 
         )
         return
 
+    # The `!=` above detects RESOLUTION, not MOVEMENT. Removing the validator's `end_minutes += 1440`
+    # rollover leaves the two copies still disagreeing - the validator returns (960, 570) instead of
+    # (960, 2010) - so that mutation keeps the assertion green while silently changing what an overnight
+    # session means: a 17:00-09:00 futures window would become a -6.5-hour one rather than a 17.5-hour
+    # one. Verified by mutation on 2026-10-14.
+    #
+    # So the reversed case is also pinned to the value it has today. This is the one case where the
+    # divergence is a deliberate difference rather than a defect - the validator rolls over because
+    # overnight sessions are real, and the downloader refuses because for a single-day equity session
+    # `17:00 -> 09:00` is a typo - so nothing should move it silently, in either direction.
+    if label == "reversed":
+        assert as_validator == ("value", (960, 2010)), (
+            f"the overnight rollover changed: validate._session_window now returns "
+            f"{as_validator!r} for 16:00->09:30, where it has always returned (960, 2010). Either the "
+            f"rollover is wrong, or the downloader should learn it and the divergence is resolved - "
+            f"and both are decisions recorded in the needs-decision entry for the coverage validator. "
+            f"Updating this number without updating that entry is how the two drift apart unnoticed."
+        )
     assert as_validator != as_downloader, (
         f"{label}: the recorded divergence between validate._session_window and "
         f"auto_download._explicit_session_window has been resolved - the validator now "
