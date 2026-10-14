@@ -98,3 +98,127 @@ def test_a_real_price_is_not_logged_at_all(caplog: pytest.LogCaptureFixture) -> 
         assert _Adapter._resolve_execution_price(order=None, deal=deal) == 261.7
 
     assert not _warnings(caplog), _warnings(caplog)
+
+
+class TestExecutionPricePresence:
+    """`_execution_price_presence` classifies the three states the flag column needs.
+
+    The decision (backlog item 10, resolved 2026-10-11) is to flag an unresolvable price rather than
+    refuse the row or substitute the signal's price:
+
+    * refusing drops `filled_qty` from the quantity ledger, so a filled signal looks unfilled and is
+      submitted again - a duplicate live order, not a logging nit;
+    * substituting was measured to change 4 of 4 rows that have both values, by a consistent +3.6%, in
+      the one column used to reconcile against the broker.
+
+    `actual_price` therefore keeps its `NOT NULL` 0.0 sentinel, and a sibling `actual_price_observed`
+    records which of these happened. These tests pin the classifier that populates it, so the column can
+    be added without re-deciding the policy at the point of the write.
+
+    The states are three rather than two because collapsing them is the failure this exists to prevent:
+    a stored `actual_price = 0` is indistinguishable between "the broker sent zero" and "the broker sent
+    nothing", and the reader has no way back to the wire.
+    """
+
+    @staticmethod
+    def _classify(**payloads: Any) -> str:
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+        return CTraderLiveAdapter._execution_price_presence(
+            order=payloads.get("order"), deal=payloads.get("deal")
+        )
+
+    def test_a_real_price_on_the_deal_is_observed(self) -> None:
+        assert self._classify(deal=_Field(executionPrice=261.7)) == "observed"
+
+    def test_a_real_price_on_the_order_only_is_still_observed(self) -> None:
+        """The order is a fallback, and a fallback price is still an observed one."""
+        assert self._classify(order=_Field(executionPrice=1.13978)) == "observed"
+
+    def test_a_deal_price_takes_precedence_over_the_order(self) -> None:
+        """A usable deal price wins over a usable order price - and a *sent-zero* deal price wins too.
+
+        The first version of this test asserted `observed` for a deal at 261.7 and an order at 999.0,
+        which passes whichever order the loop runs in, so inverting the precedence left it green. It is
+        written to discriminate instead: the deal carries a price that is present but unusable and the
+        order carries a good one, so the two possible precedences return different answers.
+
+        The disagreement that matters: the resolver returns 0.0 in this case, because it checks the deal
+        first and a sent-zero deal is not a usable price. A classifier that preferred the order would
+        say `observed`, and the stored row would carry a flag saying a price was read when the stored
+        `actual_price` is the 0.0 sentinel. A flag that contradicts its own column is worse than none.
+        """
+        # Deal sent-zero wins on precedence -> unusable.
+        assert self._classify(
+            deal=_Field(executionPrice=0.0), order=_Field(executionPrice=261.7)
+        ) == "sent_bad"
+        # Deal absent -> falls through to the order.
+        assert self._classify(
+            deal=_Field(), order=_Field(executionPrice=261.7)
+        ) == "observed"
+
+    def test_an_explicitly_sent_zero_is_sent_but_unusable(self) -> None:
+        """Not "absent". The broker spoke and said zero; `HasField` is true.
+
+        This is the distinction that makes the column worth having. The existing sent-zero warning calls
+        this "the one case a reader cannot otherwise notice, because the broker spoke and said zero" -
+        and an omitted price leaves nothing in the payload at all. Collapsing the two here would put the
+        conflation straight back into the column the flag exists to disambiguate.
+        """
+        assert self._classify(deal=_Field(executionPrice=0.0)) == "sent_bad"
+
+    def test_a_negative_price_is_sent_but_unusable(self) -> None:
+        """The resolver rejects it (`finite and > 0`), so the row is unusable - but the broker sent one."""
+        assert self._classify(deal=_Field(executionPrice=-3.5)) == "sent_bad"
+
+    def test_nothing_sent_at_all_is_absent(self) -> None:
+        assert self._classify(deal=_Field(), order=_Field()) == "absent"
+
+    def test_no_payloads_is_absent(self) -> None:
+        assert self._classify() == "absent"
+
+    def test_the_three_states_are_distinct_for_the_measured_corpus(self) -> None:
+        """The property the column depends on, stated over the whole set at once.
+
+        Trivially true pairwise for any single input, and worth asserting anyway because the three-way
+        distinction is the entire reason the method exists. A future "simplification" that collapses
+        `sent_bad` into `absent` passes every single-input test above and fails only here.
+        """
+        observed = self._classify(deal=_Field(executionPrice=261.7))
+        sent_bad = self._classify(deal=_Field(executionPrice=0.0))
+        absent = self._classify(deal=_Field())
+        assert len({observed, sent_bad, absent}) == 3, (
+            "the three presence states collapsed into fewer; the column this populates would recreate "
+            "exactly the conflation it exists to remove"
+        )
+
+    def test_it_agrees_with_the_resolver_on_every_case(self) -> None:
+        """The flag must describe the stored value, not a parallel opinion about it.
+
+        For all six payload shapes: whenever the resolver returns a real price the classifier says
+        `observed`, and whenever it returns its 0.0 sentinel the classifier says one of the two non-
+        observed states. If they ever disagree, a row would carry a flag contradicting its own
+        `actual_price`, which is worse than having no flag.
+        """
+        from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+        shapes = [
+            {"deal": _Field(executionPrice=261.7)},
+            {"deal": _Field(executionPrice=0.0)},
+            {"deal": _Field(executionPrice=-3.5)},
+            {"deal": _Field()},
+            {"order": _Field(executionPrice=1.13978), "deal": _Field()},
+            {},
+        ]
+        for payloads in shapes:
+            deal, order = payloads.get("deal"), payloads.get("order")
+            price = CTraderLiveAdapter._resolve_execution_price(order=order, deal=deal)
+            presence = CTraderLiveAdapter._execution_price_presence(order=order, deal=deal)
+            if price > 0:
+                assert presence == "observed", (
+                    f"resolver returned {price} but presence said {presence!r} for {payloads}"
+                )
+            else:
+                assert presence in {"sent_bad", "absent"}, (
+                    f"resolver returned the 0.0 sentinel but presence said {presence!r} for {payloads}"
+                )

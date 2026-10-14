@@ -3085,6 +3085,64 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return 0.0
 
     @staticmethod
+    def _execution_price_presence(*, order: Any | None, deal: Any | None) -> str:
+        """Whether a price was observed, sent-but-unusable, or never sent at all.
+
+        **Three states, not two, and the third is the reason this exists.**
+        `_resolve_execution_price` returns `0.0` for two different situations, and a reader of the stored
+        row cannot tell them apart:
+
+            "observed"    a real price was read from the deal or the order
+            "sent_bad"    the broker sent a price and it was unusable (non-finite, or <= 0)
+            "absent"      no price was sent at all, on either payload
+
+        The backlog decision (item 10, resolved 2026-10-11) is to **flag** such a row rather than refuse
+        it or substitute the signal's price - refusing drops `filled_qty` and can cause a duplicate live
+        order, and substituting was measured to corrupt 4 of 4 rows by a consistent +3.6% in the one
+        column used to reconcile against the broker. The flag is a sibling `actual_price_observed`
+        column, and this is the value that populates it.
+
+        **Why a separate method rather than changing `_resolve_execution_price`'s signature.** That
+        resolver has 20 test references and is called from the fill-record path; returning a tuple there
+        would touch every call site for no behavioural gain. Presence is a question about the payload,
+        answerable without reading the returned float, so it is asked separately.
+
+        **A deliberate limitation.** `executionPrice` carries protobuf *presence*, so a sent zero and an
+        omitted price are distinguishable on the wire - which is what `_explicitly_sent_zero_prices`
+        already exploits. But this returns `str` rather than a protobuf-derived enum precisely because
+        the distinction the *column* needs is "was a price observed", and collapsing `sent_bad` and
+        `absent` at the storage boundary would recreate the conflation this method exists to avoid.
+
+        Kept read-only and side-effect-free: it logs nothing, so a caller may ask without generating a
+        second copy of the warnings `_resolve_execution_price` already emits.
+        """
+        # The deal is checked before the order because that is the resolver's own precedence: a deal
+        # price is the executed one, and an order price is a fallback.
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            raw = getattr(payload, "executionPrice", None)
+            if raw is None:
+                continue
+            # Presence, using the same probe as `_explicitly_sent_zero_prices` above rather than a
+            # second one. A non-protobuf payload has no `HasField`, and for those the attribute being
+            # present at all is the only signal available - so the field defaults to "assume sent" and
+            # the value test below decides. That is deliberately permissive: this method classifies, it
+            # does not validate.
+            has_field = getattr(payload, "HasField", None)
+            if has_field is not None:
+                try:
+                    if not bool(has_field("executionPrice")):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            value = _to_float(raw)
+            if math.isfinite(value) and value > 0:
+                return "observed"
+            return "sent_bad"
+        return "absent"
+
+    @staticmethod
     def _honour_zero_money_digits() -> bool:
         """Whether a broker-sent `moneyDigits` of 0 is honoured. Default: no.
 
