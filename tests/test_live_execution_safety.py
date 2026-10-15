@@ -8374,3 +8374,90 @@ def test_terminal_auth_failure_blocks_the_account_before_dropping_the_adapter() 
     assert was_blocked, "a terminal auth failure must block the account"
     assert "acc-1" not in adapters, "the dead adapter must not stay in the pool"
     assert disconnected == ["acc-1:terminal_auth_failure"]
+
+
+# --- the Alpaca close-side guard, and the cTrader pre-flight auth check ---------
+#
+# The Alpaca tests above cover a correct-side close and an exit with nothing to close. They do not
+# cover the case in between: a position that DOES exist, closed from the WRONG side. Disabling that one
+# comparison -
+#
+#     if signal.action != close_action:  ->  if False:
+#
+# SURVIVED the full suite (4,975 passed, exit 0). It is the guard whose stated purpose is that an
+# exit-only order which would OPEN rather than close "would open it unbounded, because the exit-only
+# path drops the mandatory SL/TP". Nothing tested it.
+#
+# The cTrader one is smaller but the same shape: `_fetch_open_positions` is replaced by a stub in five
+# tests, so removing its terminal-auth pre-flight went unnoticed too.
+def test_alpaca_exit_only_refuses_the_wrong_side_of_a_real_position(monkeypatch) -> None:
+    from live_runner import alpaca_adapter as module
+
+    def _exit_signal(action: str, symbol: str = "AAPL") -> LiveSignal:
+        return LiveSignal(
+            deployment_id="dep-1",
+            symbol=symbol,
+            action=action,
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+        )
+
+    # A long exists: buying is not closing it. That would double the long, unbounded, with no SL/TP.
+    long_adapter, long_submitted, _ = _alpaca_exit_only_adapter(
+        module, monkeypatch, [{"symbol": "AAPL", "qty": 3.0}]
+    )
+    with pytest.raises(ValueError, match="does not close a long position"):
+        asyncio.run(long_adapter.submit_order(_exit_signal("buy"), qty=2.0))
+    assert long_submitted == [], "a wrong-side exit must never reach the broker"
+
+    # A short exists: selling is not closing it either.
+    short_adapter, short_submitted, _ = _alpaca_exit_only_adapter(
+        module, monkeypatch, [{"symbol": "AAPL", "qty": -3.0}]
+    )
+    with pytest.raises(ValueError, match="does not close a short position"):
+        asyncio.run(short_adapter.submit_order(_exit_signal("sell"), qty=2.0))
+    assert short_submitted == [], "a wrong-side exit must never reach the broker"
+
+
+def test_alpaca_exit_only_refuses_an_ambiguous_mixed_book(monkeypatch) -> None:
+    from live_runner import alpaca_adapter as module
+
+    adapter, submitted, _ = _alpaca_exit_only_adapter(
+        module,
+        monkeypatch,
+        [{"symbol": "AAPL", "qty": 3.0}, {"symbol": "AAPL", "qty": -2.0}],
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 2.0, "exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+    with pytest.raises(ValueError, match="mixed long and short"):
+        asyncio.run(adapter.submit_order(signal, qty=2.0))
+    assert submitted == [], "an ambiguous book must never be closed on a guess"
+
+
+def test_ctrader_fetch_open_positions_checks_terminal_auth_before_using_the_session() -> None:
+    from live_runner import ctrader_adapter as module
+    from live_runner.ctrader_adapter import CTraderAuthTerminalError
+
+    adapter = module.CTraderLiveAdapter.__new__(module.CTraderLiveAdapter)
+    # Auth already failed terminally. Reading positions on that session cannot work, and the failure
+    # must surface as the auth error rather than as a confusing reconcile error. These are the real
+    # attribute names `_raise_if_terminal_auth_failed` reads.
+    adapter._terminal_auth_failure_reason = "token revoked"
+    adapter._terminal_auth_failure_code = "401"
+
+    attempted: list[str] = []
+
+    def _fail_connect() -> None:
+        attempted.append("connect")
+
+    adapter.connect = _fail_connect  # type: ignore[method-assign]
+    with pytest.raises(CTraderAuthTerminalError):
+        asyncio.run(adapter._fetch_open_positions())
+    assert attempted == [], "the terminal auth failure must be raised before any session is used"
