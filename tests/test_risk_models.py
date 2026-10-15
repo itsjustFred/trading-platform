@@ -187,3 +187,65 @@ def test_the_fraction_bounds_are_inclusive() -> None:
     """0 and 1 are both valid fractions; the boundary is part of the contract."""
     assert _decision(risk_percent=0).risk_percent == 0
     assert _decision(risk_percent=1).risk_percent == 1
+
+
+# --- the realized-risk accessors (#84) ----------------------------------------
+#
+# This file's docstring already records two mutations that survived here. Two more joined them on
+# 2026-10-15, found by scanning `risk/` - a package the money-path gate added at L202 did not cover,
+# because that gate only looked at `live_runner`.
+#
+#     M11  realized_risk_amount ignores the realized figure, always returns the policy one   SURVIVED
+#     M12  realized_risk_percent returns the policy percent, not realized/balance          SURVIVED
+#
+# The docstring of `realized_risk_amount` says consumers "must read this, never the policy figure, or
+# they overstate risk on every capped fill". These are the accessors that distinction depends on, and
+# both are written into live order metadata by `size_live_signal_for_submission` - so a regression here
+# reports the wrong risk for every capped fill without any test noticing.
+def _order_with_realized(realized: float, policy_amount: float, policy_percent: float) -> SizedOrder:
+    return SizedOrder(
+        signal=_signal(stop_loss=95.0),
+        position_size=0.5,
+        risk_amount=policy_amount,
+        risk_percent=policy_percent,
+        risk_reward_ratio=None,
+        decision=_decision(metadata={"realized_risk_amount": realized}),
+    )
+
+
+def test_realized_risk_amount_prefers_the_realized_figure_over_the_policy_one() -> None:
+    """The policy figure is 8x the truth on this order. Reading the wrong one overstates risk."""
+    from risk.models import realized_risk_amount
+
+    order = _order_with_realized(realized=12.5, policy_amount=100.0, policy_percent=0.01)
+    assert realized_risk_amount(order) == pytest.approx(12.5)
+
+
+def test_realized_risk_amount_falls_back_to_the_policy_figure_when_there_is_no_realized_one() -> None:
+    from risk.models import realized_risk_amount
+
+    order = SizedOrder(
+        signal=_signal(stop_loss=95.0),
+        position_size=0.5,
+        risk_amount=100.0,
+        risk_percent=0.01,
+        risk_reward_ratio=None,
+        decision=_decision(metadata={}),
+    )
+    assert realized_risk_amount(order) == pytest.approx(100.0)
+
+
+def test_realized_risk_percent_is_realized_over_balance_not_the_policy_percent() -> None:
+    """The engine reports no realized percent, so it is derived here - 12.5/1000, not the policy 1%."""
+    from risk.models import realized_risk_percent
+
+    order = _order_with_realized(realized=12.5, policy_amount=100.0, policy_percent=0.01)
+    assert realized_risk_percent(order, 1_000.0) == pytest.approx(0.0125)
+    assert realized_risk_percent(order, 1_000.0) != pytest.approx(0.01)
+
+
+def test_realized_risk_percent_falls_back_to_policy_on_an_unknown_balance() -> None:
+    from risk.models import realized_risk_percent
+
+    order = _order_with_realized(realized=12.5, policy_amount=100.0, policy_percent=0.01)
+    assert realized_risk_percent(order, 0.0) == pytest.approx(0.01)
