@@ -8132,3 +8132,102 @@ class TestAMonthlySpellingIsRefusedAtTheConfigBoundary:
             "_next_candle_close no longer resolves 1M to the next minute; the documented "
             "consequence of the collision has changed"
         )
+
+
+# --- size_live_signal_for_submission is executed by no test --------------------
+#
+# The one test in this file that mentions `size_live_signal_for_submission` *replaces* it with a stub
+# (`_sizing_without_stop`, above) so a case about a missing stop-loss can run. Nothing executed the real
+# function, which the reach measurement confirmed independently: it is reached transitively from
+# `submit_order_with_risk`, but no test names it.
+#
+# Two mutations were applied to prove the gap rather than infer it from a name list:
+#
+#   M1  "enforce_stop_direction": True -> False          SURVIVED, 4969 passed, exit 0
+#   M2  drop the broker position count before sizing      killed, 2 failed
+#
+# M1 is the dangerous one. `enforce_stop_direction` is what makes the risk engine refuse a stop on the
+# wrong side of the entry, so setting it False allows a live order to be sized against a stop that would
+# not protect the position - and the entire suite stayed green. M2 being killed shows the harness works
+# and the gap is specific, not "this function is untested".
+#
+# Both tests wrap the real RiskEngine rather than substituting one. An earlier attempt returned a
+# `SimpleNamespace`, which the `realized_risk_amount` helper then rejected for missing fields - a stub
+# that has to imitate more of the engine than the engine itself is worth. Delegating to `super()` keeps
+# the assertions on real sizing output.
+def _spy_risk_engine(captured: dict[str, Any]) -> type:
+    from live_runner import daemon as daemon_module
+
+    real = daemon_module.RiskEngine
+
+    class _Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, config: Any) -> None:
+            super().__init__(config)
+            captured["config"] = config
+
+        def calculate_position_size(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return super().calculate_position_size(**kwargs)
+
+    return _Spy
+
+
+def _long_signal(**metadata: Any) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="d1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1000,
+        timestamp=datetime(2026, 1, 3, 12, 0, tzinfo=timezone.utc),
+        metadata=metadata,
+    )
+
+
+def test_live_sizing_enforces_stop_direction() -> None:
+    from live_runner.daemon import size_live_signal_for_submission
+
+    captured: dict[str, Any] = {}
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("live_runner.daemon.RiskEngine", _spy_risk_engine(captured))
+        size_live_signal_for_submission(
+            _long_signal(stop_loss=1.0950, take_profit=1.1100),
+            _deployment(),
+            account_balance=10_000.0,
+            current_exposure=0.0,
+            pip_value=10.0,
+            current_positions=0,
+        )
+    finally:
+        monkey.undo()
+
+    # M1 dies here. With the flag flipped to False the sizing call still succeeds, so nothing else in
+    # the suite notices; only this assertion sees the difference.
+    assert captured["signal"].metadata["enforce_stop_direction"] is True
+    assert captured["signal"].stop_loss == pytest.approx(1.0950)
+    assert captured["signal"].take_profit == pytest.approx(1.1100)
+    assert captured["account_balance"] == pytest.approx(10_000.0)
+    assert captured["pip_value"] == pytest.approx(10.0)
+
+
+def test_live_sizing_carries_broker_position_count_into_the_signal() -> None:
+    from live_runner.daemon import size_live_signal_for_submission
+
+    captured: dict[str, Any] = {}
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("live_runner.daemon.RiskEngine", _spy_risk_engine(captured))
+        sized = size_live_signal_for_submission(
+            _long_signal(stop_loss=1.0950),
+            _deployment(),
+            account_balance=10_000.0,
+            current_positions=2,
+        )
+    finally:
+        monkey.undo()
+
+    # M2 dies here. Without the count, max_positions and max_total_exposure bind as if the account
+    # were flat, which is exactly what the call site warns about.
+    assert sized.metadata["current_positions"] == 2
+    assert sized.metadata["qty"] == pytest.approx(sized.metadata["explicit_qty"])
+    assert sized.metadata["qty"] > 0
