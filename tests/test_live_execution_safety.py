@@ -8231,3 +8231,48 @@ def test_live_sizing_carries_broker_position_count_into_the_signal() -> None:
     assert sized.metadata["current_positions"] == 2
     assert sized.metadata["qty"] == pytest.approx(sized.metadata["explicit_qty"])
     assert sized.metadata["qty"] > 0
+
+
+# --- _resolve_account_balance: cash vs equity ---------------------------------
+#
+# No test named this function. It decides which broker figure sizes a live order, and the distinction
+# is not cosmetic: `get_balance()` returns `(balance, equity)` where balance is cash and equity
+# includes floating P&L. Sizing on cash instead of equity under-sizes every order whenever a position
+# is open.
+#
+# Mutating the unpacking - `_, equity` to `equity, _` - SURVIVED the full suite: 4,971 passed, exit 0.
+# The test below is the one that should have existed.
+def test_resolve_account_balance_prefers_equity_over_cash() -> None:
+    from live_runner.daemon import _resolve_account_balance
+
+    class _BalanceAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_balance(self) -> tuple[float, float]:
+            self.calls += 1
+            # Deliberately different values. A test returning the same number twice would agree with
+            # either unpacking, which is how this gap survived in the first place.
+            return 12_000.0, 20_000.0  # cash, equity
+
+    adapter = _BalanceAdapter()
+    resolved = asyncio.run(_resolve_account_balance(adapter, None))
+    assert resolved == pytest.approx(20_000.0)
+    assert adapter.calls == 1
+
+
+def test_resolve_account_balance_uses_the_supplied_balance_without_asking_the_broker() -> None:
+    from live_runner.daemon import _resolve_account_balance
+
+    class _MustNotBeCalled:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_balance(self) -> tuple[float, float]:
+            self.calls += 1
+            return 1.0, 1.0
+
+    adapter = _MustNotBeCalled()
+    resolved = asyncio.run(_resolve_account_balance(adapter, 5_000.0))
+    assert resolved == pytest.approx(5_000.0)
+    assert adapter.calls == 0, "a supplied balance must not trigger a broker round-trip"
