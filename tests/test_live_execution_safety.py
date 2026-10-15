@@ -8276,3 +8276,101 @@ def test_resolve_account_balance_uses_the_supplied_balance_without_asking_the_br
     resolved = asyncio.run(_resolve_account_balance(adapter, 5_000.0))
     assert resolved == pytest.approx(5_000.0)
     assert adapter.calls == 0, "a supplied balance must not trigger a broker round-trip"
+
+
+# --- the balance poller, and what it does when a broker credential dies --------
+#
+# Neither function was named by a test, and both mutations survived the full suite (4,973 passed,
+# exit 0):
+#
+#   M3  drop _block_ctrader_account() from the terminal-auth path
+#   M4  record `balance` in the equity column
+#
+# These two belong together because they describe how an account goes quiet. On a terminal
+# authorization failure the adapter is removed from the pool; blocking the account is what stops it
+# being retried forever. Removing the adapter without blocking it leaves an account that has stopped
+# polling with nothing recording why - which is exactly the shape of the two ACTIVE deployments found
+# silent in production on 2026-10-15 (79h and ~50d). This suite cannot say what happened there; it can
+# only make sure the code that would leave a trace is exercised.
+def test_poll_adapter_balance_records_balance_and_equity_separately() -> None:
+    from live_runner import daemon as daemon_module
+
+    saved: list[Any] = []
+
+    class _BalanceAdapter:
+        async def get_balance(self) -> tuple[float, float]:
+            # Different values on purpose: a record built from either column looks right if both
+            # columns hold the same number.
+            return 3_000.0, 4_500.0
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(
+            daemon_module,
+            "save_live_balance",
+            lambda record: saved.append(record),
+        )
+        adapters = {"acc-1": _BalanceAdapter()}
+        asyncio.run(
+            daemon_module._poll_adapter_balance(
+                adapters,
+                "acc-1",
+                adapters["acc-1"],
+                datetime(2026, 1, 3, 12, 0, tzinfo=timezone.utc),
+            )
+        )
+    finally:
+        monkey.undo()
+
+    assert len(saved) == 1
+    # M4 dies here.
+    assert saved[0].balance == pytest.approx(3_000.0)
+    assert saved[0].equity == pytest.approx(4_500.0)
+    assert saved[0].account_id == "acc-1"
+
+
+def test_terminal_auth_failure_blocks_the_account_before_dropping_the_adapter() -> None:
+    from live_runner import daemon as daemon_module
+    from live_runner.ctrader_adapter import CTraderAuthTerminalError
+
+    disconnected: list[str] = []
+
+    class _FailingAdapter:
+        async def get_balance(self) -> tuple[float, float]:
+            raise CTraderAuthTerminalError("token revoked")
+
+    class _SpyAdapter:
+        pass
+
+    adapters = {"acc-1": _SpyAdapter()}
+
+    async def _fake_disconnect(adapter_obj: Any, *, account_id: str, reason: str) -> None:
+        disconnected.append(f"{account_id}:{reason}")
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(daemon_module, "_disconnect_adapter", _fake_disconnect)
+        # `_block_ctrader_account` is deliberately NOT stubbed. An earlier version stubbed it and then
+        # asserted the real block set was populated, which is a test that contradicts itself: the stub
+        # guarantees the set stays empty. Asserting the real side effect is both coherent and stronger.
+        daemon_module._CTRADER_AUTH_BLOCKED_ACCOUNTS.discard("acc-1")
+        daemon_module._CTRADER_AUTH_BLOCKED_REASONS.pop("acc-1", None)
+        asyncio.run(
+            daemon_module._poll_adapter_balance(
+                adapters,
+                "acc-1",
+                _FailingAdapter(),
+                datetime(2026, 1, 3, 12, 0, tzinfo=timezone.utc),
+            )
+        )
+        was_blocked = "acc-1" in daemon_module._CTRADER_AUTH_BLOCKED_ACCOUNTS
+    finally:
+        monkey.undo()
+        daemon_module._CTRADER_AUTH_BLOCKED_ACCOUNTS.discard("acc-1")
+        daemon_module._CTRADER_AUTH_BLOCKED_REASONS.pop("acc-1", None)
+
+    # M3 dies here. Without the block the account is simply dropped from the pool: polling stops and
+    # nothing records that a terminal authorization failure stopped it.
+    assert was_blocked, "a terminal auth failure must block the account"
+    assert "acc-1" not in adapters, "the dead adapter must not stay in the pool"
+    assert disconnected == ["acc-1:terminal_auth_failure"]
