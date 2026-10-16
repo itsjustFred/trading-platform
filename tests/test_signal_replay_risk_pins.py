@@ -160,3 +160,71 @@ def test_a_negative_quantity_cannot_produce_negative_exposure() -> None:
     positions = {"p1": _position(stop_loss=95.0, quantity=-2.0)}
     exposure = adapter._current_exposure(positions, equity=1_000.0)
     assert exposure >= 0.0, "exposure must never be negative; a negative cap allowance is larger, not smaller"
+
+
+# --- M51: the broker truth that binds max_positions ------------------------------
+
+
+def _replay_signal(**overrides):
+    from runner.engines.signal_replay_adapter import ReplaySignal
+
+    fields = {
+        "timestamp": pd.Timestamp("2024-01-01"),
+        "symbol": "EURUSD",
+        "action": "buy",
+        "entry_price": 100.0,
+        "stop_loss": 98.0,
+        "take_profit": None,
+        "timeframe": "1h",
+        "source": "internal",
+        "metadata": {},
+    }
+    fields.update(overrides)
+    return ReplaySignal(**fields)
+
+
+def test_the_risk_signal_reports_the_real_number_of_open_positions() -> None:
+    """`current_positions` is what makes `max_positions` bind.
+
+    Without it the risk engine sizes every signal as if the account were flat, so a backtest can hold
+    more simultaneous positions than the configuration allows - and live, where the same field is
+    populated, cannot. That divergence is the expensive kind: the backtest says the strategy works.
+    """
+    adapter = SignalReplayAdapter()
+    positions = {"a": _position(), "b": _position(symbol="GBPUSD")}
+    signal = adapter._build_risk_signal(
+        effective_signal=_replay_signal(),
+        target_direction="LONG",
+        fill_price=100.0,
+        normalized_timeframe="1h",
+        open_positions=positions,
+    )
+    assert signal.metadata["current_positions"] == 2
+
+
+def test_the_risk_signal_reports_zero_when_nothing_is_open() -> None:
+    adapter = SignalReplayAdapter()
+    signal = adapter._build_risk_signal(
+        effective_signal=_replay_signal(),
+        target_direction="LONG",
+        fill_price=100.0,
+        normalized_timeframe="1h",
+        open_positions={},
+    )
+    assert signal.metadata["current_positions"] == 0
+
+
+def test_the_risk_signal_carries_the_signal_metadata_through() -> None:
+    """A second thing the same dict is responsible for, so both are pinned together."""
+    adapter = SignalReplayAdapter()
+    signal = adapter._build_risk_signal(
+        effective_signal=_replay_signal(metadata={"equity_at_entry": 50_000.0}),
+        target_direction="SHORT",
+        fill_price=101.0,
+        normalized_timeframe="4h",
+        open_positions={"a": _position()},
+    )
+    assert signal.metadata["equity_at_entry"] == pytest.approx(50_000.0)
+    assert signal.metadata["current_positions"] == 1
+    assert signal.action == "sell"
+    assert signal.entry_price == pytest.approx(101.0)
