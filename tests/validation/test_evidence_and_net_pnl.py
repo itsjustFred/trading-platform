@@ -149,3 +149,35 @@ def test_a_missing_report_is_not_evidence() -> None:
     assert not has_evidence
     assert not passed
     assert status == "missing"
+
+
+# --- M38: a failure with no field evidence is still a failure -------------------
+
+
+def test_a_failed_trade_result_with_no_field_evidence_is_still_reported() -> None:
+    """A comparison that failed without producing field deltas must not vanish from the report.
+
+    The delta has no expected/actual to show - that is precisely why it is easy to drop - but dropping
+    it means the report shows nothing where a failed comparison happened. `severity="error"` and the
+    explanation are the only traces left, and both only exist if the delta is emitted.
+    """
+    report = RiskComparisonReport(
+        trade_results=[
+            RiskComparisonResult(
+                passed=False,
+                field_results={},
+                explanation="stop-loss present on reference, absent on platform",
+            )
+        ],
+        summary={},
+        passed=False,
+        explanation="1 of 1 trades failed",
+    )
+
+    deltas = _extract_risk_deltas(report)
+    assert len(deltas) == 1, "the failed result must produce exactly one delta"
+    only = deltas[0]
+    assert only.field == "risk_trade_result"
+    assert only.passed is False
+    assert only.severity == "error"
+    assert "stop-loss" in (only.explanation or "")
