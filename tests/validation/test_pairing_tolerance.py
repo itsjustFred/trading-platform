@@ -73,3 +73,53 @@ def test_the_tolerance_is_float_noise_and_not_a_percentage_of_quantity() -> None
         "a 5-unit gap on a billion-unit position is 5e-9 relative - noise, and must not be reported "
         "as an unclosed position; but it must also not be reported as noise if the band is wider"
     )
+
+
+# --- M35: a negative quantity is garbage, not a short ---------------------------
+
+
+def test_a_negative_quantity_is_treated_as_no_quantity() -> None:
+    """Direction is carried separately ("in" / "out"), so a negative qty is malformed data.
+
+    Accepting it would let a negative sum into `entry_quantity`, and from there into the residual
+    arithmetic that decides closed / partial / open. A position entered at -50 and exited at -50 reads
+    as exactly closed; a position entered at 50 with one -10 exit row reads as over-closed. Neither
+    raises, and both produce a plausible-looking import.
+    """
+    from validation.importers._pairing import _quantity, _row_quantity
+
+    assert _quantity(-1.0) == 0.0
+    assert _quantity("-1") == 0.0
+    assert _quantity(-0.0001) == 0.0
+    assert _row_quantity({"quantity": -5.0}, None) == 0.0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_quantity_is_treated_as_no_quantity(bad: float) -> None:
+    from validation.importers._pairing import _quantity
+
+    assert _quantity(bad) == 0.0
+
+
+@pytest.mark.parametrize("bad", [None, True, "", "abc", [], {}])
+def test_a_quantity_that_is_not_a_number_is_treated_as_no_quantity(bad: object) -> None:
+    from validation.importers._pairing import _quantity
+
+    assert _quantity(bad) == 0.0
+
+
+def test_a_negative_quantity_row_does_not_corrupt_the_position() -> None:
+    """The end-to-end shape: one bad row must not turn a genuinely open position into a closed one."""
+    from validation.importers._pairing import PositionFills, classify_position_fills
+
+    fills = [
+        PositionFills(
+            position_id="p-1",
+            entries=[{"quantity": 100.0}],
+            exits=[{"quantity": -40.0}],  # malformed: clamped to 0, so 100 never closed
+        )
+    ]
+    result = classify_position_fills(fills)
+    assert result[0].status == "partial"
+    assert result[0].exit_quantity == 0.0
+    assert result[0].residual_quantity == pytest.approx(100.0)
