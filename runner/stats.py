@@ -340,7 +340,12 @@ def _resolve_backtest_period_bounds(
     try:
         equity_times = [
             pd.Timestamp(ts)
-            for ts in pd.to_datetime([point.time for point in equity_curve], utc=True, errors="coerce")
+            for ts in pd.to_datetime(
+                [point.time for point in equity_curve],
+                utc=True,
+                errors="coerce",
+                format="mixed",
+            )
             if not pd.isna(ts)
         ]
     except Exception:
