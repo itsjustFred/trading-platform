@@ -2760,6 +2760,10 @@ async def _enforce_stopped_deployments(
     stopped is how open exposure survives behind a dashboard that says
     "stopped". A partial sweep is logged with its outstanding items and retried
     on the next tick.
+
+    The cancel is the one sweep that does not gate the next step: a surviving
+    order still lets the flatten run, because leaving positions open is worse
+    than leaving an order resting. It does gate the stamp.
     """
     stopped = [
         deployment
@@ -2864,9 +2868,15 @@ async def _enforce_stopped_deployments(
             )
             continue
 
+        # A partial cancel must not stop the flatten: closing the positions is
+        # the money-safety action, and the remaining order is retried on the
+        # next tick. It does, however, prevent the enforced stamp - the account
+        # may still have something resting.
+        cancel_ok = cancelled is not None and cancelled.complete
         if cancelled is None:
             logger.error(
-                "Adapter cannot cancel orders; stopped deployment is NOT flat",
+                "Adapter cannot cancel orders; flattening anyway and keeping the "
+                "deployment unenforced",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
@@ -2874,11 +2884,10 @@ async def _enforce_stopped_deployments(
                     }
                 },
             )
-            continue
-        if not cancelled.complete:
+        elif not cancel_ok:
             logger.error(
-                "Order cancel was incomplete for stopped deployment; keeping it "
-                "unenforced and retrying: %s",
+                "Order cancel was incomplete for stopped deployment; flattening "
+                "anyway and retrying the cancel: %s",
                 cancelled.describe(),
                 extra={
                     "data": {
@@ -2887,7 +2896,6 @@ async def _enforce_stopped_deployments(
                     }
                 },
             )
-            continue
 
         try:
             flattened = (
@@ -2970,6 +2978,28 @@ async def _enforce_stopped_deployments(
                 orphaned.describe(),
                 extra={"data": {"deployment_id": deployment_id}},
             )
+
+        # Both halves must be complete before the deployment counts as enforced.
+        # The account is flat either way - the money-safety part is done - but a
+        # surviving order means the next tick must try again, and the orphan
+        # sweep above cannot be trusted to have covered it.
+        if not cancel_ok:
+            logger.error(
+                "Not recording STOPPED enforcement: the order cancel was "
+                "incomplete, so orders may still be resting. Retrying next tick: %s",
+                (
+                    cancelled.describe()
+                    if cancelled is not None
+                    else "adapter cannot cancel open orders"
+                ),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
 
         already_enforced.add(deployment_id)
         try:

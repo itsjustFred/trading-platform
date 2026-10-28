@@ -141,14 +141,34 @@ def test_partial_flatten_does_not_stamp_and_does_not_sweep_orphans(
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
 
 
-def test_partial_cancel_does_not_flatten_or_stamp(isolated_db_sandbox) -> None:
+def test_partial_cancel_still_flattens_but_does_not_stamp(isolated_db_sandbox) -> None:
+    """Closing positions outranks a clean cancel.
+
+    Refusing to flatten because an entry survived its cancel would leave the
+    exposure open - the exact thing STOPPED exists to prevent. The surviving
+    order does keep the deployment unenforced, so the next tick retries.
+    """
     database, _, _ = isolated_db_sandbox
     _seed(database)
     adapter = _ControlAdapter(cancel=ControlOutcome(completed=1, failed=("entry-2",)))
 
     ledger = _enforce(database, adapter)
 
-    assert adapter.calls == ["cancel"]
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_adapter_that_cannot_cancel_still_flattens_but_does_not_stamp(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter(supports_cancel_orders=False)
+
+    ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["flatten", "orphan"]
     assert DEPLOYMENT_ID not in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
 
