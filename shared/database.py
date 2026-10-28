@@ -740,9 +740,6 @@ class LiveAccountModel(SQLModel, table=True):
             name=account.name,
             ctid=account.ctid,
             broker_login=account.broker_login,
-            # A create must never leave this NULL: the column is NOT NULL and
-            # the daemon gate treats an absent value as "not demo".
-            is_demo=bool(account.is_demo),
         )
 
     def to_live_account(self) -> LiveAccountConfig:
@@ -752,9 +749,6 @@ class LiveAccountModel(SQLModel, table=True):
             name=self.name,
             ctid=self.ctid or "",
             broker_login=self.broker_login or "",
-            # Read back so the daemon can refuse a non-demo account before it
-            # ever builds an adapter for it.
-            is_demo=bool(self.is_demo),
         )
 
 

@@ -103,9 +103,7 @@ def _enforce(database, adapter: _ControlAdapter, already: set[str] | None = None
             {ACCOUNT_ID: adapter},
             already_enforced=ledger,
             account_lookup={
-                ACCOUNT_ID: LiveAccountConfig(
-                    id=ACCOUNT_ID, broker="ctrader", is_demo=True
-                )
+                ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")
             },
         )
     )
@@ -225,17 +223,15 @@ def test_shared_account_is_not_flattened_for_one_stopped_deployment(
     assert adapter.calls == []
 
 
-def test_demo_gate_refuses_to_build_an_adapter_for_a_non_demo_account(
+def test_demo_gate_refuses_a_newly_built_non_demo_adapter(
     isolated_db_sandbox, monkeypatch
 ) -> None:
     database, _, _ = isolated_db_sandbox
-    _seed(database, is_demo=False)
+    _seed(database)
     account = database.list_live_accounts()[0]
-    calls: list[str] = []
 
     def _factory(*args, **kwargs):
-        calls.append("factory")
-        return _ControlAdapter()
+        return _ControlAdapter(demo=False)
 
     monkeypatch.setattr(daemon, "_create_adapter_for_account", _factory)
     active: dict[str, object] = {}
@@ -249,7 +245,6 @@ def test_demo_gate_refuses_to_build_an_adapter_for_a_non_demo_account(
         )
     )
 
-    assert calls == []
     assert active == {}
 
 

@@ -163,11 +163,6 @@ class LiveAccountConfig(BaseModel):
     name: str = ""
     broker_login: str | None = None
     ctid: str | None = None
-    # Whether the broker confirmed this account as a demo/paper account. The
-    # daemon's adapter gate reads this and refuses anything that is not an
-    # explicit ``True``: routing a real order to a live account is the one
-    # mistake this platform cannot undo.
-    is_demo: bool | None = None
 
 
 class LiveAccount(BaseModel):

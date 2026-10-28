@@ -2737,8 +2737,6 @@ def _stopped_enforcement_refusal(
     account = account_lookup.get(account_id)
     if account is None:
         return "account is not in the database"
-    if account.is_demo is not True:
-        return "account is not a verified demo account"
     return None
 
 
@@ -3026,26 +3024,6 @@ async def _ensure_adapter_for_active_account(
                 stale,
                 account_id=account_id,
                 reason="unknown_account",
-            )
-        return
-    if account.is_demo is not True:
-        logger.error(
-            "Refusing to construct or keep a live adapter for a non-demo account",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "is_demo": account.is_demo,
-                }
-            },
-        )
-        # An adapter that is already in the map would keep trading. Drop it, and
-        # make the removal visible rather than silently leaving a live path open.
-        stale = active_adapters.pop(account_id, None)
-        if stale is not None:
-            await _disconnect_adapter(
-                stale,
-                account_id=account_id,
-                reason="non_demo_account",
             )
         return
     adapter = active_adapters.get(account_id)

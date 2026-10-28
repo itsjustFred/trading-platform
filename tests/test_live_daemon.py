@@ -46,7 +46,6 @@ def test_ensure_adapter_for_active_account_keeps_adapter_after_connect_failure(m
         name="Demo",
         broker_login="",
         ctid="",
-        is_demo=True,
     )
 
     def _factory(_account, *, accounts_env_values, accounts_env_path=None):
@@ -104,7 +103,6 @@ def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypa
         name="Demo",
         broker_login="",
         ctid="",
-        is_demo=True,
     )
 
     def _factory(_account, *, accounts_env_values, accounts_env_path=None):
