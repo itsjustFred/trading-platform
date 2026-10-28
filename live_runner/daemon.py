@@ -165,9 +165,12 @@ def _adapter_is_demo(adapter: BaseLiveAdapter) -> bool:
 
     Fail closed on every uncertainty: an unknown adapter type, a missing flag,
     or a flag that is not literally ``True`` is not demo. cTrader calls it
-    ``demo`` and Alpaca ``paper``; the account row's ``is_demo`` is checked
-    separately, because a correctly configured adapter can still be pointed at
-    a live account.
+    ``demo`` and Alpaca ``paper``.
+
+    Deliberately reads the adapter and not ``LiveAccountConfig.is_demo``: the
+    account row's flag is not populated by ``ensure_live_account``, so gating on
+    it would reject every account. The adapter is also the object that actually
+    sends orders, so its own flag is the closer one to the risk.
     """
     if isinstance(adapter, AlpacaLiveAdapter):
         return getattr(adapter, "paper", None) is True
