@@ -78,6 +78,127 @@ def _trade_in_window(
     return _parsed_in_window(parsed, start_bound, end_bound)
 
 
+def _trade_net_pnl(trade: Trade) -> float | None:
+    """The trade's net PnL, or None when it is not a finite number."""
+    pnl = (
+        float(trade.net_pnl)
+        if trade.net_pnl is not None
+        else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
+    )
+    return pnl if math.isfinite(pnl) else None
+
+
+def _net_pnl_before(
+    result: BacktestResult,
+    cutoff: datetime,
+    *,
+    inclusive: bool = False,
+) -> float:
+    """Sum net trade PnL of exits before (or at, when inclusive) ``cutoff``."""
+    total = 0.0
+    for trade in result.trades:
+        exit_time = _parse_ts(_last_exit_time(trade))
+        if exit_time is None:
+            continue
+        if exit_time > cutoff or (not inclusive and exit_time == cutoff):
+            continue
+        pnl = _trade_net_pnl(trade)
+        if pnl is None:
+            continue
+        total += pnl
+        if not math.isfinite(total):
+            raise ValueError("Net trade PnL accumulation is non-finite")
+    return total
+
+
+def _window_starting_equity(
+    result: BacktestResult,
+    start_bound: datetime | None,
+) -> float:
+    """Equity at the window start, reconstructed from prior net PnL.
+
+    A windowed aggregation must start from the equity the account actually had
+    at the window start, not from the initial capital: otherwise every return
+    inside the window is computed against the wrong base.  When the engine
+    curve already carries points before the window, the reconstructed value is
+    reconciled against them with a one-cent tolerance and the engine value is
+    preferred only when it agrees.
+    """
+    initial_capital = float(result.meta.initial_capital)
+    if not math.isfinite(initial_capital):
+        raise ValueError("Initial capital must be finite")
+    if start_bound is None:
+        return initial_capital
+
+    prior_points: list[tuple[datetime, float]] = []
+    for point in result.equity_curve:
+        point_time = _parse_ts(point.time)
+        equity = float(point.equity)
+        if point_time is None or point_time >= start_bound or not math.isfinite(equity):
+            continue
+        prior_points.append((point_time, equity))
+
+    starting_equity = initial_capital + _net_pnl_before(result, start_bound)
+    if not prior_points:
+        return starting_equity
+
+    reconciled_through, reconciled_equity = max(prior_points, key=lambda item: item[0])
+    net_through_reconciled = _net_pnl_before(result, reconciled_through, inclusive=True)
+    expected_equity = initial_capital + net_through_reconciled
+    if not math.isclose(
+        reconciled_equity,
+        expected_equity,
+        rel_tol=0.0,
+        abs_tol=0.01,
+    ):
+        # The engine point disagrees with the net ledger: trust the ledger.
+        return starting_equity
+    return reconciled_equity + (starting_equity - initial_capital - net_through_reconciled)
+
+
+def _strictly_increasing_curve(
+    curve: list[EquityPoint],
+    inception: datetime,
+    end_bound: datetime | None,
+) -> list[EquityPoint] | None:
+    """Normalize a curve to strictly increasing, finite timestamps.
+
+    Duplicate timestamps are coalesced (the later point wins) and points that
+    still collide with the previous timestamp are shifted by one microsecond.
+    Returns None when such a shift would leave the requested window.
+    """
+    coalesced: list[EquityPoint] = []
+    previous_source: datetime | None = None
+    for point in curve:
+        current = _parse_ts(point.time)
+        if current is None:
+            raise ValueError("Equity curve contains an invalid timestamp")
+        if previous_source is not None and current < previous_source:
+            raise ValueError("Equity curve timestamps are out of order")
+        if previous_source is not None and current == previous_source:
+            coalesced[-1] = point
+        else:
+            coalesced.append(point)
+        previous_source = current
+
+    normalized: list[EquityPoint] = []
+    previous = inception
+    for point in coalesced:
+        current = _parse_ts(point.time)
+        if current is None or current < previous:
+            raise ValueError("Equity curve timestamps are not strictly ordered")
+        equity = float(point.equity)
+        if not math.isfinite(equity):
+            raise ValueError("Equity curve contains non-finite equity")
+        if current <= previous:
+            current = previous + timedelta(microseconds=1)
+            if end_bound is not None and current > end_bound:
+                return None
+        normalized.append(EquityPoint(time=current.isoformat(), equity=equity))
+        previous = current
+    return normalized
+
+
 def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
     return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
 
@@ -119,8 +240,19 @@ def _windowed_curve(
 
 
 def _preserves_engine_curve(
-    preserved_curve: list[EquityPoint] | None, daily_points: list[EquityPoint]
+    preserved_curve: list[EquityPoint] | None,
+    daily_points: list[EquityPoint],
+    trades: list[Trade] | None = None,
 ) -> bool:
+    """Whether the engine curve may replace the net-PnL daily build.
+
+    The engine curve is only kept when it is dense enough to describe the same
+    window (coverage, gaps, boundaries), is ordered and finite, reaches at
+    least to the last trade exit, and its endpoint agrees with the net ledger
+    within one cent.  The endpoint tolerance is absolute: a relative tolerance
+    would silently accept large absolute errors on high-priced or leveraged
+    accounts.
+    """
     if len(preserved_curve or ()) < 2 or not daily_points:
         return False
     try:
@@ -178,8 +310,15 @@ def _preserves_engine_curve(
     gaps = preserved_index.to_series().diff().dropna()
     if gaps.empty or gaps.max() > MAX_PRESERVED_CURVE_GAP:
         return False
-    tolerance = max(0.01, abs(daily_final) * 1e-9)
-    return abs(preserved_final - daily_final) <= tolerance
+    trade_exits = [
+        parsed
+        for trade in trades or ()
+        if (parsed := _parse_ts(_last_exit_time(trade))) is not None
+    ]
+    if trade_exits and preserved_index[-1] < max(trade_exits):
+        # The curve stops before the last trade it is supposed to describe.
+        return False
+    return abs(preserved_final - daily_final) <= 0.01
 
 
 def _curve_frequency(points: list[EquityPoint]) -> str:
@@ -187,7 +326,12 @@ def _curve_frequency(points: list[EquityPoint]) -> str:
         return "unknown"
     try:
         spacing = (
-            pd.to_datetime([point.time for point in points], utc=True)
+            pd.to_datetime(
+                [point.time for point in points],
+                utc=True,
+                errors="coerce",
+                format="mixed",
+            )
             .to_series()
             .diff()
             .dropna()
@@ -221,31 +365,37 @@ def build_daily_equity_curve(
     *,
     start: datetime | None = None,
     end: datetime | None = None,
+    starting_equity: float | None = None,
 ) -> tuple[list[EquityPoint], list[dict[str, Any]]]:
     initial_capital = float(result.meta.initial_capital)
     if not math.isfinite(initial_capital) or initial_capital <= 0:
         raise ValueError("initial_capital must be finite and > 0")
+    if starting_equity is None:
+        starting_equity = initial_capital
+    starting_equity = float(starting_equity)
+    if not math.isfinite(starting_equity):
+        raise ValueError("starting equity must be finite")
 
     equity_by_day: dict[str, float] = defaultdict(float)
     event_days: list[datetime] = []
     for trade in result.trades:
-        pnl = (
-            float(trade.net_pnl)
-            if trade.net_pnl is not None
-            else float(trade.pnl or 0.0) - float(trade.fees or 0.0)
-        )
-        if not math.isfinite(pnl):
+        pnl = _trade_net_pnl(trade)
+        if pnl is None:
             continue
-        exit_time = _last_exit_time(trade)
-        parsed = _parse_ts(exit_time)
+        parsed = _parse_ts(_last_exit_time(trade))
         if parsed is None:
             continue
         event_days.append(parsed)
-        equity_by_day[parsed.date().isoformat()] += pnl
+        # Bucket by the UTC day: an exit at 23:30-05:00 belongs to the next
+        # UTC day, and using the raw offset date would misdate the PnL.
+        equity_by_day[parsed.astimezone(timezone.utc).date().isoformat()] += pnl
 
     if not event_days:
         return [], []
 
+    # Only an explicitly requested end instant is a hard boundary; a date-only
+    # ``backtest_end`` describes a whole day and must keep its end-of-day close.
+    explicit_end = end is not None
     start_bound = _parse_ts(start) if start is not None else _parse_ts(result.meta.backtest_start)
     end_bound = _parse_ts(end) if end is not None else _parse_ts(result.meta.backtest_end)
     start = start_bound or (
@@ -260,28 +410,24 @@ def build_daily_equity_curve(
     )
     if start is None or end is None or end < start:
         return [], []
-    start = start.astimezone(timezone.utc).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    end = end.astimezone(timezone.utc).replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
 
-    daily_points = [EquityPoint(time=start.isoformat(), equity=round(initial_capital, 2))]
+    # The inception point sits at the requested start instant, so the curve
+    # never begins before the window it describes.
+    inception = start.astimezone(timezone.utc)
+    cursor = inception.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = end.astimezone(timezone.utc).date()
+    end_instant = end.astimezone(timezone.utc)
+
+    daily_points = [EquityPoint(time=inception.isoformat(), equity=round(starting_equity, 2))]
     daily_returns: list[dict[str, Any]] = []
-    running_equity = initial_capital
-    cursor = start
-    while cursor <= end:
+    running_equity = starting_equity
+    while cursor.date() <= end_day:
         day = cursor.date().isoformat()
         pnl = equity_by_day.get(day, 0.0)
         previous = running_equity
         running_equity += pnl
+        if not math.isfinite(running_equity):
+            raise ValueError("Daily equity accumulation is non-finite")
         daily_returns.append(
             {
                 "date": day,
@@ -290,14 +436,22 @@ def build_daily_equity_curve(
             }
         )
         point_time = cursor + timedelta(days=1) - timedelta(microseconds=1)
-        point = EquityPoint(time=point_time.isoformat(), equity=round(running_equity, 2))
-        if daily_points[-1].time == point.time:
-            daily_points[-1] = point
-        else:
-            daily_points.append(point)
+        if explicit_end and cursor.date() == end_day:
+            # Never let the last close overshoot an explicit end instant.
+            point_time = min(point_time, end_instant)
+        daily_points.append(
+            EquityPoint(time=point_time.isoformat(), equity=round(running_equity, 2))
+        )
         cursor += timedelta(days=1)
 
-    return daily_points, daily_returns
+    normalized_closes = _strictly_increasing_curve(
+        daily_points[1:],
+        inception,
+        end_instant if explicit_end else None,
+    )
+    if normalized_closes is None:
+        raise ValueError("Daily equity closes cannot be normalized within the requested window")
+    return [daily_points[0], *normalized_closes], daily_returns
 
 
 def attach_daily_equity(
@@ -320,21 +474,33 @@ def attach_daily_equity(
     """
     start_bound = _parse_day_bound(start, is_end=False)
     end_bound = _parse_day_bound(end, is_end=True)
+    if start is not None and start_bound is None:
+        raise ValueError("Daily equity start bound is invalid")
+    if end is not None and end_bound is None:
+        raise ValueError("Daily equity end bound is invalid")
+    if start_bound is not None and end_bound is not None and start_bound > end_bound:
+        raise ValueError("Daily equity start bound must not exceed end bound")
+    if start_bound is not None and end_bound is not None and start_bound == end_bound:
+        raise ValueError("Daily equity start and end bounds must differ")
 
     # If there are no trades and no existing equity curve, mark as unknown frequency
     if not result.trades and not result.equity_curve:
         result.meta.data = result.meta.data or {}
         result.meta.data["equity_frequency"] = "unknown"
+        result.meta.data.pop("daily_return_count", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
+        result.stats["daily_returns"] = []
         return result
 
     # Build daily equity from trades, restricted to the requested window
     scoped_result = _scoped_view(result, start_bound, end_bound)
+    starting_equity = _window_starting_equity(result, start_bound)
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
         start=start_bound,
         end=end_bound,
+        starting_equity=starting_equity,
     )
 
     # If no daily points could be built (e.g., no valid exit times), fallback to existing curve
@@ -347,6 +513,7 @@ def attach_daily_equity(
             result.meta.data["equity_frequency"] = "unknown"
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
+        result.stats["daily_returns"] = []
         return result
 
     # When a window is active, an engine-provided curve must be scoped to the
@@ -357,7 +524,7 @@ def attach_daily_equity(
     preserved_curve = _windowed_curve(result, start_bound, end_bound)
     result.meta.data = result.meta.data or {}
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
-    if _preserves_engine_curve(preserved_curve, daily_points):
+    if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
         result.equity_curve = preserved_curve
         _attach_daily_stats(
             result,
