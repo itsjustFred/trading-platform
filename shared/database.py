@@ -1664,7 +1664,7 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
 
     orphans = connection.execute(
         text(
-            "SELECT DISTINCT s.deployment_id, s.symbol "
+            "SELECT s.deployment_id, s.symbol "
             "FROM live_signals s "
             "WHERE s.deployment_id LIKE :prefix "
             "AND s.deployment_id NOT IN (SELECT id FROM live_deployments)"
@@ -1674,8 +1674,17 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
     if not orphans:
         return 0
 
-    resolved = 0
+    # One row per deployment, not per signal: the same smoke label covers every signal of that
+    # account, so iterating the pairs would count a deployment twice and give its `symbols` column
+    # whichever symbol happened to come back first.
+    symbols_by_deployment: dict[str, set[str]] = {}
     for deployment_id, symbol in orphans:
+        symbols = symbols_by_deployment.setdefault(str(deployment_id), set())
+        if symbol:
+            symbols.add(str(symbol).upper())
+
+    resolved = 0
+    for deployment_id, symbols in symbols_by_deployment.items():
         account_id = str(deployment_id)[len(_SMOKE_DEPLOYMENT_PREFIX):].strip()
         if not account_id:
             continue
@@ -1713,7 +1722,7 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
                     "new_id": new_id,
                     "name": deployment_id,
                     "account_id": account_id,
-                    "symbols": json.dumps([str(symbol).upper()] if symbol else []),
+                    "symbols": json.dumps(sorted(symbols)),
                     "now": now,
                 },
             )

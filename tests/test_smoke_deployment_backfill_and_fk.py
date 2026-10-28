@@ -8,6 +8,8 @@ lands for the six and stays blocked on exactly one row, and these tests pin both
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import create_engine, event, text
 
@@ -126,6 +128,29 @@ def test_backfill_creates_the_parent_row_for_a_smoke_orphan(conn):
     assert row[4] == "1m"
     assert row[5] == "PAUSED"
     assert row[6] == "smoke"
+
+
+def test_one_parent_row_covers_every_signal_of_the_smoke_label(conn):
+    """The label identifies a deployment, not a signal.
+
+    Two signals for the same account on different symbols must produce one parent whose `symbols`
+    column names both. Iterating the (deployment, symbol) pairs instead would count the deployment
+    twice and record only whichever symbol came back first.
+    """
+    _add_account(conn, "44695443")
+    _add_signal(conn, "s1", "ctrader-demo-smoke-44695443", symbol="EURUSD")
+    _add_signal(conn, "s2", "ctrader-demo-smoke-44695443", symbol="XAUUSD")
+
+    assert _backfill_smoke_deployments(conn) == 1
+
+    rows = conn.execute(text("select id, symbols from live_deployments")).fetchall()
+    assert len(rows) == 1, rows
+    assert json.loads(rows[0][1]) == ["EURUSD", "XAUUSD"], rows[0][1]
+    parented = conn.execute(
+        text("select count(*) from live_signals where deployment_id = :parent"),
+        {"parent": rows[0][0]},
+    ).scalar_one()
+    assert parented == 2, "not every signal of the label was repointed at its parent"
 
 
 def test_backfill_is_idempotent(conn):
