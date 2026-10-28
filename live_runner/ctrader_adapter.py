@@ -1729,6 +1729,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
+            # This path returns early when `deal_id <= 0`, so it is positive here.
+            broker_fill_id=deal_id,
         )
 
     async def _persist_recovered_deals(
@@ -2331,6 +2333,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             dedupe_key=self._build_dedupe_key(
                 deal, order_id=order_id, timestamp_ms=timestamp_ms,
                 filled_volume=filled_volume,
+            ),
+            # Recorded so a later collision between two equal-sized fills is decidable from the
+            # table, rather than by taking the dedupe key apart again. `None` when the broker sent
+            # no deal - the case the key builder already handles by deriving a key instead.
+            broker_fill_id=(
+                (int(getattr(deal, "dealId", 0) or 0) or None) if deal is not None else None
             ),
         )
         persisted = await asyncio.to_thread(save_live_execution, execution)

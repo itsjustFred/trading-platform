@@ -642,6 +642,10 @@ class LiveExecutionModel(SQLModel, table=True):
         default=None,
         sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
     )
+    # The broker's own per-fill id. Nullable and unindexed on purpose: it is *evidence*, not a
+    # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
+    # invite reading it as one. Adapters with no such id leave it NULL.
+    broker_fill_id: int | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -656,6 +660,7 @@ class LiveExecutionModel(SQLModel, table=True):
             dedupe_key=(str(execution.dedupe_key).strip() or None)
             if execution.dedupe_key is not None
             else None,
+            broker_fill_id=execution.broker_fill_id,
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -668,6 +673,7 @@ class LiveExecutionModel(SQLModel, table=True):
             timestamp=self.timestamp,
             broker_order_id=self.broker_order_id,
             dedupe_key=self.dedupe_key,
+            broker_fill_id=self.broker_fill_id,
         )
 
 
@@ -1609,6 +1615,25 @@ def _migrate_backtests_equity_curve(connection: Connection) -> None:
         _backfill_backtest_equity_curves(connection)
 
 
+def _add_live_executions_broker_fill_id(connection: Connection) -> None:
+    """Add `live_executions.broker_fill_id`, the broker's per-fill identifier.
+
+    The dedupe key is a string this codebase assembled, so "were these two rows the same broker
+    fill?" is not answerable from the table afterwards. When two equal-sized fills on one order
+    collide - the case backlog item 1 is about - taking the key apart is the only evidence there is,
+    and it is ambiguous by construction.
+
+    Nullable with no default and no index: recorded evidence, not a constraint. Uniqueness stays
+    with `dedupe_key` and its partial unique index, and adapters with no such id leave this NULL.
+    No-ops when the column already exists.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "broker_fill_id" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN broker_fill_id INTEGER"))
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -1639,6 +1664,7 @@ def _migrate_schema() -> None:
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
+        _add_live_executions_broker_fill_id(connection)
 
 
 def _find_existing_live_signal(
