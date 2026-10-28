@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import optuna
@@ -563,6 +564,7 @@ def test_split_period_applies_an_embargo_gap():
         "2024-01-01T00:00:00+00:00",
         "2024-01-11T00:00:00+00:00",
         0.7,
+        embargo_days=0,
         embargo_pct=0.1,
     )
     train_end = pd.Timestamp(train["end"])
@@ -579,7 +581,10 @@ def test_split_period_without_embargo_stays_contiguous():
     import runner.optimizer as opt
 
     train, test = opt._split_backtest_period(
-        "2024-01-01T00:00:00+00:00", "2024-01-11T00:00:00+00:00", 0.7
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        0.7,
+        embargo_days=0,
     )
     assert pd.Timestamp(test["start"]) - pd.Timestamp(train["end"]) == pytest.approx(
         pd.Timedelta(microseconds=1), abs=pd.Timedelta(seconds=1)
@@ -594,6 +599,7 @@ def test_split_period_rejects_an_embargo_that_eats_the_test_window():
             "2024-01-01T00:00:00+00:00",
             "2024-01-11T00:00:00+00:00",
             0.9,
+            embargo_days=0,
             embargo_pct=0.5,
         )
 

@@ -693,7 +693,7 @@ def run_optimization(
                 train_period=train_period,
                 test_period=test_period,
                 target_metric=config.target_metric,
-                timeframe=str(execution_context.get("timeframe") or "") or None,
+                timeframe=timeframe,
             )
         ),
     }
