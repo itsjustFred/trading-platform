@@ -37,7 +37,13 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.models import LiveExecution, LiveSignal
+from shared.models import (
+    PRICE_ABSENT,
+    PRICE_OBSERVED,
+    PRICE_SENT_BAD,
+    LiveExecution,
+    LiveSignal,
+)
 
 logger = get_logger("live-runner")
 
@@ -1739,7 +1745,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         return LiveExecution(
             signal_id=signal_uuid,
-            actual_price=_to_float(getattr(deal, "executionPrice", 0)),
+            # The same guarded resolver and the same presence verdict as the live fill path:
+            # this one read the raw field, so a NaN or a negative price from a reconciled deal
+            # was stored as-is while the stream path refused it.
+            actual_price=self._resolve_execution_price(order=order, deal=deal),
+            actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
             commission=_to_float(getattr(deal, "commission", 0)),
             timestamp=_to_datetime_from_ms(timestamp_ms),
@@ -2354,6 +2364,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         execution = LiveExecution(
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),
+            # Stored beside the price, because `0.0` alone cannot say whether the broker omitted
+            # the field, sent zero, or sent something unusable. Without it every consumer of
+            # `actual_price` treats a non-answer as a price.
+            actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
             commission=_to_float(getattr(deal, "commission", 0.0)) if deal is not None else 0.0,
             timestamp=_to_datetime_from_ms(timestamp_ms),
@@ -2465,15 +2479,71 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
+        """The best readable execution price, or 0.0 when none is readable.
+
+        Guarded exactly as `_resolve_filled_volume` below: finite and positive. It used to test
+        truthiness alone, which admitted a negative price and - worse - NaN, because `if value:`
+        is true for NaN. A NaN row makes `avg(actual_price)` NaN and makes `WHERE actual_price >
+        x` silently skip it, so neither was a cosmetic problem.
+
+        0.0 remains the "could not be read" answer rather than an error: refusing the row would
+        drop `filled_qty`, and a fill the database never saw is how a duplicate live order gets
+        submitted. What a reader needs is to know that the price is not evidence, and that is
+        `_execution_price_presence`, stored in `actual_price_observed`.
+        """
         if deal is not None:
             value = _to_float(getattr(deal, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         if order is not None:
             value = _to_float(getattr(order, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         return 0.0
+
+    @staticmethod
+    def _execution_price_presence(*, order: Any | None, deal: Any | None) -> str:
+        """Whether a price was observed, sent-but-unusable, or never sent at all.
+
+        Three states, not two, and the third is why this exists. `_resolve_execution_price`
+        returns `0.0` for two different situations and a reader of the stored row cannot tell
+        them apart:
+
+            observed   a finite, positive price was read from the deal or the order
+            sent_bad   the broker sent a price and it is unusable (zero, negative, non-finite)
+            absent     no price was sent at all, on either payload
+
+        `0.0` is therefore never `observed`. A price of exactly zero is `sent_bad`, which is the
+        point: it looks like a price and is not one.
+
+        The deal is checked before the order because that is the resolver's own precedence - a
+        deal price is the executed one, an order price a fallback.
+
+        Read-only and side-effect free: it logs nothing, so a caller may ask without a second
+        copy of whatever `_resolve_execution_price` already said.
+        """
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            raw = getattr(payload, "executionPrice", None)
+            if raw is None:
+                continue
+            # `executionPrice` is an `optional double`, so presence separates a sent zero from an
+            # omitted field. A payload without `HasField` (a test double, a replay adapter) has
+            # only the attribute being present at all, which is the same fallback the resolver
+            # uses - the value test below still decides.
+            has_field = getattr(payload, "HasField", None)
+            if has_field is not None:
+                try:
+                    if not bool(has_field("executionPrice")):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            value = _to_float(raw)
+            if math.isfinite(value) and value > 0:
+                return PRICE_OBSERVED
+            return PRICE_SENT_BAD
+        return PRICE_ABSENT
 
     @staticmethod
     def _resolve_filled_volume(*, order: Any | None, deal: Any | None) -> float:

@@ -651,6 +651,10 @@ class LiveExecutionModel(SQLModel, table=True):
     # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
     # invite reading it as one. Adapters with no such id leave it NULL.
     broker_fill_id: int | None = Field(default=None, nullable=True)
+    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad` or `absent`.
+    # Nullable and with no database default: a row written before this column existed has no
+    # verdict, and "no verdict" must not be fabricated into "observed".
+    actual_price_observed: str | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -666,6 +670,7 @@ class LiveExecutionModel(SQLModel, table=True):
             if execution.dedupe_key is not None
             else None,
             broker_fill_id=execution.broker_fill_id,
+            actual_price_observed=execution.actual_price_observed,
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -679,6 +684,7 @@ class LiveExecutionModel(SQLModel, table=True):
             broker_order_id=self.broker_order_id,
             dedupe_key=self.dedupe_key,
             broker_fill_id=self.broker_fill_id,
+            actual_price_observed=self.actual_price_observed,
         )
 
 
@@ -1611,6 +1617,29 @@ def _add_live_executions_broker_fill_id(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE live_executions ADD COLUMN broker_fill_id INTEGER"))
 
 
+def _add_live_executions_actual_price_observed(connection: Connection) -> None:
+    """Add `live_executions.actual_price_observed`, the verdict on `actual_price`.
+
+    `actual_price` cannot say whether the broker stated a price at all: the resolver's "could not
+    be read" sentinel is `0.0`, so an omitted price, an explicitly-sent zero and a genuine zero
+    are one stored value. Anything derived from such a row is meaningless, and nothing on the
+    table said which rows those were.
+
+    Nullable, no default, unindexed: a row written before this column existed has *no verdict*,
+    which is a different fact from `observed` and must not be fabricated into one. Additive only -
+    no existing row changes, and a reader that ignores the column behaves exactly as before.
+
+    No-ops when the column already exists, because `init_db` runs on every process start.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "actual_price_observed" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_executions ADD COLUMN actual_price_observed TEXT")
+        )
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -1887,6 +1916,7 @@ def _migrate_schema() -> None:
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
+        _add_live_executions_actual_price_observed(connection)
 
 
 def _find_existing_live_signal(

@@ -1125,3 +1125,169 @@ def test_a_deal_that_grows_is_amended_not_dropped(isolated_db) -> None:
     assert rows[0][2] == pytest.approx(500.0), (
         "the amendment was dropped, so the stored quantity is stuck at its first-seen value"
     )
+
+
+# ── Execution price: 0.0 is not a price ──────────────────────────────────────────────────────
+#
+# `_resolve_execution_price` returns 0.0 as its "could not be read" sentinel, so an omitted
+# price, an explicitly-sent zero and a genuine zero all stored the same value. The classifier
+# below is what makes the three countable, and it is persisted beside the price.
+
+
+def _deal_with_price(price: float | None):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+    deal = ProtoOADeal()
+    if price is not None:
+        deal.executionPrice = price
+    return deal
+
+
+def test_a_real_price_is_observed() -> None:
+    deal = _deal_with_price(261.7)
+
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "observed"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == pytest.approx(
+        261.7
+    )
+
+
+def test_a_price_of_exactly_zero_is_sent_but_unusable() -> None:
+    """The case that looks like a price. `0.0` must never be classified as observed."""
+    deal = _deal_with_price(0.0)
+
+    assert deal.HasField("executionPrice") is True
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "sent_bad"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == 0.0
+
+
+def test_an_omitted_price_is_absent_not_zero() -> None:
+    """`optional double` carries presence, so an unset field is distinguishable from a sent 0."""
+    deal = _deal_with_price(None)
+
+    assert deal.HasField("executionPrice") is False
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "absent"
+
+
+@pytest.mark.parametrize("price", [-1.0, float("nan"), float("inf")])
+def test_an_unusable_price_is_never_returned_as_the_price(price: float) -> None:
+    """A negative or non-finite price used to pass `if value:` - NaN did, and poisoned averages."""
+    deal = _deal_with_price(price)
+
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "sent_bad"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == 0.0
+
+
+def test_the_deal_price_wins_over_the_order_price() -> None:
+    """Precedence, and the verdict follows the source that answered."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.executionPrice = 1.0
+    deal = _deal_with_price(2.0)
+
+    assert CTraderLiveAdapter._resolve_execution_price(order=order, deal=deal) == pytest.approx(
+        2.0
+    )
+    assert CTraderLiveAdapter._execution_price_presence(order=order, deal=deal) == "observed"
+
+
+def test_the_verdict_is_persisted_beside_the_price(isolated_db) -> None:
+    """The column is only worth having if the fill path writes it."""
+    database = isolated_db[0]
+    signal_id = "66666666-6666-4666-8666-666666666666"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    def _fill(deal_id: int, price: float | None):
+        from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+        deal = ProtoOADeal()
+        deal.dealId = deal_id
+        deal.orderId = 45678
+        deal.symbolId = 1
+        deal.filledVolume = 500_000
+        deal.executionTimestamp = 1_700_000_000_000
+        if price is not None:
+            deal.executionPrice = price
+        return SimpleNamespace(
+            executionType=1,
+            order=None,
+            deal=deal,
+            HasField=lambda field: field == "deal",
+        )
+
+    asyncio.run(adapter._persist_execution_event(_fill(3001, 261.7)))
+    asyncio.run(adapter._persist_execution_event(_fill(3002, 0.0)))
+    asyncio.run(adapter._persist_execution_event(_fill(3003, None)))
+
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT broker_fill_id, actual_price, actual_price_observed "
+                "FROM live_executions ORDER BY rowid"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert rows == [(3001, 261.7, "observed"), (3002, 0.0, "sent_bad"), (3003, 0.0, "absent")], (
+        rows
+    )
+
+
+def test_the_column_is_additive_nullable_and_has_no_default(isolated_db) -> None:
+    """No verdict is not a verdict of `observed`, so the column must be nullable and defaultless."""
+    import sqlite3
+
+    database = isolated_db[0]
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(live_executions)")}
+    finally:
+        conn.close()
+
+    assert "actual_price_observed" in columns, (
+        "live_executions has no actual_price_observed column, so a 0.0 price stays "
+        "indistinguishable from an omitted one"
+    )
+    notnull, default = columns["actual_price_observed"][3], columns["actual_price_observed"][4]
+    assert notnull == 0, "existing rows have no verdict and must be allowed to stay NULL"
+    assert default is None, (
+        "a database default would fabricate a verdict for rows nobody classified"
+    )
+
+
+def test_the_migration_adds_the_column_and_is_idempotent(isolated_db) -> None:
+    """Staged by dropping the column, so this exercises the ALTER rather than `create_all`."""
+    import sqlite3
+
+    database = isolated_db[0]
+    db_path = database.DB_PATH
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE live_executions DROP COLUMN actual_price_observed")
+        conn.commit()
+        missing = "actual_price_observed" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(live_executions)")
+        }
+    finally:
+        conn.close()
+    assert missing, "could not stage a table without the column, so this proves nothing"
+
+    with database.get_engine().connect() as writable:
+        database._add_live_executions_actual_price_observed(writable)
+        writable.commit()
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        after = {row[1] for row in conn.execute("PRAGMA table_info(live_executions)")}
+    finally:
+        conn.close()
+    assert "actual_price_observed" in after, "the migration did not add the column"
+
+    with database.get_engine().connect() as writable:
+        database._add_live_executions_actual_price_observed(writable)
+        writable.commit()

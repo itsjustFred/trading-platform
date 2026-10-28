@@ -227,6 +227,16 @@ class LiveSignal(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+#: Verdicts for `LiveExecution.actual_price_observed`.
+#:
+#: `observed`  a finite, positive price was read from the broker payload.
+#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`    the broker stated no price at all on any field the resolver reads.
+PRICE_OBSERVED = "observed"
+PRICE_SENT_BAD = "sent_bad"
+PRICE_ABSENT = "absent"
+
+
 class LiveExecution(BaseModel):
     """Execution fill received from broker for a previously emitted signal."""
 
@@ -251,6 +261,21 @@ class LiveExecution(BaseModel):
     #
     # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
     broker_fill_id: int | None = None
+
+    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
+    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    #
+    # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
+    # be read" produces the same stored value whether the broker omitted `executionPrice` or
+    # explicitly sent zero, and a reader of the row cannot tell either from a genuine price that
+    # happens to be zero. Any PnL derived from such a row is meaningless, and until this column
+    # existed nothing said which rows those were.
+    #
+    # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
+    # one is `absent`. Nullable because rows written before this column existed, and adapters that
+    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
+    # `observed`.
+    actual_price_observed: str | None = None
 
 
 class LiveBalanceRecord(BaseModel):
