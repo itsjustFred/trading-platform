@@ -1291,3 +1291,116 @@ def test_the_migration_adds_the_column_and_is_idempotent(isolated_db) -> None:
     with database.get_engine().connect() as writable:
         database._add_live_executions_actual_price_observed(writable)
         writable.commit()
+
+
+# ── Connection auth state ────────────────────────────────────────────────────────────────────
+
+
+def test_a_new_connection_cannot_inherit_authentication() -> None:
+    """A connect event means a socket that has not been authenticated yet.
+
+    `_authenticate` short-circuits on `_authenticated and _symbol_name_to_id`, and a dozen gates
+    - including the order paths - test `not self._authenticated`. A stale True plus a populated
+    symbol cache would let a trade go out on a connection the broker never authenticated.
+    """
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    client = object()
+    adapter._client = client
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._already_logged_in_notified = True
+
+    adapter._on_connected(client)
+
+    assert adapter._connected is True, "the connection is real; only the auth state is stale"
+    assert adapter._authenticated is False
+    assert adapter._already_logged_in_notified is False
+
+
+def test_a_blanked_demo_switch_is_refused_not_defaulted() -> None:
+    """`resolve_env_value` keeps "blanked" distinct from "absent"; the adapter must too.
+
+    With `default=False` the same blank would select live trading silently.
+    """
+    with pytest.raises(ValueError, match="CTRADER_DEMO"):
+        CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="1",
+            env_values={"CTRADER_DEMO": ""},
+        )
+
+
+def test_an_absent_demo_switch_still_defaults_to_demo(monkeypatch) -> None:
+    monkeypatch.delenv("CTRADER_DEMO", raising=False)
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1", env_values={}
+    )
+
+    assert adapter.demo is True
+
+
+def test_an_explicit_demo_argument_beats_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("CTRADER_DEMO", "true")
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1", demo=False
+    )
+
+    assert adapter.demo is False
+
+
+# ── Connect-failure classification ──────────────────────────────────────────────────────────
+
+
+def test_a_deferred_response_timeout_is_not_reported_as_authentication(caplog) -> None:
+    """`(15, 'Deferred')` is Twisted's response timeout, not a credential problem.
+
+    It contains neither "token" nor "timeout", so it used to fall into the fallback that named
+    authentication - once per retry, forever, for a token that worked.
+    """
+    import logging
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    exc = Exception(15, "Deferred")
+
+    with caplog.at_level(logging.INFO, logger="live-runner"):
+        adapter._log_connect_failure(exc, str(exc), str(exc).lower())
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("NO RESPONSE" in message and "15s" in message for message in messages), messages
+    assert not any("authentication" in message.lower() for message in messages), (
+        "a response timeout was reported as an authentication problem"
+    )
+
+
+def test_a_similar_message_is_not_claimed_as_a_response_timeout() -> None:
+    from live_runner.ctrader_adapter import _classify_deferred_response_timeout
+
+    assert _classify_deferred_response_timeout(Exception(), "(15, 'Deferred')") == (True, 15)
+    assert _classify_deferred_response_timeout(Exception(), "(15, 'Other')") == (False, None)
+    assert _classify_deferred_response_timeout(Exception(), "error 15 Deferred") == (False, None)
+
+
+def test_an_unclassified_failure_does_not_name_a_cause(caplog) -> None:
+    import logging
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    with caplog.at_level(logging.INFO, logger="live-runner"):
+        adapter._log_connect_failure(RuntimeError("x"), "something new", "something new")
+
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert "NOT CLASSIFIED" in joined
+    assert "auth" not in joined.lower().replace("not classified", ""), (
+        "the fallback guessed a cause, which is what sent operators to refresh a working token"
+    )
