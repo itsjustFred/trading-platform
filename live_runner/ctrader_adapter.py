@@ -18,6 +18,7 @@ from uuid import UUID
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    ControlOutcome,
     coerce_positive_live_qty,
     is_unbounded_tp,
     money_digits_from_trader,
@@ -577,6 +578,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq: Any = None
         self._ProtoOASymbolsListRes: Any = None
         self._ProtoOANewOrderReq: Any = None
+        self._ProtoOACancelOrderReq: Any = None
         self._ProtoOAClosePositionReq: Any = None
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
@@ -595,6 +597,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOARefreshTokenRes: Any = None
         self._ProtoOADealStatus: Any = None
         self._ProtoOAPositionStatus: Any = None
+        self._ProtoOAOrderStatus: Any = None
         self._ProtoOAOrderType: Any = None
         self._ProtoOATradeSide: Any = None
         self._ProtoOAExecutionType: Any = None
@@ -618,6 +621,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAAccountAuthRes,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
+                ProtoOACancelOrderReq,
                 ProtoOAClosePositionReq,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
@@ -641,6 +645,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
                 ProtoOAExecutionType,
+                ProtoOAOrderStatus,
                 ProtoOAOrderType,
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
@@ -663,6 +668,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq = ProtoOASymbolsListReq
         self._ProtoOASymbolsListRes = ProtoOASymbolsListRes
         self._ProtoOANewOrderReq = ProtoOANewOrderReq
+        self._ProtoOACancelOrderReq = ProtoOACancelOrderReq
         self._ProtoOAClosePositionReq = ProtoOAClosePositionReq
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
@@ -681,6 +687,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOARefreshTokenRes = ProtoOARefreshTokenRes
         self._ProtoOADealStatus = ProtoOADealStatus
         self._ProtoOAPositionStatus = ProtoOAPositionStatus
+        self._ProtoOAOrderStatus = ProtoOAOrderStatus
         self._ProtoOAOrderType = ProtoOAOrderType
         self._ProtoOATradeSide = ProtoOATradeSide
         self._ProtoOAExecutionType = ProtoOAExecutionType
@@ -2221,6 +2228,353 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             equity = _to_float(getattr(trader, "equity", balance)) / scale
         return balance, equity
 
+    @property
+    def supports_cancel_orders(self) -> bool:
+        return True
+
+    @property
+    def supports_flatten(self) -> bool:
+        return True
+
+    async def _reconcile_state(self) -> Any:
+        """The account's current orders and positions, from one call.
+
+        Reconcile, not OrderList. `ProtoOAOrderListReq` is a historical query bounded by
+        `fromTimestamp`/`toTimestamp`; 0/0 does not mean "now", so it can answer with nothing -
+        and a cancel that finds nothing reports success while leaving the order resting - or
+        with unrelated history. Reconcile takes no time bounds and is by definition current
+        state, which is the same call `_fetch_open_positions` already makes for positions.
+
+        Shared by the blanket cancel, the orphan sweep and the flatten so all three see one
+        consistent snapshot: a sweep that read positions and orders from two different
+        snapshots could cancel a protection for a position that had just been closed and
+        re-opened.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+
+        reconcile_req = self._ProtoOAReconcileReq()
+        reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            reconcile_res = await self._send_request_with_refresh_retry(
+                reconcile_req, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(reconcile_res, self._ProtoOAReconcileRes):
+            raise RuntimeError(
+                f"Unexpected reconcile response: {type(reconcile_res).__name__}"
+            )
+        return reconcile_res
+
+    async def _fetch_open_positions(self) -> list[Any]:
+        """Every open position, including ones whose trade data is unreadable.
+
+        The unreadable ones are deliberately *not* filtered out here: `get_positions` skips them
+        because it cannot describe them, but the flatten has to report them, or a position the
+        adapter could not read would count as one that does not exist.
+        """
+        reconcile_res = await self._reconcile_state()
+        open_positions: list[Any] = []
+        for position in getattr(reconcile_res, "position", []) or []:
+            status = int(getattr(position, "positionStatus", 0) or 0)
+            if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                continue
+            open_positions.append(position)
+        return open_positions
+
+    def _unrecognised_status_wire_value(self, order: Any) -> int | None:
+        """The status number the broker sent, when this client has no name for it.
+
+        An enum value this build does not know is not lost: protobuf keeps it in the message's
+        unknown fields, under `orderStatus`'s own field number, with the original value intact.
+        A status that was never sent leaves no unknown field at all. So "the broker sent nothing"
+        and "the broker sent a status this client cannot name" are distinguishable, and this
+        asks the question rather than treating the second as the first - which would read a
+        future terminal status as ACCEPTED and cancel it.
+
+        Returns None for anything that cannot carry the fingerprint - a test double, or a build
+        without explicit presence - so the ordinary path is unaffected.
+        """
+        unknown_fields = getattr(order, "UnknownFields", None)
+        fields_by_name = getattr(getattr(order, "DESCRIPTOR", None), "fields_by_name", None)
+        if unknown_fields is None or fields_by_name is None:
+            return None
+        wanted = {
+            fields_by_name[name].number
+            for name in ("orderStatus", "status")
+            if name in fields_by_name
+        }
+        if not wanted:
+            return None
+        try:
+            unknown = list(unknown_fields())
+        except TypeError:
+            return None
+        for field in unknown:
+            # Wire type 0 is varint, which is how an enum arrives on the wire.
+            if field.field_number in wanted and field.wire_type == 0:
+                return int(field.data)
+        return None
+
+    def _is_working_order(self, order: Any) -> bool:
+        """Whether an order is still ACCEPTED, i.e. a cancel would be legal.
+
+        A filled or already-cancelled order must not be sent for cancellation: cTrader rejects
+        it, and the rejection is a per-order failure the sweep has to record rather than an
+        abort. Only ACCEPTED orders are working; anything else is already terminal.
+
+        Three "cannot tell" paths, all resolved in the direction that leaves nothing resting,
+        because that is the unsafe direction for a sweep that exists to disarm the account:
+        no status enum, no status field, and a status this client has no name for. The last one
+        arrives looking exactly like ACCEPTED; it is detected and logged, while the decision
+        stays as it was - which failure is cheaper here is a trading judgement.
+        """
+        unrecognised = self._unrecognised_status_wire_value(order)
+        if unrecognised is not None:
+            logger.warning(
+                "cTrader sent order status %s, which this client has no name for. It reads as "
+                "ACCEPTED, so this order is being cancelled on a status nobody here could "
+                "interpret; if that status is terminal the broker may refuse the cancel.",
+                unrecognised,
+            )
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        if status_enum is None:
+            logger.warning(
+                "cTrader client exposes no order-status enum, so every order is treated as "
+                "working and a cancel sweep will send a cancel for each",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            return True
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            logger.warning(
+                "cTrader order carries no status field; treating it as ACCEPTED, so it will be "
+                "cancelled if a sweep runs",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                    }
+                },
+            )
+            return True
+        try:
+            return int(raw_status) == int(status_enum.ORDER_STATUS_ACCEPTED)
+        except (TypeError, ValueError):
+            # The one path that resolves *against* cancelling, and the only silent one. It is
+            # logged because it disagrees with the other three: an order whose status cannot be
+            # parsed would otherwise be left resting with no trace at all.
+            logger.warning(
+                "cTrader order status %r is not an integer, so it is treated as NOT working and "
+                "will not be cancelled by a sweep; this resolves in the opposite direction from "
+                "the other unrecognised-status paths, which assume working",
+                raw_status,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                    }
+                },
+            )
+            return False
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        """`int(value)` when it is a positive integer, else None.
+
+        The proto fields these feed (`orderId`, `positionId`, `volume`) are int64: assigning the
+        string form raises TypeError on the wire, and 0 is rejected by the broker. Both are
+        "unidentifiable" for the sweep's purposes, not "nothing to do".
+        """
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed > 0 else None
+
+    async def _cancel_order_id(self, order_id: int) -> None:
+        """Send one cancel for a validated positive order id."""
+        cancel_req = self._ProtoOACancelOrderReq()
+        cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
+        cancel_req.orderId = order_id
+        try:
+            await self._send_request_with_refresh_retry(cancel_req, timeout_seconds=10)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel every working *detached* order for this cTrader account.
+
+        `STOP_LOSS_TAKE_PROFIT` is deliberately not cancellable here. That type is not a resting
+        entry: it is the stop and target attached to an open position, and cancelling it leaves
+        that position with no stop and no target. A blanket cancel runs before the flatten, so
+        the naked-position window is not a formality - if the flatten then fails, the position
+        survives with every risk control removed. Protections that outlive their position are
+        removed by :meth:`cancel_orphaned_protections` instead.
+
+        One refusal does not strand the rest: the remaining orders still need cancelling, and a
+        rejection on one says nothing about the next. Every refusal and every unaddressable
+        order is reported in the outcome, because a caller cannot tell a complete sweep from a
+        partial one by the count alone.
+        """
+        reconcile_res = await self._reconcile_state()
+
+        # Market and market-range orders fill immediately and cannot be cancelled.
+        cancellable = {
+            int(self._ProtoOAOrderType.LIMIT),
+            int(self._ProtoOAOrderType.STOP),
+            int(self._ProtoOAOrderType.STOP_LIMIT),
+        }
+        cancelled = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        # `ProtoOAReconcileRes` names the repeated field `order`, not `orders`.
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            if order_type not in cancellable:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is None:
+                unidentified.append(f"order:{getattr(order, 'orderId', None)!r}")
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                # `CTraderAuthTerminalError` is a RuntimeError, not a CTraderApiError, so an
+                # auth-terminal failure still propagates and ends the sweep - correct, because
+                # the connection is no longer usable and the remaining cancels would fail too.
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                logger.warning(
+                    "cTrader refused to cancel order %s: %s. Continuing the sweep - the "
+                    "remaining orders still need cancelling.",
+                    order_id,
+                    exc,
+                )
+                continue
+            cancelled += 1
+        return ControlOutcome(
+            completed=cancelled,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel attached SL/TP orders whose position no longer exists.
+
+        `cancel_open_orders` never disarms a live position, so closing a position leaves its
+        protection behind: it can no longer fill, it holds an order slot, and it makes a
+        flattened account look like something is still resting. This removes exactly those and
+        nothing else:
+
+        - the order type must be STOP_LOSS_TAKE_PROFIT (no other type is attached);
+        - its `positionId` must be a positive integer *absent* from the open-position set of
+          the same snapshot. An unset or unreadable `positionId` is left alone: "I cannot tell
+          which position this belongs to" must never resolve to "cancel the stop on a position
+          that is still open";
+        - it must be ACCEPTED, exactly like the blanket cancel.
+        """
+        reconcile_res = await self._reconcile_state()
+        open_position_ids: set[int] = set()
+        for position in getattr(reconcile_res, "position", []) or []:
+            if int(getattr(position, "positionStatus", 0) or 0) != (
+                self._ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            ):
+                continue
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            if position_id is not None:
+                open_position_ids.add(position_id)
+
+        cancelled = 0
+        failed: list[str] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if order_type != int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT):
+                continue
+            position_id = self._positive_int(getattr(order, "positionId", 0))
+            if position_id is None or position_id in open_position_ids:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is None:
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                continue
+            cancelled += 1
+        return ControlOutcome(completed=cancelled, failed=tuple(failed))
+
+    async def close_all_positions(self) -> ControlOutcome:
+        """Flatten every open position for this cTrader account, at market.
+
+        A position whose id or volume cannot be read is reported as unidentifiable rather than
+        skipped: it is still open, and a caller that only sees a count would read the sweep as
+        successful while exposure remains. The same holds for a broker refusal - the other
+        positions are still attempted, and the refusal is named in the outcome.
+        """
+        positions = await self._fetch_open_positions()
+        closed = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for position in positions:
+            # `positionId` and `volume` are protobuf int64 fields: the string form cannot be
+            # assigned, a float raises TypeError, and an unset volume serializes as 0, which
+            # cTrader rejects instead of closing.
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            if position_id is None:
+                unidentified.append(f"position:{getattr(position, 'positionId', None)!r}")
+                continue
+            trade_data = getattr(position, "tradeData", None)
+            volume = self._positive_int(
+                _to_float(getattr(trade_data, "volume", 0)) if trade_data is not None else 0
+            )
+            if volume is None:
+                unidentified.append(f"position:{position_id}:volume")
+                continue
+            close_req = self._ProtoOAClosePositionReq()
+            close_req.ctidTraderAccountId = self.ctid_trader_account_id
+            close_req.positionId = position_id
+            close_req.volume = volume
+            try:
+                await self._send_request_with_refresh_retry(close_req, timeout_seconds=15)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(position_id))
+                logger.warning(
+                    "cTrader refused to close position %s: %s. Continuing the flatten - the "
+                    "remaining positions are still open.",
+                    position_id,
+                    exc,
+                )
+                continue
+            closed += 1
+        return ControlOutcome(
+            completed=closed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
     async def get_positions(self) -> list[dict[str, Any]]:
         """Return open positions with signed qty for exposure limits and exit-only sizing.
 
@@ -2230,25 +2584,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         current_price/unrealized_pnl are not available without a spot
         subscription and are reported as 0.0.
         """
-        self._raise_if_terminal_auth_failed()
-        if not self._connected or not self._authenticated:
-            await self.connect()
-
-        self._raise_if_terminal_auth_failed()
-        reconcile_req = self._ProtoOAReconcileReq()
-        reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
-        try:
-            reconcile_res = await self._send_request_with_refresh_retry(
-                reconcile_req,
-                timeout_seconds=15,
-            )
-        except CTraderApiError as exc:
-            self._raise_terminal_auth_from_api_error(exc)
-            raise
-        if not isinstance(reconcile_res, self._ProtoOAReconcileRes):
-            raise RuntimeError(
-                f"Unexpected reconcile response: {type(reconcile_res).__name__}"
-            )
+        open_positions = await self._fetch_open_positions()
 
         symbol_id_to_name = {
             symbol_id: name for name, symbol_id in self._symbol_name_to_id.items()
@@ -2256,10 +2592,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         payload: list[dict[str, Any]] = []
         observed_position_ids: dict[str, list[int]] = {}
         self._position_ids_by_symbol = {}
-        for position in getattr(reconcile_res, "position", []):
-            status = int(getattr(position, "positionStatus", 0) or 0)
-            if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
-                continue
+        for position in open_positions:
             trade_data = getattr(position, "tradeData", None)
             if trade_data is None:
                 continue

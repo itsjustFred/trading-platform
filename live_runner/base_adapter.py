@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 from shared.models import LiveSignal
@@ -87,6 +88,48 @@ def money_scale(money_digits: int) -> int:
     return 10**money_digits
 
 
+@dataclass(frozen=True)
+class ControlOutcome:
+    """What a cancel or flatten sweep actually achieved, including what it did not.
+
+    A bare count cannot answer the only question the caller has - "is the account flat and
+    disarmed?" - because `completed > 0` is equally true of a sweep that closed one of three
+    positions. Reporting that as success is how a stopped deployment ends up with open exposure
+    and a dashboard that says `stopped`.
+
+    So the outcome carries the three ways a sweep can fall short of complete:
+
+    ``completed``     items the broker accepted (orders cancelled, positions closed)
+    ``unidentified``  items the adapter could see but could not address - no id, no volume, an
+                      unreadable status. Not an error to retry blindly; the payload is the
+                      problem, so it is named rather than skipped.
+    ``failed``        items the broker refused, or where the request raised
+
+    ``complete`` is the contract: a caller may only treat the account as stopped/flat when the
+    sweep was complete. A partial sweep must be retried or escalated, never recorded as enforced.
+    An empty sweep is complete (there was nothing to do), which is why the flag is not
+    ``completed > 0``.
+    """
+
+    completed: int = 0
+    unidentified: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        """Whether every item the adapter could see was acted on successfully."""
+        return not self.unidentified and not self.failed
+
+    def describe(self) -> str:
+        """A one-line summary for logs and operator messages."""
+        if self.complete:
+            return f"{self.completed} completed, nothing outstanding"
+        return (
+            f"{self.completed} completed, {len(self.unidentified)} unidentifiable "
+            f"{sorted(self.unidentified)}, {len(self.failed)} refused {sorted(self.failed)}"
+        )
+
+
 def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")
@@ -123,3 +166,51 @@ class BaseLiveAdapter(ABC):
     @abstractmethod
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
+
+    # ── Operator safety controls ──────────────────────────────────────────────────────────────
+    #
+    # Status semantics built on top of these:
+    #   PAUSED  -> stop opening new positions; orders and positions are left untouched, and the
+    #              deployment can be resumed.
+    #   STOPPED -> stop opening new positions, cancel every open order, then flatten every open
+    #              position. Deliberately not implicit in PAUSED, so pausing never liquidates.
+    #
+    # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
+    # instead of reading a silent no-op as "nothing was open".
+
+    @property
+    def supports_cancel_orders(self) -> bool:
+        """Whether :meth:`cancel_open_orders` is implemented for this broker."""
+        return False
+
+    @property
+    def supports_flatten(self) -> bool:
+        """Whether :meth:`close_all_positions` is implemented for this broker."""
+        return False
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel every working order for this account.
+
+        Raises NotImplementedError when the broker cannot do this, so a caller cannot mistake a
+        silent no-op for "nothing was open".
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot cancel open orders")
+
+    async def close_all_positions(self) -> ControlOutcome:
+        """Flatten every open position for this account.
+
+        Raises NotImplementedError when the broker cannot do this.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot close positions")
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel position-protection orders whose position no longer exists.
+
+        A cleanliness control, not a safety one: an orphaned protection cannot fill, it only
+        holds an order slot and misleads an operator reading the account. Adapters raise
+        NotImplementedError when they cannot tell an orphan from a live position's stop, so the
+        caller reports the account as unswept instead of claiming a clean zero.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot identify orphaned protections"
+        )
