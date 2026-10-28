@@ -240,6 +240,27 @@ class TestBacktestResult:
             assert r2.meta.id == r.meta.id
             assert len(r2.trades) == 2
 
+    def test_curve_attached_after_construction_serializes_evidence_status(self, tmp_path):
+        """A curve attached after construction must not leave a stale status.
+
+        The daily-equity builder attaches the curve to an already constructed
+        result, so the status derived in ``__post_init__`` goes stale.  The
+        artifact then omitted the field while reloading it inferred
+        ``available``: writer and reader disagreed about the same file.
+        """
+        result = BacktestResult(meta=_make_result().meta, trades=[_make_simple_trade()])
+        assert result.equity_evidence_status == "unknown"
+        assert "equity_evidence_status" not in result.to_dict()
+
+        result.equity_curve = [EquityPoint(time="2021-01-01", equity=100_000.0)]
+        assert result.to_dict()["equity_evidence_status"] == "available"
+
+        path = tmp_path / "result.json"
+        result.save(path)
+        reloaded = BacktestResult.load(path)
+        assert reloaded.equity_evidence_status == "available"
+        assert reloaded.to_dict()["equity_evidence_status"] == "available"
+
     def test_save_preserves_existing_file_when_serialization_fails(self, tmp_path, monkeypatch):
         result = _make_result()
         path = tmp_path / "result.json"

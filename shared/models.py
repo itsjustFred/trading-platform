@@ -729,9 +729,21 @@ class BacktestResult:
     drawings: list[dict[str, Any]] = field(default_factory=list)
     equity_evidence_status: Literal["unknown", "available", "missing"] = "unknown"
 
-    def __post_init__(self) -> None:
+    def _derived_equity_evidence_status(self) -> Literal["unknown", "available", "missing"]:
+        """Equity evidence status derived from the curve currently attached.
+
+        The status is derived in ``__post_init__``, but the curve can be attached
+        afterwards (the daily-equity builder does exactly that).  Reading the raw
+        attribute at serialization time then produced artifacts that contradicted
+        their own curve, and reloading such a file reported ``available`` while the
+        writer had written nothing at all.
+        """
         if self.equity_curve and self.equity_evidence_status == "unknown":
-            self.equity_evidence_status = "available"
+            return "available"
+        return self.equity_evidence_status
+
+    def __post_init__(self) -> None:
+        self.equity_evidence_status = self._derived_equity_evidence_status()
         if self.equity_evidence_status == "available" and not self.equity_curve:
             raise ValueError("equity_evidence_status=available requires an equity curve")
 
@@ -748,8 +760,9 @@ class BacktestResult:
             d["indicators"] = [i.to_dict() for i in self.indicators]
         if self.drawings:
             d["drawings"] = self.drawings
-        if self.equity_evidence_status != "unknown":
-            d["equity_evidence_status"] = self.equity_evidence_status
+        evidence_status = self._derived_equity_evidence_status()
+        if evidence_status != "unknown":
+            d["equity_evidence_status"] = evidence_status
         return d
 
     @classmethod
