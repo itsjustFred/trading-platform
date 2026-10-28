@@ -71,8 +71,11 @@ def step_two_user_prompt(
 
 def step_three_developer_prompt(*, system_prompt: str, engine: str) -> str:
     engine_guidance = (
-        "Fuer vectorbt muss generate_signals(df, params) mindestens (entries, exits, indicators_dict) "
-        "und optional als viertes Element drawings zurueckgeben. "
+        "Fuer vectorbt muss generate_signals(df, params) IMMER exakt das 4-Tupel "
+        "(entries, exits, indicators_dict, drawings) zurueckgeben - auch wenn keine "
+        "Drawings erzeugt werden, ist drawings dann eine leere Liste. Ein 3-Tupel "
+        "verletzt den Platform-Contract. drawings ist eine Liste von Dicts mit "
+        "type ('marker' oder 'line'), time und optional position/shape/color/text. "
         "Alle logikrelevanten Entry-/Exit-/Stop-/Trailing-Indikatoren muessen in indicators_dict landen."
         if engine == "vectorbt"
         else (
@@ -101,15 +104,16 @@ def step_three_user_prompt(
     repair_section = ""
     if attempt_error:
         repair_section = (
-            "\n\nDer vorherige Screening-Versuch ist mit folgendem Fehler fehlgeschlagen. "
+            "\n\nDer vorherige Backtest-/Validierungsversuch ist mit folgendem Fehler fehlgeschlagen. "
             "Korrigiere NUR den Python-Code. Markdown und STRATEGY_META bleiben unveraendert.\n"
             "```text\n"
             f"{attempt_error[-ERROR_CONTEXT_LIMIT:]}\n"
             "```"
         )
     return (
-        "Schreibe nun den vollstaendigen Python Code (mit imports). Die Hauptfunktion MUSS `entries, exits, indicators_dict` "
-        "und optional `drawings` als viertes Rueckgabe-Element liefern, wenn das Framework vectorbt ist. "
+        "Schreibe nun den vollstaendigen Python Code (mit imports). Die Hauptfunktion MUSS `entries, exits, indicators_dict, drawings` "
+        "liefern, wenn das Framework vectorbt ist: exakt vier Rueckgabe-Werte, wobei `drawings` (Liste von Marker-/Line-Dicts) "
+        "leer sein darf, aber nie weggelassen werden darf. "
         "Halte dich strikt an die Logik im Markdown.\n"
         f"Framework: {engine}\n\n"
         "Verwende dieses STRATEGY_META unveraendert:\n"
