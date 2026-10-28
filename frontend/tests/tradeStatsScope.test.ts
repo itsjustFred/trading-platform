@@ -49,3 +49,18 @@ test("PSR renders as a fraction per the backend contract", async () => {
     /label="PSR \(higher = better\)"[\s\S]{0,200}requireMetricScale\("backtest_stats", "psr"\)/,
   );
 });
+
+test("portfolio contributions render an absent win rate as a dash, not 0.00%", async () => {
+  const source = stripComments(
+    await readFile(
+      new URL("../src/pages/PortfolioDetailPage.tsx", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  // The neighbouring PSR, max-drawdown and CAGR cells all branch on `!= null`
+  // and print an em dash. Win rate fell through to `?? 0`, so a portfolio whose
+  // win rate could not be computed was listed as a measured 0.00% - a losing
+  // result that was never observed.
+  assert.match(source, /\{row\.win_rate != null[\s\S]{0,160}: "—"\}/);
+});

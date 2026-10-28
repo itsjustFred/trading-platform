@@ -929,9 +929,13 @@ function ContributionTable({
               {/* This payload rescales win_rate to percent points while the
                   portfolio's combined_stats serves a fraction: the flat
                   `* 100` this cell used to hard-code is what made the two
-                  disagree. */}
+                  disagree. A missing win rate is rendered like the PSR, max
+                  drawdown and CAGR cells beside it: `?? 0` would report an
+                  unmeasured win rate as a measured 0.00%. */}
               <td style={tdStyle}>
-                {(toPercentPointsForKey("portfolio_contributions", "win_rate", row.win_rate) ?? 0).toFixed(2)}%
+                {row.win_rate != null
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "win_rate", row.win_rate) ?? 0).toFixed(2)}%`
+                  : "—"}
               </td>
               <td style={tdStyle}>{row.trade_count}</td>
               <td

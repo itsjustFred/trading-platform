@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 
@@ -40,8 +40,8 @@ export function SmartHarvestModal({
   // state: the dedupe has to be exact at the instant the callback runs, and a
   // state copy read through the closure can still hold the previous value when
   // two status transitions land in one batch - which would report the same job
-  // to the parent twice. It also keeps the callback identity stable, so passing
-  // it down cannot be mistaken for a reason to rebuild the log stream.
+  // to the parent twice. Keeping it out of state also means a status line does
+  // not re-render this modal; the callback's identity is held by useCallback.
   const notifiedJobIdRef = useRef<string | null>(null);
   const [wasOpen, setWasOpen] = useState(open);
 
@@ -67,20 +67,26 @@ export function SmartHarvestModal({
   // forwarded from the callback rather than mirrored by an effect. Every
   // terminal status closes the stream, but only a clean finish or a failure is
   // reported upstream, so a partial run is never counted as a failure.
-  const handleStatusChange = (status: string) => {
-    setJobStatus(status);
-    if (
-      !jobId ||
-      notifiedJobIdRef.current === jobId ||
-      !isTerminalTaskStatus(status)
-    ) {
-      return;
-    }
-    notifiedJobIdRef.current = jobId;
-    if (status === "completed" || status === "failed") {
-      onTaskFinished?.(status, jobId);
-    }
-  };
+  //
+  // Memoised on the two values it reads, so a status line arriving does not hand
+  // the terminal a new callback identity for a job that has not changed.
+  const handleStatusChange = useCallback(
+    (status: string) => {
+      setJobStatus(status);
+      if (
+        !jobId ||
+        notifiedJobIdRef.current === jobId ||
+        !isTerminalTaskStatus(status)
+      ) {
+        return;
+      }
+      notifiedJobIdRef.current = jobId;
+      if (status === "completed" || status === "failed") {
+        onTaskFinished?.(status, jobId);
+      }
+    },
+    [jobId, onTaskFinished],
+  );
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
