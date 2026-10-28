@@ -466,6 +466,7 @@ def _resolve_backtest_period_bounds(
                 [point.time for point in equity_curve],
                 utc=True,
                 errors="coerce",
+                format="mixed",
             )
             if not pd.isna(ts)
         ]

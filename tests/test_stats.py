@@ -154,6 +154,21 @@ class TestComputeStats:
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
 
+    def test_cagr_handles_mixed_fractional_curve_timestamps(self):
+        # Daily equity curves mix second-resolution inception points with
+        # microsecond-resolution closes; without format="mixed" every close
+        # coerces to NaT and the CAGR window silently falls back.
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=99_000.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=101_000.0),
+        ]
+
+        stats = compute_stats([], equity_curve=equity)
+
+        expected = (101_000.0 / 100_000.0) ** (365.25 / 3.0) - 1.0
+        assert stats["cagr"] == pytest.approx(expected, abs=1e-6)
+
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the
         # 365.75-day trade span.
