@@ -845,3 +845,283 @@ def test_get_balance_marks_terminal_auth_failure_for_not_authorized() -> None:
 
     assert adapter._terminal_auth_failure_code == "TRADING_ACCOUNT_IS_NOT_AUTHORIZED"
     assert "not authorized" in adapter._terminal_auth_failure_reason.lower()
+
+
+# ── Fill identity: two real fills must not collapse onto one dedupe key ──────────────────────
+#
+# The adapter used to derive the key from `(order, timestamp, volume)` whenever the broker sent
+# no deal id. Two genuine equal-sized fills on one order therefore produced the *same* key, and
+# the second was logged as a duplicate and dropped - the position ended up short with a log line
+# arguing against it. These tests drive the real persistence path against a throwaway database,
+# because the defect only exists once the key reaches the unique index.
+
+
+def _seed_signal(database, signal_id: str, *, broker_order_id: str = "45678") -> None:
+    from datetime import datetime, timezone
+
+    with database.get_session() as session:
+        session.add(database.LiveAccountModel(id="acc-1", broker="ctrader", name="acc-1"))
+        session.add(
+            database.LiveDeploymentModel(
+                id="acc-1",
+                strategy_name="fill-identity",
+                account_id="acc-1",
+                symbols_json=["EURUSD"],
+                timeframe="1m",
+            )
+        )
+        session.add(
+            database.LiveSignalModel(
+                id=signal_id,
+                deployment_id="acc-1",
+                symbol="EURUSD",
+                action="BUY",
+                theoretical_price=1.2345,
+                source="internal",
+                broker_order_id=broker_order_id,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+
+def _execution_adapter():
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter.account_config_id = "acc-1"
+    adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._order_id_to_symbol[45678] = "EURUSD"
+    return adapter
+
+
+def _fill_event(
+    *,
+    signal_id: str,
+    deal_id: int,
+    volume: int = 500_000,
+    timestamp: int = 1_700_000_000_000,
+):
+    """A fill whose deal carries the broker's per-fill id."""
+    return SimpleNamespace(
+        executionType=1,
+        order=None,
+        deal=SimpleNamespace(
+            dealId=deal_id,
+            orderId=45678,
+            symbolId=1,
+            filledVolume=volume,
+            executionPrice=1.2345,
+            executionTimestamp=timestamp,
+            commission=0.0,
+        ),
+        HasField=lambda field: field == "deal",
+    )
+
+
+def _order_fill_event(*, signal_id: str, executed_volume: int, timestamp: int = 1_700_000_000_000):
+    """An order-level fill: no deal, so the only quantity is the order's cumulative volume."""
+    return SimpleNamespace(
+        executionType=2,
+        order=SimpleNamespace(
+            orderId=45678,
+            clientOrderId=signal_id,
+            executedVolume=executed_volume,
+            utcLastUpdateTimestamp=timestamp,
+        ),
+        deal=None,
+        HasField=lambda field: field == "order",
+    )
+
+
+def _rows(database) -> list[tuple[str | None, int | None, float]]:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return list(
+            conn.execute(
+                "SELECT dedupe_key, broker_fill_id, filled_qty FROM live_executions ORDER BY rowid"
+            )
+        )
+    finally:
+        conn.close()
+
+
+def test_two_distinct_fills_with_equal_size_and_timestamp_are_two_rows(isolated_db) -> None:
+    """**The blocker.** Equal size, same millisecond, one order - only the broker id separates them.
+
+    Both fills must be stored. Before the fix the second one's key collided with the first and
+    `save_live_execution` refused it as a duplicate that it was not.
+    """
+    database = isolated_db[0]
+    signal_id = "11111111-1111-4111-8111-111111111111"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    asyncio.run(adapter._persist_execution_event(_fill_event(signal_id=signal_id, deal_id=1001)))
+    asyncio.run(adapter._persist_execution_event(_fill_event(signal_id=signal_id, deal_id=1002)))
+
+    rows = _rows(database)
+    assert [row[0] for row in rows] == ["ctrader:deal:1001", "ctrader:deal:1002"], rows
+    assert [row[1] for row in rows] == [1001, 1002], rows
+    assert sum(row[2] for row in rows) == pytest.approx(1000.0)
+
+
+def test_a_redelivered_fill_is_stored_once(isolated_db) -> None:
+    """The other half: the same fill arriving twice must not be counted twice."""
+    database = isolated_db[0]
+    signal_id = "22222222-2222-4222-8222-222222222222"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = _fill_event(signal_id=signal_id, deal_id=1003)
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(event))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][1] == 1003
+    assert rows[0][2] == pytest.approx(500.0)
+
+
+def test_an_order_level_fill_is_identified_by_the_cumulative_volume(isolated_db) -> None:
+    """With no deal id, identity comes from the order's cumulative executed volume.
+
+    That number strictly increases per fill, so two genuine fills are distinguishable, and the
+    persistence cap keeps the second row at the increment rather than re-storing the total.
+    """
+    database = isolated_db[0]
+    signal_id = "33333333-3333-4333-8333-333333333333"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _order_fill_event(signal_id=signal_id, executed_volume=500_000)
+        )
+    )
+    asyncio.run(
+        adapter._persist_execution_event(
+            _order_fill_event(signal_id=signal_id, executed_volume=1_000_000)
+        )
+    )
+
+    rows = _rows(database)
+    assert len(rows) == 2, rows
+    assert rows[0][0] == "ctrader:order:45678:cum:500000"
+    assert rows[1][0] == "ctrader:order:45678:cum:1000000"
+    assert [row[2] for row in rows] == [pytest.approx(500.0), pytest.approx(500.0)], (
+        "the order's executedVolume is cumulative; storing it whole would double-count the "
+        "first fill"
+    )
+    assert sum(row[2] for row in rows) == pytest.approx(1000.0)
+
+
+def test_a_redelivered_order_level_fill_adds_nothing(isolated_db) -> None:
+    database = isolated_db[0]
+    signal_id = "44444444-4444-4444-8444-444444444444"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = _order_fill_event(signal_id=signal_id, executed_volume=500_000)
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(event))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][2] == pytest.approx(500.0)
+
+
+def test_a_fill_with_no_identity_at_all_is_refused_not_collided() -> None:
+    """No deal id, no cumulative volume, no timestamp: the key cannot separate two fills.
+
+    Inventing one would either lose a real fill (a colliding key) or double-count a redelivery
+    (a unique key per event). The event is refused so it is retained for reconciliation, which
+    reads deals that do carry ids.
+    """
+    with pytest.raises(ValueError, match="no deal id, no cumulative order volume and no timestamp"):
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0),
+            order_id=123,
+            timestamp_ms=0,
+            filled_volume=500.0,
+            order_cumulative_volume=0.0,
+        )
+
+
+def test_the_fallback_key_separates_every_component_it_carries() -> None:
+    """A timestamp-only fallback still has to separate two fills that differ in any component."""
+    base = CTraderLiveAdapter._build_dedupe_key(
+        SimpleNamespace(dealId=0),
+        order_id=123,
+        timestamp_ms=1000,
+        filled_volume=500.0,
+    )
+    assert base == "ctrader:order:123:1000:500"
+    for changed in (
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=124, timestamp_ms=1000, filled_volume=500.0
+        ),
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=2000, filled_volume=500.0
+        ),
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=1000, filled_volume=501.0
+        ),
+    ):
+        assert changed != base, f"a distinct fill produced the same key {base}"
+
+
+def test_a_deal_that_grows_is_amended_not_dropped(isolated_db) -> None:
+    """A dealId repeated with a larger quantity is the broker amending the fill.
+
+    `ProtoOADeal.filledVolume` can grow for a deal already reported. Dropping the repeat as a
+    duplicate freezes the stored quantity at its first-seen value and loses the rest of the
+    fill, which is what the plain insert path did.
+    """
+    database = isolated_db[0]
+    signal_id = "55555555-5555-4555-8555-555555555555"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = SimpleNamespace(
+        executionType=1,
+        order=SimpleNamespace(
+            orderId=45678,
+            clientOrderId=signal_id,
+            executedVolume=500_000,
+            utcLastUpdateTimestamp=1_700_000_000_000,
+        ),
+        deal=SimpleNamespace(
+            dealId=2001,
+            orderId=45678,
+            symbolId=1,
+            filledVolume=300_000,
+            executionPrice=1.2345,
+            executionTimestamp=1_700_000_000_000,
+            commission=0.0,
+        ),
+        HasField=lambda field: field == "order",
+    )
+    amended = SimpleNamespace(**{**event.__dict__})
+    amended.deal = SimpleNamespace(
+        dealId=2001,
+        orderId=45678,
+        symbolId=1,
+        filledVolume=500_000,
+        executionPrice=1.2345,
+        executionTimestamp=1_700_000_000_000,
+        commission=0.0,
+    )
+
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(amended))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][0] == "ctrader:deal:2001"
+    assert rows[0][2] == pytest.approx(500.0), (
+        "the amendment was dropped, so the stored quantity is stuck at its first-seen value"
+    )

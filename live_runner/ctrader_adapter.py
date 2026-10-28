@@ -32,6 +32,7 @@ from shared.database import (
     get_live_signal_timestamp,
     list_live_signal_ids_for_reconciliation,
     save_live_execution,
+    save_live_execution_up_to_cumulative,
     save_live_signal,
     set_live_signal_broker_order_id,
 )
@@ -75,6 +76,19 @@ def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
     raise ValueError(
         f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
     )
+
+
+def _format_key_quantity(value: float) -> str:
+    """A stable text form for a quantity inside a dedupe key.
+
+    `:g` switches to exponent notation at 1e6, so two different volumes could still render
+    differently depending on magnitude and a key built yesterday would stop matching one built
+    today. Integral volumes are rendered as integers, everything else at full precision.
+    """
+    numeric = float(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    return repr(numeric)
 
 
 def _to_datetime_from_ms(timestamp_ms: int | float | None) -> datetime:
@@ -2325,6 +2339,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         filled_qty = _broker_volume_to_qty(
             filled_volume, self._scale_for(fill_symbol).volume_per_qty
         )
+        # The order's `executedVolume` is *cumulative* for the order, not this fill's slice, and
+        # it is the only quantity the broker states that lets `save_live_execution_up_to_cumulative`
+        # tell a redelivery from an amendment. Converted with the same symbol scale as the fill so
+        # the cap and the stored rows are in one unit.
+        cumulative_volume = self._resolve_order_cumulative_volume(order)
+        cumulative_qty = (
+            _broker_volume_to_qty(
+                cumulative_volume, self._scale_for(fill_symbol).volume_per_qty
+            )
+            if cumulative_volume > 0
+            else 0.0
+        )
         execution = LiveExecution(
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),
@@ -2333,17 +2359,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
-                deal, order_id=order_id, timestamp_ms=timestamp_ms,
+                deal,
+                order_id=order_id,
+                timestamp_ms=timestamp_ms,
                 filled_volume=filled_volume,
+                order_cumulative_volume=cumulative_volume,
             ),
-            # Recorded so a later collision between two equal-sized fills is decidable from the
-            # table, rather than by taking the dedupe key apart again. `None` when the broker sent
-            # no deal - the case the key builder already handles by deriving a key instead.
+            # The broker's own per-fill id, so a later collision between two equal-sized fills is
+            # decidable from the table rather than by taking the dedupe key apart again. `None`
+            # when the broker sent no deal - the case the key builder handles by deriving a key.
             broker_fill_id=(
                 (int(getattr(deal, "dealId", 0) or 0) or None) if deal is not None else None
             ),
         )
-        persisted = await asyncio.to_thread(save_live_execution, execution)
+        if cumulative_qty > 0:
+            # P1's amendment semantics, not a second insert: the same key with a *larger*
+            # quantity amends the stored row, the same quantity is a redelivery, and nothing is
+            # stored past the broker's own cumulative. That last part is what stops a repeated
+            # order-level snapshot - whose volume is cumulative, not incremental - from being
+            # added to the rows already stored for the signal.
+            persisted_qty = await asyncio.to_thread(
+                save_live_execution_up_to_cumulative, execution, cumulative_qty
+            )
+            persisted = persisted_qty > 0.0
+        else:
+            persisted = await asyncio.to_thread(save_live_execution, execution)
         if not persisted:
             logger.info(
                 "Skipped duplicate cTrader execution fill",
@@ -2352,6 +2392,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         "signal_id": str(execution.signal_id),
                         "broker_order_id": execution.broker_order_id,
                         "execution_type": execution_type,
+                        "dedupe_key": execution.dedupe_key,
+                        "broker_fill_id": execution.broker_fill_id,
                     }
                 },
             )
@@ -2460,17 +2502,69 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return 0
 
     @staticmethod
+    def _resolve_order_cumulative_volume(order: Any | None) -> float:
+        """The order's cumulative executed volume, in broker units, or 0.0 when unreadable.
+
+        `ProtoOAOrder.executedVolume` is the total filled on the order so far - not this
+        event's slice. It is what the persistence cap compares against, and it strictly
+        increases per fill, which is why it is also part of the fill's identity when the broker
+        sent no per-fill id.
+        """
+        if order is None:
+            return 0.0
+        value = _to_float(getattr(order, "executedVolume", 0.0))
+        if math.isfinite(value) and value > 0:
+            return value
+        return 0.0
+
+    @staticmethod
     def _build_dedupe_key(
         deal: Any | None,
         *,
         order_id: int | None,
         timestamp_ms: int,
         filled_volume: float,
+        order_cumulative_volume: float = 0.0,
     ) -> str:
+        """A key that separates two fills without ever counting one twice.
+
+        The broker's `dealId` is the only identifier that is unique per fill by construction,
+        so it is used whenever it is present. When it is not, identity has to come from
+        something else, and the previous fallback - `(order, timestamp, volume)` - collided on
+        exactly the fills it existed to separate: two equal-sized fills in the same millisecond
+        on one order produced one key, and the second was logged as a duplicate and dropped.
+        The position then ends up short with a log line arguing against it.
+
+        Two stronger fallbacks, in order:
+
+        - the order's **cumulative** executed volume, which strictly increases per fill, so two
+          distinct fills always differ and a repeat of the same value is a redelivery of the
+          same order state;
+        - a millisecond timestamp plus the volume, which is adequate but not proof.
+
+        When none of the three is available the key cannot be derived at all, and this raises
+        instead of inventing one. The neighbouring checks in `_persist_execution_event` refuse
+        the same way for a non-positive volume and an unresolvable symbol; the event is then
+        retained for reconciliation, which reads deals that *do* carry ids. Silently colliding
+        would lose a real fill, and inventing a per-event unique key would count a redelivery
+        twice - both are money errors, so neither is chosen.
+        """
         deal_id = int(getattr(deal, "dealId", 0) or 0) if deal is not None else 0
         if deal_id > 0:
             return f"ctrader:deal:{deal_id}"
-        return f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
+        if order_cumulative_volume > 0:
+            cumulative_text = _format_key_quantity(order_cumulative_volume)
+            return f"ctrader:order:{order_id or ''}:cum:{cumulative_text}"
+        if timestamp_ms > 0:
+            return (
+                f"ctrader:order:{order_id or ''}:{timestamp_ms}:"
+                f"{_format_key_quantity(filled_volume)}"
+            )
+        raise ValueError(
+            "cTrader fill carries no deal id, no cumulative order volume and no timestamp, so "
+            "two distinct fills on this order would be indistinguishable; retaining the event "
+            "for reconciliation rather than storing it under a key that may collide."
+        )
 
     def _requeue_execution_event(self, event: Any) -> bool:
         key = id(event)

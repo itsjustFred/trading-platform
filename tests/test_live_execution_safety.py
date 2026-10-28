@@ -1178,11 +1178,17 @@ def test_ctrader_sparse_deal_uses_order_executed_volume(monkeypatch):
     adapter._order_id_to_symbol[45678] = "EURUSD"
     adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
     saved: list[LiveExecution] = []
-    monkeypatch.setattr(
-        module,
-        "save_live_execution",
-        lambda execution: saved.append(execution) or True,
-    )
+    cumulative_caps: list[float] = []
+
+    def _capture(execution: LiveExecution, cumulative_qty: float) -> float:
+        # The order states a cumulative executed volume, so the fill is persisted through the
+        # capped path - that is what keeps a repeated order-level snapshot from being added
+        # twice. What this test pins is the *unit*, so the cap is recorded and returned as met.
+        saved.append(execution)
+        cumulative_caps.append(cumulative_qty)
+        return execution.filled_qty
+
+    monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
 
     event = SimpleNamespace(
         executionType=1,
@@ -1209,6 +1215,10 @@ def test_ctrader_sparse_deal_uses_order_executed_volume(monkeypatch):
     assert len(saved) == 1
     assert saved[0].filled_qty == pytest.approx(5000.0)
     assert saved[0].dedupe_key == "ctrader:deal:778"
+    assert cumulative_caps == [pytest.approx(5000.0)], (
+        "the broker's cumulative executed volume must reach the cap in qty units, or the cap "
+        "compares broker units against qty and stops capping anything"
+    )
 
 
 def test_ctrader_reconciled_deals_are_persisted_in_qty_units(monkeypatch):
