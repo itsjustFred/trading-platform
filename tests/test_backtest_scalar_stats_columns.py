@@ -135,6 +135,34 @@ def test_a_metric_the_producer_never_named_also_leaves_the_column_alone(
     assert values["psr"] == 0.7, values
 
 
+def test_a_non_finite_number_is_treated_as_undefined(isolated_db: tuple) -> None:
+    """NaN and infinity are number-shaped but cannot be stored honestly.
+
+    The columns are ``NOT NULL`` REAL, so ``float('nan')`` commits without complaint and then
+    poisons every later read: ``nan > 0`` is False, ``nan == nan`` is False, and JSON built from the
+    row is invalid. ``math.isfinite`` is the only check that catches it, because it *is* a float. So
+    it counts as absence and the stored value is carried forward - never destroyed, never poisoned.
+    """
+    _save("nonfinite-1", {"sharpe_ratio": -0.9, "psr": 0.4})
+    _save("nonfinite-1", {"sharpe_ratio": float("nan"), "psr": float("inf")})
+    values = _columns("nonfinite-1")
+    assert values["sharpe_ratio"] == -0.9, values
+    assert values["psr"] == 0.4, values
+
+
+def test_an_unparsable_value_is_treated_as_undefined(isolated_db: tuple) -> None:
+    """A producer that emits ``"n/a"`` must not take the whole save down, nor fabricate a 0.0.
+
+    Failing the insert would lose the entire backtest over one malformed field; coercing to ``0.0``
+    would assert a Sharpe of zero the producer never computed. Carrying the stored value forward is
+    the same rule as for a metric the producer never named, and the warning log is what makes the
+    producer bug visible instead of silent.
+    """
+    _save("junk-1", {"sharpe_ratio": 0.8})
+    _save("junk-1", {"sharpe_ratio": "n/a"})
+    assert _columns("junk-1")["sharpe_ratio"] == 0.8, _columns("junk-1")
+
+
 def test_p_value_defaults_to_one_not_zero(isolated_db: tuple) -> None:
     """``1.0`` means "no evidence against the null hypothesis"; ``0.0`` means the opposite.
 

@@ -133,6 +133,67 @@ def test_a_smaller_quantity_does_not_shrink_a_reported_fill(db):
     assert _rows(engine) == [("ctrader:deal:26533115", pytest.approx(2.0))]
 
 
+def test_an_amendment_is_capped_by_the_brokers_cumulative(db):
+    """Growing a deal must not push the signal past the quantity the broker reports as filled.
+
+    The insert path already caps at ``cumulative - already persisted``. If the amendment path did
+    not, a deal whose first insert was capped - because the broker's cumulative was lower than the
+    deal's own ``filledVolume`` - would be "amended" on the very next redelivery back up to the
+    number the cap rejected, which is the same over-count the dedupe key exists to prevent.
+    """
+    engine, signal_id = db
+    inserted = save_live_execution_up_to_cumulative(_execution(signal_id, 2.0), 1.0)
+    assert inserted == pytest.approx(1.0), "the insert path should have capped at the cumulative"
+
+    # Same deal, same claimed quantity, same broker cumulative: a redelivery, not new information.
+    again = save_live_execution_up_to_cumulative(_execution(signal_id, 2.0), 1.0)
+
+    assert again == 0.0, "the redelivery was booked as an amendment and inflated the total"
+    assert _rows(engine) == [("ctrader:deal:26533115", pytest.approx(1.0))]
+
+
+def test_an_amendment_cannot_consume_quantity_another_deal_already_booked(db):
+    """The cap is about the whole signal, not just this row.
+
+    Two deals on one signal: A books 1.0, B books 0.5, and the broker reports 1.5 filled. A then
+    re-sends with 1.2 - a real increase, but there is no headroom left, so nothing may be added.
+    """
+    engine, signal_id = db
+    save_live_execution_up_to_cumulative(_execution(signal_id, 1.0), 1.0)
+    other = _execution(signal_id, 0.5)
+    other.dedupe_key = "ctrader:deal:26533116"
+    save_live_execution_up_to_cumulative(other, 1.5)
+
+    amended = save_live_execution_up_to_cumulative(_execution(signal_id, 1.2), 1.5)
+
+    assert amended == 0.0, "the amendment exceeded the broker's own cumulative"
+    with Session(engine) as session:
+        total = session.exec(text("select sum(filled_qty) from live_executions")).scalar()
+    assert float(total) == pytest.approx(1.5), (
+        "the signal now claims more filled than the broker does"
+    )
+
+
+def test_an_amendment_within_the_headroom_is_booked(db):
+    """The cap must not swallow a legitimate increase.
+
+    The broker's cumulative grew to 1.7 and deal A grew by 0.2, which fits exactly in the 0.2 of
+    headroom left after deal B. The guard is a ceiling, not a freeze.
+    """
+    engine, signal_id = db
+    save_live_execution_up_to_cumulative(_execution(signal_id, 1.0), 1.0)
+    other = _execution(signal_id, 0.5)
+    other.dedupe_key = "ctrader:deal:26533116"
+    save_live_execution_up_to_cumulative(other, 1.5)
+
+    amended = save_live_execution_up_to_cumulative(_execution(signal_id, 1.2), 1.7)
+
+    assert amended == pytest.approx(0.2)
+    with Session(engine) as session:
+        total = session.exec(text("select sum(filled_qty) from live_executions")).scalar()
+    assert float(total) == pytest.approx(1.7)
+
+
 def test_commission_is_added_only_for_the_incremental_slice(db):
     engine, signal_id = db
     first = _execution(signal_id, 1.0)

@@ -2086,6 +2086,14 @@ def save_live_execution_up_to_cumulative(
                 .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
                 .limit(1)
             ).first()
+            local_filled_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == normalized_signal_id
+                    )
+                ).one()
+                or 0.0
+            )
             if existing is not None:
                 # Same dedupe key. Two very different situations share this branch, and conflating
                 # them loses fills:
@@ -2103,11 +2111,18 @@ def save_live_execution_up_to_cumulative(
                 # correct. The remaining risk is amendment, and it is handled here: only an increase
                 # amends, and a decrease is treated as redelivery rather than shrinking a fill that
                 # already happened.
-                delta = requested_qty - float(existing.filled_qty or 0.0)
+                #
+                # The increase is capped by what the broker still says is missing for the whole
+                # signal, exactly as the insert path below is. Without the cap a redelivery of a
+                # deal whose first insert was itself capped - because the broker's cumulative was
+                # lower than the deal claimed - would grow the stored total past the broker's own
+                # number, which is the same over-count the dedupe key exists to prevent.
+                prior_qty = float(existing.filled_qty or 0.0)
+                delta = min(requested_qty - prior_qty, cumulative_qty - local_filled_qty)
                 if delta <= 0.0:
                     session.rollback()
                     return 0.0
-                existing.filled_qty = float(existing.filled_qty or 0.0) + delta
+                existing.filled_qty = prior_qty + delta
                 if record.commission:
                     # Commission was recorded against the first-seen quantity, so only the
                     # incremental slice needs adding. A deal that reports commission per unit is
@@ -2124,19 +2139,11 @@ def save_live_execution_up_to_cumulative(
                     "filled_qty %s -> %s",
                     existing.id,
                     existing.dedupe_key,
-                    delta,
+                    prior_qty,
                     existing.filled_qty,
                 )
                 return delta
 
-            local_filled_qty = float(
-                session.exec(
-                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
-                        LiveExecutionModel.signal_id == normalized_signal_id
-                    )
-                ).one()
-                or 0.0
-            )
             persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
@@ -3100,7 +3107,9 @@ def _scalar_stats_for_save(
     stored. Letting the model's default land instead would mean a re-save of a backtest whose
     Sharpe is no longer computable overwrites a real stored value with 0.0 - destroying data to
     express absence, which is the failure the corpus audit found in the first place, reintroduced
-    by the fix for it. So absence leaves the column alone and only a number moves it.
+    by the fix for it. So absence leaves the column alone and only a finite number moves it - a
+    malformed or non-finite value is not a number the column can hold honestly, so it counts as
+    absence and is logged.
     """
     current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
     row = session.exec(
@@ -3118,7 +3127,26 @@ def _scalar_stats_for_save(
         # `default=None` makes "the producer did not name it" and "the producer declared it
         # undefined" both resolve to None, which is precisely the do-not-write case.
         value = resolve_defined_stat(stats, name, None)
-        resolved[name] = current[name] if value is None else float(value)
+        resolved[name] = current[name]
+        if value is None:
+            continue
+        # A value that is not a finite number cannot be stored honestly: the columns are NOT NULL
+        # REAL, and a stored NaN or infinity poisons every later comparison and any JSON read of
+        # the row. Carrying the stored value forward is the same rule as for an absent metric, and
+        # it is logged because a malformed number is a producer bug, not an absence.
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        if math.isfinite(number):
+            resolved[name] = number
+        else:
+            logger.warning(
+                "Ignoring unusable %s value %r for backtest %s: not a finite number",
+                name,
+                value,
+                backtest_id,
+            )
     return resolved
 
 
