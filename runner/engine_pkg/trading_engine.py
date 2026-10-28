@@ -875,7 +875,6 @@ class TradeEngine:
             return None, None
         return resolve_ask_high_low(row, self._bar_spread(row))
 
-=======
     def _record_bar_excursion(
         self,
         position: Position,
