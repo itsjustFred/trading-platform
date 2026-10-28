@@ -84,6 +84,7 @@ from shared.database import (
 )
 from shared.database import (
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
     create_live_deployment,
     create_service,
@@ -171,11 +172,6 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
 
-# The recorder is a hard import, not part of the optional block above: the daemon
-# imports the same function from the same module, so a viewer-only fallback for it
-# would give the two processes different verification semantics - exactly the
-# split that let the TTL go unrefreshed in the first place.
-from live_runner.account_discovery import record_discovered_account_verification
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
@@ -4806,6 +4802,16 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
 
 
 def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+    # STOPPED is a request, not a fact. The daemon marks
+    # `stopped_enforced_at` only after a *complete* cancel-and-flatten sweep, so
+    # a STOPPED row without that stamp still has exposure at the broker. The
+    # payload says so explicitly; a bare `status: STOPPED` is what let the
+    # dashboard report a stop that had only partially happened.
+    stopped_enforced_at = deployment.stopped_enforced_at
+    exposure_may_be_open = (
+        str(deployment.status or "").strip().upper() == "STOPPED"
+        and stopped_enforced_at is None
+    )
     payload = {
         "id": str(deployment.id),
         "strategy_name": deployment.strategy_name,
@@ -4813,6 +4819,10 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "symbols": deployment.symbols,
         "timeframe": deployment.timeframe,
         "status": deployment.status,
+        "stopped_enforced_at": (
+            stopped_enforced_at.isoformat() if stopped_enforced_at is not None else None
+        ),
+        "exposure_may_be_open": exposure_may_be_open,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,
         "symbol_filter": deployment.symbol_filter,
@@ -4887,17 +4897,10 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 str(account.get("ctid")).strip() if account.get("ctid") else None
             )
             # Only a real boolean counts as the source asserting demo-ness. A
-            # missing or non-boolean value leaves the stored flag alone and is
-            # reported to the client as unasserted, instead of being invented
-            # into a False that would demote a verified demo account.
+            # missing or non-boolean value is reported to the client as
+            # unasserted rather than invented into a False.
             raw_is_demo = account.get("is_demo")
             is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
-            record_discovered_account_verification(
-                account_id,
-                is_demo=is_demo,
-                ctid=normalized_ctid,
-                broker_login=normalized_login,
-            )
             payload.append(
                 {
                     "id": account_id,
@@ -4919,12 +4922,6 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
             str(account.ctid).strip() if getattr(account, "ctid", None) else None
         )
         is_demo = bool(account.is_demo)
-        record_discovered_account_verification(
-            account.id,
-            is_demo=is_demo,
-            ctid=normalized_ctid,
-            broker_login=normalized_login,
-        )
         payload.append(
             {
                 "id": account.id,
@@ -11967,25 +11964,19 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
     discovered = await asyncio.to_thread(_cached_live_accounts_payload)
-    # Persist what discovery just learned. The guarded account re-point and the
-    # ACTIVE verification-freshness gate both operate on stored account rows, so
-    # an account that was only ever seen in a discovery response cannot be a
-    # valid deployment target.
+    # Persist what discovery just learned: the guarded account re-point
+    # operates on stored account rows, so an account that was only ever seen in
+    # a discovery response could not be a deployment target.
     #
-    # A read must never demote a safety flag. `is_demo` is only forwarded when
-    # discovery positively asserted it; an unasserted flag becomes None, which
-    # `upsert_live_accounts` treats as "say nothing". Coercing a missing field
-    # to False here is what silently disarmed accounts: the stored flag flipped
-    # to non-demo while `demo_verified_at` stayed fresh, the adapter was torn
-    # down, and no later read could ever put it back.
+    # Only fields discovery actually reported are forwarded. `is_demo` is
+    # deliberately not written here: the stored flag is owned by the arming
+    # path, and a read that guessed at it would be a write with side effects.
     persisted: list[LiveAccountConfig] = []
     for item in discovered:
         broker = str(item.get("broker") or "").strip().lower()
         account_id = str(item.get("id") or "").strip()
         if broker not in {"alpaca", "ctrader"} or not account_id:
             continue
-        raw_is_demo = item.get("is_demo")
-        asserted = bool(item.get("is_demo_asserted", isinstance(raw_is_demo, bool)))
         persisted.append(
             LiveAccountConfig(
                 id=account_id,
@@ -11994,7 +11985,6 @@ async def get_live_accounts() -> list[dict[str, Any]]:
                 broker_login=str(item.get("broker_login") or item.get("login") or "").strip()
                 or None,
                 ctid=str(item.get("ctid") or "").strip() or None,
-                is_demo=bool(raw_is_demo) if asserted and isinstance(raw_is_demo, bool) else None,
             )
         )
     if persisted:
@@ -12942,6 +12932,14 @@ async def delete_live_deployment_endpoint(
         list_live_deployment_submission_claims, deployment_id
     )
 
+    # Remember the status we found, because the gate below overwrites it. If the
+    # delete is refused for having history, the deployment must be left as it was
+    # rather than stuck PAUSED by a request that changed nothing.
+    existing = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    original_status = str(existing.status or "").strip().upper()
+
     # Close the claim gate *before* draining, not just delete afterwards.
     # `claim_live_deployment_submission` only inserts a lease while the row reads
     # ACTIVE, and DELETE never changed the status - so the gate was open for the
@@ -12969,7 +12967,59 @@ async def delete_live_deployment_endpoint(
         deployment_id, initial_claims=pending_claims
     )
 
-    deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
+    try:
+        deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
+    except LiveDeploymentInUseError as exc:
+        # A deployment with signals or executions cannot be deleted without
+        # destroying the record of real trades, so the database refuses. That
+        # refusal used to escape as an `IntegrityError` and become a 500 - after
+        # the gate above had already written PAUSED - leaving the operator with an
+        # error and a deployment silently disarmed. The refusal is now a typed
+        # answer with the counts that explain it, and the status is put back so a
+        # failed delete has no side effects at all.
+        restored_to: str | None = None
+        if original_status and original_status != "PAUSED":
+            try:
+                await asyncio.to_thread(
+                    update_live_deployment_status, deployment_id, original_status
+                )
+                restored_to = original_status
+            except Exception as restore_exc:  # pragma: no cover - defensive
+                logger.error(
+                    "Delete was refused and the previous status could not be restored",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "previous_status": original_status,
+                            "error": repr(restore_exc),
+                        }
+                    },
+                )
+        await _audit_live_control(
+            action="deployment.delete",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "deployment still has records",
+                "signal_count": exc.signal_count,
+                "execution_count": exc.execution_count,
+                "status_restored": restored_to,
+                "submission_drain_outcome": drain.outcome.value,
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "deployment_in_use",
+                "message": str(exc),
+                "deployment_id": deployment_id,
+                "signal_count": exc.signal_count,
+                "execution_count": exc.execution_count,
+                "status_restored": restored_to,
+            },
+        ) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
     await _audit_live_control(

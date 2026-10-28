@@ -313,3 +313,43 @@ def test_optimization_summary_preserves_zero_oos_baseline():
     assert summary["train_stats"]["total_pnl"] == 0.0
     assert summary["test_stats"]["total_pnl"] == 0.0
     assert summary["oos_status"] == "available"
+
+
+def test_backtest_summary_keeps_an_undefined_metric_absent():
+    """An unmeasurable Sharpe/PSR/p-value must stay null, not become 0.
+
+    `_safe_float(value, 0.0)` turns an undefined PSR into the worst attainable
+    value and an undefined p-value into 1.0, so a run with too few daily returns
+    is listed as a measured result. The list payload has to carry the absence
+    through to the client, which renders it as unavailable.
+    """
+    import viewer.main as viewer_main_module
+
+    summary = viewer_main_module._backtest_summary_from_meta(
+        {
+            "id": "undef-1",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "initial_capital": 100000.0,
+            "total_pnl": 0.0,
+            "total_return": 0.0,
+            "sharpe_ratio": None,
+            "psr": None,
+            "p_value": None,
+        }
+    )
+
+    assert summary["sharpe"] is None
+    assert summary["psr"] is None
+    assert summary["p_value"] is None
+
+
+def test_undefined_metrics_are_not_published_as_zero():
+    """The database layer must tell "declared undefined" from "computed as 0"."""
+    from shared.database import _stat_number_or_undefined
+
+    assert _stat_number_or_undefined({"undefined_metrics": ["psr"]}, "psr", 0.0) is None
+    # A producer that named the metric with a real zero keeps that zero.
+    assert _stat_number_or_undefined({"psr": 0.0}, "psr", 0.0) == 0.0
+    # And an artifact written before the convention keeps its old default.
+    assert _stat_number_or_undefined({}, "psr", 0.0) == 0.0
