@@ -9,14 +9,17 @@ import subprocess
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
+    Float,
     String,
     TextClause,
     UniqueConstraint,
@@ -25,6 +28,7 @@ from sqlalchemy import (
     func,
     or_,
     text,
+    update,
 )
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
@@ -49,6 +53,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    resolve_defined_stat,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -299,13 +304,51 @@ class BacktestRecord(SQLModel, table=True):
     parameters: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     tags_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("tags", JSON, nullable=False),
+        sa_column=Column("tags", JSON, nullable=False, server_default=text("'[]'")),
     )
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
     equity_curve: list[dict[str, Any]] = Field(
-        default_factory=list, sa_column=Column("equity_curve", JSON, nullable=False)
+        default_factory=list,
+        # Production has this column NULLABLE with DEFAULT '[]'; the model says NOT NULL. The
+        # nullability difference is left alone on purpose - narrowing it is a separate decision, and
+        # a model that claimed NOT NULL where production allows NULL is a much smaller problem than
+        # one that writes where it cannot.
+        sa_column=Column("equity_curve", JSON, nullable=False, server_default=text("'[]'")),
+    )
+    # These four columns have existed in the physical table for some time - NOT NULL, with defaults
+    # 0.0/0.0/0.0/1.0 - but the model never mapped them. Two consequences, both live:
+    #
+    #   * every INSERT took `DEFAULT 0.0`, so the fabricated 0.0 a corpus audit kept finding
+    #     was **manufactured by the schema**, not by a legacy backward-compatibility path;
+    #   * `session.merge()` issues an UPDATE over *mapped* columns only, so re-saving a backtest
+    #     with freshly computed stats left the scalar column at its old value forever - so the JSON
+    #     `stats` blob and the scalar column could disagree permanently, by construction.
+    #
+    # Mapped here so the columns can hold what the code computed. The defaults match the physical
+    # definitions exactly, so a row that says nothing still stores what it stored before.
+    # `Field(default=...)` is a *Python-side* default only, so `create_all` would produce NOT NULL
+    # columns with **no database default** - a schema that diverges from production's, where these
+    # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
+    # and a fresh install would not match the database it is supposed to replace. So the defaults
+    # are declared at the schema level too, matching production exactly - verified read-only
+    # against `/home/ubuntu/data/backtests.db`.
+    sharpe_ratio: float = Field(
+        default=0.0,
+        sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
+    )
+    psr: float = Field(
+        default=0.0,
+        sa_column=Column("psr", Float, nullable=False, server_default="0.0"),
+    )
+    cagr: float = Field(
+        default=0.0,
+        sa_column=Column("cagr", Float, nullable=False, server_default="0.0"),
+    )
+    p_value: float = Field(
+        default=1.0,
+        sa_column=Column("p_value", Float, nullable=False, server_default="1.0"),
     )
 
 
@@ -509,13 +552,29 @@ class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
     id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
-    deployment_id: str = Field(index=True)
+    # Declared here, not only by `_migrate_schema`. A schema built by `create_all` used to have no
+    # foreign key on this column at all, so whether an orphan signal was even possible depended on
+    # which path created the database - and two test fixtures were relying on the difference. The
+    # migration still exists because SQLite cannot add a foreign key to an existing table; it now
+    # only has work to do on databases that predate this declaration.
+    deployment_id: str = Field(foreign_key="live_deployments.id", index=True)
     symbol: str = Field(index=True)
     action: str = Field(index=True)
     theoretical_price: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
-    source: str = Field(default="internal", index=True)
-    broker_order_id: str = Field(default="", index=True)
+    # Production stores DEFAULT 'internal' on this column; the model declared only the Python-side
+    # default, so a fresh install produced a NOT NULL column with no database default. `index` moves
+    # onto the Column because SQLAlchemy rejects it on Field when `sa_column` is given.
+    source: str = Field(
+        default="internal",
+        sa_column=Column("source", String, nullable=False, index=True,
+                         server_default=text("'internal'")),
+    )
+    broker_order_id: str = Field(
+        default="",
+        sa_column=Column("broker_order_id", String, nullable=False, index=True,
+                         server_default=text("''")),
+    )
     discord_message_id: str | None = Field(
         default=None,
         sa_column=Column("discord_message_id", String, nullable=True, index=True),
@@ -590,6 +649,14 @@ class LiveExecutionModel(SQLModel, table=True):
         default=None,
         sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
     )
+    # The broker's own per-fill id. Nullable and unindexed on purpose: it is *evidence*, not a
+    # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
+    # invite reading it as one. Adapters with no such id leave it NULL.
+    broker_fill_id: int | None = Field(default=None, nullable=True)
+    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad` or `absent`.
+    # Nullable and with no database default: a row written before this column existed has no
+    # verdict, and "no verdict" must not be fabricated into "observed".
+    actual_price_observed: str | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -604,6 +671,8 @@ class LiveExecutionModel(SQLModel, table=True):
             dedupe_key=(str(execution.dedupe_key).strip() or None)
             if execution.dedupe_key is not None
             else None,
+            broker_fill_id=execution.broker_fill_id,
+            actual_price_observed=execution.actual_price_observed,
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -616,6 +685,8 @@ class LiveExecutionModel(SQLModel, table=True):
             timestamp=self.timestamp,
             broker_order_id=self.broker_order_id,
             dedupe_key=self.dedupe_key,
+            broker_fill_id=self.broker_fill_id,
+            actual_price_observed=self.actual_price_observed,
         )
 
 
@@ -656,6 +727,10 @@ class LiveAccountModel(SQLModel, table=True):
     name: str = Field(default="", index=True)
     ctid: str | None = Field(default=None, index=True)
     broker_login: str | None = Field(default=None, index=True)
+    is_demo: bool = Field(
+        default=False,
+        sa_column=Column("is_demo", Boolean, nullable=False, index=True, server_default=text("0")),
+    )
 
     @classmethod
     def from_live_account(cls, account: LiveAccountConfig) -> "LiveAccountModel":
@@ -745,20 +820,40 @@ class LiveDeploymentModel(SQLModel, table=True):
     )
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
-    signal_source: str = Field(default="internal", index=True)
-    signal_source_type: str = Field(default="internal", index=True)
-    signal_source_id: str = Field(default="", index=True)
+    stopped_enforced_at: datetime | None = Field(default=None, index=True)
+    signal_source: str = Field(
+        default="internal",
+        sa_column=Column(
+            "signal_source", String, nullable=False, index=True, server_default=text("'internal'")
+        ),
+    )
+    signal_source_type: str = Field(
+        default="internal",
+        sa_column=Column(
+            "signal_source_type",
+            String,
+            nullable=False,
+            index=True,
+            server_default=text("'internal'"),
+        ),
+    )
+    signal_source_id: str = Field(
+        default="",
+        sa_column=Column(
+            "signal_source_id", String, nullable=False, index=True, server_default=text("''")
+        ),
+    )
     symbol_filter_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("symbol_filter", JSON, nullable=False),
+        sa_column=Column("symbol_filter", JSON, nullable=False, server_default=text("'[]'")),
     )
     signal_config_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("signal_config", JSON, nullable=False),
+        sa_column=Column("signal_config", JSON, nullable=False, server_default=text("'{}'")),
     )
     settings_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("settings", JSON, nullable=False),
+        sa_column=Column("settings", JSON, nullable=False, server_default=text("'{}'")),
     )
     created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
     updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
@@ -786,6 +881,10 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols_json=deployment.symbols,
             timeframe=deployment.timeframe,
             status=deployment.status,
+            # Preserved across a status write so stamping enforcement does not
+            # reset it. A transition out of STOPPED clears it explicitly in
+            # `update_live_deployment_status`.
+            stopped_enforced_at=deployment.stopped_enforced_at,
             signal_source=source_name,
             signal_source_type=source_type,
             signal_source_id=source_id,
@@ -806,6 +905,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols=self.symbols_json or [],
             timeframe=self.timeframe,
             status=self.status,
+            stopped_enforced_at=self.stopped_enforced_at,
             signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
             signal_source_id=str(self.signal_source_id or "").strip() or None,
             symbol_filter=[
@@ -817,6 +917,33 @@ class LiveDeploymentModel(SQLModel, table=True):
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
         )
+
+
+class LiveDeploymentSubmissionClaimModel(SQLModel, table=True):
+    """One in-flight submission lease per deployment.
+
+    The claim turns "still ACTIVE" from a snapshot taken earlier in the dispatch
+    into a single atomic database fact read immediately before the broker call.
+    A PAUSE either wins the race (the claim fails and nothing is sent) or is
+    already in effect while the claimed order finishes.
+
+    ``UNIQUE(deployment_id)`` is the point: with a non-unique index a second
+    dispatcher could claim the same ACTIVE deployment and both submit. Expired
+    leases are reaped by :func:`claim_live_deployment_submission`, and a live
+    submission renews its lease, so a slow broker call cannot silently lose it.
+    """
+
+    __tablename__ = "live_deployment_submission_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "deployment_id", name="uq_live_deployment_submission_claims_deployment"
+        ),
+    )
+
+    token: str = Field(primary_key=True)
+    deployment_id: str = Field(index=True)
+    claimed_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    expires_at: datetime = Field(index=True)
 
 
 class BackgroundTaskRecord(SQLModel, table=True):
@@ -1270,34 +1397,6 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 connection.commit()
 
 
-def _backfill_curve_for_id(connection: Connection, bt_id: str) -> list[dict[str, Any]]:
-    """Build a missing equity_curve from equity_points, else the JSON file."""
-    if _table_column_names(connection, "equity_points"):
-        points = connection.execute(
-            text(
-                "SELECT time, equity FROM equity_points "
-                "WHERE backtest_id = :id ORDER BY id"
-            ),
-            {"id": bt_id},
-        ).fetchall()
-        if points:
-            return [
-                {"time": str(time), "equity": float(equity)}
-                for time, equity in points
-            ]
-
-    json_path = DATA_DIR / "backtests" / f"{bt_id}.trades.json"
-    if json_path.exists():
-        try:
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        curve = payload.get("equity_curve")
-        if isinstance(curve, list) and curve:
-            return [dict(point) for point in curve if isinstance(point, dict)]
-    return []
-
-
 def _add_live_deployment_columns(connection: Connection, column_names: set[str]) -> None:
     """Add live_deployments signal-source and filter columns when missing."""
     if "settings" not in column_names:
@@ -1349,6 +1448,61 @@ def _add_live_deployment_columns(connection: Connection, column_names: set[str])
                 "ADD COLUMN symbol_filter JSON NOT NULL DEFAULT '[]'"
             )
         )
+    if "stopped_enforced_at" not in column_names:
+        # The STOPPED enforcement ledger used to be a set in daemon memory, so a
+        # restart re-ran cancel/flatten for deployments that were already
+        # stopped. Persisting the stamp makes the ledger survive the process.
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN stopped_enforced_at DATETIME"
+            )
+        )
+
+
+def _add_backtests_stat_columns(connection: Connection) -> None:
+    """Add the scalar stat columns to `backtests`, which were never migrated.
+
+    `sharpe_ratio`, `psr`, `cagr` and `p_value` exist in the production table and have done for some
+    time, but **no migration creates them**. They are absent from this model, so `create_all` never
+    made them, and there is no `_add_*_column` step for them either. Every database in existence
+    therefore splits two ways: production, where somebody added the columns by hand, and every other
+    database - a fresh install, a developer's sandbox, a test fixture - built from the model, where
+    they simply do not exist.
+
+    That is why the columns read `0.0` on 2,600 rows rather than being absent: on those rows the
+    *schema default* was taken, because nothing could write anything else.
+
+    It stayed invisible while the model ignored the columns, since nothing ever named them. It stops
+    being invisible the moment the model maps them, because then every `SELECT backtests.*` names
+    them and a database without them fails outright - which is exactly how this surfaced.
+
+    So the columns need the migration they should always have had. Definitions match production
+    exactly, verified read-only against `/home/ubuntu/data/backtests.db`:
+
+        sharpe_ratio REAL NOT NULL DEFAULT 0.0
+        psr         REAL NOT NULL DEFAULT 0.0
+        cagr        REAL NOT NULL DEFAULT 0.0
+        p_value     REAL NOT NULL DEFAULT 1.0
+
+    `p_value` defaults to 1.0, not 0.0, because "no evidence against the null hypothesis" is the
+    correct value for a p-value that was never computed; 0.0 would assert the opposite.
+
+    No-ops when the columns are already present, so this is safe on production and on repeat runs.
+    """
+    column_names = _table_column_names(connection, "backtests")
+    if not column_names:
+        return
+    for column, ddl in (
+        ("sharpe_ratio", "REAL NOT NULL DEFAULT 0.0"),
+        ("psr", "REAL NOT NULL DEFAULT 0.0"),
+        ("cagr", "REAL NOT NULL DEFAULT 0.0"),
+        ("p_value", "REAL NOT NULL DEFAULT 1.0"),
+    ):
+        if column not in column_names:
+            connection.execute(
+                text(f"ALTER TABLE backtests ADD COLUMN {column} {ddl}")
+            )
 
 
 def _add_backtests_tags_column(connection: Connection) -> None:
@@ -1370,6 +1524,13 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
     if "broker_login" not in column_names:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
+    # The model maps this now, so every `SELECT live_accounts.*` names it. A database built before
+    # that mapping existed does not have the column, and production's definition is NOT NULL
+    # DEFAULT 0 - matched here so a migrated database and a fresh one are the same shape.
+    if "is_demo" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
+        )
 
 
 def _add_background_task_columns(connection: Connection) -> None:
@@ -1482,6 +1643,48 @@ def _migrate_backtests_equity_curve(connection: Connection) -> None:
         _backfill_backtest_equity_curves(connection)
 
 
+def _add_live_executions_broker_fill_id(connection: Connection) -> None:
+    """Add `live_executions.broker_fill_id`, the broker's per-fill identifier.
+
+    The dedupe key is a string this codebase assembled, so "were these two rows the same broker
+    fill?" is not answerable from the table afterwards. When two equal-sized fills on one order
+    collide - the case backlog item 1 is about - taking the key apart is the only evidence there is,
+    and it is ambiguous by construction.
+
+    Nullable with no default and no index: recorded evidence, not a constraint. Uniqueness stays
+    with `dedupe_key` and its partial unique index, and adapters with no such id leave this NULL.
+    No-ops when the column already exists.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "broker_fill_id" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN broker_fill_id INTEGER"))
+
+
+def _add_live_executions_actual_price_observed(connection: Connection) -> None:
+    """Add `live_executions.actual_price_observed`, the verdict on `actual_price`.
+
+    `actual_price` cannot say whether the broker stated a price at all: the resolver's "could not
+    be read" sentinel is `0.0`, so an omitted price, an explicitly-sent zero and a genuine zero
+    are one stored value. Anything derived from such a row is meaningless, and nothing on the
+    table said which rows those were.
+
+    Nullable, no default, unindexed: a row written before this column existed has *no verdict*,
+    which is a different fact from `observed` and must not be fabricated into one. Additive only -
+    no existing row changes, and a reader that ignores the column behaves exactly as before.
+
+    No-ops when the column already exists, because `init_db` runs on every process start.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "actual_price_observed" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_executions ADD COLUMN actual_price_observed TEXT")
+        )
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -1496,21 +1699,374 @@ def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
         )
 
 
+_SMOKE_DEPLOYMENT_PREFIX = "ctrader-demo-smoke-"
+
+
+def _backfill_smoke_deployments(connection: Connection) -> int:
+    """Give smoke-sourced orphan signals the parent deployment row they were always meant to have.
+
+    ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
+    no deployment row, so those signals were invisible to every deployment-scoped query. This
+    recreates exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history
+    and future runs agree.
+
+    Three deliberate restrictions, each a guard against fabricating a trading record:
+
+    * only ids carrying the smoke prefix are touched - anything else is somebody's real deployment;
+    * the account must already exist in ``live_accounts``, because ``live_deployments.account_id``
+      carries a foreign key and an invented account would be worse than an orphan;
+    * the row is ``PAUSED`` with the smoke label as ``strategy_name``, following the existing
+      ``discord::`` convention for synthetic deployments, so no runner trades it.
+
+    **Adoption, not just creation.** ``live_deployments.id`` is typed ``uuid.UUID`` on
+    ``LiveDeploymentConfig``, so the readable label lives in ``strategy_name`` and the key is a
+    UUID. That means a parent can already exist under the same label with a different key - the
+    shape left by a run that predates this backfill - and the signals naming the label are still
+    orphans.
+    An earlier version skipped that case, which left the signals orphaned *and* the parent present:
+    the migration then failed its ``foreign_key_check`` and ``init_db()`` raised. So an existing
+    parent is adopted and the signals are repointed at it, exactly as a newly created one is.
+
+    Never deletes. Non-smoke orphans are left untouched and reported.
+
+    Returns the number of smoke deployment rows created *or* adopted.
+    """
+    column_names = _table_column_names(connection, "live_deployments")
+    signal_columns = _table_column_names(connection, "live_signals")
+    if "account_id" not in column_names or "deployment_id" not in signal_columns:
+        return 0
+
+    orphans = connection.execute(
+        text(
+            "SELECT s.deployment_id, s.symbol "
+            "FROM live_signals s "
+            "WHERE s.deployment_id LIKE :prefix "
+            "AND s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+        ),
+        {"prefix": _SMOKE_DEPLOYMENT_PREFIX + "%"},
+    ).fetchall()
+    if not orphans:
+        return 0
+
+    # One row per deployment, not per signal: the same smoke label covers every signal of that
+    # account, so iterating the pairs would count a deployment twice and give its `symbols` column
+    # whichever symbol happened to come back first.
+    symbols_by_deployment: dict[str, set[str]] = {}
+    for deployment_id, symbol in orphans:
+        symbols = symbols_by_deployment.setdefault(str(deployment_id), set())
+        if symbol:
+            symbols.add(str(symbol).upper())
+
+    resolved = 0
+    for deployment_id, symbols in symbols_by_deployment.items():
+        account_id = str(deployment_id)[len(_SMOKE_DEPLOYMENT_PREFIX):].strip()
+        if not account_id:
+            continue
+        known = connection.execute(
+            text("SELECT 1 FROM live_accounts WHERE id = :id"), {"id": account_id}
+        ).first()
+        if known is None:
+            # Refuse to invent an account. Leave the orphan and let the FK stay blocked.
+            logger.warning(
+                "Leaving smoke orphan %s: account %s is not in live_accounts",
+                deployment_id,
+                account_id,
+            )
+            continue
+        # A readable lookup keys on `strategy_name`, because the id is a UUID.
+        existing = connection.execute(
+            text("SELECT id FROM live_deployments WHERE strategy_name = :name"),
+            {"name": deployment_id},
+        ).first()
+        if existing is not None:
+            new_id = str(existing[0])
+        else:
+            new_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat(sep=" ")
+            connection.execute(
+                text(
+                    "INSERT INTO live_deployments "
+                    "(id, strategy_name, account_id, symbols, timeframe, status, "
+                    " signal_source, signal_source_type, signal_source_id, symbol_filter, "
+                    " signal_config, settings, created_at, updated_at) "
+                    "VALUES (:new_id, :name, :account_id, :symbols, '1m', 'PAUSED', "
+                    " 'smoke', 'internal', '', '[]', '{}', '{}', :now, :now)"
+                ),
+                {
+                    "new_id": new_id,
+                    "name": deployment_id,
+                    "account_id": account_id,
+                    "symbols": json.dumps(sorted(symbols)),
+                    "now": now,
+                },
+            )
+        # The signals still name the descriptive label, which is `strategy_name` rather than `id`.
+        # Repoint them, or the parent exists and every signal is still orphaned - the state this
+        # function exists to leave behind.
+        connection.execute(
+            text("UPDATE live_signals SET deployment_id = :new WHERE deployment_id = :old"),
+            {"new": new_id, "old": deployment_id},
+        )
+        resolved += 1
+    if resolved:
+        logger.info("Backfilled %d smoke deployment row(s) for orphaned signals", resolved)
+    return resolved
+
+
+def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
+    """Add the ``live_signals.deployment_id -> live_deployments.id`` foreign key.
+
+    SQLite cannot add a foreign key to an existing table, so the table is rebuilt: capture index DDL
+    *before* dropping, create the new table, copy, drop, rename, restore indexes.
+
+    Three traps this step exists to avoid:
+
+    * reading index DDL after ``DROP TABLE`` silently loses every index, because the drop removes
+      them. ``PRAGMA foreign_key_check`` validates referential integrity only and never notices.
+    * copying rows that violate the new constraint. That is not caught here either - the surrounding
+      ``_schema_migration_connection`` runs ``foreign_key_check`` and raises, rolling the whole
+      migration back. So this is safe to attempt while orphans remain: it either lands or changes
+      nothing.
+    * ``live_executions.signal_id`` already references ``live_signals(id)`` - a foreign key this
+      migration does not own and must not drop. With enforcement on, ``DROP TABLE live_signals`` is
+      refused *even when every dependent row has been removed*, because the surviving executions
+      point at rows inside the table being dropped. Measured on a production clone: the migration
+      failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
+      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes
+      a bad swap fail closed.
+
+    Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
+    On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
+    ``foreign_key_check`` reports the violation and the whole migration rolls back - so this is
+    fail-closed, not silent.
+
+    Returns True when the rebuild ran.
+    """
+    if any(
+        row[3] == "deployment_id"
+        for row in connection.execute(text("PRAGMA foreign_key_list(live_signals)")).fetchall()
+    ):
+        return False
+
+    # Capture index DDL before anything is dropped: DROP TABLE removes the indexes with it, and
+    # foreign_key_check validates referential integrity only, so lost indexes go unnoticed.
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_signals' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_signals'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        return False
+
+    # Reuse the real CREATE TABLE text and splice the constraint in just before the closing paren.
+    # Rebuilding from a column-name list silently drops PRIMARY KEY, which makes live_signals.id no
+    # longer unique - and live_executions has an FK to it, so every later pragma raises
+    # "foreign key mismatch" and the database is left unusable. The column-list approach was tried
+    # and failed exactly that way.
+    closing = create_sql.rstrip().rfind(")")
+    if closing == -1:
+        return False
+    body = create_sql.rstrip()[:closing].rstrip()
+    if body.endswith(","):
+        body = body[:-1]
+    new_create_sql = (
+        f"{body},\n\tFOREIGN KEY (deployment_id) REFERENCES live_deployments (id)\n)"
+    )
+
+    # The table name is rewritten through a pattern rather than `str.replace`, because SQLite may
+    # store it quoted: a rebuild that succeeds leaves `CREATE TABLE "live_signals" (...)` behind,
+    # and a plain replace of the unquoted spelling would then match nothing - so a second run (after
+    # the FK was lost some other way) would recreate `live_signals` while it still existed.
+    new_create_sql, replacements = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_signals\"|`live_signals`|\[live_signals\]|live_signals)",
+        "CREATE TABLE live_signals__fk_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if replacements != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_signals: could not address the table in its own CREATE statement"
+        )
+
+    columns = [
+        str(row[1])
+        for row in connection.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+    ]
+    if not columns:
+        return False
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(column) for column in columns
+    )
+
+    # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
+    # pragma while a transaction is open, so setting it mid-transaction leaves enforcement ON and
+    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN;
+    # this is here for callers that do not, and is restored in the finally below either way.
+    #
+    # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_signals__fk_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_signals__fk_new ({column_list}) "
+                f"SELECT {column_list} FROM live_signals"
+            )
+        )
+        connection.execute(text("DROP TABLE live_signals"))
+        connection.execute(text("ALTER TABLE live_signals__fk_new RENAME TO live_signals"))
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+    logger.info("Rebuilt live_signals with the deployment_id foreign key")
+    return True
+
+
+def _has_unique_index_on_column(connection: Connection, table: str, column: str) -> bool:
+    """True when ``table`` already enforces UNIQUE on exactly ``column``.
+
+    Covers both shapes SQLite can hold: a named index and the implicit
+    ``sqlite_autoindex_*`` behind a table-level UNIQUE constraint, which is what
+    ``SQLModel.metadata.create_all`` produces from the model declaration. A
+    database created fresh therefore needs no migration, and one created before
+    the constraint existed gets a named unique index instead.
+    """
+    quoted_table = connection.dialect.identifier_preparer.quote(table)
+    for row in connection.execute(text(f"PRAGMA index_list({quoted_table})")).fetchall():
+        if not bool(row[2]):  # row[2] is the "unique" flag
+            continue
+        index_name = str(row[1])
+        quoted_index = connection.dialect.identifier_preparer.quote(index_name)
+        indexed_columns = [
+            str(info[2])
+            for info in connection.execute(
+                text(f"PRAGMA index_info({quoted_index})")
+            ).fetchall()
+        ]
+        if indexed_columns == [column]:
+            return True
+    return False
+
+
+def _prune_duplicate_submission_claims(connection: Connection) -> int:
+    """Collapse concurrent claims for one deployment down to the live one.
+
+    A plain unique index cannot be created while two rows share a deployment, and
+    refusing the migration would take the whole database down for every caller,
+    which is a worse outcome than collapsing the duplicates.
+
+    The keeper is the **in-flight** lease, not merely the one with the latest
+    ``expires_at``. A lease that has not expired is a submission that may still
+    be at the broker, and deleting it would let a second dispatcher submit a
+    duplicate; an expired lease is evidence that an outcome was never observed.
+    So in-flight wins over expired unconditionally, and only among in-flight
+    leases does the latest expiry (the most remaining runway) decide. When every
+    lease has expired, the latest one is kept so the deployment stays claimable.
+    """
+    duplicated = connection.execute(
+        text(
+            "SELECT deployment_id FROM live_deployment_submission_claims "
+            "GROUP BY deployment_id HAVING COUNT(*) > 1"
+        )
+    ).fetchall()
+    now = _utcnow_naive()
+    removed = 0
+    for (deployment_id,) in duplicated:
+        keeper = connection.execute(
+            text(
+                "SELECT token FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id "
+                "ORDER BY (expires_at > :now) DESC, "
+                "expires_at DESC, claimed_at DESC, token DESC LIMIT 1"
+            ),
+            {"deployment_id": str(deployment_id), "now": now},
+        ).first()
+        if keeper is None:  # pragma: no cover - the group is non-empty by query
+            continue
+        result = connection.execute(
+            text(
+                "DELETE FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id AND token != :token"
+            ),
+            {"deployment_id": str(deployment_id), "token": str(keeper[0])},
+        )
+        dropped = int(result.rowcount or 0)
+        removed += dropped
+        logger.warning(
+            "Collapsed concurrent live deployment submission claims to satisfy the "
+            "one-lease-per-deployment invariant; the extra leases were superseded",
+            extra={"data": {"deployment_id": str(deployment_id), "dropped": dropped}},
+        )
+    return removed
+
+
+def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
+    """Make the live submission claim mutually exclusive per deployment.
+
+    ``deployment_id`` used to carry only a non-unique index, so two dispatchers
+    could both claim the same ACTIVE deployment and both submit. The claim is
+    the only thing standing between a stale "still ACTIVE" snapshot and a real
+    broker order, so the uniqueness is enforced by the database itself.
+    """
+    if not _table_column_names(connection, "live_deployment_submission_claims"):
+        return
+    if _has_unique_index_on_column(
+        connection, "live_deployment_submission_claims", "deployment_id"
+    ):
+        return
+    _prune_duplicate_submission_claims(connection)
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_live_deployment_submission_claims_deployment "
+            "ON live_deployment_submission_claims(deployment_id)"
+        )
+    )
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
         _add_backtests_tags_column(connection)
+        _add_backtests_stat_columns(connection)
         _add_live_account_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
 
+        # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a
+        # row that violates the constraint it is introducing. On a database whose only orphans are
+        # smoke-shaped this makes the FK land; anything left over keeps the migration fail-closed
+        # via `foreign_key_check` at the end of `_schema_migration_connection`.
+        _backfill_smoke_deployments(connection)
+        _migrate_live_signal_deployment_fk(connection)
+
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
+        _migrate_live_submission_claim_uniqueness(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
+        _add_live_executions_broker_fill_id(connection)
+        _add_live_executions_actual_price_observed(connection)
 
 
 def _find_existing_live_signal(
@@ -1719,10 +2275,6 @@ def save_live_execution_up_to_cumulative(
                 .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
                 .limit(1)
             ).first()
-            if existing is not None:
-                session.rollback()
-                return 0.0
-
             local_filled_qty = float(
                 session.exec(
                     select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
@@ -1731,6 +2283,56 @@ def save_live_execution_up_to_cumulative(
                 ).one()
                 or 0.0
             )
+            if existing is not None:
+                # Same dedupe key. Two very different situations share this branch, and conflating
+                # them loses fills:
+                #
+                #   redelivery   the broker sent the same deal again, unchanged. Dropping it is
+                #                right - this is the duplicate the key exists to catch.
+                #   amendment    the broker sent the same dealId with a LARGER quantity, because
+                #                `ProtoOADeal` carries `filledVolume` and the deal grew. Dropping it
+                #                freezes the stored quantity at its first-seen value and the rest of
+                #                the fill is never recorded.
+                #
+                # cTrader exposes no fill-level identifier - a deal entry has dealId, orderId,
+                # positionId and symbolId and nothing finer - so an order split into several fills
+                # arrives as several deals with distinct dealIds, each stored. That case is already
+                # correct. The remaining risk is amendment, and it is handled here: only an increase
+                # amends, and a decrease is treated as redelivery rather than shrinking a fill that
+                # already happened.
+                #
+                # The increase is capped by what the broker still says is missing for the whole
+                # signal, exactly as the insert path below is. Without the cap a redelivery of a
+                # deal whose first insert was itself capped - because the broker's cumulative was
+                # lower than the deal claimed - would grow the stored total past the broker's own
+                # number, which is the same over-count the dedupe key exists to prevent.
+                prior_qty = float(existing.filled_qty or 0.0)
+                delta = min(requested_qty - prior_qty, cumulative_qty - local_filled_qty)
+                if delta <= 0.0:
+                    session.rollback()
+                    return 0.0
+                existing.filled_qty = prior_qty + delta
+                if record.commission:
+                    # Commission was recorded against the first-seen quantity, so only the
+                    # incremental slice needs adding. A deal that reports commission per unit is
+                    # handled by the caller scaling it, same as the partial-persist path below.
+                    existing.commission = float(existing.commission or 0.0) + float(
+                        record.commission
+                    ) * (delta / requested_qty)
+                if record.actual_price and not existing.actual_price:
+                    existing.actual_price = float(record.actual_price)
+                session.add(existing)
+                session.commit()
+                logger.info(
+                    "Amended live execution %s: dedupe key %s repeated with a larger quantity, "
+                    "filled_qty %s -> %s",
+                    existing.id,
+                    existing.dedupe_key,
+                    prior_qty,
+                    existing.filled_qty,
+                )
+                return delta
+
             persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
@@ -2153,24 +2755,58 @@ def update_service_status(
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
+    respect_operator_intent: bool = True,
 ) -> Service | None:
+    """Write a service's status, with PAUSED as an atomic floor.
+
+    `respect_operator_intent` makes PAUSED a floor: a PAUSED service is never
+    moved to any other status by this function. The pause was set by a person
+    through the API, and nothing the process observes afterwards - a message
+    arriving, a connector failing, a reconnect completing - outranks that.
+
+    The check is a conditional ``UPDATE`` rather than read-check-write. The
+    previous shape read the row, compared in Python, and wrote it back, so a
+    FAILED write that committed between the read and the write silently
+    overwrote PAUSED; `_recover_failed_services` then read FAILED and restarted
+    the bot the operator had paused. SQLite serialises writers, so a single
+    statement whose ``WHERE`` re-tests the status cannot lose that race.
+
+    Pass `respect_operator_intent=False` only where the caller is *establishing*
+    operator intent, i.e. an API call that is itself setting or clearing a pause.
+    """
     normalized_id = str(service_id or "").strip()
     if not normalized_id:
         return None
     normalized_status = _normalize_service_status(status)
     init_db()
+    values: dict[str, Any] = {
+        "status": normalized_status,
+        "updated_at": _utcnow_naive(),
+    }
+    if last_activity is not None:
+        values["last_activity"] = last_activity
     with get_session() as session:
+        statement = (
+            update(ServiceModel)
+            .where(ServiceModel.id == normalized_id)
+            .values(**values)
+        )
+        if (
+            respect_operator_intent
+            and normalized_status != ServiceStatus.PAUSED.value
+        ):
+            # Re-tested in the same statement as the write, so a concurrent
+            # PAUSE cannot be overwritten by a FAILED/RUNNING landing after it.
+            statement = statement.where(
+                ServiceModel.status != ServiceStatus.PAUSED.value
+            )
+        session.execute(statement)
+        session.commit()
         record = session.get(ServiceModel, normalized_id)
         if record is None:
             return None
-        record.status = normalized_status
-        if last_activity is not None:
-            record.last_activity = last_activity
-        record.updated_at = _utcnow_naive()
-        session.add(record)
-        session.commit()
         session.refresh(record)
-    return record.to_service()
+        return record.to_service()
 
 
 def delete_service(service_id: str) -> bool:
@@ -2240,12 +2876,27 @@ def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
 
-    validate_stockkit_deployment_route(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
         if account is None:
             raise ValueError(f"Unknown live account '{deployment.account_id}'")
+        # Validate routing against the account's broker-reported identity, not
+        # the local account id, which is a different identifier space. The
+        # accounts-env is supplied so route resolution follows the configured
+        # account labels rather than a hardcoded table.
+        try:
+            from live_runner.credential_env import load_accounts_env_values
+            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+            route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+        except Exception:
+            route_env = {}
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account.broker_login or account.ctid or "",
+            accounts_env_values=route_env,
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
@@ -2276,6 +2927,15 @@ def update_live_deployment_status(
         if record is None:
             return None
         record.status = next_status
+        if next_status != "STOPPED":
+            # Clear the enforcement stamp in the *same* transaction as the
+            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
+            # keeps the old stamp, and the second stop is skipped as "already
+            # enforced" while its positions are still open. Doing it in one
+            # commit matters: a crash between the two writes must not leave a
+            # non-STOPPED deployment carrying a stamp that disables the next
+            # enforcement.
+            record.stopped_enforced_at = None
         record.updated_at = _utcnow_naive()
         session.add(record)
         session.commit()
@@ -2283,14 +2943,325 @@ def update_live_deployment_status(
     return record.to_live_deployment()
 
 
-def delete_live_deployment(deployment_id: str) -> bool:
+#: How long one submission lease is valid. Short enough that a crashed
+#: dispatcher does not wedge a deployment for long, long enough that a normal
+#: broker call finishes well inside it. A slow call renews its lease (see
+#: :func:`renew_live_deployment_submission`), so this is not a hard cap on
+#: submission duration.
+LIVE_SUBMISSION_CLAIM_TTL_SECONDS = 30.0
+
+
+def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Record that STOPPED enforcement completed for this deployment.
+
+    Only called when the adapter's cancel/flatten sweeps were *complete*; a
+    partial sweep must stay unmarked so the next tick retries it.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
     init_db()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, deployment_id)
+        record = session.get(LiveDeploymentModel, normalized)
         if record is None:
             return False
-        session.delete(record)
+        now = _utcnow_naive()
+        record.stopped_enforced_at = now
+        record.updated_at = now
+        session.add(record)
         session.commit()
+    return True
+
+
+def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Forget the enforcement stamp so a later STOPPED transition re-enforces.
+
+    The status transition clears it transactionally; this helper exists for the
+    daemon's cleanup path, which may observe a deployment that left STOPPED
+    without a status write it performed itself.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        record.stopped_enforced_at = None
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def list_stopped_enforced_deployment_ids() -> set[str]:
+    """Deployment ids whose STOPPED enforcement already completed.
+
+    Read once at daemon startup to rebuild the in-memory ledger, so a restart
+    does not repeat cancel/flatten work that is already done.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveDeploymentModel.id).where(
+                LiveDeploymentModel.stopped_enforced_at.is_not(None)
+            )
+        ).all()
+    return {str(row) for row in rows}
+
+
+def claim_live_deployment_submission(
+    deployment_id: str,
+    token: str,
+    *,
+    ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+) -> bool:
+    """Take the single submission lease for one deployment, or refuse.
+
+    Two independent facts have to hold, and both are decided by the database
+    rather than by a status snapshot taken earlier in the dispatch:
+
+    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
+      live row, so a PAUSE that committed first wins the race);
+    * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    An expired lease is deleted first, in its own committed transaction, so a
+    claimer that died mid-submission cannot wedge the deployment forever. The
+    cleanup is committed separately on purpose: it must survive a refused
+    claim, otherwise a permanently-busy deployment would also stop reaping its
+    own dead leases.
+    """
+    normalized_id = str(deployment_id or "").strip()
+    normalized_token = str(token or "").strip()
+    if not normalized_id or not normalized_token:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    with get_session() as session:
+        session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+                & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+            )
+        )
+        session.commit()
+    with get_session() as session:
+        try:
+            result = session.execute(
+                text(
+                    "INSERT INTO live_deployment_submission_claims "
+                    "(token, deployment_id, claimed_at, expires_at) "
+                    "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
+                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                ),
+                {
+                    "token": normalized_token,
+                    "claimed_at": now,
+                    "expires_at": expires_at,
+                    "deployment_id": normalized_id,
+                },
+            )
+            session.commit()
+            return int(result.rowcount or 0) == 1
+        except IntegrityError:
+            # The UNIQUE(deployment_id) lease is held: another dispatcher is
+            # already submitting for this deployment. Refusing is the point.
+            session.rollback()
+            logger.warning(
+                "Live deployment submission already claimed by another "
+                "dispatcher; refusing the second claim",
+                extra={"data": {"deployment_id": normalized_id, "token": normalized_token}},
+            )
+            return False
+        except Exception:
+            session.rollback()
+            raise
+
+
+def renew_live_deployment_submission(
+    token: str,
+    *,
+    ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+) -> bool:
+    """Extend a held lease so a slow broker call does not lose it.
+
+    The claim has a TTL, and a submission that outlives it used to become
+    reclaimable while it was still at the broker: a second dispatcher would then
+    take the lease and submit a duplicate order. Renewal is only valid for the
+    token that still owns the row, so a lease that was already reaped or taken
+    over cannot be revived.
+    """
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployment_submission_claims "
+                "SET expires_at = :expires_at WHERE token = :token"
+            ),
+            {"expires_at": expires_at, "token": normalized_token},
+        )
+        session.commit()
+        return int(result.rowcount or 0) == 1
+
+
+def release_live_deployment_submission(token: str) -> bool:
+    """Release a lease whose submission outcome is known.
+
+    Never called when the outcome is unknown: a broker may have accepted an
+    order whose response was lost, and releasing the lease would let the next
+    signal submit a duplicate before anyone reconciled.
+    """
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    init_db()
+    with get_session() as session:
+        result = session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                LiveDeploymentSubmissionClaimModel.token == normalized_token
+            )
+        )
+        session.commit()
+        return int(result.rowcount or 0) > 0
+
+
+@dataclass(frozen=True)
+class LiveDeploymentSubmissionClaim:
+    """One observed submission lease, and whether it is still within its TTL."""
+
+    token: str
+    expires_at: datetime
+    expired: bool
+
+
+def list_live_deployment_submission_claims(
+    deployment_id: str,
+) -> list[LiveDeploymentSubmissionClaim]:
+    """Read-only inventory of the submission leases held for ``deployment_id``.
+
+    This never deletes anything. An expired-but-never-released claim is
+    *evidence that an outcome was never observed*, and must not read as "nothing
+    was in flight".
+    """
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return []
+    init_db()
+    now = _utcnow_naive()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveDeploymentSubmissionClaimModel.token,
+                LiveDeploymentSubmissionClaimModel.expires_at,
+            ).where(LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+        ).all()
+    return [
+        LiveDeploymentSubmissionClaim(
+            token=str(row[0]),
+            expires_at=row[1],
+            expired=row[1] <= now,
+        )
+        for row in rows
+    ]
+
+
+class LiveDeploymentInUseError(RuntimeError):
+    """Raised when a deployment cannot be deleted because records still reference it.
+
+    A typed error instead of the driver's ``IntegrityError`` escaping through the ORM: the caller
+    has to make a decision - refuse, archive, or delete the history deliberately first - and a
+    ``sqlite3.IntegrityError`` cannot carry that. Nothing is deleted when this is raised, and the
+    check happens before the delete rather than relying on the foreign key, so the behaviour is the
+    same on a database whose ``live_signals.deployment_id`` key was never migrated in.
+    """
+
+    def __init__(
+        self,
+        deployment_id: str,
+        *,
+        signal_count: int | None = None,
+        execution_count: int | None = None,
+    ) -> None:
+        detail = ""
+        if signal_count is not None and execution_count is not None:
+            detail = f" ({signal_count} signal(s), {execution_count} execution(s))"
+        super().__init__(
+            f"Deployment {deployment_id} still has records referencing it{detail}; nothing was "
+            f"deleted. Resolve or remove those records explicitly if the history is expendable."
+        )
+        self.deployment_id = deployment_id
+        self.signal_count = signal_count
+        self.execution_count = execution_count
+
+
+def delete_live_deployment(deployment_id: str) -> bool:
+    """Delete a deployment, refusing while signals or executions still reference it.
+
+    It used to attempt the delete unconditionally, so any deployment with history raised a raw
+    ``sqlite3.IntegrityError`` out of the ORM - the viewer turned that into a 500 after having
+    already set the deployment PAUSED, leaving it stuck there. Deleting the signals as a cascade
+    would have "worked", but it silently destroys the execution record of real trades, which is the
+    one thing this database exists to keep.
+
+    So the refusal is explicit and typed, the counts come with it, and the caller decides. Returns
+    True when the row was deleted and False when it was already absent.
+    """
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return False
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveDeploymentModel, normalized_id)
+            if record is None:
+                session.rollback()
+                return False
+            signal_count = int(
+                session.exec(
+                    select(func.count(LiveSignalModel.id)).where(
+                        LiveSignalModel.deployment_id == normalized_id
+                    )
+                ).one()
+                or 0
+            )
+            execution_count = int(
+                session.exec(
+                    select(func.count(LiveExecutionModel.id))
+                    .join(
+                        LiveSignalModel,
+                        LiveExecutionModel.signal_id == LiveSignalModel.id,
+                    )
+                    .where(LiveSignalModel.deployment_id == normalized_id)
+                ).one()
+                or 0
+            )
+            if signal_count or execution_count:
+                session.rollback()
+                raise LiveDeploymentInUseError(
+                    normalized_id,
+                    signal_count=signal_count,
+                    execution_count=execution_count,
+                )
+            session.delete(record)
+            session.commit()
+        except LiveDeploymentInUseError:
+            raise
+        except IntegrityError as exc:
+            # A signal inserted between the count and the delete. The foreign key caught it, and the
+            # caller gets the same typed refusal rather than a driver exception.
+            session.rollback()
+            raise LiveDeploymentInUseError(normalized_id) from exc
+        except Exception:
+            session.rollback()
+            raise
     return True
 
 
@@ -2588,6 +3559,73 @@ def list_live_signals_for_replay(
     return _replay_signal_payload(rows)
 
 
+# The scalar stat columns, with the default each physically carries. `p_value` defaults to 1.0
+# because "no evidence against the null hypothesis" is the right value for a p-value that was never
+# computed - which is exactly why it must never be silently replaced by 0.0.
+_SCALAR_STAT_COLUMNS: tuple[tuple[str, float], ...] = (
+    ("sharpe_ratio", 0.0),
+    ("psr", 0.0),
+    ("cagr", 0.0),
+    ("p_value", 1.0),
+)
+
+
+def _scalar_stats_for_save(
+    session: Any, backtest_id: str, stats: dict[str, Any]
+) -> dict[str, float]:
+    """The values the four scalar stat columns should hold after this save.
+
+    A metric the stats **define** is written. A metric they do not - because the producer listed it
+    in `undefined_metrics`, or because the artifact predates the convention and never named it -
+    **carries its current column value forward**.
+
+    That second half is the whole point. These columns are NOT NULL, so "undefined" cannot be
+    stored. Letting the model's default land instead would mean a re-save of a backtest whose
+    Sharpe is no longer computable overwrites a real stored value with 0.0 - destroying data to
+    express absence, which is the failure the corpus audit found in the first place, reintroduced
+    by the fix for it. So absence leaves the column alone and only a finite number moves it - a
+    malformed or non-finite value is not a number the column can hold honestly, so it counts as
+    absence and is logged.
+    """
+    current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
+    row = session.exec(
+        select(
+            BacktestRecord.sharpe_ratio,
+            BacktestRecord.psr,
+            BacktestRecord.cagr,
+            BacktestRecord.p_value,
+        ).where(BacktestRecord.id == backtest_id)
+    ).first()
+    if row is not None:
+        current.update(zip((name for name, _ in _SCALAR_STAT_COLUMNS), row))
+    resolved: dict[str, float] = {}
+    for name, _default in _SCALAR_STAT_COLUMNS:
+        # `default=None` makes "the producer did not name it" and "the producer declared it
+        # undefined" both resolve to None, which is precisely the do-not-write case.
+        value = resolve_defined_stat(stats, name, None)
+        resolved[name] = current[name]
+        if value is None:
+            continue
+        # A value that is not a finite number cannot be stored honestly: the columns are NOT NULL
+        # REAL, and a stored NaN or infinity poisons every later comparison and any JSON read of
+        # the row. Carrying the stored value forward is the same rule as for an absent metric, and
+        # it is logged because a malformed number is a producer bug, not an absence.
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        if math.isfinite(number):
+            resolved[name] = number
+        else:
+            logger.warning(
+                "Ignoring unusable %s value %r for backtest %s: not a finite number",
+                name,
+                value,
+                backtest_id,
+            )
+    return resolved
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -2681,8 +3719,14 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
             "reject_missing_stop": result.meta.reject_missing_stop,
             "require_explicit_column_roles": result.meta.require_explicit_column_roles,
         }
+        scalar_stats = _scalar_stats_for_save(session, backtest_id, result.stats or {})
+
         backtest_record = BacktestRecord(
             id=backtest_id,
+            sharpe_ratio=scalar_stats["sharpe_ratio"],
+            psr=scalar_stats["psr"],
+            cagr=scalar_stats["cagr"],
+            p_value=scalar_stats["p_value"],
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,

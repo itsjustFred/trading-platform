@@ -97,6 +97,37 @@ def isolated_db_no_schema(monkeypatch, tmp_path: Path):
     yield from _make_sandbox_db(monkeypatch, tmp_path, create_schema=False)
 
 
+def seed_live_deployments(
+    database, deployment_ids, *, account_id: str = "fixture-account"
+) -> None:
+    """Create the parent rows that a fixture's synthetic signals point at.
+
+    ``live_signals.deployment_id`` carries a foreign key, so a fixture writing a signal has to write
+    its deployment first, exactly like production code does. One definition, because several modules
+    write signals against synthetic ids and every one of them predates the constraint.
+    """
+    database.init_db()
+    with database.get_session() as session:
+        if session.get(database.LiveAccountModel, account_id) is None:
+            session.add(
+                database.LiveAccountModel(id=account_id, broker="fixture", name=account_id)
+            )
+            session.flush()
+        for deployment_id in deployment_ids:
+            if session.get(database.LiveDeploymentModel, deployment_id) is None:
+                session.add(
+                    database.LiveDeploymentModel(
+                        id=deployment_id,
+                        strategy_name=f"fixture-{deployment_id}",
+                        account_id=account_id,
+                        symbols_json=[],
+                        timeframe="1m",
+                        status="PAUSED",
+                    )
+                )
+        session.commit()
+
+
 @lru_cache(maxsize=None)
 def _playwright_browser_launchable(browser_name: str) -> tuple[bool, str]:
     from playwright.sync_api import sync_playwright
