@@ -301,7 +301,13 @@ def data_staleness_reason(identity: Any) -> str | None:
         current = file_fingerprint(path)
         if current is None:
             return f"data file is gone: {path}"
-        if current != (int(entry.get("mtime_ns", -1)), int(entry.get("size_bytes", -1))):
+        try:
+            recorded = (int(entry.get("mtime_ns", -1)), int(entry.get("size_bytes", -1)))
+        except (TypeError, ValueError):
+            # A malformed recorded stat cannot be compared, and "I cannot check
+            # it" is exactly the case that must not be served.
+            return f"a recorded data file entry is unreadable: {path}"
+        if current != recorded:
             return f"data file changed since the run: {path}"
     if data.get("fingerprint") != fingerprint_of(files):
         return "the recorded data fingerprint does not match its own file list"

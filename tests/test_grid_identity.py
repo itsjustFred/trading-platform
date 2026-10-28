@@ -18,6 +18,7 @@ from runner.grid_identity import (
     cell_identity,
     data_fingerprint,
     data_staleness_reason,
+    fingerprint_of,
     identity_matches,
     read_identity,
     strategy_source_sha256,
@@ -209,6 +210,29 @@ def test_data_staleness_reason_detects_a_tampered_file_list(tmp_path):
     reason = data_staleness_reason(tampered)
 
     assert reason is not None and "fingerprint" in reason
+
+
+def test_data_staleness_reason_refuses_a_malformed_recorded_stat(tmp_path):
+    """A stat that cannot be converted is unverifiable, not a match.
+
+    `int()` on a hand-edited or corrupted `mtime_ns`/`size_bytes` raises, and an
+    exception escaping here would turn "I cannot check it" into a crash instead
+    of the refusal the caller needs.
+    """
+    _setup(tmp_path)
+    identity = _identity(tmp_path)
+    files = [
+        {**entry, "mtime_ns": "not-a-number"}
+        for entry in identity["data"]["files"]
+    ]
+    malformed = {
+        **identity,
+        "data": {**identity["data"], "files": files, "fingerprint": fingerprint_of(files)},
+    }
+
+    reason = data_staleness_reason(malformed)
+
+    assert reason is not None and "unreadable" in reason
 
 
 @pytest.mark.parametrize(

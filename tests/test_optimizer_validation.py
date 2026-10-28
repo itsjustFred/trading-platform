@@ -571,10 +571,12 @@ def test_split_period_applies_an_embargo_gap():
     train_end = pd.Timestamp(train["end"])
     test_start = pd.Timestamp(test["start"])
     assert test_start > train_end
-    # 10-day window, 10% embargo => about a day of dead time.
-    assert (test_start - train_end) == pytest.approx(
-        pd.Timedelta(days=1), abs=pd.Timedelta(minutes=1)
-    )
+    # 10-day window, 10% embargo => a day of dead time. Asserted as an explicit
+    # interval rather than an approximate Timedelta: the percentage is applied
+    # in floating point, so the exact nanosecond is not a contract, but "a day,
+    # not an hour and not two days" is.
+    gap = test_start - train_end
+    assert pd.Timedelta(hours=23) < gap <= pd.Timedelta(days=1, seconds=1)
 
 
 def test_split_period_without_embargo_stays_contiguous():
@@ -588,9 +590,11 @@ def test_split_period_without_embargo_stays_contiguous():
         0.7,
         embargo_days=0,
     )
-    assert pd.Timestamp(test["start"]) - pd.Timestamp(train["end"]) == pytest.approx(
-        pd.Timedelta(microseconds=1), abs=pd.Timedelta(seconds=1)
-    )
+    # No embargo requested: the windows are contiguous but must not share the
+    # split bar, so the gap is exactly the one-microsecond offset.
+    assert (
+        pd.Timestamp(test["start"]) - pd.Timestamp(train["end"])
+    ) == pd.Timedelta(microseconds=1)
 
 
 def test_split_period_rejects_an_embargo_that_eats_the_test_window():

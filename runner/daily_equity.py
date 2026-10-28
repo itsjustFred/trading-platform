@@ -228,6 +228,7 @@ def _daily_points_from_engine_curve(
     result: BacktestResult,
     *,
     start: datetime | None = None,
+    end: datetime | None = None,
     starting_equity: float | None = None,
 ) -> tuple[list[EquityPoint], list[dict[str, Any]]] | None:
     """Compact a reconciling engine curve to one point per calendar day.
@@ -238,9 +239,13 @@ def _daily_points_from_engine_curve(
     PnL) it is the more faithful daily series and is preferred. Days the engine
     curve skipped are emitted as explicit flat points (see
     :func:`_fill_engine_curve_gaps`) so no multi-day move is booked as a single
-    day. Returns None when the curve does not reconcile, is not parseable, or is
-    endpoint-only (fewer than ``MIN_RECONCILING_ENGINE_CURVE_POINTS`` points
-    carry no path).
+    day, and the series is carried flat through the window end so it describes
+    the same period the calendar fill does — otherwise the same window would
+    publish a different number of daily returns depending on which path built
+    it, and Sharpe's denominator would depend on where the engine stopped
+    observing. Returns None when the curve does not reconcile, is not parseable,
+    or is endpoint-only (fewer than ``MIN_RECONCILING_ENGINE_CURVE_POINTS``
+    points carry no path).
     """
     if not result.trades:
         return None
@@ -306,13 +311,33 @@ def _daily_points_from_engine_curve(
 
     last_by_day: dict[str, tuple[datetime, float]] = {}
     for timestamp, equity in curve[start_index:]:
-        # Anything on or before the baseline day is already represented by the
-        # opening point; keeping it would make the published curve go backwards.
-        if timestamp.date() <= baseline.date():
+        # Anything BEFORE the baseline day is outside the window. A later
+        # observation on the baseline day itself is that day's close and is
+        # kept: dropping it would silently discard the first day's move, which
+        # is the same defect the daily-return series had.
+        if timestamp.date() < baseline.date():
             continue
         last_by_day[timestamp.date().isoformat()] = (timestamp, equity)
 
     ordered = _fill_engine_curve_gaps(baseline.date(), base_equity, last_by_day)
+
+    # Carry the flat tail through the window end. The calendar fill emits every
+    # day of the window, so a series that stopped at the engine's last
+    # observation would report fewer daily returns for the same window — a
+    # shorter Sharpe sample decided by where the engine happened to stop.
+    if end is not None and ordered:
+        end_day = end.astimezone(timezone.utc).date()
+        cursor_date, cursor_equity = ordered[-1][0].date(), ordered[-1][1]
+        while cursor_date < end_day:
+            cursor_date += timedelta(days=1)
+            ordered.append(
+                (
+                    datetime.combine(
+                        cursor_date, datetime.min.time(), tzinfo=timezone.utc
+                    ),
+                    cursor_equity,
+                )
+            )
 
     for timestamp, equity in ordered:
         points.append(EquityPoint(time=timestamp.isoformat(), equity=round(equity, 2)))
@@ -768,9 +793,14 @@ def attach_daily_equity(
     # mark-to-market path of open positions, which the calendar fill (built
     # from closed trades only) cannot see. Gated on being non-endpoint-only and
     # on reconciling with the net ledger within the derived tolerance.
+    # The window end is the explicit bound when one was requested, else the
+    # artifact's own `backtest_end` — the same window `build_daily_equity_curve`
+    # filled, so both paths publish the same period.
+    window_end = end_bound if end_bound is not None else _parse_ts(result.meta.backtest_end)
     engine_daily = _daily_points_from_engine_curve(
         scoped_result,
         start=start_bound,
+        end=window_end,
         starting_equity=starting_equity,
     )
     if engine_daily is not None:
