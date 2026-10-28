@@ -2649,14 +2649,96 @@ def update_live_deployment_status(
     return record.to_live_deployment()
 
 
+class LiveDeploymentInUseError(RuntimeError):
+    """Raised when a deployment cannot be deleted because records still reference it.
+
+    A typed error instead of the driver's ``IntegrityError`` escaping through the ORM: the caller has
+    to make a decision - refuse, archive, or delete the history deliberately first - and a
+    ``sqlite3.IntegrityError`` cannot carry that. Nothing is deleted when this is raised, and the
+    check happens before the delete rather than relying on the foreign key, so the behaviour is the
+    same on a database whose ``live_signals.deployment_id`` key was never migrated in.
+    """
+
+    def __init__(
+        self,
+        deployment_id: str,
+        *,
+        signal_count: int | None = None,
+        execution_count: int | None = None,
+    ) -> None:
+        detail = ""
+        if signal_count is not None and execution_count is not None:
+            detail = f" ({signal_count} signal(s), {execution_count} execution(s))"
+        super().__init__(
+            f"Deployment {deployment_id} still has records referencing it{detail}; nothing was "
+            f"deleted. Resolve or remove those records explicitly if the history is expendable."
+        )
+        self.deployment_id = deployment_id
+        self.signal_count = signal_count
+        self.execution_count = execution_count
+
+
 def delete_live_deployment(deployment_id: str) -> bool:
+    """Delete a deployment, refusing while signals or executions still reference it.
+
+    It used to attempt the delete unconditionally, so any deployment with history raised a raw
+    ``sqlite3.IntegrityError`` out of the ORM - the viewer turned that into a 500 after having
+    already set the deployment PAUSED, leaving it stuck there. Deleting the signals as a cascade
+    would have "worked", but it silently destroys the execution record of real trades, which is the
+    one thing this database exists to keep.
+
+    So the refusal is explicit and typed, the counts come with it, and the caller decides. Returns
+    True when the row was deleted and False when it was already absent.
+    """
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return False
     init_db()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, deployment_id)
-        if record is None:
-            return False
-        session.delete(record)
-        session.commit()
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveDeploymentModel, normalized_id)
+            if record is None:
+                session.rollback()
+                return False
+            signal_count = int(
+                session.exec(
+                    select(func.count(LiveSignalModel.id)).where(
+                        LiveSignalModel.deployment_id == normalized_id
+                    )
+                ).one()
+                or 0
+            )
+            execution_count = int(
+                session.exec(
+                    select(func.count(LiveExecutionModel.id))
+                    .join(
+                        LiveSignalModel,
+                        LiveExecutionModel.signal_id == LiveSignalModel.id,
+                    )
+                    .where(LiveSignalModel.deployment_id == normalized_id)
+                ).one()
+                or 0
+            )
+            if signal_count or execution_count:
+                session.rollback()
+                raise LiveDeploymentInUseError(
+                    normalized_id,
+                    signal_count=signal_count,
+                    execution_count=execution_count,
+                )
+            session.delete(record)
+            session.commit()
+        except LiveDeploymentInUseError:
+            raise
+        except IntegrityError as exc:
+            # A signal inserted between the count and the delete. The foreign key caught it, and the
+            # caller gets the same typed refusal rather than a driver exception.
+            session.rollback()
+            raise LiveDeploymentInUseError(normalized_id) from exc
+        except Exception:
+            session.rollback()
+            raise
     return True
 
 
