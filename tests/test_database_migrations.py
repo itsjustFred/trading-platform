@@ -1,6 +1,8 @@
 """Tests for database migrations and model persistence."""
 import json
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -575,3 +577,36 @@ def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> N
     summary2 = migrate_json_to_sqlite(skip_existing=True)
     assert summary2["migrated"] == 0
     assert summary2["skipped"] == 1
+
+
+def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db) -> None:
+    """A database built before `is_demo` was mapped must gain the column.
+
+    Mapping a column in the model makes every `SELECT live_accounts.*` name it, so a database whose
+    `live_accounts` predates the mapping fails outright - the same shape as the four scalar stat
+    columns in `backtests`. Production's definition is `NOT NULL DEFAULT 0`; a migrated database
+    must end up with the same shape as a fresh one.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    db_path = Path(database.DB_PATH)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE live_accounts")
+        conn.execute("CREATE TABLE live_accounts (id TEXT PRIMARY KEY, broker TEXT, name TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    database._migrate_schema()
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = {str(row[1]): row for row in conn.execute("PRAGMA table_info(live_accounts)")}
+    finally:
+        conn.close()
+    assert "is_demo" in columns, "the migration did not add live_accounts.is_demo"
+    not_null, default = columns["is_demo"][3], columns["is_demo"][4]
+    assert not_null == 1, "is_demo must be NOT NULL, matching production"
+    assert default is not None and str(default).strip("'") == "0", (
+        f"is_demo must default to 0, matching production; got {default!r}"
+    )
