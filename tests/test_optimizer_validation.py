@@ -558,6 +558,7 @@ class TestRiskAdjustedObjectiveWiring:
 def test_split_period_applies_an_embargo_gap():
     """The embargo must move the real test start, not only be reported."""
     import pandas as pd
+
     import runner.optimizer as opt
 
     train, test = opt._split_backtest_period(
@@ -578,6 +579,7 @@ def test_split_period_applies_an_embargo_gap():
 
 def test_split_period_without_embargo_stays_contiguous():
     import pandas as pd
+
     import runner.optimizer as opt
 
     train, test = opt._split_backtest_period(
@@ -622,9 +624,11 @@ def test_reported_split_geometry_matches_the_applied_split():
     Previously the embargo was applied only in the report, so the payload
     described a dead gap that the optimizer never used.
     """
-    import pandas as pd
-    import runner.optimizer as opt
     from types import SimpleNamespace
+
+    import pandas as pd
+
+    import runner.optimizer as opt
 
     config = opt.OptimizationConfig(
         base_backtest_id="bt_x",

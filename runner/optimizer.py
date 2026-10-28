@@ -29,7 +29,6 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.database import load_backtest_result
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 
 import pandas as pd
-import pytest
 
 from runner.engines._drawings import _normalize_drawings
 
