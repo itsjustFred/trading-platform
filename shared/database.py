@@ -17,6 +17,7 @@ from uuid import uuid4
 from sqlalchemy import (
     JSON,
     Column,
+    Float,
     String,
     TextClause,
     UniqueConstraint,
@@ -49,6 +50,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    resolve_defined_stat,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -306,6 +308,39 @@ class BacktestRecord(SQLModel, table=True):
     created_at: str = Field(default="", index=True)
     equity_curve: list[dict[str, Any]] = Field(
         default_factory=list, sa_column=Column("equity_curve", JSON, nullable=False)
+    )
+    # These four columns have existed in the physical table for some time - NOT NULL, with defaults
+    # 0.0/0.0/0.0/1.0 - but the model never mapped them. Two consequences, both live:
+    #
+    #   * every INSERT took `DEFAULT 0.0`, so the fabricated 0.0 a corpus audit kept finding
+    #     was **manufactured by the schema**, not by a legacy backward-compatibility path;
+    #   * `session.merge()` issues an UPDATE over *mapped* columns only, so re-saving a backtest
+    #     with freshly computed stats left the scalar column at its old value forever - so the JSON
+    #     `stats` blob and the scalar column could disagree permanently, by construction.
+    #
+    # Mapped here so the columns can hold what the code computed. The defaults match the physical
+    # definitions exactly, so a row that says nothing still stores what it stored before.
+    # `Field(default=...)` is a *Python-side* default only, so `create_all` would produce NOT NULL
+    # columns with **no database default** - a schema that diverges from production's, where these
+    # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
+    # and a fresh install would not match the database it is supposed to replace. So the defaults
+    # are declared at the schema level too, matching production exactly - verified read-only
+    # against `/home/ubuntu/data/backtests.db`.
+    sharpe_ratio: float = Field(
+        default=0.0,
+        sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
+    )
+    psr: float = Field(
+        default=0.0,
+        sa_column=Column("psr", Float, nullable=False, server_default="0.0"),
+    )
+    cagr: float = Field(
+        default=0.0,
+        sa_column=Column("cagr", Float, nullable=False, server_default="0.0"),
+    )
+    p_value: float = Field(
+        default=1.0,
+        sa_column=Column("p_value", Float, nullable=False, server_default="1.0"),
     )
 
 
@@ -1351,6 +1386,51 @@ def _add_live_deployment_columns(connection: Connection, column_names: set[str])
         )
 
 
+def _add_backtests_stat_columns(connection: Connection) -> None:
+    """Add the scalar stat columns to `backtests`, which were never migrated.
+
+    `sharpe_ratio`, `psr`, `cagr` and `p_value` exist in the production table and have done for some
+    time, but **no migration creates them**. They are absent from this model, so `create_all` never
+    made them, and there is no `_add_*_column` step for them either. Every database in existence
+    therefore splits two ways: production, where somebody added the columns by hand, and every other
+    database - a fresh install, a developer's sandbox, a test fixture - built from the model, where
+    they simply do not exist.
+
+    That is why the columns read `0.0` on 2,600 rows rather than being absent: on those rows the
+    *schema default* was taken, because nothing could write anything else.
+
+    It stayed invisible while the model ignored the columns, since nothing ever named them. It stops
+    being invisible the moment the model maps them, because then every `SELECT backtests.*` names
+    them and a database without them fails outright - which is exactly how this surfaced.
+
+    So the columns need the migration they should always have had. Definitions match production
+    exactly, verified read-only against `/home/ubuntu/data/backtests.db`:
+
+        sharpe_ratio REAL NOT NULL DEFAULT 0.0
+        psr         REAL NOT NULL DEFAULT 0.0
+        cagr        REAL NOT NULL DEFAULT 0.0
+        p_value     REAL NOT NULL DEFAULT 1.0
+
+    `p_value` defaults to 1.0, not 0.0, because "no evidence against the null hypothesis" is the
+    correct value for a p-value that was never computed; 0.0 would assert the opposite.
+
+    No-ops when the columns are already present, so this is safe on production and on repeat runs.
+    """
+    column_names = _table_column_names(connection, "backtests")
+    if not column_names:
+        return
+    for column, ddl in (
+        ("sharpe_ratio", "REAL NOT NULL DEFAULT 0.0"),
+        ("psr", "REAL NOT NULL DEFAULT 0.0"),
+        ("cagr", "REAL NOT NULL DEFAULT 0.0"),
+        ("p_value", "REAL NOT NULL DEFAULT 1.0"),
+    ):
+        if column not in column_names:
+            connection.execute(
+                text(f"ALTER TABLE backtests ADD COLUMN {column} {ddl}")
+            )
+
+
 def _add_backtests_tags_column(connection: Connection) -> None:
     """Add the tags column to legacy backtests tables."""
     column_names = _table_column_names(connection, "backtests")
@@ -1502,6 +1582,7 @@ def _migrate_schema() -> None:
             connection, _table_column_names(connection, "live_deployments")
         )
         _add_backtests_tags_column(connection)
+        _add_backtests_stat_columns(connection)
         _add_live_account_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
@@ -2588,6 +2669,52 @@ def list_live_signals_for_replay(
     return _replay_signal_payload(rows)
 
 
+# The scalar stat columns, with the default each physically carries. `p_value` defaults to 1.0
+# because "no evidence against the null hypothesis" is the right value for a p-value that was never
+# computed - which is exactly why it must never be silently replaced by 0.0.
+_SCALAR_STAT_COLUMNS: tuple[tuple[str, float], ...] = (
+    ("sharpe_ratio", 0.0),
+    ("psr", 0.0),
+    ("cagr", 0.0),
+    ("p_value", 1.0),
+)
+
+
+def _scalar_stats_for_save(
+    session: Any, backtest_id: str, stats: dict[str, Any]
+) -> dict[str, float]:
+    """The values the four scalar stat columns should hold after this save.
+
+    A metric the stats **define** is written. A metric they do not - because the producer listed it
+    in `undefined_metrics`, or because the artifact predates the convention and never named it -
+    **carries its current column value forward**.
+
+    That second half is the whole point. These columns are NOT NULL, so "undefined" cannot be
+    stored. Letting the model's default land instead would mean a re-save of a backtest whose
+    Sharpe is no longer computable overwrites a real stored value with 0.0 - destroying data to
+    express absence, which is the failure the corpus audit found in the first place, reintroduced
+    by the fix for it. So absence leaves the column alone and only a number moves it.
+    """
+    current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
+    row = session.exec(
+        select(
+            BacktestRecord.sharpe_ratio,
+            BacktestRecord.psr,
+            BacktestRecord.cagr,
+            BacktestRecord.p_value,
+        ).where(BacktestRecord.id == backtest_id)
+    ).first()
+    if row is not None:
+        current.update(zip((name for name, _ in _SCALAR_STAT_COLUMNS), row))
+    resolved: dict[str, float] = {}
+    for name, _default in _SCALAR_STAT_COLUMNS:
+        # `default=None` makes "the producer did not name it" and "the producer declared it
+        # undefined" both resolve to None, which is precisely the do-not-write case.
+        value = resolve_defined_stat(stats, name, None)
+        resolved[name] = current[name] if value is None else float(value)
+    return resolved
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -2681,8 +2808,14 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
             "reject_missing_stop": result.meta.reject_missing_stop,
             "require_explicit_column_roles": result.meta.require_explicit_column_roles,
         }
+        scalar_stats = _scalar_stats_for_save(session, backtest_id, result.stats or {})
+
         backtest_record = BacktestRecord(
             id=backtest_id,
+            sharpe_ratio=scalar_stats["sharpe_ratio"],
+            psr=scalar_stats["psr"],
+            cagr=scalar_stats["cagr"],
+            p_value=scalar_stats["p_value"],
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,

@@ -667,6 +667,34 @@ class BacktestStats:
         return cls(**payload)
 
 
+def resolve_defined_stat(
+    stats: dict[str, Any] | None,
+    key: str,
+    default: float | None = None,
+) -> float | None:
+    """Resolve a stat, honouring the producer's ``undefined_metrics`` list.
+
+    The convention is that a quantity which could not be computed is *named* in
+    ``undefined_metrics`` and its value omitted, so an absent number is never
+    readable as a real one. ``dict.get(key, 0)`` silently undoes that: it cannot
+    tell "computed as zero" from "never computed" and returns 0 for the omitted
+    key.
+
+    It lives here rather than in the database or viewer layer because both need
+    it and the convention belongs to the data model. It has already bitten twice
+    - once for PSR, where the default was the *worst* attainable value, and once
+    for the portfolio combined stats - each time because the default was applied
+    somewhere new.
+    """
+    if not isinstance(stats, dict):
+        return default
+    undefined = stats.get("undefined_metrics")
+    if isinstance(undefined, (list, tuple, set)) and key in undefined:
+        return None
+    value = stats.get(key, default)
+    return default if value is None else value
+
+
 @dataclass
 class PortfolioStats:
     """Canonical portfolio statistics for persisted combined portfolio metrics."""
