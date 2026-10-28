@@ -2086,8 +2086,47 @@ def save_live_execution_up_to_cumulative(
                 .limit(1)
             ).first()
             if existing is not None:
-                session.rollback()
-                return 0.0
+                # Same dedupe key. Two very different situations share this branch, and conflating
+                # them loses fills:
+                #
+                #   redelivery   the broker sent the same deal again, unchanged. Dropping it is
+                #                right - this is the duplicate the key exists to catch.
+                #   amendment    the broker sent the same dealId with a LARGER quantity, because
+                #                `ProtoOADeal` carries `filledVolume` and the deal grew. Dropping it
+                #                freezes the stored quantity at its first-seen value and the rest of
+                #                the fill is never recorded.
+                #
+                # cTrader exposes no fill-level identifier - a deal entry has dealId, orderId,
+                # positionId and symbolId and nothing finer - so an order split into several fills
+                # arrives as several deals with distinct dealIds, each stored. That case is already
+                # correct. The remaining risk is amendment, and it is handled here: only an increase
+                # amends, and a decrease is treated as redelivery rather than shrinking a fill that
+                # already happened.
+                delta = requested_qty - float(existing.filled_qty or 0.0)
+                if delta <= 0.0:
+                    session.rollback()
+                    return 0.0
+                existing.filled_qty = float(existing.filled_qty or 0.0) + delta
+                if record.commission:
+                    # Commission was recorded against the first-seen quantity, so only the
+                    # incremental slice needs adding. A deal that reports commission per unit is
+                    # handled by the caller scaling it, same as the partial-persist path below.
+                    existing.commission = float(existing.commission or 0.0) + float(
+                        record.commission
+                    ) * (delta / requested_qty)
+                if record.actual_price and not existing.actual_price:
+                    existing.actual_price = float(record.actual_price)
+                session.add(existing)
+                session.commit()
+                logger.info(
+                    "Amended live execution %s: dedupe key %s repeated with a larger quantity, "
+                    "filled_qty %s -> %s",
+                    existing.id,
+                    existing.dedupe_key,
+                    delta,
+                    existing.filled_qty,
+                )
+                return delta
 
             local_filled_qty = float(
                 session.exec(
