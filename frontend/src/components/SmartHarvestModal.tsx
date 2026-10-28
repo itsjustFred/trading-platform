@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArrowRight, RotateCcw, Sparkles } from "lucide-react";
 
@@ -36,12 +36,20 @@ export function SmartHarvestModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  // Job whose terminal status has already been reported upstream.
-  const [notifiedJobId, setNotifiedJobId] = useState<string | null>(null);
+  // Job whose terminal status has already been reported upstream. A ref, not
+  // state: the dedupe has to be exact at the instant the callback runs, and a
+  // state copy read through the closure can still hold the previous value when
+  // two status transitions land in one batch - which would report the same job
+  // to the parent twice. It also keeps the callback identity stable, so passing
+  // it down cannot be mistaken for a reason to rebuild the log stream.
+  const notifiedJobIdRef = useRef<string | null>(null);
   const [wasOpen, setWasOpen] = useState(open);
 
   // Reopening starts a fresh form; adjusting during render beats a
-  // setState-in-effect cascade.
+  // setState-in-effect cascade. `notifiedJobIdRef` is deliberately not cleared
+  // here - writing a ref during render is unsafe, and it does not need clearing:
+  // the dedupe compares it against the *current* job id, which is null until a
+  // new job is queued and then a fresh id.
   if (wasOpen !== open) {
     setWasOpen(open);
     if (open) {
@@ -52,7 +60,6 @@ export function SmartHarvestModal({
       setError("");
       setJobId(null);
       setJobStatus("idle");
-      setNotifiedJobId(null);
     }
   }
 
@@ -62,10 +69,14 @@ export function SmartHarvestModal({
   // reported upstream, so a partial run is never counted as a failure.
   const handleStatusChange = (status: string) => {
     setJobStatus(status);
-    if (!jobId || notifiedJobId === jobId || !isTerminalTaskStatus(status)) {
+    if (
+      !jobId ||
+      notifiedJobIdRef.current === jobId ||
+      !isTerminalTaskStatus(status)
+    ) {
       return;
     }
-    setNotifiedJobId(jobId);
+    notifiedJobIdRef.current = jobId;
     if (status === "completed" || status === "failed") {
       onTaskFinished?.(status, jobId);
     }
@@ -83,7 +94,7 @@ export function SmartHarvestModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setNotifiedJobId(null);
+    notifiedJobIdRef.current = null;
     setError("");
   };
 
@@ -105,7 +116,7 @@ export function SmartHarvestModal({
       });
       setJobId(res.task_id);
       setJobStatus(res.status || "starting");
-      setNotifiedJobId(null);
+      notifiedJobIdRef.current = null;
       onTaskStarted?.(res.task_id);
     } catch (err: unknown) {
       setError(

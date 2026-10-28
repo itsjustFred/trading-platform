@@ -162,11 +162,14 @@ export function sharpeTone(
 ): string | undefined {
   if (isUnavailableStatValue(sharpe)) return undefined;
   const value = Number(sharpe);
+  // A string label such as "n/a" is not empty, so the guard above lets it
+  // through, and every comparison against NaN is false - which would fall
+  // through to the negative tone and paint an unparseable value red.
+  if (!Number.isFinite(value)) return undefined;
   if (value > 1) return SHARPE_TONES.strong;
   if (value > 0) return SHARPE_TONES.weak;
   return SHARPE_TONES.negative;
 }
-
 
 /** "+"/"-" prefix for signed USD values (no prefix at zero). */
 export function signedUsdPrefix(value: number): string {

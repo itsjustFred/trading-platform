@@ -595,6 +595,10 @@ export function LiveHubPage() {
         )
         .catch(() => false);
       if (applied) {
+        // The status change did land, so the card has to show it: leaving the
+        // stale ACTIVE row on screen next to a toast saying it stopped invites
+        // the operator to click the action again.
+        await refreshDeployments(true);
         showToast(
           `${card.strategy_name} is ${targetStatus.toLowerCase()}, but the viewer could not confirm the submission drain. Verify the broker before resuming.`,
           "warning",

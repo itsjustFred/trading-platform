@@ -63,3 +63,34 @@ test("other websocket consumers keep the default heartbeat", async () => {
   // streams (which the server pings) must still use the default.
   assert.doesNotMatch(liveStreams, /heartbeatIntervalMs:\s*0/);
 });
+
+test("terminal hosts dedupe the reported job through a ref, not state", async () => {
+  // A state copy of "which job did I already report" is read through the
+  // closure, so two status transitions batched into one commit both see the old
+  // value and the parent is told the same job finished twice. A ref is read at
+  // call time, and keeping the dedupe out of state also stops the callback from
+  // being re-created on every status line the terminal receives.
+  for (const path of [
+    "../src/components/ResampleModal.tsx",
+    "../src/components/DownloadModal.tsx",
+    "../src/components/SmartHarvestModal.tsx",
+  ]) {
+    const source = stripComments(await read(path));
+
+    assert.doesNotMatch(
+      source,
+      /const \[notifiedJobId, setNotifiedJobId\]/,
+      `${path} must not track the reported job in state`,
+    );
+    assert.match(
+      source,
+      /notifiedJobIdRef\.current === jobId/,
+      `${path} must dedupe against the ref`,
+    );
+    assert.match(
+      source,
+      /notifiedJobIdRef\.current = jobId;/,
+      `${path} must record the reported job in the ref`,
+    );
+  }
+});

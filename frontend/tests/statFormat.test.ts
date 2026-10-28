@@ -130,6 +130,11 @@ test("sharpeTone returns undefined for a ratio the backend could not compute", (
   assert.equal(sharpeTone(undefined), undefined);
   assert.equal(sharpeTone(Number.NaN), undefined);
   assert.equal(sharpeTone(""), undefined);
+  // Non-finite numbers are the same case as NaN: `Infinity > 1` would otherwise
+  // make an unmeasurable ratio the strongest possible tier.
+  assert.equal(sharpeTone(Number.POSITIVE_INFINITY), undefined);
+  assert.equal(sharpeTone(Number.NEGATIVE_INFINITY), undefined);
+  assert.equal(sharpeTone("Infinity"), undefined);
 });
 
 test("sharpeTone has three tiers, so a negative Sharpe is not amber", () => {
@@ -148,8 +153,12 @@ test("sharpeTone accepts the string spelling a payload may carry", () => {
   assert.equal(sharpeTone("0.5"), "#d29922");
   assert.equal(sharpeTone("-0.5"), "#f85149");
   // "n/a" is not "unavailable" as far as `isUnavailableStatValue` is concerned -
-  // there is a pre-existing test pinning that, and it is not mine to overturn here.
-  // So it is a value that is merely not a number, `Number("n/a")` is NaN, and every
-  // comparison is false, which lands it in the negative tier.
-  assert.equal(sharpeTone("n/a"), "#f85149");
+  // there is a separate test pinning that contract, and it is not changed here.
+  // But `Number("n/a")` is NaN and every comparison against NaN is false, so the
+  // old two-step let a label the backend never computed fall into the *negative*
+  // tier and paint the metric red. That is the same false judgement as the null
+  // case above, one step further down, so a non-finite number gets no tone at
+  // all. The isUnavailableStatValue contract is untouched: this function only
+  // refuses to grade what it cannot parse.
+  assert.equal(sharpeTone("n/a"), undefined);
 });
