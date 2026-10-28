@@ -163,6 +163,11 @@ class LiveAccountConfig(BaseModel):
     name: str = ""
     broker_login: str | None = None
     ctid: str | None = None
+    # Whether the broker confirmed this account as a demo/paper account. The
+    # daemon's adapter gate reads this and refuses anything that is not an
+    # explicit ``True``: routing a real order to a live account is the one
+    # mistake this platform cannot undo.
+    is_demo: bool | None = None
 
 
 class LiveAccount(BaseModel):
@@ -186,6 +191,12 @@ class LiveDeploymentConfig(BaseModel):
     symbols: list[str]
     timeframe: str
     status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    # When STOPPED enforcement (cancel entries, flatten, sweep orphaned
+    # protections) last completed for this deployment. The daemon seeds its
+    # in-memory ledger from this, so a restart does not repeat work that is
+    # already done - and it is cleared on every transition out of STOPPED, so a
+    # second stop enforces again instead of being skipped as "already done".
+    stopped_enforced_at: datetime | None = None
     signal_source_type: Literal["internal", "discord"] = "internal"
     signal_source_id: str | None = None
     symbol_filter: list[str] = Field(default_factory=list)
