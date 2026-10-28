@@ -3012,7 +3012,7 @@ def claim_live_deployment_submission(
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
 
     An expired lease is deleted first, in its own committed transaction, so a
-    claimor that died mid-submission cannot wedge the deployment forever. The
+    claimer that died mid-submission cannot wedge the deployment forever. The
     cleanup is committed separately on purpose: it must survive a refused
     claim, otherwise a permanently-busy deployment would also stop reaping its
     own dead leases.
