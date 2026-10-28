@@ -14,6 +14,7 @@ identically:
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -25,6 +26,33 @@ logger = get_logger("live-runner")
 
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
+
+DISCORD_BOT_ENV_PREFIX = "DISCORD_BOT_"
+
+
+def discord_bot_env_canonical_name(name: str) -> str:
+    """Canonicalise a bot/service name for use in a ``DISCORD_BOT_<NAME>_`` key.
+
+    Per-bot credentials are matched by ``^DISCORD_BOT_[A-Z0-9_]+_...`` in
+    :mod:`live_runner.service_discovery`, so a name that keeps its spaces or
+    punctuation can never be configured at all. Every per-bot key (token, auth
+    scheme, ...) must be built through this helper, otherwise the keys for two
+    credentials of the same bot silently diverge.
+    """
+    return re.sub(r"[^A-Z0-9_]+", "_", str(name or "").strip().upper())
+
+
+def discord_bot_env_key(name: str, suffix: str) -> str:
+    """Build the per-bot env key for a credential, e.g. ``_TOKEN``/``_AUTH_SCHEME``."""
+    canonical = discord_bot_env_canonical_name(name)
+    # A name made only of punctuation canonicalises to "_", which is not a name
+    # an operator could ever have written in the variable. Returning a key for it
+    # is worse than returning none: the lookup then misses silently and the bot
+    # falls back to the shared author list, which looks like a lookup that
+    # happened. Found by mutation testing, not by reading.
+    if not canonical.strip("_"):
+        return ""
+    return f"{DISCORD_BOT_ENV_PREFIX}{canonical}_{suffix}"
 
 
 def parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
