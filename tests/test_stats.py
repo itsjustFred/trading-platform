@@ -9,6 +9,9 @@ from runner.stats import (
     _daily_returns_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
+    _period_risk_free_rate,
+    _sharpe_manual,
+    _sortino_manual,
     compute_stats,
     compute_stats_for_result,
 )
@@ -36,6 +39,37 @@ def _equity_curve_from_returns(returns: list[float], initial_capital: float = 10
         equity *= 1 + ret
         points.append(EquityPoint(time=(start + timedelta(days=index)).isoformat(), equity=equity))
     return points
+
+
+class TestQuantStatsManualParity:
+    returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002, -0.003, 0.009]
+
+    def test_period_risk_free_rate_uses_compound_conversion(self):
+        # Merge resolution: the branch's compound per-period conversion is
+        # kept — it is what makes `_sharpe_manual`/`_sortino_manual` bit-identical
+        # to quantstats (ADR D5: one definition per metric on both paths), so
+        # the symbol is imported at module level again.
+        assert _period_risk_free_rate(0.04) == pytest.approx(math.pow(1.04, 1 / 252) - 1)
+
+    def test_manual_sharpe_matches_quantstats_definition(self):
+        import pandas as pd
+
+        qs = pytest.importorskip("quantstats.stats")
+
+        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        expected = float(qs.sharpe(series, rf=0.04, periods=252))
+
+        assert _sharpe_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
+
+    def test_manual_sortino_matches_quantstats_definition(self):
+        import pandas as pd
+
+        qs = pytest.importorskip("quantstats.stats")
+
+        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        expected = float(qs.sortino(series, rf=0.04, periods=252))
+
+        assert _sortino_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
 
 
 class TestComputeStats:
@@ -71,6 +105,23 @@ class TestComputeStats:
         assert stats["avg_loser"] == round(-100 / 3, 2)
         # Profit factor: 300 / 100 = 3.0
         assert stats["profit_factor"] == 3.0
+
+    def test_trade_metrics_use_net_pnl_after_fees(self):
+        winner = _trade(100)
+        winner.fees = 20.0
+        winner.net_pnl = 80.0
+        loser = _trade(-50)
+        loser.fees = 10.0
+        loser.net_pnl = -60.0
+
+        stats = compute_stats([winner, loser])
+
+        assert stats["winners"] == 1
+        assert stats["losers"] == 1
+        assert stats["total_pnl"] == 20.0
+        assert stats["avg_winner"] == 80.0
+        assert stats["avg_loser"] == -60.0
+        assert stats["profit_factor"] == pytest.approx(80.0 / 60.0, rel=1e-4)
 
     def test_holding_bars(self):
         trades = [_trade(10, holding_bars=5), _trade(-5, holding_bars=3)]
@@ -154,6 +205,42 @@ class TestComputeStats:
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
 
+    def test_cagr_prefers_equity_period_over_trade_bounds(self):
+        """Same contract as `test_cagr_annualizes_with_trade_period_bounds`.
+
+        Merge resolution: the two sides of the merge added this scenario under
+        different names. Both keep the shared 731-day equity window, so both are
+        retained as separate tests rather than one shadowing the other.
+        """
+        equity = [
+            EquityPoint(time="2020-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2022-01-01T00:00:00+00:00", equity=121000.0),
+        ]
+        trades = [
+            Trade(
+                id=1,
+                symbol="X",
+                direction="LONG",
+                entry_time="2021-01-01T00:00:00+00:00",
+                entry_price=100.0,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2023-01-01T00:00:00+00:00",
+                        price=121.0,
+                        quantity=1,
+                        pnl=21000.0,
+                    )
+                ],
+                pnl=21000.0,
+            )
+        ]
+
+        stats = compute_stats(trades, equity_curve=equity)
+
+        expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
     def test_cagr_handles_mixed_fractional_curve_timestamps(self):
         # Daily equity curves mix second-resolution inception points with
         # microsecond-resolution closes; without format="mixed" every close
@@ -172,6 +259,46 @@ class TestComputeStats:
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the
         # 365.75-day trade span.
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
+        ]
+        trades = [
+            Trade(
+                id=1,
+                symbol="X",
+                direction="LONG",
+                entry_time="2024-01-01T12:00:00+00:00",
+                entry_price=100.0,
+                quantity=1,
+                exits=[
+                    TradeExit(
+                        time="2025-01-01T06:00:00+00:00",
+                        price=110.0,
+                        quantity=1,
+                        pnl=10000.0,
+                    )
+                ],
+                pnl=10000.0,
+            )
+        ]
+
+        stats = compute_stats(trades, equity_curve=equity)
+
+        # 2024-01-01T00:00Z -> 2025-01-01T00:00Z is 366 calendar days.
+        expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
+    def test_cagr_uses_equity_period_when_available(self):
+        """The equity window, not the 365.75-day trade span, drives CAGR.
+
+        Merge resolution: the other side of the merge asserted a 365-day year
+        for this window. 2024 is a leap year, so the equity endpoints are 366
+        days apart and the trade span is 365.75 — neither is 365.0, so that
+        literal could not describe any window this fixture produces. The 366-day
+        expectation is kept, and it still proves the equity period is preferred:
+        the trade bounds would give 365.75.
+        """
         equity = [
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
             EquityPoint(time="2025-01-01T00:00:00+00:00", equity=110000.0),
@@ -361,18 +488,128 @@ class TestCalmarAndQsFallback:
         )
 
     def test_qs_installed_but_unparseable_times_still_yields_sharpe(self):
-        """With QS installed but timestamps unresolvable, Sharpe must not be 0.
+        """Unparseable timestamps must not change the Sharpe that is published.
 
-        Kills the mutant that disables the manual fall-through: the fallback
-        computes Sharpe/Sortino on raw period returns instead of silently
-        leaving 0.0.
+        **Why this test was rewritten.** The original asserted only
+        ``stats["sharpe_ratio"] != 0.0``. That cannot distinguish an annualized
+        Sharpe from a per-observation ratio — the defect published a per-period
+        ratio of 0.20 for a daily Sharpe of 3.2, which is very much "not
+        0.0" — so the assertion locked the defect in. The premise behind it,
+        that the fall-through exists to keep the number non-zero, was wrong:
+        under ADR D5 the two code paths must publish the SAME Sharpe for the
+        same returns, so the contract to pin is parity with the `"daily"`
+        branch, not the absence of a zero.
+
+        The fixture below builds two curves with identical equity values: one
+        with daily timestamps (the `daily` branch, quantstats) and one with
+        timestamps nothing can parse (the fall-through). Same returns in, same
+        Sharpe out.
         """
-        equity = [
-            EquityPoint(time=f"not-a-timestamp-{i}", equity=100_000.0 * (1.001**i))
-            for i in range(40)
+        returns = [
+            0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
+            -0.003, 0.009, 0.001, -0.002, 0.005, -0.001,
         ]
-        stats = compute_stats([], equity_curve=equity)
-        assert stats["sharpe_ratio"] != 0.0, (
-            "unparseable equity timestamps must fall back to the manual Sharpe "
-            "path (raw period returns), not silently publish 0.0"
+
+        def _equities():
+            values = [100_000.0]
+            for value in returns:
+                values.append(values[-1] * (1 + value))
+            return values
+
+        start = datetime(2021, 1, 1, tzinfo=timezone.utc)
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=equity)
+            for index, equity in enumerate(_equities())
+        ]
+        daily = [
+            EquityPoint(
+                time=(start + timedelta(days=index)).isoformat(), equity=equity
+            )
+            for index, equity in enumerate(_equities())
+        ]
+
+        unknown = compute_stats([], equity_curve=unparseable, risk_free_rate=0.04)
+        daily_stats = compute_stats([], equity_curve=daily, risk_free_rate=0.04)
+
+        assert daily_stats["equity_return_frequency"] == "daily"
+        assert unknown["equity_return_frequency"].startswith("unknown")
+        assert daily_stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual(returns, 0.04), abs=1e-4
         )
+        assert unknown["sharpe_ratio"] == pytest.approx(
+            daily_stats["sharpe_ratio"], abs=1e-4
+        ), (
+            "a per-observation ratio was published as a Sharpe: "
+            f"{unknown['sharpe_ratio']} instead of {daily_stats['sharpe_ratio']}"
+        )
+        assert unknown["sortino_ratio"] == pytest.approx(
+            daily_stats["sortino_ratio"], abs=1e-4
+        )
+        # Not merely "non-zero": the annualized value, ~13.75x the per-period
+        # ratio the defect produced for these returns.
+        assert unknown["sharpe_ratio"] > 1.0
+        assert "sharpe_ratio" not in unknown["undefined_metrics"]
+
+    def test_unknown_frequency_states_why_the_period_assumption_is_unverified(self):
+        """`equity_return_frequency` must name the reason, not just "unknown"."""
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=100_000.0 * (1.001**index))
+            for index in range(40)
+        ]
+
+        stats = compute_stats([], equity_curve=unparseable, risk_free_rate=0.04)
+
+        assert stats["equity_return_frequency"] == (
+            "unknown:unparseable_equity_timestamps"
+        ), (
+            "the payload must say the equity curve had no readable clock, so a "
+            "consumer can see the annualisation was a stated assumption rather "
+            "than a fact read off the data"
+        )
+        # A known frequency stays a bare token, so existing consumers keep
+        # matching on it.
+        assert stats["undefined_metrics"] is not None
+        known = _equity_curve_from_returns([0.01, -0.005, 0.004] * 4)
+        assert compute_stats([], equity_curve=known)["equity_return_frequency"] == "daily"
+
+    def test_describe_return_frequency_is_a_no_op_without_a_reason(self):
+        from runner.stats import (
+            UNKNOWN_RETURN_FREQUENCY,
+            _describe_return_frequency,
+        )
+
+        assert _describe_return_frequency("daily", None) == "daily"
+        assert _describe_return_frequency("none", None) == "none"
+        assert _describe_return_frequency(UNKNOWN_RETURN_FREQUENCY, "why") == "unknown:why"
+
+    def test_sharpe_manual_has_no_annualization_knob(self):
+        """The per-period variant is unreachable, not merely unused.
+
+        ``annualization_factor=1.0`` is what published a per-observation ratio
+        under the name "Sharpe". Leaving the parameter in place (unused, with a
+        default) invites the same call back, so its absence is the fix.
+        """
+        import inspect
+
+        from runner.stats import _sortino_manual
+
+        for helper in (_sharpe_manual, _sortino_manual):
+            assert "annualization_factor" not in inspect.signature(helper).parameters
+
+        # And the only ratio these helpers can produce is the annualized one:
+        # the per-period variant is off by exactly sqrt(252).
+        returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002]
+        annualized = _sharpe_manual(returns, 0.0)
+        assert annualized == pytest.approx(
+            (sum(returns) / len(returns))
+            / (
+                sum(
+                    (value - sum(returns) / len(returns)) ** 2 for value in returns
+                )
+                / (len(returns) - 1)
+            )
+            ** 0.5
+            * math.sqrt(252)
+        )
+        assert annualized != pytest.approx(annualized / math.sqrt(252))
+

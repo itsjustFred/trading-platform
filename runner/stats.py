@@ -27,6 +27,14 @@ SECONDS_PER_DAY = 24 * 60 * 60
 DAILY_RETURN_PERIODS_PER_YEAR = 252
 DEFAULT_RISK_FREE_RATE = 0.0
 
+#: Reported in ``extras.equity_return_frequency`` when the equity curve's
+#: timestamps cannot be resolved, i.e. when the return series has no known
+#: period length. The reason is appended (see ``_describe_return_frequency``)
+#: so a consumer can tell "the engine curve had no readable clock" apart from
+#: the other ways a frequency can be unknown.
+UNKNOWN_RETURN_FREQUENCY = "unknown"
+UNPARSEABLE_EQUITY_TIMESTAMPS = "unparseable_equity_timestamps"
+
 try:
     import quantstats as qs
 
@@ -118,6 +126,7 @@ def compute_stats(
     p_value = 1.0
     undefined_metrics: set[str] = set()
     return_frequency = "none"
+    return_frequency_reason: str | None = None
     duplicate_timestamp_count = _duplicate_timestamp_count(equity_curve or [])
 
     if equity_curve and len(equity_curve) > 1:
@@ -141,8 +150,17 @@ def compute_stats(
             if len(daily_return_series) <= 1:
                 undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
         else:
-            return_frequency = "unknown"
-            undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
+            return_frequency = UNKNOWN_RETURN_FREQUENCY
+            return_frequency_reason = UNPARSEABLE_EQUITY_TIMESTAMPS
+            # Sharpe/Sortino/PSR/p-value are NOT undefined on this path: the
+            # fall-throughs below compute all four on the raw observation
+            # returns. This block used to mark them undefined unconditionally,
+            # so the payload both published a number and declared it
+            # unavailable — two consumers of the same dict reached opposite
+            # conclusions about the same metric. The reason the period could not
+            # be verified is reported in `equity_return_frequency` instead.
+            if len(daily_returns) <= 1:
+                undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
 
         # Environment-independent definitions (Cleanup 16-D1, F17): the two
         # code paths below previously published DIFFERENT metric definitions
@@ -172,17 +190,15 @@ def compute_stats(
                 # _safe_qs call return 0.0 silently. Treat QS as unusable.
                 qs_usable = False
             if not qs_usable:
-                if return_frequency == "unknown" and len(daily_returns) > 1:
-                    sharpe_ratio = _sharpe_manual(
-                        daily_returns,
-                        risk_free_rate,
-                        annualization_factor=1.0,
-                    )
-                    sortino_ratio = _sortino_manual(
-                        daily_returns,
-                        risk_free_rate,
-                        annualization_factor=1.0,
-                    )
+                if return_frequency == UNKNOWN_RETURN_FREQUENCY and len(daily_returns) > 1:
+                    # Unparseable timestamps leave no way to resample to
+                    # daily, so the manual definition runs on the raw
+                    # observation returns. It is annualised exactly like the
+                    # daily path (ADR D5: one definition per metric on both
+                    # code paths) — publishing the un-annualised ratio under
+                    # the name "Sharpe" reported a daily 3.2 as 0.20.
+                    sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
+                    sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
                     psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
                 else:
                     undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
@@ -205,17 +221,12 @@ def compute_stats(
                 sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                 sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
-            elif return_frequency == "unknown" and len(daily_returns) > 1:
-                sharpe_ratio = _sharpe_manual(
-                    daily_returns,
-                    risk_free_rate,
-                    annualization_factor=1.0,
-                )
-                sortino_ratio = _sortino_manual(
-                    daily_returns,
-                    risk_free_rate,
-                    annualization_factor=1.0,
-                )
+            elif return_frequency == UNKNOWN_RETURN_FREQUENCY and len(daily_returns) > 1:
+                # Same definition as the daily branch above, and the same
+                # reason: an unparseable timestamp must not change the number
+                # that is published (ADR D5).
+                sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
+                sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
             else:
                 undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
@@ -258,7 +269,9 @@ def compute_stats(
         extras={
             "risk_free_rate": float(risk_free_rate),
             "undefined_metrics": sorted(undefined_metrics),
-            "equity_return_frequency": return_frequency,
+            "equity_return_frequency": _describe_return_frequency(
+                return_frequency, return_frequency_reason
+            ),
             "duplicate_equity_timestamps": duplicate_timestamp_count,
         },
     ).to_dict()
@@ -529,6 +542,20 @@ def _safe_qs(func, returns: pd.Series, **kwargs) -> float:
 # ─── Manual fallback helpers ─────────────────────────────────────────────────
 
 
+def _describe_return_frequency(frequency: str, reason: str | None) -> str:
+    """``<frequency>[:<reason>]`` for ``extras.equity_return_frequency``.
+
+    A bare ``"unknown"`` told a consumer nothing beyond "something was off", so
+    the reason is carried in the same field: ``"unknown:unparseable_equity_
+    timestamps"`` says the equity curve had no readable clock, which is what
+    forced the raw-observation return series. Known frequencies are reported
+    unchanged so existing consumers keep matching on them.
+    """
+    if not reason:
+        return frequency
+    return f"{frequency}:{reason}"
+
+
 def _duplicate_timestamp_count(equity_curve: list[EquityPoint]) -> int:
     if len(equity_curve) < 2:
         return 0
@@ -650,43 +677,81 @@ def _one_sided_p_value(returns: list[float]) -> float:
         return 1.0
 
 
+def _period_risk_free_rate(
+    risk_free_rate: float,
+    periods: int = DAILY_RETURN_PERIODS_PER_YEAR,
+) -> float:
+    """Convert an annual risk-free rate to a per-period rate.
+
+    The compound conversion ``(1 + rf) ** (1 / periods) - 1`` is what
+    quantstats applies to the annual ``rf`` before differencing, so using it
+    here is what keeps the manual fallback definitionally identical to the
+    quantstats path (ADR D5, docs/cleanup-16d1-money-path-semantics.md).
+    """
+    return math.pow(1.0 + float(risk_free_rate), 1.0 / periods) - 1.0
+
+
 def _sharpe_manual(
     returns: list[float],
     risk_free_rate: float,
-    annualization_factor: float = math.sqrt(252),
 ) -> float:
-    """Annualized Sharpe ratio (manual)."""
-    if not returns:
+    """Annualized Sharpe ratio, definitionally identical to quantstats.
+
+    Excess returns are ``r - rf_period``; the dispersion is the sample
+    standard deviation (ddof=1, i.e. ``pandas.Series.std()``); the ratio is
+    scaled by ``sqrt(252)``.
+
+    There is deliberately no ``annualization_factor`` parameter. It used to
+    default to ``sqrt(252)`` and be passed ``1.0`` on the raw-period fallback
+    path (equity timestamps unresolvable), which silently published a
+    *per-observation* ratio under the name "Sharpe" — a daily 3.2 was reported
+    as 0.20 — while the docstring still claimed the function was definitionally
+    identical to the quantstats path. The knob only ever had one correct value,
+    so it is gone: ADR D5 requires ONE definition per metric on both code
+    paths, and a machine whose equity timestamps do not parse must publish the
+    same Sharpe as one whose timestamps do. The period assumption the fallback
+    cannot verify is reported through
+    ``extras.equity_return_frequency`` instead of being applied to the number.
+    """
+    if len(returns) < 2:
         return 0.0
-    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
-    excess = [r - period_rf for r in returns]
+    period_rf = _period_risk_free_rate(risk_free_rate)
+    excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
-    variance = sum((r - mean_excess) ** 2 for r in excess) / len(excess)
+    variance = sum((value - mean_excess) ** 2 for value in excess) / (len(excess) - 1)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
-    return (mean_excess / std) * annualization_factor
+    return (mean_excess / std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
 
 
 def _sortino_manual(
     returns: list[float],
     risk_free_rate: float,
-    annualization_factor: float = math.sqrt(252),
 ) -> float:
-    """Annualized Sortino ratio (manual)."""
-    if not returns:
+    """Annualized Sortino ratio, definitionally identical to quantstats.
+
+    Numerator is the mean EXCESS return. Downside deviation is
+    ``sqrt(sum(min(excess, 0) ** 2) / n)`` — every observation counts in the
+    denominator, and only the negative excess returns contribute to the sum
+    (the Red Rock Capital definition quantstats documents). Dividing by the
+    count of losing periods instead, or deviating the raw returns rather than
+    the excess returns, is a different ratio that does not match the
+    quantstats path.
+
+    Like :func:`_sharpe_manual` there is no ``annualization_factor``: the
+    ratio is always scaled by ``sqrt(252)``.
+    """
+    if len(returns) < 2:
         return 0.0
-    period_rf = risk_free_rate / 252 if annualization_factor == math.sqrt(252) else 0.0
-    mean_return = sum(returns) / len(returns)
-    downside = [r for r in returns if r < 0]
-    if len(downside) < 2:
-        return 0.0
-    downside_var = sum(r**2 for r in downside) / len(downside)
-    downside_std = math.sqrt(downside_var) if downside_var > 0 else 0
+    period_rf = _period_risk_free_rate(risk_free_rate)
+    excess = [float(value) - period_rf for value in returns]
+    mean_excess = sum(excess) / len(excess)
+    downside_variance = sum(min(value, 0.0) ** 2 for value in excess) / len(excess)
+    downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0
     if downside_std == 0:
         return 0.0
-    excess_mean = mean_return - period_rf
-    return (excess_mean / downside_std) * annualization_factor
+    return (mean_excess / downside_std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
 
 
 def _probabilistic_sharpe(

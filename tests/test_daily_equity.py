@@ -850,5 +850,325 @@ class TestAttachDailyEquity:
         assert result.equity_curve[-1].time == "2024-01-31T23:59:59.999999+00:00"
 
 
+class TestEngineCurveGapFill:
+    """Fix (a): a multi-day move must never be booked as a single day.
+
+    The engine-curve path used to compact the curve to ``last_by_day`` and
+    derive returns from consecutive *observed* days. The calendar fill it
+    replaces emits every day of the window, so the engine path silently had a
+    different — and gap-dependent — daily series.
+    """
+
+    @staticmethod
+    def _result(curve, *, pnl=1000.0, exit_time="2024-01-09T15:00:00Z"):
+        return make_result(
+            trades=[
+                make_trade(
+                    entry_time="2024-01-02T10:00:00Z",
+                    exit_time=exit_time,
+                    pnl=pnl,
+                )
+            ],
+            equity_curve=curve,
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-10",
+        )
+
+    def test_gap_days_are_emitted_as_flat_points(self):
+        from runner.daily_equity import _daily_points_from_engine_curve
+
+        result = self._result(
+            [
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-05T00:00:00+00:00", equity=103000.0),
+                EquityPoint(time="2024-01-09T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+
+        points, returns = _daily_points_from_engine_curve(
+            result, start=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+
+        # 2024-01-01 opening point plus one point per calendar day through the
+        # last observed day: 10 points, 9 daily returns, one per elapsed day.
+        assert [point.time[:10] for point in points] == [
+            f"2024-01-{day:02d}" for day in range(1, 10)
+        ]
+        # The engine's own levels are still the ones published.
+        assert points[4].equity == 103000.0
+        assert points[8].equity == 101000.0
+        # Every skipped day is an explicit zero return, so the series describes
+        # the window instead of collapsing 8 calendar days into 2 returns.
+        assert [item["return"] for item in returns] == [
+            0.0,
+            0.0,
+            0.0,
+            pytest.approx(0.03),
+            0.0,
+            0.0,
+            0.0,
+            pytest.approx(-2000.0 / 103000.0),
+        ]
+        # One return per distinct calendar day, and the days are contiguous.
+        assert [item["date"] for item in returns] == [
+            f"2024-01-{day:02d}" for day in range(2, 10)
+        ]
+
+    def test_multi_day_move_is_not_annualised_as_one_day(self):
+        """The reported daily statistics must not scale with the skipped days.
+
+        The defect: a curve observing only 01-05, 01-08 and 01-09 produced the
+        returns ``[+3.00%, -1.94%]`` and a ``mean x 252`` annualisation of
+        ~133%, where the mean over the eight calendar days those two moves
+        actually span gives ~33%. The error was ~2x here and grew with the gap,
+        so the same backtest scored differently depending on how many days the
+        engine curve happened to skip.
+        """
+        from runner.daily_equity import _daily_points_from_engine_curve
+        from runner.stats import _sharpe_manual
+
+        result = self._result(
+            [
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-05T00:00:00+00:00", equity=103000.0),
+                EquityPoint(time="2024-01-09T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+
+        _points, returns = _daily_points_from_engine_curve(
+            result, start=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+        observed = [item["return"] for item in returns]
+        # The series the old compaction produced: one return per OBSERVED day.
+        collapsed = [0.03, -2000.0 / 103000.0]
+
+        def _annualised_mean(series):
+            return sum(series) / len(series) * 252
+
+        assert len(observed) == 8, "one return per calendar day, not per observation"
+        assert observed != collapsed
+        assert _annualised_mean(observed) == pytest.approx(0.3333, abs=1e-3)
+        assert _annualised_mean(collapsed) == pytest.approx(1.3334, abs=1e-3)
+        # A real Sharpe ratio, not only a mean, moves by the same factor: the
+        # gap-collapsed series is a *different strategy*, not a coarser view of
+        # the same one.
+        assert _sharpe_manual(observed, 0.0) < _sharpe_manual(collapsed, 0.0)
+
+    def test_gap_before_the_first_observation_is_filled(self):
+        """The flat period before the engine's first point is a gap too."""
+        from runner.daily_equity import _daily_points_from_engine_curve
+
+        result = self._result(
+            [
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-04T00:00:00+00:00", equity=100200.0),
+                EquityPoint(time="2024-01-06T00:00:00+00:00", equity=100500.0),
+            ],
+            pnl=500.0,
+            exit_time="2024-01-06T15:00:00Z",
+        )
+
+        points, returns = _daily_points_from_engine_curve(
+            result, start=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+
+        assert [point.time[:10] for point in points] == [
+            f"2024-01-{day:02d}" for day in range(1, 7)
+        ]
+        assert [item["return"] for item in returns] == [
+            0.0,
+            0.0,
+            pytest.approx(0.002),
+            0.0,
+            pytest.approx(300.0 / 100200.0),
+        ]
+
+    def test_dense_engine_curve_is_not_gap_filled(self):
+        """Contiguous days gain nothing from the filler: no point is invented."""
+        from runner.daily_equity import _daily_points_from_engine_curve
+
+        result = self._result(
+            [
+                EquityPoint(time=f"2024-01-{day:02d}T00:00:00+00:00", equity=100000.0)
+                for day in range(1, 5)
+            ]
+            + [EquityPoint(time="2024-01-05T00:00:00+00:00", equity=100500.0)]
+            + [
+                EquityPoint(time=f"2024-01-{day:02d}T00:00:00+00:00", equity=100500.0)
+                for day in range(6, 10)
+            ],
+            pnl=500.0,
+            exit_time="2024-01-05T15:00:00Z",
+        )
+
+        points, _returns = _daily_points_from_engine_curve(
+            result, start=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+
+        # 2024-01-01 is consumed as the opening point, then 01-02..01-09.
+        assert [point.time[:10] for point in points] == [
+            f"2024-01-{day:02d}" for day in range(1, 10)
+        ]
+
+    def test_endpoint_only_curve_is_still_rejected(self):
+        """The gap fill must not resurrect the endpoint-only curve.
+
+        ``MIN_RECONCILING_ENGINE_CURVE_POINTS`` guards a different failure: a
+        2-point curve describes the same total return the calendar fill already
+        describes, so adopting it would publish a curve with no path at all.
+        Filling gaps must not become a way around that gate.
+        """
+        from runner.daily_equity import _daily_points_from_engine_curve
+
+        result = self._result(
+            [
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+                EquityPoint(time="2024-01-09T00:00:00+00:00", equity=101000.0),
+            ]
+        )
+
+        assert _daily_points_from_engine_curve(result) is None
+
+
+class TestReconciliationTolerance:
+    """Fix (b): the gate is derived from the arithmetic, not a round number."""
+
+    @staticmethod
+    def _many_trades(count: int, *, pnl: float = 100.0):
+        trades = []
+        for index in range(count):
+            day = (index % 27) + 2
+            trade = make_trade(
+                entry_time=f"2024-01-{day:02d}T10:00:00Z",
+                exit_time=f"2024-01-{day:02d}T15:00:00Z",
+                pnl=pnl,
+            )
+            trade.net_pnl = pnl
+            trades.append(trade)
+        return trades
+
+    @staticmethod
+    def _curve(trades, final_equity: float):
+        # Three points: an endpoint-only curve is rejected before the
+        # reconciliation is even reached, so the fixture has to carry a path.
+        return [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
+            EquityPoint(
+                time="2024-01-15T00:00:00+00:00", equity=(100000.0 + final_equity) / 2
+            ),
+            EquityPoint(time="2024-01-28T00:00:00+00:00", equity=final_equity),
+        ]
+
+    def test_cent_level_reconciliation_drift_is_accepted(self):
+        """Per-trade cent rounding must not discard the engine's curve.
+
+        The gate used to be ``max(0.05, |initial| * 1e-9)`` — a flat $0.05 on a
+        $100k account. Twenty trades whose stored ``net_pnl`` sit six tenths of
+        a cent away from what the engine's own equity path accumulated drift by
+        $0.12, which the old gate rejected: the mark-to-market path the function
+        exists to preserve was silently thrown away for a rounding artefact.
+        """
+        from runner.daily_equity import (
+            _daily_points_from_engine_curve,
+            _reconciliation_tolerance,
+        )
+
+        count = 20
+        trades = self._many_trades(count)
+        drift = count * 0.006
+        final = 100000.0 + count * 100.0 - drift
+        result = make_result(
+            trades=trades, equity_curve=self._curve(trades, final)
+        )
+
+        assert drift > 0.05, "the fixture must exceed the old flat five-cent gate"
+        assert drift < _reconciliation_tolerance(
+            expected_final=100000.0 + count * 100.0, trade_count=count
+        )
+
+        reconciled = _daily_points_from_engine_curve(result)
+
+        assert reconciled is not None, (
+            "a $0.12 reconciliation drift over 20 trades is cent-level "
+            "rounding, not a contradiction; the curve must be preserved"
+        )
+        assert reconciled[0][-1].equity == pytest.approx(final)
+
+    def test_genuine_contradiction_is_still_rejected(self):
+        """The widened bound must not admit a curve the trades cannot reach."""
+        from runner.daily_equity import (
+            _daily_points_from_engine_curve,
+            _reconciliation_tolerance,
+        )
+
+        count = 20
+        trades = self._many_trades(count)
+        expected = 100000.0 + count * 100.0
+        # $4500 above what 20 x $100 of net PnL can produce.
+        contradiction = expected + 4500.0
+        assert (
+            abs(contradiction - expected)
+            > 20 * _reconciliation_tolerance(
+                expected_final=expected, trade_count=count
+            )
+        )
+        result = make_result(
+            trades=trades, equity_curve=self._curve(trades, contradiction)
+        )
+
+        assert _daily_points_from_engine_curve(result) is None
+
+    def test_tolerance_is_cent_floor_plus_one_cent_per_trade(self):
+        """The bound is ``max(cent floor, float64 drift) + n * one cent``."""
+        from runner.daily_equity import (
+            EQUITY_CENT,
+            _reconciliation_tolerance,
+        )
+
+        # One trade: a whole cent of quantisation plus a whole cent of drift.
+        assert _reconciliation_tolerance(
+            expected_final=100000.0, trade_count=1
+        ) == pytest.approx(2 * EQUITY_CENT)
+        # A hundred trades: the per-trade term dominates at a realistic account
+        # size, and it is derived from the rounding, not from a round number.
+        hundred = _reconciliation_tolerance(
+            expected_final=100000.0, trade_count=100
+        )
+        assert hundred == pytest.approx(101 * EQUITY_CENT)
+        assert hundred == pytest.approx(1.01)
+        assert hundred > 0.05
+        # Monotone in the trade count, and independent of the account size in
+        # the range where cent quantisation is the binding limit.
+        assert hundred > _reconciliation_tolerance(
+            expected_final=100000.0, trade_count=10
+        )
+        assert _reconciliation_tolerance(
+            expected_final=1e9, trade_count=10
+        ) == pytest.approx(
+            _reconciliation_tolerance(expected_final=1e5, trade_count=10)
+        )
+
+    def test_tolerance_carries_the_relative_float64_term_for_absurd_accounts(self):
+        """At $1e15 the float64 accumulation term, not the cent floor, binds.
+
+        That is what the relative epsilon is for: cent quantisation does not
+        grow with the account, but float64 summation error does.
+        """
+        from runner.daily_equity import (
+            EQUITY_CENT,
+            _reconciliation_tolerance,
+        )
+
+        tolerance = _reconciliation_tolerance(
+            expected_final=1e15, trade_count=1_000_000
+        )
+
+        # 8 * 1e6 * 2**-52 * 1e15 = ~1.776, far above the cent floor.
+        assert tolerance == pytest.approx(
+            8.0 * 1e6 * 2.0**-52 * 1e15 + 1e6 * EQUITY_CENT
+        )
+        assert tolerance > EQUITY_CENT
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

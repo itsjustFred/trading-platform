@@ -278,6 +278,35 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on **every**
+  path, including the one taken when the equity curve's timestamps cannot be
+  parsed. That path used to pass `annualization_factor=1.0` into
+  `_sharpe_manual`/`_sortino_manual`, which published a per-observation ratio
+  under the name "Sharpe": a daily Sharpe of 3.2 was reported as 0.20, with
+  `undefined_metrics` untouched so the payload looked complete. The knob is
+  gone (it only ever had one correct value) and
+  `extras.equity_return_frequency` now carries the reason
+  (`unknown:unparseable_equity_timestamps`) instead of a bare `unknown`, so a
+  consumer can see that the period assumption could not be verified from the
+  data. An equity curve whose timestamps do not parse produces exactly the
+  same Sharpe as one whose timestamps do — that is the D5 contract. Note that
+  the `unknown` path also stopped listing these four metrics in
+  `undefined_metrics` while still publishing a number for them; the payload no
+  longer contradicts itself.
+- A *reconciling* engine curve is compacted to one point per **calendar** day,
+  not per observed day. A curve that observed only 01-05, 01-08 and 01-09
+  produced three returns for an eight-day window, so a multi-day move was
+  annualised as if it had happened in one day (~2x here, and the factor grew
+  with the gap). `daily_equity_curve` and `daily_return_count` now describe the
+  same window as the calendar fill, with an explicit flat point for every day
+  the engine did not observe. Artifacts that compare `daily_return_count`
+  across code generations are not comparable.
+- The engine-curve-vs-trades reconciliation gate is no longer a flat `$0.05`.
+  It is `max(one cent, 8·n·2⁻⁵²·|expected|) + n·one cent` — derived from the
+  cent quantisation the equity arithmetic actually performs, plus the float64
+  accumulation term that grows with the account. Curves that were off by cents
+  of accumulated per-trade rounding are now preserved instead of silently
+  discarded; the endpoint-only rejection is unchanged.
 
 If a fresh run's metrics disagree with a persisted pre-16-D1 artifact, this
 is the expected cause — re-run comparisons within one code generation.
