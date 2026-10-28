@@ -174,6 +174,10 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
   onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
+  // A STOPPED deployment whose enforcement sweep has not completed still has
+  // exposure at the broker. Rendering the raw status would report a stop that
+  // only partly happened.
+  const stopPending = card.status === "STOPPED" && Boolean(card.exposure_may_be_open);
   return (
     <div
       key={card.id}
@@ -195,7 +199,16 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
-        <div style={statusChipStyle(card.status)}>{card.status}</div>
+        <div
+          style={stopPending ? stopPendingChipStyle : statusChipStyle(card.status)}
+          title={
+            stopPending
+              ? "The daemon has not confirmed a complete cancel-and-flatten yet, so positions may still be open at the broker."
+              : undefined
+          }
+        >
+          {stopPending ? "STOPPING" : card.status}
+        </div>
       </div>
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
         {card.timeframe} · {card.symbols.join(", ")}
@@ -1775,6 +1788,24 @@ function statusChipStyle(status: LiveDeploymentStatus): React.CSSProperties {
     letterSpacing: "0.03em",
   };
 }
+
+/**
+ * A STOPPED deployment whose cancel/flatten sweep has not completed. Deliberately
+ * not the STOPPED colour: the stop was requested, the exposure is not confirmed
+ * gone, and the two must not look alike.
+ */
+const stopPendingChipStyle: React.CSSProperties = {
+  marginBottom: "8px",
+  fontSize: "0.7rem",
+  display: "inline-flex",
+  alignItems: "center",
+  borderRadius: "999px",
+  padding: "3px 8px",
+  border: "1px solid rgba(251, 146, 60, 0.45)",
+  background: "rgba(251, 146, 60, 0.16)",
+  color: "#fdba74",
+  letterSpacing: "0.03em",
+};
 
 const addDeploymentBtnStyle: React.CSSProperties = {
   display: "inline-flex",

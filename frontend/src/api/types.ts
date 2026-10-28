@@ -568,6 +568,17 @@ export interface LiveDeploymentConfig {
   symbols: string[];
   timeframe: string;
   status: LiveDeploymentStatus;
+  /**
+   * When the daemon last completed a *complete* cancel-and-flatten sweep for a
+   * STOPPED deployment. `null` while STOPPED means the stop is still only a
+   * request: exposure may be open at the broker.
+   */
+  stopped_enforced_at?: string | null;
+  /**
+   * `status === "STOPPED"` with no enforcement stamp. The status alone is not a
+   * fact about exposure, so the UI must not present this deployment as stopped.
+   */
+  exposure_may_be_open?: boolean;
   signal_source_type?: LiveSignalSource;
   signal_source_id?: string | null;
   symbol_filter?: string[];
