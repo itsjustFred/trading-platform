@@ -99,9 +99,29 @@ by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
 
-**Pinned by:** `tests/test_stats.py` (existing suite, green on both paths) —
-the QS and fallback formulas now provably share the total_return/Calmar
-computation.
+**Daily series includes the first trading day.** The daily equity build writes
+an inception point at the window start (00:00) and a close at
+`23:59:59.999999` of every day. Resampling to the *last* observation of each
+calendar day therefore dropped the inception point whenever its day also
+carried a close, so the first day's return never reached the series: three
+trading days produced two daily returns, a first-day loss vanished, and
+Sharpe/Sortino/PSR came out too high by an amount that depended on whether day
+one happened to be a loss. The curve's first observation is that day's opening
+equity and is now the base of its return; a day carrying a single observation
+still yields no return rather than a synthetic flat one.
+
+`daily_returns[*].equity` is the exact ledger value while the persisted curve
+rounds to cents. Rounding the reported field too would either desynchronise it
+from the `return` beside it or quantise the running balance — and a quantised
+accumulator drifts by up to half a cent per day, which would push a long
+window's endpoint outside the one-cent reconciliation gate.
+
+**Pinned by:** `tests/test_stats.py` (existing suite, green on both paths — the
+QS and fallback formulas provably share the total_return/Calmar computation),
+plus `TestFirstTradingDayReturn` (3 trading days ⇒ 3 returns with the first-day
+loss included; Sharpe and Sortino strictly lower than the collapsed series) and
+`TestComputeStats::test_intraday_sharpe_uses_daily_returns_not_bar_density` (one
+return per trading day, including the first).
 
 ## D6 — Risk-parity covariance uses asset prices first (F30)
 
