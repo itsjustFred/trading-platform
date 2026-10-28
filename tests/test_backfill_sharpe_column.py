@@ -96,15 +96,18 @@ def test_each_column_is_reconciled_independently(conn):
 
 
 def test_p_value_uses_its_own_sentinel_of_one_not_zero(conn):
-    """p_value defaults to 1.0, not 0.0 - a 0.0 column there is a real value and must be left alone."""
-    conn.execute("update backtests set p_value = 0.0, stats = '{\"p_value\": 0.75}' where id = 'both-zero'")
+    """p_value defaults to 1.0, not 0.0 - a 0.0 column is a real value and must be left alone."""
+    conn.execute(
+        "update backtests set p_value = 0.0, stats = '{\"p_value\": 0.75}' "
+        "where id = 'both-zero'"
+    )
     conn.commit()
 
     module = _load()
     rows = module.find_disagreements(conn)
     assert not any(column == "p_value" for _id, column, _c, _p in rows), (
-        "a p_value column of 0.0 was treated as a sentinel. It is not - p_value's sentinel is 1.0, so "
-        "0.0 is a real value and reconciling it would overwrite real data"
+        "a p_value column of 0.0 was treated as a sentinel. It is not - p_value's sentinel is "
+        "1.0, so 0.0 is a real value and reconciling it would overwrite real data"
     )
 
 
@@ -119,9 +122,9 @@ def test_a_column_holding_a_real_value_is_never_reconciled(conn):
     module = _load()
     rows = module.find_disagreements(conn)
     assert not any(r[0] == "drift" for r in rows), (
-        "a row whose cagr column holds a real 0.1803 against a payload 0.1786 must not be reported - "
-        "that is recomputation drift, and overwriting a real value with a different real value "
-        "destroys information rather than restoring it"
+        "a row whose cagr column holds a real 0.1803 against a payload 0.1786 must not be "
+        "reported - that is recomputation drift, and overwriting a real value with a different "
+        "real value destroys information rather than restoring it"
     )
 
 
@@ -137,7 +140,8 @@ def test_declared_undefined_rows_are_reported_and_never_applied(conn):
     module = _load()
     withheld = module.find_declared_undefined(conn)
     assert ("withheld", "sharpe_ratio") in withheld, (
-        "a producer-declared undefined metric must be reported so the script can refuse to overwrite it"
+        "a producer-declared undefined metric must be reported so the script can refuse to "
+        "overwrite it"
     )
     rows = module.find_disagreements(conn)
     module._reconcile(conn, rows)
@@ -148,14 +152,24 @@ def test_declared_undefined_rows_are_reported_and_never_applied(conn):
 
 
 def test_the_corpus_has_no_declared_undefined_sentinels_today():
-    """Zero today, measured. This is the check that makes the refusal path worth keeping."""
+    """Zero today, measured. This is the check that makes the refusal path worth keeping.
+
+    Opt-in and read-only, like the corpus count above: the live database is not part of this
+    repository, must not be opened by a test run, and its path is not portable.
+    """
+    import os
     import sqlite3 as _sqlite3
 
-    db = Path("/home/ubuntu/data/backtests.db")
-    if not db.exists():
+    configured = os.environ.get("TRADING_PRODUCTION_DB")
+    if not configured:
+        pytest.skip("set TRADING_PRODUCTION_DB to a production copy to check the corpus")
+    db = Path(configured)
+    if not db.is_file():
         pytest.skip(f"{db} is absent, so there is no corpus to inspect")
     with _sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
-        rows = connection.execute("select sharpe_ratio, psr, cagr, p_value, stats from backtests").fetchall()
+        rows = connection.execute(
+            "select sharpe_ratio, psr, cagr, p_value, stats from backtests"
+        ).fetchall()
 
     withheld = 0
     for *values, stats in rows:
@@ -172,8 +186,9 @@ def test_the_corpus_has_no_declared_undefined_sentinels_today():
             if column in undefined and payload.get(column) is not None:
                 withheld += 1
     assert withheld == 0, (
-        f"{withheld} cells now declare their metric undefined while publishing a value. The refusal "
-        f"path in this script is no longer hypothetical and the operator must be told before any apply."
+        f"{withheld} cells now declare their metric undefined while publishing a value. The "
+        f"refusal path in this script is no longer hypothetical and the operator must be told "
+        f"before any apply."
     )
 
 

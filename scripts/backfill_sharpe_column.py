@@ -61,7 +61,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from shared.constants import DATA_DIR  # noqa: E402 - after the sys.path bootstrap, deliberately
+from shared.constants import DATA_DIR  # noqa: E402, I001 - after the sys.path bootstrap
 _DISAGREEMENT_TOLERANCE = 1e-9
 
 # Each column's physically-stored "never computed" default. `p_value` is 1.0, not 0.0, because

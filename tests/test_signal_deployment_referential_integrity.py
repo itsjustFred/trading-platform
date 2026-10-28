@@ -62,7 +62,11 @@ def test_live_signals_declares_the_deployment_foreign_key() -> None:
     it. The cost is now paid - `live_smoke._ensure_ctrader_smoke_deployment` writes the parent row
     before the signal - so the assertion is inverted rather than deleted.
     """
-    match = re.search(r"class LiveSignalModel\(SQLModel, table=True\):(.*?)\n\s*@classmethod", DATABASE.read_text(), re.S)
+    match = re.search(
+        r"class LiveSignalModel\(SQLModel, table=True\):(.*?)\n\s*@classmethod",
+        DATABASE.read_text(),
+        re.S,
+    )
     block = match.group(1) if match else ""
     assert block, "could not locate LiveSignalModel in shared/database.py"
     assert 'foreign_key="live_deployments.id"' in block, (
@@ -97,12 +101,12 @@ def test_the_smoke_tooling_creates_the_parent_before_the_signal() -> None:
     assert text.index(ensure_call) < text.index(signal_construction), (
         "the deployment must be ensured before the signal that depends on it"
     )
-    # The label is a strategy_name, never a primary key: live_deployments.id is typed uuid.UUID, so a
-    # descriptive id stopped the daemon syncing every deployment including the armed ones.
+    # The label is a strategy_name, never a primary key: live_deployments.id is typed uuid.UUID,
+    # so a descriptive id stopped the daemon syncing every deployment including the armed ones.
     assert "strategy_name=strategy_name" in text
     assert "id=strategy_name" not in text, (
-        "the smoke deployment went back to using the descriptive label as its primary key, which is "
-        "not a UUID and will stop the daemon syncing every deployment again"
+        "the smoke deployment went back to using the descriptive label as its primary key, which "
+        "is not a UUID and will stop the daemon syncing every deployment again"
     )
 
 
@@ -171,7 +175,8 @@ def _seed_smoke_parent(engine, *, account_id: str, parent_id: str | None) -> str
         if parent_id is not None:
             connection.exec_driver_sql(
                 "INSERT INTO live_deployments "
-                "(id, strategy_name, account_id, symbols, timeframe, status, created_at, updated_at)"
+                "(id, strategy_name, account_id, symbols, timeframe, status, created_at,"
+                " updated_at)"
                 f" VALUES ('{parent_id}', '{label}', '{account_id}', '[]', '1m', 'PAUSED', '', '')"
             )
         connection.exec_driver_sql(
@@ -459,7 +464,10 @@ class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
                     )
                 )
                 conn.execute(
-                    text("INSERT INTO live_signals SELECT id, deployment_id FROM live_signals__keep")
+                    text(
+                        "INSERT INTO live_signals SELECT id, deployment_id"
+                        " FROM live_signals__keep"
+                    )
                 )
                 conn.execute(text("DROP TABLE live_signals__keep"))
                 conn.execute(text("PRAGMA legacy_alter_table=OFF"))

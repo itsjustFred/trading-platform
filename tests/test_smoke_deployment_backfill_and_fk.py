@@ -37,9 +37,11 @@ def conn(tmp_path):
                 "CREATE TABLE live_deployments (id TEXT PRIMARY KEY, strategy_name TEXT NOT NULL, "
                 "account_id TEXT NOT NULL, symbols TEXT NOT NULL, timeframe TEXT NOT NULL, "
                 "status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
-                "settings TEXT NOT NULL DEFAULT '{}', signal_source TEXT NOT NULL DEFAULT 'internal', "
-                "signal_config TEXT NOT NULL DEFAULT '{}', signal_source_type TEXT NOT NULL DEFAULT "
-                "'internal', signal_source_id TEXT NOT NULL DEFAULT '', "
+                "settings TEXT NOT NULL DEFAULT '{}', "
+                "signal_source TEXT NOT NULL DEFAULT 'internal', "
+                "signal_config TEXT NOT NULL DEFAULT '{}', "
+                "signal_source_type TEXT NOT NULL DEFAULT 'internal', "
+                "signal_source_id TEXT NOT NULL DEFAULT '', "
                 "symbol_filter TEXT NOT NULL DEFAULT '[]')"
             )
         )
@@ -93,7 +95,8 @@ def _add_signal(conn, signal_id: str, deployment_id: str, symbol: str = "EURUSD"
     conn.execute(
         text(
             f"INSERT INTO live_signals ({SIGNAL_COLUMNS}) "
-            "VALUES (:id, :dep, :sym, 'buy', 1.0, '2026-09-25 10:00:00', '{}', 'internal', '', NULL, NULL)"
+            "VALUES (:id, :dep, :sym, 'buy', 1.0, '2026-09-25 10:00:00', '{}', 'internal', '',"
+            " NULL, NULL)"
         ),
         {"id": signal_id, "dep": deployment_id, "sym": symbol},
     )
@@ -112,8 +115,8 @@ def test_backfill_creates_the_parent_row_for_a_smoke_orphan(conn):
         )
     ).fetchone()
     assert row is not None
-    # The key is a UUID because LiveDeploymentConfig.id is typed uuid.UUID; the readable label lives in
-    # strategy_name. A descriptive primary key here stopped the daemon syncing every deployment.
+    # The key is a UUID because LiveDeploymentConfig.id is typed uuid.UUID; the readable label
+    # lives in strategy_name. A descriptive primary key stopped the daemon syncing every deployment.
     import uuid as _uuid
 
     _uuid.UUID(row[0])
@@ -240,9 +243,9 @@ def test_fk_migration_is_a_noop_when_already_present(conn):
 def test_orphan_blocks_the_fk_and_the_framework_rolls_it_back(conn):
     """The real production shape: one non-smoke orphan blocks the FK, by design.
 
-    ``_schema_migration_connection`` runs DDL with ``PRAGMA foreign_keys=OFF`` and then validates, so
-    that is the path under test: the copy succeeds and ``foreign_key_check`` reports the violation
-    that makes the framework raise and roll back.
+    ``_schema_migration_connection`` runs DDL with ``PRAGMA foreign_keys=OFF`` and then
+    validates, so that is the path under test: the copy succeeds and ``foreign_key_check``
+    reports the violation that makes the framework raise and roll back.
     """
     _add_account(conn, "44695443")
     _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
@@ -273,8 +276,8 @@ def test_orphan_blocks_the_fk_and_the_framework_rolls_it_back(conn):
         # A whole-database check still reports the fixture's deliberate orphan - s2's
         # `removed-by-hand-uuid` is not backfilled, and this migration does not backfill anything.
         # That is the contract: `_schema_migration_connection` runs foreign_key_check and raises,
-        # rolling the rebuild back. Here we assert the violation is *that* one, not that it is absent,
-        # because this fixture is deliberately shaped with an orphan in it.
+        # rolling the rebuild back. Here we assert the violation is *that* one, not that it is
+        # absent, because this fixture is deliberately shaped with an orphan in it.
         violations = enforced.execute(text("pragma foreign_key_check")).fetchall()
         assert all(v[2] == "live_deployments" for v in violations), (
             f"an unexpected violation appeared: {violations}"
@@ -301,7 +304,10 @@ def test_probe_agrees_with_the_migration_on_production_shaped_data(conn):
 
     assert _backfill_smoke_deployments(conn) == 5
     remaining = conn.execute(
-        text("select count(*) from live_signals where deployment_id not in (select id from live_deployments)")
+        text(
+            "select count(*) from live_signals where deployment_id not in "
+            "(select id from live_deployments)"
+        )
     ).scalar_one()
     assert remaining == 1
 
@@ -309,10 +315,10 @@ def test_probe_agrees_with_the_migration_on_production_shaped_data(conn):
 def test_the_backfill_repoints_the_signal_at_the_new_uuid(conn):
     """Creating the parent is not enough on its own.
 
-    The signal names the descriptive label, which after the fix is `strategy_name` rather than `id`. If
-    the parent is created with a fresh UUID and the signal is left pointing at the label, every signal
-    stays orphaned - the state this function exists to leave behind - while the deployment exists and
-    looks fine. So the repoint is asserted, not assumed.
+    The signal names the descriptive label, which after the fix is `strategy_name` rather than
+    `id`. If the parent is created with a fresh UUID and the signal is left pointing at the label,
+    every signal stays orphaned - the state this function exists to leave behind - while the
+    deployment exists and looks fine. So the repoint is asserted, not assumed.
     """
     _add_account(conn, "44695443")
     _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
@@ -325,8 +331,8 @@ def test_the_backfill_repoints_the_signal_at_the_new_uuid(conn):
         )
     ).fetchone()
     assert row is not None, (
-        "the signal still points at the descriptive label rather than the deployment's UUID id, so it "
-        "remains an orphan even though its parent row exists"
+        "the signal still points at the descriptive label rather than the deployment's UUID id, "
+        "so it remains an orphan even though its parent row exists"
     )
     assert row[1] == "ctrader-demo-smoke-44695443"
 
@@ -335,10 +341,10 @@ def test_the_backfill_adopts_a_parent_that_already_carries_the_label(conn):
     """The case that made `init_db()` raise: a parent exists, keyed by a UUID, labelled with the
     smoke name, and the signals still name the label.
 
-    Skipping it - which an earlier version did - leaves the parent present and every signal orphaned.
-    The FK rebuild then copies them, `foreign_key_check` reports the violation and
-    `_schema_migration_connection` raises `foreign key violations remain`, so nothing migrates at all.
-    The parent must be adopted, and no second row invented for the same label.
+    Skipping it - which an earlier version did - leaves the parent present and every signal
+    orphaned. The FK rebuild then copies them, `foreign_key_check` reports the violation and
+    `_schema_migration_connection` raises `foreign key violations remain`, so nothing migrates
+    at all. The parent must be adopted, and no second row invented for the same label.
     """
     _add_account(conn, "44695443")
     existing_id = "8f14e45f-ceea-467f-a3b1-2c0e1c1e5f00"

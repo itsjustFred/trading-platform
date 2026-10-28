@@ -1631,10 +1631,10 @@ _SMOKE_DEPLOYMENT_PREFIX = "ctrader-demo-smoke-"
 def _backfill_smoke_deployments(connection: Connection) -> int:
     """Give smoke-sourced orphan signals the parent deployment row they were always meant to have.
 
-    ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created no
-    deployment row, so those signals were invisible to every deployment-scoped query. This recreates
-    exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history and future
-    runs agree.
+    ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
+    no deployment row, so those signals were invisible to every deployment-scoped query. This
+    recreates exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history
+    and future runs agree.
 
     Three deliberate restrictions, each a guard against fabricating a trading record:
 
@@ -1645,12 +1645,13 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
       ``discord::`` convention for synthetic deployments, so no runner trades it.
 
     **Adoption, not just creation.** ``live_deployments.id`` is typed ``uuid.UUID`` on
-    ``LiveDeploymentConfig``, so the readable label lives in ``strategy_name`` and the key is a UUID.
-    That means a parent can already exist under the same label with a different key - the shape left
-    by a run that predates this backfill - and the signals naming the label are still orphans. An
-    earlier version skipped that case, which left the signals orphaned *and* the parent present: the
-    migration then failed its ``foreign_key_check`` and ``init_db()`` raised. So an existing parent is
-    adopted and the signals are repointed at it, exactly as a newly created one is.
+    ``LiveDeploymentConfig``, so the readable label lives in ``strategy_name`` and the key is a
+    UUID. That means a parent can already exist under the same label with a different key - the
+    shape left by a run that predates this backfill - and the signals naming the label are still
+    orphans.
+    An earlier version skipped that case, which left the signals orphaned *and* the parent present:
+    the migration then failed its ``foreign_key_check`` and ``init_db()`` raised. So an existing
+    parent is adopted and the signals are repointed at it, exactly as a newly created one is.
 
     Never deletes. Non-smoke orphans are left untouched and reported.
 
@@ -1748,8 +1749,8 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
       refused *even when every dependent row has been removed*, because the surviving executions
       point at rows inside the table being dropped. Measured on a production clone: the migration
       failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
-      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes a
-      bad swap fail closed.
+      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes
+      a bad swap fail closed.
 
     Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
     On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
@@ -1797,9 +1798,9 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
     )
 
     # The table name is rewritten through a pattern rather than `str.replace`, because SQLite may
-    # store it quoted: a rebuild that succeeds leaves `CREATE TABLE "live_signals" (...)` behind, and
-    # a plain replace of the unquoted spelling would then match nothing - so a second run (after the
-    # FK was lost some other way) would recreate `live_signals` while `live_signals` still existed.
+    # store it quoted: a rebuild that succeeds leaves `CREATE TABLE "live_signals" (...)` behind,
+    # and a plain replace of the unquoted spelling would then match nothing - so a second run (after
+    # the FK was lost some other way) would recreate `live_signals` while it still existed.
     new_create_sql, replacements = re.subn(
         r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
         r"(?:\"live_signals\"|`live_signals`|\[live_signals\]|live_signals)",
@@ -1864,10 +1865,10 @@ def _migrate_schema() -> None:
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
 
-        # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a row
-        # that violates the constraint it is introducing. On a database whose only orphans are
-        # smoke-shaped this makes the FK land; anything left over keeps the migration fail-closed via
-        # `foreign_key_check` at the end of `_schema_migration_connection`.
+        # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a
+        # row that violates the constraint it is introducing. On a database whose only orphans are
+        # smoke-shaped this makes the FK land; anything left over keeps the migration fail-closed
+        # via `foreign_key_check` at the end of `_schema_migration_connection`.
         _backfill_smoke_deployments(connection)
         _migrate_live_signal_deployment_fk(connection)
 
@@ -2691,8 +2692,8 @@ def update_live_deployment_status(
 class LiveDeploymentInUseError(RuntimeError):
     """Raised when a deployment cannot be deleted because records still reference it.
 
-    A typed error instead of the driver's ``IntegrityError`` escaping through the ORM: the caller has
-    to make a decision - refuse, archive, or delete the history deliberately first - and a
+    A typed error instead of the driver's ``IntegrityError`` escaping through the ORM: the caller
+    has to make a decision - refuse, archive, or delete the history deliberately first - and a
     ``sqlite3.IntegrityError`` cannot carry that. Nothing is deleted when this is raised, and the
     check happens before the delete rather than relying on the foreign key, so the behaviour is the
     same on a database whose ``live_signals.deployment_id`` key was never migrated in.

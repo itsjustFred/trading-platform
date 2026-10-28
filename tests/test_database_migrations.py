@@ -143,8 +143,8 @@ def signal_parent(isolated_db):
     """The deployment ``_make_live_signal`` names.
 
     ``live_signals.deployment_id`` carries a foreign key, so the factory's synthetic id needs a
-    parent row. Kept as its own fixture rather than seeded in ``isolated_db``, because other tests in
-    this module stage and rebuild these tables from scratch.
+    parent row. Kept as its own fixture rather than seeded in ``isolated_db``, because other tests
+    in this module stage and rebuild these tables from scratch.
     """
     database, _engine, _data_dir, _backtests_dir = isolated_db
     seed_live_deployments(database, ["dep-1"])
@@ -329,7 +329,10 @@ def _legacy_signals_db(engine) -> None:
             )
         )
         conn.execute(
-            text("INSERT INTO live_accounts (id, broker, name) VALUES ('acct-legacy', 'ctrader', 'a')")
+            text(
+                "INSERT INTO live_accounts (id, broker, name) "
+                "VALUES ('acct-legacy', 'ctrader', 'a')"
+            )
         )
         conn.execute(
             text(

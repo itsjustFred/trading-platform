@@ -1,23 +1,25 @@
 """A repeated dedupe key is either a redelivery or an amendment. Only one of them may be dropped.
 
-`save_live_execution_up_to_cumulative` branches on "is there already a row with this dedupe key". That
-single check conflated two situations which mean opposite things:
+`save_live_execution_up_to_cumulative` branches on "is there already a row with this dedupe key".
+That single check conflated two situations which mean opposite things:
 
-    redelivery   the broker sent the same deal again, unchanged. Dropping it is right - this is the
-                 duplicate `ctrader:deal:<dealId>` exists to catch, and dropping it is what stops the
-                 43.07822 + 0.07822 double-count.
+    redelivery   the broker sent the same deal again, unchanged. Dropping it is right - this is
+                 the duplicate `ctrader:deal:<dealId>` exists to catch, and dropping it is what
+                 stops the 43.07822 + 0.07822 double-count.
     amendment    the broker sent the same dealId with a LARGER quantity. `ProtoOADeal` carries
                  `filledVolume` alongside `volume`, so a deal can grow. Dropping that freezes the
-                 stored quantity at its first-seen value and the remainder of the fill is never recorded.
+                 stored quantity at its first-seen value and the remainder of the fill is never
+                 recorded.
 
-cTrader exposes no fill-level identifier - a deal entry has `dealId`, `orderId`, `positionId` and
-`symbolId` and nothing finer, and there is no `fillId` anywhere in the installed protos. So an order
-split into several fills arrives as several deals with distinct ids and each is stored correctly. That
-case needs no code. The amendment case is the one that was being dropped, and it is what this file pins.
+cTrader exposes no fill-level identifier - a deal entry has `dealId`, `orderId`, `positionId`
+and `symbolId` and nothing finer, and there is no `fillId` anywhere in the installed protos. So
+an order split into several fills arrives as several deals with distinct ids and each is stored
+correctly. That case needs no code. The amendment case is the one that was being dropped, and it
+is what this file pins.
 
-The distinction is one-directional: only an increase amends. A smaller or equal quantity is treated as
-redelivery, because shrinking a fill that the broker has already reported would be worse than ignoring
-it.
+The distinction is one-directional: only an increase amends. A smaller or equal quantity is
+treated as redelivery, because shrinking a fill that the broker has already reported would be
+worse than ignoring it.
 """
 
 from __future__ import annotations
@@ -106,8 +108,8 @@ def test_a_larger_quantity_amends_instead_of_being_dropped(db):
 
     assert amended == pytest.approx(2.0), "the incremental slice should be reported as persisted"
     assert _rows(engine) == [("ctrader:deal:26533115", pytest.approx(3.0))], (
-        "the amended quantity must accumulate on the one row rather than adding a second row or being "
-        "silently capped at the first-seen value"
+        "the amended quantity must accumulate on the one row rather than adding a second row or "
+        "being silently capped at the first-seen value"
     )
 
 
@@ -121,7 +123,7 @@ def test_several_amendments_accumulate(db):
 
 
 def test_a_smaller_quantity_does_not_shrink_a_reported_fill(db):
-    """One-directional on purpose: shrinking a fill the broker already reported is worse than ignoring it."""
+    """One-directional on purpose: shrinking a reported fill is worse than ignoring it."""
     engine, signal_id = db
     save_live_execution_up_to_cumulative(_execution(signal_id, 2.0), 2.0)
 
