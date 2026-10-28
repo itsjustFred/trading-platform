@@ -20,6 +20,8 @@ from live_runner.base_adapter import (
     BaseLiveAdapter,
     coerce_positive_live_qty,
     is_unbounded_tp,
+    money_digits_from_trader,
+    money_scale,
 )
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
@@ -2187,8 +2189,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
 
         trader = trader_res.trader
-        money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
-        scale = 10**money_digits if 0 <= money_digits <= 12 else 100
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
         balance = _to_float(getattr(trader, "balance", 0)) / scale
         equity = balance
         if hasattr(trader, "equity"):

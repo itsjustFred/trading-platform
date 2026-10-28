@@ -17,6 +17,7 @@ from live_runner.alpaca_adapter import (
     _alpaca_credential_blocks,
     _default_alpaca_credentials,
 )
+from live_runner.base_adapter import money_digits_from_trader, money_scale
 from live_runner.credential_env import load_accounts_env_values
 from shared.logging import get_logger
 from shared.models import LiveAccount
@@ -289,9 +290,14 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
 
 
 def _trader_balance(trader: Any) -> float:
-    money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
-    scale = 10**money_digits if 0 <= money_digits <= 12 else 100
-    return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / scale
+    """The account balance in currency units.
+
+    `moneyDigits` is resolved presence-aware by :func:`money_digits_from_trader`: a broker that
+    sends a genuine 0 means "no minor units", and dividing by 100 would make the balance 100x
+    too small. The `or 2` collapse that used to live here did exactly that.
+    """
+    money_digits = money_digits_from_trader(trader)
+    return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / money_scale(money_digits)
 
 
 def _ctrader_message_name_sources(message: Any) -> list[Any]:
@@ -367,7 +373,15 @@ def _ctrader_extract_login(*sources: Any) -> str:
             candidate = str(raw_value).strip()
             if not candidate:
                 continue
-            if candidate.isdigit() and int(candidate) <= 0:
+            # `int(candidate) <= 0` cannot be tested as written, because a negative login
+            # carries a sign and `"-1".isdigit()` is False - so the `<= 0` half never ran for
+            # the values it was written for, and the guard refused `0` while passing `-1`.
+            # `traderLogin` is an int64, so a negative is an ordinary wire value, and every
+            # validator downstream (`preflight`, `account_routing`) already rejects a
+            # non-positive identifier with a bare `int(...) <= 0` and no `isdigit()` conjunct.
+            # Test the magnitude and keep the sign out of it.
+            magnitude = candidate.lstrip("+-")
+            if magnitude.isdigit() and (int(magnitude) == 0 or candidate.startswith("-")):
                 continue
             return candidate
     return ""
