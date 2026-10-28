@@ -20,6 +20,7 @@ from shared.models import LiveAccountConfig, LiveDeploymentConfig
 class _FailingAdapter:
     connect_calls: int = 0
     disconnect_calls: int = 0
+    demo: bool = True
 
     async def connect(self) -> None:
         self.connect_calls += 1
@@ -45,6 +46,7 @@ def test_ensure_adapter_for_active_account_keeps_adapter_after_connect_failure(m
         name="Demo",
         broker_login="",
         ctid="",
+        is_demo=True,
     )
 
     def _factory(_account, *, accounts_env_values, accounts_env_path=None):
@@ -83,6 +85,7 @@ def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypa
     class _TerminalFailAdapter:
         connect_calls: int = 0
         disconnect_calls: int = 0
+        demo: bool = True
 
         async def connect(self) -> None:
             self.connect_calls += 1
@@ -101,6 +104,7 @@ def test_ensure_adapter_for_active_account_blocks_ctrader_terminal_auth(monkeypa
         name="Demo",
         broker_login="",
         ctid="",
+        is_demo=True,
     )
 
     def _factory(_account, *, accounts_env_values, accounts_env_path=None):
@@ -932,6 +936,14 @@ def test_active_deployment_trades_after_status_recheck(monkeypatch) -> None:
         daemon,
         "get_live_deployment",
         lambda deployment_id: _discord_deployment("ACTIVE"),
+    )
+    # This test is about the status re-check, not the claim. The claim needs a
+    # real deployment row, which this unit-level fixture does not create.
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda *args, **kwargs: True
     )
 
     async def _no_wait(_signal, _timeframe):

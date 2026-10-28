@@ -46,11 +46,19 @@ from risk import RiskConfig, RiskEngine, TradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.database import (
+    LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    claim_live_deployment_submission,
+    clear_live_deployment_stopped_enforced,
     create_service,
     get_live_deployment,
+    get_service,
     list_live_accounts,
     list_live_deployments,
     list_services,
+    list_stopped_enforced_deployment_ids,
+    mark_live_deployment_stopped_enforced,
+    release_live_deployment_submission,
+    renew_live_deployment_submission,
     save_live_balance,
     update_service_status,
 )
@@ -152,6 +160,28 @@ def _adapter_is_ready(adapter: BaseLiveAdapter) -> bool:
     return True
 
 
+def _adapter_is_demo(adapter: BaseLiveAdapter) -> bool:
+    """Whether this adapter provably routes to a demo/paper account.
+
+    Fail closed on every uncertainty: an unknown adapter type, a missing flag,
+    or a flag that is not literally ``True`` is not demo. cTrader calls it
+    ``demo`` and Alpaca ``paper``; the account row's ``is_demo`` is checked
+    separately, because a correctly configured adapter can still be pointed at
+    a live account.
+    """
+    if isinstance(adapter, AlpacaLiveAdapter):
+        return getattr(adapter, "paper", None) is True
+    if isinstance(adapter, CTraderLiveAdapter):
+        return getattr(adapter, "demo", None) is True
+    # Unknown adapter types still have to prove it, so a double or a future
+    # adapter cannot slip through by being unrecognised. Only a literal True on
+    # either documented flag counts.
+    return (
+        getattr(adapter, "demo", None) is True
+        or getattr(adapter, "paper", None) is True
+    )
+
+
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
     if value is None:
         return default
@@ -249,7 +279,16 @@ def _recover_failed_services() -> list[Service]:
     for service in services:
         if service.status != ServiceStatus.FAILED:
             continue
-        update_service_status(str(service.id), ServiceStatus.RUNNING)
+        # The write is conditional on the row still not being PAUSED, so a
+        # pause that landed after the list read wins. Only arm the reconnect
+        # floor when the service actually moved to RUNNING.
+        recovered = update_service_status(str(service.id), ServiceStatus.RUNNING)
+        if recovered is None or recovered.status != ServiceStatus.RUNNING:
+            logger.info(
+                "Not recovering a service whose operator paused it",
+                extra={"data": {"service_id": str(service.id)}},
+            )
+            continue
         _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE[str(service.id)] = (
             datetime.now(timezone.utc)
             + timedelta(seconds=DISCORD_RECONNECT_RETRY_FLOOR_SECONDS)
@@ -1195,6 +1234,38 @@ def _resolve_discord_service_trusted_author_ids(
     )
 
 
+async def _renew_submission_claim_until_cancelled(token: str) -> None:
+    """Keep a submission lease alive while the broker call is in flight.
+
+    A fixed 30 s lease used to expire under a slow submit, and a second
+    dispatcher could then take it and submit a duplicate. Renewal runs at a
+    third of the TTL, so a single missed beat is harmless. Losing the lease is
+    logged loudly but does not cancel the in-flight call: the order may already
+    be at the broker, and killing the coroutine would not recall it.
+    """
+    interval = max(LIVE_SUBMISSION_CLAIM_TTL_SECONDS / 3.0, 0.05)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            renewed = await asyncio.to_thread(
+                renew_live_deployment_submission, token
+            )
+        except Exception as exc:
+            logger.error(
+                "Could not renew the live submission lease; a slow submit may now "
+                "lose it",
+                extra={"data": {"token": token, "error": repr(exc)}},
+            )
+            return
+        if not renewed:
+            logger.error(
+                "Live submission lease was lost while the order was in flight; "
+                "the outcome must be reconciled before the next submission",
+                extra={"data": {"token": token}},
+            )
+            return
+
+
 async def _submit_normalized_discord_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -1296,22 +1367,68 @@ async def _submit_normalized_discord_signal(
             },
         )
         return
-    try:
-        broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
-    except Exception as exc:
-        logger.warning(
-            "Discord signal submission failed",
+
+    # Atomic submission claim. The status re-checks above ran against a
+    # snapshot; between them and the broker call an operator can pause the
+    # deployment. The claim turns "still ACTIVE" into a single atomic database
+    # fact taken immediately before submission, so a PAUSE either wins the race
+    # (the claim fails and nothing is sent) or is already in effect while this
+    # dispatcher finishes the order it had already claimed.
+    claim_token = uuid.uuid4().hex
+    claimed = await asyncio.to_thread(
+        claim_live_deployment_submission,
+        str(deployment.id),
+        claim_token,
+    )
+    if not claimed:
+        logger.info(
+            "Skipping discord signal: deployment no longer ACTIVE at submission claim",
             extra={
                 "data": {
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
-                    "symbol": live_signal.symbol,
-                    "error": str(exc),
+                    "symbol": normalized_signal.symbol,
+                    "snapshot_status": deployment.status,
                 }
             },
         )
         return
 
+    renew_task = asyncio.create_task(
+        _renew_submission_claim_until_cancelled(claim_token),
+        name=f"submission-claim-renewal-{deployment.id}",
+    )
+    try:
+        try:
+            broker_order_id = await submit_order_with_risk(
+                adapter, deployment, live_signal
+            )
+        except Exception as exc:
+            # **Do not release the lease.** The broker may have accepted the
+            # order and only the response was lost; releasing would let the next
+            # signal submit a duplicate before anyone reconciled. The lease is
+            # left to expire, which the drain reports as INDETERMINATE rather
+            # than DRAINED.
+            logger.error(
+                "Discord signal submission failed with an unknown outcome; "
+                "holding the submission lease until it expires and requiring "
+                "reconciliation before the next submit",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
+    finally:
+        renew_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renew_task
+
+    await asyncio.to_thread(release_live_deployment_submission, claim_token)
     logger.info(
         "Discord signal submitted",
         extra={
@@ -2066,6 +2183,16 @@ async def _sync_running_discord_bot(
     accounts_env_values: Mapping[str, str],
 ) -> None:
     service_id = str(service.id)
+    # The caller's list is a snapshot taken before this tick's work. Re-read the
+    # row so a bot paused in the meantime is not started and then stopped a tick
+    # later; PAUSED is operator intent, not a transient state.
+    current = await asyncio.to_thread(get_service, service_id)
+    if current is None or current.status != ServiceStatus.RUNNING:
+        logger.info(
+            "Discord service is no longer RUNNING; refusing to start it",
+            extra={"data": {"service_id": service_id}},
+        )
+        return
     token_env_key, token, channel_id = _resolve_discord_bot_runtime(
         service,
         accounts_env_values=accounts_env_values,
@@ -2577,6 +2704,298 @@ def _log_deployment_status_observations(
         )
 
 
+def _account_ids_needing_stopped_enforcement(
+    deployments: list[LiveDeploymentConfig],
+    already_enforced: set[str],
+) -> set[str]:
+    """Accounts holding a STOPPED deployment whose cancel/flatten is still due.
+
+    These accounts need a connected adapter because the adapter is what performs
+    the sweep. Connecting only runnable accounts meant an account whose
+    deployments were all STOPPED never got one, so the stop was retried forever
+    and never actually enforced.
+
+    Returns account ids only; whether they may *trade* is decided separately
+    from the runnable set, so connecting for enforcement never grants trading
+    permission.
+    """
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "STOPPED"
+        and str(deployment.id) not in already_enforced
+    }
+
+
+def _stopped_enforcement_refusal(
+    account_lookup: Mapping[str, LiveAccountConfig] | None,
+    account_id: str,
+) -> str | None:
+    """Why this account can never get an adapter, or None when it can."""
+    if account_lookup is None:
+        return None
+    account = account_lookup.get(account_id)
+    if account is None:
+        return "account is not in the database"
+    if account.is_demo is not True:
+        return "account is not a verified demo account"
+    return None
+
+
+async def _enforce_stopped_deployments(
+    deployments: list[LiveDeploymentConfig],
+    active_adapters: dict[str, BaseLiveAdapter],
+    *,
+    already_enforced: set[str],
+    account_lookup: Mapping[str, LiveAccountConfig] | None = None,
+) -> None:
+    """Make STOPPED mean what an operator expects: nothing open, nothing resting.
+
+    For each STOPPED deployment: cancel working orders (leaving attached SL/TP
+    alone), flatten positions, then sweep protections orphaned by the flatten.
+    Enforced once per transition, not every tick, so a persistently stopped
+    deployment does not spam the broker.
+
+    A deployment is recorded as enforced **only when both sweeps report
+    ``ControlOutcome.complete``**. `completed > 0` is not success: it is equally
+    true of a sweep that closed one of three positions, and recording that as
+    stopped is how open exposure survives behind a dashboard that says
+    "stopped". A partial sweep is logged with its outstanding items and retried
+    on the next tick.
+    """
+    stopped = [
+        deployment
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "STOPPED"
+    ]
+    stopped_ids = {str(deployment.id) for deployment in stopped}
+    # Forget deployments that are no longer stopped, so a later STOPPED
+    # transition enforces again instead of being skipped as "already done".
+    left_stopped = {
+        deployment_id
+        for deployment_id in already_enforced
+        if deployment_id not in stopped_ids
+    }
+    already_enforced.difference_update(left_stopped)
+    for deployment_id in sorted(left_stopped):
+        try:
+            await asyncio.to_thread(
+                clear_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not clear a stale STOPPED enforcement stamp",
+                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+            )
+
+    # cancel/flatten act on the whole broker account, not on one deployment's
+    # positions. If another deployment on the same account is ACTIVE or PAUSED,
+    # flattening would close positions that deployment still owns.
+    position_owning_accounts = {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) in {"ACTIVE", "PAUSED"}
+    }
+
+    for deployment in stopped:
+        deployment_id = str(deployment.id)
+        if deployment_id in already_enforced:
+            continue
+
+        if deployment.account_id in position_owning_accounts:
+            logger.error(
+                "Refusing to flatten a shared account: another deployment on it is "
+                "still ACTIVE or PAUSED and its positions would be closed too",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        adapter = active_adapters.get(deployment.account_id)
+        if adapter is None:
+            block_reason = _stopped_enforcement_refusal(
+                account_lookup, deployment.account_id
+            )
+            if block_reason is not None:
+                logger.error(
+                    "Stopped deployment's account can never get an adapter, so the "
+                    "cancel/flatten can never run; flatten it at the broker by hand. "
+                    "Reason: %s",
+                    block_reason,
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+            else:
+                logger.info(
+                    "Stopped deployment has no active adapter yet; will retry cancel/flatten",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+            continue
+
+        try:
+            cancelled = (
+                await adapter.cancel_open_orders()
+                if adapter.supports_cancel_orders
+                else None
+            )
+        except NotImplementedError:
+            cancelled = None
+        except Exception as exc:
+            logger.error(
+                "Failed to cancel open orders for stopped deployment",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            continue
+
+        if cancelled is None:
+            logger.error(
+                "Adapter cannot cancel orders; stopped deployment is NOT flat",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+            continue
+        if not cancelled.complete:
+            logger.error(
+                "Order cancel was incomplete for stopped deployment; keeping it "
+                "unenforced and retrying: %s",
+                cancelled.describe(),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        try:
+            flattened = (
+                await adapter.close_all_positions() if adapter.supports_flatten else None
+            )
+        except NotImplementedError:
+            flattened = None
+        except Exception as exc:
+            logger.error(
+                "Failed to flatten positions for stopped deployment",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            continue
+
+        if flattened is None:
+            logger.error(
+                "Adapter cannot flatten positions; stopped deployment is NOT flat",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+            continue
+        if not flattened.complete:
+            logger.error(
+                "Flatten was incomplete for stopped deployment; keeping it "
+                "unenforced and retrying: %s",
+                flattened.describe(),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        # The account is flat. Sweep the protections the flatten detached. This
+        # is cleanliness, not safety - a failure here cannot create exposure -
+        # so it is reported but does not block the enforced stamp.
+        try:
+            orphaned = await adapter.cancel_orphaned_protections()
+        except NotImplementedError:
+            orphaned = None
+        except Exception as exc:
+            logger.warning(
+                "Failed to sweep protections orphaned by the flatten; the account "
+                "is flat but may still list resting protection orders",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            orphaned = None
+        if orphaned is None:
+            logger.warning(
+                "Adapter cannot identify orphaned protections; the account is flat "
+                "but protection orders may still be listed by the broker",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+        elif not orphaned.complete:
+            logger.warning(
+                "Orphaned-protection sweep was incomplete; the account is flat: %s",
+                orphaned.describe(),
+                extra={"data": {"deployment_id": deployment_id}},
+            )
+
+        already_enforced.add(deployment_id)
+        try:
+            await asyncio.to_thread(
+                mark_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not record STOPPED enforcement for a deployment",
+                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+            )
+        logger.warning(
+            "Enforced STOPPED deployment: orders cancelled and positions flattened",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "cancelled": cancelled.describe(),
+                    "flattened": flattened.describe(),
+                }
+            },
+        )
+
+
 async def _load_db_accounts_and_deployments(
 ) -> tuple[list[LiveAccountConfig], list[LiveDeploymentConfig]]:
     accounts_task = asyncio.to_thread(list_live_accounts)
@@ -2595,18 +3014,62 @@ async def _ensure_adapter_for_active_account(
 ) -> None:
     if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
         return
+    account = account_lookup.get(account_id)
+    if account is None:
+        logger.error(
+            "Refusing to construct an adapter for an unknown account",
+            extra={"data": {"account_id": account_id}},
+        )
+        stale = active_adapters.pop(account_id, None)
+        if stale is not None:
+            await _disconnect_adapter(
+                stale,
+                account_id=account_id,
+                reason="unknown_account",
+            )
+        return
+    if account.is_demo is not True:
+        logger.error(
+            "Refusing to construct or keep a live adapter for a non-demo account",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "is_demo": account.is_demo,
+                }
+            },
+        )
+        # An adapter that is already in the map would keep trading. Drop it, and
+        # make the removal visible rather than silently leaving a live path open.
+        stale = active_adapters.pop(account_id, None)
+        if stale is not None:
+            await _disconnect_adapter(
+                stale,
+                account_id=account_id,
+                reason="non_demo_account",
+            )
+        return
     adapter = active_adapters.get(account_id)
+    if adapter is not None and not _adapter_is_demo(adapter):
+        logger.error(
+            "Existing adapter is not in demo/paper mode; refusing continued use",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+        active_adapters.pop(account_id, None)
+        await _disconnect_adapter(
+            adapter,
+            account_id=account_id,
+            reason="non_demo_adapter",
+        )
+        return
     if adapter is not None:
         if _adapter_is_ready(adapter):
             return
     else:
-        account = account_lookup.get(account_id)
-        if account is None:
-            logger.warning(
-                "Active deployment references unknown account",
-                extra={"data": {"account_id": account_id}},
-            )
-            return
         try:
             adapter = _create_adapter_for_account(
                 account,
@@ -2623,6 +3086,17 @@ async def _ensure_adapter_for_active_account(
             )
             return
         if adapter is None:
+            return
+        if not _adapter_is_demo(adapter):
+            logger.error(
+                "Refusing a newly created adapter that is not in demo/paper mode",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
             return
         active_adapters[account_id] = adapter
 
@@ -2798,6 +3272,23 @@ async def sync_deployments_loop(
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
+    # Seeded from the database, not empty. Every restart used to re-run cancel
+    # and flatten for deployments that were already stopped, because this set
+    # was process-local while the stamp it mirrors is persisted.
+    try:
+        enforced_stopped_deployments = await asyncio.to_thread(
+            list_stopped_enforced_deployment_ids
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # Fail toward re-enforcing rather than toward skipping it: an empty
+        # ledger repeats work, a wrong one would leave a stopped deployment with
+        # open positions.
+        enforced_stopped_deployments = set()
+        logger.warning(
+            "Could not read the persisted STOPPED enforcement ledger; "
+            "enforcement will be re-run for every stopped deployment this tick",
+            extra={"data": {"error": repr(exc)}},
+        )
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
@@ -2842,15 +3333,25 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            # B2: disconnect against runnable (blocked-excluded) ids — a
-            # blocked account must never keep a live adapter via the
-            # active-id set.
-            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
+            # A STOPPED deployment can only be flattened by an adapter, so an
+            # account whose deployments are all STOPPED still needs one. The
+            # retained set is the union of runnable and enforcement accounts;
+            # only the runnable set may trade, and the task sets below use it
+            # alone, so connecting for enforcement never grants permission.
+            enforcement_account_ids = _account_ids_needing_stopped_enforcement(
+                deployments,
+                enforced_stopped_deployments,
+            ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            retained_account_ids = runnable_account_ids | enforcement_account_ids
+
+            # B2: disconnect against retained (blocked-excluded) ids — a
+            # blocked account must never keep a live adapter via either path.
+            await _disconnect_inactive_adapters(active_adapters, retained_account_ids)
 
             active_discord_account_ids = _discord_active_account_ids(deployments)
 
             await _connect_active_accounts(
-                runnable_account_ids,
+                retained_account_ids,
                 account_lookup,
                 active_adapters,
                 accounts_env_values=accounts_env_values,
@@ -2859,6 +3360,18 @@ async def sync_deployments_loop(
 
             _cancel_inactive_tasks(active_tasks, runnable_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)
+
+            # STOPPED means "cancel entries, flatten, sweep orphaned
+            # protections", enforced here rather than only in the status
+            # endpoint so it also holds when another operator changed the status
+            # or the daemon restarted. It runs after the connect because the
+            # adapter is what performs the sweep.
+            await _enforce_stopped_deployments(
+                deployments,
+                active_adapters,
+                already_enforced=enforced_stopped_deployments,
+                account_lookup=account_lookup,
+            )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,

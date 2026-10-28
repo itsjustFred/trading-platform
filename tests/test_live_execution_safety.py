@@ -4602,7 +4602,13 @@ def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
         created_at=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(module, "list_services", lambda: [service])
-    monkeypatch.setattr(module, "update_service_status", lambda *_args: None)
+    # The recovery path now only arms the floor when the conditional status
+    # write actually moved the row to RUNNING.
+    monkeypatch.setattr(
+        module,
+        "update_service_status",
+        lambda *_args: service.model_copy(update={"status": ServiceStatus.RUNNING}),
+    )
 
     module._recover_failed_services()
 
