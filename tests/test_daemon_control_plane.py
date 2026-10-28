@@ -14,7 +14,7 @@ import pytest
 
 import live_runner.daemon as daemon
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
-from live_runner.base_adapter import ControlOutcome
+from live_runner.base_adapter import ControlOutcome, order_not_submitted
 from shared.database import (
     clear_live_deployment_stopped_enforced,
     get_live_deployment,
@@ -41,10 +41,13 @@ class _ControlAdapter:
     flatten: ControlOutcome = field(default_factory=ControlOutcome)
     orphan: ControlOutcome = field(default_factory=ControlOutcome)
     flatten_error: Exception | None = None
+    submit_error: Exception | None = None
+    pre_submit_error: Exception | None = None
     demo: bool = True
     supports_cancel_orders: bool = True
     supports_flatten: bool = True
     calls: list[str] = field(default_factory=list)
+    submitted: list[tuple[object, float | None]] = field(default_factory=list)
     disconnect_calls: int = 0
 
     async def cancel_open_orders(self) -> ControlOutcome:
@@ -60,6 +63,20 @@ class _ControlAdapter:
     async def cancel_orphaned_protections(self) -> ControlOutcome:
         self.calls.append("orphan")
         return self.orphan
+
+    async def get_balance(self) -> tuple[float, float]:
+        return 100_000.0, 100_000.0
+
+    async def submit_order(self, signal, *, qty: float | None = None) -> str:
+        self.submitted.append((signal, qty))
+        if self.pre_submit_error is not None:
+            # Mirrors a real adapter: a refusal raised inside the pre-request
+            # block is marked, so the caller knows nothing reached the broker.
+            with order_not_submitted():
+                raise self.pre_submit_error
+        if self.submit_error is not None:
+            raise self.submit_error
+        return "order-1"
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
@@ -359,21 +376,11 @@ def _trade_signal() -> object:
     )
 
 
-def test_submit_exception_keeps_the_claim_so_the_drain_is_not_drained(
-    isolated_db_sandbox, monkeypatch
-) -> None:
-    database, _, _ = isolated_db_sandbox
-    _seed(database, status="ACTIVE")
-
-    async def _explode(*args, **kwargs):
-        raise RuntimeError("broker timeout after the order was sent")
-
-    monkeypatch.setattr(daemon, "submit_order_with_risk", _explode)
-
+def _submit(database, adapter: _ControlAdapter) -> None:
     asyncio.run(
         daemon._submit_normalized_discord_signal(
             ACCOUNT_ID,
-            _ControlAdapter(),
+            adapter,
             _deployment(database),
             _trade_signal(),
             signal_timeframe="1h",
@@ -381,9 +388,61 @@ def test_submit_exception_keeps_the_claim_so_the_drain_is_not_drained(
         )
     )
 
+
+def test_submit_exception_keeps_the_claim_so_the_drain_is_not_drained(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter(
+        submit_error=RuntimeError("broker timeout after the order was sent")
+    )
+
+    _submit(database, adapter)
+
+    assert adapter.submitted, "the order reached the adapter"
     claims = list_live_deployment_submission_claims(DEPLOYMENT_ID)
     assert len(claims) == 1
     assert claims[0].expired is False
+
+
+def test_pre_broker_refusal_releases_the_claim(isolated_db_sandbox) -> None:
+    """A refusal the adapter proves happened before the request must not lock
+    the deployment out for the lease TTL.
+
+    The failure is still reported as a failed submission, but the next signal
+    may try immediately: nothing reached the broker, so there is no duplicate
+    risk to hold the lease for.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter(
+        pre_submit_error=ValueError("volume below the broker minimum")
+    )
+
+    _submit(database, adapter)
+
+    assert adapter.submitted, "the adapter was asked to submit"
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
+def test_preparation_failure_never_takes_the_claim(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """Sizing/validation runs before the claim, so it cannot hold a lease."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter()
+
+    async def _reject(*args, **kwargs):
+        raise ValueError("Refusing to submit live order without stop loss")
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _reject)
+
+    _submit(database, adapter)
+
+    assert adapter.submitted == []
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
 
 
 def test_claim_is_renewed_while_the_submit_is_in_flight(
@@ -423,7 +482,7 @@ def test_claim_is_renewed_while_the_submit_is_in_flight(
     assert after > before
 
 
-def test_alpaca_stopped_keeps_sl_tp_when_the_flatten_fails(
+def test_alpaca_stopped_never_leaves_a_naked_position_when_the_flatten_fails(
     isolated_db_sandbox,
 ) -> None:
     from tests.test_alpaca_adapter import (
@@ -437,8 +496,10 @@ def test_alpaca_stopped_keeps_sl_tp_when_the_flatten_fails(
     client = _FakeTradingClient(
         orders=[
             _FakeOrder("entry-1", "AAPL", "buy"),
-            _FakeOrder("sl-1", "AAPL", "sell", order_type="stop"),
-            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit"),
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit", qty=10.0),
         ],
         positions=[_FakePosition("AAPL", 10.0)],
         close_error=RuntimeError("broker refused to flatten"),
@@ -451,4 +512,11 @@ def test_alpaca_stopped_keeps_sl_tp_when_the_flatten_fails(
 
     assert DEPLOYMENT_ID not in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
-    assert [order.id for order in client.orders] == ["sl-1", "tp-1"]
+    # The entry is gone, the position survived, and it is protected again by a
+    # stop at the price the cancelled protection carried: no naked position.
+    assert "entry-1" not in [order.id for order in client.orders]
+    stops = [order for order in client.orders if order.order_type == "stop"]
+    assert len(stops) == 1
+    assert stops[0].side == "sell"
+    assert stops[0].qty == 10.0
+    assert stops[0].stop_price == 190.0

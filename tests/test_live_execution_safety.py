@@ -21,7 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import BaseLiveAdapter, is_order_not_submitted
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
@@ -4587,6 +4587,66 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
 
     assert asyncio.run(adapter.submit_order(signal, qty=2.0)) == "777"
     assert volumes == [2000]
+
+
+def _ctrader_entry_signal() -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 1.09, "take_profit": 1.12},
+    )
+
+
+def test_ctrader_pre_submit_refusal_is_marked_as_not_submitted(monkeypatch) -> None:
+    """A local refusal proves nothing reached the broker.
+
+    The submission lease may be released on this, because retrying cannot
+    duplicate an order that was never sent.
+    """
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
+    monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
+
+    with pytest.raises(ValueError, match="finite and positive") as raised:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=0.0))
+
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_ctrader_broker_write_failure_is_not_marked_as_not_submitted(
+    monkeypatch,
+) -> None:
+    """A failure of the send itself may still have reached the broker."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: ("sig-1", True))
+    monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
+    monkeypatch.setattr(
+        adapter, "_build_new_order_request", lambda signal, *, symbol_id: object()
+    )
+
+    async def _resolve_symbol_id(_symbol: str) -> int:
+        return 1
+
+    async def _send(_request):
+        raise RuntimeError("connection lost after send")
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _resolve_symbol_id)
+    monkeypatch.setattr(adapter, "_submit_new_order_request", _send)
+
+    with pytest.raises(RuntimeError, match="connection lost") as raised:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=1.0))
+
+    assert is_order_not_submitted(raised.value) is False
 
 
 def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:

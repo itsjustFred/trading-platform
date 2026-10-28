@@ -23,6 +23,7 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     coerce_positive_live_qty,
+    is_order_not_submitted,
     is_unbounded_tp,
 )
 from live_runner.credential_env import (
@@ -860,7 +861,7 @@ async def _resolve_account_balance(
     return account_balance
 
 
-async def submit_order_with_risk(
+async def prepare_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     signal: LiveSignal,
@@ -868,7 +869,19 @@ async def submit_order_with_risk(
     current_exposure: float = 0.0,
     account_balance: float | None = None,
     pip_value: float | None = None,
-) -> str:
+) -> tuple[LiveSignal, float]:
+    """Size and validate an order, returning exactly what to submit.
+
+    Split out from :func:`submit_order_with_risk` so a caller can separate the
+    two phases that matter for a submission lease: everything here happens
+    before the broker can see an order, so a failure is safe to retry; the
+    adapter call the caller makes next is not. The submission path claims its
+    lease *after* this returns, so a plain validation or sizing refusal cannot
+    lock the deployment out for the lease TTL.
+
+    Nothing in here places an order. It does read broker state (positions,
+    balance) because sizing has to see broker truth.
+    """
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
         # Exit-only orders close an existing position at the broker-observed
@@ -883,10 +896,7 @@ async def submit_order_with_risk(
             update["action"] = close_action
         # C1/B2: the broker-resolved flatten qty is binding — pass it
         # explicitly so the adapter never re-sizes.
-        return await adapter.submit_order(
-            signal.model_copy(update=update),
-            qty=float(metadata["explicit_qty"]),
-        )
+        return signal.model_copy(update=update), float(metadata["explicit_qty"])
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -993,9 +1003,28 @@ async def submit_order_with_risk(
     sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     # C1/B2: the risk-sized qty is binding — pass it explicitly so the
     # adapter sizes exactly zero times (never with default config).
-    return await adapter.submit_order(
-        sized_signal, qty=float(sized_signal.metadata["qty"])
+    return sized_signal, float(sized_signal.metadata["qty"])
+
+
+async def submit_order_with_risk(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+    *,
+    current_exposure: float = 0.0,
+    account_balance: float | None = None,
+    pip_value: float | None = None,
+) -> str:
+    """Prepare an order and submit it, for callers with no lease to protect."""
+    prepared_signal, prepared_qty = await prepare_order_with_risk(
+        adapter,
+        deployment,
+        signal,
+        current_exposure=current_exposure,
+        account_balance=account_balance,
+        pip_value=pip_value,
     )
+    return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -1371,6 +1400,28 @@ async def _submit_normalized_discord_signal(
         )
         return
 
+    # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
+    # here, and every failure in them happens before an order can reach the
+    # broker. Claiming first (as this used to) held the lease for the whole TTL
+    # on a plain validation refusal, locking the deployment out for no reason.
+    try:
+        prepared_signal, prepared_qty = await prepare_order_with_risk(
+            adapter, deployment, live_signal
+        )
+    except Exception as exc:
+        logger.warning(
+            "Discord signal refused before submission; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "error": str(exc),
+                }
+            },
+        )
+        return
+
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
     # deployment. The claim turns "still ACTIVE" into a single atomic database
@@ -1403,10 +1454,36 @@ async def _submit_normalized_discord_signal(
     )
     try:
         try:
-            broker_order_id = await submit_order_with_risk(
-                adapter, deployment, live_signal
+            broker_order_id = await adapter.submit_order(
+                prepared_signal, qty=prepared_qty
             )
         except Exception as exc:
+            if is_order_not_submitted(exc):
+                # The adapter marked the failure as provably pre-request: the
+                # order never left the process, so the lease can be released
+                # and the next signal is not locked out for the TTL.
+                try:
+                    await asyncio.to_thread(
+                        release_live_deployment_submission, claim_token
+                    )
+                except Exception:
+                    # The lease expires on its own. Never let the cleanup turn a
+                    # handled refusal into an exception that aborts the fan-out
+                    # to the remaining deployments.
+                    logger.exception("Could not release the submission lease")
+                logger.warning(
+                    "Discord signal was refused before the broker request; "
+                    "released the submission lease",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "deployment_id": str(deployment.id),
+                            "symbol": prepared_signal.symbol,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                return
             # **Do not release the lease.** The broker may have accepted the
             # order and only the response was lost; releasing would let the next
             # signal submit a duplicate before anyone reconciled. The lease is
@@ -1420,7 +1497,7 @@ async def _submit_normalized_discord_signal(
                     "data": {
                         "account_id": account_id,
                         "deployment_id": str(deployment.id),
-                        "symbol": live_signal.symbol,
+                        "symbol": prepared_signal.symbol,
                         "error": str(exc),
                     }
                 },

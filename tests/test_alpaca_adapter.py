@@ -11,10 +11,13 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
+from live_runner import alpaca_adapter as alpaca_module
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, _alpaca_market_data_start
+from live_runner.base_adapter import is_order_not_submitted
 from shared.models import LiveSignal
 
 
@@ -25,6 +28,8 @@ class _FakeOrder:
     side: str
     order_type: str = "limit"
     order_class: str = "simple"
+    qty: float = 0.0
+    stop_price: float | None = None
     legs: list["_FakeOrder"] = field(default_factory=list)
 
 
@@ -35,18 +40,29 @@ class _FakePosition:
 
 
 class _FakeTradingClient:
+    """A broker double that enforces Alpaca's quantity-reservation rule.
+
+    A close is refused while any reducing-side order on the symbol still holds
+    the position's quantity. That refusal is the whole reason the flatten has
+    to cancel the protections first, so the double has to reproduce it - a
+    double that closes regardless would let a broken ordering pass its test.
+    """
+
     def __init__(
         self,
         *,
         orders: list[_FakeOrder] | None = None,
         positions: list[_FakePosition] | None = None,
         close_error: Exception | None = None,
+        submit_error: Exception | None = None,
     ) -> None:
         self.orders = list(orders or [])
         self.positions = list(positions or [])
         self.cancelled: list[str] = []
-        self.close_calls: list[bool] = []
+        self.close_calls: list[str] = []
+        self.submitted: list[object] = []
         self.close_error = close_error
+        self.submit_error = submit_error
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
         return list(self.orders)
@@ -58,12 +74,41 @@ class _FakeTradingClient:
         self.cancelled.append(order_id)
         self.orders = [order for order in self.orders if order.id != order_id]
 
-    def close_all_positions(self, cancel_orders: bool = False):
-        self.close_calls.append(cancel_orders)
+    def _reserved_qty(self, symbol: str) -> float:
+        position = next((item for item in self.positions if item.symbol == symbol), None)
+        if position is None:
+            return 0.0
+        side = "sell" if position.qty > 0 else "buy"
+        return sum(
+            abs(order.qty)
+            for order in self.orders
+            if order.symbol == symbol and order.side == side
+        )
+
+    def close_position(self, symbol: str, close_options=None):
+        self.close_calls.append(symbol)
         if self.close_error is not None:
             raise self.close_error
-        self.positions = []
-        return []
+        if self._reserved_qty(symbol) > 0:
+            raise RuntimeError("insufficient qty available for order to be filled")
+        self.positions = [item for item in self.positions if item.symbol != symbol]
+        return SimpleNamespace(id=f"close-{symbol}", symbol=symbol)
+
+    def submit_order(self, order_data):
+        if self.submit_error is not None:
+            raise self.submit_error
+        self.submitted.append(order_data)
+        side = str(getattr(order_data.side, "value", order_data.side))
+        order = _FakeOrder(
+            id=f"restored-{len(self.submitted)}",
+            symbol=str(order_data.symbol),
+            side=side,
+            order_type="stop",
+            qty=float(order_data.qty),
+            stop_price=float(order_data.stop_price),
+        )
+        self.orders.append(order)
+        return SimpleNamespace(id=order.id, symbol=order.symbol)
 
 
 def _adapter(client: _FakeTradingClient) -> AlpacaLiveAdapter:
@@ -90,26 +135,138 @@ def test_cancel_open_orders_leaves_attached_sl_tp_alone() -> None:
     assert [order.id for order in client.orders] == ["sl-1", "tp-1"]
 
 
-def test_failed_flatten_keeps_protections_and_does_not_report_complete() -> None:
+def test_fake_refuses_a_close_while_protections_reserve_the_quantity() -> None:
+    """The double reproduces the broker rule the flatten has to work around.
+
+    Without this refusal the flatten tests would pass on any ordering, including
+    the one that keeps the SL/TP working and is therefore never executed.
+    """
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("sl-1", "AAPL", "sell", order_type="stop", qty=10.0)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient qty"):
+        client.close_position("AAPL")
+
+    client.cancel_order_by_id("sl-1")
+    client.close_position("AAPL")
+
+    assert client.positions == []
+
+
+def test_flatten_cancels_protections_before_closing() -> None:
     client = _FakeTradingClient(
         orders=[
-            _FakeOrder("entry-1", "AAPL", "buy"),
-            _FakeOrder("sl-1", "AAPL", "sell", order_type="stop"),
-            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit"),
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit", qty=10.0),
         ],
         positions=[_FakePosition("AAPL", 10.0)],
-        close_error=RuntimeError("broker refused to flatten"),
     )
-    adapter = _adapter(client)
 
-    cancel = asyncio.run(adapter.cancel_open_orders())
-    with pytest.raises(RuntimeError):
-        asyncio.run(adapter.close_all_positions())
+    outcome = asyncio.run(_adapter(client).close_all_positions())
 
-    assert cancel.complete is True
-    # The position still exists and both risk controls are still resting: no
-    # naked position was created by the failed flatten.
-    assert [order.id for order in client.orders] == ["sl-1", "tp-1"]
+    assert outcome.complete is True
+    # The legs go first, and only then is the position closed.
+    assert client.cancelled == ["sl-1", "tp-1"]
+    assert client.close_calls == ["AAPL"]
+    assert client.positions == []
+
+
+def test_refused_close_restores_the_stop_it_cancelled() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit", qty=10.0),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+        close_error=RuntimeError("broker refused to close"),
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert any(item.startswith("AAPL:close:") for item in outcome.failed)
+    # The position survived; the stop that was cancelled to unblock the close is
+    # back on it, at the price the strategy had chosen.
+    restored = [order for order in client.orders if order.order_type == "stop"]
+    assert len(restored) == 1
+    assert restored[0].side == "sell"
+    assert restored[0].qty == 10.0
+    assert restored[0].stop_price == 190.0
+
+
+def test_refused_close_without_a_restorable_stop_is_reported_as_naked() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+        close_error=RuntimeError("broker refused to close"),
+        submit_error=RuntimeError("broker is down"),
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    # A failure to restore the stop is a naked live position: it must be
+    # visible in the outcome, not just in a log line.
+    assert any("NO-STOP-RESTORED" in item for item in outcome.failed)
+
+
+def test_cancel_refusal_does_not_attempt_the_close() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("sl-1", "AAPL", "sell", order_type="stop", qty=10.0)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    def _refuse_cancel(order_id: str) -> None:
+        raise RuntimeError("cancel rejected")
+
+    client.cancel_order_by_id = _refuse_cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    # Closing while the order still reserves the quantity would be refused by
+    # the broker anyway; not attempting it keeps the failure unambiguous.
+    assert client.close_calls == []
+    assert any(item.startswith("AAPL:cancel:") for item in outcome.failed)
+
+
+def test_cancel_failure_after_a_partial_sweep_restores_the_stop() -> None:
+    """Half a cancel leaves the position without its stop; put one back."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit", qty=10.0),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    real_cancel = client.cancel_order_by_id
+
+    def _fail_on_tp(order_id: str) -> None:
+        if order_id == "tp-1":
+            raise RuntimeError("cancel rejected")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _fail_on_tp  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert client.close_calls == []
+    stops = [order for order in client.orders if order.order_type == "stop"]
+    assert len(stops) == 1
+    assert stops[0].stop_price == 190.0
 
 
 def test_close_all_positions_reports_a_partial_flatten() -> None:
@@ -118,17 +275,13 @@ def test_close_all_positions_reports_a_partial_flatten() -> None:
 
     # The broker acknowledges but the position survives: the re-read must make
     # the outcome incomplete instead of trusting the acknowledgement.
-    original = client.close_all_positions
+    def _acknowledge_only(symbol: str, close_options=None):
+        client.close_calls.append(symbol)
+        return SimpleNamespace(id=f"close-{symbol}", symbol=symbol)
 
-    def _acknowledge_only(cancel_orders: bool = False):
-        client.close_calls.append(cancel_orders)
-        return []
+    client.close_position = _acknowledge_only  # type: ignore[method-assign]
 
-    client.close_all_positions = _acknowledge_only  # type: ignore[method-assign]
-    try:
-        outcome = asyncio.run(adapter.close_all_positions())
-    finally:
-        client.close_all_positions = original  # type: ignore[method-assign]
+    outcome = asyncio.run(adapter.close_all_positions())
 
     assert outcome.complete is False
     assert "AAPL" in outcome.failed
@@ -251,3 +404,42 @@ def test_bulk_response_shape_is_not_read_as_zero() -> None:
 
     with pytest.raises(RuntimeError, match="unrecognised shape"):
         asyncio.run(adapter.cancel_open_orders())
+
+
+def _entry_signal() -> LiveSignal:
+    return LiveSignal(
+        deployment_id="11111111-1111-1111-1111-111111111111",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=200.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 195.0, "take_profit": 210.0},
+    )
+
+
+def test_pre_submit_refusal_is_marked_as_not_submitted() -> None:
+    adapter = _adapter(_FakeTradingClient())
+
+    with pytest.raises(ValueError, match="finite and positive") as raised:
+        asyncio.run(adapter.submit_order(_entry_signal(), qty=0.0))
+
+    # No request could have left the process, so the caller may release its
+    # submission lease instead of waiting out the TTL.
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_broker_write_failure_is_not_marked_as_not_submitted(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    client = _FakeTradingClient(submit_error=RuntimeError("connection reset"))
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module, "save_live_signal", lambda _signal: (str(uuid4()), True)
+    )
+
+    with pytest.raises(RuntimeError, match="connection reset") as raised:
+        asyncio.run(adapter.submit_order(_entry_signal(), qty=1.0))
+
+    # The broker may have accepted the order before the connection died, so the
+    # caller must treat the outcome as unknown and keep its lease.
+    assert is_order_not_submitted(raised.value) is False
