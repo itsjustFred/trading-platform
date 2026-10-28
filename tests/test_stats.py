@@ -18,6 +18,14 @@ from runner.stats import (
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
+# `compute_stats` publishes `cagr` rounded to six decimal places
+# (runner/stats.py: `cagr=round(float(cagr), 6)`), so an exact comparison against
+# the unrounded expectation can be off by up to 5e-7. Sit just above that
+# rounding floor instead of at it: the tolerance still separates the equity
+# window from the trade window (>=1e-5 apart in every CAGR fixture here), which
+# the previous 1e-3 tolerance could not.
+CAGR_PAYLOAD_TOLERANCE = 1e-6
+
 
 def _trade(pnl: float, holding_bars: int | None = None) -> Trade:
     """Helper: minimal trade with given PnL."""
@@ -204,7 +212,7 @@ class TestComputeStats:
         stats = compute_stats(trades, equity_curve=equity)
 
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
     def test_cagr_prefers_equity_period_over_trade_bounds(self):
         """Same contract as `test_cagr_annualizes_with_trade_period_bounds`.
@@ -240,7 +248,7 @@ class TestComputeStats:
         stats = compute_stats(trades, equity_curve=equity)
 
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
     def test_cagr_handles_mixed_fractional_curve_timestamps(self):
         # Daily equity curves mix second-resolution inception points with
@@ -288,7 +296,7 @@ class TestComputeStats:
 
         # 2024-01-01T00:00Z -> 2025-01-01T00:00Z is 366 calendar days.
         expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
     def test_cagr_uses_equity_period_when_available(self):
         """The equity window, not the 365.75-day trade span, drives CAGR.
@@ -327,7 +335,7 @@ class TestComputeStats:
         stats = compute_stats(trades, equity_curve=equity)
 
         expected = (110000.0 / 100000.0) ** (365.25 / 366) - 1
-        assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+        assert math.isclose(stats["cagr"], expected, rel_tol=1e-9, abs_tol=CAGR_PAYLOAD_TOLERANCE)
 
     def test_trade_stats_are_net_of_fees(self):
         # #84: gross pnl flatters win-rate/profit-factor/total.
