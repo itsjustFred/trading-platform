@@ -319,6 +319,8 @@ def _daily_points_from_engine_curve(
         daily_return = (
             (equity - previous_equity) / previous_equity if previous_equity > 0 else 0.0
         )
+        # Same contract as the calendar fill: the exact value, not the cent
+        # rounding the persisted point carries.
         daily_returns.append(
             {
                 "date": timestamp.date().isoformat(),
@@ -650,6 +652,12 @@ def build_daily_equity_curve(
         running_equity += pnl
         if not math.isfinite(running_equity):
             raise ValueError("Daily equity accumulation is non-finite")
+        # ``equity`` is the exact ledger value; the persisted curve rounds it to
+        # cents (see the EquityPoint below). Rounding here too would either
+        # desynchronise the field from the ``return`` beside it or quantise the
+        # running balance, and a quantised accumulator drifts by up to half a
+        # cent per day — which would push the curve's endpoint outside the
+        # one-cent reconciliation gate for a long window.
         daily_returns.append(
             {
                 "date": day,

@@ -363,7 +363,21 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()
         previous = daily_equity.shift(1)
-        returns = daily_equity.pct_change(fill_method=None)
+        # The curve's first observation is the OPENING equity of its first day,
+        # and therefore the base of that day's return. Resampling to the last
+        # observation of each day drops it whenever the same day also carries a
+        # close (the daily build writes an inception point at 00:00 and a close
+        # at 23:59:59.999999), which silently deleted the first day's return:
+        # three trading days produced two returns, and the one that vanished was
+        # the first — so a first-day loss never reached Sharpe or Sortino and
+        # both came out too high. Only a day that actually has a later
+        # observation gets this base; a day with a single point has no return to
+        # measure and must not be given a synthetic flat one.
+        first_day = series.index[0].normalize()
+        observations_on_first_day = int((series.index.normalize() == first_day).sum())
+        if observations_on_first_day >= 2 and daily_equity.index[0] == first_day:
+            previous.iloc[0] = float(series.iloc[0])
+        returns = (daily_equity - previous) / previous
         returns.loc[previous <= 0] = pd.NA
         returns = returns.replace([math.inf, -math.inf], pd.NA).dropna()
         return returns if not returns.empty else None

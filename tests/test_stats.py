@@ -7,6 +7,7 @@ import pytest
 
 from runner.stats import (
     _daily_returns_from_equity_curve,
+    _daily_returns_series_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
     _period_risk_free_rate,
@@ -376,11 +377,97 @@ class TestComputeStats:
 
         assert stats["total_return"] > 0
         assert stats["sharpe_ratio"] > 0
-        assert len(daily_returns) == 29
+        # One return per trading day, INCLUDING the first: the curve's first
+        # observation is that day's opening equity, so resampling to the last
+        # observation per day must not drop the day it belongs to. The old
+        # expectation of 29 pinned exactly that loss.
+        assert len(daily_returns) == 30
 
     def test_emit_supplied_risk_free_rate(self):
         stats = compute_stats([_trade(100)], risk_free_rate=0.0375)
         assert stats["risk_free_rate"] == pytest.approx(0.0375)
+
+
+class TestFirstTradingDayReturn:
+    """Three trading days must produce three daily returns, the first included.
+
+    The daily equity build writes an inception point at the window start
+    (00:00) and a close at 23:59:59.999999 of every day. Resampling to the last
+    observation of each day dropped that inception point whenever the same day
+    also carried a close, so the first day's return never reached the series: a
+    first-day loss vanished, Sharpe and Sortino came out too high, and the size
+    of the error depended on whether day one happened to be a loss.
+    """
+
+    @staticmethod
+    def _curve() -> list[EquityPoint]:
+        """The exact layout `build_daily_equity_curve` emits."""
+        return [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T23:59:59.999999+00:00", equity=99_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=99_990.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=100_989.9),
+        ]
+
+    @staticmethod
+    def _curve_with_a_first_day_loss() -> list[EquityPoint]:
+        """-2% on day one, then +3% and -1%: both ratios are well defined."""
+        return [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T23:59:59.999999+00:00", equity=98_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=100_940.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=99_930.6),
+        ]
+
+    def test_three_trading_days_produce_three_returns_including_the_first_loss(self):
+        series = _daily_returns_series_from_equity_curve(self._curve())
+
+        assert series is not None
+        assert len(series) == 3, "the first trading day's return is missing"
+        assert series.iloc[0] == pytest.approx(-0.01)
+        assert series.iloc[1] == pytest.approx(0.01)
+        assert series.iloc[2] == pytest.approx(0.01)
+
+    def test_a_day_with_a_single_observation_gains_no_synthetic_return(self):
+        """Only a day that carries an opening AND a close has a return."""
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=101_000.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=102_000.0),
+        ]
+
+        series = _daily_returns_series_from_equity_curve(curve)
+
+        assert series is not None
+        assert len(series) == 2
+        assert series.iloc[0] == pytest.approx(0.01)
+
+    def test_sharpe_and_sortino_drop_once_the_first_day_is_counted(self):
+        """The defect direction: the collapsed series overstates both ratios."""
+        series = _daily_returns_series_from_equity_curve(
+            self._curve_with_a_first_day_loss()
+        )
+        assert series is not None
+        observed = [float(value) for value in series]
+        # What the resample-to-last produced: the two later days only.
+        collapsed = [0.03, -0.01]
+
+        assert observed == pytest.approx([-0.02, 0.03, -0.01])
+        assert _sharpe_manual(observed, 0.0) < _sharpe_manual(collapsed, 0.0)
+        assert _sortino_manual(observed, 0.0) < _sortino_manual(collapsed, 0.0)
+
+    def test_compute_stats_reports_the_sharpe_of_all_three_days(self):
+        stats = compute_stats([], equity_curve=self._curve(), risk_free_rate=0.0)
+
+        series = _daily_returns_series_from_equity_curve(self._curve())
+        assert series is not None
+        assert stats["equity_return_frequency"] == "daily"
+        assert stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual([float(value) for value in series], 0.0), abs=1e-4
+        )
+        assert stats["sortino_ratio"] == pytest.approx(
+            _sortino_manual([float(value) for value in series], 0.0), abs=1e-4
+        )
 
 
 class TestMaxConsecutiveLosses:
