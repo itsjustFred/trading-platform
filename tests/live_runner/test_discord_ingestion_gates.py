@@ -3178,7 +3178,7 @@ class TestAuthorDiscoveryRecord:
         # three-entry fixture, so the assertion failed for the right reason
         # against the wrong data.
         monkeypatch.setattr(
-            module, "_observe", lambda bot, pages: _coro(pending.pop(0))
+            module, "_observe", lambda bot, pages, **kwargs: _coro(pending.pop(0))
         )
         return module.main(argv)
 
@@ -3631,3 +3631,77 @@ def test_an_unresolvable_allowlist_is_not_an_allow_all() -> None:
 
     assert _deployment_trusted_author_ids(deployment, accounts_env_values={}) == set()
     assert _deployment_trusted_author_ids(deployment) == set()
+
+
+def test_the_discovery_tool_reads_the_token_from_its_env_key(monkeypatch):
+    """`discover_discord_bots_from_env` returns the token *key*, never the token.
+
+    Reading `bot["token"]` built every source with an empty credential, so the
+    tool could only ever report 401s - and the allowlist it exists to recover
+    would never be discovered. The token and the auth scheme are resolved from
+    the same accounts-env mapping the daemon uses.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "discover_discord_authors.py"
+    spec = importlib.util.spec_from_file_location("discover_authors_token_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    seen: dict[str, object] = {}
+
+    class _Source:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        async def observe_channel_authors(self, channel_id, *, pages):
+            return []
+
+    monkeypatch.setattr(module, "DiscordSignalSource", _Source)
+
+    bot = {
+        "name": "NITRO",
+        "token_env_key": "DISCORD_BOT_NITRO_TOKEN",
+        "channel_id": "100000000000000001",
+    }
+    env = {
+        "DISCORD_BOT_NITRO_TOKEN": "synthetic-token",
+        "DISCORD_BOT_NITRO_AUTH_SCHEME": "bot",
+    }
+
+    result = asyncio.run(module._observe(bot, 1, env_values=env))
+
+    assert result["error"] is None
+    assert seen["token"] == "synthetic-token"
+    assert seen["auth_scheme"] == "bot"
+
+
+def test_the_discovery_tool_reports_a_missing_token_instead_of_hiding_it(monkeypatch):
+    """An unresolvable credential is an error for that bot, not an empty result."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "discover_discord_authors.py"
+    spec = importlib.util.spec_from_file_location("discover_authors_missing_token", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Source:
+        def __init__(self, **kwargs):
+            raise RuntimeError("Discord token missing")
+
+    monkeypatch.setattr(module, "DiscordSignalSource", _Source)
+
+    bot = {
+        "name": "NITRO",
+        "token_env_key": "DISCORD_BOT_NITRO_TOKEN",
+        "channel_id": "100000000000000001",
+    }
+
+    result = asyncio.run(module._observe(bot, 1, env_values={}))
+
+    assert result["authors"] == []
+    assert "token" in result["error"].lower()

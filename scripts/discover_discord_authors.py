@@ -34,28 +34,47 @@ from live_runner import service_discovery
 from live_runner.credential_env import (
     discord_bot_env_key,
     load_accounts_env_values,
+    resolve_env_value,
 )
 from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 from live_runner.signal_sources.discord_source import DiscordSignalSource
 
 
-async def _observe(bot: dict, pages: int) -> dict:
+async def _observe(
+    bot: dict,
+    pages: int,
+    *,
+    env_values: dict[str, str] | None = None,
+) -> dict:
     name = str(bot.get("name") or "")
-    source = DiscordSignalSource(
-        bot_name=name,
-        token=str(bot.get("token") or ""),
-        channel_id=str(bot.get("channel_id") or ""),
-        service_id=None,
-        # Required by the constructor, and irrelevant here: nothing is parsed
-        # into a signal, so no message is ever admitted or refused.
-        trusted_author_ids=["*"],
-    )
     channel_id = str(bot.get("channel_id") or "")
-    # One unreadable channel must not abort the whole report. The ingest path
-    # already treats 401/403 as per-channel; a discovery tool that dies on the
-    # first bad token says nothing about the other two bots, which is the
-    # opposite of what it was run for.
+    values = env_values if env_values is not None else {}
+    # `discover_discord_bots_from_env` returns the *key* the token lives under,
+    # never the token itself. Reading `bot["token"]` (which does not exist) built
+    # every source with an empty credential, so the tool could only ever report
+    # 401s.
+    token = resolve_env_value(values, str(bot.get("token_env_key") or ""))
+    # The scheme belongs to the credential: a bot token sent raw is a 401, and
+    # so is an account token sent with a "Bot " prefix. Resolved from the same
+    # per-bot scope the daemon uses, not guessed here.
+    from live_runner.daemon import _resolve_discord_auth_scheme
+
     try:
+        auth_scheme = _resolve_discord_auth_scheme(name, values)
+        source = DiscordSignalSource(
+            bot_name=name,
+            token=token,
+            channel_id=channel_id,
+            service_id=None,
+            # Required by the constructor, and irrelevant here: nothing is parsed
+            # into a signal, so no message is ever admitted or refused.
+            trusted_author_ids=["*"],
+            auth_scheme=auth_scheme,
+        )
+        # One unreadable channel must not abort the whole report. The ingest path
+        # already treats 401/403 as per-channel; a discovery tool that dies on the
+        # first bad token says nothing about the other two bots, which is the
+        # opposite of what it was run for.
         rows = await source.observe_channel_authors(channel_id, pages=pages)
         error = None
     except Exception as exc:
@@ -138,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     # around - otherwise --accounts-env is silently ignored and the tool reports
     # "no bots configured" against the wrong file.
     service_discovery.DEFAULT_ACCOUNTS_ENV = args.accounts_env
-    load_accounts_env_values(args.accounts_env)
+    env_values = load_accounts_env_values(args.accounts_env)
     bots = service_discovery.discover_discord_bots_from_env()
     if not bots:
         print(
@@ -147,7 +166,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    results = [asyncio.run(_observe(bot, args.pages)) for bot in bots]
+    results = [
+        asyncio.run(_observe(bot, args.pages, env_values=env_values)) for bot in bots
+    ]
 
     # Recorded before the format branch, not inside the --json arm. --out has a
     # default, so the record was silently skipped for the default text output -

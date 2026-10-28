@@ -661,10 +661,9 @@ def _validate_signal_age_before_wait(
     if configured is None:
         max_age = max(300.0, 2.0 * _timeframe_age_budget_seconds(timeframe))
     else:
-        try:
-            max_age = float(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max_signal_age_seconds must be numeric") from exc
+        # Through the shared coercer: a boolean or a non-finite value is a config
+        # error, not a budget. `float(True)` silently means one second.
+        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
     if max_age <= 0:
         raise ValueError("max_signal_age_seconds must be positive")
     age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
@@ -1546,10 +1545,30 @@ async def _submit_normalized_discord_signal(
         )
         return
     if wait_enabled:
-        await wait_for_candle_close(
-            normalized_signal,
-            normalized_signal.timeframe or signal_timeframe,
-        )
+        try:
+            await wait_for_candle_close(
+                normalized_signal,
+                normalized_signal.timeframe or signal_timeframe,
+            )
+        except ValueError as exc:
+            # An unrecognised timeframe is a configuration error, not a reason to
+            # trade immediately: `wait_for_candle_close` refuses rather than
+            # silently skipping the wait. Skip this deployment's signal and keep
+            # the listener alive - letting it propagate would tear down the whole
+            # account's source and lose the rest of the poll batch.
+            logger.warning(
+                "Skipping discord signal: candle-close wait refused the timeframe",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                        "signal_timeframe": signal_timeframe,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
@@ -2629,9 +2648,17 @@ async def _sync_running_discord_bot(
     # wins. `_resolve_discord_auth_scheme` validates the vocabulary and raises on
     # an unknown value rather than guessing between account and bot tokens.
     try:
-        auth_scheme = (
-            str(service_config.get("discord_auth_scheme") or "").strip().lower()
-            or _resolve_discord_auth_scheme(service.name, accounts_env_values)
+        override = str(service_config.get("discord_auth_scheme") or "").strip().lower()
+        if override and override not in _DISCORD_AUTH_SCHEME_VOCABULARY:
+            # An explicit override is not exempt from the vocabulary: a typo must
+            # fail the service, not reach the source and be rejected there with a
+            # different error (or, worse, be guessed).
+            raise ValueError(
+                f"Unsupported Discord auth_scheme {override!r} for {service.name!r}; "
+                f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
+            )
+        auth_scheme = override or _resolve_discord_auth_scheme(
+            service.name, accounts_env_values
         )
     except ValueError as exc:
         logger.warning(
