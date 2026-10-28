@@ -225,7 +225,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
         "signal_source_type": "discord",
         "signal_source_id": "RAMJET",
         "signal_source": "discord",
-        "signal_config": {"channel_id": "123", "wait_candle_close": True},
+        "signal_config": {"channel_id": "100000000000000009", "wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -250,6 +250,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "id": _account_id,
             "broker": "alpaca",
             "name": "Alpaca Paper",
+            # Routing compares the broker-reported account number for the
+            # RAMJET route, not the local account id.
+            "broker_login": "PA3T0MQAGQ51",
         },
     )
     monkeypatch.setattr(
@@ -302,7 +305,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "signal_source_id": "RAMJET",
             "symbol_filter": ["AAPL", "MSFT"],
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "wait_candle_close": True},
+            "signal_config": {"channel_id": "100000000000000009", "wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -314,7 +317,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
     assert created["signal_source_id"] == "RAMJET"
     assert created["symbol_filter"] == ["AAPL", "MSFT"]
     assert created["signal_source"] == "discord"
-    assert created["signal_config"]["channel_id"] == "123"
+    assert created["signal_config"]["channel_id"] == "100000000000000009"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -447,7 +450,12 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
     monkeypatch.setattr(
         viewer_main_module,
         "_ensure_live_account_for_deployment",
-        lambda _account_id: {"id": _account_id, "broker": "alpaca", "name": "Wrong"},
+        lambda _account_id: {
+            "id": _account_id,
+            "broker": "alpaca",
+            "name": "Wrong",
+            "broker_login": "PA-WRONG-ACCOUNT",
+        },
     )
 
     client = TestClient(viewer_main_module.app)
@@ -461,7 +469,7 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
             "signal_source_type": "discord",
             "signal_source_id": "RAMJET",
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "signal_processor": "ramjet"},
+            "signal_config": {"channel_id": "100000000000000009", "signal_processor": "ramjet"},
         },
     )
 

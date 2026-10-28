@@ -12085,7 +12085,16 @@ async def create_live_deployment_endpoint(
         settings=payload.settings or {},
     )
     try:
-        validate_stockkit_deployment_route(deployment)
+        from live_runner.credential_env import load_accounts_env_values
+        from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=str(
+                account_payload.get("broker_login") or account_payload.get("ctid") or ""
+            ),
+            accounts_env_values=load_accounts_env_values(DEFAULT_ACCOUNTS_ENV),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     try:
