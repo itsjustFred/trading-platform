@@ -353,3 +353,20 @@ def test_undefined_metrics_are_not_published_as_zero():
     assert _stat_number_or_undefined({"psr": 0.0}, "psr", 0.0) == 0.0
     # And an artifact written before the convention keeps its old default.
     assert _stat_number_or_undefined({}, "psr", 0.0) == 0.0
+
+
+def test_non_finite_stats_are_not_published_as_measurements():
+    """NaN/Infinity in an artifact has no measurable value, so it stays absent.
+
+    These are the same class of lie as the 0.0 default: `float("nan")` serialises
+    to a bare `NaN` token that strict JSON clients reject, and `Infinity` reads as
+    an impossibly good Sharpe. Both mean "could not compute", so they resolve to
+    None like a named undefined metric - not to the caller's default.
+    """
+    from shared.database import _stat_number_or_undefined
+
+    for value in (float("nan"), float("inf"), float("-inf"), "n/a"):
+        assert _stat_number_or_undefined({"sharpe_ratio": value}, "sharpe_ratio", 0.0) is None
+
+    # A numeric string is a real measurement written by an older producer.
+    assert _stat_number_or_undefined({"sharpe_ratio": "1.25"}, "sharpe_ratio", 0.0) == 1.25

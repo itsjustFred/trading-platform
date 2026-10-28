@@ -2274,6 +2274,74 @@ def test_deleting_a_deployment_with_history_is_a_conflict_and_restores_the_statu
     )
 
 
+def test_a_refused_delete_keeps_the_stop_enforcement_stamp(
+    viewer_client, isolated_db_sandbox
+):
+    """Only an ACTIVE row needs the transient PAUSED gate, and the rest must not get it.
+
+    The gate exists to close the submission claim window before the drain, and
+    that window is only open for an ACTIVE row. Writing PAUSED to a STOPPED row
+    is not a no-op: the status transition clears ``stopped_enforced_at`` in the
+    same transaction (P3), so a delete that is then refused for having history
+    would silently downgrade a stop whose cancel-and-flatten sweep had completed
+    to one that never ran. The dashboard reads that stamp to decide whether
+    exposure may still be open, so the visible result is a deployment that starts
+    reporting open exposure again after a request that changed nothing.
+    """
+    import uuid as _uuid
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-stop", "alpaca")
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-stop",
+            symbols=["EURUSD"],
+            timeframe="1h",
+            status="STOPPED",
+            signal_source_type="discord",
+        )
+    )
+    with database_module.get_session() as session:
+        session.add(
+            database_module.LiveSignalModel(
+                id=str(_uuid.uuid4()),
+                deployment_id=deployment_id,
+                symbol="EURUSD",
+                action="buy",
+                theoretical_price=1.1,
+                timestamp=datetime(2026, 10, 1, 10, 0, tzinfo=timezone.utc),
+                source="internal",
+                broker_order_id="",
+            )
+        )
+        session.commit()
+    assert database_module.mark_live_deployment_stopped_enforced(deployment_id)
+
+    response = viewer_client.delete(
+        f"/api/live/deployments/{deployment_id}"
+        f"?confirm_deployment_id={deployment_id}"
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["error"] == "deployment_in_use"
+    assert detail["signal_count"] == 1
+    assert detail["status_restored"] is None, (
+        "the refused delete claims to have restored a status, so it rewrote one"
+    )
+
+    row = database_module.get_live_deployment(deployment_id)
+    assert row is not None
+    assert row.status == "STOPPED"
+    assert row.stopped_enforced_at is not None, (
+        "a refused delete cleared the enforcement stamp, so a completed stop now "
+        "reads as unenforced"
+    )
+
+
 def test_a_stopped_deployment_reports_open_exposure_until_enforcement_completes():
     """Blocker 4: STOPPED is a request until the daemon confirms a full sweep.
 

@@ -12719,6 +12719,7 @@ async def update_live_deployment_status_endpoint(
                 action="deployment.status",
                 target_type="live_deployment",
                 target_id=deployment_id,
+                request=request,
                 succeeded=False,
                 detail={
                     "requested_status": requested_status,
@@ -12736,14 +12737,14 @@ async def update_live_deployment_status_endpoint(
                 ),
             )
 
-        # Re-verify the account against the broker immediately before arming.
-        # The DB gate also enforces verification freshness, so a stale
-        # confirmation can never be reused to arm a deployment.
+        # Re-verify the account against the broker immediately before arming so
+        # a stale identity can never be reused to arm a deployment.
         if not await _reverify_account_against_broker(deployment.account_id):
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",
                 target_id=deployment_id,
+                request=request,
                 succeeded=False,
                 detail={
                     "requested_status": requested_status,
@@ -12952,16 +12953,25 @@ async def delete_live_deployment_endpoint(
     # ordering is reproduced here: snapshot, write a non-ACTIVE status, drain, then
     # delete. The intermediate PAUSED is transient - the row is about to go - and it
     # is the same status the status endpoint writes before its own drain.
-    try:
-        gated = await asyncio.to_thread(
-            update_live_deployment_status, deployment_id, "PAUSED"
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail=_public_value_error_detail(exc)
-        ) from exc
-    if gated is None:
-        raise HTTPException(status_code=404, detail="Live deployment not found")
+    #
+    # Only an ACTIVE row needs the write. The claim gate is already closed for any
+    # other status, and rewriting it would be a real side effect on a row the
+    # request may still fail to delete: a STOPPED deployment carries the P3
+    # `stopped_enforced_at` stamp, and moving it to PAUSED clears that stamp, so a
+    # refused delete would silently turn a proven stop back into an unproven one.
+    gated = existing
+    status_gated = original_status == "ACTIVE"
+    if status_gated:
+        try:
+            gated = await asyncio.to_thread(
+                update_live_deployment_status, deployment_id, "PAUSED"
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=_public_value_error_detail(exc)
+            ) from exc
+        if gated is None:
+            raise HTTPException(status_code=404, detail="Live deployment not found")
 
     drain = await _drain_live_deployment_submissions(
         deployment_id, initial_claims=pending_claims
@@ -12977,8 +12987,13 @@ async def delete_live_deployment_endpoint(
         # error and a deployment silently disarmed. The refusal is now a typed
         # answer with the counts that explain it, and the status is put back so a
         # failed delete has no side effects at all.
+        #
+        # Only a gate write is undone. Restoring a status that was never changed
+        # would itself be a write: for a STOPPED row it re-runs the transition
+        # that clears `stopped_enforced_at`, so the "restore" would erase the
+        # stamp the refused delete was supposed to leave alone.
         restored_to: str | None = None
-        if original_status and original_status != "PAUSED":
+        if status_gated:
             try:
                 await asyncio.to_thread(
                     update_live_deployment_status, deployment_id, original_status

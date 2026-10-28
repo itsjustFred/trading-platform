@@ -3326,42 +3326,57 @@ def update_live_deployment_account(
         raise ValueError("deployment_id and account_id are required")
     init_db()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, normalized_deployment)
-        if record is None:
-            return None
+        # Take the write lock before the in-flight check, not after it. A deferred
+        # transaction only reads here, so a dispatcher could insert a claim between
+        # the count and the commit: the re-point would then succeed with a
+        # submission already on its way to the *old* account, which is the exact
+        # thing the check exists to prevent. BEGIN IMMEDIATE serialises the check
+        # against claim insertion, the same way save_live_execution does.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveDeploymentModel, normalized_deployment)
+            if record is None:
+                session.rollback()
+                return None
 
-        account = session.get(LiveAccountModel, normalized_account)
-        if account is None:
-            raise ValueError(f"Refusing to re-point at unknown account '{account_id}'")
+            account = session.get(LiveAccountModel, normalized_account)
+            if account is None:
+                raise ValueError(
+                    f"Refusing to re-point at unknown account '{account_id}'"
+                )
 
-        current_status = str(record.status or "").strip().upper()
-        if current_status == "ACTIVE" and not allow_active:
-            raise ValueError(
-                "Refusing to re-point an ACTIVE deployment; pause it first "
-                "(or pass allow_active=True once the listener is stopped)"
-            )
+            current_status = str(record.status or "").strip().upper()
+            if current_status == "ACTIVE" and not allow_active:
+                raise ValueError(
+                    "Refusing to re-point an ACTIVE deployment; pause it first "
+                    "(or pass allow_active=True once the listener is stopped)"
+                )
 
-        # Only an unexpired lease is genuinely in flight. Counting every claim
-        # regardless of expiry meant a lease whose TTL had elapsed still blocked a
-        # re-point with "in-flight submissions; drain them first" - an error the
-        # operator cannot act on, because there is nothing left to drain.
-        in_flight = session.exec(
-            select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
-                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment)
-                & (LiveDeploymentSubmissionClaimModel.expires_at > _utcnow_naive())
-            )
-        ).one()
-        if int(in_flight or 0) > 0:
-            raise ValueError(
-                "Refusing to re-point a deployment with in-flight submissions; "
-                "drain them first"
-            )
+            # Only an unexpired lease is genuinely in flight. Counting every claim
+            # regardless of expiry meant a lease whose TTL had elapsed still
+            # blocked a re-point with "in-flight submissions; drain them first" -
+            # an error the operator cannot act on, because there is nothing left
+            # to drain.
+            in_flight = session.exec(
+                select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
+                    (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment)
+                    & (LiveDeploymentSubmissionClaimModel.expires_at > _utcnow_naive())
+                )
+            ).one()
+            if int(in_flight or 0) > 0:
+                raise ValueError(
+                    "Refusing to re-point a deployment with in-flight submissions; "
+                    "drain them first"
+                )
 
-        record.account_id = normalized_account
-        record.updated_at = _utcnow_naive()
-        session.add(record)
-        session.commit()
-        session.refresh(record)
+            record.account_id = normalized_account
+            record.updated_at = _utcnow_naive()
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+        except Exception:
+            session.rollback()
+            raise
     return record.to_live_deployment()
 
 
@@ -4173,8 +4188,20 @@ def _stat_number_or_undefined(
 
     The default is only applied to a metric the producer did not name, so
     artifacts written before the convention keep their previous values.
+
+    A resolved value that is not a finite number is reported as undefined, not
+    coerced: an artifact carrying ``NaN``/``Infinity`` (or a string) has no
+    measurable value for that key, and publishing it as-is puts a non-JSON number
+    in the payload while still reading as a measurement.
     """
-    return resolve_defined_stat(stats, key, default)
+    resolved = resolve_defined_stat(stats, key, default)
+    if resolved is None:
+        return None
+    try:
+        numeric = float(resolved)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
