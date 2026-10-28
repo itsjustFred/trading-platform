@@ -15,7 +15,13 @@ import {
 } from "recharts";
 
 import { compareBacktests } from "../api/client";
+import {
+  requireMetricScale,
+  toPercentPoints,
+  type PercentScale,
+} from "../api/metricScale";
 import type { BacktestsCompareResponse } from "../api/types";
+import { describeError } from "../lib/errorMessage";
 
 const COLORS = ["#58a6ff", "#3fb950"];
 
@@ -23,27 +29,62 @@ type MetricConfig = {
   key: keyof BacktestsCompareResponse["backtest1"]["stats"];
   label: string;
   better: "higher" | "lower";
-  format: "number" | "percent" | "currency" | "integer";
-};
+} & (
+  | { format: "percent"; scale: PercentScale }
+  | { format: "number" | "currency" | "integer" }
+);
 
-// The /api/backtests/compare payload serves every percent-like metric here in
-// percent points (see _backtest_compare_payload in viewer/main.py), so no
-// per-metric scale is needed on this page.
+// /api/backtests/compare is NOT unit-homogeneous: total_return stays in the
+// engine's fraction, the rest are normalized to percent points (see
+// _backtest_compare_payload in viewer/main.py). Every percent row therefore
+// states its own scale, resolved from the per-payload contract table so the
+// page cannot drift from the payload it reads.
 const METRICS: MetricConfig[] = [
-  { key: "total_return", label: "Total Return", better: "higher", format: "percent" },
+  {
+    key: "total_return",
+    label: "Total Return",
+    better: "higher",
+    format: "percent",
+    scale: requireMetricScale("backtest_compare", "total_return"),
+  },
   { key: "net_profit", label: "Net Profit", better: "higher", format: "currency" },
   { key: "sharpe_ratio", label: "Sharpe (higher = better)", better: "higher", format: "number" },
-  { key: "psr", label: "PSR (higher = better)", better: "higher", format: "percent" },
+  {
+    key: "psr",
+    label: "PSR (higher = better)",
+    better: "higher",
+    format: "percent",
+    // This payload rescales psr by 100; the other payloads serve the fraction.
+    scale: requireMetricScale("backtest_compare", "psr"),
+  },
   { key: "p_value", label: "p-Value (lower = better)", better: "lower", format: "number" },
-  { key: "cagr", label: "CAGR (higher = better)", better: "higher", format: "percent" },
-  { key: "max_drawdown", label: "Max DD (lower = better)", better: "lower", format: "percent" },
-  { key: "win_rate", label: "Win Rate (higher = better)", better: "higher", format: "percent" },
+  {
+    key: "cagr",
+    label: "CAGR (higher = better)",
+    better: "higher",
+    format: "percent",
+    scale: requireMetricScale("backtest_compare", "cagr"),
+  },
+  {
+    key: "max_drawdown",
+    label: "Max DD (lower = better)",
+    better: "lower",
+    format: "percent",
+    scale: requireMetricScale("backtest_compare", "max_drawdown"),
+  },
+  {
+    key: "win_rate",
+    label: "Win Rate (higher = better)",
+    better: "higher",
+    format: "percent",
+    scale: requireMetricScale("backtest_compare", "win_rate"),
+  },
   { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];
 
-function formatMetric(value: number, format: MetricConfig["format"]): string {
+function formatMetric(value: number, metric: MetricConfig): string {
   if (!Number.isFinite(value)) return "—";
-  if (format === "currency") {
+  if (metric.format === "currency") {
     return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toLocaleString(
       "en-US",
       {
@@ -51,10 +92,10 @@ function formatMetric(value: number, format: MetricConfig["format"]): string {
       },
     )}`;
   }
-  if (format === "percent") {
-    return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+  if (metric.format === "percent") {
+    return `${value >= 0 ? "+" : ""}${(toPercentPoints(value, metric.scale) ?? 0).toFixed(2)}%`;
   }
-  if (format === "integer") {
+  if (metric.format === "integer") {
     return `${value >= 0 ? "+" : ""}${Math.trunc(value)}`;
   }
   return value.toFixed(3);
@@ -68,21 +109,26 @@ function deltaColorFor(delta: number, betterSecond: boolean): string {
   return betterSecond ? "#3fb950" : "#f85149";
 }
 
-function formatMetricRaw(
-  value: number,
-  format: MetricConfig["format"],
-): string {
+function formatMetricRaw(value: number, metric: MetricConfig): string {
   if (!Number.isFinite(value)) return "—";
-  if (format === "currency") {
+  if (metric.format === "currency") {
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   }
-  if (format === "percent") {
-    return `${value.toFixed(2)}%`;
+  if (metric.format === "percent") {
+    return `${(toPercentPoints(value, metric.scale) ?? 0).toFixed(2)}%`;
   }
-  if (format === "integer") {
+  if (metric.format === "integer") {
     return Math.trunc(value).toLocaleString("en-US");
   }
   return value.toFixed(3);
+}
+
+/** Ids come from the query string; the key is what the effect and state key on. */
+function parseCompareIds(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function formatChartTime(unixSeconds: number): string {
@@ -93,36 +139,51 @@ function formatChartTime(unixSeconds: number): string {
 export function ComparePage() {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const [data, setData] = useState<BacktestsCompareResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  // Results and failures are stored with the ids they belong to, so the
+  // loading/error/data shown for the current selection is derived rather than
+  // mirrored into state by the fetch effect.
+  const [result, setResult] = useState<{
+    key: string;
+    data: BacktestsCompareResponse;
+  } | null>(null);
+  const [failure, setFailure] = useState<{ key: string; message: string } | null>(
+    null,
+  );
 
-  const ids = (params.get("ids") || "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  const idsKey = params.get("ids") || "";
+  const ids = useMemo(() => parseCompareIds(idsKey), [idsKey]);
+  const selectionValid = ids.length === 2;
+  const selectionError = selectionValid
+    ? ""
+    : "Select exactly 2 backtests to compare.";
+  const data = result?.key === idsKey ? result.data : null;
+  const fetchError = failure?.key === idsKey ? failure.message : "";
+  const error = selectionError || fetchError;
+  const loading = selectionValid && data === null && fetchError === "";
 
   useEffect(() => {
-    if (ids.length !== 2) {
-      setLoading(false);
-      setError("Select exactly 2 backtests to compare.");
+    if (!selectionValid) {
       return;
     }
-    setLoading(true);
-    setError("");
+    let cancelled = false;
     compareBacktests(ids)
       .then((payload) => {
-        setData(payload);
+        if (cancelled) return;
+        setResult({ key: idsKey, data: payload });
+        setFailure(null);
       })
       .catch((error_: unknown) => {
-        const message =
-          error_ instanceof Error
-            ? error_.message
-            : "Could not load comparison data";
-        setError(message);
-      })
-      .finally(() => setLoading(false));
-  }, [ids.join(",")]);
+        if (cancelled) return;
+        setFailure({
+          key: idsKey,
+          message:
+            describeError(error_, "Could not load comparison data"),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ids, idsKey, selectionValid]);
 
   const equityOverlayData = useMemo(() => {
     if (!data) return [];
@@ -285,13 +346,13 @@ export function ComparePage() {
                   <tr key={metric.key}>
                     <td style={tdStyle}>{metric.label}</td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(left, metric.format)}
+                      {formatMetricRaw(left, metric)}
                     </td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(right, metric.format)}
+                      {formatMetricRaw(right, metric)}
                     </td>
                     <td style={{ ...tdStyle, color: deltaColor }}>
-                      {formatMetric(delta, metric.format)}
+                      {formatMetric(delta, metric)}
                     </td>
                   </tr>
                 );

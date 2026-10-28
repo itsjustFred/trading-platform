@@ -143,6 +143,7 @@ export function LiveViewerPage() {
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [loadingHeader, setLoadingHeader] = useState(true);
   const [headerError, setHeaderError] = useState("");
+  const [fillsError, setFillsError] = useState("");
 
   useEffect(() => {
     if (!accountId) {
@@ -171,6 +172,7 @@ export function LiveViewerPage() {
         setAccount(foundAccount);
         setDeployments(accountDeployments);
         setFills(sortedFills);
+        setFillsError("");
         setSelectedSymbol((current) => {
           if (current && symbols.includes(current)) return current;
           return symbols[0] ?? "";
@@ -213,6 +215,7 @@ export function LiveViewerPage() {
       return;
     }
     setFills(sortLiveTrades(executionsStream.data.trades));
+    setFillsError("");
   }, [executionsStream.data]);
 
   useEffect(() => {
@@ -227,7 +230,16 @@ export function LiveViewerPage() {
           return;
         }
         setFills(sortLiveTrades(payload.trades));
-      } catch {
+        setFillsError("");
+      } catch (error: unknown) {
+        if (cancelled) {
+          return;
+        }
+        setFillsError(
+          error instanceof Error
+            ? error.message
+            : "Failed to refresh live trades.",
+        );
       }
     };
     void refreshTrades();
@@ -270,8 +282,10 @@ export function LiveViewerPage() {
     staleTime: signalsFallbackPolling ? LIVE_VIEWER_FALLBACK_POLL_MS : Number.POSITIVE_INFINITY,
   });
 
-  const positions = positionsPayload?.positions ?? [];
-  const signals = signalsPayload?.signals ?? [];
+  const positionsPayloadPositions = positionsPayload?.positions;
+  const signalsPayloadSignals = signalsPayload?.signals;
+  const positions = useMemo(() => positionsPayloadPositions ?? [], [positionsPayloadPositions]);
+  const signals = useMemo(() => signalsPayloadSignals ?? [], [signalsPayloadSignals]);
   const trades = useMemo(() => toTradeHistoryRows(fills), [fills]);
   const symbols = useMemo(
     () => uniqueSymbols(deployments, fills, positions, signals),
@@ -601,6 +615,14 @@ export function LiveViewerPage() {
           <h2 style={{ margin: "2px 0 10px", fontSize: "0.95rem", fontWeight: 600 }}>
             Trade History
           </h2>
+          {fillsError && (
+            <div
+              role="alert"
+              style={{ color: "var(--color-red)", fontSize: "0.8rem", marginBottom: "8px" }}
+            >
+              Trade history refresh failed: {fillsError}
+            </div>
+          )}
           {selectedTrades.length === 0 ? (
             <EmptyState label="No completed trades" />
           ) : (

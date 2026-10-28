@@ -102,6 +102,13 @@ class Service(BaseModel):
     status: ServiceStatus
     config: dict[str, Any] = Field(default_factory=dict)
     last_activity: datetime | None = None
+    # When the service was last *tried*, successfully or not.
+    #
+    # `last_activity` only advances on a successful read, so a service that has
+    # been failing for three days keeps showing the last time it worked - which
+    # reads as "the process is not trying" when it is. Anyone triaging a failed
+    # service from `last_activity` alone draws the wrong conclusion.
+    last_attempt_at: datetime | None = None
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
@@ -215,10 +222,43 @@ class LiveDeploymentCreateRequest(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
+class LiveControlConfirmation(BaseModel):
+    """Explicit acknowledgement attached to a state-changing live control.
+
+    A client-side dialog is not a control: the API is directly callable, so a
+    dialog constrains the UI and nothing else. This field is the server-side
+    half, and it is required rather than advisory for the operations that can
+    move real money or destroy state - arming, re-pointing and deleting.
+
+    ``deployment_id`` is echoed back deliberately. Typing a fixed phrase proves
+    only that the operator was present; naming the deployment proves they
+    confirmed *this* one, which is the mistake that actually happens when
+    several similar rows are stacked in a list.
+    """
+
+    confirmed_deployment_id: str
+    reason: str = ""
+
+
 class LiveDeploymentStatusUpdateRequest(BaseModel):
     """Payload for updating a deployment runtime status via API."""
 
     status: Literal["ACTIVE", "PAUSED", "STOPPED"]
+    # Required for the transitions that can start trading or end it. PAUSE is
+    # included: it drains in-flight submissions, so it is not a free action
+    # either. Absent, the endpoint refuses rather than defaulting to false.
+    confirmation: LiveControlConfirmation | None = None
+
+
+class LiveDeploymentAccountUpdateRequest(BaseModel):
+    """Payload for re-pointing a deployment at a different broker account."""
+
+    account_id: str
+    # Re-pointing an ACTIVE deployment leaves the running listener holding the
+    # old account until the next sync, so it must be opted into explicitly.
+    allow_active: bool = False
+    # Re-pointing moves which account real orders reach. Required.
+    confirmation: LiveControlConfirmation | None = None
 
 
 class LiveSignal(BaseModel):

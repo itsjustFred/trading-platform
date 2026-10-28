@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import { ArrowLeft, PencilLine, Plus, ScrollText } from "lucide-react";
 import { getStrategyDetail, renameStrategy } from "../api/client";
+import type { StrategyDetail } from "../api/types";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
 import { psrTone } from "../lib/statFormat";
 import { RenameModal } from "../components/RenameModal";
@@ -13,8 +14,13 @@ interface MarkdownCodeProps {
 }
 
 /** Shared react-markdown `code` renderer used by the notes/markdown panels. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function markdownCodeRenderer({ inline, children, ...props }: MarkdownCodeProps & Record<string, any>) {
+// Only `className` is forwarded: react-markdown also passes the hast `node`,
+// which must never reach the DOM.
+function markdownCodeRenderer({
+  inline,
+  children,
+  className,
+}: MarkdownCodeProps & React.ComponentProps<"code">) {
   return inline ? (
     <code
       style={{
@@ -24,7 +30,7 @@ function markdownCodeRenderer({ inline, children, ...props }: MarkdownCodeProps 
         padding: "2px 6px",
         fontSize: "0.8rem",
       }}
-      {...props}
+      className={className}
     >
       {children}
     </code>
@@ -40,7 +46,7 @@ function markdownCodeRenderer({ inline, children, ...props }: MarkdownCodeProps 
         color: "#c9d1d9",
         fontSize: "0.82rem",
       }}
-      {...props}
+      className={className}
     >
       {children}
     </code>
@@ -162,7 +168,7 @@ const richMarkdownComponents = {
 export function StrategyDetailPage() {
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
-  const [detail, setDetail] = useState<any>(null);
+  const [detail, setDetail] = useState<StrategyDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false);
@@ -204,8 +210,12 @@ export function StrategyDetailPage() {
       const updated = await renameStrategy(detail.slug, nextName);
       setDetail(updated);
       setShowRenameModal(false);
-    } catch (error: any) {
-      setRenameError(error.message || "Could not rename strategy");
+    } catch (error: unknown) {
+      setRenameError(
+        error instanceof Error && error.message
+          ? error.message
+          : "Could not rename strategy",
+      );
     } finally {
       setSavingRename(false);
     }
@@ -570,7 +580,7 @@ export function StrategyDetailPage() {
               gap: "10px",
             }}
           >
-            {detail.backtests.map((backtest: any) => (
+            {detail.backtests.map((backtest) => (
               <Link
                 key={backtest.id}
                 to={`/backtests/${backtest.id}`}
@@ -688,7 +698,7 @@ export function StrategyDetailPage() {
             Portfolios ({detail.portfolios.length})
           </h2>
           <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            {detail.portfolios.map((portfolio: any) => (
+            {detail.portfolios.map((portfolio) => (
               <Link
                 key={portfolio.id}
                 to={`/portfolios/${portfolio.id}`}

@@ -8,6 +8,8 @@ import {
   toChartTime,
 } from "../src/lib/liveChartTime.ts";
 
+import { stripComments } from "./sourceRegion.ts";
+
 test("chart time accepts positive unix seconds and truncates fractions", () => {
   assert.equal(toChartTime(1_700_000_000.9), 1_700_000_000);
   assert.equal(toChartTime(60), 60);
@@ -52,10 +54,16 @@ test("parameter field ids stay non-empty for degenerate names", () => {
   assert.equal(parameterFieldId("///"), "optimize-param-unnamed");
 });
 
+// Comments are stripped before any assertion here. These are whole-file presence
+// and absence checks, and a comment is not code: it satisfies a `match` and it
+// satisfies a `doesNotMatch` equally well, so an absence check could not tell a fix
+// from a note about the fix.
 test("optimize modal labels reference the per-parameter id helper, not static ids", async () => {
-  const modal = await readFile(
-    new URL("../src/components/OptimizeModal.tsx", import.meta.url),
-    "utf8",
+  const modal = stripComments(
+    await readFile(
+      new URL("../src/components/OptimizeModal.tsx", import.meta.url),
+      "utf8",
+    ),
   );
 
   assert.doesNotMatch(modal, /htmlFor="optimize-(categories|min|max|step)"/);
@@ -64,9 +72,11 @@ test("optimize modal labels reference the per-parameter id helper, not static id
 });
 
 test("live viewer exit markers resolve time from the execution timestamp", async () => {
-  const viewer = await readFile(
-    new URL("../src/pages/LiveViewer.tsx", import.meta.url),
-    "utf8",
+  const viewer = stripComments(
+    await readFile(
+      new URL("../src/pages/LiveViewer.tsx", import.meta.url),
+      "utf8",
+    ),
   );
 
   assert.match(viewer, /exitTimeUnix: asFinite\(row\.execution_time, 0\)/);

@@ -35,6 +35,27 @@ export const Sparkline = memo(function Sparkline({
   );
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
+  // Drawdown of each point against the running peak up to that point.
+  const drawdowns = useMemo(
+    () =>
+      normalized
+        .reduce<{ peak: number; points: number[] }>(
+          (acc, value) => {
+            const peak = Math.max(acc.peak, value);
+            acc.peak = peak;
+            acc.points.push(
+              !Number.isFinite(peak) || Math.abs(peak) < 1e-9
+                ? 0
+                : ((value - peak) / Math.abs(peak)) * 100,
+            );
+            return acc;
+          },
+          { peak: Number.NEGATIVE_INFINITY, points: [] },
+        )
+        .points,
+    [normalized],
+  );
+
   if (normalized.length < 2) return null;
 
   const min = Math.min(...normalized);
@@ -57,16 +78,6 @@ export const Sparkline = memo(function Sparkline({
 
   // Fill area under the line
   const fillPoints = `0,${height} ${points} ${width},${height}`;
-  const drawdowns = useMemo(() => {
-    let peak = Number.NEGATIVE_INFINITY;
-    return normalized.map((value) => {
-      peak = Math.max(peak, value);
-      if (!Number.isFinite(peak) || Math.abs(peak) < 1e-9) {
-        return 0;
-      }
-      return ((value - peak) / Math.abs(peak)) * 100;
-    });
-  }, [normalized]);
 
   const hoverIdx =
     hoverIndex == null

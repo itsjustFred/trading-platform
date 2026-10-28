@@ -1,5 +1,18 @@
 export type StrategyParameterValue = number | string | boolean | null;
 
+/**
+ * Free-form tag bag a strategy file declares. The keys the UI reads are typed;
+ * anything else is allowed but must be narrowed before use.
+ */
+export interface StrategyTags {
+  type?: string[];
+  source?: string;
+  asset_class?: string[];
+  complexity?: string;
+  link?: string;
+  [key: string]: unknown;
+}
+
 export interface StrategyMeta {
   slug: string;
   name: string;
@@ -8,7 +21,7 @@ export interface StrategyMeta {
   created_at: string;
   source_url: string;
   notes: string;
-  tags: Record<string, any>;
+  tags: StrategyTags;
   type: string[];
   source: string;
   asset_class: string[];
@@ -111,6 +124,8 @@ export interface BacktestSummary {
   total_pnl: number;
   win_rate: number;
   created_at: string;
+  psr?: number;
+  p_value?: number;
 }
 
 export interface BacktestMeta {
@@ -130,7 +145,7 @@ export interface BacktestMeta {
     universe: string;
     source: string;
   };
-  parameters: Record<string, any>;
+  parameters: Record<string, StrategyParameterValue>;
   tags: string[];
   notes: string;
 }
@@ -408,7 +423,7 @@ export interface BacktestStats {
   expectancy: number;
   psr?: number;
   p_value?: number;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 export interface CapmScatterPoint {
@@ -436,6 +451,12 @@ export interface EquityPoint {
   equity: number;
 }
 
+export interface BenchmarkResponse {
+  symbol: string;
+  timeframe: string;
+  equity: Record<string, number>[];
+}
+
 export interface LiveAccount {
   id: string;
   name: string;
@@ -449,7 +470,7 @@ export interface LiveAccount {
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
-export type ServiceType = "discord_bot" | "scheduled_job";
+export type ServiceType = "discord_bot" | "scheduled_job" | "trading_daemon";
 export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
 export type VerificationEvidenceStatus =
   | "success"
@@ -464,6 +485,13 @@ export interface Service {
   status: ServiceStatus;
   config: Record<string, unknown>;
   last_activity?: string | null;
+  /**
+   * When anyone last *tried* this service, which is a different question from
+   * `last_activity`. A service that has failed keeps re-reading as failed long
+   * after its listener is gone, so "when did it last do anything?" cannot answer
+   * "is it still trying?". Mirrors `shared.models.Service`.
+   */
+  last_attempt_at?: string | null;
   created_at: string;
 }
 
@@ -546,6 +574,24 @@ export interface LiveDeploymentConfig {
   signal_source: LiveSignalSource;
   signal_config: Record<string, unknown>;
   settings: Record<string, unknown>;
+}
+
+export interface LiveDeploymentStatusUpdateResponse extends LiveDeploymentConfig {
+  /**
+   * Only present on a status change that is not ACTIVE. `DRAINED` means every
+   * submission lease held when the status changed was released before its TTL.
+   * `IN_FLIGHT` means a dispatcher still held one, `INDETERMINATE` means a lease
+   * expired without being released so whether the order reached the broker is
+   * unknown. A non-`DRAINED` outcome is still a *successful* status change - the
+   * pause is in effect and blocks further orders - and must never be shown to
+   * the operator as a failed pause.
+   */
+  submission_drain_outcome?: "DRAINED" | "IN_FLIGHT" | "INDETERMINATE";
+  submission_drain_complete?: boolean;
+  in_flight_submissions?: number;
+  expired_unreleased_submissions?: number;
+  status_change_applied?: boolean;
+  warning?: string;
 }
 
 export interface LiveDeploymentCreateRequest {
@@ -1208,20 +1254,29 @@ export interface PortfolioDetail {
   account_capital: number;
   components: PortfolioComponent[];
   strategies: PortfolioStrategy[];
+  /**
+   * Mirrors `shared.models.PortfolioStats`. The nullable members are nullable
+   * *upstream*, not optionally: the backend emits `null` for a statistic it could
+   * not compute, and `isUnavailableStatValue` in `lib/statFormat.ts` exists to
+   * render that as unavailable rather than as zero. Declaring them `number` while
+   * the code checks them for null is a type lie that `tsc` cannot catch in the
+   * other direction - it rejects the correct handling and permits arithmetic on
+   * a null at runtime.
+   */
   combined_stats: {
-    sharpe: number;
-    sortino?: number;
-    cagr: number;
+    sharpe: number | null;
+    sortino?: number | null;
+    cagr: number | null;
     total_return?: number;
     max_drawdown_duration?: number;
     win_rate?: number;
-    profit_factor?: number;
-    calmar?: number;
-    max_drawdown: number;
+    profit_factor?: number | null;
+    calmar?: number | null;
+    max_drawdown: number | null;
     net_profit: number;
-    psr?: number;
+    psr?: number | null;
     p_value?: number;
-    correlation_matrix: Record<string, any>;
+    correlation_matrix: Record<string, Record<string, number>>;
   };
   combined_equity: { time: string; equity: number }[];
   strategy_contributions: {

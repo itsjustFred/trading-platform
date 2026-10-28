@@ -6,7 +6,7 @@ import type {
   SignalProcessorOption,
 } from "../api/types";
 import { Modal } from "./Modal";
-import { useToast } from "./ToastProvider";
+import { useToast } from "./toastContext";
 
 interface BacktestFromSignalsModalProps {
   open: boolean;

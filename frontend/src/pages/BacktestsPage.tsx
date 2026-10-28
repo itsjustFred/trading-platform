@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { normalizeWinRate } from "../api/metricScale";
+import { normalizeWinRate, toPercentPointsForKey } from "../api/metricScale";
 import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
@@ -28,7 +28,7 @@ import { FilterBar } from "../components/FilterBar";
 import { Modal } from "../components/Modal";
 import { MultiSelectDropdown } from "../components/MultiSelectDropdown";
 import { Sparkline } from "../components/Sparkline";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
 
 type SortField =
   | "created_at"
@@ -249,7 +249,10 @@ function toBounds(values: number[], fallback: NumericRange): NumericRange {
 function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
   return {
     totalReturn: toBounds(
-      items.map((item) => metricValue(item.total_return) * 100),
+      items.map(
+        (item) =>
+          toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0,
+      ),
       { min: -50, max: 50 },
     ),
     sharpe: toBounds(
@@ -265,21 +268,31 @@ function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
       { min: 0, max: 1 },
     ),
     cagr: toBounds(
-      items.map((item) => metricValue(item.cagr) * 100),
+      items.map(
+        (item) =>
+          toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0,
+      ),
       { min: -20, max: 40 },
     ),
     maxDrawdown: toBounds(
-      items.map((item) => Math.abs(metricValue(item.max_drawdown)) * 100),
+      items.map(
+        (item) =>
+          toPercentPointsForKey(
+            "backtest_list",
+            "max_drawdown",
+            Math.abs(metricValue(item.max_drawdown)),
+          ) ?? 0,
+      ),
       {
         min: 0,
         max: 60,
       },
     ),
     winRate: toBounds(
-      items.map((item) => {
-        const normalized = normalizeWinRate(item.win_rate);
-        return normalized == null ? 0 : normalized * 100;
-      }),
+      items.map(
+        (item) =>
+          toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0,
+      ),
       { min: 0, max: 100 },
     ),
   };
@@ -760,8 +773,10 @@ export function BacktestsPage() {
   }, [nameFilter]);
 
   useEffect(() => {
+    // `debouncedNameFilter` reaches the loader through its useCallback deps;
+    // it is listed here as well so the dependency is self-evident.
     void loadAllMetadata(debouncedNameFilter.trim().length === 0);
-  }, [loadAllMetadata]);
+  }, [loadAllMetadata, debouncedNameFilter]);
 
   const allStrategies = useMemo(
     () =>
@@ -812,13 +827,21 @@ export function BacktestsPage() {
         }
       }
 
-      const totalReturn = metricValue(item.total_return) * 100;
+      const totalReturn =
+        toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0;
       const sharpe = metricValue(item.sharpe_ratio);
       const psr = metricValue(item.psr);
       const pValue = metricValue(item.p_value, 1);
-      const cagr = metricValue(item.cagr) * 100;
-      const maxDrawdown = Math.abs(metricValue(item.max_drawdown)) * 100;
-      const winRate = (normalizeWinRate(item.win_rate) ?? 0) * 100;
+      const cagr =
+        toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0;
+      const maxDrawdown =
+        toPercentPointsForKey(
+          "backtest_list",
+          "max_drawdown",
+          Math.abs(metricValue(item.max_drawdown)),
+        ) ?? 0;
+      const winRate =
+        toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0;
 
       return (
         totalReturn >= numericFilters.totalReturn.min &&
@@ -1634,11 +1657,18 @@ export function BacktestsPage() {
         >
           {currentPageItems.map((item) => {
             const selected = selectedIds.has(item.id);
-            const totalReturnPct = metricValue(item.total_return) * 100;
-            const cagrPct = metricValue(item.cagr) * 100;
+            const totalReturnPct =
+              toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0;
+            const cagrPct =
+              toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0;
             const maxDrawdownPct =
-              Math.abs(metricValue(item.max_drawdown)) * 100;
-            const winRatePct = (normalizeWinRate(item.win_rate) ?? 0) * 100;
+              toPercentPointsForKey(
+                "backtest_list",
+                "max_drawdown",
+                Math.abs(metricValue(item.max_drawdown)),
+              ) ?? 0;
+            const winRatePct =
+              toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0;
             const sparkline = previewById[item.id] ?? item.equity_preview ?? [];
 
             return (

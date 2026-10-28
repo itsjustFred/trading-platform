@@ -7,8 +7,6 @@ functions that are consumed by the FastAPI routes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import ast
 import json
 import logging
@@ -33,10 +31,21 @@ import pyarrow.parquet as pq
 
 from data_tools import cache_manager
 from data_tools.catalog_builder import build_catalog, scan_ohlcv
-from runner.auto_agent import DEFAULT_MODEL_NAME, SUPPORTED_MODEL_NAMES, run_auto_agent
-from runner.llm_providers import DEFAULT_LLM_PROVIDER_NAME, SUPPORTED_LLM_PROVIDER_NAMES
-from runner.optimizer import OptimizationConfig
-from runner.optimizer import run_optimization as execute_optimization
+from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    DEFAULT_MODEL_NAME,
+    SUPPORTED_MODEL_NAMES,
+    run_auto_agent,
+)
+from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    DEFAULT_LLM_PROVIDER_NAME,
+    SUPPORTED_LLM_PROVIDER_NAMES,
+)
+from runner.optimizer import (
+    OptimizationConfig,  # noqa: F401 - re-exported for viewer/main.py and the API surface
+)
+from runner.optimizer import (
+    run_optimization as execute_optimization,  # noqa: F401 - re-exported for viewer/main.py and the API surface
+)
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.constants import (
     DATA_DIR,
@@ -46,7 +55,12 @@ from shared.constants import (
     normalize_timeframe,
 )
 from shared.logging import get_logger, redact_text, redact_value
-from shared.models import BacktestResult, EquityPoint, PortfolioStats, Trade
+from shared.models import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    BacktestResult,
+    EquityPoint,
+    PortfolioStats,
+    Trade,
+)
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
@@ -57,9 +71,12 @@ from shared.strategy_registry import (
     strategy_documentation_path,
     strategy_relative_file,
     strategy_slug_for_path,
-    update_strategy_display_name,
+    update_strategy_display_name,  # noqa: F401 - re-exported for viewer/main.py and the API surface
 )
-from viewer.comparison import compare_backtests, compute_drawdown_pct
+from viewer.comparison import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
+    compare_backtests,
+    compute_drawdown_pct,
+)
 
 logger = get_logger("viewer")
 
@@ -384,7 +401,15 @@ def _backtest_info_payload(result: BacktestResult) -> dict:
         if meta.data.get("timeframes")
         else "1h",
         "timeframes": meta.data.get("timeframes", []),
+        "data_source": meta.data.get("source", ""),
+        "requested_data_source": meta.data.get("requested_data_source", ""),
+        "asset_classes": meta.data.get("asset_classes", []),
+        "data_files": meta.data.get("data_files", []),
+        "pnl_basis": meta.data.get("pnl_basis", {}),
+        "risk_config": meta.data.get("risk_config", {}),
         "initial_capital": meta.initial_capital,
+        "duration_days": meta.duration_days,
+        "total_bars": meta.total_bars,
         "created_at": meta.created_at,
         "trade_count": len(result.trades),
         "parameters": meta.parameters,
@@ -1187,6 +1212,7 @@ def _quick_stats_and_equity(
             "max_drawdown_pct": 0,
             "net_profit": 0,
             "net_profit_pct": 0,
+            "total_return": 0,
             "p_value": 1.0,
             "psr": None,
             "equity_mini": [],
@@ -1249,7 +1275,8 @@ def _quick_stats_and_equity(
             equity.append(round(running, 2))
         total_pnl = running - initial_capital
 
-    net_profit_pct = round(total_pnl / initial_capital * 100, 2) if initial_capital else 0
+    total_return_fraction = (total_pnl / initial_capital) if initial_capital else 0.0
+    net_profit_pct = round(total_return_fraction * 100, 2)
 
     if "max_drawdown_pct" in derived_stats:
         max_drawdown_pct = round(abs(_safe_float(derived_stats.get("max_drawdown_pct"))) * 100, 2)
@@ -1278,6 +1305,10 @@ def _quick_stats_and_equity(
         "max_drawdown_pct": max_drawdown_pct,
         "net_profit": round(total_pnl, 2),
         "net_profit_pct": net_profit_pct,
+        # A fraction, the engine definition (E_end / E_start - 1) that
+        # frontend/src/api/metricScale.ts declares for total_return. The
+        # net_profit_pct above is this same number in percent points.
+        "total_return": round(total_return_fraction, 8),
         "psr": psr_val,
         "p_value": p_value,
         "equity_mini": equity_mini,
@@ -1351,6 +1382,18 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         else None
     )
 
+    # Persisted runner stats carry total_return as a FRACTION (the engine
+    # definition is E_end / E_start - 1, see runner/stats.py) and
+    # frontend/src/api/metricScale.ts declares it a "fraction" for this payload,
+    # so it is passed through unscaled. Fall back to the net figure when the
+    # engine did not record it.
+    total_return_fraction = _safe_float(raw.get("total_return"), float("nan"))
+    if not math.isfinite(total_return_fraction):
+        total_return_fraction = (
+            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
+            / (result.meta.initial_capital or 100000)
+        )
+
     stats = {
         "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
         "net_profit_pct": round(
@@ -1383,6 +1426,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
+        "total_return": round(total_return_fraction, 6),
         "expectancy": 0,  # computed below
     }
     # Expectancy
@@ -1490,6 +1534,9 @@ def _indicator_payload(
     }
 
 
+_PANDAS_TA_MISSING_WARNED = False
+
+
 def _compute_indicators(
     df: pd.DataFrame, indicator_list: list[dict], ohlcv_times: list[float]
 ) -> list[dict]:
@@ -1497,6 +1544,20 @@ def _compute_indicators(
     try:
         import pandas_ta as ta
     except ImportError:
+        # Every indicator panel - RSI, ATR, Bollinger, MACD - is produced by this one import, and a
+        # missing `pandas_ta` therefore removes all of them at once while leaving the rest of the chart
+        # intact. That failure is invisible: the panels are simply absent.
+        #
+        # `pandas_ta` is declared in no dependency file, so a fresh install lands here, and the bare
+        # `return []` said nothing about why. Warned once rather than per call, because this runs per
+        # chart request.
+        global _PANDAS_TA_MISSING_WARNED
+        if not _PANDAS_TA_MISSING_WARNED:
+            _PANDAS_TA_MISSING_WARNED = True
+            logger.warning(
+                "pandas_ta is not installed, so no chart indicators can be computed; "
+                "RSI, ATR, Bollinger and MACD panels will be absent rather than wrong"
+            )
         return []
 
     results = []
@@ -1855,8 +1916,20 @@ def _strategy_payload(entry: StrategyEntry) -> dict:
     }
 
 
+#: Per-repo cap for `dolt pull`. Four repos at 30s each is two minutes of
+#: waiting, and this runs per backtest request, so a slow or unreachable remote
+#: used to pile up threads that kept the process alive long after the work was
+#: done.
+_DOLTHUB_PULL_TIMEOUT_SECONDS = 10
+
+
 def _dolthub_pull():
-    """Non-blocking dolt pull in all Dolthub repos. Logs warnings on failure."""
+    """Best-effort dolthub pull. Logs warnings on failure.
+
+    A pull that misses its deadline is killed and logged rather than retried: the
+    data is refreshed on the next request anyway, and blocking here only delays
+    the request that triggered it.
+    """
     dolthub_repos = DATA_DIR / "dolthub"
     if not dolthub_repos.is_dir():
         return
@@ -1873,7 +1946,13 @@ def _dolthub_pull():
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=_DOLTHUB_PULL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "dolt pull %s exceeded %ss and was abandoned",
+                repo,
+                _DOLTHUB_PULL_TIMEOUT_SECONDS,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             logger.warning("dolt pull %s failed: %s", repo, exc)
@@ -2244,6 +2323,24 @@ def _download_request_key(identity: dict[str, Any]) -> str:
 
 
 _SINGLEFLIGHT_OWNER_CONTEXT = threading.local()
+# The singleflight lease fields, defined once.
+#
+# Two operations read this list and they are *not* symmetric, which is what makes a
+# divergence here dangerous rather than merely untidy:
+#
+# - `_clear_singleflight_reservation` in this module POPS every key, releasing the lease
+#   in memory;
+# - `viewer/main.py::_task_snapshot_payload` COPIES every key into the persisted payload,
+#   so a held lease survives a restart and is not re-acquired by a second worker.
+#
+# A key present in the persisted set but missing from the cleared set is therefore the
+# bad direction: the field is written to disk and never released, so the reservation is
+# never freed and the task is stuck as permanently claimed. The reverse direction leaves a
+# stale field on disk, which at worst costs a redundant re-claim after a restart.
+#
+# These were two identical thirteen-entry tuples, one per module, with nothing relating
+# them. Same shape as every other duplicate this audit has found: they agree today, and
+# agreement is what hides it.
 _SINGLEFLIGHT_RUNTIME_KEYS = (
     "download_request_key",
     "owner_pid",

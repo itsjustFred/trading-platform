@@ -12,6 +12,9 @@ interface LiveTerminalProps {
 
 /** Log text parsed out of the task feed: `[task:<id>] status=<word>`. */
 const TASK_STATUS_LINE = /\[task:[^\]]+\]\s+status=(\w+)/i;
+// One tone per status the feed can report: green/red for a clean finish, amber
+// for a terminal-but-not-clean outcome, cyan/slate for the socket state. The
+// `connected` tone doubles as the unknown-status fallback below.
 const TERMINAL_STATUS_TONES: Record<string, string> = {
   completed: "#86efac",
   failed: "#f87171",

@@ -8,7 +8,7 @@ import type {
   OptimizationRunRequest,
   StrategyParameterValue,
 } from "../api/types";
-import { useToast } from "./ToastProvider";
+import { useToast } from "./toastContext";
 import { Modal } from "./Modal";
 
 type MetricOption = OptimizationRunRequest["target_metric"];
