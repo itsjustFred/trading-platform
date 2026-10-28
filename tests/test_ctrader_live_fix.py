@@ -19,6 +19,7 @@ from uuid import uuid4
 import pytest
 
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.conftest import seed_live_deployments
 
 # The reconcile-payload helpers below build real protobuf messages; without
 # the package every test in that block would fail on import rather than skip.
@@ -283,6 +284,9 @@ def isolated_db(isolated_db_sandbox):
     directly, so these persistence tests keep their ``database = isolated_db``
     style."""
     database, _engine, _data_dir = isolated_db_sandbox
+    # `live_signals.deployment_id` carries a foreign key, so the synthetic id these persistence
+    # tests write needs a parent row like any other signal.
+    seed_live_deployments(database, ["dep-1"])
     return database
 
 

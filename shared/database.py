@@ -550,7 +550,12 @@ class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
     id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
-    deployment_id: str = Field(index=True)
+    # Declared here, not only by `_migrate_schema`. A schema built by `create_all` used to have no
+    # foreign key on this column at all, so whether an orphan signal was even possible depended on
+    # which path created the database - and two test fixtures were relying on the difference. The
+    # migration still exists because SQLite cannot add a foreign key to an existing table; it now
+    # only has work to do on databases that predate this declaration.
+    deployment_id: str = Field(foreign_key="live_deployments.id", index=True)
     symbol: str = Field(index=True)
     action: str = Field(index=True)
     theoretical_price: float = Field(default=0.0)
@@ -1351,34 +1356,6 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 connection.commit()
 
 
-def _backfill_curve_for_id(connection: Connection, bt_id: str) -> list[dict[str, Any]]:
-    """Build a missing equity_curve from equity_points, else the JSON file."""
-    if _table_column_names(connection, "equity_points"):
-        points = connection.execute(
-            text(
-                "SELECT time, equity FROM equity_points "
-                "WHERE backtest_id = :id ORDER BY id"
-            ),
-            {"id": bt_id},
-        ).fetchall()
-        if points:
-            return [
-                {"time": str(time), "equity": float(equity)}
-                for time, equity in points
-            ]
-
-    json_path = DATA_DIR / "backtests" / f"{bt_id}.trades.json"
-    if json_path.exists():
-        try:
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        curve = payload.get("equity_curve")
-        if isinstance(curve, list) and curve:
-            return [dict(point) for point in curve if isinstance(point, dict)]
-    return []
-
-
 def _add_live_deployment_columns(connection: Connection, column_names: set[str]) -> None:
     """Add live_deployments signal-source and filter columns when missing."""
     if "settings" not in column_names:
@@ -1648,6 +1625,234 @@ def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
         )
 
 
+_SMOKE_DEPLOYMENT_PREFIX = "ctrader-demo-smoke-"
+
+
+def _backfill_smoke_deployments(connection: Connection) -> int:
+    """Give smoke-sourced orphan signals the parent deployment row they were always meant to have.
+
+    ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created no
+    deployment row, so those signals were invisible to every deployment-scoped query. This recreates
+    exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history and future
+    runs agree.
+
+    Three deliberate restrictions, each a guard against fabricating a trading record:
+
+    * only ids carrying the smoke prefix are touched - anything else is somebody's real deployment;
+    * the account must already exist in ``live_accounts``, because ``live_deployments.account_id``
+      carries a foreign key and an invented account would be worse than an orphan;
+    * the row is ``PAUSED`` with the smoke label as ``strategy_name``, following the existing
+      ``discord::`` convention for synthetic deployments, so no runner trades it.
+
+    **Adoption, not just creation.** ``live_deployments.id`` is typed ``uuid.UUID`` on
+    ``LiveDeploymentConfig``, so the readable label lives in ``strategy_name`` and the key is a UUID.
+    That means a parent can already exist under the same label with a different key - the shape left
+    by a run that predates this backfill - and the signals naming the label are still orphans. An
+    earlier version skipped that case, which left the signals orphaned *and* the parent present: the
+    migration then failed its ``foreign_key_check`` and ``init_db()`` raised. So an existing parent is
+    adopted and the signals are repointed at it, exactly as a newly created one is.
+
+    Never deletes. Non-smoke orphans are left untouched and reported.
+
+    Returns the number of smoke deployment rows created *or* adopted.
+    """
+    column_names = _table_column_names(connection, "live_deployments")
+    signal_columns = _table_column_names(connection, "live_signals")
+    if "account_id" not in column_names or "deployment_id" not in signal_columns:
+        return 0
+
+    orphans = connection.execute(
+        text(
+            "SELECT DISTINCT s.deployment_id, s.symbol "
+            "FROM live_signals s "
+            "WHERE s.deployment_id LIKE :prefix "
+            "AND s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+        ),
+        {"prefix": _SMOKE_DEPLOYMENT_PREFIX + "%"},
+    ).fetchall()
+    if not orphans:
+        return 0
+
+    resolved = 0
+    for deployment_id, symbol in orphans:
+        account_id = str(deployment_id)[len(_SMOKE_DEPLOYMENT_PREFIX):].strip()
+        if not account_id:
+            continue
+        known = connection.execute(
+            text("SELECT 1 FROM live_accounts WHERE id = :id"), {"id": account_id}
+        ).first()
+        if known is None:
+            # Refuse to invent an account. Leave the orphan and let the FK stay blocked.
+            logger.warning(
+                "Leaving smoke orphan %s: account %s is not in live_accounts",
+                deployment_id,
+                account_id,
+            )
+            continue
+        # A readable lookup keys on `strategy_name`, because the id is a UUID.
+        existing = connection.execute(
+            text("SELECT id FROM live_deployments WHERE strategy_name = :name"),
+            {"name": deployment_id},
+        ).first()
+        if existing is not None:
+            new_id = str(existing[0])
+        else:
+            new_id = str(uuid4())
+            now = datetime.now(timezone.utc).isoformat(sep=" ")
+            connection.execute(
+                text(
+                    "INSERT INTO live_deployments "
+                    "(id, strategy_name, account_id, symbols, timeframe, status, "
+                    " signal_source, signal_source_type, signal_source_id, symbol_filter, "
+                    " signal_config, settings, created_at, updated_at) "
+                    "VALUES (:new_id, :name, :account_id, :symbols, '1m', 'PAUSED', "
+                    " 'smoke', 'internal', '', '[]', '{}', '{}', :now, :now)"
+                ),
+                {
+                    "new_id": new_id,
+                    "name": deployment_id,
+                    "account_id": account_id,
+                    "symbols": json.dumps([str(symbol).upper()] if symbol else []),
+                    "now": now,
+                },
+            )
+        # The signals still name the descriptive label, which is `strategy_name` rather than `id`.
+        # Repoint them, or the parent exists and every signal is still orphaned - the state this
+        # function exists to leave behind.
+        connection.execute(
+            text("UPDATE live_signals SET deployment_id = :new WHERE deployment_id = :old"),
+            {"new": new_id, "old": deployment_id},
+        )
+        resolved += 1
+    if resolved:
+        logger.info("Backfilled %d smoke deployment row(s) for orphaned signals", resolved)
+    return resolved
+
+
+def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
+    """Add the ``live_signals.deployment_id -> live_deployments.id`` foreign key.
+
+    SQLite cannot add a foreign key to an existing table, so the table is rebuilt: capture index DDL
+    *before* dropping, create the new table, copy, drop, rename, restore indexes.
+
+    Three traps this step exists to avoid:
+
+    * reading index DDL after ``DROP TABLE`` silently loses every index, because the drop removes
+      them. ``PRAGMA foreign_key_check`` validates referential integrity only and never notices.
+    * copying rows that violate the new constraint. That is not caught here either - the surrounding
+      ``_schema_migration_connection`` runs ``foreign_key_check`` and raises, rolling the whole
+      migration back. So this is safe to attempt while orphans remain: it either lands or changes
+      nothing.
+    * ``live_executions.signal_id`` already references ``live_signals(id)`` - a foreign key this
+      migration does not own and must not drop. With enforcement on, ``DROP TABLE live_signals`` is
+      refused *even when every dependent row has been removed*, because the surviving executions
+      point at rows inside the table being dropped. Measured on a production clone: the migration
+      failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
+      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes a
+      bad swap fail closed.
+
+    Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
+    On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
+    ``foreign_key_check`` reports the violation and the whole migration rolls back - so this is
+    fail-closed, not silent.
+
+    Returns True when the rebuild ran.
+    """
+    if any(
+        row[3] == "deployment_id"
+        for row in connection.execute(text("PRAGMA foreign_key_list(live_signals)")).fetchall()
+    ):
+        return False
+
+    # Capture index DDL before anything is dropped: DROP TABLE removes the indexes with it, and
+    # foreign_key_check validates referential integrity only, so lost indexes go unnoticed.
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_signals' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_signals'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        return False
+
+    # Reuse the real CREATE TABLE text and splice the constraint in just before the closing paren.
+    # Rebuilding from a column-name list silently drops PRIMARY KEY, which makes live_signals.id no
+    # longer unique - and live_executions has an FK to it, so every later pragma raises
+    # "foreign key mismatch" and the database is left unusable. The column-list approach was tried
+    # and failed exactly that way.
+    closing = create_sql.rstrip().rfind(")")
+    if closing == -1:
+        return False
+    body = create_sql.rstrip()[:closing].rstrip()
+    if body.endswith(","):
+        body = body[:-1]
+    new_create_sql = (
+        f"{body},\n\tFOREIGN KEY (deployment_id) REFERENCES live_deployments (id)\n)"
+    )
+
+    # The table name is rewritten through a pattern rather than `str.replace`, because SQLite may
+    # store it quoted: a rebuild that succeeds leaves `CREATE TABLE "live_signals" (...)` behind, and
+    # a plain replace of the unquoted spelling would then match nothing - so a second run (after the
+    # FK was lost some other way) would recreate `live_signals` while `live_signals` still existed.
+    new_create_sql, replacements = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_signals\"|`live_signals`|\[live_signals\]|live_signals)",
+        "CREATE TABLE live_signals__fk_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if replacements != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_signals: could not address the table in its own CREATE statement"
+        )
+
+    columns = [
+        str(row[1])
+        for row in connection.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+    ]
+    if not columns:
+        return False
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(column) for column in columns
+    )
+
+    # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
+    # pragma while a transaction is open, so setting it mid-transaction leaves enforcement ON and
+    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN;
+    # this is here for callers that do not, and is restored in the finally below either way.
+    #
+    # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_signals__fk_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_signals__fk_new ({column_list}) "
+                f"SELECT {column_list} FROM live_signals"
+            )
+        )
+        connection.execute(text("DROP TABLE live_signals"))
+        connection.execute(text("ALTER TABLE live_signals__fk_new RENAME TO live_signals"))
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+    logger.info("Rebuilt live_signals with the deployment_id foreign key")
+    return True
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         _add_live_deployment_columns(
@@ -1658,6 +1863,13 @@ def _migrate_schema() -> None:
         _add_live_account_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
+
+        # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a row
+        # that violates the constraint it is introducing. On a database whose only orphans are
+        # smoke-shaped this makes the FK land; anything left over keeps the migration fail-closed via
+        # `foreign_key_check` at the end of `_schema_migration_connection`.
+        _backfill_smoke_deployments(connection)
+        _migrate_live_signal_deployment_fk(connection)
 
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)

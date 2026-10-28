@@ -26,6 +26,7 @@ from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.conftest import seed_live_deployments
 
 
 def _alpaca_order_id(label: str) -> str:
@@ -1450,6 +1451,9 @@ def isolated_db(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+    # `live_signals.deployment_id` carries a foreign key, so the synthetic ids this module writes
+    # need parents like any other signal. The ids are the module's, not the code's.
+    seed_live_deployments(database, ["dep-1", "dep-2", "dep-naive", "dep-aware"])
     yield database
     engine.dispose()
 
@@ -1533,6 +1537,9 @@ def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
 def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
     unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
     with database.ENGINE.begin() as connection:
+        # Replaces whatever the fixture's `init_db()` created: these tests stage the *legacy* shape,
+        # which by definition predates the deployment foreign key and the deployment-scoped indexes.
+        connection.execute(database.text("DROP TABLE IF EXISTS live_signals"))
         connection.execute(
             database.text(
                 "CREATE TABLE live_signals ("
@@ -1764,6 +1771,9 @@ def test_migration_rebuild_preserves_live_execution_foreign_key(isolated_db):
         discord_message_id="fk-message",
     )
     with database.ENGINE.begin() as connection:
+        # Replaces the fixture's table: the point is a minimal legacy one whose only feature is the
+        # child foreign key the rebuild must not rewrite.
+        connection.execute(database.text("DROP TABLE IF EXISTS live_executions"))
         connection.execute(
             database.text(
                 "CREATE TABLE live_executions ("

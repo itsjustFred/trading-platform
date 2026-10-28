@@ -28,6 +28,8 @@ from shared.models import (
 )
 from sqlmodel import select
 
+from tests.conftest import seed_live_deployments
+
 
 def test_backtest_record_equity_curve_persistence(isolated_db) -> None:
     """Test that equity_curve can be stored and retrieved from SQLite."""
@@ -136,6 +138,18 @@ def isolated_db(isolated_db_sandbox):
     return database, engine, data_dir, backtests_dir
 
 
+@pytest.fixture
+def signal_parent(isolated_db):
+    """The deployment ``_make_live_signal`` names.
+
+    ``live_signals.deployment_id`` carries a foreign key, so the factory's synthetic id needs a
+    parent row. Kept as its own fixture rather than seeded in ``isolated_db``, because other tests in
+    this module stage and rebuild these tables from scratch.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    seed_live_deployments(database, ["dep-1"])
+
+
 def _make_live_signal(*, discord_message_id=None, broker_order_id=None, **extra) -> LiveSignal:
     metadata: dict = {}
     if discord_message_id is not None:
@@ -172,7 +186,7 @@ def test_from_live_signal_missing_discord_id_is_real_null() -> None:
     assert model.discord_message_id is None  # not the literal string "None"
 
 
-def test_two_signals_without_discord_id_both_saved(isolated_db) -> None:
+def test_two_signals_without_discord_id_both_saved(isolated_db, signal_parent) -> None:
     save_live_signal(_make_live_signal())
     save_live_signal(_make_live_signal())
     with get_session() as session:
@@ -180,7 +194,7 @@ def test_two_signals_without_discord_id_both_saved(isolated_db) -> None:
     assert count == 2
 
 
-def test_empty_string_discord_id_treated_as_missing(isolated_db) -> None:
+def test_empty_string_discord_id_treated_as_missing(isolated_db, signal_parent) -> None:
     save_live_signal(_make_live_signal(discord_message_id=""))
     save_live_signal(_make_live_signal(discord_message_id="   "))
     with get_session() as session:
@@ -190,7 +204,7 @@ def test_empty_string_discord_id_treated_as_missing(isolated_db) -> None:
     assert all(r.discord_message_id is None for r in rows)
 
 
-def test_two_signals_same_discord_id_deduped(isolated_db) -> None:
+def test_two_signals_same_discord_id_deduped(isolated_db, signal_parent) -> None:
     save_live_signal(_make_live_signal(discord_message_id="discord-42"))
     save_live_signal(_make_live_signal(discord_message_id="discord-42"))
     with get_session() as session:
@@ -205,7 +219,7 @@ def test_two_signals_same_discord_id_deduped(isolated_db) -> None:
 # ─── Finding 6: concurrent / IntegrityError race ─────────────────────────────
 
 
-def test_concurrent_same_discord_id_yields_one_record(isolated_db) -> None:
+def test_concurrent_same_discord_id_yields_one_record(isolated_db, signal_parent) -> None:
     """Simulate the race: pre-check sees nothing, then commit hits the unique index."""
     database, engine, _data_dir, _bt = isolated_db
 
@@ -257,7 +271,7 @@ def test_concurrent_same_discord_id_yields_one_record(isolated_db) -> None:
 # ─── Finding 7: broker_order_id top-up on dedupe ─────────────────────────────
 
 
-def test_dedupe_fills_missing_broker_order_id(isolated_db) -> None:
+def test_dedupe_fills_missing_broker_order_id(isolated_db, signal_parent) -> None:
     save_live_signal(_make_live_signal(discord_message_id="ord-1"))
     save_live_signal(
         _make_live_signal(discord_message_id="ord-1", broker_order_id="BRK-999")
@@ -273,7 +287,7 @@ def test_dedupe_fills_missing_broker_order_id(isolated_db) -> None:
     assert rows[0].metadata_json.get("broker_order_id") == "BRK-999"
 
 
-def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db) -> None:
+def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db, signal_parent) -> None:
     save_live_signal(
         _make_live_signal(discord_message_id="ord-2", broker_order_id="BRK-AAA")
     )
@@ -294,8 +308,36 @@ def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db) -> None
 
 
 def _legacy_signals_db(engine) -> None:
-    """Create a live_signals table WITHOUT discord_message_id / unique index."""
+    """Create a live_signals table WITHOUT discord_message_id / unique index.
+
+    Also creates the deployment the legacy rows name. A real legacy database has both tables, and
+    ``live_signals.deployment_id`` now carries a foreign key - without the parent row the migration
+    would refuse the whole database, which is the correct behaviour but not what these two tests are
+    about.
+    """
     with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE live_accounts (id TEXT PRIMARY KEY, broker TEXT, name TEXT)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE live_deployments (id TEXT PRIMARY KEY, strategy_name TEXT, "
+                "account_id TEXT, symbols TEXT, timeframe TEXT, status TEXT, "
+                "created_at TEXT, updated_at TEXT)"
+            )
+        )
+        conn.execute(
+            text("INSERT INTO live_accounts (id, broker, name) VALUES ('acct-legacy', 'ctrader', 'a')")
+        )
+        conn.execute(
+            text(
+                "INSERT INTO live_deployments (id, strategy_name, account_id, symbols, timeframe, "
+                "status, created_at, updated_at) VALUES "
+                "('dep', 'legacy', 'acct-legacy', '[]', '1m', 'PAUSED', '', '')"
+            )
+        )
         conn.execute(
             text(
                 "CREATE TABLE live_signals ("
