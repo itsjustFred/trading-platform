@@ -699,4 +699,3 @@ class TestCalmarAndQsFallback:
             * math.sqrt(252)
         )
         assert annualized != pytest.approx(annualized / math.sqrt(252))
-
