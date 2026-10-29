@@ -40,7 +40,13 @@ TIMEFRAME_MAP = {
     "1h": "1h",
     "4h": "4h",
     "1d": "1D",
-    "1w": "1W",
+    # `W-MON`, not `1W`. They are the same frequency but not the same *labelling*: `1W` is
+    # W-SUN **right-closed**, so pandas labels a weekly bar with the Sunday its week *ends* on.
+    # `shared/market_calendar.py` states the rule this repo works to - "A bar's timestamp is the
+    # *start* of the interval it summarises" - and says a weekly bar is "stamped on Monday".
+    # `live_runner/signal_sources/execution_timing.py::_next_candle_close` anchors weeks on
+    # Monday for the same reason. `1W` was the single outlier on all three counts.
+    "1w": "W-MON",
 }
 
 # Ordering for validation (lower index = smaller timeframe)
@@ -92,6 +98,34 @@ def _aggregation_for(columns: list[str]) -> dict[str, str | object]:
     return agg
 
 
+def _resample_kwargs(rule: str, origin: str) -> dict[str, object]:
+    """The `resample()` keyword arguments for one rule, and why `origin` may be absent.
+
+    `label`/`closed` are pinned rather than left to pandas, because the defaults are *per
+    frequency*: intraday and daily offsets default to left/left, while weekly, monthly and
+    quarterly default to right/right. Left alone, one function labelled daily bars by their
+    first day and weekly bars by their last. Measured: forcing left/left is bit-identical for
+    1min/5min/15min/30min/1h/4h/1D, and only `1w` changes.
+
+    `origin` is a **tick-only** parameter. It shifts buckets for h/m/s/ms/us/ns and is silently
+    ignored for everything else - D, W, M and the fixed frequencies - while making pandas emit
+    `RuntimeWarning: The 'origin' keyword does not take effect ...`. So it is passed only where
+    it has effect: for the rest of the table it did nothing except produce a warning on every
+    call, and a warning that always fires is one an operator learns to skip.
+
+    Named and separate so the rule is directly testable. Asserting on the *absence of a warning*
+    is not: pandas' warning is not reliably capturable in-process, and the property that actually
+    matters - which rules receive `origin` - is a pure function of the rule.
+    """
+    kwargs: dict[str, object] = {"label": "left", "closed": "left"}
+    # `isinstance(..., Tick)` rather than reading `offset.nanos`: `nanos` *raises* for a non-fixed
+    # frequency, and does so inconsistently - `Week` raises while `Day` returns a value - so
+    # probing it is not a reliable test of tick-likeness.
+    if isinstance(pd.tseries.frequencies.to_offset(rule), pd.tseries.offsets.Tick):
+        kwargs["origin"] = origin
+    return kwargs
+
+
 def resample_with_origin(
     df: pd.DataFrame,
     rule: str,
@@ -101,16 +135,46 @@ def resample_with_origin(
 ) -> pd.DataFrame:
     """Shared resample helper with explicit bucket origin (C5).
 
-    Buckets align to UTC via ``origin`` (default ``"start_day"``) instead of
-    pandas defaults; empty buckets are dropped LOUDLY (count-logged, so gaps
-    stay visible instead of vanishing); extra columns (spread, bid_*/ask_*)
-    are retained via :func:`_aggregation_for`.
+    Empty buckets are dropped LOUDLY (count-logged, so gaps stay visible instead
+    of vanishing); extra columns (spread, bid_*/ask_*) are retained via
+    :func:`_aggregation_for`.
+
+    **``origin`` only applies to tick-like rules**, which is a narrower claim than this
+    docstring used to make. It used to say "Buckets align to UTC via ``origin``", implying it
+    governed every rule. Measured: ``origin`` shifts buckets for ``h``/``m``/``s``/``ms``/``us``/
+    ``ns`` and is **silently ignored for everything else** - ``D``, ``W``, ``M`` and the fixed
+    frequencies - while emitting ``RuntimeWarning: The 'origin' keyword does not take effect when
+    resampling with a 'freq' that is not Tick-like``. So for half this module's table the parameter
+    did nothing except produce a warning on every call.
+
+    Measured on data deliberately not starting on a bucket boundary: with ``origin="start_day"`` an
+    hourly series buckets at 05:00 and with ``origin="start"`` at 05:17 - the parameter works. The
+    same comparison for ``1D`` and ``1W`` gives identical buckets for every origin.
+
+    So ``origin`` is now passed only where it has effect. That is behaviour-identical for all eight
+    rules - verified bucket-for-bucket, index and aggregate - and it removes a warning that would
+    otherwise fire on every daily and weekly resample. A warning that always fires is a warning an
+    operator learns to skip, which is the trade this module already avoids elsewhere by *counting*
+    dropped buckets rather than passing over them in silence.
     """
     frame = df.copy()
     frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True)
     frame = frame.set_index(timestamp_col).sort_index()
     had_zero_volume_flag = "zero_volume_bar" in frame.columns
-    resampled = frame.resample(rule, origin=origin).agg(
+    # `label`/`closed` are pinned rather than left to pandas, because the defaults are *per
+    # frequency*: intraday and daily offsets default to left/left, while weekly, monthly, quarterly
+    # and yearly default to right/right. Left alone, this one function labelled daily bars by
+    # their first day and weekly bars by their last - so a daily bar and a weekly bar in the same
+    # frame could not be read with the same expression, against the documented rule above.
+    #
+    # Measured: forcing left/left is bit-identical for 1min/5min/15min/30min/1h/4h/1D. Only `1w`
+    # changes, which is the point.
+    # Named once and used at both call sites below, because the two have to agree: if the
+    # `zero_volume_bar` fallback resampled on different boundaries its flags would silently stop
+    # lining up with the bars they describe. That call is currently unreachable, so nothing
+    # enforces the pairing except this.
+    resample_kwargs = _resample_kwargs(rule, origin)
+    resampled = frame.resample(rule, **resample_kwargs).agg(
         _aggregation_for([str(column) for column in frame.columns])
     )
     if had_zero_volume_flag:
@@ -122,7 +186,9 @@ def resample_with_origin(
             )
         else:
             resampled["zero_volume_bar"] = (
-                frame[["zero_volume_bar"]].resample(rule, origin=origin).min()
+                frame[["zero_volume_bar"]]
+                .resample(rule, **resample_kwargs)
+                .min()
             )
     empty_buckets = int(resampled["open"].isna().sum()) if "open" in resampled else 0
     if empty_buckets:

@@ -1,12 +1,11 @@
 """Tests for data_tools/resample.py."""
 
-import tempfile
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from data_tools.resample import resample_ohlcv, resample_file
+from data_tools.resample import TIMEFRAME_MAP, resample_file, resample_ohlcv
 
 
 @pytest.fixture
@@ -292,3 +291,314 @@ class TestBidAskAggregation:
         frame["volume"] = 0
         result = resample_with_origin(frame, "5min")
         assert bool(result.iloc[0]["zero_volume_bar"]) is True
+
+
+class TestEveryBarsTimestampIsItsIntervalStart:
+    """`market_calendar.py` states the rule this repo works to; the resampler broke it for weekly.
+
+    > A bar's timestamp is the *start* of the interval it summarises ... a weekly bar stamped on
+    > Monday contains every session from Monday to Friday.
+
+    `resample_with_origin` passed only `origin=`, so pandas' **per-frequency** defaults leaked
+    through: intraday and daily offsets default to `label='left', closed='left'`, while `1W` is
+    W-SUN **right-closed**. So one function labelled daily bars by their first day and weekly bars
+    by their last - measured: the bar labelled Sun 2023-01-01 actually covered Mon 2022-12-26
+    through Sun 2023-01-01. A daily bar and a weekly bar from the same frame could not be read
+    with the same expression.
+
+    `_next_candle_close` anchors weeks on Monday for the same documented reason, so the two
+    disagreed by a day at the boundary. Three places stated Monday-and-start; the resampler was
+    the only outlier, on all three counts.
+    """
+
+    @staticmethod
+    def _daily_source(start: str = "2022-12-24", end: str = "2023-01-09"):
+        import pandas as pd
+
+        days = pd.date_range(start, end, freq="1D", tz="UTC")
+        return pd.DataFrame({
+            "timestamp": days,
+            "open": 1.0,
+            # day-of-month as the value, so a bucket reveals exactly which days it swallowed.
+            "high": days.day.astype(float),
+            "low": days.day.astype(float),
+            "close": 1.0,
+            "volume": 1.0,
+        })
+
+    def test_a_weekly_bar_is_stamped_monday_and_covers_monday_to_sunday(self) -> None:
+        import pandas as pd
+
+        from data_tools.resample import resample_ohlcv
+
+        result = resample_ohlcv(self._daily_source(), "1w")
+        result = result[result["volume"] > 0]
+        stamps = pd.to_datetime(result["timestamp"])
+        assert (stamps.dt.weekday == 0).all(), (
+            f"weekly bars are not all Monday-stamped: "
+            f"{[str(pd.Timestamp(t).date()) for t in stamps]}"
+        )
+        # Which days each bar swallows is the whole point, so check it directly rather than
+        # through a marker range - a range is meaningless across a month boundary, where one
+        # Mon-Sun week legitimately holds markers 26..31 and 1.
+        stamps = pd.to_datetime(result["timestamp"])
+        for stamp, volume in zip(stamps, result["volume"]):
+            monday = stamp
+            days_in_bucket = int(
+                (
+                    (self._daily_source()["timestamp"] >= monday)
+                    & (self._daily_source()["timestamp"] < monday + pd.Timedelta(days=7))
+                ).sum()
+            )
+            assert int(volume) == days_in_bucket, (
+                f"the bar stamped {monday:%Y-%m-%d} holds {int(volume)} rows but its Mon-Sun "
+                f"window contains {days_in_bucket}"
+            )
+
+    def test_the_first_bar_starts_on_the_monday_its_data_begins_within(self) -> None:
+        """Left-closed means the bar's own stamp is a day the bar contains."""
+        import pandas as pd
+
+        from data_tools.resample import resample_ohlcv
+
+        result = resample_ohlcv(self._daily_source("2023-01-03", "2023-01-18"), "1w")
+        result = result[result["volume"] > 0]
+        first = pd.Timestamp(result["timestamp"].iloc[0])
+        assert first.weekday() == 0 and first.date() == pd.Timestamp("2023-01-02").date(), (
+            f"the first weekly bar is stamped {first}, expected Mon 2023-01-02 - the Monday on or "
+            "before the first source row, because the bucket is left-closed"
+        )
+
+    @pytest.mark.parametrize("timeframe", ["1m", "5m", "15m", "30m", "1h", "4h", "1d"])
+    def test_forcing_left_closed_is_a_no_op_for_every_other_timeframe(self, timeframe) -> None:
+        """The change must be confined to weekly, and that is checkable.
+
+        Measured against the pre-change behaviour: all seven of these already defaulted to
+        left/left, so pinning it explicitly cannot move them. If one of these starts failing, the
+        pin has become a behaviour change rather than a clarification.
+        """
+        import pandas as pd
+
+        from data_tools.resample import TIMEFRAME_MAP
+
+        minute_index = pd.date_range("2023-01-02", "2023-01-02 05:59", freq="1min", tz="UTC")
+        source = pd.DataFrame({
+            "timestamp": minute_index, "open": 1.0, "high": 2.0,
+            "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+        was = source.set_index("timestamp").resample(TIMEFRAME_MAP[timeframe]).agg(
+            {"open": "first", "volume": "sum"}
+        )
+        now = source.set_index("timestamp").resample(
+            TIMEFRAME_MAP[timeframe], label="left", closed="left"
+        ).agg({"open": "first", "volume": "sum"})
+        was, now = was[was["volume"] > 0], now[now["volume"] > 0]
+        assert was.index.equals(now.index), (
+            f"{timeframe} buckets moved when label/closed were pinned; the weekly fix was supposed "
+            "to touch nothing else"
+        )
+
+    def test_the_live_weekly_close_agrees_with_a_monday_stamp(self) -> None:
+        """The two halves have to agree, or the divergence just moves.
+
+        `_next_candle_close` anchors weeks on Monday 00:00 UTC. Given the Monday stamp the
+        resampler now emits, the bar must close exactly seven days later - the next Monday, which
+        is where a Mon-Sun week ends.
+        """
+        from datetime import datetime
+
+        from live_runner.signal_sources.execution_timing import _next_candle_close
+
+        week = 7 * 86400
+        for stamp in ("2022-12-26", "2023-01-02", "2023-01-09"):
+            reference = datetime.fromisoformat(f"{stamp}T00:00:00+00:00")
+            close = _next_candle_close(reference, week, timeframe="1w")
+            assert close.weekday() == 0, f"a weekly close landed on {close:%A}, not Monday"
+            assert (close - reference).days == 7, (
+                f"a bar stamped {stamp} closes {close}, which is not seven days later"
+            )
+
+    def test_volume_and_ohlc_are_conserved_across_the_new_week_buckets(self) -> None:
+        """Moving which days group together must not lose or invent anything."""
+        import numpy as np
+
+        from data_tools.resample import resample_ohlcv
+
+        source = self._daily_source()
+        result = resample_ohlcv(source, "1w")
+        result = result[result["volume"] > 0]
+        assert result["volume"].sum() == pytest.approx(source["volume"].sum()), (
+            "weekly volume no longer sums to the source volume"
+        )
+        assert result["high"].max() == pytest.approx(source["high"].max())
+        assert result["low"].min() == pytest.approx(source["low"].min())
+        # Independent reference: floor each row to the Monday of its week, then group. Note the
+        # floor has to be `timestamp - weekday days`; `pd.offsets.Week(weekday=0)` rolls *forward*
+        # to the next Monday, which silently produced a third grouping and a wrong bar count.
+        monday_of = source["timestamp"] - pd.to_timedelta(source["timestamp"].dt.weekday, unit="D")
+        expected = source.assign(monday=monday_of).groupby("monday").size()
+        assert len(result) == len(expected), (
+            f"{len(result)} weekly bars from resample_ohlcv but {len(expected)} from an "
+            "independent Monday-anchored groupby"
+        )
+        assert np.array_equal(result["volume"].to_numpy(), expected.to_numpy())
+
+
+    def test_the_zero_volume_else_branch_is_unreachable_and_why(self) -> None:
+        """Records why a mutation of the `else` branch cannot be killed, rather than hiding it.
+
+        `resample_with_origin` has a fallback for the case where `resampled` has no `volume`
+        column, resampling the `zero_volume_bar` flag separately. That branch **cannot run**:
+        `_aggregation_for` always includes `"volume"` in the aggregation dict, so a source frame
+        without a volume column makes `.agg` raise before the branch is reached. Measured:
+
+            KeyError: Label(s) ['volume'] do not exist
+
+        So the honest position is not "the fallback is covered" - it is that the code is carrying a
+        branch nothing can reach. The separate resample call there has been given the same
+        `label="left", closed="left"` as the main one anyway, so that if the branch ever does
+        become reachable it cannot silently stop aligning with Monday-labelled bars. This test
+        pins the unreachability so that nobody later "fixes" the branch believing it is live.
+        """
+        import pandas as pd
+
+        from data_tools.resample import _aggregation_for
+
+        agg = _aggregation_for(["open", "high", "low", "close", "zero_volume_bar"])
+        assert "volume" in agg, (
+            "_aggregation_for no longer requests `volume` unconditionally; if it has become "
+            "conditional then the `else` branch in resample_with_origin became reachable and "
+            "needs a real test rather than this note"
+        )
+
+        days = pd.date_range("2022-12-26", "2023-01-09", freq="1D", tz="UTC")
+        without_volume = pd.DataFrame({
+            "timestamp": days, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5,
+            "zero_volume_bar": [i % 2 == 0 for i in range(len(days))],
+        })
+        with pytest.raises(KeyError):
+            from data_tools.resample import resample_with_origin
+
+            resample_with_origin(without_volume, "W-MON")
+
+
+class TestOriginIsOnlyPassedWherePandasHonoursIt:
+    """`origin` is a tick-only parameter, and the docstring claimed otherwise.
+
+    The docstring used to say "Buckets align to UTC via `origin`", implying it governed every rule.
+    Measured: it shifts buckets for `h`/`m`/`s`/`ms`/`us`/`ns` and is **silently ignored for
+    everything else** — `D`, `W`, `M` and the fixed frequencies — while emitting a `RuntimeWarning`
+    on every call. For half this module's table the parameter did nothing except make noise.
+
+    So it is now passed only where it has effect. A warning that fires on every daily and weekly
+    resample is a warning an operator learns to skip, which is the trade this module already avoids
+    elsewhere by *counting* dropped buckets rather than passing over them in silence.
+    """
+
+    @staticmethod
+    def _ragged_source():
+        """Deliberately not starting on a bucket boundary, so an effective origin would show."""
+        import numpy as np
+        import pandas as pd
+
+        index = pd.date_range("2023-01-02 05:17", "2023-01-16 22:40", freq="17min", tz="UTC")
+        rng = np.random.default_rng(3)
+        return pd.DataFrame({
+            "timestamp": index, "open": 1.0, "high": 2.0 + rng.random(len(index)),
+            "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+
+    @pytest.mark.parametrize("timeframe", list(TIMEFRAME_MAP))
+    def test_origin_is_passed_exactly_for_the_tick_like_rules(self, timeframe) -> None:
+        """Asserted on the rule, not on the absence of a warning.
+
+        An earlier version of this test caught warnings with `simplefilter("always")` and
+        `resetwarnings()` and still could not see the one it was looking for - pandas emits it
+        somewhere `catch_warnings(record=True)` does not reliably capture, even though pytest's own
+        warning summary showed it. A test that cannot see the failure is not a test.
+
+        Which rules *receive* `origin` is a pure function of the rule, so that is what is asserted.
+        """
+        import pandas as pd
+
+        from data_tools.resample import _resample_kwargs
+
+        kwargs = _resample_kwargs(TIMEFRAME_MAP[timeframe], "start_day")
+        is_tick = isinstance(
+            pd.tseries.frequencies.to_offset(TIMEFRAME_MAP[timeframe]), pd.tseries.offsets.Tick
+        )
+        assert ("origin" in kwargs) is is_tick, (
+            f"{timeframe}: origin {'was' if 'origin' in kwargs else 'was not'} passed but the rule "
+            f"{'is' if is_tick else 'is not'} tick-like; pandas ignores `origin` for "
+            "non-tick rules and warns, so passing it there is pure noise"
+        )
+
+    @pytest.mark.parametrize("timeframe", list(TIMEFRAME_MAP))
+    def test_label_and_closed_are_always_pinned(self, timeframe) -> None:
+        """The other half of the kwargs, and the one that actually changes bars."""
+        from data_tools.resample import _resample_kwargs
+
+        kwargs = _resample_kwargs(TIMEFRAME_MAP[timeframe], "start_day")
+        assert kwargs["label"] == "left" and kwargs["closed"] == "left", (
+            f"{timeframe}: pandas' per-frequency defaults leaked back in, which is how weekly bars "
+            "came to be labelled by their interval end"
+        )
+
+    def test_omitting_origin_changes_nothing_for_any_rule(self) -> None:
+        """The load-bearing claim: this is a warning fix, not a behaviour change.
+
+        Compared bucket-for-bucket - index *and* aggregate - with `origin` supplied and omitted. If
+        a future pandas starts honouring `origin` for daily or weekly, this fails rather than the
+        change silently altering every daily and weekly bar.
+        """
+        import numpy as np
+
+        source = self._ragged_source().set_index("timestamp")
+        for key, rule in TIMEFRAME_MAP.items():
+            def buckets(**extra):
+                resampled = source.resample(rule, **extra).agg(
+                    {"high": "max", "low": "min", "volume": "sum"}
+                )
+                return resampled[resampled["volume"] > 0]
+
+            with_origin = buckets(origin="start_day", label="left", closed="left")
+            without = buckets(label="left", closed="left")
+            assert with_origin.index.equals(without.index), f"{key}: bucket boundaries differ"
+            for column in ("high", "low"):
+                assert np.array_equal(
+                    with_origin[column].to_numpy(), without[column].to_numpy()
+                ), f"{key}: {column} differs"
+
+    def test_origin_still_shifts_an_hourly_series_where_it_should(self) -> None:
+        """Guards the fix from over-correcting into "never pass origin"."""
+        from data_tools.resample import resample_with_origin
+
+        source = self._ragged_source()
+        by_day = resample_with_origin(source, "1h", origin="start_day")
+        by_start = resample_with_origin(source, "1h", origin="start")
+        first_day = pd.Timestamp(by_day["timestamp"].iloc[0])
+        first_start = pd.Timestamp(by_start["timestamp"].iloc[0])
+        assert first_day.strftime("%H:%M") == "05:00", first_day
+        assert first_start.strftime("%H:%M") == "05:17", first_start
+        assert first_day != first_start, (
+            "`origin` no longer shifts an hourly series at all, so it is being dropped everywhere "
+            "rather than only where pandas ignores it"
+        )
+
+    def test_daily_and_weekly_ignore_origin_which_is_why_it_is_not_passed(self) -> None:
+        """The measurement behind the change, recorded so the docstring cannot drift from it."""
+        import pandas as pd
+
+        from data_tools.resample import resample_with_origin
+
+        source = self._ragged_source()
+        for rule in ("1D", "1W"):
+            by_day = resample_with_origin(source, rule, origin="start_day")
+            by_epoch = resample_with_origin(source, rule, origin="epoch")
+            assert by_day["timestamp"].tolist() == by_epoch["timestamp"].tolist(), (
+                f"{rule} now honours `origin`, so passing it conditionally is wrong - "
+                "either pass it everywhere or stop claiming pandas ignores it"
+            )
+        assert isinstance(
+            pd.tseries.frequencies.to_offset("1D"), pd.tseries.offsets.Tick
+        ) is False
