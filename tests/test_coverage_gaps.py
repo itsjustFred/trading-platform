@@ -1252,13 +1252,32 @@ def test_a_genuine_long_weekend_in_1m_data_still_passes(
 
 
 def test_the_closure_allowance_is_calendar_derived_not_declared():
-    """It must move with the calendar, not sit in a comment."""
-    from data_tools.auto_download import long_weekend_gap_days
+    """It must move with the calendar, and per hole rather than as one number.
+
+    A plain weekend and a Monday-holiday week are both excusable by shape, so a
+    single longest-closure allowance would let the weekend be a day wider than
+    the calendar can account for.
+    """
+    import datetime as dt
+
+    from data_tools.auto_download import closure_hole_allowance_seconds
     from shared import market_calendar
 
-    assert long_weekend_gap_days() == market_calendar.longest_scheduled_closure_days()
-    # 89.5 hours: the Thursday-to-Tuesday gap of a three-closed-weekday week.
-    assert long_weekend_gap_days() == pytest.approx(89.5 / 24.0)
+    weekend = closure_hole_allowance_seconds(
+        "1m", start=dt.date(2026, 9, 11), end=dt.date(2026, 9, 14)
+    )
+    holiday_week = closure_hole_allowance_seconds(
+        "1m", start=dt.date(2026, 9, 4), end=dt.date(2026, 9, 8)
+    )
+
+    # Friday close to Monday open is 65.5 hours, to Tuesday open 89.5.
+    assert holiday_week - weekend == pytest.approx(24.0 * 3600.0)
+    assert weekend == pytest.approx(
+        (market_calendar.session_open_utc(dt.date(2026, 9, 14))
+         - market_calendar.session_close_utc(dt.date(2026, 9, 11))).total_seconds()
+        + 2.0 * market_calendar.session_span_seconds(dt.date(2026, 9, 11))
+        + 60.0
+    )
 
 
 def test_weekly_and_monthly_thresholds_are_unchanged_by_the_allowance():

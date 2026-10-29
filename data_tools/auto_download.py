@@ -570,40 +570,6 @@ GAP_SPACING_MULTIPLE = 3.0
 MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
 
 
-def long_weekend_gap_days() -> float:
-    """Longest bar-to-bar closure the exchange calendar produces, in days.
-
-    This replaces a flat ``LONG_WEEKEND_GAP_DAYS = 4.0`` that was applied as a
-    *floor* over the failing threshold, which meant it overrode the base
-    threshold for every timeframe rather than adding anything to it. The
-    consequences were all in the permissive direction:
-
-    * 1m, 4h and 1d data all failed at 4.00 days instead of 3.00, so a downloader
-      that silently failed for 3.6 days passed the gate and the backtest ran
-      over forward-filled prices and reported a Sharpe.
-    * Nothing real was bought by it. An ordinary long weekend closes from
-      Friday's close to Monday's open, which the *3.0-day base already covers*
-      (2.73 days of elapsed time on the US equity grid). The next closure shape
-      up -- a Monday or Friday holiday, at 3.73 days -- is the one that needed
-      help, and 4.0 does not reach it either. So the floor sat in the dead band
-      between two closure shapes, and excused misaligned holes instead.
-
-    The allowance is now a separate, calendar-derived term and it is applied
-    per hole by :func:`market_calendar.closure_explains_hole`, not as a global
-    minimum: a hole the calendar explains is market behaviour, and a hole of the
-    same length that straddles a live session is a data hole. That distinction
-    cannot be made by any single length budget, which is why the 4.0-day floor
-    could not simply be re-tuned.
-    """
-    return float(market_calendar.longest_scheduled_closure_days())
-
-
-# Kept as a module constant for callers that only need the number. Assigned at
-# import because the calendar is procedural and cheap to evaluate once, and read
-# by `closure_hole_allowance_seconds`.
-LONG_WEEKEND_GAP_DAYS = long_weekend_gap_days()
-
-
 #: Unit-first sub-daily labels, which the numeric-prefix pattern cannot express.
 #: Values are the nominal bar spacing in days.
 _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS: dict[str, float] = {
@@ -1280,28 +1246,34 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
 
 
 def closure_hole_allowance_seconds(
-    timeframe: str | None, *, start: date
+    timeframe: str | None, *, start: date, end: date
 ) -> float:
-    """Widest hole the exchange calendar can account for, in seconds.
+    """Widest hole *this* exchange closure can account for, in seconds.
 
     Composed from calendar facts rather than declared, and it is *not* a
     threshold that fails or passes coverage on its own -- it is only ever
     consulted for a hole that :func:`market_calendar.closure_explains_hole` has
     already accepted by shape. Three terms:
 
-    * the calendar's own longest scheduled closure
-      (:func:`long_weekend_gap_days`), which for the modelled rules is 89.5
-      hours: a week with one holiday shut plus the weekend.
-    * two regular session lengths of extended-hours tail, because the calendar
-      models the 6.5-hour regular session while a 24/5 venue may place its first
-      bar of a reopening session up to a full session after the modelled open.
+    * the closure itself, from the modelled close of the last session before it
+      to the modelled open of the first session after it. Measured per hole
+      rather than taken as the calendar's longest closure: a plain weekend and a
+      holiday week are both excusable by shape, and only the first should be
+      allowed to be two days wide.
+    * two regular session lengths of tail, because the calendar models the
+      6.5-hour regular session while an early close cuts three hours off it and
+      a 24/5 venue may place its first bar of a reopening session up to a full
+      session after the modelled open.
     * one bar, which is arithmetic rather than slack: the last bar before a
       closure is stamped at the last minute of the session, so the measured hole
       is one bar interval wider than the closure itself.
     """
     bar_seconds = max(1.0, round(timeframe_nominal_days(timeframe) * 86_400.0))
+    closure_seconds = (
+        market_calendar.session_open_utc(end) - market_calendar.session_close_utc(start)
+    ).total_seconds()
     return (
-        LONG_WEEKEND_GAP_DAYS * 86_400.0
+        max(0.0, closure_seconds)
         + 2.0 * market_calendar.session_span_seconds(start)
         + bar_seconds
     )
@@ -1360,7 +1332,9 @@ def _gap_is_market_closure(
         return False
     if not market_calendar.closure_explains_hole(start_date, end_date):
         return False
-    return gap_seconds <= closure_hole_allowance_seconds(timeframe, start=start_date)
+    return gap_seconds <= closure_hole_allowance_seconds(
+        timeframe, start=start_date, end=end_date
+    )
 
 
 def _gaps_overlapping_window(

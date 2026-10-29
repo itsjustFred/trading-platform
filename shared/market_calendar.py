@@ -45,9 +45,9 @@ observe. It is deliberately *not* claimed to be complete:
 Holiday rules are taken from ``pandas.tseries.holiday`` (already a hard
 dependency via ``pandas>=2.0,<4``) rather than from a hand-maintained table, so
 they are procedural and hold for any year. The two rules pandas does not
-provide -- "Saturday holiday is observed the preceding Friday" and "a New
-Year's Day falling on Saturday is observed on 31 December of the previous
-year" -- are applied explicitly below and are covered by the table-driven
+provide -- "a Saturday holiday is observed the preceding Friday", and the
+exception that leaves a Saturday New Year's Day unshifted so 31 December stays
+a session -- are applied explicitly below and are covered by the table-driven
 tests.
 """
 
@@ -65,7 +65,6 @@ from pandas.tseries.holiday import (
     USMemorialDay,
     USPresidentsDay,
     USThanksgivingDay,
-    sunday_to_monday,
 )
 
 __all__ = [
@@ -92,31 +91,41 @@ SESSION_CLOSE = dt.time(16, 0)
 _ONE_DAY = dt.timedelta(days=1)
 
 
-def _saturday_holiday_to_friday(day: dt.date) -> dt.date:
-    """A fixed-date holiday landing on Saturday is observed the Friday before.
+def _observed_fixed_date(day: dt.date) -> dt.date:
+    """A fixed-date holiday moves off the weekend: Saturday back, Sunday forward.
 
     Independence Day and Christmas both do this on the US exchanges (NYSE rule
-    7.2.1), so 4 July 2026 (a Saturday) closes the market on Friday 3 July.
-    ``pandas``' federal calendar only shifts Sunday holidays, so without this
-    the Saturday case would be treated as a trading day.
+    7.2.1), so 4 July 2026 (a Saturday) closes the market on Friday 3 July and
+    25 December 2022 (a Sunday) closes it on Monday 26 December.
+
+    Applied per rule rather than as a pass over the generated dates, because
+    New Year's Day is the exception to the Saturday half - see
+    :func:`_new_years_day`.
     """
-    return day - _ONE_DAY if day.weekday() == 5 else day
+    if day.weekday() == 5:
+        return day - _ONE_DAY
+    if day.weekday() == 6:
+        return day + _ONE_DAY
+    return day
 
 
 def _new_years_day(day: dt.date) -> dt.date:
-    """1 January falling on Saturday is observed on 31 December, not 2 January.
+    """New Year's Day is the one fixed date the Saturday rule does not shift.
 
-    2022-01-01 was a Saturday and the exchanges were closed on Friday
-    2021-12-31. A naive "shift forward" would have reported 3 January 2022 as
-    the reopening day and mis-sized the surrounding closure by a session.
+    Every other Saturday holiday closes the preceding Friday, but 1 January is
+    the exception: when it falls on a Saturday the exchanges still trade on 31
+    December, because that Friday is the last session of the year. 2021-12-31
+    was a full trading day and 2022-01-01 was the closure.
+
+    A Sunday 1 January is observed on Monday, like every other Sunday holiday.
     """
-    if day.weekday() != 5:
-        return day
-    return day - dt.timedelta(days=1)
+    if day.weekday() == 6:
+        return day + dt.timedelta(days=1)
+    return day
 
 
-#: Procedural holiday rules. ``observance`` handles the Sunday case; the
-#: Saturday case is applied by the post-processing pass in :func:`holidays`.
+#: Procedural holiday rules. Every fixed-date rule carries its own weekend
+#: observance, so the generated dates need no second pass.
 _HOLIDAY_RULES: tuple[Holiday, ...] = (
     Holiday("New Year's Day", month=1, day=1, observance=_new_years_day),
     USMartinLutherKingJr,
@@ -125,35 +134,33 @@ _HOLIDAY_RULES: tuple[Holiday, ...] = (
     # 2022. `pandas`' federal calendar does not carry it, so an unmodelled
     # calendar would schedule a session on 19 June -- which for 2026 (a Friday)
     # means a real closure day that this module would happily call a session.
+    # The exchanges began observing it in 2022, so it is not a closure in the
+    # years before that - a backtest from 2020 must not lose a session to it.
     Holiday(
         "Juneteenth National Independence Day",
         month=6,
         day=19,
-        observance=sunday_to_monday,
+        observance=_observed_fixed_date,
+        start_date=dt.datetime(2022, 1, 1),
     ),
     GoodFriday,
     USMemorialDay,
     USLaborDay,
     USThanksgivingDay,
-    Holiday("Independence Day", month=7, day=4, observance=sunday_to_monday),
-    Holiday("Christmas", month=12, day=25, observance=sunday_to_monday),
+    Holiday("Independence Day", month=7, day=4, observance=_observed_fixed_date),
+    Holiday("Christmas", month=12, day=25, observance=_observed_fixed_date),
 )
 
 
 @lru_cache(maxsize=8)
 def holidays(start: dt.date, end: dt.date) -> frozenset[dt.date]:
-    """Scheduled US equity closures in the inclusive range ``[start, end]``.
-
-    The Saturday-observed-on-Friday shift is applied here rather than through a
-    ``DateOffset`` because pandas rejects a callable in ``offset`` and a
-    ``BaseOffset`` subclass emits a ``PerformanceWarning`` on every call.
-    """
+    """Scheduled US equity closures in the inclusive range ``[start, end]``."""
     found: set[dt.date] = set()
     for rule in _HOLIDAY_RULES:
         for moment in rule.dates(
             dt.datetime(start.year - 1, 1, 1), dt.datetime(end.year + 1, 12, 31)
         ):
-            observed = _saturday_holiday_to_friday(moment.date())
+            observed = moment.date()
             if start <= observed <= end:
                 found.add(observed)
     return frozenset(found)

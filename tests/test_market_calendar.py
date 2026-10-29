@@ -47,21 +47,44 @@ def test_calendar_matches_the_published_2026_closure_dates():
 
 
 @pytest.mark.parametrize(
-    ("holiday", "why"),
+    ("observed", "why"),
     [
         ("2026-07-03", "4 July 2026 is a Saturday, observed the preceding Friday"),
         ("2026-12-25", "25 December 2026 is a Friday, observed on the day"),
-        ("2021-12-31", "1 January 2022 was a Saturday, observed in the prior year"),
-        ("2022-12-24", "25 December 2021 was a Saturday, observed the preceding Friday"),
+        ("2021-12-24", "25 December 2021 was a Saturday, observed the preceding Friday"),
+        ("2022-12-26", "25 December 2022 was a Sunday, observed the following Monday"),
     ],
 )
-def test_saturday_holidays_are_observed_on_the_preceding_friday(holiday, why):
+def test_weekend_holidays_move_off_the_weekend(observed, why):
     """`pandas`' federal calendar only shifts Sunday holidays, so a Saturday
     holiday would be scheduled as a trading day -- and 4 July 2026 is one."""
-    day = dt.date.fromisoformat(holiday)
+    assert not market_calendar.is_session(dt.date.fromisoformat(observed)), why
 
-    assert not market_calendar.is_session(day), why
-    assert market_calendar.is_session(day - dt.timedelta(days=1)) or day.weekday() == 4
+
+def test_a_saturday_new_years_day_does_not_close_the_preceding_friday():
+    """New Year's Day is the exception to the Saturday rule: the exchanges trade
+    on 31 December, because that Friday is the last session of the year. Treating
+    it as a closure would invent a missing session in every such year."""
+    assert market_calendar.is_session(dt.date(2021, 12, 31))
+    assert market_calendar.is_session(dt.date(2022, 1, 3)), (
+        "Monday 3 January 2022 was a trading day"
+    )
+    assert not market_calendar.is_session(dt.date(2022, 1, 1))
+
+
+def test_a_sunday_new_years_day_is_observed_on_monday():
+    assert not market_calendar.is_session(dt.date(2023, 1, 2))
+    assert market_calendar.is_session(dt.date(2023, 1, 3))
+
+
+def test_juneteenth_is_a_closure_only_from_2022():
+    """The exchanges began observing it in 2022. A 2020 or 2021 backtest must
+    not lose a session to a holiday that did not exist yet."""
+    assert market_calendar.is_session(dt.date(2021, 6, 18))
+    assert market_calendar.is_session(dt.date(2021, 6, 21))
+    assert not market_calendar.is_session(dt.date(2022, 6, 20)), (
+        "19 June 2022 was a Sunday, so the closure is the Monday"
+    )
 
 
 def test_early_close_days_are_sessions_not_closures():
