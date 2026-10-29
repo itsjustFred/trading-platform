@@ -145,7 +145,10 @@ def test_acquire_lock_does_not_overwrite_lock_file_metadata(queue_runner) -> Non
     module.LOCK_PATH.write_text("operator-metadata\n", encoding="utf-8")
 
     assert module.acquire_lock() is True
-    assert module.LOCK_PATH.read_text(encoding="utf-8") == ""
+    # filelock 4.0.x truncates the file once it owns the lock; 4.2.1+ leaves a
+    # pre-existing file untouched (#835). Either way the runner's metadata must
+    # live in the sidecar file and must never be written into queue.lock.
+    assert module.LOCK_PATH.read_text(encoding="utf-8") in ("", "operator-metadata\n")
     metadata = json.loads(module._lock_metadata_path().read_text(encoding="utf-8"))
     assert metadata["pid"] > 0
     module.release_lock()
