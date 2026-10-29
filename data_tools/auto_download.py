@@ -16,6 +16,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from data_tools.path_safety import ensure_dataset_path_within, validate_dataset_component
+from shared import market_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -31,10 +32,24 @@ _US_STOCK_SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z.\-]{0,9}$")
 
 # Parent Decision Record (2026-08-31): coverage checks fail closed on
 # significant internal gaps. Small missing-bar windows may warn; larger gaps
-# fail. Defaults follow the thresholds proposed in the parent issue: an
-# internal hole longer than INTERNAL_GAP_FAIL_DAYS (3 calendar days) fails the
-# coverage check, a hole longer than INTERNAL_GAP_WARN_DAYS (1 calendar day)
-# warns, and anything shorter is tolerated (source downtime).
+# fail. The parent issue's figures are INTERNAL_GAP_FAIL_DAYS (3 calendar days)
+# and INTERNAL_GAP_WARN_DAYS (1 calendar day), and those remain the base.
+#
+# They are the base, not the whole rule. `scaled_gap_threshold_days` scales the
+# threshold by the timeframe's own bar spacing, because a flat 3-day budget flags
+# every bar of a weekly series as a hole and no weekly or monthly backtest could
+# pass the gate at all. What is actually applied:
+#
+#     1m .. 1d   3 days   (unchanged from the parent record)
+#     1w        21 days   (3 x the 7-day bar spacing)
+#     1mo       90 days   (3 x the 30-day bar spacing)
+#
+# A separate calendar-derived allowance covers scheduled closures; see
+# `_gap_is_market_closure` for why it only speaks for US equity venues. This
+# comment previously stated a flat 3 days for every timeframe, which was wrong for
+# 1w and 1mo by a factor of seven and thirty - anyone reasoning about the gate from
+# the comment rather than from `scaled_gap_threshold_days` would have modelled it
+# incorrectly.
 #
 # Thresholds deliberately count calendar days, not business days (the parent
 # record states the fail threshold in calendar days): a regular FX weekend
@@ -368,7 +383,17 @@ class InternalGap:
     gap_days: float
 
     def to_dict(self) -> dict[str, object]:
-        return {"start": self.start, "end": self.end, "gap_days": round(self.gap_days, 2)}
+        return {
+            "start": self.start,
+            "end": self.end,
+            "gap_days": round(self.gap_days, 2),
+            # The rounded `gap_days` above cannot resolve a one-minute bar
+            # (1/1440 of a day is 0.0007, and the report carries two decimals),
+            # and the closure allowance needs a one-bar margin. The exact width
+            # travels alongside it so the calendar check never has to work from
+            # a rounded number.
+            "gap_seconds": round(self.gap_days * 86_400.0),
+        }
 
 
 def _coverage_window_from_env(env_value: str | None, default: str) -> str:
@@ -535,6 +560,139 @@ def _resolve_data_root(data_dir: str | Path) -> Path:
     return DATA_DIR
 
 
+# A bar-to-bar hole only means something when it is far larger than the normal
+# spacing of the series. Judging holes by an absolute calendar-day count instead
+# misreports perfectly regular data: weekly bars sit 7 days apart, so every
+# single one looked like a week-long hole and weekly coverage always failed.
+# Sub-daily timeframes keep the fixed floor, because an overnight or weekend
+# closure is legitimately longer than several bars of an intraday series.
+GAP_SPACING_MULTIPLE = 3.0
+MIN_INTERNAL_GAP_THRESHOLD_DAYS = INTERNAL_GAP_WARN_DAYS
+
+
+def long_weekend_gap_days() -> float:
+    """Longest bar-to-bar closure the exchange calendar produces, in days.
+
+    This replaces a flat ``LONG_WEEKEND_GAP_DAYS = 4.0`` that was applied as a
+    *floor* over the failing threshold, which meant it overrode the base
+    threshold for every timeframe rather than adding anything to it. The
+    consequences were all in the permissive direction:
+
+    * 1m, 4h and 1d data all failed at 4.00 days instead of 3.00, so a downloader
+      that silently failed for 3.6 days passed the gate and the backtest ran
+      over forward-filled prices and reported a Sharpe.
+    * Nothing real was bought by it. An ordinary long weekend closes from
+      Friday's close to Monday's open, which the *3.0-day base already covers*
+      (2.73 days of elapsed time on the US equity grid). The next closure shape
+      up -- a Monday or Friday holiday, at 3.73 days -- is the one that needed
+      help, and 4.0 does not reach it either. So the floor sat in the dead band
+      between two closure shapes, and excused misaligned holes instead.
+
+    The allowance is now a separate, calendar-derived term and it is applied
+    per hole by :func:`market_calendar.closure_explains_hole`, not as a global
+    minimum: a hole the calendar explains is market behaviour, and a hole of the
+    same length that straddles a live session is a data hole. That distinction
+    cannot be made by any single length budget, which is why the 4.0-day floor
+    could not simply be re-tuned.
+    """
+    return float(market_calendar.longest_scheduled_closure_days())
+
+
+# Kept as a module constant for callers that only need the number. Assigned at
+# import because the calendar is procedural and cheap to evaluate once, and read
+# by `closure_hole_allowance_seconds`.
+LONG_WEEKEND_GAP_DAYS = long_weekend_gap_days()
+
+
+#: Unit-first sub-daily labels, which the numeric-prefix pattern cannot express.
+#: Values are the nominal bar spacing in days.
+_SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS: dict[str, float] = {
+    "s1": 1.0 / 86_400.0,
+    "tick": 1.0 / 86_400.0,
+}
+
+
+def timeframe_nominal_days(timeframe: str | None) -> float:
+    """Nominal calendar spacing of one bar in ``timeframe``.
+
+    The numeric prefix is part of the timeframe: ``5m`` bars are five minutes
+    apart and ``4w`` bars are four weeks apart, so ignoring it would size the
+    allowed hole against the wrong spacing.
+    """
+    normalized = str(timeframe or "").strip().lower()
+    # The repo's own sub-daily labels put the unit first, so the numeric-prefix regex
+    # below never matched them and they fell through to the `1.0` daily fallback -
+    # sizing `s1` and `tick` as *one day* when they are one second. That silently
+    # loosened their gap threshold 3x (1.0 -> 3.0 days), so a two-day hole in tick
+    # data was reported as `ok` rather than as a warning. These are real labels:
+    # `KNOWN_TIMEFRAMES` in consolidate_parquets and the viewer both spell them this
+    # way, and the grid downloader lists them by name in UNSUPPORTED_TIMEFRAMES.
+    #
+    # Not a backtest hazard on its own - `TIMEFRAME_MINUTES` has no entry for either,
+    # so `has_sufficient_segment_coverage` returns False and they cannot be traded -
+    # but a coverage report that says "ok" about a two-day hole is a report nobody
+    # should believe.
+    if normalized in _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS:
+        return _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS[normalized]
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*(mo|[a-z]+)$", normalized)
+    if match is None:
+        return 1.0
+    try:
+        count = float(match.group(1))
+    except ValueError:  # pragma: no cover - guarded by the regex above
+        return 1.0
+    unit = match.group(2)
+    if unit == "mo":
+        return count * 30.0
+    if unit == "w":
+        return count * 7.0
+    if unit == "d":
+        return count
+    if unit == "h":
+        return count / 24.0
+    if unit == "m":
+        return count / 1440.0
+    if unit == "s":
+        return count / 86_400.0
+    return count
+
+
+def scaled_gap_threshold_days(
+    timeframe: str | None,
+    base_days: float,
+    *,
+    allow_long_weekend: bool = False,
+) -> float:
+    """Length budget: the longest hole in ``timeframe`` that still FAILS coverage.
+
+    Widened for long-spaced series because a weekly bar sits 7 days apart, so a
+    fixed 3-day allowance reported every weekly bar as a hole.
+
+    ``allow_long_weekend`` used to raise a *floor* to 4 days, which meant it
+    replaced the base threshold instead of adding to it and silently loosened
+    every timeframe to 4 days. It no longer changes the length budget at all:
+    the long-weekend allowance is now applied per hole, by
+    :func:`market_calendar.closure_explains_hole`, so a hole the exchange
+    calendar explains is excused while a hole of the same length straddling a
+    live session is reported. The parameter is kept so the call sites that
+    distinguish the failing threshold from the warning threshold stay explicit
+    about which one they are asking for.
+    """
+    scaled = timeframe_nominal_days(timeframe) * GAP_SPACING_MULTIPLE
+    return max(float(base_days), scaled, MIN_INTERNAL_GAP_THRESHOLD_DAYS)
+
+
+def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    for requirement in requirements:
+        report = analyze_ohlcv_coverage(data_root, requirement)
+        if report.get("status") == "failed":
+            raise RuntimeError(
+                "OHLCV coverage has internal gaps for "
+                f"{requirement.symbol} {requirement.timeframe}: "
+                f"{report.get('gaps') or report.get('error')}"
+            )
+
+
 def _parquet_has_bar_in_range(path: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> bool:
     """Return whether the parquet at ``path`` has any timestamp within ``[start_ts, end_ts]``."""
     try:
@@ -680,25 +838,39 @@ def _find_gaps_inside_file(
             )
         )
 
-    # Report the largest hole per file so callers get a single actionable gap.
-    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
-    return [largest] if largest is not None else []
+    # Every hole above the threshold, largest first - not just the largest.
+    #
+    # Collapsing to the largest was a fail-open with the bias pointing the wrong
+    # way. The coverage verdict is computed per gap, so a second, smaller hole was
+    # never examined at all; and the *largest* hole is systematically the one most
+    # likely to be an excusable market closure, because holiday weeks are the
+    # longest holes there are. Demonstrated on real bar boundaries: a directory
+    # holding a 3.50-day outage and a 4.00-day Friday-to-Tuesday US holiday week
+    # reported only the holiday, which the calendar excused, and the coverage check
+    # answered "warning" with no failed downloads - while the 3.50-day hole sat
+    # above the 3.0-day fail threshold the whole time.
+    #
+    # Sorted largest-first so any caller that inspects only the first still gets
+    # the most actionable one, which is what the old behaviour guaranteed.
+    return sorted(gaps, key=lambda gap: gap.gap_days, reverse=True)
 
 
 def find_internal_gaps(
     symbol_dir: Path,
     timeframe: str | None = None,
     *,
-    threshold_days: float = INTERNAL_GAP_WARN_DAYS,
+    threshold_days: float | None = None,
 ) -> list[dict[str, object]]:
     """Detect holes *inside* the stored timestamp range of one symbol directory.
 
     Coverage based on global min/max passes files that simply stop in the
     middle (DV-B15). This compares the bar-to-bar boundaries of every parquet
     that belongs to the symbol: adjacent files (segmented/monthly storage) and
-    the bars inside one file. The largest hole longer than ``threshold_days``
-    (default: 1 calendar day) is reported — gaps are measured in calendar
-    days, so a regular weekend (~2 days) is reported as a warning.
+    the bars inside one file. Every hole longer than ``threshold_days``
+    (default: ``INTERNAL_GAP_WARN_DAYS``, 1 calendar day) is reported, largest
+    first, so the coverage verdict is computed over all of them rather than over
+    whichever one happened to be longest. Gaps are measured in calendar days, so a
+    regular weekend (~2 days) is reported as a warning.
     """
     def _matches_timeframe(path: Path) -> bool:
         if timeframe is None:
@@ -709,6 +881,15 @@ def find_internal_gaps(
             stem == normalized
             or stem.startswith(f"{normalized}_")
             or stem.startswith(f"{normalized}-")
+        )
+
+    if threshold_days is None:
+        # Without a timeframe there is no nominal spacing to scale against, so
+        # widening would only hide real holes. Keep the fixed floor.
+        threshold_days = (
+            scaled_gap_threshold_days(timeframe, INTERNAL_GAP_WARN_DAYS)
+            if timeframe
+            else INTERNAL_GAP_WARN_DAYS
         )
 
     parquet_paths = sorted(
@@ -742,10 +923,12 @@ def find_internal_gaps(
         file_gaps = _find_gaps_inside_file(path, threshold_days=threshold_days)
         gaps.extend(file_gaps)
 
-    largest = max(gaps, key=lambda gap: gap.gap_days, default=None)
-    if largest is not None:
-        return [largest.to_dict()]
-    return []
+    # Every hole above the threshold, largest first. The `max()` this replaces
+    # collapsed *across* files as well as within them, so the same fail-open
+    # applied to a segmented layout: a real outage in one month's file was invisible
+    # whenever a longer holiday week lived in another. Largest first keeps the
+    # "most actionable gap first" property the collapse was there to provide.
+    return [gap.to_dict() for gap in sorted(gaps, key=lambda g: g.gap_days, reverse=True)]
 
 
 def _contained_rglob(root: Path, pattern: str) -> Iterator[Path]:
@@ -1096,6 +1279,90 @@ def _coverage_for(data_root: Path, symbol: str, timeframe: str) -> tuple[str, st
     return min(starts), max(ends)
 
 
+def closure_hole_allowance_seconds(
+    timeframe: str | None, *, start: date
+) -> float:
+    """Widest hole the exchange calendar can account for, in seconds.
+
+    Composed from calendar facts rather than declared, and it is *not* a
+    threshold that fails or passes coverage on its own -- it is only ever
+    consulted for a hole that :func:`market_calendar.closure_explains_hole` has
+    already accepted by shape. Three terms:
+
+    * the calendar's own longest scheduled closure
+      (:func:`long_weekend_gap_days`), which for the modelled rules is 89.5
+      hours: a week with one holiday shut plus the weekend.
+    * two regular session lengths of extended-hours tail, because the calendar
+      models the 6.5-hour regular session while a 24/5 venue may place its first
+      bar of a reopening session up to a full session after the modelled open.
+    * one bar, which is arithmetic rather than slack: the last bar before a
+      closure is stamped at the last minute of the session, so the measured hole
+      is one bar interval wider than the closure itself.
+    """
+    bar_seconds = max(1.0, round(timeframe_nominal_days(timeframe) * 86_400.0))
+    return (
+        LONG_WEEKEND_GAP_DAYS * 86_400.0
+        + 2.0 * market_calendar.session_span_seconds(start)
+        + bar_seconds
+    )
+
+
+def _gap_is_market_closure(
+    gap: dict[str, object],
+    *,
+    timeframe: str | None,
+    symbol: str = "",
+    data_dir: str | Path = "",
+) -> bool:
+    """Whether the exchange calendar accounts for this hole.
+
+    Three questions, in this order. **First: is this venue one the calendar
+    models at all?** :func:`market_calendar` says so itself — "Non-US venues are
+    not modelled ... nothing here should be used to judge those" — and the shape
+    test it offers is not venue-agnostic. A Monday-holiday week in US equities
+    has no US session between Friday and Tuesday, so a Dukascopy FX series that
+    simply died for those four days matched the shape exactly and was excused,
+    while `_uses_us_equity_calendar` already knew the symbol was not a US venue.
+    A silent four-day hole in FX is worse than a spurious failure, so a venue the
+    calendar does not model gets no excuse at all.
+
+    That is deliberately fail-closed, and it has a known cost: a *genuine* 24/5
+    venue closure (FX reopens Sunday ~22:00 UTC, so the resuming bar's date is a
+    Sunday and the shape test refuses it) now hard-fails rather than being
+    excused. Closing that properly needs a real per-venue calendar, and guessing
+    a width for a market we do not model is the failure this whole check exists
+    to prevent. Recorded rather than papered over.
+
+    The remaining two questions are the original ones. The shape comes from
+    :func:`market_calendar.closure_explains_hole` -- did the hole span any
+    scheduled session? Then the width is checked against
+    :func:`closure_hole_allowance_seconds`.
+
+    Fails closed on anything it cannot read: a gap whose endpoints or exact width
+    are missing or unparseable is treated as a data hole, never as market
+    behaviour. An unparseable date is a bug in the gap report, and excusing it
+    would hide it -- as would guessing a width from the rounded ``gap_days``,
+    which cannot resolve a one-minute bar.
+    """
+    if not _uses_us_equity_calendar(symbol, timeframe or "", data_dir):
+        # A venue the calendar does not model. Refusing here is the whole point:
+        # the alternative is certifying a data hole as market behaviour.
+        return False
+    raw_start = str(gap.get("start") or "").strip()
+    raw_end = str(gap.get("end") or "").strip()
+    if not raw_start or not raw_end or "gap_seconds" not in gap:
+        return False
+    try:
+        start_date = date.fromisoformat(raw_start)
+        end_date = date.fromisoformat(raw_end)
+        gap_seconds = float(gap["gap_seconds"])
+    except (TypeError, ValueError):
+        return False
+    if not market_calendar.closure_explains_hole(start_date, end_date):
+        return False
+    return gap_seconds <= closure_hole_allowance_seconds(timeframe, start=start_date)
+
+
 def _gaps_overlapping_window(
     gaps: list[dict[str, object]], start: str | None, end: str | None
 ) -> list[dict[str, object]]:
@@ -1103,7 +1370,8 @@ def _gaps_overlapping_window(
 
     Ancient history outside the required window must not fail a requirement
     that never touches it; boundary-touching holes carry no interior
-    missing bars and are excluded too.
+    missing bars and are excluded too. The list is copied on the pass-through
+    path so the caller never receives an alias of the input.
     """
     if start is None or end is None:
         return list(gaps)
@@ -1146,15 +1414,17 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         gaps.extend(find_internal_gaps(candidate, timeframe))
 
     error: str | None = None
-    required_start: str | None = None
-    required_end: str | None = None
+    # Both the stored-bounds check below and the gap window filter further down
+    # need the requested window, so it is normalized once, unconditionally. The
+    # explicit annotations keep it bound on every path, including the
+    # ``bounds is None`` branch where no bounds comparison happens.
+    required_start: str | None = _normalize_coverage_date(requirement.start)
+    required_end: str | None = _normalize_coverage_date(requirement.end)
     if bounds is None:
         error = (
             f"No {symbol} {timeframe} parquet found under {data_root / 'ohlcv'}"
         )
     else:
-        required_start = _normalize_coverage_date(requirement.start)
-        required_end = _normalize_coverage_date(requirement.end)
         if required_start is not None and required_start < bounds[0]:
             error = (
                 f"Requested start {required_start} is before stored coverage start {bounds[0]}"
@@ -1162,11 +1432,51 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         elif required_end is not None and required_end > bounds[1]:
             error = f"Requested end {required_end} is after stored coverage end {bounds[1]}"
 
-    significant_gaps = [
-        gap for gap in gaps if float(gap.get("gap_days", 0)) > INTERNAL_GAP_FAIL_DAYS
-    ]
+    # The fail threshold scales with the timeframe: a weekly series has 7-day
+    # bar spacing, so a fixed 3-day allowance flagged every bar as a hole and no
+    # weekly or monthly backtest could pass the gate.
+    #
+    # The long-weekend allowance is a SEPARATE term applied here rather than a
+    # floor on that threshold. A hole the exchange calendar explains -- it starts
+    # on a session, resumes on the next session after a closure, and spans no
+    # session of its own -- is market behaviour and stays a warning. A hole of the
+    # same length that straddles a live session is a downloader that stopped, and
+    # fails. No single length budget can tell those apart: an ordinary long
+    # weekend is 2.73 days and a Monday-holiday week is 3.73, so any constant big
+    # enough for the second also passes the 3.6-day hole that motivated the
+    # original 4.0-day floor.
+    #
+    # The calendar only speaks for venues it models, so `_gap_is_market_closure`
+    # returns False for anything else. Known cost, accepted deliberately: a
+    # genuine multi-day closure on a 24/5 venue (FX, metals, crypto) now hard-fails
+    # rather than being excused, because a 24/5 venue reopens Sunday ~22:00 UTC and
+    # the resuming bar's date is a Sunday, which the US shape test refuses. Closing
+    # that properly needs a real per-venue calendar; guessing closure dates for a
+    # market we do not model is the exact failure this check prevents. Ordinary
+    # weekends on those venues are unaffected -- they pass on the threshold above,
+    # not on the calendar.
+    fail_threshold = scaled_gap_threshold_days(
+        requirement.timeframe,
+        INTERNAL_GAP_FAIL_DAYS,
+        allow_long_weekend=True,
+    )
     significant_gaps = _gaps_overlapping_window(
-        significant_gaps, required_start, required_end
+        [
+            gap
+            for gap in gaps
+            if float(gap.get("gap_days", 0)) > fail_threshold
+            and not _gap_is_market_closure(
+                gap,
+                timeframe=requirement.timeframe,
+                symbol=requirement.symbol,
+                # data_root is the already-resolved root; _resolve_data_root
+                # accepts either form, so passing it here keeps the venue lookup
+                # reading the same tree the coverage check just read.
+                data_dir=data_root,
+            )
+        ],
+        required_start,
+        required_end,
     )
 
     if error or significant_gaps:

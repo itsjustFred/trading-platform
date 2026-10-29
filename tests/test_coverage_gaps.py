@@ -114,6 +114,27 @@ class TestInternalGapDetection:
         )
         assert report["status"] == "failed"
 
+    def test_gap_outside_required_window_does_not_fail(self, tmp_path):
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [
+                "2019-01-01T00:00:00Z",
+                "2019-01-01T01:00:00Z",
+                "2024-06-01T00:00:00Z",
+                "2024-06-01T01:00:00Z",
+                "2024-06-01T02:00:00Z",
+            ],
+        )
+
+        report = analyze_ohlcv_coverage(
+            tmp_path,
+            DataRequirement(
+                symbol="EURUSD", timeframe="1h", start="2024-06-01", end="2024-06-01"
+            ),
+        )
+
+        assert report["status"] != "failed"
+
 
 class TestFailedDownloadVisibility:
     def test_ensure_backtest_data_raises_when_download_produces_nothing(
@@ -248,6 +269,40 @@ class TestValidateGapBounds:
 
         with pytest.raises(ValueError, match="escapes its root"):
             validate_module.validate_parquet(outside)
+
+
+class TestEnsureBacktestDataGapGateViaModuleImport:
+    """The same internal-gap scenario, driven through the module-level import.
+
+    Merge resolution: both sides of the merge added this scenario in a class
+    called ``TestEnsureBacktestDataGapGate``, so the later definition silently
+    shadowed the earlier one and half the gap-gate coverage stopped running.
+    The classes are renamed apart so both are collected. The only real
+    difference between them is the import binding under test: this one resolves
+    ``auto_download`` from module scope, so it also guards that binding.
+    """
+
+    def test_internal_gap_fails_coverage(self, tmp_path, monkeypatch):
+        early = pd.date_range("2024-01-01", "2024-01-05", freq="1h", tz="UTC")
+        late = pd.date_range("2024-01-15", "2024-01-20", freq="1h", tz="UTC")
+        _write_bars(
+            tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
+            [ts.isoformat() for ts in [*early, *late]],
+        )
+        monkeypatch.setattr(
+            auto_download,
+            "_download_missing_ohlcv_data",
+            lambda **kwargs: None,
+        )
+
+        with pytest.raises(RuntimeError, match="internal gaps"):
+            auto_download.ensure_backtest_data(
+                symbols=["EURUSD"],
+                timeframe="1h",
+                start="2024-01-01",
+                end="2024-01-20",
+                data_dir=tmp_path,
+            )
 
 
 class TestGapDetectionSingleFile:
@@ -822,3 +877,974 @@ def test_observed_session_uses_an_interior_window_at_boundary_cuts() -> None:
         start_ts=pd.Timestamp("2024-01-02T10:30:00Z"),
         end_ts=pd.Timestamp("2024-01-04T13:00:00Z"),
     ) == (540, 900)
+# ─── the allowed hole length must scale with the timeframe ──────────────────
+
+
+def _write_series(directory, filename, timestamps):
+    import pandas as pd
+
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+        }
+    ).to_parquet(directory / filename)
+    return directory
+
+
+def test_regular_weekly_data_is_not_reported_as_a_gap(tmp_path):
+    """Weekly bars sit 7 days apart, so a 1-day threshold flagged every bar.
+
+    The reported hole made weekly coverage always fail, blocking any backtest
+    that used a weekly timeframe.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1w.parquet",
+        pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1w") == []
+
+
+def test_regular_monthly_data_is_not_reported_as_a_gap(tmp_path):
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1mo.parquet",
+        pd.date_range("2024-01-01", periods=36, freq="30D", tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1mo") == []
+
+
+def test_regular_daily_data_still_tolerates_a_weekend(tmp_path):
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    # Business-day cadence leaves 2-day weekend holes.
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "1d.parquet",
+        pd.bdate_range("2024-01-01", periods=60, tz="UTC"),
+    )
+    assert find_internal_gaps(symbol_dir, "1d") == []
+
+
+def test_a_real_hole_in_daily_data_is_still_reported(tmp_path):
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    ts = list(pd.date_range("2024-01-01", periods=20, freq="1D", tz="UTC"))
+    ts += list(pd.date_range("2024-03-01", periods=20, freq="1D", tz="UTC"))
+    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1d.parquet", ts)
+    gaps = find_internal_gaps(symbol_dir, "1d")
+    assert gaps and gaps[0]["gap_days"] > 30, f"a six-week hole must still fail: {gaps}"
+
+
+def test_gap_threshold_scales_with_timeframe_but_keeps_an_intraday_floor():
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    # The warning threshold keeps a tight 1-day floor for sub-daily timeframes,
+    # so a genuine intraday hole is still surfaced rather than accepted.
+    assert scaled_gap_threshold_days("1m", 1) == 1.0
+    assert scaled_gap_threshold_days("1h", 1) == 1.0
+    # REWRITTEN. These two lines used to assert that the failing threshold is
+    # 4.0 days, pinning the premise that a long weekend *is* four calendar days
+    # and that the 4.0-day floor belongs in the length budget. Neither is true.
+    # On the US equity grid an ordinary long weekend runs from Friday's close to
+    # Monday's open, which is 2.73 days -- already inside the 3-day base. And the
+    # 4.0-day floor was a *minimum* over that base, so it overrode it for every
+    # timeframe and let 1-minute data with a 3.6-day hole through the gate. The
+    # long-weekend allowance is now applied per hole against the exchange
+    # calendar (see test_long_weekend_closure_does_not_fail_coverage and
+    # test_calendar_distinguishes_a_weekend_from_a_downloader_outage), so the
+    # length budget is the base again.
+    assert scaled_gap_threshold_days("1h", 3, allow_long_weekend=True) == 3.0
+    assert scaled_gap_threshold_days("1d", 3, allow_long_weekend=True) == 3.0
+    # The long-weekend flag no longer changes the length budget at all, for any
+    # timeframe: the two shapes must be impossible to confuse.
+    for timeframe in ("1m", "5m", "1h", "4h", "1d", "1w", "1mo", "3mo"):
+        assert scaled_gap_threshold_days(
+            timeframe, 3, allow_long_weekend=True
+        ) == scaled_gap_threshold_days(timeframe, 3), timeframe
+    # Longer-spaced series widen proportionally, from the timeframe's own nominal
+    # spacing, and are not loosened by the closure allowance on top.
+    assert scaled_gap_threshold_days("1d", 1) == 3.0
+    assert scaled_gap_threshold_days("1w", 1) == 21.0
+    assert scaled_gap_threshold_days("1mo", 1) == 90.0
+    assert scaled_gap_threshold_days("1w", 3, allow_long_weekend=True) == 21.0
+    assert scaled_gap_threshold_days("1mo", 3, allow_long_weekend=True) == 90.0
+
+
+def test_weekly_coverage_analysis_does_not_fail_on_regular_data(tmp_path):
+    """`analyze_ohlcv_coverage` is the gate that actually blocks a backtest.
+
+    With a fixed 3-day fail threshold, regular weekly data (7-day spacing) was
+    reported as `failed` for internal gaps, so no weekly backtest could start.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    symbol_dir = root / "ohlcv" / "GOLD1"
+    ts = pd.date_range("2024-01-05", periods=60, freq="7D", tz="UTC")
+    _write_series(symbol_dir, "1w.parquet", ts)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="GOLD1",
+            timeframe="1w",
+            # Inside the stored range: an out-of-range request fails for an
+            # unrelated boundary reason and would not exercise the gap check.
+            start="2024-01-05",
+            end="2025-02-20",
+        ),
+    )
+    assert report["status"] != "failed", f"regular weekly data must not fail: {report}"
+    assert not report["gaps"], f"regular weekly data must report no gaps: {report}"
+
+
+def test_nominal_days_scales_by_the_numeric_prefix():
+    """`4w` bars are four weeks apart and `5m` bars are five minutes apart.
+
+    Ignoring the prefix sized the allowed hole against the wrong spacing, so a
+    4-week series would be judged against a 3-day threshold.
+    """
+    from data_tools.auto_download import timeframe_nominal_days
+
+    assert timeframe_nominal_days("4w") == 28.0
+    assert timeframe_nominal_days("1w") == 7.0
+    assert timeframe_nominal_days("3mo") == 90.0
+    assert timeframe_nominal_days("1mo") == 30.0
+    assert timeframe_nominal_days("5m") == pytest.approx(5 / 1440)
+    assert timeframe_nominal_days("4h") == pytest.approx(4 / 24)
+    assert timeframe_nominal_days("2d") == 2.0
+    # Unparseable input falls back to daily rather than raising.
+    assert timeframe_nominal_days("nonsense") == 1.0
+    assert timeframe_nominal_days("") == 1.0
+
+
+def test_multi_week_timeframes_get_a_wider_gap_threshold():
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    assert scaled_gap_threshold_days("4w", 1) == 84.0
+    assert scaled_gap_threshold_days("2w", 1) == 42.0
+
+
+def test_gap_analysis_without_a_timeframe_keeps_the_fixed_floor(tmp_path):
+    """With no timeframe there is no spacing to scale against.
+
+    Widening anyway would only hide real holes, so the floor is kept.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    # 2 days apart with no timeframe given: must still be reported. Scaling
+    # would raise the bar to 3 days and hide it.
+    symbol_dir = _write_series(
+        Path(tmp_path) / "GOLD1",
+        "custom.parquet",
+        pd.date_range("2024-01-01", periods=12, freq="2D", tz="UTC"),
+    )
+    gaps = find_internal_gaps(symbol_dir, None)
+    assert gaps and gaps[0]["gap_days"] == pytest.approx(2.0), (
+        f"a 2-day hole must be reported when no timeframe is known: {gaps}"
+    )
+
+
+def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
+    """Friday close to Monday open is about three days even for hourly bars.
+
+    With a fixed 3-day fail threshold that escalated to `failed` and blocked the
+    backtest. It must stay a warning: the closure is real market behaviour, and a
+    warning is still surfaced rather than silently accepted.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    stamps = list(
+        pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC")
+    ) + [pd.Timestamp("2024-03-11 22:00", tz="UTC")]
+    # AAPL, not the metal this used to use. The shape asserted here - closed
+    # Friday 21:00 UTC, no bars until Monday - is a *US equity* weekend, and the
+    # calendar that excuses it models US equities. On GOLD1 the same fixture is
+    # not market behaviour at all: a 24/5 Dukascopy venue trades Sunday 22:00
+    # through Monday, so those bars should exist. Asserting a US closure on a
+    # non-US venue is the same confusion that let a four-day FX outage be excused
+    # as a holiday, so the symbol is corrected rather than the assertion.
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="AAPL", timeframe="1h",
+            start="2024-03-06", end="2024-03-11",
+        ),
+    )
+    assert report["status"] != "failed", f"a long weekend must not fail coverage: {report}"
+    assert report["gaps"], "the closure should still be reported as a gap"
+
+
+def test_a_real_multi_day_hole_in_intraday_data_is_still_reported(tmp_path):
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    stamps = list(pd.date_range("2024-03-01", periods=5, freq="1h", tz="UTC")) + list(
+        pd.date_range("2024-03-09", periods=5, freq="1h", tz="UTC")
+    )
+    symbol_dir = _write_series(Path(tmp_path) / "GOLD1", "1h.parquet", stamps)
+    gaps = find_internal_gaps(symbol_dir, "1h")
+    assert gaps and gaps[0]["gap_days"] > 4, f"an 8-day hole must be reported: {gaps}"
+
+# ── The long-weekend allowance must be a calendar term, not a flat floor ──────
+#
+# `LONG_WEEKEND_GAP_DAYS = 4.0` was applied as a *minimum* over the failing
+# threshold, so it replaced the 3.0-day base for every timeframe instead of
+# adding to it. The length budget went to 4.00 days for 1m, 4h and 1d alike, so
+# 1-minute data with a 3.6-day hole -- a downloader that silently failed for
+# most of a week -- passed the gate, the backtest ran over forward-filled prices
+# and reported a Sharpe. It bought nothing real either: an ordinary long weekend
+# is 65.5 hours on the US equity grid, already inside the 3.0-day base, and the
+# 4.0-day floor sat in the gap between the two closure shapes that do occur.
+#
+# No single length budget can fix this, and that is the point of the tests
+# below. A long weekend and a downloader outage are both about three days long,
+# so the allowance has to be decided per hole against the calendar.
+
+
+def _around(before: str, after: str, *, minutes: int = 20) -> list:
+    """1-minute bars clustered either side of a hole, so only the hole is wide.
+
+    The last bar before the hole lands exactly on ``before`` and the first after
+    it exactly on ``after``, so the measured hole is precisely ``after - before``.
+    """
+    lead = pd.Timestamp(before) - pd.Timedelta(minutes=minutes)
+    trail = pd.Timestamp(after) + pd.Timedelta(minutes=minutes)
+    return list(pd.date_range(lead, before, freq="1min", tz="UTC")) + list(
+        pd.date_range(after, trail, freq="1min", tz="UTC")
+    )
+
+
+def _one_minute_report(tmp_path, before: str, after: str, start: str, end: str):
+    root = tmp_path / "data"
+    _write_series(root / "ohlcv" / "AAPL", "1m.parquet", _around(before, after))
+    return analyze_ohlcv_coverage(
+        root,
+        DataRequirement(symbol="AAPL", timeframe="1m", start=start, end=end),
+    )
+
+
+def test_a_3_6_day_hole_in_1m_data_still_fails_coverage(tmp_path):
+    """The defect, as a length. 3.6 days is just under the old 4.0-day floor and
+    spans two ordinary sessions, so nothing about it is market behaviour."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-09-17 20:00",   # Thursday 17 September's close
+        after="2026-09-21 11:36",    # Monday mid-morning: 87.6 hours later
+        start="2026-09-17",
+        end="2026-09-21",
+    )
+
+    assert report["status"] == "failed", (
+        f"a 3.6-day hole in 1m data is a dead downloader, not a closure: {report}"
+    )
+    assert report["failed_downloads"], f"the hole must be named: {report}"
+    assert report["failed_downloads"][0]["gap_days"] == pytest.approx(3.65, abs=0.01)
+
+
+def test_a_closure_shaped_hole_wider_than_the_closure_is_not_excused(tmp_path):
+    """The dates look exactly like Good Friday 2026 -- Thursday to Monday, with
+    no session in between -- but the hole runs from Thursday midnight to Monday
+    midnight, five days against a 64.5-hour closure. The extended-hours tail
+    exists for a venue that resumes a few hours late, not for 56 extra hours of
+    missing session time."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-04-02 00:00",   # Thursday, before Good Friday
+        after="2026-04-06 23:59",    # Monday: five days later
+        start="2026-04-02",
+        end="2026-04-06",
+    )
+
+    assert report["gaps"] and report["gaps"][0]["gap_days"] == pytest.approx(5.0, abs=0.01)
+    assert report["status"] == "failed", report
+
+
+# Table-driven on real 2026 US closure dates, in 1-minute data, which is the
+# case the flat floor hurt most. Every `after` is 10:00 Eastern on the reopening
+# session, i.e. a live series that resumed trading.
+LONG_WEEKEND_CASES = [
+    pytest.param(
+        "ordinary long weekend: Fri 11 Sep close, Mon 14 Sep open",
+        "2026-09-11 20:00", "2026-09-14 13:30", "2026-09-11", "2026-09-14",
+        id="ordinary-long-weekend",
+    ),
+    pytest.param(
+        "Independence Day 2026, observed Friday 3 July: 89.5 hours",
+        "2026-07-02 20:00", "2026-07-06 13:30", "2026-07-02", "2026-07-06",
+        id="independence-day-2026",
+    ),
+    pytest.param(
+        "Labor Day 2026 on Monday 7 September: 89.5 hours",
+        "2026-09-04 20:00", "2026-09-08 13:30", "2026-09-04", "2026-09-08",
+        id="labor-day-2026",
+    ),
+    pytest.param(
+        "Martin Luther King Jr Day 2026 on Monday 19 January",
+        "2026-01-16 21:00", "2026-01-20 14:30", "2026-01-16", "2026-01-20",
+        id="mlk-day-2026",
+    ),
+    pytest.param(
+        "Memorial Day 2026 on Monday 25 May",
+        "2026-05-22 20:00", "2026-05-26 13:30", "2026-05-22", "2026-05-26",
+        id="memorial-day-2026",
+    ),
+    pytest.param(
+        "Juneteenth 2026 on Friday 19 June",
+        "2026-06-18 20:00", "2026-06-22 13:30", "2026-06-18", "2026-06-22",
+        id="juneteenth-2026",
+    ),
+    pytest.param(
+        "Good Friday 2026 on Friday 3 April (Maundy Thursday trades)",
+        "2026-04-02 20:00", "2026-04-06 13:30", "2026-04-02", "2026-04-06",
+        id="good-friday-2026",
+    ),
+    pytest.param(
+        "Christmas 2026 on a Friday",
+        "2026-12-24 21:00", "2026-12-28 14:30", "2026-12-24", "2026-12-28",
+        id="christmas-2026",
+    ),
+    pytest.param(
+        "New Year 2027 on a Friday, closing out the 2026 regular week",
+        "2026-12-31 21:00", "2027-01-04 14:30", "2026-12-31", "2027-01-04",
+        id="new-year-2027",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "before", "after", "start", "end"), LONG_WEEKEND_CASES
+)
+def test_a_genuine_long_weekend_in_1m_data_still_passes(
+    tmp_path, label, before, after, start, end
+):
+    report = _one_minute_report(tmp_path, before, after, start, end)
+
+    assert report["status"] != "failed", f"{label} must not fail coverage: {report}"
+    assert report["gaps"], f"{label} should still be reported, not silently hidden"
+
+
+def test_the_closure_allowance_is_calendar_derived_not_declared():
+    """It must move with the calendar, not sit in a comment."""
+    from data_tools.auto_download import long_weekend_gap_days
+    from shared import market_calendar
+
+    assert long_weekend_gap_days() == market_calendar.longest_scheduled_closure_days()
+    # 89.5 hours: the Thursday-to-Tuesday gap of a three-closed-weekday week.
+    assert long_weekend_gap_days() == pytest.approx(89.5 / 24.0)
+
+
+def test_weekly_and_monthly_thresholds_are_unchanged_by_the_allowance():
+    """`GAP_SPACING_MULTIPLE` still sizes those from the bar spacing, and the
+    closure allowance no longer touches them."""
+    from data_tools.auto_download import scaled_gap_threshold_days
+
+    assert scaled_gap_threshold_days("1w", 1) == 21.0
+    assert scaled_gap_threshold_days("1mo", 1) == 90.0
+    assert scaled_gap_threshold_days("1w", 3, allow_long_weekend=True) == 21.0
+    assert scaled_gap_threshold_days("1mo", 3, allow_long_weekend=True) == 90.0
+
+
+def test_a_gap_with_unreadable_endpoints_is_never_excused():
+    """Fails closed: a gap report this function cannot read is a bug, and
+    excusing it would hide that bug behind a closure."""
+    from data_tools.auto_download import _gap_is_market_closure
+
+    weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
+    # The positive control names a US venue, because that is the only kind this
+    # calendar can account for. Called with no symbol it now returns False - an
+    # unstated venue is not a licence to excuse, and that is the defect.
+    assert _gap_is_market_closure(weekend, timeframe="1m", symbol="AAPL")
+
+    # Every negative case names the US venue too. Without it these assertions
+    # still passed - but for the wrong reason: an unnamed venue is refused before
+    # the endpoints are ever read, so the test was measuring the venue guard three
+    # times over and the fail-closed parsing it exists to pin was not exercised at
+    # all. Found by a CodeRabbit review scoped to tests/, one commit after the
+    # venue guard landed.
+    assert not _gap_is_market_closure(
+        {**weekend, "start": ""}, timeframe="1m", symbol="AAPL"
+    )
+    assert not _gap_is_market_closure(
+        {**weekend, "end": "not-a-date"}, timeframe="1m", symbol="AAPL"
+    )
+    # A report with no exact width is not guessed at from the rounded
+    # `gap_days`, which cannot resolve a one-minute bar.
+    assert not _gap_is_market_closure(
+        {"start": "2026-09-11", "end": "2026-09-14", "gap_days": 2.73},
+        timeframe="1m",
+        symbol="AAPL",
+    )
+
+
+def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
+    """The defect: a real hole in FX, certified as a holiday.
+
+    Martin Luther King Jr Day 2026 closed US equities on Monday 19 January, and
+    the calendar's shape test asks whether any *US session* falls between the
+    hole's endpoints. Between a Friday close and a Tuesday resume there is none -
+    Saturday, Sunday, and the holiday itself - so a Dukascopy series that simply
+    died for those four days matched the shape exactly and was excused, even
+    though `_uses_us_equity_calendar` already knew EURUSD was not a US venue.
+
+    A silent four-day hole in FX is worse than a spurious failure: the backtest
+    runs over a series with forward-filled prices and reports a result.
+    `shared/market_calendar` says it outright - "Non-US venues are not modelled ...
+    nothing here should be used to judge those" - and the check ignored it.
+    """
+    from data_tools.auto_download import _gap_is_market_closure, _uses_us_equity_calendar
+
+    fx_outage = {
+        "start": "2026-01-16",   # Friday 21:00 UTC, last bar
+        "end": "2026-01-20",     # Tuesday 22:00 UTC, first bar back
+        "gap_seconds": 349_200.0,
+        "gap_days": 4.04,
+    }
+
+    for symbol in ("EURUSD", "USDJPY", "XAUUSD", "BTCUSD"):
+        assert not _uses_us_equity_calendar(symbol), (
+            f"{symbol} is not a US equity venue, so the calendar cannot account "
+            f"for its closures"
+        )
+        assert not _gap_is_market_closure(
+            fx_outage, timeframe="1m", symbol=symbol
+        ), (
+            f"a four-day hole in {symbol} was excused as a market closure. The US "
+            "equity calendar does not model this venue, so it cannot certify its "
+            "outage as a holiday - the data is missing, not closed."
+        )
+
+    # The identical hole on a US equity is a genuine long weekend, and still
+    # passes. The fix narrows the excuse; it does not remove it.
+    for symbol in ("AAPL", "SPY"):
+        assert _gap_is_market_closure(fx_outage, timeframe="1m", symbol=symbol), (
+            f"a real US equity holiday week stopped being excused for {symbol}"
+        )
+
+
+def test_an_unknown_venue_is_never_excused():
+    """No symbol is not a licence.
+
+    The positive control in the fail-closed test above had to start naming a US
+    venue, because with no symbol the function now returns False. That is
+    deliberate: `closure_explains_hole` cannot know what it is being asked about,
+    and guessing "probably equities" is how a four-day hole becomes a warning.
+    """
+    from data_tools.auto_download import _gap_is_market_closure
+
+    weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
+
+    assert not _gap_is_market_closure(weekend, timeframe="1m")
+    assert not _gap_is_market_closure(weekend, timeframe="1m", symbol="")
+    assert not _gap_is_market_closure(weekend, timeframe="1m", symbol="   ")
+
+
+def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
+    """The whole path, not just the helper: a status the backtest actually sees."""
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    # Friday 21:00 UTC, then nothing until Tuesday 22:00 - a 24/5 FX venue that
+    # was open the whole time in between.
+    stamps = list(
+        pd.date_range("2026-01-16 15:00", "2026-01-16 21:00", freq="1h", tz="UTC")
+    ) + [pd.Timestamp("2026-01-20 22:00", tz="UTC")]
+    _write_series(root / "ohlcv" / "EURUSD", "1h.parquet", stamps)
+
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="EURUSD", timeframe="1h", start="2026-01-16", end="2026-01-20"
+        ),
+    )
+
+    assert report["status"] == "failed", (
+        f"a four-day hole in FX must fail coverage, not warn: {report}"
+    )
+    assert report["gaps"], "the hole must still be reported, not merely fail silently"
+
+
+def test_unit_first_sub_daily_labels_are_not_sized_as_daily_bars():
+    """`s1` and `tick` are one second, and the fallback said one day.
+
+    The numeric-prefix pattern this function uses (`5m`, `4w`) cannot match a
+    label that puts the unit first, so `s1` and `tick` fell through to the `1.0`
+    daily fallback. That silently loosened their gap threshold from 1.0 to 3.0
+    days, and a two-day hole in tick data was reported as `ok` instead of as a
+    warning - a coverage report nobody should believe.
+
+    These are the repo's own labels, not hypotheticals: `KNOWN_TIMEFRAMES` in
+    `consolidate_parquets.py` and the viewer's timeframe list both spell them this
+    way, and the grid downloader names them in `UNSUPPORTED_TIMEFRAMES`.
+
+    The unparseable fallback is asserted too, because the fix must not turn a
+    genuinely unknown label into a permissive one - `nonsense` is still a day, and
+    that is the existing deliberate behaviour.
+    """
+    from data_tools.auto_download import (
+        scaled_gap_threshold_days,
+        timeframe_nominal_days,
+    )
+
+    one_second = 1.0 / 86_400.0
+    for label in ("s1", "tick", "S1", "TICK", " s1 "):
+        assert timeframe_nominal_days(label) == pytest.approx(one_second), (
+            f"{label!r} sized as {timeframe_nominal_days(label)} days; it is one second"
+        )
+        assert scaled_gap_threshold_days(label, 1) == 1.0, (
+            f"{label!r} got a {scaled_gap_threshold_days(label, 1)}-day threshold; "
+            f"a sub-daily series must not be allowed a multi-day hole"
+        )
+
+    # `1s` and `s1` are the same spacing expressed two ways, so they must agree.
+    assert timeframe_nominal_days("s1") == pytest.approx(timeframe_nominal_days("1s"))
+
+    # And the pre-existing fallback is untouched.
+    assert timeframe_nominal_days("nonsense") == 1.0
+    assert timeframe_nominal_days(None) == 1.0
+    assert timeframe_nominal_days("") == 1.0
+
+
+def _two_holes_one_excusable(tmp_path):
+    """A real 3.5-day outage alongside a longer, excusable US holiday week.
+
+    Three bar ranges, so two distinct holes: Friday 16 January's close to Tuesday
+    20 January is the MLK week and the calendar excuses it, while 10 to 14 January
+    is 3.5 days of missing bars - above the 3.0-day fail threshold, so it has to
+    fail coverage. The holiday is the *larger* of the two, which is the whole point.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
+
+    root = tmp_path / "data"
+    stamps = (
+        list(pd.date_range("2026-01-10 00:00", "2026-01-10 23:00", freq="1h", tz="UTC"))
+        + list(
+            pd.date_range("2026-01-14 11:00", "2026-01-16 12:00", freq="1h", tz="UTC")
+        )
+        + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
+    )
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+    report = analyze_ohlcv_coverage(
+        root,
+        DataRequirement(
+            symbol="AAPL", timeframe="1h", start="2026-01-10", end="2026-01-20"
+        ),
+    )
+    return report
+
+
+def test_a_smaller_hole_next_to_an_excusable_one_is_still_caught(tmp_path):
+    """Collapsing to the largest hole hid the hole that mattered.
+
+    `find_internal_gaps` returned only the longest hole per symbol directory, and
+    the coverage verdict is computed per gap - so a second, smaller hole was never
+    examined. The bias points straight at the failure: **the largest hole is
+    systematically the most likely to be an excusable closure**, because holiday
+    weeks are the longest gaps there are. Picking the largest therefore surfaced
+    the one hole the calendar would excuse and discarded the one it would not.
+
+    Measured before the fix, on these bar boundaries: one gap reported (the 4.00-day
+    holiday), status `warning`, `failed_downloads` empty - while a 3.50-day hole sat
+    above the 3.0-day fail threshold the whole time.
+    """
+    report = _two_holes_one_excusable(tmp_path)
+
+    assert report["status"] == "failed", (
+        f"a 3.5-day hole next to an excusable holiday must fail coverage: {report}"
+    )
+    failed = report.get("failed_downloads") or []
+    assert any(abs(float(gap["gap_days"]) - 3.5) < 0.01 for gap in failed), (
+        f"the real outage is not among the failed downloads: {failed}"
+    )
+    # And the genuine holiday is still excused - the fix must not turn every
+    # multi-day gap into a failure.
+    assert not any(
+        abs(float(gap["gap_days"]) - 4.0) < 0.01 for gap in failed
+    ), f"the MLK holiday week was failed as a data hole: {failed}"
+
+
+def test_every_hole_above_the_threshold_is_returned_largest_first(tmp_path):
+    """The report is the whole set, ordered so the first is still the worst.
+
+    Largest first preserves what the `max()` guaranteed for any caller that only
+    looks at the first element, while no longer discarding the rest.
+    """
+    import pandas as pd
+
+    from data_tools.auto_download import find_internal_gaps
+
+    root = tmp_path / "data"
+    stamps = (
+        list(pd.date_range("2026-01-10 00:00", "2026-01-10 23:00", freq="1h", tz="UTC"))
+        + list(
+            pd.date_range("2026-01-14 11:00", "2026-01-16 12:00", freq="1h", tz="UTC")
+        )
+        + list(pd.date_range("2026-01-20 12:00", "2026-01-20 23:00", freq="1h", tz="UTC"))
+    )
+    _write_series(root / "ohlcv" / "AAPL", "1h.parquet", stamps)
+
+    gaps = find_internal_gaps(root / "ohlcv" / "AAPL", "1h", threshold_days=1.0)
+
+    assert len(gaps) == 2, f"expected both holes, got {gaps}"
+    assert [round(float(gap["gap_days"]), 2) for gap in gaps] == [4.0, 3.5], (
+        f"gaps must come back largest first: {[(g['start'], g['gap_days']) for g in gaps]}"
+    )
+
+
+def _segmented_gap_file(tmp_path, name: str):
+    """One 1-minute file with a 30-minute hole, written under `name`."""
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    idx = pd.date_range("2024-03-01 14:30", periods=240, freq="1min", tz="UTC")
+    idx = idx.delete(slice(120, 150))
+    base = np.arange(len(idx), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / name
+    directory.mkdir(parents=True)
+    path = directory / f"{name}.parquet"
+    frame.to_parquet(path, index=False)
+    return validate_parquet(path, ohlcv_root=root)
+
+
+def test_a_segmented_dataset_is_validated_at_its_own_timeframe(tmp_path):
+    """A segmented file must not be validated at the 3-hour default.
+
+    `validate_parquet` took `candidate.stem` as the timeframe, so every segmented
+    dataset became a timeframe called `1m_2024_03`. That misses the gap-threshold
+    table and falls back to 180 minutes - a **36x** loosening against the 5 minutes
+    a 1-minute file actually gets. Measured on identical data, before the fix:
+
+        1m.parquet          -> status=warning  gaps=1
+        1m_2024_03.parquet  -> status=ok      gaps=0
+
+    A 30-minute hole in a segmented 1m file was not merely under-reported; it was
+    invisible, and `status=ok` is a claim that the data is clean. Segmented storage
+    is a layout this repo deliberately supports - `catalog_builder` parses the
+    segment out, has whole machinery for `tick_2024_01` monthly layouts, and merges
+    the entries - so its datasets were being validated by a reader that did not know
+    they existed.
+
+    It reached further than the threshold too: this same value is passed to
+    `_gap_classification`, so gap classification was deciding with a name no
+    calendar could match.
+
+    Both files now report the same timeframe and the same gap, and the segmented
+    name is still recognised as segmented by the shared parser.
+    """
+    plain = _segmented_gap_file(tmp_path, "1m")
+    segmented = _segmented_gap_file(tmp_path, "1m_2024_03")
+
+    assert segmented.timeframe == plain.timeframe == "1m", (
+        f"segmented reported {segmented.timeframe!r} and plain {plain.timeframe!r}; "
+        f"one parser should serve both readers"
+    )
+    assert len(segmented.gaps) == len(plain.gaps) == 1, (
+        f"the same data yielded {len(plain.gaps)} gap(s) plain and "
+        f"{len(segmented.gaps)} segmented"
+    )
+    assert segmented.status == plain.status, (
+        f"the same data was {plain.status} plain and {segmented.status} segmented"
+    )
+    # "warning", not "ok": the hole is real and must be surfaced, not tolerated.
+    assert segmented.status != "ok", (
+        "a 30-minute hole in a 1-minute series reported 'ok', which is a claim the "
+        "data is clean"
+    )
+
+
+def test_a_tick_segmented_dataset_is_still_recognised(tmp_path):
+    """The other segmented shape the catalog builder supports explicitly.
+
+    `tick_2024_01` is a monthly tick layout with its own handling in the shared
+    parser, so it is the case most likely to regress if the parser is ever changed
+    to reject rather than strip a segment.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.catalog_builder import _extract_timeframe_and_segment
+    from data_tools.validate import validate_parquet
+
+    timeframe, segment = _extract_timeframe_and_segment("tick_2024_01")
+    assert (timeframe, segment) == ("tick", "2024_01")
+
+    idx = pd.date_range("2024-01-02 09:00", periods=200, freq="min", tz="UTC")
+    base = np.arange(len(idx), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "tick_2024_01"
+    directory.mkdir(parents=True)
+    path = directory / "tick_2024_01.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = validate_parquet(path, ohlcv_root=root)
+
+    assert result.timeframe == "tick", (
+        f"a monthly tick layout was read as {result.timeframe!r}"
+    )
+
+
+def _many_expected_gaps_plus_one_real_hole(tmp_path):
+    """25 weekend-sized gaps first, then one genuine hole late in the file.
+
+    Mirrors the shape that defeats a "look at the first N gaps" rule: in a real
+    multi-month intraday file the earliest large gaps are all weekends, holidays and
+    overnight closes, and they classify as *expected*.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    days = pd.date_range("2024-01-01", "2024-02-05", freq="D", tz="UTC")
+    stamps: list[pd.Timestamp] = []
+    for day in days:
+        if day.weekday() >= 5:
+            continue
+        segment = pd.date_range(
+            day + pd.Timedelta(hours=14), periods=30, freq="1min", tz="UTC"
+        )
+        if day.day > 20:
+            segment = segment.delete(slice(10, 18))  # 8 minutes, mid-session
+        stamps.extend(segment)
+    index = pd.DatetimeIndex(sorted(set(stamps)))
+    base = np.arange(len(index), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": index,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "1m"
+    directory.mkdir(parents=True)
+    path = directory / "1m.parquet"
+    frame.to_parquet(path, index=False)
+    return validate_parquet(path, ohlcv_root=root)
+
+
+def test_a_gap_after_the_twentieth_is_still_examined(tmp_path):
+    """A verdict computed from the first 20 of 130 gaps is a claim about the first 20.
+
+    The loop was `for pos in range(min(20, len(large_gaps)))`. In a multi-month
+    intraday file the earliest large gaps are weekends, holidays and overnight
+    closes, and they classify as expected - so they consumed the whole budget and
+    nothing after them was ever looked at. A real 45-minute hole in the middle of a
+    session reported `status=ok` with no warnings at all.
+
+    The cap is kept for the *report*, which is a fair thing to want, and lifted for
+    the *examination*: a file with 130 gaps and one real hole must still say it has a
+    real hole. And when the list is truncated it says so, because a truncated list
+    that does not mention the truncation is how the cap became invisible.
+    """
+    from data_tools.validate import MAX_REPORTED_GAPS
+
+    result = _many_expected_gaps_plus_one_real_hole(tmp_path)
+
+    detected = [w for w in result.warnings if "data gaps detected" in w]
+    assert detected, f"no gap was reported at all: {result.warnings}"
+    # The property, not a count I guessed: more unexpected gaps exist than the
+    # report lists, so the examination ran past the cap. (My first attempt asserted
+    # an exact number from a fixture whose arithmetic I had not checked - 28 gaps,
+    # not 21 - so the assertion was wrong in a way that had nothing to do with the
+    # code under test.)
+    reported_total = int(detected[0].split()[0])
+    assert reported_total > MAX_REPORTED_GAPS, (
+        f"only {reported_total} gap(s) were examined, so the cap still bounds the "
+        f"examination rather than only the report"
+    )
+    assert len(result.gaps) <= MAX_REPORTED_GAPS, (
+        f"the report grew past its own cap: {len(result.gaps)}"
+    )
+    assert any("not listed" in w for w in result.warnings), (
+        f"the report was truncated without saying so: {result.warnings}. A capped "
+        f"list that does not mention the cap reads as a complete one."
+    )
+    assert result.status == "warning", (
+        f"a file with a genuine mid-session hole reported {result.status}"
+    )
+
+
+def test_a_file_with_only_expected_gaps_reports_none(tmp_path):
+    """The other direction: lifting the cap must not manufacture findings."""
+    import numpy as np
+    import pandas as pd
+
+    from data_tools.validate import validate_parquet
+
+    # One continuous session, no hole anywhere. The first version of this fixture
+    # used a 30-minute window per weekday, which makes the weekday-to-weekday
+    # overnight a *genuine* 23.5-hour gap rather than an expected close - so the
+    # test failed for a correct reason and was testing the wrong thing.
+    index = pd.date_range("2024-01-02 14:30", periods=600, freq="1min", tz="UTC")
+    base = np.arange(len(index), dtype=float)
+    frame = pd.DataFrame(
+        {
+            "timestamp": index,
+            "open": base + 100,
+            "high": base + 101,
+            "low": base + 99,
+            "close": base + 100.5,
+            "volume": 1.0,
+        }
+    )
+    root = tmp_path / "ohlcv"
+    directory = root / "nasdaq" / "NQ" / "1m"
+    directory.mkdir(parents=True)
+    path = directory / "1m.parquet"
+    frame.to_parquet(path, index=False)
+
+    result = validate_parquet(path, ohlcv_root=root)
+
+    assert not result.gaps, (
+        f"weekend and overnight gaps must stay expected, got {result.gaps[:3]}"
+    )
+    assert result.status == "ok", (
+        f"a clean weekday series reported {result.status}: {result.warnings}"
+    )
+
+
+def test_source_meta_is_found_under_the_key_the_downloader_actually_writes(
+    tmp_path, monkeypatch
+):
+    """Two readers of one shared file must agree on its key.
+
+    The downloader writes `source/asset_class/symbol/timeframe` and `catalog_builder`
+    reads that shape. `validate` looked up three *path-shaped* keys - the absolute
+    path, the posix path, and the path relative to `DATA_DIR`, all of which end in
+    `.parquet`. Verified against the live `data/source_meta.json`: 56 keys, every
+    one canonical, none path-shaped.
+
+    So the lookup never matched anything and `_dataset_metadata` always returned
+    empty, and `validate_parquet` fell back to the observed-session heuristic. That
+    fallback is the lossy consumer: the metadata carries the session and calendar the
+    downloader *knows*, and it was being discarded, so the verdict on whether data
+    is clean was made from an inference.
+
+    Legacy path-shaped keys are still accepted - the point is not to break an older
+    file - but the canonical shape is tried first because that is what is written.
+    """
+    import json
+
+    import pandas as pd
+
+    from data_tools import validate as validate_module
+    from data_tools.validate import _dataset_metadata
+
+    key = "dukascopy/forex/EURUSD/1h"
+    declared = {"session": {"start": "08:00", "end": "16:00"}, "calendar": "FX"}
+
+    root = tmp_path
+    (root / "ohlcv").mkdir()
+    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }
+    ).to_parquet(target, index=False)
+    (root / "source_meta.json").write_text(json.dumps({key: declared}))
+    monkeypatch.setattr(validate_module, "DATA_DIR", root)
+
+    assert _dataset_metadata(target) == declared, (
+        f"the dataset metadata was not found under the key the downloader writes "
+        f"({key!r}), so validation fell back to inferring the session from the data"
+    )
+
+
+def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
+    tmp_path, monkeypatch
+):
+    """The fix must not break a file written under the old scheme."""
+    import json
+
+    import pandas as pd
+
+    from data_tools import validate as validate_module
+    from data_tools.validate import _dataset_metadata
+
+    root = tmp_path
+    (root / "ohlcv").mkdir()
+    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-01-02 09:00", tz="UTC")],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }
+    ).to_parquet(target, index=False)
+    (root / "source_meta.json").write_text(
+        json.dumps({str(target): {"calendar": "legacy"}})
+    )
+    monkeypatch.setattr(validate_module, "DATA_DIR", root)
+
+    assert _dataset_metadata(target) == {"calendar": "legacy"}, (
+        "an existing path-shaped key stopped resolving, which would discard metadata "
+        "for any dataset written before the canonical scheme"
+    )

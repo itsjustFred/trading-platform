@@ -28,6 +28,7 @@ from pathlib import Path
 import pandas as pd
 
 from data_tools.auto_download import TIMEFRAME_MINUTES, _nyse_holidays
+from data_tools.catalog_builder import _extract_timeframe_and_segment
 from data_tools.path_safety import ensure_dataset_path_within
 from shared.constants import DATA_DIR, normalize_timeframe
 
@@ -46,6 +47,11 @@ EXPECTED_BARS_PER_DAY = {
 }
 
 # Gap thresholds per timeframe (in minutes) — gaps larger than this are flagged
+#: How many unexpected gaps a validation result will *list*. The list is
+#: bounded so a multi-year file cannot produce an unbounded report; the
+#: verdict is not, so a file with 130 gaps and 1 real hole still says so.
+MAX_REPORTED_GAPS = 20
+
 GAP_THRESHOLD_MINUTES = {
     "1m": 5,
     "5m": 15,
@@ -70,6 +76,31 @@ def _utc_timestamp(value: object) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
+class _MalformedSession:
+    """A session was configured but could not be parsed. Not the same thing as *absent*.
+
+    `_session_window` used to return `None` for both, from three distinct causes: nothing was
+    configured, the value had no `start`/`end` separator, or a clock would not parse. The caller
+    could not tell them apart - and for equity-like assets it does not merely shrug, it substitutes
+    an *observed* window, so a configured session that never parsed was being silently replaced by
+    a guess. `data_tools/auto_download.py::_parse_session_clock` raises for the same inputs, so the
+    two copies disagreed about what malformed means.
+
+    This sentinel separates them without deciding anything: the caller below still maps malformed
+    to exactly today's behaviour, so no gap classification changes and the mislabelling pin stays
+    valid. What changes is that the difference is now *observable*, which is the precondition for
+    anyone choosing a policy. Backlog item 7.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "<malformed session>"
+
+
+MALFORMED_SESSION = _MalformedSession()
+
+
 def _parse_session_clock(value: object) -> int | None:
     if value is None:
         return None
@@ -84,7 +115,12 @@ def _parse_session_clock(value: object) -> int | None:
     return int(parsed.hour * 60 + parsed.minute)
 
 
-def _session_window(value: object) -> tuple[int, int] | None:
+def _session_window(value: object) -> tuple[int, int] | None | _MalformedSession:
+    """Resolve a session to `(start_minutes, end_minutes)`.
+
+    Returns `None` when **no** session was configured, `MALFORMED_SESSION` when one was configured
+    but could not be parsed, and the window otherwise. The three cases used to share `None`.
+    """
     if value is None:
         return None
     if isinstance(value, Mapping):
@@ -95,15 +131,18 @@ def _session_window(value: object) -> tuple[int, int] | None:
     else:
         text = str(value).strip()
         if not text:
+            # An empty string is an *empty* configuration, not a broken one.
             return None
         separator = "-" if "-" in text else (" to " if " to " in text else None)
         if separator is None:
-            return None
+            return MALFORMED_SESSION
         start, end = text.split(separator, 1)
+    if start is None and end is None:
+        return None
     start_minutes = _parse_session_clock(start)
     end_minutes = _parse_session_clock(end)
     if start_minutes is None or end_minutes is None:
-        return None
+        return MALFORMED_SESSION
     if end_minutes <= start_minutes:
         end_minutes += 1440
     return start_minutes, end_minutes
@@ -204,6 +243,49 @@ def _weekend_boundary(start: pd.Timestamp, end: pd.Timestamp) -> bool:
     return False
 
 
+_MALFORMED_SESSION_WARNED: set[str] = set()
+
+
+def reset_malformed_session_warnings() -> None:
+    """Forget which malformed sessions have been warned about. For tests."""
+    _MALFORMED_SESSION_WARNED.clear()
+
+
+def _warn_malformed_session_once(session_value: object, asset_class: str) -> None:
+    """Say once that a configured session could not be parsed.
+
+    Hoisted out of `_gap_classification` deliberately. The warning used to sit at the top of that
+    function, which the gap loop calls once per gap examined - and the examination is explicitly
+    *not* capped: the file notes that "the report is capped below and the examination is not: a
+    verdict computed from the first 20 of 130 gaps is a claim about the first 20". Measured before
+    this change: three calls produced three identical warnings, so a typo'd session on a multi-year
+    intraday file produced one per gap.
+
+    That is precisely the crying wolf the same batch refused for item 1's dedupe warning, and it
+    would have trained an operator to ignore the only signal that their own typo caused the
+    coverage warnings they were reading. The wording is unchanged and malformed still maps to
+    exactly today's classification, so no gap verdict moves - only the volume changed.
+
+    **Memoised per session value**, because hoisting the call out of the body is not enough on its
+    own: `_gap_classification` resolves the session itself, so the caller still reaches this once
+    per gap. A repeated value warns once per process. `reset_malformed_session_warnings()` clears
+    the record, which is what the tests use so they do not depend on each other's ordering.
+    Backlog item 7.
+    """
+    key = repr(session_value)
+    if key in _MALFORMED_SESSION_WARNED:
+        return
+    _MALFORMED_SESSION_WARNED.add(key)
+    logger.warning(
+        "Configured trading session %r could not be parsed, so it is being treated as if no "
+        "session were configured%s. The downloader raises on the same input, so this config "
+        "would fail at download time - which is worth knowing before triaging a coverage warning "
+        "as missing market data.",
+        session_value,
+        " and replaced by an observed one" if asset_class in _EQUITY_LIKE_ASSET_CLASSES else "",
+    )
+
+
 def _is_intraday_timeframe(timeframe: str) -> bool:
     return str(timeframe).strip().lower() not in {
         "",
@@ -245,6 +327,13 @@ def _gap_classification(
     if session_value is None and isinstance(calendar, Mapping):
         session_value = calendar.get("session", calendar.get("trading_session"))
     resolved_session = _session_window(session_value)
+    if resolved_session is MALFORMED_SESSION:
+        # Preserved deliberately: a malformed session still behaves as no session, so every gap
+        # classification is unchanged and the mislabelling pin stays valid. What is new is that the
+        # substitution below is no longer silent - and for equity-like assets it *is* a
+        # substitution, because an observed window is used in its place.
+        _warn_malformed_session_once(session_value, normalized_asset_class)
+        resolved_session = None
     if resolved_session is None and normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
         resolved_session = observed_session
     holiday_value = holidays
@@ -361,7 +450,27 @@ def _dataset_metadata(path: Path) -> dict:
             continue
         if not isinstance(payload, Mapping):
             continue
-        keys = [str(path), path.as_posix()]
+        # The canonical key first: `source/asset_class/symbol/timeframe`, which is
+        # what the downloader writes and what catalog_builder reads. Verified
+        # against the live file - 56 keys, every one of that shape, none
+        # path-shaped.
+        #
+        # The path-shaped lookups below never matched anything. Every one of them is
+        # a way of naming a *file*, while the writer names a *dataset*, so this
+        # function silently returned nothing and `validate_parquet` always fell back
+        # to the observed-session heuristic - the lossy consumer was the one
+        # deciding whether data is clean. Two readers of one shared file, disagreeing
+        # on its key scheme, which is the third appearance of that shape in this
+        # function's own file (see also the timeframe parsing).
+        keys: list[str] = []
+        source = path.parts[-4] if len(path.parts) >= 4 else ""
+        asset_class = path.parts[-3] if len(path.parts) >= 3 else ""
+        symbol = path.parent.name
+        timeframe_stem = path.stem
+        canonical = f"{source}/{asset_class}/{symbol}/{timeframe_stem}"
+        keys.append(canonical)
+        # Retained for any file written under the old path-shaped scheme.
+        keys.extend([str(path), path.as_posix()])
         try:
             keys.append(str(path.resolve().relative_to(DATA_DIR.resolve())))
         except (OSError, RuntimeError, ValueError):
@@ -435,7 +544,23 @@ def validate_parquet(
     # Extract metadata from path: {source}/{asset_class}/.../{symbol}/{tf}.parquet
     source = parts[0] if len(parts) >= 4 else "unknown"
     symbol = candidate.parent.name
-    timeframe = candidate.stem
+    # Parse the stem the way the catalog builder does, rather than taking it whole.
+    # `candidate.stem` is wrong for every segmented dataset, which is a layout this
+    # repo deliberately supports: `1m_2024_03` became the timeframe
+    # "1m_2024_03", missed the gap-threshold table, and fell back to the 180-minute
+    # default - a 36x loosening against the 5 minutes a 1-minute file actually gets.
+    # A 30-minute hole in a segmented 1m file was therefore never even considered.
+    #
+    # It also reached further than the threshold: this `timeframe` is passed to
+    # `_gap_classification`, so gap classification was deciding with a name no
+    # calendar could match.
+    #
+    # Measured across the two readers of the same filename:
+    #     1m.parquet         -> 5 min     1m_2024_03.parquet -> 180 min
+    # One parser, both readers - the same discipline the rest of this branch is
+    # about, applied to a filename rather than a broker payload.
+    parsed_timeframe, _segment = _extract_timeframe_and_segment(candidate.stem)
+    timeframe = parsed_timeframe or candidate.stem
 
     result = ValidationResult(
         path=str(rel),
@@ -540,7 +665,24 @@ def validate_parquet(
         threshold = pd.Timedelta(minutes=GAP_THRESHOLD_MINUTES.get(timeframe, 180))
 
         large_gaps = diffs[diffs > threshold]
-        for pos in range(min(20, len(large_gaps))):
+        unexpected_gaps = 0
+        unreported_gaps = 0
+        # Classify EVERY large gap, not the first 20.
+        #
+        # The first 20 gaps in a multi-month intraday file are all weekends,
+        # holidays and overnight closes, and they classify as expected - so they
+        # consume the entire budget and nothing after them is ever looked at. A
+        # real 45-minute hole in the middle of a session then reported
+        # `status=ok` with no warnings. Measured A/B on identical-shaped data:
+        #
+        #   hole in the first 20  -> status=warning  gaps=1
+        #   hole after 20        -> status=ok      gaps=0
+        #
+        # The cap was presumably there to bound the *report*, which is a
+        # reasonable thing to want. So the report is capped below and the
+        # examination is not: a verdict computed from the first 20 of 130 gaps is
+        # a claim about the first 20.
+        for pos in range(len(large_gaps)):
             idx = large_gaps.index[pos]
             gap_start = ts.iloc[idx - 1] if idx > 0 else ts.iloc[0]
             gap_end = ts.loc[idx]
@@ -560,17 +702,28 @@ def validate_parquet(
             if classification in _EXPECTED_GAP_CLASSIFICATIONS:
                 continue
 
-            result.gaps.append(
-                {
-                    "start": str(gap_start),
-                    "end": str(gap_end),
-                    "gap_minutes": round(gap_minutes, 1),
-                    "classification": classification,
-                }
-            )
+            unexpected_gaps += 1
+            if len(result.gaps) < MAX_REPORTED_GAPS:
+                result.gaps.append(
+                    {
+                        "start": str(gap_start),
+                        "end": str(gap_end),
+                        "gap_minutes": round(gap_minutes, 1),
+                        "classification": classification,
+                    }
+                )
+            else:
+                unreported_gaps += 1
 
-        if len(result.gaps) > 0:
-            result.warnings.append(f"{len(result.gaps)} data gaps detected")
+        if unexpected_gaps > 0:
+            result.warnings.append(f"{unexpected_gaps} data gaps detected")
+        if unreported_gaps > 0:
+            # Never silently: a truncated list that does not say so is how the cap
+            # became invisible in the first place.
+            result.warnings.append(
+                f"{unreported_gaps} further gap(s) not listed; the first "
+                f"{MAX_REPORTED_GAPS} are shown"
+            )
 
     # ─── OHLC consistency ──────────────────────────────────────────────
 
