@@ -34,6 +34,15 @@ class ReadinessCheck(BaseModel):
     severity: Literal["error", "warning", "info"] = "info"
     message: str = ""
     details: dict[str, Any] = Field(default_factory=dict)
+    #: Whether this check could be evaluated at all. `True` for every check that has an answer,
+    #: including a failing one - a failure is an answer. `False` means the check had nothing to
+    #: compare and is therefore excluded from the counts that decide readiness.
+    #:
+    #: Added for the zero-expectation Sharpe case, where the relative term of the tolerance
+    #: vanishes and there is no scale to be proportionate to. It is `True` everywhere by default
+    #: and is only ever `False` when `ReadinessConfig` opts in, so existing reports aggregate
+    #: identically.
+    applicable: bool = True
 
 
 class ReadinessReport(BaseModel):
@@ -78,9 +87,42 @@ class ReadinessConfig(BaseModel):
     # (as produced by validation/stats/calculator.py); the gate compares
     # stored fields and cannot re-derive the risk-free rate. Runner-produced
     # stats must be recomputed with risk_free_rate=0.0 before validation.
-    # Pass when the absolute drift fits max(10% relative, 0.1 absolute).
+    # Pass when the absolute drift fits max(10% relative, 0.05 absolute).
+    #
+    # The absolute floor was 0.1, and it governs whenever the expectation is small - which is
+    # the common case, not an edge case: 59.2% of the backtest corpus (1,572 of 2,655) stores
+    # `sharpe_ratio` exactly 0.0. At 0.1 the gate was ~15x looser in relative terms at zero
+    # than at a typical Sharpe of 1.5, so a drift of 0.09 against an expectation of 0.15 - a
+    # 60% proportional regression - passed.
+    #
+    # Halved to 0.05 because it is the cheapest fix with a measured scope: over the 1,030
+    # corpus rows that carry a non-zero Sharpe, 0.05 flips 7 of 2,655 rows and 0.02 flips 9,
+    # so 0.05 captures most of the tightening at the smallest blast radius. Reversible: this
+    # is a config default, not logic.
+    #
+    # Deliberately NOT changed here: whether `expected == 0` should be "not comparable"
+    # rather than pass or fail. That is a policy question - it would remove 1,572 of 2,655
+    # rows (59.2%) from the verdict, all of which pass today - and it is exposed as the switch
+    # below instead of being decided by arithmetic.
     stats_sharpe_tolerance_pct: float = 0.10
-    stats_sharpe_tolerance_abs: float = 0.1
+    stats_sharpe_tolerance_abs: float = 0.05
+    # #83 follow-up: what to do when the *expected* Sharpe is exactly zero, where the relative
+    # term vanishes and only the absolute floor applies. This is the open policy question in the
+    # backlog, and it is exposed here as a switch rather than left implicit in the arithmetic.
+    #
+    # `False` (the default) preserves today's behaviour exactly: a zero expectation is compared
+    # against the floor and can pass or fail like any other value.
+    #
+    # `True` would mark the check not-applicable instead, on the reasoning that an expectation of
+    # zero carries no scale to be proportionate to. It is NOT enabled, because it would remove
+    # 1,572 of 2,655 rows (59.2%) from the verdict - all of which pass today - while 1,019 of the
+    # 1,083 genuinely comparable rows already fail. That is a change to what the platform
+    # certifies, not a bug fix, and it belongs to whoever owns that policy.
+    #
+    # The field exists so that turning it on later is a one-word config change rather than a code
+    # change, and so that the current behaviour is a decision on the record instead of an
+    # accident of arithmetic.
+    stats_sharpe_zero_expectation_is_not_comparable: bool = False
     # #83: max-drawdown gate — 2pp absolute on max_drawdown_pct.
     stats_max_drawdown_tolerance_pp: float = 0.02
 
