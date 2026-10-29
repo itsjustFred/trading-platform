@@ -20,6 +20,38 @@ import aiohttp
 import pandas as pd
 from dotenv import load_dotenv
 
+# isort: split
+
+# --- import-origin guard -------------------------------------------------
+# Running a script puts `scripts/` on `sys.path[0]`, not the repo root, so `import shared` does not
+# find the checkout this file lives in: it falls through to the installed package, which points at a
+# *different* tree. Measured on 2026-10-04: the two were genuinely different revisions, and the
+# installed one carried a *shorter migration set*, so a script run this way applied an older schema
+# than the code believes and then reported success.
+#
+# Refused rather than silently corrected: quietly importing a different tree than the one being
+# edited is the hazard, not the fix. Run from the repo root as
+#     python -m scripts.adaptive_harvester
+# to use this checkout. Pinned by tests/test_script_import_origin.py.
+import shared as _shared_package
+
+_EXPECTED_PKG = Path(__file__).resolve().parent.parent / "shared"
+_ACTUAL_PKG = Path(next(iter(_shared_package.__path__))).resolve()
+if _ACTUAL_PKG != _EXPECTED_PKG:
+    print(
+        "refusing to run: `shared` was imported from the wrong tree.\n"
+        f"  this script lives in : {Path(__file__).resolve().parent.parent}\n"
+        f"  expected shared/     : {_EXPECTED_PKG}\n"
+        f"  actually imported    : {_ACTUAL_PKG}\n"
+        "\n"
+        "Running a script puts scripts/ on sys.path[0], not the repo root, so `import shared`\n"
+        "falls through to the installed package - a different revision, with a shorter\n"
+        "migration set. To run against the checkout being edited, from the repo root:\n"
+        "    python -m scripts.adaptive_harvester\n",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+# --- end import-origin guard ---------------------------------------------
 from data_tools.downloaders.dukascopy_native import (
     SYMBOL_CONFIG,
     _get_decimal_factor,
