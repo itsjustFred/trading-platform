@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from risk.config import RiskConfig
 from runner import portfolio_optimizer
 from runner.engines.signal_replay_adapter import (
     ReplaySignal,
@@ -25,8 +26,6 @@ from runner.engines.signal_replay_adapter import (
     _OpenPosition,
 )
 from runner.portfolio_optimizer import _portfolio_sharpe_from_weights
-from risk.config import RiskConfig
-
 
 # ─── F36: portfolio sharpe is annualized ────────────────────────────────────
 
@@ -76,7 +75,7 @@ class TestReplaySizingEquity:
         now marked at 90.0 → unrealized −10_000. The next sizing call must see
         an account balance of 90_000, not the realized-only 100_000.
         """
-        adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, 
+        adapter = SignalReplayAdapter(fee_params={"fees": "zero"},
             risk_config=RiskConfig(max_risk_per_trade=0.01, max_total_exposure=1.0),
             initial_capital=100_000.0,
         )
@@ -221,7 +220,7 @@ class TestMultiSymbolSettlement:
         −20_000; the open position is removed, so sizing for a GOLD1 signal
         sees capital − 20k realized and no PROBE MTM leg.
         """
-        adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, 
+        adapter = SignalReplayAdapter(fee_params={"fees": "zero"},
             risk_config=RiskConfig(max_risk_per_trade=0.01, max_total_exposure=1.0),
             initial_capital=100_000.0,
         )

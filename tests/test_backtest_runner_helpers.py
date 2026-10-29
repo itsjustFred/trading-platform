@@ -1,8 +1,8 @@
 """Unit tests for the extracted backtest-runner helpers (pre-mortem hardening)."""
 
 from viewer.main import (
-    _consume_backtest_line,
     _backtest_runner_stage,
+    _consume_backtest_line,
 )
 
 

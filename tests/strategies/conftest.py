@@ -19,8 +19,8 @@ import os
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
-import pyarrow.parquet as pq
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 
 from runner.engines.contract import parse_date_bound

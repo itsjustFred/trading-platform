@@ -15,9 +15,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts import run_risk_parity_backtest as risk_parity
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
-from scripts import run_risk_parity_backtest as risk_parity
 
 DEFAULT_OUTPUT = Path("data/backtests/risk_parity_quantconnect_reimplementation.json")
 DEFAULT_SOURCE = Path("ohlcv/yfinance/equity/US")

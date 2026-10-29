@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "volatility_breakout" / "volatility_breakout.py")
 # Window retargeted: the old window (2025-01-01..2025-03-31) predates the local
 # US500/1h dataset (starts 2025-04-01) and is uncovered everywhere locally.
@@ -41,7 +40,7 @@ EXPECTED_NET_PROFIT = 38.85
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="volatility_breakout",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

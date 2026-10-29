@@ -111,8 +111,9 @@ def test_stats_endpoint_payload_uses_flat_threshold_math(monkeypatch):
     import uuid
     from datetime import datetime, timezone
 
-    import viewer.main as viewer_main_module
     from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
     from shared.models import LiveBalanceRecord
 
     account_id = "acc-flat"

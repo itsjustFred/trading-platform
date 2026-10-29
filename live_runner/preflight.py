@@ -14,7 +14,7 @@ from dotenv import dotenv_values
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
-from live_runner.ctrader_adapter import CTraderLiveAdapter, DEFAULT_ACCOUNTS_ENV
+from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 

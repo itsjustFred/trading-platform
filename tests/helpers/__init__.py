@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pandas as pd
 
-
 #: Crossover strategy shared by the sizing/curve regression tests.
 SMA_CROSSOVER_STRATEGY = """
 import pandas as pd

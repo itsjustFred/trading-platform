@@ -1,7 +1,8 @@
-from runner.engine import TradeEngine
-from runner.engines.base import BacktestConfig
 import pandas as pd
 import pytest
+
+from runner.engine import TradeEngine
+from runner.engines.base import BacktestConfig
 
 
 def _engine(params=None):

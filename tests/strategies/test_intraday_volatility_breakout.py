@@ -2,8 +2,8 @@
 Unit + Integration tests for Intraday Volatility Breakout strategy.
 """
 
-from datetime import timedelta
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np

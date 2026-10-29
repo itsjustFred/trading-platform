@@ -15,8 +15,9 @@ STRATEGY_META = {'name': 'Sample EMA Cross',
                    'golden-cross',
                    'death-cross']}}
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+
 
 def generate_signals(df, params):
     """

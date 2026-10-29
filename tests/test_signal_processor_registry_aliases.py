@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
 import pytest
+import yaml
 
 from signal_bots.nitro import NitroSignalProcessor
 from signal_bots.ramjet import RamJetSignalProcessor

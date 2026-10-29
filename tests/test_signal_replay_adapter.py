@@ -34,7 +34,7 @@ def test_signal_replay_adapter_updates_trailing_stop_and_exits() -> None:
         default_timeframe="1m",
     )
 
-    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, 
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"},
         risk_config=RiskConfig(
             max_risk_per_trade=0.01,
             max_total_exposure=0.05,

@@ -25,7 +25,6 @@ never armed as a live exit (A-M3).
 import numpy as np
 import pandas as pd
 
-
 STRATEGY_META = {
     "name": "Overnight Gap Mean Reversion (Daily Proxy)",
     "version": "2.0.0",

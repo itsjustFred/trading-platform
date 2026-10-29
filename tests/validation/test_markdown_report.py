@@ -26,7 +26,6 @@ from validation.reporting.json_report import (
     generate_markdown_report as _generate_markdown_report,
 )
 
-
 # ---------------------------------------------------------------------------
 # Basic Markdown output tests
 # ---------------------------------------------------------------------------

@@ -145,8 +145,9 @@ def test_watchdog_does_not_kill_its_own_process_group():
 def test_watchdog_kills_child_group_when_child_is_group_leader():
     """A start_new_session child leads its own group; the watchdog must kill
     the whole group (and survive doing so)."""
-    from viewer import main as viewer_main
     import os
+
+    from viewer import main as viewer_main
 
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],

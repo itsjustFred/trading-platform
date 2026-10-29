@@ -4,8 +4,14 @@ import pandas as pd
 
 from shared.constants import DATA_DIR
 from shared.database import init_db, save_result_to_sqlite
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
-
+from shared.models import (
+    BacktestMeta,
+    BacktestResult,
+    EquityPoint,
+    IndicatorSeries,
+    Trade,
+    TradeExit,
+)
 
 # Demo timestamps inside the generated OHLCV window.
 _TS_10 = "2024-01-03T10:00:00+00:00"

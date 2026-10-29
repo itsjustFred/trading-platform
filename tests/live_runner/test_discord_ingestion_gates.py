@@ -483,9 +483,9 @@ def _assume_snapshot_deployments_currently_active(monkeypatch):
     return None and every dispatch would be skipped. Default the recheck to
     "the snapshot is still current"; tests that pin the recheck itself
     override `daemon.get_live_deployment` explicitly."""
-    import live_runner.daemon as daemon_module
-
     from types import SimpleNamespace as _NS
+
+    import live_runner.daemon as daemon_module
 
     def _current(deployment_id: str):
         return _NS(status="ACTIVE", id=deployment_id)
@@ -1073,8 +1073,9 @@ class TestIssue81ConfigExpansion:
 
 class TestIssue81EnvAllowlist:
     def test_per_service_env_allowlist(self) -> None:
-        from live_runner.daemon import _deployment_trusted_author_ids
         from types import SimpleNamespace as NS
+
+        from live_runner.daemon import _deployment_trusted_author_ids
 
         deployment = NS(
             signal_config={"source": "discord"},
@@ -1088,8 +1089,9 @@ class TestIssue81EnvAllowlist:
         assert resolved == {"bot-1", "bot-2"}
 
     def test_global_env_allowlist_fallback(self) -> None:
-        from live_runner.daemon import _deployment_trusted_author_ids
         from types import SimpleNamespace as NS
+
+        from live_runner.daemon import _deployment_trusted_author_ids
 
         deployment = NS(signal_config={}, settings={}, signal_source_id="nitro")
         resolved = _deployment_trusted_author_ids(
@@ -1099,8 +1101,9 @@ class TestIssue81EnvAllowlist:
         assert resolved == {"bot-9"}
 
     def test_config_allowlist_wins_over_env(self) -> None:
-        from live_runner.daemon import _deployment_trusted_author_ids
         from types import SimpleNamespace as NS
+
+        from live_runner.daemon import _deployment_trusted_author_ids
 
         deployment = NS(
             signal_config={"trusted_author_ids": ["cfg-1"]},
