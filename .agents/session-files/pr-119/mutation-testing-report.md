@@ -51,3 +51,25 @@ absence of the sentinel print immediately localise the failure.
 
 None. The 4/5 killed set covers every load-bearing behaviour introduced by the PR
 (the `onexit` guard, the import-time wiring, the daemon flag, and the executor routing).
+
+---
+
+## Round 2 (after review hardening)
+
+The `onexit` guard moved out of import into
+`jforex_dl._disable_jpype_onexit()`, called from `_ensure_jvm_started` (both the
+start and already-started branches). Re-verified the equivalents of M1/M2
+against the new shape:
+
+| # | File | Mutation | Result | Diagnostic |
+|---|------|----------|--------|------------|
+| 6 | `data_tools/downloaders/jforex_dl.py` | Remove `_disable_jpype_onexit()` from the start branch | **Killed** | Clear — `test_ensure_jvm_started_disables_onexit_before_start` |
+| 7 | `data_tools/downloaders/jforex_dl.py` | Remove `_disable_jpype_onexit()` from the already-started branch | **Killed** | Clear — same test, reuse-path assertion |
+| 8 | `viewer/main.py` | Drop the `sys.version_info` guard in `__init__` | Survived | — no test; guard is a loud-failure aid, not behaviour |
+
+Finding 8 is expected: the version guard is a diagnostic, not a behavioural
+contract, so nothing pins it. It is covered by inspection and by the import
+smoke test (`Lint packaging and import seams` in CI executes the module).
+
+Updated score for the changed logic: 6 / 8 killed; the two survivors are
+non-load-bearing (`max_workers` count and the version assert).
