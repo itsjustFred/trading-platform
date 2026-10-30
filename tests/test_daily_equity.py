@@ -750,13 +750,18 @@ class TestAttachDailyEquity:
             )
 
     def test_window_starting_equity_rejects_drift_beyond_one_cent(self):
-        """Beyond one cent the engine point is ignored and the ledger wins."""
+        """Beyond one cent the engine point is ignored and the ledger wins.
+
+        The drift is 1.5 cents on purpose: exactly 0.02 is not distinguishable
+        from a two-cent tolerance because 100_500.02 - 100_500.0 rounds just
+        above 0.02 in binary floating point.
+        """
         prior = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
         result = make_result(
             trades=[prior],
             equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.02)
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.015)
             ],
         )
 
