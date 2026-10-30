@@ -520,7 +520,7 @@ class MT5XLSXImporter(BaseImporter):
     def _extract_first_percent(val: Any) -> float | None:
         if val is None:
             return None
-        m = re.search(r"(\d+(?:[.,]\d*)?)\s*%", str(val))
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", str(val))
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -549,7 +549,7 @@ class MT5XLSXImporter(BaseImporter):
             return val
         text = str(val).strip()
         # Percentage wrapped in text, e.g. "1.0004 (0.04%)"
-        m = re.match(r"(\d+(?:[.,]\d*)?)\s*\(([^)]+)\)", text)
+        m = re.match(r"(\d+(?:[.,]\d+)?)\s*\(([^)]+)\)", text)
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -797,7 +797,8 @@ class MT5XLSXImporter(BaseImporter):
                 quantity=entry_volume,
                 exits=exits,
                 pnl=pnl,
-                fees=fees if fees != 0.0 else None,
+                # Exact zero, not a tolerance: MT5 reports "no fees" as 0.0.
+                fees=fees if abs(fees) > 0.0 else None,
                 net_pnl=pnl - fees,
                 stop_loss=sl,
                 take_profit=tp,

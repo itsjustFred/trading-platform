@@ -479,7 +479,6 @@ def _dataset_metadata(path: Path) -> dict:
             value = payload.get(key)
             if isinstance(value, Mapping):
                 return dict(value)
-        continue
     return {}
 
 
@@ -883,8 +882,8 @@ def main() -> int:
         try:
             report_path = _report_path(args.report, data_dir)
         except ValueError as exc:
-            logger.error("%s", exc)
-            return 2
+            # argparse's own idiom: usage plus the message on stderr, exit 2.
+            parser.error(str(exc))
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "summary": {"total": total, "ok": ok, "warning": warn, "error": err},
