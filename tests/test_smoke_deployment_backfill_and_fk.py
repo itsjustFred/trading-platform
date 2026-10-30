@@ -172,6 +172,30 @@ def test_backfill_never_deletes_and_leaves_unknown_accounts_alone(conn):
     assert conn.execute(text("select count(*) from live_signals")).scalar_one() == 2
 
 
+def test_backfill_leaves_a_non_smoke_orphan_whose_account_exists_alone(conn):
+    """The prefix restriction must hold even when the account row is present.
+
+    The other fixtures pair a non-smoke id with an *absent* account, so the account guard skips it
+    and the run passes with the prefix filter removed entirely. This one gives the non-smoke id a
+    real account, so only the prefix check can keep it out: a real deployment removed by hand
+    (`4e9bbdab`) must stay orphaned and be resolved by a human, not silently re-parented to a
+    fabricated row.
+    """
+    _add_account(conn, "44695443")
+    _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
+    _add_signal(conn, "s2", "4e9bbdab-0d15-4232-91e1-cc459166b764", symbol="AAPL")
+
+    assert _backfill_smoke_deployments(conn) == 1
+
+    orphan = conn.execute(
+        text("select deployment_id from live_signals where id = 's2'")
+    ).scalar_one()
+    assert orphan == "4e9bbdab-0d15-4232-91e1-cc459166b764", (
+        "a non-smoke orphan was re-parented, which fabricates a trading record"
+    )
+    assert conn.execute(text("select count(*) from live_deployments")).scalar() == 1
+
+
 def test_fk_rebuild_keeps_every_index(conn):
     """The trap: DROP TABLE removes indexes, so DDL must be captured before it.
 
