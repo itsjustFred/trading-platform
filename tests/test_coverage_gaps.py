@@ -37,6 +37,27 @@ def _write_bars(path: Path, timestamps: list[str]) -> None:
     frame.to_parquet(path, index=False)
 
 
+def test_a_hole_of_exactly_the_fail_threshold_warns_rather_than_fails(tmp_path):
+    """The decision record says a hole *longer than* 3 calendar days fails, so a
+    hole of exactly 3.00 days is still a warning. An off-by-one on that
+    comparison would fail every hole that lands exactly on the budget."""
+    _write_bars(
+        tmp_path / "ohlcv" / "alpaca" / "equity" / "AAPL" / "1m.parquet",
+        ["2026-09-08T20:00:00Z", "2026-09-11T20:00:00Z"],
+    )
+
+    report = analyze_ohlcv_coverage(
+        tmp_path,
+        DataRequirement(
+            symbol="AAPL", timeframe="1m", start="2026-09-08", end="2026-09-11"
+        ),
+    )
+
+    assert report["gaps"][0]["gap_days"] == 3.0
+    assert report["status"] == "warning"
+    assert report["failed_downloads"] == []
+
+
 class TestInternalGapDetection:
     def test_multi_year_hole_between_contiguous_runs_is_detected(self, tmp_path):
         """Regression DV-B15: min/max only checks pass multi-year holes."""
@@ -1867,3 +1888,96 @@ def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
         "an existing path-shaped key stopped resolving, which would discard metadata "
         "for any dataset written before the canonical scheme"
     )
+
+
+# ── A malformed session is not an absent one ────────────────────────────────
+#
+# `_session_window` used to return `None` for "nothing configured", "no
+# separator" and "a clock that will not parse" alike, and for equity-like assets
+# the caller then substituted an *observed* window - so a configured session that
+# never parsed was silently replaced by a guess. It is now a distinct state that
+# warns, while still classifying exactly as before.
+
+
+class TestMalformedSessionIsNotAnAbsentOne:
+    def test_a_session_without_a_separator_is_malformed_not_absent(self):
+        from data_tools.validate import MALFORMED_SESSION, _session_window
+
+        assert _session_window("09:30-16:00") == (570, 960)
+        assert _session_window("garbage") is MALFORMED_SESSION
+        assert _session_window("") is None, "an empty string is empty config, not broken config"
+        assert _session_window(None) is None
+        assert _session_window({"start": None, "end": None}) is None, (
+            "an explicitly empty window is absent, not malformed"
+        )
+
+    def test_an_unparseable_clock_is_malformed(self):
+        from data_tools.validate import MALFORMED_SESSION, _session_window
+
+        assert _session_window("nine-16:00") is MALFORMED_SESSION
+        assert _session_window({"start": "09:30", "end": "later"}) is MALFORMED_SESSION
+
+    def test_a_malformed_session_warns_once_per_value(self, caplog):
+        """The warning used to sit in the per-gap path, so a typo on a multi-year
+        intraday file produced one warning per gap - which trains an operator to
+        ignore the only signal that their own config caused the warnings."""
+        from data_tools.validate import (
+            _warn_malformed_session_once,
+            reset_malformed_session_warnings,
+        )
+
+        reset_malformed_session_warnings()
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                _warn_malformed_session_once("garbage", "equity")
+            _warn_malformed_session_once("other garbage", "equity")
+
+        messages = [r.message for r in caplog.records if "could not be parsed" in r.message]
+        assert len(messages) == 2, f"expected one warning per distinct value, got {messages}"
+
+    def test_a_malformed_session_still_classifies_like_no_session(self):
+        """Preserved behaviour: malformed maps to "no session", so for an
+        equity-like asset the observed window is substituted. What changed is
+        that the substitution is no longer silent."""
+        from data_tools.validate import (
+            _gap_classification,
+            reset_malformed_session_warnings,
+        )
+
+        reset_malformed_session_warnings()
+        start = pd.Timestamp("2026-09-08 15:00", tz="UTC")   # 11:00 Eastern
+        end = pd.Timestamp("2026-09-08 15:30", tz="UTC")
+        observed = (13 * 60 + 30, 20 * 60)                    # 09:30-16:00 Eastern in UTC
+
+        absent = _gap_classification(start, end, "equity", "1m", observed_session=observed)
+        malformed = _gap_classification(
+            start,
+            end,
+            "equity",
+            "1m",
+            session="garbage",
+            observed_session=observed,
+        )
+
+        assert absent == "session"
+        assert malformed == absent, (
+            "a malformed session stopped behaving like an absent one; the classification "
+            "now depends on a value that never parsed"
+        )
+
+
+def test_the_report_path_must_stay_inside_the_data_directory(tmp_path):
+    """`--report` reaches this CLI from the viewer's `/api/data/validate` payload,
+    so it is caller-controlled. Writing wherever it points is a path-injection
+    sink; the report is confined to the data directory it describes."""
+    from data_tools.validate import _report_path
+
+    root = tmp_path / "data"
+    root.mkdir()
+
+    assert _report_path("validation_report.json", root) == root / "validation_report.json"
+    assert _report_path(str(root / "nested" / "r.json"), root) == root / "nested" / "r.json"
+
+    for escaping in ("../outside.json", "/etc/passwd", "nested/../../outside.json"):
+        with pytest.raises(ValueError, match="inside the data directory"):
+            _report_path(escaping, root)

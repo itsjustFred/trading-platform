@@ -150,8 +150,9 @@ def test_last_session_at_or_before(moment, expected):
 
 
 def test_last_session_at_or_before_refuses_a_naive_moment():
+    naive = dt.datetime(2026, 9, 8, 15)
     with pytest.raises(ValueError, match="timezone-aware"):
-        market_calendar.last_session_at_or_before(dt.datetime(2026, 9, 8, 15))
+        market_calendar.last_session_at_or_before(naive)
 
 
 # ── Sessions behind: closures are not staleness, outages are ─────────────────
@@ -188,6 +189,17 @@ def test_the_daily_publication_lag_is_one_session_and_within_tolerance():
     assert behind <= market_calendar.AD_HOC_CLOSURE_TOLERANCE_SESSIONS
 
 
+def test_a_bar_stamped_exactly_at_the_open_covers_its_session():
+    """A bar's timestamp is the *start* of its interval, so the bar stamped at
+    the open contains the open. The half-open interval is `[bar, bar + spacing)`,
+    and an off-by-one that made it `(bar, bar + spacing]` would drop every bar
+    that starts exactly on the session open - which is every 1-minute bar of the
+    day."""
+    assert market_calendar.bar_covering_session(
+        _at(2026, 9, 10, 13, 30), dt.date(2026, 9, 10), nominal_days=5.0 / 1440.0
+    )
+
+
 def test_a_daily_bar_stamped_at_midnight_covers_its_session():
     assert market_calendar.bar_covering_session(
         _at(2026, 9, 10, 0), dt.date(2026, 9, 10), nominal_days=1.0
@@ -204,10 +216,10 @@ def test_a_weekly_bar_stamped_on_monday_covers_the_week():
 
 
 def test_bar_staleness_refuses_a_naive_bar():
+    naive_bar = dt.datetime(2026, 9, 8, 15)
+    now = _at(2026, 9, 9, 15)
     with pytest.raises(ValueError, match="timezone-aware"):
-        market_calendar.bar_staleness_sessions(
-            dt.datetime(2026, 9, 8, 15), _at(2026, 9, 9, 15), nominal_days=1.0
-        )
+        market_calendar.bar_staleness_sessions(naive_bar, now, nominal_days=1.0)
 
 
 # ── The shape half: did the hole span a scheduled session? ──────────────────
@@ -231,6 +243,8 @@ def test_a_closure_shaped_hole_is_explained(start, end, why):
     ("start", "end", "why"),
     [
         ("2026-09-08", "2026-09-11", "three live sessions strictly inside"),
+        ("2026-09-11", "2026-09-15", "a weekend plus the live Monday inside"),
+        ("2026-07-02", "2026-07-07", "a holiday, the weekend, and the live Monday inside"),
         ("2026-09-05", "2026-09-08", "starts on a Saturday, so no session at the edge"),
         ("2026-09-08", "2026-09-08", "empty hole"),
         ("2026-09-08", "2026-09-01", "reversed"),

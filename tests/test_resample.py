@@ -602,3 +602,40 @@ class TestOriginIsOnlyPassedWherePandasHonoursIt:
         assert isinstance(
             pd.tseries.frequencies.to_offset("1D"), pd.tseries.offsets.Tick
         ) is False
+
+
+def test_unsorted_input_is_sorted_before_bucketing():
+    """A downloader that appends a late batch can hand the resampler rows out of
+    order. `resample_with_origin` sorts the index first; without that, pandas
+    buckets by position and the resulting bars are wrong rather than merely
+    reordered."""
+    from data_tools.resample import resample_with_origin
+
+    stamps = pd.to_datetime(
+        [
+            "2024-01-02 09:03",
+            "2024-01-02 09:00",
+            "2024-01-02 09:04",
+            "2024-01-02 09:01",
+            "2024-01-02 09:02",
+        ],
+        utc=True,
+    )
+    frame = pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "open": [3.0, 0.0, 4.0, 1.0, 2.0],
+            "high": [3.0, 0.0, 4.0, 1.0, 2.0],
+            "low": [3.0, 0.0, 4.0, 1.0, 2.0],
+            "close": [3.0, 0.0, 4.0, 1.0, 2.0],
+            "volume": [1.0] * 5,
+        }
+    )
+
+    out = resample_with_origin(frame, "5min")
+
+    assert list(out["timestamp"]) == [pd.Timestamp("2024-01-02 09:00", tz="UTC")]
+    assert out["open"].iloc[0] == 0.0, "the 09:00 bar must open the bucket, not the 09:05 row"
+    assert out["close"].iloc[0] == 4.0, "the 09:04 bar must close the bucket"
+    assert out["high"].iloc[0] == 4.0
+    assert out["volume"].iloc[0] == 5.0

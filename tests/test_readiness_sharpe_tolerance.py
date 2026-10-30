@@ -267,6 +267,10 @@ def test_the_zero_expectation_policy_is_a_switch_and_defaults_to_todays_behaviou
     assert gross.applicable is False, (
         "a 0.5 drift against a zero expectation was judged rather than declined"
     )
+    assert gross.severity == "info", (
+        f"a declining check kept severity {gross.severity!r}; opting in would then still fail "
+        "the row through the aggregation rather than decline to judge it"
+    )
 
     # And a non-zero expectation is completely unaffected by the switch.
     for expected, actual, want in ((0.15, 0.20, False), (1.5, 1.59, True), (1.5, 2.0, False)):
