@@ -168,7 +168,7 @@ class TestComputeStats:
         stats = compute_stats([], equity_curve=equity)
 
         expected = (101_000.0 / 100_000.0) ** (365.25 / 3.0) - 1.0
-        assert stats["cagr"] == pytest.approx(expected, abs=1e-6)
+        assert stats["cagr"] == pytest.approx(expected, rel=0, abs=1e-6)
 
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the

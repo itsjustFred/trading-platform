@@ -743,8 +743,10 @@ class TestAttachDailyEquity:
                 ],
             )
 
+            # rel=0: pytest's default rel=1e-6 would allow 0.1 currency units
+            # of slack here, which is exactly the tolerance under test.
             assert _window_starting_equity(result, start) == pytest.approx(
-                engine_equity, abs=1e-9
+                engine_equity, rel=0, abs=1e-9
             )
 
     def test_window_starting_equity_rejects_drift_beyond_one_cent(self):
@@ -758,7 +760,9 @@ class TestAttachDailyEquity:
             ],
         )
 
-        assert _window_starting_equity(result, start) == pytest.approx(100_500.0, abs=1e-9)
+        assert _window_starting_equity(result, start) == pytest.approx(
+            100_500.0, rel=0, abs=1e-9
+        )
 
     def test_window_starting_equity_cent_tolerance_is_absolute_on_high_priced_account(self):
         """One cent stays one cent: a relative tolerance would hide $0.02 here."""
@@ -777,7 +781,7 @@ class TestAttachDailyEquity:
         )
 
         assert _window_starting_equity(result, start) == pytest.approx(
-            initial_capital + 500.0, abs=1e-6
+            initial_capital + 500.0, rel=0, abs=1e-6
         )
 
     def test_high_priced_account_endpoint_drift_beyond_one_cent_is_rejected(self):
