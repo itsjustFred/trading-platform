@@ -86,6 +86,35 @@ def test_jforex_dl_disables_jpype_onexit_at_import():
     assert jforex_dl.jpype.config.onexit is False
 
 
+def test_production_code_never_calls_jpype_shutdownjvm():
+    """Pin the documented "one-shot JVM" contract the ``onexit`` fix depends on.
+
+    With ``onexit = False`` the JVM is deliberately left for the OS to reclaim
+    at process exit. JPype cannot restart a JVM in the same interpreter, so any
+    ``shutdownJVM()`` call would deadlock (it reaches the same
+    ``Threads::destroy_vm()`` path as the removed exit hook) or, worse, leave
+    ``_ensure_jvm_started`` retrying ``startJVM`` on a torn-down VM and failing
+    with a misleading diagnostics error. The contract is documented in the
+    module comment and ``docs/DATA_SOURCES.md``; this asserts no production
+    module calls it, so the invariant cannot rot silently.
+    """
+    repo_root = Path(__file__).parent.parent
+    offenders: list[str] = []
+    for path in sorted(repo_root.rglob("*.py")):
+        rel = path.relative_to(repo_root)
+        if rel.parts[0] in {"tests", ".venv", ".git"} or ".venv" in rel.parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(source.splitlines(), start=1):
+            code = line.split("#", 1)[0]
+            if "shutdownJVM" in code:
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "production code must not call jpype.shutdownJVM() (one-shot JVM contract):\n"
+        + "\n".join(offenders)
+    )
+
+
 @requires_java
 def test_process_with_started_jvm_exits_cleanly_and_promptly():
     """A process that started a JVM must exit 0 quickly, not hang.
