@@ -137,12 +137,24 @@ def test_the_column_exists_and_is_nullable(isolated_db: Any) -> None:
 
 
 def test_a_broker_fill_id_survives_the_round_trip(signal_id: str) -> None:
-    """Written on the way in, readable on the way out."""
+    """Written on the way in, readable on the way out.
+
+    Both directions are asserted: the write-only half would pass with the column populated and the
+    model still dropping it on read, which leaves the evidence unusable to every caller.
+    """
+    from sqlmodel import select
+
     assert database.save_live_execution(
         _fill(signal_id, fill_id=26533115, dedupe_key="ctrader:deal:26533115")
     )
     rows = _rows()
     assert rows == [("ctrader:deal:26533115", 26533115)], rows
+
+    with database.get_session() as session:
+        record = session.exec(select(database.LiveExecutionModel)).one()
+    assert record.to_live_execution().broker_fill_id == 26533115, (
+        "the column is populated but the model drops the value on read, so no caller can use it"
+    )
 
 
 def test_two_equal_fills_on_one_order_are_now_distinguishable(signal_id: str) -> None:
@@ -194,6 +206,63 @@ def test_dedupe_behaviour_is_unchanged(signal_id: str) -> None:
         _fill(signal_id, fill_id=26533116, dedupe_key="ctrader:deal:26533116")
     ) is True
     assert len(_rows()) == 2, _rows()
+
+
+def test_the_adapter_records_the_deal_id_it_keys_the_row_by() -> None:
+    """The whole point is that the *adapter* stores it, not that the column accepts a value.
+
+    The storage tests above would all pass with the adapter still passing nothing, which is the
+    state this change exists to end - so this drives the adapter's own construction path.
+    """
+    pytest.importorskip(
+        "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+        reason="ctrader-open-api package is not installed in this environment",
+    )
+    from types import SimpleNamespace
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=2, PARTIALLY_FILLED=3)
+    adapter._resolve_filled_volume = lambda **_: 1000.0
+    adapter._symbol_name_for_id = lambda _symbol_id: "XAUUSD"
+    adapter._scale_for = lambda _symbol: SimpleNamespace(volume_per_qty=1000.0)
+    deal = SimpleNamespace(
+        dealStatus=2,
+        dealId=26533115,
+        executionPrice=261.7,
+        commission=0.0,
+        executionTimestamp=1_700_000_000_000,
+        utcLastUpdateTimestamp=0,
+        symbolId=41,
+    )
+
+    execution = adapter._build_reconciled_execution(
+        deal, signal_uuid=uuid.uuid4(), broker_order_id="450566f0"
+    )
+
+    assert execution is not None
+    assert execution.dedupe_key == "ctrader:deal:26533115"
+    assert execution.broker_fill_id == 26533115, (
+        "the adapter keyed the row by the deal id but did not record it, so a later collision "
+        "between two equal-sized fills is still undecidable"
+    )
+
+
+def test_a_missing_deal_id_is_none_not_zero() -> None:
+    """``0`` is the protobuf default and the adapter's own sentinel, so it must not be stored."""
+    pytest.importorskip(
+        "ctrader_open_api.messages.OpenApiModelMessages_pb2",
+        reason="ctrader-open-api package is not installed in this environment",
+    )
+    from types import SimpleNamespace
+
+    from live_runner.ctrader_adapter import _deal_id_or_none
+
+    assert _deal_id_or_none(None) is None
+    assert _deal_id_or_none(SimpleNamespace()) is None
+    assert _deal_id_or_none(SimpleNamespace(dealId=0)) is None
+    assert _deal_id_or_none(SimpleNamespace(dealId=26533115)) == 26533115
 
 
 def test_the_migration_adds_the_column_and_is_idempotent(isolated_db: Any) -> None:
