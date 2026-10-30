@@ -542,18 +542,6 @@ def ensure_backtest_data(
     return downloaded
 
 
-def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
-    """Raise when any requirement's stored range hides an internal hole."""
-    for requirement in requirements:
-        coverage_report = analyze_ohlcv_coverage(data_root, requirement)
-        if coverage_report.get("status") == "failed":
-            raise RuntimeError(
-                "OHLCV coverage has internal gaps for "
-                f"{requirement.symbol} {requirement.timeframe}: "
-                f"{coverage_report.get('gaps') or coverage_report.get('error')}"
-            )
-
-
 def _resolve_data_root(data_dir: str | Path) -> Path:
     if data_dir:
         return Path(data_dir).expanduser().resolve()
@@ -649,6 +637,7 @@ def scaled_gap_threshold_days(
 
 
 def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement]) -> None:
+    """Raise when any requirement's stored range hides an internal hole."""
     for requirement in requirements:
         report = analyze_ohlcv_coverage(data_root, requirement)
         if report.get("status") == "failed":
