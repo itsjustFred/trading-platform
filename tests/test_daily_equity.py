@@ -1055,6 +1055,89 @@ class TestAttachDailyEquity:
         )
         assert returns[14]["equity"] == 101_234.57
 
+    def test_fractional_starting_equity_is_quantised_like_the_closes(self):
+        """A fractional opening balance is reported to the cent, not raw.
+
+        ``starting_equity`` comes from the reconstructed window start and is
+        generally not a whole number of cents.  It enters the curve at the same
+        precision as every close, so the opening point does not carry more
+        digits than the rest of the series.
+        """
+        result = make_result(
+            trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=0.0)]
+        )
+
+        points, returns = build_daily_equity_curve(result, starting_equity=100_000.005)
+
+        # 100_000.005 is the nearest-cent rounding case: it lands on .01.
+        assert points[0].equity == 100_000.01
+        assert all(
+            day_return["equity"] == round(day_return["equity"], 2)
+            for day_return in returns
+        )
+        by_date = {daily["date"]: daily for daily in returns}
+        # A zero-PnL day reports the same quantised balance and a flat return.
+        assert by_date["2024-01-14"]["equity"] == points[0].equity
+        assert by_date["2024-01-14"]["return"] == pytest.approx(0.0, abs=0.0)
+        assert by_date["2024-01-01"]["equity"] == points[0].equity
+
+    def test_daily_returns_reconstruct_the_curve_endpoint(self):
+        """The reported equity series must land on the published curve closes.
+
+        This pins the *relationship* between the two published views rather than
+        their individual values: ``daily_returns[i]["equity"]`` and the matching
+        curve close describe the same instant and must carry the same number.
+        Quantising one side without the other breaks this.
+        """
+        trades = [
+            make_trade(exit_time=f"2024-01-{day:02d}T15:00:00Z", pnl=0.004, id=day)
+            for day in range(1, 31)
+        ]
+        result = make_result(trades=trades)
+
+        points, returns = build_daily_equity_curve(result)
+
+        # One point per reported day, plus the opening point.
+        assert len(points) == len(returns) + 1
+        for day_return, point in zip(returns, points[1:], strict=True):
+            assert day_return["equity"] == point.equity
+        assert returns[-1]["equity"] == points[-1].equity
+
+        # The per-day factors are computed from the raw ledger, so compounding
+        # them reconstructs the ledger's own move.  The equity series is that
+        # same move quantised to the cent, so the two agree to within the
+        # rounding the curve can introduce on the opening balance.
+        compounded = 1.0
+        for day_return in returns:
+            if day_return["return"] is not None:
+                compounded *= 1.0 + day_return["return"]
+        ledger_factor = returns[-1]["equity"] / points[0].equity
+
+        assert compounded == pytest.approx(
+            ledger_factor, rel=0, abs=1.0 / points[0].equity
+        )
+
+    def test_published_curve_never_overshoots_the_end_instant(self):
+        """A generated curve must stay inside the requested window end.
+
+        Drives the ``end_bound`` guard through the public entry point: when the
+        end instant lands just short of the day close, the normalised closes
+        must not be shifted past it.
+        """
+        result = make_result(
+            trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=500.0)],
+            backtest_end="2024-01-15T23:59:59.999998+00:00",
+        )
+
+        attach_daily_equity(result)
+
+        end_bound = datetime.fromisoformat("2024-01-15T23:59:59.999998+00:00")
+        assert all(
+            datetime.fromisoformat(point.time) <= end_bound
+            for point in result.equity_curve
+        )
+        assert result.equity_curve[-1].time == "2024-01-15T23:59:59.999998+00:00"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
