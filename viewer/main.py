@@ -407,6 +407,14 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
     consumes their result and a half-finished warm only means a cold cache, so
     a daemon worker that is cut off mid-scan at teardown is the correct
     trade-off — shutdown must never wait on it.
+
+    ``_adjust_thread_count`` mirrors CPython's private
+    ``ThreadPoolExecutor`` internals (``_worker``, ``_idle_semaphore``,
+    ``_threads`` and the weakref callback) to keep worker bookkeeping intact
+    while flipping only the ``daemon`` flag. It is validated against CPython
+    3.12, the interpreter this project pins (``requires-python``, the CI
+    matrix and ``sonar.python.version`` all set 3.12); the upstream internals
+    would need re-checking before widening that range.
     """
 
     def _adjust_thread_count(self) -> None:
