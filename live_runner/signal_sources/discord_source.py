@@ -599,6 +599,75 @@ def _schedule(coro: Any) -> None:
     task.add_done_callback(_observed_tasks.discard)
 
 
+def _resolve_message_author_id(message: Any) -> str:
+    """The author id of a message, lowercased, or "" when it cannot be read."""
+    return str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
+
+
+def _resolve_message_channel_id(message: Any) -> str:
+    """The channel id of a message, or "" when it cannot be read."""
+    return str(getattr(getattr(message, "channel", None), "id", ""))
+
+
+def _reject_untrusted_author(
+    message: Any,
+    author_id: str,
+    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None,
+) -> None:
+    """Record and log one message refused by the author allowlist.
+
+    Extracted from the parser so the gate itself reads as one decision. The two
+    halves are deliberately ordered and both are load-bearing: a caller that can
+    only schedule (the parser is synchronous) must still have the rejection
+    counted before the message is dropped, or a burst of impersonation attempts
+    leaves no trace an operator can act on.
+    """
+    if on_author_rejection is not None:
+        result = on_author_rejection(author_id or "<missing>")
+        if inspect.isawaitable(result):
+            _schedule(result)
+    logger.warning(
+        "Discord message rejected: author is not a trusted signal source",
+        extra={
+            "data": {
+                "discord_author_id": author_id,
+                "discord_channel_id": _resolve_message_channel_id(message),
+            }
+        },
+    )
+
+
+def _build_signal_metadata(
+    message: Any,
+    content: str,
+    *,
+    signal_type: str | None,
+    default_timeframe: str,
+) -> dict[str, Any]:
+    """The provenance the daemon needs to age-check and audit one parsed signal."""
+    metadata: dict[str, Any] = {
+        "source": "discord",
+        "discord_signal_type": signal_type or "generic",
+        "discord_message_id": str(getattr(message, "id", "")),
+        "discord_channel_id": _resolve_message_channel_id(message),
+        "discord_author_id": str(getattr(getattr(message, "author", None), "id", "")),
+        "discord_content": content,
+        "timeframe": normalize_timeframe(default_timeframe) or default_timeframe,
+    }
+    created_at = getattr(message, "created_at", None)
+    raw_timestamp = created_at.isoformat() if isinstance(created_at, datetime) else None
+    timestamp = _parse_timestamp(raw_timestamp)
+    if timestamp is not None:
+        metadata["received_at"] = timestamp.isoformat()
+    else:
+        # No fabricated receipt time. The key is left absent so the daemon's
+        # pre-wait age gate -- which knows it is on the Discord path and so
+        # requires the key -- refuses with an operator-visible warning rather
+        # than trading a message whose age nobody can establish.
+        metadata["discord_received_at_unreadable"] = True
+    return metadata
+
+
 def _parse_trade_signal_from_message(
     message: Any,
     *,
@@ -620,23 +689,9 @@ def _parse_trade_signal_from_message(
 
     trusted = _normalize_author_ids(trusted_author_ids)
     if trusted is not None:
-        author_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
+        author_id = _resolve_message_author_id(message)
         if not author_id or author_id not in trusted:
-            if on_author_rejection is not None:
-                result = on_author_rejection(author_id or "<missing>")
-                if inspect.isawaitable(result):
-                    _schedule(result)
-            logger.warning(
-                "Discord message rejected: author is not a trusted signal source",
-                extra={
-                    "data": {
-                        "discord_author_id": author_id,
-                        "discord_channel_id": str(
-                            getattr(getattr(message, "channel", None), "id", "")
-                        ),
-                    }
-                },
-            )
+            _reject_untrusted_author(message, author_id, on_author_rejection)
             return None
 
     if on_author_accepted is not None:
@@ -664,26 +719,12 @@ def _parse_trade_signal_from_message(
     if not symbol or price is None or price <= 0:
         return None
 
-    created_at = getattr(message, "created_at", None)
-    raw_timestamp = created_at.isoformat() if isinstance(created_at, datetime) else None
-    timestamp = _parse_timestamp(raw_timestamp)
-    metadata = {
-        "source": "discord",
-        "discord_signal_type": signal_type or "generic",
-        "discord_message_id": str(getattr(message, "id", "")),
-        "discord_channel_id": str(getattr(getattr(message, "channel", None), "id", "")),
-        "discord_author_id": str(getattr(getattr(message, "author", None), "id", "")),
-        "discord_content": content,
-        "timeframe": normalize_timeframe(default_timeframe) or default_timeframe,
-    }
-    if timestamp is not None:
-        metadata["received_at"] = timestamp.isoformat()
-    else:
-        # No fabricated receipt time. The key is left absent so the daemon's
-        # pre-wait age gate -- which knows it is on the Discord path and so
-        # requires the key -- refuses with an operator-visible warning rather
-        # than trading a message whose age nobody can establish.
-        metadata["discord_received_at_unreadable"] = True
+    metadata = _build_signal_metadata(
+        message,
+        content,
+        signal_type=signal_type,
+        default_timeframe=default_timeframe,
+    )
     return TradeSignal(
         action=action,
         symbol=symbol,
@@ -712,6 +753,42 @@ class _DiscordMessageAdapter:
         self.channel = SimpleNamespace(id=str(message.get("channel_id")))
         author = message.get("author") or {}
         self.author = SimpleNamespace(id=str(author.get("id")))
+
+
+def _resolve_auth_scheme(bot_name: str, auth_scheme: str | None) -> str:
+    """Resolve and validate the credential scheme for one Discord bot.
+
+    Returns the scheme name from ``DISCORD_AUTH_SCHEMES``; raises ``ValueError``
+    for anything else.
+
+    An unrecognised scheme must never fall through to "raw" or "bot" and poll with
+    the wrong credential, so this raises rather than defaulting. Kept out of
+    ``DiscordSignalSource.__init__`` because the precedence chain, the vocabulary
+    and the refusal are one decision, and reading them interleaved with attribute
+    assignment hid that.
+    """
+    per_bot_scheme_key = discord_bot_env_key(bot_name, "AUTH_SCHEME")
+    scheme = str(
+        auth_scheme
+        or os.environ.get(per_bot_scheme_key, "")
+        or os.environ.get("DISCORD_AUTH_SCHEME", "")
+        or DEFAULT_DISCORD_AUTH_SCHEME
+    ).strip().lower()
+    if scheme not in DISCORD_AUTH_SCHEMES:
+        raise ValueError(
+            f"Unsupported Discord auth_scheme '{scheme}': unknown "
+            f"discord_auth_scheme; expected one of "
+            f"{sorted(DISCORD_AUTH_SCHEMES)}"
+        )
+    if scheme in DISCORD_ACCOUNT_AUTH_SCHEMES:
+        logger.warning(
+            "Discord source configured with an ACCOUNT (user) token. That is a "
+            "self-bot: it violates Discord's Terms of Service and can get the "
+            "account terminated. Use a Developer Portal bot token for unattended "
+            "trading.",
+            extra={"data": {"bot_name": bot_name, "auth_scheme": scheme}},
+        )
+    return scheme
 
 
 class DiscordSignalSource(BaseSignalSource):
@@ -745,30 +822,7 @@ class DiscordSignalSource(BaseSignalSource):
         # devtools), "account" the explicit one; both name the same credential.
         # Precedence: explicit argument -> per-bot env -> global env -> default,
         # so a per-bot scheme can never be shadowed by a global one.
-        per_bot_scheme_key = discord_bot_env_key(self.bot_name, "AUTH_SCHEME")
-        scheme = str(
-            auth_scheme
-            or os.environ.get(per_bot_scheme_key, "")
-            or os.environ.get("DISCORD_AUTH_SCHEME", "")
-            or DEFAULT_DISCORD_AUTH_SCHEME
-        ).strip().lower()
-        if scheme not in DISCORD_AUTH_SCHEMES:
-            # Raise: an unrecognised scheme must never fall through to "raw"
-            # or "bot" and poll with the wrong credential.
-            raise ValueError(
-                f"Unsupported Discord auth_scheme '{scheme}': unknown "
-                f"discord_auth_scheme; expected one of "
-                f"{sorted(DISCORD_AUTH_SCHEMES)}"
-            )
-        self.auth_scheme = scheme
-        if scheme in DISCORD_ACCOUNT_AUTH_SCHEMES:
-            logger.warning(
-                "Discord source configured with an ACCOUNT (user) token. That is a "
-                "self-bot: it violates Discord's Terms of Service and can get the "
-                "account terminated. Use a Developer Portal bot token for unattended "
-                "trading.",
-                extra={"data": {"bot_name": self.bot_name, "auth_scheme": scheme}},
-            )
+        self.auth_scheme = _resolve_auth_scheme(self.bot_name, auth_scheme)
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
         if fallback_channel_id:

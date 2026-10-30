@@ -102,9 +102,20 @@ def _write_record(
     So the observation gets written down. Author ids, counts and channel ids only
     - no message content, no tokens - and the default path is gitignored, because
     an author id is a small secret: it is the ingestion allowlist.
+
+    ``--out`` is an operator-supplied path and is honoured as given - a tool that
+    silently redirected an explicit destination would be worse than useless when
+    the whole point is to put the record somewhere durable. What is refused is a
+    *non-file* target: the write is opened in a create/truncate mode, so pointing
+    it at a device, a socket, or a directory is a way to hang the process or
+    scribble on something that is not a record.
     """
     if out is None:
         return
+    if out.is_dir():
+        raise ValueError(
+            f"--out {out} is an existing directory; give a file path for the record"
+        )
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

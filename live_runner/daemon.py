@@ -549,7 +549,12 @@ def _live_account_broker_login(account_id: str) -> str:
     try:
         account = get_live_account(str(account_id))
     except Exception as exc:
-        logger.error(
+        # `exception()` and not `error()`: this is an unexpected failure on the
+        # routing path, and the traceback is the only thing that says whether the
+        # account lookup itself blew up or something below it did. The empty
+        # string returned here makes routing fail closed, so without the
+        # traceback the operator sees a refusal with no cause.
+        logger.exception(
             "Could not resolve broker identity for account",
             extra={"data": {"account_id": account_id, "error": repr(exc)}},
         )
@@ -1483,15 +1488,22 @@ async def _renew_submission_claim_until_cancelled(token: str) -> None:
             return
 
 
-async def _submit_normalized_discord_signal(
+async def _prepare_discord_signal_for_submission(
     account_id: str,
-    adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     trade_signal: TradeSignal,
     *,
     signal_timeframe: str,
     wait_enabled: bool,
-) -> None:
+) -> TradeSignal | None:
+    """Apply the pre-wait gates and, when enabled, the candle-close wait.
+
+    Returns the normalised signal to submit, or ``None`` when a gate refused it.
+    Every refusal is logged with the account/deployment/symbol it applies to and
+    returns ``None`` rather than raising: these signals are dispatched in a
+    fan-out loop, and letting one deployment's bad config propagate would tear
+    down the account's whole listener and lose the rest of the poll batch.
+    """
     # B2 (owner decision): stale signals trade immediately on outdated
     # information — discard anything older than one deployment-timeframe
     # candle instead.
@@ -1507,7 +1519,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     normalized_signal = TradeSignal(
         action=trade_signal.action,
         symbol=trade_signal.symbol,
@@ -1543,7 +1555,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if wait_enabled:
         try:
             await wait_for_candle_close(
@@ -1568,7 +1580,7 @@ async def _submit_normalized_discord_signal(
                     }
                 },
             )
-            return
+            return None
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
@@ -1586,7 +1598,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
         logger.info(
             "Skipping discord signal: aged out during candle-close wait",
@@ -1598,7 +1610,29 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
+        return None
+    return normalized_signal
+
+
+async def _submit_normalized_discord_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+    *,
+    signal_timeframe: str,
+    wait_enabled: bool,
+) -> None:
+    prepared = await _prepare_discord_signal_for_submission(
+        account_id,
+        deployment,
+        trade_signal,
+        signal_timeframe=signal_timeframe,
+        wait_enabled=wait_enabled,
+    )
+    if prepared is None:
         return
+    normalized_signal = prepared
 
     try:
         live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
