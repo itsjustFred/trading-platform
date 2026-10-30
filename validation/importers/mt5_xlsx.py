@@ -520,7 +520,7 @@ class MT5XLSXImporter(BaseImporter):
     def _extract_first_percent(val: Any) -> float | None:
         if val is None:
             return None
-        m = re.search(r"([0-9]+[.,]?[0-9]*)\s*%", str(val))
+        m = re.search(r"(\d+(?:[.,]\d*)?)\s*%", str(val))
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -549,7 +549,7 @@ class MT5XLSXImporter(BaseImporter):
             return val
         text = str(val).strip()
         # Percentage wrapped in text, e.g. "1.0004 (0.04%)"
-        m = re.match(r"([0-9]+[.,]?[0-9]*)\s*\(([^)]+)\)", text)
+        m = re.match(r"(\d+(?:[.,]\d*)?)\s*\(([^)]+)\)", text)
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -628,7 +628,6 @@ class MT5XLSXImporter(BaseImporter):
         col_direction = MT5XLSXImporter._find_col(trades_df, ["Richtung"])
         col_volume = MT5XLSXImporter._find_col(trades_df, ["Volumen"])
         col_price = MT5XLSXImporter._find_col(trades_df, ["Preis"])
-        col_trade_id = MT5XLSXImporter._find_col(trades_df, ["Trade"])
         col_order_id = MT5XLSXImporter._find_col(trades_df, ["Auftrag"])
         col_commission = MT5XLSXImporter._find_col(trades_df, ["Kommission"])
         col_swap = MT5XLSXImporter._find_col(trades_df, ["Swap"])
@@ -809,8 +808,9 @@ class MT5XLSXImporter(BaseImporter):
                     "order_id": order_id,
                     "stop_loss": sl,
                     "take_profit": tp,
-                    "swap": swap if swap != 0.0 else None,
-                    "commission": commission if commission != 0.0 else None,
+                    # Exact zero, not a tolerance: MT5 reports "no swap" as 0.0.
+                    "swap": swap if abs(swap) > 0.0 else None,
+                    "commission": commission if abs(commission) > 0.0 else None,
                 },
             )
             trades.append(trade)

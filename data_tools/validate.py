@@ -829,6 +829,31 @@ def validate_all(data_dir: Path, symbol_filter: str | None = None) -> list[Valid
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 
+def _report_path(raw: str, data_dir: Path) -> Path:
+    """Resolve ``--report`` inside ``data_dir``, refusing anything that escapes it.
+
+    The path reaches this CLI from the viewer's ``/api/data/validate`` payload, so
+    it is caller-controlled. Writing a JSON file to whatever path a caller names
+    is a path-injection sink (``pythonsecurity:S8707``): it lets a request create
+    files anywhere the service account can write. The report belongs with the
+    data it describes, so it is confined to the data directory - the documented
+    example (``--report ~/data/validation_report.json``) already lives there.
+
+    ``resolve()`` before the containment check so ``..`` and symlinks are
+    followed rather than trusted as text.
+    """
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = data_dir / candidate
+    root = data_dir.expanduser().resolve()
+    resolved = candidate.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(
+            f"--report must stay inside the data directory {root}; got {raw!r}"
+        )
+    return resolved
+
+
 def main() -> int:
     import argparse
 
@@ -855,15 +880,20 @@ def main() -> int:
     print(f"  ❌ Error:    {err}")
 
     if args.report:
+        try:
+            report_path = _report_path(args.report, data_dir)
+        except ValueError as exc:
+            logger.error("%s", exc)
+            return 2
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "summary": {"total": total, "ok": ok, "warning": warn, "error": err},
             "results": [r.to_dict() for r in results],
         }
-        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.report, "w") as f:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w") as f:
             json.dump(report, f, indent=2)
-        print(f"  Report saved to: {args.report}")
+        print(f"  Report saved to: {report_path}")
 
     return 1 if err or missing_root else 0
 

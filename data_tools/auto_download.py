@@ -600,7 +600,7 @@ def timeframe_nominal_days(timeframe: str | None) -> float:
     # should believe.
     if normalized in _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS:
         return _SUBD_DAILY_TIMEFRAME_NOMINAL_DAYS[normalized]
-    match = re.match(r"^(\d+(?:\.\d+)?)\s*(mo|[a-z]+)$", normalized)
+    match = re.match(r"^(\d+(?:\.\d+)?)\s*([a-z]+)$", normalized)
     if match is None:
         return 1.0
     try:

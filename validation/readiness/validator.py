@@ -29,8 +29,10 @@ def _abs_pct_diff(expected: float, actual: float) -> float:
     actual is also zero.
     """
     denom = abs(expected)
-    if denom == 0.0:
-        return 0.0 if actual == 0.0 else 1.0
+    if denom <= 0.0:
+        # Exact zero, not a tolerance: with no expected value there is no
+        # proportion to compute, so any non-zero actual is total drift.
+        return 0.0 if abs(actual) <= 0.0 else 1.0
     return abs(expected - actual) / denom
 
 
@@ -716,7 +718,9 @@ class ReadinessValidator:
             float(getattr(expected_stats, "risk_free_rate", 0.0)),
             float(getattr(actual_stats, "risk_free_rate", 0.0)),
         )
-        canonical_rf = all(math.isfinite(rate) and rate == 0.0 for rate in risk_free_rates)
+        # Exact zero, not a tolerance: "canonical" means the runner recomputed with
+        # rf=0.0, so any epsilon would accept a rate that is not the canonical one.
+        canonical_rf = all(math.isfinite(rate) and abs(rate) <= 0.0 for rate in risk_free_rates)
         checks.append(
             ReadinessCheck(
                 name="stats_risk_free_rate",
@@ -804,7 +808,7 @@ class ReadinessValidator:
         # should be a pass/fail or an explicit "not comparable" is the open policy question; the
         # config decides, and the default preserves today's behaviour.
         sharpe_not_comparable = (
-            expected_sharpe == 0.0
+            abs(expected_sharpe) <= 0.0
             and cfg.stats_sharpe_zero_expectation_is_not_comparable
         )
         checks.append(
