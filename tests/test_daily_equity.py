@@ -743,7 +743,9 @@ class TestAttachDailyEquity:
                 ],
             )
 
-            assert _window_starting_equity(result, start) == pytest.approx(engine_equity)
+            assert _window_starting_equity(result, start) == pytest.approx(
+                engine_equity, abs=1e-9
+            )
 
     def test_window_starting_equity_rejects_drift_beyond_one_cent(self):
         """Beyond one cent the engine point is ignored and the ledger wins."""
@@ -756,7 +758,7 @@ class TestAttachDailyEquity:
             ],
         )
 
-        assert _window_starting_equity(result, start) == pytest.approx(100_500.0)
+        assert _window_starting_equity(result, start) == pytest.approx(100_500.0, abs=1e-9)
 
     def test_window_starting_equity_cent_tolerance_is_absolute_on_high_priced_account(self):
         """One cent stays one cent: a relative tolerance would hide $0.02 here."""
@@ -775,7 +777,7 @@ class TestAttachDailyEquity:
         )
 
         assert _window_starting_equity(result, start) == pytest.approx(
-            initial_capital + 500.0
+            initial_capital + 500.0, abs=1e-6
         )
 
     def test_high_priced_account_endpoint_drift_beyond_one_cent_is_rejected(self):

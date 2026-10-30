@@ -9,6 +9,7 @@ from runner.stats import (
     _daily_returns_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
+    _resolve_backtest_period_bounds,
     compute_stats,
     compute_stats_for_result,
 )
@@ -376,3 +377,28 @@ class TestCalmarAndQsFallback:
             "unparseable equity timestamps must fall back to the manual Sharpe "
             "path (raw period returns), not silently publish 0.0"
         )
+
+
+class TestPeriodBounds:
+    """The annualization window must cover the whole configured end day."""
+
+    def test_date_only_end_is_extended_to_end_of_day(self):
+        start_dt, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31",
+        )
+
+        assert start_dt.isoformat() == "2024-01-01T00:00:00+00:00"
+        assert end_dt.isoformat() == "2024-12-31T23:59:59.999999+00:00"
+
+    def test_explicit_end_instant_is_not_extended(self):
+        _, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31T12:00:00+00:00",
+        )
+
+        assert end_dt.isoformat() == "2024-12-31T12:00:00+00:00"
