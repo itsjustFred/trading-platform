@@ -70,30 +70,65 @@ def _run(script: str) -> tuple[subprocess.CompletedProcess, float]:
     return result, time.monotonic() - started
 
 
-def test_import_does_not_mutate_jpype_onexit_and_start_does():
-    """The ``onexit`` guard is armed when a JVM starts, not on import.
+def test_import_does_not_mutate_jpype_onexit():
+    """Importing the downloader must leave the process-global flag untouched.
 
-    ``onexit`` defaults to True in ``jpype/config.py``. Setting it to False is
-    process-global and irreversible, so the module defers it to the single point
-    it starts a JVM (``_ensure_jvm_started``): merely importing the downloader
-    for a constant must not strip teardown from an unrelated JPype consumer in
-    the same process. ``_JTerminate`` reads ``onexit`` at exit time, so arming
-    it just before ``startJVM`` is equally effective.
+    ``onexit`` defaults to True in ``jpype/config.py``; the module must not lower
+    it at import, so importing the downloader for a constant cannot strip
+    teardown from an unrelated JPype consumer in the same process. Runs in a
+    subprocess so it neither reads nor mutates the pytest session's state.
     """
-    jpype_config = pytest.importorskip("jpype.config")
+    result, _ = _run(
+        """
+        import sys
+        sys.path.insert(0, {repo!r})
+        import jpype.config
+        from data_tools.downloaders import jforex_dl
 
-    from data_tools.downloaders import jforex_dl
+        assert jforex_dl.jpype is not None
+        assert jforex_dl.jpype.config is jpype.config
+        assert jpype.config.onexit is True, "import must not lower onexit"
+        print("IMPORT_LEFT_ONEXIT_TRUE")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert "IMPORT_LEFT_ONEXIT_TRUE" in result.stdout, result.stderr
 
-    assert jforex_dl.jpype is not None
-    assert jforex_dl.jpype.config is jpype_config
-    # Import alone must not have touched the process-global flag.
-    assert jpype_config.onexit is True
 
-    jforex_dl._disable_jpype_onexit()
-    assert jforex_dl.jpype.config.onexit is False
+@requires_java
+def test_ensure_jvm_started_disables_onexit_before_start():
+    """Starting a JVM through the module must arm the guard; a started JVM too.
 
-    # Restore for the rest of the session; the assignment is one-way otherwise.
-    jpype_config.onexit = True
+    Covers both branches of ``_ensure_jvm_started``: the start path arms
+    ``onexit`` before ``startJVM``, and the already-started path arms it when a
+    JVM is reused. In both cases the interpreter must then exit cleanly.
+    """
+    result, elapsed = _run(
+        """
+        import sys
+        sys.path.insert(0, {repo!r})
+        import jpype
+        import jpype.config
+        from data_tools.downloaders import jforex_dl
+
+        # Start path: the guard must be armed before startJVM runs.
+        jforex_dl._ensure_jvm_started()
+        assert jpype.isJVMStarted(), "JVM did not start; test is vacuous"
+        assert jpype.config.onexit is False, "start path left onexit enabled"
+
+        # Already-started path: a second call must keep the guard armed.
+        jpype.config.onexit = True
+        jforex_dl._ensure_jvm_started()
+        assert jpype.config.onexit is False, "reuse path left onexit enabled"
+        print("ONEXIT_ARMED_ON_BOTH_PATHS")
+        """
+    )
+    assert result.returncode == 0, (
+        f"process did not exit cleanly (rc={result.returncode})\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "ONEXIT_ARMED_ON_BOTH_PATHS" in result.stdout, result.stderr
+    assert elapsed < EXIT_BUDGET_SECONDS, f"process took {elapsed:.1f}s to exit"
 
 
 def test_production_code_never_calls_jpype_shutdownjvm():

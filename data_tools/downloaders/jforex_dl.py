@@ -64,12 +64,12 @@ JPYPE_AVAILABLE = jpype is not None
 # never exits: `pytest` prints its summary and hangs until the CI
 # "Python ubuntu-latest" job hits its 60-minute timeout.
 #
-# We keep JPype out of interpreter teardown by setting `onexit = False` *before*
-# the JVM starts (`_disable_jpype_onexit`, called from `_ensure_jvm_started`).
-# The flag is process-global and one-way, so it is set at the single point this
-# module starts a JVM rather than at import: importing this module for a
-# constant must not silently strip teardown from an unrelated JPype consumer in
-# the same process.
+# We keep JPype out of interpreter teardown by setting `onexit = False` at the
+# point a JVM starts (`_disable_jpype_onexit`, called from
+# `_ensure_jvm_started`). The flag is process-global, so it is set at the single
+# point this module starts a JVM rather than at import: importing this module
+# for a constant must not silently strip teardown from an unrelated JPype
+# consumer in the same process.
 #
 # The JVM is then not explicitly shut down either: `jpype.shutdownJVM()`
 # (`destroy_jvm=True` by default) reaches the same `Threads::destroy_vm()`
@@ -85,16 +85,27 @@ JPYPE_AVAILABLE = jpype is not None
 # in all future versions"), so no hasattr guard is needed here.
 
 
-def _disable_jpype_onexit() -> None:
+def _disable_jpype_onexit() -> bool:
     """Keep JPype's ``_JTerminate`` hook out of interpreter teardown.
 
-    Process-global and irreversible for the interpreter's lifetime; called at
-    the point a JVM is about to start. ``_JTerminate`` reads
-    ``jpype.config.onexit`` at exit time (not at import), so lowering it here is
-    as effective as lowering it earlier.
+    Process-global; called at the point a JVM is about to start, or when one is
+    already running. ``_JTerminate`` reads ``jpype.config.onexit`` at exit time
+    (not at import), so lowering it here is as effective as lowering it earlier.
+
+    Returns the previous value so a caller that ends up *not* starting a JVM can
+    put it back with :func:`_restore_jpype_onexit`.
     """
+    if _jpype_config is None:
+        return True
+    previous = _jpype_config.onexit
+    _jpype_config.onexit = False
+    return previous
+
+
+def _restore_jpype_onexit(previous: bool) -> None:
+    """Undo :func:`_disable_jpype_onexit` when no JVM ended up running."""
     if _jpype_config is not None:
-        _jpype_config.onexit = False
+        _jpype_config.onexit = previous
 
 
 DEFAULT_JNLP_URL = "https://platform.dukascopy.com/demo/jforex.jnlp"
@@ -764,7 +775,6 @@ def _ensure_jvm_started() -> None:
 
     with JVM_START_LOCK:
         if not jpype_mod.isJVMStarted():
-            _disable_jpype_onexit()
             classpath, classpath_source = _resolve_jforex_classpath_details()
             if not classpath:
                 raise RuntimeError(
@@ -774,6 +784,11 @@ def _ensure_jvm_started() -> None:
 
             jvm_candidates = _discover_jvm_paths()
             startup_errors: list[tuple[str, str]] = []
+
+            # Arm the guard only once we are actually about to start a JVM, so a
+            # classpath-resolution failure above leaves the process-global flag
+            # untouched.
+            previous_onexit = _disable_jpype_onexit()
 
             for jvm_path in jvm_candidates:
                 try:
@@ -791,8 +806,10 @@ def _ensure_jvm_started() -> None:
                 try:
                     jpype_mod.startJVM(classpath=classpath, convertStrings=False)
                 except _java_exception_types() as exc:
+                    _restore_jpype_onexit(previous_onexit)
                     _raise_jforex_runtime_error("Failed to start JVM for JForex SDK", exc)
                 except Exception as exc:  # noqa: BLE001
+                    _restore_jpype_onexit(previous_onexit)
                     diagnostics = _format_jvm_startup_diagnostics(
                         classpath=classpath,
                         classpath_source=classpath_source,
@@ -800,6 +817,11 @@ def _ensure_jvm_started() -> None:
                         final_error=exc,
                     )
                     raise RuntimeError(diagnostics) from exc
+        else:
+            # A JVM is already running (started here earlier or by another
+            # caller). The exit hook reads `onexit` at exit time, so arming it
+            # now still protects this interpreter at teardown.
+            _disable_jpype_onexit()
 
     _ensure_jvm_thread_context_class_loader()
 

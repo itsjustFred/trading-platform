@@ -429,10 +429,19 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
     (``_worker``, ``_idle_semaphore``, ``_threads`` and the weakref callback)
     and is validated against CPython 3.12, the interpreter this project pins
     (``requires-python``, the CI matrix and ``sonar.python.version`` all set
-    3.12); the upstream internals would need re-checking before widening that
-    range, and ``tests/test_viewer_shutdown_nonblocking.py`` pins the symptom if
-    a future interpreter changes the join behaviour.
+    3.12). ``_adjust_thread_count`` therefore fails fast on any other minor
+    version rather than silently mis-mirroring the internals; widen the guard
+    only after re-checking the upstream source against the new interpreter.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if sys.version_info[:2] != (3, 12):
+            raise RuntimeError(
+                "_DaemonThreadPoolExecutor mirrors CPython 3.12 private "
+                "ThreadPoolExecutor internals; revalidate against "
+                f"{sys.version_info.major}.{sys.version_info.minor} before use"
+            )
+        super().__init__(*args, **kwargs)
 
     def _adjust_thread_count(self) -> None:
         if self._idle_semaphore.acquire(timeout=0):
