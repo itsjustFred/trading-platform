@@ -47,10 +47,11 @@ def make_trade(
     pnl=500.0,
     symbol="AAPL",
     direction="LONG",
+    id=1,
 ):
     """Helper to create a Trade."""
     return Trade(
-        id=1,
+        id=id,
         symbol=symbol,
         direction=direction,
         entry_time=entry_time,
@@ -219,6 +220,19 @@ class TestBuildDailyEquityCurve:
         assert abs(january_return["return"] - 0.05) < 1e-10
         assert january_return["equity"] == 105000.0
 
+    def test_daily_bucket_uses_net_pnl_not_gross(self):
+        """The daily curve is a net ledger: fees must be subtracted (#84)."""
+        trade = make_trade(pnl=500.0)
+        trade.fees = 8.0
+        trade.net_pnl = 492.0
+        result = make_result(trades=[trade])
+
+        points, returns = build_daily_equity_curve(result)
+
+        by_date = {daily["date"]: daily for daily in returns}
+        assert by_date["2024-01-15"]["equity"] == 100_492.0
+        assert points[-1].equity == 100_492.0
+
     def test_curve_starts_at_inception_before_first_loss(self):
         """The curve must open at the starting equity, not at the first loss."""
         result = make_result(
@@ -383,7 +397,7 @@ class TestAttachDailyEquity:
             for timestamp in daily_timestamps
         ]
 
-        assert not _preserves_engine_curve(preserved_curve, daily_curve)
+        assert not _preserves_engine_curve(preserved_curve, daily_curve, [])
 
     def test_rejects_sparse_existing_equity_curve(self):
         result = make_result(
@@ -575,6 +589,33 @@ class TestAttachDailyEquity:
         assert result.stats["daily_return_count"] == 0
         assert result.stats["daily_returns"] == []
 
+    def test_fallback_coalesces_duplicate_curve_timestamps(self):
+        """The fallback must publish a strictly increasing curve."""
+        result = make_result(
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_100.0),
+            ]
+        )
+
+        attach_daily_equity(result)
+
+        assert [(point.time, point.equity) for point in result.equity_curve] == [
+            ("2024-01-01T00:00:00+00:00", 100_100.0)
+        ]
+
+    def test_fallback_rejects_nonfinite_engine_equity(self):
+        """A corrupt engine curve must not be published."""
+        result = make_result(
+            equity_curve=[
+                EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+                EquityPoint(time="2024-01-02T00:00:00+00:00", equity=float("inf")),
+            ]
+        )
+
+        with pytest.raises(ValueError, match="non-finite equity"):
+            attach_daily_equity(result)
+
     def test_fallback_scopes_existing_curve_to_the_requested_window(self):
         """A window without trades must not publish the unwindowed curve."""
         curve = [
@@ -618,6 +659,17 @@ class TestAttachDailyEquity:
 
         assert result.equity_curve[-1].time == "2024-01-15T12:00:00+00:00"
         assert result.equity_curve[-1].equity == 100_500.0
+
+    def test_meta_end_instant_clamps_the_last_close(self):
+        """A meta end carrying a time is a boundary, not a whole day."""
+        result = make_result(
+            trades=[make_trade(exit_time="2024-01-15T10:00:00Z", pnl=500.0)],
+            backtest_end="2024-01-15T12:00:00Z",
+        )
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve[-1].time == "2024-01-15T12:00:00+00:00"
 
     def test_zero_width_window_fails_loudly(self):
         result = make_result(
@@ -675,11 +727,25 @@ class TestAttachDailyEquity:
             "equity": 100_700.0,
         }
 
+    def test_meta_start_rebases_starting_equity_like_an_explicit_window(self):
+        """The window can come from ``meta.backtest_start`` alone."""
+        prior_trade = make_trade(exit_time="2024-01-05T15:00:00Z", pnl=500.0)
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
+        result = make_result(
+            trades=[prior_trade, window_trade],
+            backtest_start="2024-02-01",
+            backtest_end="2024-02-28",
+        )
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve[0].equity == 100_500.0
+        assert result.equity_curve[-1].equity == 101_200.0
+
     def test_window_rebases_starting_equity_from_prior_trades(self):
         """A windowed curve must start from the equity at the window start."""
         prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
-        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0)
-        window_trade.id = 2
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(trades=[prior_trade, window_trade])
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
@@ -694,8 +760,7 @@ class TestAttachDailyEquity:
         prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
         prior_trade.fees = 10.0
         prior_trade.net_pnl = 490.0
-        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0)
-        window_trade.id = 2
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
             equity_curve=[
@@ -713,10 +778,8 @@ class TestAttachDailyEquity:
     def test_reconciliation_includes_trade_at_engine_point(self):
         """A trade exiting exactly at an engine point is part of that point."""
         first_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
-        second_trade = make_trade(exit_time="2024-01-20T15:00:00Z", pnl=200.0)
-        second_trade.id = 2
-        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=300.0)
-        window_trade.id = 3
+        second_trade = make_trade(exit_time="2024-01-20T15:00:00Z", pnl=200.0, id=2)
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=300.0, id=3)
         result = make_result(
             trades=[first_trade, second_trade, window_trade],
             equity_curve=[
@@ -733,8 +796,7 @@ class TestAttachDailyEquity:
 
     def test_window_ignores_nonfinite_prior_engine_point(self):
         prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
-        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0)
-        window_trade.id = 2
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
             equity_curve=[
@@ -747,24 +809,23 @@ class TestAttachDailyEquity:
         assert result.equity_curve[0].equity == 100_500.0
         assert result.equity_curve[-1].equity == 101_200.0
 
-    def test_window_starting_equity_reconciles_within_one_cent(self):
+    @pytest.mark.parametrize("engine_equity", [100_500.0, 100_500.005, 100_499.995])
+    def test_window_starting_equity_reconciles_within_one_cent(self, engine_equity):
         """An engine point within one cent of the net ledger is trusted."""
         prior = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
+        result = make_result(
+            trades=[prior],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=engine_equity)
+            ],
+        )
 
-        for engine_equity in (100_500.0, 100_500.005, 100_499.995):
-            result = make_result(
-                trades=[prior],
-                equity_curve=[
-                    EquityPoint(time="2024-01-10T15:00:00+00:00", equity=engine_equity)
-                ],
-            )
-
-            # rel=0: pytest's default rel=1e-6 would allow 0.1 currency units
-            # of slack here, which is exactly the tolerance under test.
-            assert _window_starting_equity(result, start) == pytest.approx(
-                engine_equity, rel=0, abs=1e-9
-            )
+        # rel=0: pytest's default rel=1e-6 would allow 0.1 currency units of
+        # slack here, which is exactly the tolerance under test.
+        assert _window_starting_equity(result, start) == pytest.approx(
+            engine_equity, rel=0, abs=1e-9
+        )
 
     def test_window_starting_equity_rejects_drift_beyond_one_cent(self):
         """Beyond one cent the engine point is ignored and the ledger wins.
@@ -806,15 +867,23 @@ class TestAttachDailyEquity:
             initial_capital + 500.0, rel=0, abs=1e-6
         )
 
-    def test_high_priced_account_endpoint_drift_beyond_one_cent_is_rejected(self):
-        """A 50-cent drift on a trillion-dollar account must not be preserved."""
+    @pytest.mark.parametrize(
+        ("drift", "preserved"),
+        [
+            (0.005, True),  # within one cent: the engine curve wins
+            (0.015, False),  # beyond one cent: the net ledger wins
+            (0.50, False),  # a relative tolerance would have accepted this
+        ],
+    )
+    def test_endpoint_drift_is_judged_by_an_absolute_one_cent(self, drift, preserved):
+        """One cent is absolute, also on a trillion-dollar account."""
         initial_capital = 1_000_000_000_000.0
         daily_final = initial_capital + 500.0
         timestamps = pd.date_range("2024-01-01", periods=31, freq="D", tz="UTC")
         curve = [
             EquityPoint(
                 time=timestamp.isoformat(),
-                equity=daily_final - 0.50 if timestamp == timestamps[-1] else initial_capital,
+                equity=daily_final - drift if timestamp == timestamps[-1] else initial_capital,
             )
             for timestamp in timestamps
         ]
@@ -828,32 +897,11 @@ class TestAttachDailyEquity:
 
         attach_daily_equity(result)
 
-        assert result.equity_curve != curve
-        assert result.equity_curve[-1].equity == daily_final
-
-    def test_endpoint_drift_within_one_cent_is_preserved(self):
-        """The one-cent tolerance is intentional: half a cent is acceptable."""
-        initial_capital = 1_000_000_000_000.0
-        daily_final = initial_capital + 500.0
-        timestamps = pd.date_range("2024-01-01", periods=31, freq="D", tz="UTC")
-        curve = [
-            EquityPoint(
-                time=timestamp.isoformat(),
-                equity=daily_final - 0.005 if timestamp == timestamps[-1] else initial_capital,
-            )
-            for timestamp in timestamps
-        ]
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-31T00:00:00Z", pnl=500.0)],
-            initial_capital=initial_capital,
-            equity_curve=curve,
-            backtest_start="2024-01-01",
-            backtest_end="2024-01-31",
-        )
-
-        attach_daily_equity(result)
-
-        assert result.equity_curve == curve
+        if preserved:
+            assert result.equity_curve == curve
+        else:
+            assert result.equity_curve != curve
+            assert result.equity_curve[-1].equity == daily_final
 
     def test_preserved_curve_ending_before_last_trade_is_rejected(self):
         """A curve that stops before the last trade cannot describe the window."""

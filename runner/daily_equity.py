@@ -81,6 +81,10 @@ def _trade_in_window(
     return _parsed_in_window(parsed, start_bound, end_bound)
 
 
+def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+    return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
+
+
 def _trade_net_pnl(trade: Trade) -> float | None:
     """The trade's net PnL, or None when it is not a finite number."""
     pnl = (
@@ -155,9 +159,9 @@ def _window_starting_equity(
         abs_tol=0.01,
     ):
         # The engine point disagrees with the net ledger: trust the ledger.
-        # Logged because a systematic divergence (e.g. an engine that reports
-        # gross instead of net equity) would otherwise rebase every window
-        # silently.
+        # Debug level keeps per-window runs quiet; a systematic divergence
+        # (e.g. an engine reporting gross instead of net equity) is visible in
+        # the run log when debugging instead of rebasing every window silently.
         logger.debug(
             "Window starting equity not reconciled; using the net ledger",
             extra={
@@ -216,8 +220,25 @@ def _strictly_increasing_curve(
     return normalized
 
 
-def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
-    return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
+def _normalize_engine_curve(curve: list[EquityPoint]) -> list[EquityPoint]:
+    """Validate an engine-provided curve without inventing an inception point.
+
+    Duplicate timestamps are coalesced and colliding ones shifted by a
+    microsecond, so the published curve is strictly increasing and finite.  An
+    unparseable timestamp, an out-of-order point or a non-finite equity is a
+    corrupt curve and raises instead of being published.
+    """
+    if not curve:
+        return []
+    first_time = _parse_ts(curve[0].time)
+    if first_time is None:
+        raise ValueError("Equity curve contains an invalid timestamp")
+    normalized = _strictly_increasing_curve(
+        curve,
+        first_time - timedelta(microseconds=1),
+        None,
+    )
+    return normalized or []
 
 
 def _scoped_view(
@@ -259,7 +280,7 @@ def _windowed_curve(
 def _preserves_engine_curve(
     preserved_curve: list[EquityPoint] | None,
     daily_points: list[EquityPoint],
-    trades: list[Trade] | None = None,
+    trades: list[Trade],
 ) -> bool:
     """Whether the engine curve may replace the net-PnL daily build.
 
@@ -334,7 +355,7 @@ def _preserves_engine_curve(
         return False
     trade_exits = [
         parsed
-        for trade in trades or ()
+        for trade in trades
         if (parsed := _parse_ts(_last_exit_time(trade))) is not None
     ]
     if trade_exits and preserved_index[-1] < max(trade_exits):
@@ -351,7 +372,6 @@ def _curve_frequency(points: list[EquityPoint]) -> str:
             pd.to_datetime(
                 [point.time for point in points],
                 utc=True,
-                errors="coerce",
                 format="mixed",
             )
             .to_series()
@@ -415,11 +435,15 @@ def build_daily_equity_curve(
     if not event_days:
         return [], []
 
-    # Only an explicitly requested end instant is a hard boundary; a date-only
-    # ``backtest_end`` describes a whole day and must keep its end-of-day close.
-    explicit_end = end is not None
+    # A date-only bound describes a whole day and keeps its end-of-day close;
+    # an instant bound (explicit or from ``meta.backtest_end``) is a hard
+    # boundary and must not be overshot.
     start_bound = _parse_ts(start) if start is not None else _parse_ts(result.meta.backtest_start)
-    end_bound = _parse_ts(end) if end is not None else _parse_ts(result.meta.backtest_end)
+    end_bound = (
+        _parse_ts(end)
+        if end is not None
+        else _parse_day_bound(result.meta.backtest_end, is_end=True)
+    )
     start = start_bound or (
         min(event_days).replace(hour=0, minute=0, second=0, microsecond=0)
         if event_days
@@ -458,8 +482,8 @@ def build_daily_equity_curve(
             }
         )
         point_time = cursor + timedelta(days=1) - timedelta(microseconds=1)
-        if explicit_end and cursor.date() == end_day:
-            # Never let the last close overshoot an explicit end instant.
+        if end_bound is not None and cursor.date() == end_day:
+            # Never let the last close overshoot the window end.
             point_time = min(point_time, end_instant)
         daily_points.append(
             EquityPoint(time=point_time.isoformat(), equity=round(running_equity, 2))
@@ -469,7 +493,7 @@ def build_daily_equity_curve(
     normalized_closes = _strictly_increasing_curve(
         daily_points[1:],
         inception,
-        end_instant if explicit_end else None,
+        end_bound,
     )
     if normalized_closes is None:
         raise ValueError("Daily equity closes cannot be normalized within the requested window")
@@ -518,8 +542,11 @@ def attach_daily_equity(
     # Build daily equity from trades, restricted to the requested window
     scoped_result = _scoped_view(result, start_bound, end_bound)
     # Unscoped on purpose: the starting equity comes from trades that exited
-    # *before* the window, which ``scoped_result`` no longer contains.
-    starting_equity = _window_starting_equity(result, start_bound)
+    # *before* the window, which ``scoped_result`` no longer contains. A window
+    # can also come from ``meta.backtest_start`` alone, so resolve it the same
+    # way ``build_daily_equity_curve`` does.
+    window_start = start_bound or _parse_ts(result.meta.backtest_start)
+    starting_equity = _window_starting_equity(result, window_start)
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
         start=start_bound,
@@ -532,8 +559,8 @@ def attach_daily_equity(
         result.meta.data = result.meta.data or {}
         # Fall back to the engine curve *scoped to the same window*: publishing
         # the unwindowed curve here would describe a different period than the
-        # requested one (pre-mortem 16-B #7 applies to this path too).
-        fallback_curve = scoped_result.equity_curve
+        # requested one. The same rule as the preserved-curve path below.
+        fallback_curve = _normalize_engine_curve(scoped_result.equity_curve or [])
         result.equity_curve = fallback_curve
         # Only mark as daily if we actually built a daily curve
         if fallback_curve and len(fallback_curve) > 1:
