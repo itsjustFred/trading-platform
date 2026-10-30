@@ -1161,3 +1161,38 @@ def test_the_base_adapter_does_not_claim_the_controls() -> None:
         _run(adapter.cancel_open_orders())
     with pytest.raises(NotImplementedError):
         _run(adapter.close_all_positions())
+
+
+def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None:
+    """`describe` is the operator-facing sentence, so its two branches must not be interchangeable.
+
+    The complete branch says nothing is outstanding; the partial branch must name every
+    unidentifiable and refused item, because that line is how an operator learns that a stopped
+    deployment still holds exposure. Swapping the predicate would have a partial sweep read as
+    clean - the exact failure `ControlOutcome` exists to prevent.
+    """
+    from live_runner.base_adapter import ControlOutcome
+
+    clean = ControlOutcome(completed=3)
+    assert clean.complete is True
+    assert clean.describe() == "3 completed, nothing outstanding"
+
+    empty = ControlOutcome()
+    assert empty.complete is True
+    assert empty.describe() == "0 completed, nothing outstanding"
+
+    partial = ControlOutcome(completed=1, unidentified=("order:None",), failed=("7",))
+    assert partial.complete is False
+    description = partial.describe()
+    assert "nothing outstanding" not in description, description
+    assert "1 completed" in description, description
+    assert "1 unidentifiable" in description and "order:None" in description, description
+    assert "1 refused" in description and "7" in description, description
+
+    unidentified_only = ControlOutcome(completed=0, unidentified=("position:None:volume",))
+    assert unidentified_only.complete is False
+    assert "nothing outstanding" not in unidentified_only.describe()
+
+    failed_only = ControlOutcome(completed=0, failed=("42",))
+    assert failed_only.complete is False
+    assert "nothing outstanding" not in failed_only.describe()

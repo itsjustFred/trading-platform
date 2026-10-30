@@ -1404,3 +1404,51 @@ def test_an_unclassified_failure_does_not_name_a_cause(caplog) -> None:
     assert "auth" not in joined.lower().replace("not classified", ""), (
         "the fallback guessed a cause, which is what sent operators to refresh a working token"
     )
+
+
+def test_an_unreadable_cumulative_volume_is_not_treated_as_a_quantity() -> None:
+    """`executedVolume` feeds the persistence cap and the dedupe key, so only a real fill counts.
+
+    An unset protobuf field reads back as `0.0`, and a broker bug could send a negative or a
+    NaN. Returning those verbatim would let a `0` cumulative produce the key
+    `...:cum:0` and hand `save_live_execution_up_to_cumulative` a cap of zero - both are
+    "no readable quantity" and must collapse to `0.0` so the caller takes its no-cumulative path.
+    """
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(None) == 0.0
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(SimpleNamespace()) == 0.0
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=0)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=-500_000)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("nan"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("inf"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume="not-a-number")
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=500_000)
+        )
+        == 500_000.0
+    )
