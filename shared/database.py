@@ -1867,6 +1867,9 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
 
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
+        # The column migrations must stay ahead of the backfill: `_backfill_smoke_deployments`
+        # inserts a `live_deployments` row naming `signal_source`, `settings` and friends, which do
+        # not exist on a legacy table until `_add_live_deployment_columns` has run.
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
@@ -3123,12 +3126,12 @@ def _scalar_stats_for_save(
     absence and is logged.
     """
     current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
+    # Built from the same tuple that names the columns, not spelled out: the zip below pairs by
+    # position, so a fifth entry added to `_SCALAR_STAT_COLUMNS` alone would silently shift every
+    # value into the wrong column instead of failing.
     row = session.exec(
         select(
-            BacktestRecord.sharpe_ratio,
-            BacktestRecord.psr,
-            BacktestRecord.cagr,
-            BacktestRecord.p_value,
+            *(getattr(BacktestRecord, name) for name, _default in _SCALAR_STAT_COLUMNS)
         ).where(BacktestRecord.id == backtest_id)
     ).first()
     if row is not None:
