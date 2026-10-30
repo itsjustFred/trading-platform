@@ -474,11 +474,18 @@ def build_daily_equity_curve(
         running_equity += pnl
         if not math.isfinite(running_equity):
             raise ValueError("Daily equity accumulation is non-finite")
+        # Cent-quantise the reported equity exactly like the curve closes below,
+        # so ``daily_returns[i]["equity"]`` and the matching
+        # ``EquityPoint.equity`` describe the same number.  An unrounded value
+        # here would let the two published views disagree on the same instant
+        # (up to half a cent per row) and make a downstream comparison against
+        # the curve look like drift.
+        closed_equity = round(running_equity, 2)
         daily_returns.append(
             {
                 "date": day,
                 "return": (running_equity - previous) / previous if previous > 0 else None,
-                "equity": running_equity,
+                "equity": closed_equity,
             }
         )
         point_time = cursor + timedelta(days=1) - timedelta(microseconds=1)
@@ -486,7 +493,7 @@ def build_daily_equity_curve(
             # Never let the last close overshoot the window end.
             point_time = min(point_time, end_instant)
         daily_points.append(
-            EquityPoint(time=point_time.isoformat(), equity=round(running_equity, 2))
+            EquityPoint(time=point_time.isoformat(), equity=closed_equity)
         )
         cursor += timedelta(days=1)
 

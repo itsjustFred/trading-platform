@@ -957,6 +957,104 @@ class TestAttachDailyEquity:
         assert result.equity_curve != curve
         assert result.equity_curve[-1].time == "2024-01-31T23:59:59.999999+00:00"
 
+    def test_curve_frequency_parses_mixed_resolution_timestamps(self):
+        """A daily curve mixing second and microsecond forms is still daily.
+
+        The generated curve is exactly this shape: the inception point carries
+        second resolution and every close carries microseconds.  pandas infers a
+        single format from the first element unless told ``format="mixed"``, so
+        without it every close becomes NaT, the median spacing turns into NaT
+        and the frequency silently degrades to ``"unknown"``.
+        """
+        points = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=100_100.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=100_200.0),
+        ]
+
+        assert daily_equity_module._curve_frequency(points) == "daily"
+
+    def test_curve_frequency_parses_mixed_resolution_intraday_points(self):
+        """The mixed-format path must also resolve sub-daily spacing."""
+        points = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T00:15:00.500000+00:00", equity=100_010.0),
+            EquityPoint(time="2024-01-01T00:30:00.500000+00:00", equity=100_020.0),
+        ]
+
+        assert daily_equity_module._curve_frequency(points) == "intraday"
+
+    def test_strictly_increasing_curve_rejects_shift_that_leaves_the_window(self):
+        """A colliding timestamp cannot be shifted past ``end_bound``.
+
+        The microsecond shift exists to make duplicate timestamps strictly
+        increasing, but it must never push a point outside the requested
+        window.  Here the only point sits exactly on the bound, so the shift
+        would overshoot by one microsecond and the curve must be rejected.
+        """
+        inception = datetime.fromisoformat("2024-01-01T00:00:00+00:00")
+        end_bound = datetime.fromisoformat("2024-01-01T00:00:00+00:00")
+        curve = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
+
+        assert daily_equity_module._strictly_increasing_curve(
+            curve, inception, end_bound
+        ) is None
+
+    def test_strictly_increasing_curve_keeps_shift_that_stays_inside_the_window(self):
+        """One microsecond of headroom is enough for the shift to be allowed.
+
+        Same curve as the rejection case, so the two tests pin the boundary
+        itself rather than any other difference between them.
+        """
+        inception = datetime.fromisoformat("2024-01-01T00:00:00+00:00")
+        end_bound = datetime.fromisoformat("2024-01-01T00:00:00.000001+00:00")
+        curve = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
+
+        normalized = daily_equity_module._strictly_increasing_curve(
+            curve, inception, end_bound
+        )
+
+        assert normalized is not None
+        assert normalized[-1].time == "2024-01-01T00:00:00.000001+00:00"
+
+    def test_daily_returns_equity_matches_the_published_curve_close(self):
+        """Both daily views must report the same, cent-quantised equity.
+
+        ``stats["daily_returns"][i]["equity"]`` and the curve close for the same
+        instant are two representations of one number.  Rounding only the curve
+        lets them drift up to half a cent apart, which reads as accounting
+        noise to anything comparing the two.
+        """
+        # Sub-cent daily gains so the rounding actually has something to do.
+        trades = [
+            make_trade(exit_time=f"2024-01-{day:02d}T15:00:00Z", pnl=0.004, id=day)
+            for day in range(1, 31)
+        ]
+        result = make_result(trades=trades)
+
+        points, returns = build_daily_equity_curve(result)
+
+        assert len(returns) == len(points) - 1
+        for day_return, point in zip(returns, points[1:], strict=True):
+            assert day_return["equity"] == point.equity
+
+    def test_daily_returns_equity_is_cent_quantised(self):
+        """Every reported equity is a whole number of cents."""
+        result = make_result(
+            trades=[
+                make_trade(exit_time="2024-01-15T15:00:00Z", pnl=1234.5678),
+                make_trade(exit_time="2024-01-16T15:00:00Z", pnl=987.6543, id=2),
+            ]
+        )
+
+        _, returns = build_daily_equity_curve(result)
+
+        assert all(
+            day_return["equity"] == round(day_return["equity"], 2)
+            for day_return in returns
+        )
+        assert returns[14]["equity"] == 101_234.57
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
