@@ -707,3 +707,112 @@ class TestCalmarAndQsFallback:
             * math.sqrt(252)
         )
         assert annualized != pytest.approx(annualized / math.sqrt(252))
+
+
+class TestWithoutQuantStats:
+    """The fallback path a bare install runs.
+
+    `runner.stats` branches on `HAS_QUANTSTATS`; with quantstats installed the
+    manual branch is dead code in this environment, so a regression there would
+    only surface on a machine that lacks the optional dependency. These tests
+    force the flag off and pin the same parity contract as the QS path.
+    """
+
+    @staticmethod
+    def _compute_without_quantstats(monkeypatch, **kwargs):
+        import runner.stats as stats_module
+
+        monkeypatch.setattr(stats_module, "HAS_QUANTSTATS", False)
+        return stats_module.compute_stats(**kwargs)
+
+    def test_fallback_matches_the_quantstats_definition_for_a_daily_curve(self, monkeypatch):
+        """No optional dependency must not mean a different Sharpe.
+
+        Both branches are documented to publish the daily-resampled, 252-period
+        annualized ratio. Force the flag off and compare against the manual
+        helpers directly: a fallback that silently returned the default 0.0
+        would pass any "is a number" assertion but not this one.
+        """
+        returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002, -0.003, 0.009]
+        curve = _equity_curve_from_returns(returns)
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=curve, risk_free_rate=0.04
+        )
+
+        assert stats["equity_return_frequency"] == "daily"
+        # The payload rounds `sharpe_ratio` to four decimals (stats.py:262),
+        # so the tolerance is that rounding floor, not the float equality.
+        assert stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual(returns, 0.04), abs=1e-4
+        )
+        assert stats["sortino_ratio"] == pytest.approx(
+            _sortino_manual(returns, 0.04), abs=1e-4
+        )
+        assert "sharpe_ratio" not in stats["undefined_metrics"]
+
+    def test_fallback_uses_the_raw_returns_when_the_clock_is_unparseable(self, monkeypatch):
+        """The unknown-frequency fall-through must compute, not declare undefined.
+
+        This is the same contract as the quantstats-installed test above, but on
+        the branch a bare install actually executes: a per-observation ratio, or
+        a silently-skipped computation, must both fail here.
+        """
+        returns = [
+            0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
+            -0.003, 0.009, 0.001, -0.002, 0.005, -0.001,
+        ]
+        values = [100_000.0]
+        for value in returns:
+            values.append(values[-1] * (1 + value))
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=equity)
+            for index, equity in enumerate(values)
+        ]
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=unparseable, risk_free_rate=0.04
+        )
+
+        assert stats["equity_return_frequency"] == (
+            "unknown:unparseable_equity_timestamps"
+        )
+        assert stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual(returns, 0.04), abs=1e-4
+        )
+        assert "sharpe_ratio" not in stats["undefined_metrics"]
+
+    def test_fallback_declares_metrics_undefined_for_a_one_point_curve(self, monkeypatch):
+        """One observation cannot produce a ratio; the payload must say so.
+
+        `undefined_metrics` is the machine-readable half of the contract, so an
+        empty set here would let a consumer read the default 0.0 as a real
+        measurement.
+        """
+        curve = [EquityPoint(time="2021-01-01T00:00:00+00:00", equity=100_000.0)]
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=curve, risk_free_rate=0.04
+        )
+
+        assert stats["undefined_metrics"] is not None
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr", "p_value"):
+            assert metric in stats["undefined_metrics"]
+
+    def test_fallback_without_a_curve_marks_the_whole_metric_set_undefined(self, monkeypatch):
+        """No equity curve at all is the extreme case of "cannot be computed"."""
+        stats = self._compute_without_quantstats(monkeypatch, trades=[], equity_curve=[])
+
+        assert stats["equity_return_frequency"] == "none"
+        assert stats["undefined_metrics"] is not None
+        for metric in (
+            "max_drawdown_pct",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "calmar_ratio",
+            "cagr",
+            "total_return",
+            "psr",
+            "p_value",
+        ):
+            assert metric in stats["undefined_metrics"]

@@ -292,6 +292,18 @@ class TestBuildDailyEquityCurve:
         with pytest.raises(ValueError, match="initial_capital must be finite"):
             build_daily_equity_curve(result)
 
+    @pytest.mark.parametrize("initial_capital", [0.0, -1.0, -100_000.0])
+    def test_rejects_nonpositive_initial_capital(self, initial_capital):
+        """A zero or negative base makes every return undefined, not just small.
+
+        `equity / initial_capital` is a division by zero at 0 and a sign flip
+        below it, so this must be refused rather than published as a curve.
+        """
+        result = make_result(initial_capital=initial_capital, trades=[make_trade()])
+
+        with pytest.raises(ValueError, match="initial_capital must be finite and > 0"):
+            build_daily_equity_curve(result)
+
     def test_rejects_nonfinite_starting_equity(self):
         result = make_result(trades=[make_trade()])
 
