@@ -1839,10 +1839,93 @@ def test_an_absent_confirmation_is_refused(isolated_db_sandbox):
         json={"status": "ACTIVE", "confirmation": {}},
     )
 
+    # An empty object fails the schema (`confirmed_deployment_id` is required),
+    # so FastAPI rejects it with 422 before the guard ever runs. It must NOT be
+    # 428: 428 is reserved for a confirmation that is absent altogether, and the
+    # two codes have to stay distinguishable for a scripted caller.
     assert response.status_code in (409, 422), (
         f"a missing confirmation was accepted (status {response.status_code})"
     )
+    assert response.status_code != 428, (
+        "an empty confirmation object is a malformed payload (422) or a "
+        "mismatched confirmation (409), not an absent confirmation (428)"
+    )
     assert database_module.get_live_deployment(did).status == "PAUSED"
+
+
+def test_an_omitted_confirmation_reports_428_precondition_required(
+    isolated_db_sandbox,
+):
+    """The *documented* contract for "you did not confirm this" is 428.
+
+    ``_require_live_control_confirmation`` distinguishes two refusals on purpose:
+    a confirmation that is *absent* is a deliberate step the caller skipped and
+    is reported as 428 Precondition Required, while a confirmation that names the
+    *wrong* deployment is a contradictory request and is reported as 409. That
+    split is the whole point of the docstring on the guard - a script can tell
+    "you did not confirm this" apart from "your payload was malformed".
+
+    It was untested until mutation testing caught it: the sibling test above sent
+    ``confirmation: {}`` and accepted ``(409, 422)``, so changing this branch's
+    428 to 409 (or 422) left every test green. The two branches must stay
+    distinguishable, so pin 428 exactly and send no ``confirmation`` key at all
+    - that is the only input that reaches the ``is None`` path.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-none", "alpaca", is_demo=True)
+
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    did = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(did),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-none",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="PAUSED",
+            signal_source_type="internal",
+        )
+    )
+
+    client = TestClient(viewer_main_module.app)
+    # No "confirmation" key at all: the field is Optional and defaults to None,
+    # which is exactly the branch that raises 428.
+    response = client.put(
+        f"/api/live/deployments/{did}/status",
+        json={"status": "ACTIVE"},
+    )
+
+    assert response.status_code == 428, (
+        "an omitted confirmation must be reported as 428 Precondition Required "
+        "so a caller can tell 'you did not confirm this' apart from 'your "
+        f"payload was malformed' (got {response.status_code})"
+    )
+    detail = response.json()["detail"]
+    assert "must be confirmed" in detail, detail
+    assert did in detail, "the refusal must name the deployment to confirm"
+    assert database_module.get_live_deployment(did).status == "PAUSED", (
+        "the deployment was armed by a request that never confirmed it"
+    )
+
+    # A skipped confirmation is a live-control attempt like any other and must
+    # land on the audit trail: this is how "something tried to arm this" is
+    # answerable after the fact.
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == did and not entry.get("succeeded")
+    ]
+    assert entries, "the refusal must be audited"
+    assert entries[0]["action"] == "deployment.status"
+    assert entries[0]["detail"].get("reason") == "no confirmation supplied"
 
 
 def test_a_failed_service_records_that_it_was_actually_tried(isolated_db_sandbox):
