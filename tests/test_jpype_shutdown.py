@@ -8,12 +8,13 @@ can no longer make progress. The interpreter therefore never exits: the whole
 ``pytest`` run hangs after printing its summary and the CI ``Python
 ubuntu-latest`` job burns its 60-minute timeout.
 
-``data_tools.downloaders.jforex_dl`` disables ``jpype.config.onexit`` at import
-so JPype stays out of interpreter teardown; the JVM is left for the OS to
-reclaim at process exit. These tests pin that contract with real subprocesses,
-because the failure only manifests at interpreter exit and cannot be observed
-in-process. The subprocess tests are skipped without a usable JDK: the guard is
-a hang in the *exit* path, which cannot occur when no JVM ever starts.
+``data_tools.downloaders.jforex_dl`` disables ``jpype.config.onexit`` at the
+point it starts a JVM (``_ensure_jvm_started``) so JPype stays out of
+interpreter teardown; the JVM is left for the OS to reclaim at process exit.
+These tests pin that contract with real subprocesses, because the failure only
+manifests at interpreter exit and cannot be observed in-process. The subprocess
+tests are skipped without a usable JDK: the guard is a hang in the *exit* path,
+which cannot occur when no JVM ever starts.
 """
 
 from __future__ import annotations
@@ -69,13 +70,15 @@ def _run(script: str) -> tuple[subprocess.CompletedProcess, float]:
     return result, time.monotonic() - started
 
 
-def test_jforex_dl_disables_jpype_onexit_at_import():
-    """Importing the downloader must keep JPype out of interpreter teardown.
+def test_import_does_not_mutate_jpype_onexit_and_start_does():
+    """The ``onexit`` guard is armed when a JVM starts, not on import.
 
-    ``onexit`` defaults to True in ``jpype/config.py``; the module lowers it on
-    import. Assert through the module's own ``jpype`` handle so the check fails
-    if the wiring is dropped, and confirm that handle really is the global
-    instance ``_JTerminate``/``shutdownJVM`` consult.
+    ``onexit`` defaults to True in ``jpype/config.py``. Setting it to False is
+    process-global and irreversible, so the module defers it to the single point
+    it starts a JVM (``_ensure_jvm_started``): merely importing the downloader
+    for a constant must not strip teardown from an unrelated JPype consumer in
+    the same process. ``_JTerminate`` reads ``onexit`` at exit time, so arming
+    it just before ``startJVM`` is equally effective.
     """
     jpype_config = pytest.importorskip("jpype.config")
 
@@ -83,7 +86,14 @@ def test_jforex_dl_disables_jpype_onexit_at_import():
 
     assert jforex_dl.jpype is not None
     assert jforex_dl.jpype.config is jpype_config
+    # Import alone must not have touched the process-global flag.
+    assert jpype_config.onexit is True
+
+    jforex_dl._disable_jpype_onexit()
     assert jforex_dl.jpype.config.onexit is False
+
+    # Restore for the rest of the session; the assignment is one-way otherwise.
+    jpype_config.onexit = True
 
 
 def test_production_code_never_calls_jpype_shutdownjvm():

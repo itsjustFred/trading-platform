@@ -397,24 +397,41 @@ _JSON_MIGRATION_STATUS = "pending"
 
 
 class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """``ThreadPoolExecutor`` whose worker threads are real daemons.
+    """``ThreadPoolExecutor`` whose workers do not pin interpreter shutdown.
 
-    ``concurrent.futures.ThreadPoolExecutor`` hardcodes non-daemon workers and
-    registers an interpreter-exit hook (``_python_exit``) that joins every
-    worker, so an in-flight blocking job pins interpreter shutdown just as it
-    pins the event loop's default-executor join. Startup prewarms (JSON→SQLite
-    migration, equity/backtest metadata scans) are fire-and-forget: nothing
-    consumes their result and a half-finished warm only means a cold cache, so
-    a daemon worker that is cut off mid-scan at teardown is the correct
-    trade-off — shutdown must never wait on it.
+    ``concurrent.futures.ThreadPoolExecutor`` hardcodes non-daemon workers and,
+    in ``_adjust_thread_count``, registers each one in the module-level
+    ``_threads_queues`` map. Two independent joins then wait on those workers:
 
-    ``_adjust_thread_count`` mirrors CPython's private
-    ``ThreadPoolExecutor`` internals (``_worker``, ``_idle_semaphore``,
-    ``_threads`` and the weakref callback) to keep worker bookkeeping intact
-    while flipping only the ``daemon`` flag. It is validated against CPython
-    3.12, the interpreter this project pins (``requires-python``, the CI
-    matrix and ``sonar.python.version`` all set 3.12); the upstream internals
-    would need re-checking before widening that range.
+    * ``threading._shutdown`` joins every **non-daemon** thread via
+      ``_shutdown_locks``, and
+    * ``concurrent.futures.thread._python_exit`` walks ``_threads_queues`` and
+      calls ``t.join()`` on every entry — *regardless of the daemon flag*.
+
+    So neither mechanism alone is sufficient, and both deviations below are
+    load-bearing:
+
+    1. ``daemon=True`` keeps the worker out of ``threading._shutdown``'s
+       non-daemon join.
+    2. This override deliberately **does not** populate ``_threads_queues``, so
+       ``_python_exit`` never sees the worker. ``daemon`` alone would not be
+       enough — ``_python_exit`` joins daemon and non-daemon entries alike.
+
+    **Do not "restore" the missing ``_threads_queues[t] = self._work_queue``
+    line.** Copying it back from CPython would re-arm ``_python_exit`` and
+    re-introduce the very interpreter-exit hang this class exists to remove.
+
+    Startup prewarms fan out into blocking database scans; a worker that is cut
+    off at teardown is the intended trade-off — shutdown must never wait on
+    them.
+
+    The override mirrors CPython's private ``ThreadPoolExecutor`` internals
+    (``_worker``, ``_idle_semaphore``, ``_threads`` and the weakref callback)
+    and is validated against CPython 3.12, the interpreter this project pins
+    (``requires-python``, the CI matrix and ``sonar.python.version`` all set
+    3.12); the upstream internals would need re-checking before widening that
+    range, and ``tests/test_viewer_shutdown_nonblocking.py`` pins the symptom if
+    a future interpreter changes the join behaviour.
     """
 
     def _adjust_thread_count(self) -> None:
@@ -442,34 +459,43 @@ class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
             self._threads.add(thread)
 
 
-# Dedicated daemon-thread pool for fire-and-forget startup prewarms. Daemon
-# threading (see above) keeps the event loop's default-executor join and the
-# interpreter-exit thread join from waiting on in-flight blocking scans.
+# Dedicated daemon-thread pool for fire-and-forget startup cache prewarms.
+# Daemon threading (see above) keeps the event loop's default-executor join and
+# the interpreter-exit thread join from waiting on in-flight blocking scans.
 _BACKGROUND_PREWARM_EXECUTOR = _DaemonThreadPoolExecutor(
     max_workers=4, thread_name_prefix="viewer-prewarm"
 )
 
 
-def _run_background_job(coro_factory):
-    """Schedule ``coro_factory`` on the daemon-thread prewarm pool.
+def _run_background_job(job):
+    """Schedule the blocking callable ``job`` on the daemon-thread prewarm pool.
 
-    Startup prewarms fan out into blocking database scans (JSON→SQLite
-    migration, equity/backtest metadata loads). ``asyncio.to_thread`` uses the
-    loop's default executor, and closing the loop joins that executor with
+    Startup cache prewarms fan out into blocking database scans (equity/backtest
+    metadata loads, payload rebuilds). ``asyncio.to_thread`` uses the loop's
+    default executor, and closing the loop joins that executor with
     ``wait=True`` — so an event-loop shutdown (e.g. a ``TestClient`` lifespan
     exit, or uvicorn draining) blocks until every in-flight blocking scan
     finishes, which can be unbounded on a populated database. Routing these
-    fire-and-forget jobs at :class:`_DaemonThreadPoolExecutor` decouples
+    fire-and-forget cache warmers at :class:`_DaemonThreadPoolExecutor` decouples
     shutdown from both the loop's default executor and the interpreter-exit
     thread join.
+
+    ``job`` is a plain synchronous callable (not a coroutine factory). A worker
+    cut off at teardown is acceptable for the jobs routed here: the cache warmers
+    only leave a cold cache, and the JSON→SQLite migration is idempotent on
+    startup (``migrate_json_to_sqlite(skip_existing=True)`` skips rows already
+    written), so an interrupted migration simply resumes on the next boot. Do
+    **not** route a non-resumable durable write here — a worker killed
+    mid-instruction would leave partial persistent state the next boot cannot
+    reconcile.
     """
     return asyncio.get_running_loop().run_in_executor(
-        _BACKGROUND_PREWARM_EXECUTOR, coro_factory
+        _BACKGROUND_PREWARM_EXECUTOR, job
     )
 
 
-async def _run_background_job_async(coro_factory):
-    return await _run_background_job(coro_factory)
+async def _run_background_job_async(job):
+    return await _run_background_job(job)
 
 
 def _run_json_to_sqlite_migration() -> None:

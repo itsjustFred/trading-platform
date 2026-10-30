@@ -64,18 +64,37 @@ JPYPE_AVAILABLE = jpype is not None
 # never exits: `pytest` prints its summary and hangs until the CI
 # "Python ubuntu-latest" job hits its 60-minute timeout.
 #
-# `onexit = False` keeps JPype out of interpreter teardown. The JVM is then not
-# explicitly shut down either: `jpype.shutdownJVM()` (`destroy_jvm=True` by
-# default) reaches the same `Threads::destroy_vm()` deadlock once the JVM has run
-# with threads, so a controlled teardown is no more reliable than the late hook.
-# Letting the OS reclaim the JVM at process exit is both safe and sufficient.
-# The JPype source warns about this exact hazard at `_core.py:508-510`.
+# We keep JPype out of interpreter teardown by setting `onexit = False` *before*
+# the JVM starts (`_disable_jpype_onexit`, called from `_ensure_jvm_started`).
+# The flag is process-global and one-way, so it is set at the single point this
+# module starts a JVM rather than at import: importing this module for a
+# constant must not silently strip teardown from an unrelated JPype consumer in
+# the same process.
+#
+# The JVM is then not explicitly shut down either: `jpype.shutdownJVM()`
+# (`destroy_jvm=True` by default) reaches the same `Threads::destroy_vm()`
+# deadlock once the JVM has run with threads, so a controlled teardown is no
+# more reliable than the late hook. Letting the OS reclaim the JVM at process
+# exit is both safe and sufficient. The JPype source warns about this exact
+# hazard at `_core.py:508-510`. `test_jpype_shutdown.py` pins that no production
+# module calls `shutdownJVM`, and that `_JTerminate` consults `onexit` at exit
+# time (so setting it before `startJVM` is effective).
 #
 # `jpype/config.py` promises the flag persists across versions ("Variables shall
 # not be removed even if deprecated ... conditions based on these will be valid
 # in all future versions"), so no hasattr guard is needed here.
-if _jpype_config is not None:
-    _jpype_config.onexit = False
+
+
+def _disable_jpype_onexit() -> None:
+    """Keep JPype's ``_JTerminate`` hook out of interpreter teardown.
+
+    Process-global and irreversible for the interpreter's lifetime; called at
+    the point a JVM is about to start. ``_JTerminate`` reads
+    ``jpype.config.onexit`` at exit time (not at import), so lowering it here is
+    as effective as lowering it earlier.
+    """
+    if _jpype_config is not None:
+        _jpype_config.onexit = False
 
 
 DEFAULT_JNLP_URL = "https://platform.dukascopy.com/demo/jforex.jnlp"
@@ -745,6 +764,7 @@ def _ensure_jvm_started() -> None:
 
     with JVM_START_LOCK:
         if not jpype_mod.isJVMStarted():
+            _disable_jpype_onexit()
             classpath, classpath_source = _resolve_jforex_classpath_details()
             if not classpath:
                 raise RuntimeError(

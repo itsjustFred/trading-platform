@@ -61,11 +61,12 @@ File: `data_tools/downloaders/dukascopy_native.py`
 - The viewer download API launches `jforex_dl` for source `dukascopy` and falls back to `dukascopy_native` when JForex/JPype/JVM is unavailable.
 - Once the JForex JVM is started it is never explicitly shut down: the process
   exits and the OS reclaims it. JPype's interpreter-exit hook is disabled
-  (`jpype.config.onexit = False` at `jforex_dl` import) because an in-teardown
-  JVM detach deadlocks in HotSpot's `Threads::destroy_vm()` — this previously
-  hung `pytest` after its summary until CI's 60-minute job timeout. A JVM
-  started in one process cannot be restarted after a shutdown, so treat the
-  start as one-shot per interpreter.
+  (`jpype.config.onexit = False`, armed by `jforex_dl` immediately before it
+  starts the JVM) because an in-teardown JVM detach deadlocks in HotSpot's
+  `Threads::destroy_vm()` — this previously hung `pytest` after its summary until
+  CI's job timeout. The flag is process-global, so it is set at the JVM start
+  path rather than at import. A JVM started in one process cannot be restarted
+  after a shutdown, so treat the start as one-shot per interpreter.
 - It can merge bid/ask exports for `tick` and `s1` using `--merge-tick` or
   `--merge-s1`.
 - Dukascopy coverage is exposed per timeframe in the API response
