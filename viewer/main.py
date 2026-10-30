@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures.thread
 import json
 import logging
 import math
@@ -13,6 +14,8 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -393,6 +396,74 @@ _JSON_MIGRATION_STATUS_LOCK = threading.Lock()
 _JSON_MIGRATION_STATUS = "pending"
 
 
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """``ThreadPoolExecutor`` whose worker threads are real daemons.
+
+    ``concurrent.futures.ThreadPoolExecutor`` hardcodes non-daemon workers and
+    registers an interpreter-exit hook (``_python_exit``) that joins every
+    worker, so an in-flight blocking job pins interpreter shutdown just as it
+    pins the event loop's default-executor join. Startup prewarms (JSON→SQLite
+    migration, equity/backtest metadata scans) are fire-and-forget: nothing
+    consumes their result and a half-finished warm only means a cold cache, so
+    a daemon worker that is cut off mid-scan at teardown is the correct
+    trade-off — shutdown must never wait on it.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            thread = threading.Thread(
+                name=thread_name,
+                target=concurrent.futures.thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)
+
+
+# Dedicated daemon-thread pool for fire-and-forget startup prewarms. Daemon
+# threading (see above) keeps the event loop's default-executor join and the
+# interpreter-exit thread join from waiting on in-flight blocking scans.
+_BACKGROUND_PREWARM_EXECUTOR = _DaemonThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="viewer-prewarm"
+)
+
+
+def _run_background_job(coro_factory):
+    """Schedule ``coro_factory`` on the daemon-thread prewarm pool.
+
+    Startup prewarms fan out into blocking database scans (JSON→SQLite
+    migration, equity/backtest metadata loads). ``asyncio.to_thread`` uses the
+    loop's default executor, and closing the loop joins that executor with
+    ``wait=True`` — so an event-loop shutdown (e.g. a ``TestClient`` lifespan
+    exit, or uvicorn draining) blocks until every in-flight blocking scan
+    finishes, which can be unbounded on a populated database. Routing these
+    fire-and-forget jobs at :class:`_DaemonThreadPoolExecutor` decouples
+    shutdown from both the loop's default executor and the interpreter-exit
+    thread join.
+    """
+    return asyncio.get_running_loop().run_in_executor(
+        _BACKGROUND_PREWARM_EXECUTOR, coro_factory
+    )
+
+
+async def _run_background_job_async(coro_factory):
+    return await _run_background_job(coro_factory)
+
+
 def _run_json_to_sqlite_migration() -> None:
     global _JSON_MIGRATION_STATUS
     with _JSON_MIGRATION_STATUS_LOCK:
@@ -414,28 +485,30 @@ def _run_json_to_sqlite_migration() -> None:
 
 async def _prewarm_data_views_background() -> None:
     try:
-        await asyncio.to_thread(_prewarm_data_views_once)
+        await _run_background_job(_prewarm_data_views_once)
     except Exception as exc:
         logger.warning("Data views prewarm failed: %s", exc)
 
 
 async def _prewarm_live_accounts_background() -> None:
     try:
-        await asyncio.to_thread(_cached_live_accounts_payload, force_refresh=True)
+        await _run_background_job(
+            lambda: _cached_live_accounts_payload(force_refresh=True)
+        )
     except Exception as exc:
         logger.warning("Live accounts prewarm failed: %s", exc)
 
 
 async def _prewarm_strategies_background() -> None:
     try:
-        await asyncio.to_thread(_cached_strategies_payload, force_refresh=True)
+        await _run_background_job(lambda: _cached_strategies_payload(force_refresh=True))
     except Exception as exc:
         logger.warning("Strategies prewarm failed: %s", exc)
 
 
 async def _prewarm_backtest_metadata_background() -> None:
     try:
-        count = await asyncio.to_thread(_refresh_backtest_meta_cache)
+        count = await _run_background_job(_refresh_backtest_meta_cache)
         logger.info("Backtest metadata cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Backtest metadata prewarm failed: %s", exc)
@@ -443,7 +516,7 @@ async def _prewarm_backtest_metadata_background() -> None:
 
 async def _prewarm_portfolio_metadata_background() -> None:
     try:
-        count = await asyncio.to_thread(_refresh_portfolio_meta_cache)
+        count = await _run_background_job(_refresh_portfolio_meta_cache)
         logger.info("Portfolio metadata cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Portfolio metadata prewarm failed: %s", exc)
@@ -451,7 +524,7 @@ async def _prewarm_portfolio_metadata_background() -> None:
 
 async def _prewarm_tasks_cache_background() -> None:
     try:
-        count = await asyncio.to_thread(_hydrate_task_cache_once, True)
+        count = await _run_background_job(lambda: _hydrate_task_cache_once(True))
         logger.info("Task cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Task cache prewarm failed: %s", exc)
@@ -1053,7 +1126,9 @@ def _resume_interrupted_downloader_task(
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(_recover_maintenance_deletes)
-    json_migration_task = asyncio.create_task(asyncio.to_thread(_run_json_to_sqlite_migration))
+    json_migration_task = asyncio.create_task(
+        _run_background_job_async(_run_json_to_sqlite_migration)
+    )
     data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
