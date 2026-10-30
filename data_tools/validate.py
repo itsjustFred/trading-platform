@@ -466,7 +466,16 @@ def _dataset_metadata(path: Path) -> dict:
         source = path.parts[-4] if len(path.parts) >= 4 else ""
         asset_class = path.parts[-3] if len(path.parts) >= 3 else ""
         symbol = path.parent.name
-        timeframe_stem = path.stem
+        # Parse the stem the way `catalog_builder.parse_ohlcv_path` does, so the key
+        # is the one the downloader wrote (`.../1h`) rather than the segmented file
+        # name (`.../1h_2024_03`). The writer keys on the *dataset* timeframe, and
+        # `catalog_builder` reads it with the same parser; using the raw stem here
+        # would re-introduce the filename-vs-dataset mismatch this branch is fixing,
+        # one layer up. Fall back to the stem when the parser cannot name a
+        # timeframe, so an unexpected layout still looks up *something* rather than
+        # silently returning nothing.
+        parsed_timeframe, _segment = _extract_timeframe_and_segment(path.stem)
+        timeframe_stem = parsed_timeframe or path.stem
         canonical = f"{source}/{asset_class}/{symbol}/{timeframe_stem}"
         keys.append(canonical)
         # Retained for any file written under the old path-shaped scheme.

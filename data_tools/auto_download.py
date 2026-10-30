@@ -641,10 +641,27 @@ def _fail_on_internal_gaps(data_root: Path, requirements: list[DataRequirement])
     for requirement in requirements:
         report = analyze_ohlcv_coverage(data_root, requirement)
         if report.get("status") == "failed":
+            # Report the two failure sources separately rather than collapsing them.
+            # `status` is `failed` when there is an `error` OR when a gap is over the
+            # fail threshold, and those are different problems: an `error` is a read
+            # that did not happen (the report may still carry a full `gaps` list from
+            # the bars it did see), while a `failed_downloads` entry is a hole the
+            # data actually has. The old message printed `gaps` first, so an errored
+            # read whose `gaps` list was non-empty described itself as a gap failure
+            # and hid the error entirely.
+            problems: list[str] = []
+            error = report.get("error")
+            if error:
+                problems.append(f"error: {error}")
+            failed_downloads = report.get("failed_downloads") or []
+            if failed_downloads:
+                problems.append(f"failing gaps: {failed_downloads}")
+            if not problems:  # pragma: no cover - defensive; status failed implies one
+                problems.append(f"gaps: {report.get('gaps')}")
             raise RuntimeError(
                 "OHLCV coverage has internal gaps for "
                 f"{requirement.symbol} {requirement.timeframe}: "
-                f"{report.get('gaps') or report.get('error')}"
+                + "; ".join(problems)
             )
 
 

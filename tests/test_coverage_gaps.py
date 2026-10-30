@@ -1312,16 +1312,24 @@ def test_weekly_and_monthly_thresholds_are_unchanged_by_the_allowance():
     assert scaled_gap_threshold_days("1mo", 3, allow_long_weekend=True) == 90.0
 
 
-def test_a_gap_with_unreadable_endpoints_is_never_excused():
+def test_a_gap_with_unreadable_endpoints_is_never_excused(tmp_path):
     """Fails closed: a gap report this function cannot read is a bug, and
     excusing it would hide that bug behind a closure."""
     from data_tools.auto_download import _gap_is_market_closure
 
+    # `data_dir` is an empty tmp root, not the default. `_uses_us_equity_calendar`
+    # walks `<data_dir>/ohlcv` looking for the symbol's segment, and the default
+    # resolves to the real data volume - so without this the assertions below
+    # silently depend on whatever the host happens to have stored, and the
+    # `_US_STOCK_SYMBOL_PATTERN` fallback is only exercised when that walk is empty.
+    empty = tmp_path / "no_dataset"
     weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
     # The positive control names a US venue, because that is the only kind this
     # calendar can account for. Called with no symbol it now returns False - an
     # unstated venue is not a licence to excuse, and that is the defect.
-    assert _gap_is_market_closure(weekend, timeframe="1m", symbol="AAPL")
+    assert _gap_is_market_closure(
+        weekend, timeframe="1m", symbol="AAPL", data_dir=empty
+    )
 
     # Every negative case names the US venue too. Without it these assertions
     # still passed - but for the wrong reason: an unnamed venue is refused before
@@ -1330,10 +1338,10 @@ def test_a_gap_with_unreadable_endpoints_is_never_excused():
     # all. Found by a CodeRabbit review scoped to tests/, one commit after the
     # venue guard landed.
     assert not _gap_is_market_closure(
-        {**weekend, "start": ""}, timeframe="1m", symbol="AAPL"
+        {**weekend, "start": ""}, timeframe="1m", symbol="AAPL", data_dir=empty
     )
     assert not _gap_is_market_closure(
-        {**weekend, "end": "not-a-date"}, timeframe="1m", symbol="AAPL"
+        {**weekend, "end": "not-a-date"}, timeframe="1m", symbol="AAPL", data_dir=empty
     )
     # A report with no exact width is not guessed at from the rounded
     # `gap_days`, which cannot resolve a one-minute bar.
@@ -1341,10 +1349,11 @@ def test_a_gap_with_unreadable_endpoints_is_never_excused():
         {"start": "2026-09-11", "end": "2026-09-14", "gap_days": 2.73},
         timeframe="1m",
         symbol="AAPL",
+        data_dir=empty,
     )
 
 
-def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
+def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar(tmp_path):
     """The defect: a real hole in FX, certified as a holiday.
 
     Martin Luther King Jr Day 2026 closed US equities on Monday 19 January, and
@@ -1361,6 +1370,9 @@ def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
     """
     from data_tools.auto_download import _gap_is_market_closure, _uses_us_equity_calendar
 
+    # Empty tmp root, so the venue lookup never walks the real data volume and the
+    # result turns on the symbol itself rather than on what the host has stored.
+    empty = tmp_path / "no_dataset"
     fx_outage = {
         "start": "2026-01-16",   # Friday 21:00 UTC, last bar
         "end": "2026-01-20",     # Tuesday 22:00 UTC, first bar back
@@ -1369,12 +1381,12 @@ def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
     }
 
     for symbol in ("EURUSD", "USDJPY", "XAUUSD", "BTCUSD"):
-        assert not _uses_us_equity_calendar(symbol), (
+        assert not _uses_us_equity_calendar(symbol, "1m", empty), (
             f"{symbol} is not a US equity venue, so the calendar cannot account "
             f"for its closures"
         )
         assert not _gap_is_market_closure(
-            fx_outage, timeframe="1m", symbol=symbol
+            fx_outage, timeframe="1m", symbol=symbol, data_dir=empty
         ), (
             f"a four-day hole in {symbol} was excused as a market closure. The US "
             "equity calendar does not model this venue, so it cannot certify its "
@@ -1384,9 +1396,9 @@ def test_a_four_day_fx_outage_is_not_excused_by_the_us_equity_calendar():
     # The identical hole on a US equity is a genuine long weekend, and still
     # passes. The fix narrows the excuse; it does not remove it.
     for symbol in ("AAPL", "SPY"):
-        assert _gap_is_market_closure(fx_outage, timeframe="1m", symbol=symbol), (
-            f"a real US equity holiday week stopped being excused for {symbol}"
-        )
+        assert _gap_is_market_closure(
+            fx_outage, timeframe="1m", symbol=symbol, data_dir=empty
+        ), f"a real US equity holiday week stopped being excused for {symbol}"
 
 
 def test_an_unknown_venue_is_never_excused():
@@ -1914,6 +1926,98 @@ def test_a_legacy_path_shaped_source_meta_key_is_still_accepted(
     assert _dataset_metadata(target) == {"calendar": "legacy"}, (
         "an existing path-shaped key stopped resolving, which would discard metadata "
         "for any dataset written before the canonical scheme"
+    )
+
+
+def test_a_segmented_source_meta_key_is_looked_up_under_the_dataset_timeframe(
+    tmp_path, monkeypatch
+):
+    """A segmented file must be keyed by its *timeframe*, not by its filename.
+
+    The downloader writes `source/asset_class/symbol/{timeframe}` and
+    `catalog_builder` reads that shape after parsing the segment out of the stem.
+    A segmented file `1h_2024_03.parquet` is stored under the dataset timeframe
+    `1h`, so keying on the raw stem would look up `.../1h_2024_03` - which nothing
+    writes - and silently return nothing. That is the same filename-vs-dataset
+    mismatch this branch already fixed in `validate_parquet`, one layer up.
+    """
+    import json
+
+    import pandas as pd
+
+    from data_tools import validate as validate_module
+    from data_tools.validate import _dataset_metadata
+
+    root = tmp_path
+    (root / "ohlcv").mkdir()
+    target = root / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h_2024_03.parquet"
+    target.parent.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2024-03-01 09:00", tz="UTC")],
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [1.0],
+        }
+    ).to_parquet(target, index=False)
+    # The writer keys on the dataset timeframe, i.e. `1h`, not the file name.
+    key = "dukascopy/forex/EURUSD/1h"
+    declared = {"session": {"start": "08:00", "end": "16:00"}, "calendar": "FX"}
+    (root / "source_meta.json").write_text(json.dumps({key: declared}))
+    monkeypatch.setattr(validate_module, "DATA_DIR", root)
+
+    assert _dataset_metadata(target) == declared, (
+        "a segmented file did not find the metadata keyed under its dataset "
+        "timeframe, so validation fell back to inferring the session from the data"
+    )
+
+
+def test_the_coverage_failure_message_separates_the_error_from_the_gaps():
+    """`status=failed` has two causes and the message must say which one.
+
+    A read `error` and a gap over the fail threshold are different problems, and
+    the report can carry both a non-empty `gaps` list and an `error`. The message
+    used to print `gaps` first, so an errored read described itself as a gap
+    failure and the error was not visible in the one line an operator reads.
+    """
+    from unittest import mock
+
+    from data_tools.auto_download import _fail_on_internal_gaps
+
+    requirement = DataRequirement(
+        symbol="AAPL", timeframe="1m", start="2024-01-01", end="2024-12-31"
+    )
+
+    # An error with a non-empty `gaps` list: the error must still be shown.
+    errored = {
+        "status": "failed",
+        "gaps": [{"start": "2024-03-01", "end": "2024-03-05", "gap_days": 4.0}],
+        "failed_downloads": [],
+        "error": "could not read the parquet footer",
+    }
+    with mock.patch.object(auto_download, "analyze_ohlcv_coverage", return_value=errored):
+        with pytest.raises(RuntimeError) as excinfo:
+            _fail_on_internal_gaps(Path("/nonexistent"), [requirement])
+    message = str(excinfo.value)
+    assert "could not read the parquet footer" in message, (
+        f"the read error was hidden behind the gaps list: {message!r}"
+    )
+
+    # A gap failure with no error: the failing gap must still be shown.
+    gapped = {
+        "status": "failed",
+        "gaps": [{"start": "2024-03-01", "end": "2024-03-05", "gap_days": 4.0}],
+        "failed_downloads": [
+            {"start": "2024-03-01", "end": "2024-03-05", "gap_days": 4.0}
+        ],
+    }
+    with mock.patch.object(auto_download, "analyze_ohlcv_coverage", return_value=gapped):
+        with pytest.raises(RuntimeError) as excinfo:
+            _fail_on_internal_gaps(Path("/nonexistent"), [requirement])
+    assert "2024-03-05" in str(excinfo.value), (
+        "the failing gap stopped being named in the coverage error"
     )
 
 
