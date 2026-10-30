@@ -110,6 +110,40 @@ def test_the_smoke_tooling_creates_the_parent_before_the_signal() -> None:
     )
 
 
+def test_the_smoke_helper_creates_one_paused_parent_per_account(isolated_db_sandbox) -> None:
+    """The behaviour behind the source-shape assertions above.
+
+    A grep can see that the helper exists and that it is called before the signal, but not that it
+    is idempotent or that the row it writes is inert. Both matter: a second smoke run must not
+    create a second deployment for the same account, and a deployment a runner could pick up is a
+    trade nobody asked for.
+    """
+    from uuid import UUID
+
+    from sqlmodel import select
+
+    database, _engine, _data_dir = isolated_db_sandbox
+    from scripts.live_smoke import _ensure_ctrader_smoke_deployment
+
+    with database.get_session() as session:
+        session.add(database.LiveAccountModel(id="44695443", broker="ctrader", name="smoke"))
+        session.commit()
+
+    first = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="xauusd")
+    second = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="xauusd")
+
+    assert first == second, "a second smoke run created a second deployment for the same account"
+    with database.get_session() as session:
+        rows = session.exec(select(database.LiveDeploymentModel)).all()
+    assert len(rows) == 1, f"expected one deployment row, got {len(rows)}"
+    row = rows[0]
+    assert row.strategy_name == "ctrader-demo-smoke-44695443"
+    assert row.status == "PAUSED", "a runner could trade a deployment the smoke run created"
+    assert row.signal_source == "smoke"
+    assert row.symbols_json == ["XAUUSD"], row.symbols_json
+    assert str(UUID(str(row.id))) == str(row.id), "the id is not a UUID"
+
+
 def test_no_code_path_deletes_a_deployment() -> None:
     """Why the seventh orphan is a different story from the other six."""
     for path in (REPO / "shared").rglob("*.py"):
@@ -486,6 +520,49 @@ class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='live_signals__fk_new'"
             ).fetchall()
             assert leftovers == [], "the rebuild left its scratch table behind"
+            assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+        finally:
+            check.close()
+
+    def test_the_rebuild_handles_a_table_whose_name_is_stored_quoted(self, tmp_path) -> None:
+        """SQLite stores the name quoted after a rename, and a plain `str.replace` misses it.
+
+        Staged directly - a rename rewrites the stored `CREATE TABLE` text as
+        ``CREATE TABLE "live_signals" (...)` - because the re-run test above rebuilds from an
+        unquoted table and so never reaches this branch.
+        """
+        from sqlalchemy import create_engine
+
+        from shared.database import _migrate_live_signal_deployment_fk
+
+        path = self._db(tmp_path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE live_signals RENAME TO live_signals_old")
+            conn.execute("ALTER TABLE live_signals_old RENAME TO live_signals")
+            stored = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='live_signals'"
+            ).fetchone()[0]
+            assert stored.startswith('CREATE TABLE "live_signals"'), (
+                f"could not stage a quoted table name, got {stored!r}"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        engine = create_engine(f"sqlite:///{path.as_posix()}")
+        try:
+            with engine.begin() as connection:
+                assert _migrate_live_signal_deployment_fk(connection) is True, (
+                    "the rebuild could not address a quoted table name, so a database whose name "
+                    "was ever rewritten by a rename can never regain the key"
+                )
+        finally:
+            engine.dispose()
+
+        check = sqlite3.connect(path)
+        try:
+            assert len(check.execute("PRAGMA foreign_key_list(live_signals)").fetchall()) == 1
             assert check.execute("PRAGMA foreign_key_check").fetchall() == []
         finally:
             check.close()

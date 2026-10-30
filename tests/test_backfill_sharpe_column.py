@@ -47,6 +47,7 @@ def conn(tmp_path):
             ("unparseable-stats", 0.0, 0.0, 0.0, 1.0, "{not json"),
             ("legacy-key", 0.0, 0.0, 0.0, 1.0, '{"sharpe": -2.5}'),
             ("payload-missing", 0.0, 0.0, 0.0, 1.0, '{"total_trades": 3}'),
+            ("unparseable-value", 0.0, 0.0, 0.0, 1.0, '{"p_value": "n/a"}'),
         ],
     )
     db.commit()
@@ -67,6 +68,10 @@ def test_it_finds_exactly_the_disagreeing_rows(conn):
     assert ("no-stats", "sharpe_ratio") not in found
     assert ("unparseable-stats", "sharpe_ratio") not in found
     assert ("payload-missing", "sharpe_ratio") not in found
+    assert ("unparseable-value", "p_value") not in found, (
+        "a payload value that is not a number was treated as a disagreement; coercing it would "
+        "write a fabricated 0.0 into the column"
+    )
 
 
 def test_each_column_is_reconciled_independently(conn):
@@ -93,6 +98,39 @@ def test_each_column_is_reconciled_independently(conn):
         conn.execute("select id, psr from backtests where id = 'agreeing'").fetchall()
     )
     assert values["agreeing"] == pytest.approx(0.33)
+
+
+def test_a_metric_other_than_the_withheld_one_is_still_reconciled(conn):
+    """``undefined_metrics`` names *which* metric was withheld, and only that one.
+
+    A row that declares ``psr`` undefined still has a stale ``sharpe_ratio``, and skipping the whole
+    row would leave that stale. The count matters too: the operator-facing line reports
+    ``corrected of total``, so a counter that stops incrementing misreports the write.
+    """
+    conn.execute(
+        "insert into backtests (id, sharpe_ratio, psr, cagr, p_value, stats) "
+        "values ('partial', 0.0, 0.0, 0.0, 1.0, "
+        "'{\"sharpe_ratio\": -4.0, \"undefined_metrics\": [\"psr\"]}')"
+    )
+    conn.commit()
+
+    module = _load()
+    found = {(r[0], r[1]) for r in module.find_disagreements(conn)}
+    assert ("partial", "sharpe_ratio") in found, (
+        "the row was skipped entirely because a different metric was declared undefined"
+    )
+    assert ("partial", "psr") not in found, "the withheld metric must not be reconciled"
+    assert ("partial", "sharpe_ratio") not in module.find_declared_undefined(conn)
+
+    all_rows = module.find_disagreements(conn)
+    assert module._reconcile(conn, all_rows) == len(all_rows), (
+        "the reported count no longer matches the number of cells written"
+    )
+    conn.commit()
+    corrected = conn.execute(
+        "select sharpe_ratio from backtests where id = 'partial'"
+    ).fetchone()[0]
+    assert corrected == pytest.approx(-4.0)
 
 
 def test_p_value_uses_its_own_sentinel_of_one_not_zero(conn):

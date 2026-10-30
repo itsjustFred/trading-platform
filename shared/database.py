@@ -1863,6 +1863,8 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
         connection.execute(text(statement))
     logger.info("Rebuilt live_signals with the deployment_id foreign key")
     return True
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         _add_live_deployment_columns(
