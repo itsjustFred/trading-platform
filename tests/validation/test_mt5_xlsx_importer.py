@@ -631,3 +631,61 @@ class TestTradeColumnRequired:
     def test_present_trade_column_still_imports(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(self._write_report(tmp_path, include_trade=True))
         assert len(ref.trades) == 1, "one in/out pair must reconstruct one position"
+
+
+class TestZeroFeesBecomeNone:
+    """MT5 reports "no fees" as ``0.0``; the importer stores that as ``None``.
+
+    A mutant flipping ``abs(fees) > 0.0`` to ``>= 0.0`` would store ``0.0`` and
+    still pass every other test, because the fee columns are only exercised with
+    non-zero values. Pin the exact-zero mapping and the net-pnl arithmetic.
+    """
+
+    def _write_report(
+        self, tmp_path: Path, *, commission: float, swap: float, profit: float = 100.0
+    ) -> Path:
+        header = [
+            "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
+            "Kommission", "Swap", "Gewinn", "Kommentar",
+        ]
+        rows = [
+            ["Trades"] + [None] * (len(header) - 1),
+            header,
+            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085,
+             commission, swap, 0.0, ""],
+            ["2024.01.03 16:00:00", 3, "EURUSD", "sell", "out", "0.10", 1.090,
+             0.0, 0.0, profit, ""],
+        ]
+        trades = pd.DataFrame(rows)
+        orders = pd.DataFrame([["Orders", None], [None, None]])
+
+        path = tmp_path / f"report_{commission}_{swap}.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            trades.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    def test_zero_commission_and_swap_are_stored_as_none(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=0.0, swap=0.0)
+        )
+        trade = ref.trades[0]
+        assert trade.fees is None
+        assert trade.meta["commission"] is None
+        assert trade.meta["swap"] is None
+
+    def test_nonzero_fees_are_stored_as_the_summed_value(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=2.5, swap=1.5)
+        )
+        trade = ref.trades[0]
+        assert trade.fees == pytest.approx(4.0)
+        assert trade.meta["commission"] == pytest.approx(2.5)
+        assert trade.meta["swap"] == pytest.approx(1.5)
+
+    def test_net_pnl_subtracts_fees_from_gross(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=2.5, swap=1.5, profit=100.0)
+        )
+        trade = ref.trades[0]
+        assert trade.net_pnl == pytest.approx(trade.pnl - 4.0)
