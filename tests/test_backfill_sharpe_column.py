@@ -189,6 +189,48 @@ def test_declared_undefined_rows_are_reported_and_never_applied(conn):
     assert value == 0.0, "the deliberate 'never computed' marker was overwritten"
 
 
+def test_main_refuses_to_apply_while_a_deliberate_sentinel_exists(
+    tmp_path, monkeypatch, capsys
+):
+    """The refusal must stop the run, not just print above a successful write.
+
+    ``--apply`` writes every other disagreement, so falling through leaves the operator reading
+    "Refusing:" at the top of a run that exited zero and wrote anyway.
+    """
+    import sys
+
+    db = sqlite3.connect(tmp_path / "backtests.db")
+    db.execute(
+        "create table backtests (id text primary key, sharpe_ratio real not null default 0.0, "
+        "psr real not null default 0.0, cagr real not null default 0.0, "
+        "p_value real not null default 1.0, stats text)"
+    )
+    db.execute(
+        "insert into backtests values ('withheld', 0.0, 0.0, 0.0, 1.0, "
+        "'{\"sharpe_ratio\": -5.0, \"undefined_metrics\": [\"sharpe_ratio\"]}')"
+    )
+    db.execute(
+        "insert into backtests values ('stale', 0.0, 0.0, 0.0, 1.0, '{\"sharpe_ratio\": -2.0}')"
+    )
+    db.commit()
+    db.close()
+
+    module = _load()
+    monkeypatch.setattr(sys, "argv", ["backfill", "--data-dir", str(tmp_path), "--apply"])
+    with pytest.raises(SystemExit) as exit_info:
+        module.main()
+    assert exit_info.value.code != 0, "the refusal exited zero, so automation cannot see it"
+
+    db = sqlite3.connect(f"file:{tmp_path / 'backtests.db'}?mode=ro", uri=True)
+    try:
+        values = dict(db.execute("select id, sharpe_ratio from backtests").fetchall())
+    finally:
+        db.close()
+    assert values == {"withheld": 0.0, "stale": 0.0}, (
+        f"the script announced a refusal and wrote anyway: {values}"
+    )
+
+
 def test_the_corpus_has_no_declared_undefined_sentinels_today():
     """Zero today, measured. This is the check that makes the refusal path worth keeping.
 

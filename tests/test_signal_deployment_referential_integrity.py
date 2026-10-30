@@ -144,16 +144,55 @@ def test_the_smoke_helper_creates_one_paused_parent_per_account(isolated_db_sand
     assert str(UUID(str(row.id))) == str(row.id), "the id is not a UUID"
 
 
-def test_no_code_path_deletes_a_deployment() -> None:
-    """Why the seventh orphan is a different story from the other six."""
-    for path in (REPO / "shared").rglob("*.py"):
-        if "tests" in path.parts:
-            continue
-        body = path.read_text(errors="replace")
-        assert "delete(LiveDeploymentModel)" not in body, (
-            f"{path} can now delete a deployment row, so the orphans have a second cause and this "
-            f"file's account of them is incomplete"
+def test_the_app_cannot_delete_a_deployment_that_still_has_signals(isolated_db_sandbox) -> None:
+    """Why the seventh orphan is a different story from the other six.
+
+    The app does have one deletion path - `delete_live_deployment`, added for Blocker 5 - but it
+    refuses while any signal or execution still points at the row, so application code cannot
+    produce an orphan. That is what makes the hand-removed `4e9bbdab` a different cause from the
+    smoke tooling, and why this file's account of the two stories still holds.
+
+    This previously asserted that *no* code path deletes a deployment, by grepping for
+    `delete(LiveDeploymentModel)`. That grep cannot see `session.delete(record)`, so it kept passing
+    while the app gained a deletion path - the assertion was about the spelling, not the behaviour.
+    """
+    from datetime import datetime, timezone
+
+    database, engine, _data_dir = isolated_db_sandbox
+    database.init_db()
+    with database.get_session() as session:
+        session.add(database.LiveAccountModel(id="acct-keep", broker="fixture", name="acct-keep"))
+        session.add(
+            database.LiveDeploymentModel(
+                id="dep-keep",
+                strategy_name="keep-me",
+                account_id="acct-keep",
+                symbols_json=[],
+                timeframe="1m",
+            )
         )
+        session.commit()
+    with database.get_session() as session:
+        session.add(
+            database.LiveSignalModel(
+                id="sig-keep",
+                deployment_id="dep-keep",
+                symbol="AAPL",
+                action="buy",
+                theoretical_price=1.0,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    with pytest.raises(database.LiveDeploymentInUseError):
+        database.delete_live_deployment("dep-keep")
+
+    with engine.connect() as connection:
+        survivors = connection.exec_driver_sql(
+            "SELECT count(*) FROM live_deployments"
+        ).scalar_one()
+    assert survivors == 1, "the app deleted a deployment that still had history"
 
 
 def test_the_two_orphan_stories_are_recorded_separately() -> None:

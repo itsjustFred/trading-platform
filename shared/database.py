@@ -1633,8 +1633,9 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
 
     ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
     no deployment row, so those signals were invisible to every deployment-scoped query. This
-    recreates exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history
-    and future runs agree.
+    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, with one difference:
+    the ``symbols`` column names every symbol the orphaned signals traded, because the backfill sees
+    all of them at once while a single run only knows its own.
 
     Three deliberate restrictions, each a guard against fabricating a trading record:
 
@@ -1758,8 +1759,10 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
       refused *even when every dependent row has been removed*, because the surviving executions
       point at rows inside the table being dropped. Measured on a production clone: the migration
       failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
-      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes
-      a bad swap fail closed.
+      swap; ``_schema_migration_connection`` turns it back on after the commit, and this function
+      restores both pragmas best-effort in a ``finally``. That restore is only real for
+      ``legacy_alter_table``: SQLite ignores a ``foreign_keys`` change made inside a transaction,
+      so for a direct caller inside one the outer context manager is what re-enables it.
 
     Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
     On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
@@ -1835,8 +1838,9 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
 
     # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
     # pragma while a transaction is open, so setting it mid-transaction leaves enforcement ON and
-    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN;
-    # this is here for callers that do not, and is restored in the finally below either way.
+    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN and
+    # re-enables it after the commit; the pair below is for callers that do not, and only the
+    # `legacy_alter_table` half takes effect inside a transaction.
     #
     # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
     foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
@@ -3109,7 +3113,7 @@ _SCALAR_STAT_COLUMNS: tuple[tuple[str, float], ...] = (
 
 
 def _scalar_stats_for_save(
-    session: Any, backtest_id: str, stats: dict[str, Any]
+    session: Session, backtest_id: str, stats: dict[str, Any]
 ) -> dict[str, float]:
     """The values the four scalar stat columns should hold after this save.
 
@@ -3261,10 +3265,7 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
 
         backtest_record = BacktestRecord(
             id=backtest_id,
-            sharpe_ratio=scalar_stats["sharpe_ratio"],
-            psr=scalar_stats["psr"],
-            cagr=scalar_stats["cagr"],
-            p_value=scalar_stats["p_value"],
+            **scalar_stats,
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,
