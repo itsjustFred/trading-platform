@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures.thread
 import json
 import logging
 import math
@@ -13,6 +14,8 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -393,6 +396,117 @@ _JSON_MIGRATION_STATUS_LOCK = threading.Lock()
 _JSON_MIGRATION_STATUS = "pending"
 
 
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """``ThreadPoolExecutor`` whose workers do not pin interpreter shutdown.
+
+    ``concurrent.futures.ThreadPoolExecutor`` hardcodes non-daemon workers and,
+    in ``_adjust_thread_count``, registers each one in the module-level
+    ``_threads_queues`` map. Two independent joins then wait on those workers:
+
+    * ``threading._shutdown`` joins every **non-daemon** thread via
+      ``_shutdown_locks``, and
+    * ``concurrent.futures.thread._python_exit`` walks ``_threads_queues`` and
+      calls ``t.join()`` on every entry — *regardless of the daemon flag*.
+
+    So neither mechanism alone is sufficient, and both deviations below are
+    load-bearing:
+
+    1. ``daemon=True`` keeps the worker out of ``threading._shutdown``'s
+       non-daemon join.
+    2. This override deliberately **does not** populate ``_threads_queues``, so
+       ``_python_exit`` never sees the worker. ``daemon`` alone would not be
+       enough — ``_python_exit`` joins daemon and non-daemon entries alike.
+
+    **Do not "restore" the missing ``_threads_queues[t] = self._work_queue``
+    line.** Copying it back from CPython would re-arm ``_python_exit`` and
+    re-introduce the very interpreter-exit hang this class exists to remove.
+
+    Startup prewarms fan out into blocking database scans; a worker that is cut
+    off at teardown is the intended trade-off — shutdown must never wait on
+    them.
+
+    The override mirrors CPython's private ``ThreadPoolExecutor`` internals
+    (``_worker``, ``_idle_semaphore``, ``_threads`` and the weakref callback)
+    and is validated against CPython 3.12, the interpreter this project pins
+    (``requires-python``, the CI matrix and ``sonar.python.version`` all set
+    3.12). ``_adjust_thread_count`` therefore fails fast on any other minor
+    version rather than silently mis-mirroring the internals; widen the guard
+    only after re-checking the upstream source against the new interpreter.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if sys.version_info[:2] != (3, 12):
+            raise RuntimeError(
+                "_DaemonThreadPoolExecutor mirrors CPython 3.12 private "
+                "ThreadPoolExecutor internals; revalidate against "
+                f"{sys.version_info.major}.{sys.version_info.minor} before use"
+            )
+        super().__init__(*args, **kwargs)
+
+    def _adjust_thread_count(self) -> None:
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            thread = threading.Thread(
+                name=thread_name,
+                target=concurrent.futures.thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self._threads.add(thread)
+
+
+# Dedicated daemon-thread pool for fire-and-forget startup cache prewarms.
+# Daemon threading (see above) keeps the event loop's default-executor join and
+# the interpreter-exit thread join from waiting on in-flight blocking scans.
+_BACKGROUND_PREWARM_EXECUTOR = _DaemonThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="viewer-prewarm"
+)
+
+
+def _run_background_job(job):
+    """Schedule the blocking callable ``job`` on the daemon-thread prewarm pool.
+
+    Startup cache prewarms fan out into blocking database scans (equity/backtest
+    metadata loads, payload rebuilds). ``asyncio.to_thread`` uses the loop's
+    default executor, and closing the loop joins that executor with
+    ``wait=True`` — so an event-loop shutdown (e.g. a ``TestClient`` lifespan
+    exit, or uvicorn draining) blocks until every in-flight blocking scan
+    finishes, which can be unbounded on a populated database. Routing these
+    fire-and-forget cache warmers at :class:`_DaemonThreadPoolExecutor` decouples
+    shutdown from both the loop's default executor and the interpreter-exit
+    thread join.
+
+    ``job`` is a plain synchronous callable (not a coroutine factory). A worker
+    cut off at teardown is acceptable for the jobs routed here: the cache warmers
+    only leave a cold cache, and the JSON→SQLite migration is idempotent on
+    startup (``migrate_json_to_sqlite(skip_existing=True)`` skips rows already
+    written), so an interrupted migration simply resumes on the next boot. Do
+    **not** route a non-resumable durable write here — a worker killed
+    mid-instruction would leave partial persistent state the next boot cannot
+    reconcile.
+    """
+    return asyncio.get_running_loop().run_in_executor(
+        _BACKGROUND_PREWARM_EXECUTOR, job
+    )
+
+
+async def _run_background_job_async(job):
+    return await _run_background_job(job)
+
+
 def _run_json_to_sqlite_migration() -> None:
     global _JSON_MIGRATION_STATUS
     with _JSON_MIGRATION_STATUS_LOCK:
@@ -414,28 +528,30 @@ def _run_json_to_sqlite_migration() -> None:
 
 async def _prewarm_data_views_background() -> None:
     try:
-        await asyncio.to_thread(_prewarm_data_views_once)
+        await _run_background_job(_prewarm_data_views_once)
     except Exception as exc:
         logger.warning("Data views prewarm failed: %s", exc)
 
 
 async def _prewarm_live_accounts_background() -> None:
     try:
-        await asyncio.to_thread(_cached_live_accounts_payload, force_refresh=True)
+        await _run_background_job(
+            lambda: _cached_live_accounts_payload(force_refresh=True)
+        )
     except Exception as exc:
         logger.warning("Live accounts prewarm failed: %s", exc)
 
 
 async def _prewarm_strategies_background() -> None:
     try:
-        await asyncio.to_thread(_cached_strategies_payload, force_refresh=True)
+        await _run_background_job(lambda: _cached_strategies_payload(force_refresh=True))
     except Exception as exc:
         logger.warning("Strategies prewarm failed: %s", exc)
 
 
 async def _prewarm_backtest_metadata_background() -> None:
     try:
-        count = await asyncio.to_thread(_refresh_backtest_meta_cache)
+        count = await _run_background_job(_refresh_backtest_meta_cache)
         logger.info("Backtest metadata cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Backtest metadata prewarm failed: %s", exc)
@@ -443,7 +559,7 @@ async def _prewarm_backtest_metadata_background() -> None:
 
 async def _prewarm_portfolio_metadata_background() -> None:
     try:
-        count = await asyncio.to_thread(_refresh_portfolio_meta_cache)
+        count = await _run_background_job(_refresh_portfolio_meta_cache)
         logger.info("Portfolio metadata cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Portfolio metadata prewarm failed: %s", exc)
@@ -451,7 +567,7 @@ async def _prewarm_portfolio_metadata_background() -> None:
 
 async def _prewarm_tasks_cache_background() -> None:
     try:
-        count = await asyncio.to_thread(_hydrate_task_cache_once, True)
+        count = await _run_background_job(lambda: _hydrate_task_cache_once(True))
         logger.info("Task cache warmed (%s items)", count)
     except Exception as exc:
         logger.warning("Task cache prewarm failed: %s", exc)
@@ -1053,7 +1169,9 @@ def _resume_interrupted_downloader_task(
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(_recover_maintenance_deletes)
-    json_migration_task = asyncio.create_task(asyncio.to_thread(_run_json_to_sqlite_migration))
+    json_migration_task = asyncio.create_task(
+        _run_background_job_async(_run_json_to_sqlite_migration)
+    )
     data_views_prewarm_task = asyncio.create_task(_prewarm_data_views_background())
     live_accounts_prewarm_task = asyncio.create_task(_prewarm_live_accounts_background())
     strategies_prewarm_task = asyncio.create_task(_prewarm_strategies_background())
