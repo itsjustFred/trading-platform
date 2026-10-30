@@ -935,6 +935,52 @@ class TestAttachDailyEquity:
             assert result.equity_curve != curve
             assert result.equity_curve[-1].equity == daily_final
 
+    @pytest.mark.parametrize(
+        ("drift", "preserved"),
+        [
+            (0.0, True),
+            (0.0049, True),  # just inside the cent
+            (0.0051, True),  # the other side of the same rounding step
+            (0.0099, True),  # still inside
+            (0.0101, False),  # just outside: the ledger wins
+        ],
+    )
+    def test_fractional_endpoint_drift_pins_both_sides_of_one_cent(
+        self, drift, preserved
+    ):
+        """Pin the one-cent cliff itself, not just points far from it.
+
+        The ledger endpoint is quantised to the cent, so the comparison must
+        resolve drift at a fraction of a cent.  Running the same case at 0.0049
+        and 0.0101 pins the boundary from both sides on an account whose
+        absolute size does not wash the fraction out.
+        """
+        initial_capital = 100_000.0
+        daily_final = initial_capital + 500.0
+        timestamps = pd.date_range("2024-01-01", periods=31, freq="D", tz="UTC")
+        curve = [
+            EquityPoint(
+                time=timestamp.isoformat(),
+                equity=daily_final - drift if timestamp == timestamps[-1] else initial_capital,
+            )
+            for timestamp in timestamps
+        ]
+        result = make_result(
+            trades=[make_trade(exit_time="2024-01-31T00:00:00Z", pnl=500.0)],
+            initial_capital=initial_capital,
+            equity_curve=curve,
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+        )
+
+        attach_daily_equity(result)
+
+        if preserved:
+            assert result.equity_curve == curve
+        else:
+            assert result.equity_curve != curve
+            assert result.equity_curve[-1].equity == daily_final
+
     def test_preserved_curve_ending_before_last_trade_is_rejected(self):
         """A curve that stops before the last trade cannot describe the window."""
         timestamps = pd.date_range("2024-01-01", "2024-01-27", freq="D", tz="UTC")
@@ -1113,8 +1159,11 @@ class TestAttachDailyEquity:
                 compounded *= 1.0 + day_return["return"]
         ledger_factor = returns[-1]["equity"] / points[0].equity
 
+        # One cent of endpoint difference, expressed against the opening
+        # balance, plus the fp noise the compounding multiply can accumulate.
+        one_cent = 0.01 / points[0].equity
         assert compounded == pytest.approx(
-            ledger_factor, rel=0, abs=1.0 / points[0].equity
+            ledger_factor, rel=0, abs=one_cent + abs(ledger_factor) * 1e-12
         )
 
     def test_published_curve_never_overshoots_the_end_instant(self):
