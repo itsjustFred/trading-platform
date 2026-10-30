@@ -466,6 +466,11 @@ def _resolve_backtest_period_bounds(
                 [point.time for point in equity_curve],
                 utc=True,
                 errors="coerce",
+                # Required: daily equity curves mix second-resolution inception
+                # points with microsecond-resolution closes. Without "mixed",
+                # pandas infers one format from the first element and silently
+                # coerces every close to NaT, collapsing the annualization
+                # window (and therefore CAGR/Calmar) to nothing.
                 format="mixed",
             )
             if not pd.isna(ts)

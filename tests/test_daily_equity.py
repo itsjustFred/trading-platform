@@ -575,6 +575,23 @@ class TestAttachDailyEquity:
         assert result.stats["daily_return_count"] == 0
         assert result.stats["daily_returns"] == []
 
+    def test_fallback_scopes_existing_curve_to_the_requested_window(self):
+        """A window without trades must not publish the unwindowed curve."""
+        curve = [
+            EquityPoint(time=f"2024-02-{day:02d}T00:00:00+00:00", equity=100_000.0 + day)
+            for day in range(1, 10)
+        ]
+        result = make_result(
+            trades=[make_trade(exit_time="2024-01-05T15:00:00Z")],
+            equity_curve=curve,
+        )
+
+        attach_daily_equity(result, start="2024-02-01", end="2024-02-05")
+
+        assert result.equity_curve == curve[:5]
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.stats["daily_return_count"] == 0
+
     def test_generated_curve_normalizes_inception_close_collision(self):
         """An inception instant at the day close must not duplicate timestamps."""
         result = make_result(

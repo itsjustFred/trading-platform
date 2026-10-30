@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,8 @@ from typing import Any
 import pandas as pd
 
 from shared.models import BacktestResult, EquityPoint, Trade
+
+logger = logging.getLogger(__name__)
 
 MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
 MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
@@ -152,6 +155,20 @@ def _window_starting_equity(
         abs_tol=0.01,
     ):
         # The engine point disagrees with the net ledger: trust the ledger.
+        # Logged because a systematic divergence (e.g. an engine that reports
+        # gross instead of net equity) would otherwise rebase every window
+        # silently.
+        logger.debug(
+            "Window starting equity not reconciled; using the net ledger",
+            extra={
+                "data": {
+                    "engine_equity": reconciled_equity,
+                    "ledger_equity": expected_equity,
+                    "delta": reconciled_equity - expected_equity,
+                    "start_bound": start_bound.isoformat(),
+                }
+            },
+        )
         return starting_equity
     return reconciled_equity + (starting_equity - initial_capital - net_through_reconciled)
 
@@ -252,6 +269,11 @@ def _preserves_engine_curve(
     within one cent.  The endpoint tolerance is absolute: a relative tolerance
     would silently accept large absolute errors on high-priced or leveraged
     accounts.
+
+    Only the endpoint is reconciled.  Interior points stay engine-owned: an
+    intraday curve carries unrealized PnL for positions that are still open at
+    a bar close, so comparing interior values against the realized ledger would
+    reject legitimate curves.
     """
     if len(preserved_curve or ()) < 2 or not daily_points:
         return False
@@ -495,6 +517,8 @@ def attach_daily_equity(
 
     # Build daily equity from trades, restricted to the requested window
     scoped_result = _scoped_view(result, start_bound, end_bound)
+    # Unscoped on purpose: the starting equity comes from trades that exited
+    # *before* the window, which ``scoped_result`` no longer contains.
     starting_equity = _window_starting_equity(result, start_bound)
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
@@ -506,9 +530,14 @@ def attach_daily_equity(
     # If no daily points could be built (e.g., no valid exit times), fallback to existing curve
     if not daily_points:
         result.meta.data = result.meta.data or {}
+        # Fall back to the engine curve *scoped to the same window*: publishing
+        # the unwindowed curve here would describe a different period than the
+        # requested one (pre-mortem 16-B #7 applies to this path too).
+        fallback_curve = scoped_result.equity_curve
+        result.equity_curve = fallback_curve
         # Only mark as daily if we actually built a daily curve
-        if result.equity_curve and len(result.equity_curve) > 1:
-            result.meta.data["equity_frequency"] = _curve_frequency(result.equity_curve)
+        if fallback_curve and len(fallback_curve) > 1:
+            result.meta.data["equity_frequency"] = _curve_frequency(fallback_curve)
         else:
             result.meta.data["equity_frequency"] = "unknown"
         result.stats = result.stats or {}
