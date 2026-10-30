@@ -539,18 +539,20 @@ def attach_daily_equity(
         result.stats["daily_returns"] = []
         return result
 
-    # Build daily equity from trades, restricted to the requested window
-    scoped_result = _scoped_view(result, start_bound, end_bound)
+    # Build daily equity from trades, restricted to the requested window. The
+    # window can come from ``meta.backtest_start``/``meta.backtest_end`` alone,
+    # so resolve it once and use it for trades, engine curve and build alike:
+    # a trade after the end instant must not contribute to the last day.
+    effective_start = start_bound or _parse_ts(result.meta.backtest_start)
+    effective_end = end_bound or _parse_day_bound(result.meta.backtest_end, is_end=True)
+    scoped_result = _scoped_view(result, effective_start, effective_end)
     # Unscoped on purpose: the starting equity comes from trades that exited
-    # *before* the window, which ``scoped_result`` no longer contains. A window
-    # can also come from ``meta.backtest_start`` alone, so resolve it the same
-    # way ``build_daily_equity_curve`` does.
-    window_start = start_bound or _parse_ts(result.meta.backtest_start)
-    starting_equity = _window_starting_equity(result, window_start)
+    # *before* the window, which ``scoped_result`` no longer contains.
+    starting_equity = _window_starting_equity(result, effective_start)
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
-        start=start_bound,
-        end=end_bound,
+        start=effective_start,
+        end=effective_end,
         starting_equity=starting_equity,
     )
 
@@ -567,6 +569,10 @@ def attach_daily_equity(
             result.meta.data["equity_frequency"] = _curve_frequency(fallback_curve)
         else:
             result.meta.data["equity_frequency"] = "unknown"
+        if result.meta.data["equity_frequency"] == "daily":
+            result.meta.data["daily_return_count"] = 0
+        else:
+            result.meta.data.pop("daily_return_count", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
         result.stats["daily_returns"] = []
@@ -577,7 +583,7 @@ def attach_daily_equity(
     # curve next to window-scoped daily_returns would make the curve and the
     # reported daily returns describe different periods (pre-mortem 16-B #7).
     # _scoped_view computes exactly this view; reuse it instead of re-filtering.
-    preserved_curve = _windowed_curve(result, start_bound, end_bound)
+    preserved_curve = _windowed_curve(result, effective_start, effective_end)
     result.meta.data = result.meta.data or {}
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
     if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):

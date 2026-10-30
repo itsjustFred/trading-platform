@@ -582,12 +582,29 @@ class TestAttachDailyEquity:
             equity_curve=[EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0)]
         )
         result.stats["daily_returns"] = [{"stale": True}]
+        result.meta.data["daily_return_count"] = 7
 
         attach_daily_equity(result)
 
         assert result.meta.data["equity_frequency"] == "unknown"
+        assert "daily_return_count" not in result.meta.data
         assert result.stats["daily_return_count"] == 0
         assert result.stats["daily_returns"] == []
+
+    def test_fallback_clears_stale_meta_count_on_a_daily_curve(self):
+        """A fallback that keeps a daily curve reports zero returns in meta too."""
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-02T00:00:00+00:00", equity=100_000.0),
+        ]
+        result = make_result(equity_curve=curve)
+        result.meta.data["daily_return_count"] = 7
+
+        attach_daily_equity(result)
+
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.meta.data["daily_return_count"] == 0
+        assert result.stats["daily_return_count"] == 0
 
     def test_fallback_coalesces_duplicate_curve_timestamps(self):
         """The fallback must publish a strictly increasing curve."""
@@ -670,6 +687,21 @@ class TestAttachDailyEquity:
         attach_daily_equity(result)
 
         assert result.equity_curve[-1].time == "2024-01-15T12:00:00+00:00"
+
+    def test_meta_end_instant_excludes_later_trades_from_the_last_day(self):
+        """A trade after the meta end instant must not feed the last close."""
+        result = make_result(
+            trades=[
+                make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0),
+                make_trade(exit_time="2024-01-15T15:00:00Z", pnl=700.0, id=2),
+            ],
+            backtest_end="2024-01-15T12:00:00Z",
+        )
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve[-1].time == "2024-01-15T12:00:00+00:00"
+        assert result.equity_curve[-1].equity == 100_500.0
 
     def test_zero_width_window_fails_loudly(self):
         result = make_result(
