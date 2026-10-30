@@ -47,11 +47,35 @@ logger = logging.getLogger(__name__)
 
 try:
     import jpype
+    import jpype.config as _jpype_config
     import jpype.imports  # noqa: F401  (enables Java import hook)
 except ImportError:  # pragma: no cover - optional runtime dependency
     jpype = None
+    _jpype_config = None
 
 JPYPE_AVAILABLE = jpype is not None
+
+# JPype installs an interpreter-exit hook (`atexit.register(_JTerminate)` in
+# `jpype/_core.py`) that calls `_jpype.shutdown(destroy_jvm, False)` from *inside*
+# `Py_FinalizeEx`. Detaching the JVM at that point reaches HotSpot's
+# `Threads::destroy_vm()`, which blocks forever on the Threads lock waiting for
+# Java threads — JPype's own "Python Reference Queue" among them — that can no
+# longer make progress once the interpreter is finalizing. The process then
+# never exits: `pytest` prints its summary and hangs until the CI
+# "Python ubuntu-latest" job hits its 60-minute timeout.
+#
+# `onexit = False` keeps JPype out of interpreter teardown. The JVM is then not
+# explicitly shut down either: `jpype.shutdownJVM()` (`destroy_jvm=True` by
+# default) reaches the same `Threads::destroy_vm()` deadlock once the JVM has run
+# with threads, so a controlled teardown is no more reliable than the late hook.
+# Letting the OS reclaim the JVM at process exit is both safe and sufficient.
+# The JPype source warns about this exact hazard at `_core.py:508-510`.
+#
+# `jpype/config.py` promises the flag persists across versions ("Variables shall
+# not be removed even if deprecated ... conditions based on these will be valid
+# in all future versions"), so no hasattr guard is needed here.
+if _jpype_config is not None:
+    _jpype_config.onexit = False
 
 
 DEFAULT_JNLP_URL = "https://platform.dukascopy.com/demo/jforex.jnlp"
