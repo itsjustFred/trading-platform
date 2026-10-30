@@ -46,6 +46,11 @@ TIMEFRAME_MAP = {
     # *start* of the interval it summarises" - and says a weekly bar is "stamped on Monday".
     # `live_runner/signal_sources/execution_timing.py::_next_candle_close` anchors weeks on
     # Monday for the same reason. `1W` was the single outlier on all three counts.
+    #
+    # Migration note: weekly files written before this change still carry Sunday labels, and
+    # `merge_resampled_history` unions on timestamp, so re-downloading a stored 1w series keeps
+    # both the old Sunday bar and the new Monday bar for the same week. Re-label or drop existing
+    # 1w.parquet files before the next weekly re-download.
     "1w": "W-MON",
 }
 

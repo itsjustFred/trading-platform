@@ -1406,6 +1406,33 @@ def test_an_unknown_venue_is_never_excused():
     assert not _gap_is_market_closure(weekend, timeframe="1m", symbol="   ")
 
 
+def test_a_new_downloader_is_not_excused_until_its_source_is_registered(tmp_path):
+    """The venue gate requires the *source* to be a known US-equity feed, not just
+    the asset class. A new downloader therefore fails closed - loudly, as a
+    coverage error - instead of having its holes excused by a calendar that may
+    not describe it. Registering the source is the one-line fix."""
+    from data_tools.auto_download import _gap_is_market_closure
+
+    weekend = {"start": "2026-09-11", "end": "2026-09-14", "gap_seconds": 235_800}
+    unregistered = tmp_path / "unregistered"
+    registered = tmp_path / "registered"
+    for root, source in ((unregistered, "polygon"), (registered, "alpaca")):
+        _write_bars(
+            root / "ohlcv" / source / "equity" / "AAPL" / "1m.parquet",
+            ["2026-09-11T19:59:00Z", "2026-09-14T13:30:00Z"],
+        )
+
+    assert not _gap_is_market_closure(
+        weekend, timeframe="1m", symbol="AAPL", data_dir=unregistered
+    ), "an unregistered downloader's holiday closure was excused"
+
+    # ...and the same file under a registered source is excused, so the test is
+    # measuring the source list and not something else.
+    assert _gap_is_market_closure(
+        weekend, timeframe="1m", symbol="AAPL", data_dir=registered
+    )
+
+
 def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
     """The whole path, not just the helper: a status the backtest actually sees."""
     import pandas as pd
