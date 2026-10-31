@@ -655,3 +655,49 @@ def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db
     assert default is not None and str(default).strip("'") == "0", (
         f"is_demo must default to 0, matching production; got {default!r}"
     )
+
+
+def test_migrate_schema_parents_smoke_orphans_and_lands_the_foreign_key(legacy_db) -> None:
+    """The whole slice, end to end, on a database shaped like production.
+
+    A legacy `live_signals` with no foreign key and a smoke-prefixed orphan whose account exists:
+    `init_db()` must (a) create the parent deployment, (b) repoint the signal at it, and (c) finish
+    with the `deployment_id` foreign key present and no orphans left. This is the one path that ties
+    the two halves together - the unit tests each exercise a piece, and neither would fail if
+    `_migrate_schema` forgot to call them in that order.
+    """
+    database, engine, _data_dir = legacy_db
+    _legacy_signals_db(engine)
+    with engine.begin() as conn:
+        # A smoke orphan rather than the fixture's default 'dep'-parented row: this is the shape the
+        # backfill exists to resolve.
+        conn.execute(
+            text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price, "
+                "timestamp, source, broker_order_id, metadata) "
+                "VALUES ('smoke-1', 'ctrader-demo-smoke-acct-legacy', 'EURUSD', 'buy', 1.0, "
+                "'2024-01-01T00:00:00', 'internal', '', '{}')"
+            )
+        )
+
+    database.init_db()
+
+    with engine.connect() as conn:
+        fks = conn.execute(text("PRAGMA foreign_key_list(live_signals)")).fetchall()
+        orphans = conn.execute(
+            text(
+                "SELECT count(*) FROM live_signals s "
+                "WHERE s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+            )
+        ).scalar_one()
+        parents = conn.execute(
+            text(
+                "SELECT count(*) FROM live_deployments "
+                "WHERE strategy_name = 'ctrader-demo-smoke-acct-legacy'"
+            )
+        ).scalar_one()
+    assert any(
+        (row[2], row[3], row[4]) == ("live_deployments", "deployment_id", "id") for row in fks
+    ), "init_db() did not land the deployment_id foreign key on a smoke-only database"
+    assert parents == 1, "the smoke orphan's parent was not created"
+    assert orphans == 0, "a smoke orphan survived the migration, so the FK was left blocked"

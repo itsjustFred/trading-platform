@@ -96,6 +96,26 @@ def test_an_absent_deployment_reports_false(isolated_db) -> None:
     assert database.delete_live_deployment("never-existed") is False
 
 
+def test_a_blank_id_is_refused_without_touching_the_database(isolated_db) -> None:
+    """An empty or whitespace id is not a lookup, so it must not reach the session.
+
+    `session.get(Model, "")` is a legal call that simply finds nothing, so the guard reads as
+    cosmetic - but a blank id reaching the delete path would let a caller who lost the real id
+    delete *something* if the normalization ever changed, and it means every "no id" caller still
+    opens a transaction. The guard is asserted directly, with a real deployment present to prove the
+    blank id is not resolved to it.
+    """
+    database, _engine, _data_dir = isolated_db
+    database.init_db()
+    deployment_id = _deployment(database)
+
+    for blank in ("", "   ", None):
+        assert database.delete_live_deployment(blank) is False, blank
+    assert _deployment_exists(database, deployment_id), (
+        "a blank id deleted a real deployment, so the normalization guard is not load-bearing"
+    )
+
+
 def test_a_deployment_with_signals_refuses_with_a_typed_error(isolated_db) -> None:
     """The regression: no `IntegrityError` escapes, and nothing is half-deleted."""
     database, _engine, _data_dir = isolated_db

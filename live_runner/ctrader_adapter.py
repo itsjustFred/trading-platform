@@ -343,7 +343,8 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     """
     if deal is None:
         return None
-    return int(getattr(deal, "dealId", 0) or 0) or None
+    deal_id = int(getattr(deal, "dealId", 0) or 0)
+    return deal_id if deal_id > 0 else None
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"

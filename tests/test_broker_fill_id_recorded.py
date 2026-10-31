@@ -263,6 +263,12 @@ def test_a_missing_deal_id_is_none_not_zero() -> None:
     assert _deal_id_or_none(SimpleNamespace()) is None
     assert _deal_id_or_none(SimpleNamespace(dealId=0)) is None
     assert _deal_id_or_none(SimpleNamespace(dealId=26533115)) == 26533115
+    # A negative id is not a real deal either. cTrader's dealIds are positive longs, so this is
+    # defensive, but `or None` alone would have let a negative through - and the whole point of
+    # this helper is that only a genuine id is ever stored.
+    assert _deal_id_or_none(SimpleNamespace(dealId=-1)) is None, (
+        "a negative dealId was stored as if it were real"
+    )
 
 
 def test_the_migration_adds_the_column_and_is_idempotent(isolated_db: Any) -> None:
