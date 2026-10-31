@@ -899,17 +899,8 @@ class TestAttachDailyEquity:
             initial_capital + 500.0, rel=0, abs=1e-6
         )
 
-    @pytest.mark.parametrize(
-        ("drift", "preserved"),
-        [
-            (0.005, True),  # within one cent: the engine curve wins
-            (0.015, False),  # beyond one cent: the net ledger wins
-            (0.50, False),  # a relative tolerance would have accepted this
-        ],
-    )
-    def test_endpoint_drift_is_judged_by_an_absolute_one_cent(self, drift, preserved):
-        """One cent is absolute, also on a trillion-dollar account."""
-        initial_capital = 1_000_000_000_000.0
+    def _assert_endpoint_drift(self, *, drift, preserved, initial_capital):
+        """Attach a 31-day curve whose endpoint is off by ``drift`` and check the outcome."""
         daily_final = initial_capital + 500.0
         timestamps = pd.date_range("2024-01-01", periods=31, freq="D", tz="UTC")
         curve = [
@@ -934,6 +925,20 @@ class TestAttachDailyEquity:
         else:
             assert result.equity_curve != curve
             assert result.equity_curve[-1].equity == daily_final
+
+    @pytest.mark.parametrize(
+        ("drift", "preserved"),
+        [
+            (0.005, True),  # within one cent: the engine curve wins
+            (0.015, False),  # beyond one cent: the net ledger wins
+            (0.50, False),  # a relative tolerance would have accepted this
+        ],
+    )
+    def test_endpoint_drift_is_judged_by_an_absolute_one_cent(self, drift, preserved):
+        """One cent is absolute, also on a trillion-dollar account."""
+        self._assert_endpoint_drift(
+            drift=drift, preserved=preserved, initial_capital=1_000_000_000_000.0
+        )
 
     @pytest.mark.parametrize(
         ("drift", "preserved"),
@@ -955,31 +960,9 @@ class TestAttachDailyEquity:
         and 0.0101 pins the boundary from both sides on an account whose
         absolute size does not wash the fraction out.
         """
-        initial_capital = 100_000.0
-        daily_final = initial_capital + 500.0
-        timestamps = pd.date_range("2024-01-01", periods=31, freq="D", tz="UTC")
-        curve = [
-            EquityPoint(
-                time=timestamp.isoformat(),
-                equity=daily_final - drift if timestamp == timestamps[-1] else initial_capital,
-            )
-            for timestamp in timestamps
-        ]
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-31T00:00:00Z", pnl=500.0)],
-            initial_capital=initial_capital,
-            equity_curve=curve,
-            backtest_start="2024-01-01",
-            backtest_end="2024-01-31",
+        self._assert_endpoint_drift(
+            drift=drift, preserved=preserved, initial_capital=100_000.0
         )
-
-        attach_daily_equity(result)
-
-        if preserved:
-            assert result.equity_curve == curve
-        else:
-            assert result.equity_curve != curve
-            assert result.equity_curve[-1].equity == daily_final
 
     def test_preserved_curve_ending_before_last_trade_is_rejected(self):
         """A curve that stops before the last trade cannot describe the window."""
