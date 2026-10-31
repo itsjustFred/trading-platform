@@ -169,6 +169,7 @@ def _reconcile(conn: sqlite3.Connection, rows: list[tuple[str, str, float, float
         corrected += 1
     return corrected
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Correct stale scalar stat columns in backtests from the stats payload."
