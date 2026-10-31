@@ -219,6 +219,21 @@ def _position_qty(position: Mapping[str, Any]) -> float:
     return qty
 
 
+def _is_flat(qty: float) -> bool:
+    """Whether a broker quantity means "no position".
+
+    Comparing a quantity to ``0.0`` with ``==`` is a float-equality bug (Sonar
+    S1244): a position left with a sub-unit residue would read as open forever,
+    and a quantity a hair above zero would never be treated as closed. The
+    tolerance is absolute and far below any tradable unit (brokers quote to at
+    most 1e-9), so a real position cannot be mistaken for flat.
+
+    Non-finite values are not flat - ``_position_qty`` already refuses them, and
+    a NaN that slipped through must not read as "nothing open".
+    """
+    return math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12)
+
+
 def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
     for key in keys:
         if key not in metadata:
@@ -844,7 +859,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             quantity
             for position in await self.get_positions()
             if str(position.get("symbol") or "").strip().upper() == symbol
-            and (quantity := _position_qty(position)) != 0.0
+            and not _is_flat(quantity := _position_qty(position))
         ]
         if not quantities:
             raise ValueError(
@@ -1173,7 +1188,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         for position in await self.get_positions():
             symbol = str(position.get("symbol") or "").strip().upper()
             qty = _position_qty(position)
-            if not symbol or qty == 0.0:
+            if not symbol or _is_flat(qty):
                 continue
             sides[symbol] = "sell" if qty > 0 else "buy"
         return sides
@@ -1464,7 +1479,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         positions = [
             position
             for position in await self.get_positions()
-            if _position_qty(position) != 0.0
+            if not _is_flat(_position_qty(position))
         ]
         if not positions:
             return ControlOutcome(completed=0)
@@ -1473,7 +1488,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         for position in positions:
             symbol = str(position.get("symbol") or "").strip().upper()
             qty = _position_qty(position)
-            if not symbol or qty == 0.0:
+            if not symbol or _is_flat(qty):
                 continue
             problem = await self._flatten_symbol(client, symbol, qty)
             if problem is not None:
@@ -1484,7 +1499,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         remaining = [
             position
             for position in await self.get_positions()
-            if _position_qty(position) != 0.0
+            if not _is_flat(_position_qty(position))
         ]
         for position in remaining:
             symbol = str(position.get("symbol") or "?")
@@ -1508,7 +1523,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
-            if _position_qty(position) != 0.0
+            if not _is_flat(_position_qty(position))
         }
         completed = 0
         unidentified: list[str] = []

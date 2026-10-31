@@ -452,6 +452,34 @@ def test_cancel_orphaned_protections_refuses_an_unparseable_qty() -> None:
         asyncio.run(adapter.cancel_orphaned_protections())
 
 
+def test_is_flat_uses_a_tolerance_and_rejects_non_finite() -> None:
+    """S1244: comparing a broker quantity to 0.0 with `==` is not a flat test."""
+    from live_runner.alpaca_adapter import _is_flat
+
+    assert _is_flat(0.0) is True
+    assert _is_flat(-0.0) is True
+    assert _is_flat(1e-13) is True
+    assert _is_flat(-1e-13) is True
+    # Far below any tradable unit but still a real quantity.
+    assert _is_flat(1e-9) is False
+    assert _is_flat(0.5) is False
+    assert _is_flat(float("nan")) is False
+    assert _is_flat(float("inf")) is False
+
+
+def test_a_sub_unit_residue_position_is_treated_as_flat() -> None:
+    """A residue must not keep a stopped deployment unflattened forever."""
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("sl-1", "AAPL", "sell", order_type="stop", qty=1e-13)],
+        positions=[_FakePosition("AAPL", 1e-13)],
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.close_calls == []
+
+
 def _entry_signal() -> LiveSignal:
     return LiveSignal(
         deployment_id="11111111-1111-1111-1111-111111111111",
