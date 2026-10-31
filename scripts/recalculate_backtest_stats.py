@@ -40,6 +40,7 @@ _guard.ensure_own_checkout("recalculate_backtest_stats")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.stats import compute_stats_for_result
+from scripts._safe_path import under_root
 from shared.constants import DATA_DIR
 from shared.database import (
     init_db,
@@ -136,7 +137,10 @@ def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[
 
             if not dry_run:
                 payload["stats"] = merged_stats
-                _save_json_payload(path, payload)
+                _save_json_payload(
+                    under_root(path, root=backtests_dir, field="backtest"),
+                    payload,
+                )
             updated += 1
         except Exception as exc:
             failed += 1

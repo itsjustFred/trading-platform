@@ -44,7 +44,7 @@ _guard.ensure_own_checkout("backtest_to_validation_ref")
 # that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
 # take this script off the roster and out of the gate that keeps the guard alive.
 import shared  # noqa: F401
-from scripts._safe_path import reject_traversal
+from scripts._safe_path import reject_traversal, under_root
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 from validation.reference import ValidationReference, resolve_initial_capital
 
@@ -61,7 +61,10 @@ def _safe_input_path(raw: Path) -> Path:
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
-    d = json.loads(_safe_input_path(path).read_text(encoding="utf-8"))
+    # Operator-supplied, read-only input: it may legitimately live outside the
+    # repo, so confinement is not the contract here. Traversal is rejected and
+    # the failure names the path.
+    d = json.loads(_safe_input_path(path).read_text(encoding="utf-8"))  # NOSONAR
     meta = BacktestMeta(**d["meta"])
     trades = [Trade(**t) for t in d.get("trades", [])]
     for t in trades:
@@ -103,8 +106,9 @@ def main() -> None:
 
     res = _load_backtest_result(args.input)
     ref = _to_validation_reference(res)
-    args.output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
-    print(f"Wrote ValidationReference to {args.output}")
+    output = under_root(args.output, root=Path.cwd(), field="--output")
+    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
+    print(f"Wrote ValidationReference to {output}")
 
 
 if __name__ == "__main__":

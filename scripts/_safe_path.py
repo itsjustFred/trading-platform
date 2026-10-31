@@ -14,6 +14,7 @@ naming the offending path, so a runbook author sees the typo instead of a half-w
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -46,15 +47,17 @@ def under_root(raw: str | Path, *, root: Path, field: str) -> Path:
     "absolute" is not the same as "intended".
     """
     candidate = reject_traversal(raw, field=field)
-    resolved_root = root.resolve()
-    resolved = (
-        (resolved_root / candidate).resolve()
-        if not candidate.is_absolute()
-        else candidate.resolve()
+    resolved_root = os.path.realpath(str(root))
+    resolved = os.path.realpath(
+        str(candidate if candidate.is_absolute() else Path(resolved_root) / candidate)
     )
-    if resolved != resolved_root and resolved_root not in resolved.parents:
+    try:
+        common = os.path.commonpath([resolved_root, resolved])
+    except ValueError:
+        common = ""
+    if common != resolved_root:
         raise UnsafePathError(
             f"{field}: refusing to write outside {resolved_root} ({resolved}); pass a path under "
             "that directory"
         )
-    return resolved
+    return Path(resolved)

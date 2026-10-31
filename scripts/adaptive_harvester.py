@@ -60,6 +60,7 @@ from data_tools.downloaders.dukascopy_native import (
     generate_tick_urls,
     parse_ticks,
 )
+from scripts._safe_path import UnsafePathError, under_root
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -162,7 +163,20 @@ def _month_label(month_start: date) -> str:
     return f"{month_start.year:04d}-{month_start.month:02d}"
 
 
+def _safe_write_path(path: Path) -> Path:
+    """Allow writes only under the data directory or the project root."""
+    for root in (DATA_DIR, PROJECT_ROOT):
+        try:
+            return under_root(path, root=root, field="output")
+        except UnsafePathError:
+            continue
+    raise UnsafePathError(
+        f"output: refusing to write outside {DATA_DIR} or {PROJECT_ROOT} ({path})"
+    )
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path = _safe_write_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -567,7 +581,7 @@ async def _download_month(
             if penalties_this_batch:
                 penalty_count += 1
                 logger.warning("Rate limit hit! Backing off.")
-                cooldown_seconds = random.randint(15, 30)
+                cooldown_seconds = random.SystemRandom().randint(15, 30)
                 await asyncio.sleep(cooldown_seconds)
                 tuning.batch_size = max(MIN_BATCH_SIZE, tuning.batch_size // 2)
                 tuning.delay_ms = min(MAX_DELAY_MS, tuning.delay_ms * 2)
