@@ -110,11 +110,13 @@ one happened to be a loss. The curve's first observation is that day's opening
 equity and is now the base of its return; a day carrying a single observation
 still yields no return rather than a synthetic flat one.
 
-`daily_returns[*].equity` is the exact ledger value while the persisted curve
-rounds to cents. Rounding the reported field too would either desynchronise it
-from the `return` beside it or quantise the running balance — and a quantised
-accumulator drifts by up to half a cent per day, which would push a long
-window's endpoint outside the one-cent reconciliation gate.
+`daily_returns[*].equity` and the matching `EquityPoint.equity` are both
+cent-quantised, so the two published views describe the same number at the same
+instant instead of differing by up to half a cent per row. The running balance
+itself stays exact — only the reported values are rounded — so a long window
+does not accumulate a quantisation drift that would push its endpoint outside
+the reconciliation gate, and each `return` is computed from the exact balance
+before it is published beside the rounded equity.
 
 **Pinned by:** `tests/test_stats.py` (existing suite, green on both paths — the
 QS and fallback formulas provably share the total_return/Calmar computation),
@@ -322,11 +324,14 @@ this code (older persisted artifacts keep their original numbers):
   the engine did not observe. Artifacts that compare `daily_return_count`
   across code generations are not comparable.
 - The engine-curve-vs-trades reconciliation gate is no longer a flat `$0.05`.
-  It is `max(one cent, 8·n·2⁻⁵²·|expected|) + n·one cent` — derived from the
-  cent quantisation the equity arithmetic actually performs, plus the float64
+  It is `max(n·one cent, 8·n·2⁻⁵²·|expected|)` — derived from the cent
+  quantisation the equity arithmetic actually performs, plus the float64
   accumulation term that grows with the account. Curves that were off by cents
   of accumulated per-trade rounding are now preserved instead of silently
-  discarded; the endpoint-only rejection is unchanged.
+  discarded; the endpoint-only rejection is unchanged. The two terms are
+  combined with `max`, not addition, so a single-trade run keeps the absolute
+  one-cent cliff: the per-trade cent already contains that trade's own
+  endpoint quantisation.
 
 If a fresh run's metrics disagree with a persisted pre-16-D1 artifact, this
 is the expected cause — re-run comparisons within one code generation.

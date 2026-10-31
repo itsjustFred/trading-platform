@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -10,6 +11,8 @@ from typing import Any
 import pandas as pd
 
 from shared.models import BacktestResult, EquityPoint, Trade
+
+logger = logging.getLogger(__name__)
 
 MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
 MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
@@ -105,6 +108,10 @@ def _trade_in_window(
     return _parsed_in_window(parsed, start_bound, end_bound)
 
 
+def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
+    return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
+
+
 def _trade_net_pnl(trade: Trade) -> float | None:
     """The trade's net PnL, or None when it is not a finite number."""
     pnl = (
@@ -145,21 +152,28 @@ def _reconciliation_tolerance(*, expected_final: float, trade_count: int) -> flo
     the bound is derived from the arithmetic both sides actually perform instead
     of from a round-number dollar amount:
 
-    1. **Cent floor.** ``runner/engines/vectorbt_adapter.py`` stores each trade
-       as ``pnl=round(pnl, 2)``, ``fees=round(fees, 2)`` and
+    1. **Per-trade cent drift.** ``runner/engines/vectorbt_adapter.py`` stores
+       each trade as ``pnl=round(pnl, 2)``, ``fees=round(fees, 2)`` and
        ``net_pnl=round(pnl - fees, 2)``, and the curve as
-       ``equity=round(running, 2)``. The final observation is therefore up to
-       half a cent from the exact running total and the last trade's own
-       ``net_pnl`` rounding adds at most another half cent: one whole cent.
-    2. **Per-trade drift.** An engine that accumulates its curve from the
-       *unrounded* ``pnl - fees`` while this module sums the *stored*
-       ``net_pnl`` disagrees by up to half a cent on gross PnL plus half a cent
-       on fees — one whole cent per trade — and those differences accumulate
-       linearly in the trade count instead of cancelling.
-    3. **Float64 accumulation.** Naive summation of ``n`` doubles of magnitude
+       ``equity=round(running, 2)``. For one trade the final observation is up
+       to half a cent from the exact running total and the trade's own
+       ``net_pnl`` rounding adds at most another half cent: one whole cent. An
+       engine that accumulates its curve from the *unrounded* ``pnl - fees``
+       while this module sums the *stored* ``net_pnl`` disagrees by the same
+       amount, and those differences accumulate linearly in the trade count
+       instead of cancelling. One cent per trade covers both halves; a separate
+       flat cent on top would double-count the first trade.
+    2. **Float64 accumulation.** Naive summation of ``n`` doubles of magnitude
        ``m`` carries an error of about ``n * 2**-52 * m``, scaled by 8 for the
        per-term error bound. This is the relative epsilon: it is the only term
        that grows with the account, because cent quantisation does not.
+
+    The two terms are combined with ``max``, not addition: they describe the
+    same disagreement from two angles, and the per-trade term already contains
+    the endpoint quantisation for the first trade. That keeps the single-trade
+    bound at exactly one cent — the same absolute cliff
+    ``_preserves_engine_curve`` applies — while a twenty-trade ledger still gets
+    its twenty-cent allowance.
 
     A genuine contradiction — an engine curve ending somewhere the trades cannot
     reach, e.g. 105000.0 against 100500.0 — sits four orders of magnitude above
@@ -172,7 +186,7 @@ def _reconciliation_tolerance(*, expected_final: float, trade_count: int) -> flo
     float64_drift = (
         FLOAT64_ACCUMULATION_SAFETY * trades * FLOAT64_EPSILON * abs(expected_final)
     )
-    return max(EQUITY_CENT, float64_drift) + (trades * EQUITY_CENT)
+    return max(trades * EQUITY_CENT, float64_drift)
 
 
 def _fill_engine_curve_gaps(
@@ -401,6 +415,20 @@ def _window_starting_equity(
         abs_tol=0.01,
     ):
         # The engine point disagrees with the net ledger: trust the ledger.
+        # Debug level keeps per-window runs quiet; a systematic divergence
+        # (e.g. an engine reporting gross instead of net equity) is visible in
+        # the run log when debugging instead of rebasing every window silently.
+        logger.debug(
+            "Window starting equity not reconciled; using the net ledger",
+            extra={
+                "data": {
+                    "engine_equity": reconciled_equity,
+                    "ledger_equity": expected_equity,
+                    "delta": reconciled_equity - expected_equity,
+                    "start_bound": start_bound.isoformat(),
+                }
+            },
+        )
         return starting_equity
     return reconciled_equity + (starting_equity - initial_capital - net_through_reconciled)
 
@@ -448,8 +476,25 @@ def _strictly_increasing_curve(
     return normalized
 
 
-def _in_window(value: str, start_bound: datetime | None, end_bound: datetime | None) -> bool:
-    return _parsed_in_window(_parse_ts(value), start_bound, end_bound)
+def _normalize_engine_curve(curve: list[EquityPoint]) -> list[EquityPoint]:
+    """Validate an engine-provided curve without inventing an inception point.
+
+    Duplicate timestamps are coalesced and colliding ones shifted by a
+    microsecond, so the published curve is strictly increasing and finite.  An
+    unparseable timestamp, an out-of-order point or a non-finite equity is a
+    corrupt curve and raises instead of being published.
+    """
+    if not curve:
+        return []
+    first_time = _parse_ts(curve[0].time)
+    if first_time is None:
+        raise ValueError("Equity curve contains an invalid timestamp")
+    normalized = _strictly_increasing_curve(
+        curve,
+        first_time - timedelta(microseconds=1),
+        None,
+    )
+    return normalized or []
 
 
 def _scoped_view(
@@ -491,7 +536,7 @@ def _windowed_curve(
 def _preserves_engine_curve(
     preserved_curve: list[EquityPoint] | None,
     daily_points: list[EquityPoint],
-    trades: list[Trade] | None = None,
+    trades: list[Trade],
 ) -> bool:
     """Whether the engine curve may replace the net-PnL daily build.
 
@@ -501,6 +546,11 @@ def _preserves_engine_curve(
     within one cent.  The endpoint tolerance is absolute: a relative tolerance
     would silently accept large absolute errors on high-priced or leveraged
     accounts.
+
+    Only the endpoint is reconciled.  Interior points stay engine-owned: an
+    intraday curve carries unrealized PnL for positions that are still open at
+    a bar close, so comparing interior values against the realized ledger would
+    reject legitimate curves.
     """
     if len(preserved_curve or ()) < 2 or not daily_points:
         return False
@@ -561,7 +611,7 @@ def _preserves_engine_curve(
         return False
     trade_exits = [
         parsed
-        for trade in trades or ()
+        for trade in trades
         if (parsed := _parse_ts(_last_exit_time(trade))) is not None
     ]
     if trade_exits and preserved_index[-1] < max(trade_exits):
@@ -578,7 +628,6 @@ def _curve_frequency(points: list[EquityPoint]) -> str:
             pd.to_datetime(
                 [point.time for point in points],
                 utc=True,
-                errors="coerce",
                 format="mixed",
             )
             .to_series()
@@ -642,11 +691,15 @@ def build_daily_equity_curve(
     if not event_days:
         return [], []
 
-    # Only an explicitly requested end instant is a hard boundary; a date-only
-    # ``backtest_end`` describes a whole day and must keep its end-of-day close.
-    explicit_end = end is not None
+    # A date-only bound describes a whole day and keeps its end-of-day close;
+    # an instant bound (explicit or from ``meta.backtest_end``) is a hard
+    # boundary and must not be overshot.
     start_bound = _parse_ts(start) if start is not None else _parse_ts(result.meta.backtest_start)
-    end_bound = _parse_ts(end) if end is not None else _parse_ts(result.meta.backtest_end)
+    end_bound = (
+        _parse_ts(end)
+        if end is not None
+        else _parse_day_bound(result.meta.backtest_end, is_end=True)
+    )
     start = start_bound or (
         min(event_days).replace(hour=0, minute=0, second=0, microsecond=0)
         if event_days
@@ -677,32 +730,33 @@ def build_daily_equity_curve(
         running_equity += pnl
         if not math.isfinite(running_equity):
             raise ValueError("Daily equity accumulation is non-finite")
-        # ``equity`` is the exact ledger value; the persisted curve rounds it to
-        # cents (see the EquityPoint below). Rounding here too would either
-        # desynchronise the field from the ``return`` beside it or quantise the
-        # running balance, and a quantised accumulator drifts by up to half a
-        # cent per day — which would push the curve's endpoint outside the
-        # one-cent reconciliation gate for a long window.
+        # Cent-quantise the reported equity exactly like the curve closes below,
+        # so ``daily_returns[i]["equity"]`` and the matching
+        # ``EquityPoint.equity`` describe the same number.  An unrounded value
+        # here would let the two published views disagree on the same instant
+        # (up to half a cent per row) and make a downstream comparison against
+        # the curve look like drift.
+        closed_equity = round(running_equity, 2)
         daily_returns.append(
             {
                 "date": day,
                 "return": (running_equity - previous) / previous if previous > 0 else None,
-                "equity": running_equity,
+                "equity": closed_equity,
             }
         )
         point_time = cursor + timedelta(days=1) - timedelta(microseconds=1)
-        if explicit_end and cursor.date() == end_day:
-            # Never let the last close overshoot an explicit end instant.
+        if end_bound is not None and cursor.date() == end_day:
+            # Never let the last close overshoot the window end.
             point_time = min(point_time, end_instant)
         daily_points.append(
-            EquityPoint(time=point_time.isoformat(), equity=round(running_equity, 2))
+            EquityPoint(time=point_time.isoformat(), equity=closed_equity)
         )
         cursor += timedelta(days=1)
 
     normalized_closes = _strictly_increasing_curve(
         daily_points[1:],
         inception,
-        end_instant if explicit_end else None,
+        end_bound,
     )
     if normalized_closes is None:
         raise ValueError("Daily equity closes cannot be normalized within the requested window")
@@ -748,24 +802,40 @@ def attach_daily_equity(
         result.stats["daily_returns"] = []
         return result
 
-    # Build daily equity from trades, restricted to the requested window
-    scoped_result = _scoped_view(result, start_bound, end_bound)
-    starting_equity = _window_starting_equity(result, start_bound)
+    # Build daily equity from trades, restricted to the requested window. The
+    # window can come from ``meta.backtest_start``/``meta.backtest_end`` alone,
+    # so resolve it once and use it for trades, engine curve and build alike:
+    # a trade after the end instant must not contribute to the last day.
+    effective_start = start_bound or _parse_ts(result.meta.backtest_start)
+    effective_end = end_bound or _parse_day_bound(result.meta.backtest_end, is_end=True)
+    scoped_result = _scoped_view(result, effective_start, effective_end)
+    # Unscoped on purpose: the starting equity comes from trades that exited
+    # *before* the window, which ``scoped_result`` no longer contains.
+    starting_equity = _window_starting_equity(result, effective_start)
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
-        start=start_bound,
-        end=end_bound,
+        start=effective_start,
+        end=effective_end,
         starting_equity=starting_equity,
     )
 
     # If no daily points could be built (e.g., no valid exit times), fallback to existing curve
     if not daily_points:
         result.meta.data = result.meta.data or {}
+        # Fall back to the engine curve *scoped to the same window*: publishing
+        # the unwindowed curve here would describe a different period than the
+        # requested one. The same rule as the preserved-curve path below.
+        fallback_curve = _normalize_engine_curve(scoped_result.equity_curve or [])
+        result.equity_curve = fallback_curve
         # Only mark as daily if we actually built a daily curve
-        if result.equity_curve and len(result.equity_curve) > 1:
-            result.meta.data["equity_frequency"] = _curve_frequency(result.equity_curve)
+        if fallback_curve and len(fallback_curve) > 1:
+            result.meta.data["equity_frequency"] = _curve_frequency(fallback_curve)
         else:
             result.meta.data["equity_frequency"] = "unknown"
+        if result.meta.data["equity_frequency"] == "daily":
+            result.meta.data["daily_return_count"] = 0
+        else:
+            result.meta.data.pop("daily_return_count", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
         result.stats["daily_returns"] = []
@@ -776,7 +846,7 @@ def attach_daily_equity(
     # curve next to window-scoped daily_returns would make the curve and the
     # reported daily returns describe different periods (pre-mortem 16-B #7).
     # _scoped_view computes exactly this view; reuse it instead of re-filtering.
-    preserved_curve = _windowed_curve(result, start_bound, end_bound)
+    preserved_curve = _windowed_curve(result, effective_start, effective_end)
     result.meta.data = result.meta.data or {}
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
     if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
