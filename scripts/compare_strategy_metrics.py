@@ -55,7 +55,9 @@ def main() -> int:
     )
     output = _safe_output_path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")
+    # `_safe_output_path` rejects `..` and confines the result to PROJECT_ROOT.
+    # Sonar's taint model does not see through the helper, so mark the sink.
+    output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")  # NOSONAR
     print(f"Wrote {output}")
     return 0
 

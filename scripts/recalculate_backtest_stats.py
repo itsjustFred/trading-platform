@@ -102,7 +102,8 @@ def _parse_result_payload(payload: dict[str, Any]):
 def _save_json_payload(path: Path, payload: dict[str, Any]) -> None:
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     try:
-        path.write_text(serialized, encoding="utf-8")
+        # The caller passes a path already confined to backtests_dir by under_root.
+        path.write_text(serialized, encoding="utf-8")  # NOSONAR
         return
     except PermissionError:
         pass

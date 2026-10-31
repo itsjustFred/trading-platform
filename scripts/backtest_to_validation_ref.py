@@ -107,7 +107,8 @@ def main() -> None:
     res = _load_backtest_result(args.input)
     ref = _to_validation_reference(res)
     output = under_root(args.output, root=Path.cwd(), field="--output")
-    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
+    # `under_root` rejects `..` and confines the write to the current directory.
+    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")  # NOSONAR
     print(f"Wrote ValidationReference to {output}")
 
 

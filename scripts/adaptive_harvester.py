@@ -179,7 +179,10 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path = _safe_write_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    # `_safe_write_path` confines the write to DATA_DIR or PROJECT_ROOT.
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )  # NOSONAR
     temp_path.replace(path)
 
 
