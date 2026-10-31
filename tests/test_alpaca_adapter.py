@@ -406,6 +406,80 @@ def test_bulk_response_shape_is_not_read_as_zero() -> None:
         asyncio.run(adapter.cancel_open_orders())
 
 
+def test_positions_mark_an_unparseable_qty_instead_of_reading_it_as_flat() -> None:
+    """A broker row whose qty cannot be read is flagged, not silently zeroed."""
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+    )
+    adapter = _adapter(client)
+
+    positions = asyncio.run(adapter.get_positions())
+
+    assert positions[0]["qty"] == 0.0
+    assert positions[0]["qty_unparseable"] is True
+    assert positions[0]["qty_raw"] == "not-a-number"
+
+
+def test_flatten_refuses_to_treat_an_unparseable_qty_as_flat() -> None:
+    """The STOPPED stamp is only safe if a malformed qty cannot pass as flat.
+
+    If ``close_all_positions`` read an unreadable qty as zero it would report a
+    successful flatten while real exposure stayed open, and the daemon would
+    stamp the deployment stopped over a live position.
+    """
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+    )
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unparseable"):
+        asyncio.run(adapter.close_all_positions())
+
+
+def test_cancel_orphaned_protections_refuses_an_unparseable_qty() -> None:
+    """The orphan sweep must not treat an unreadable position as flat.
+
+    Reading the row as zero would make its protection look orphaned and cancel a
+    stop that is guarding a live position.
+    """
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="nan-ish")],
+        orders=[_FakeOrder(id="stop-1", symbol="AAPL", side="sell", order_type="stop")],
+    )
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unparseable"):
+        asyncio.run(adapter.cancel_orphaned_protections())
+
+
+def test_is_flat_uses_a_tolerance_and_rejects_non_finite() -> None:
+    """S1244: comparing a broker quantity to 0.0 with `==` is not a flat test."""
+    from live_runner.alpaca_adapter import _is_flat
+
+    assert _is_flat(0.0) is True
+    assert _is_flat(-0.0) is True
+    assert _is_flat(1e-13) is True
+    assert _is_flat(-1e-13) is True
+    # Far below any tradable unit but still a real quantity.
+    assert _is_flat(1e-9) is False
+    assert _is_flat(0.5) is False
+    assert _is_flat(float("nan")) is False
+    assert _is_flat(float("inf")) is False
+
+
+def test_a_sub_unit_residue_position_is_treated_as_flat() -> None:
+    """A residue must not keep a stopped deployment unflattened forever."""
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("sl-1", "AAPL", "sell", order_type="stop", qty=1e-13)],
+        positions=[_FakePosition("AAPL", 1e-13)],
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.close_calls == []
+
+
 def _entry_signal() -> LiveSignal:
     return LiveSignal(
         deployment_id="11111111-1111-1111-1111-111111111111",

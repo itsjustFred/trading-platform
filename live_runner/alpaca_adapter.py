@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -171,6 +171,67 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_parseable_qty(value: Any) -> bool:
+    """Whether ``value`` yields a finite float quantity."""
+    try:
+        return math.isfinite(float(Decimal(str(value))))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _position_qty(position: Mapping[str, Any]) -> float:
+    """The broker position's signed quantity, refusing to guess on a bad value.
+
+    ``_to_float(..., default=0.0)`` maps an *unparseable* ``qty`` onto "flat",
+    which would let a position with a malformed quantity be silently skipped as
+    "no position" — the flatten would then report success and a STOPPED
+    deployment would be stamped enforced while real exposure stayed open.
+
+    :func:`get_positions` marks such a row with ``qty_unparseable`` (the
+    displayed ``qty`` is still the coerced ``0.0`` so ordinary consumers keep
+    working). This helper is the risk-path reader: it raises on that marker, and
+    on a non-finite quantity, rather than returning a misleading zero.
+    """
+    if position.get("qty_unparseable"):
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has an unparseable "
+            f"qty ({position.get('qty_raw')!r}); refusing to treat it as flat"
+        )
+    if "qty" not in position:
+        return 0.0
+    value = position.get("qty")
+    if value is None:
+        return 0.0
+    try:
+        qty = float(Decimal(str(value)))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has an unparseable "
+            f"qty ({value!r}); refusing to treat it as flat"
+        ) from exc
+    if not math.isfinite(qty):
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has a non-finite "
+            f"qty ({value!r}); refusing to treat it as flat"
+        )
+    return qty
+
+
+def _is_flat(qty: float) -> bool:
+    """Whether a broker quantity means "no position".
+
+    Comparing a quantity to ``0.0`` with ``==`` is a float-equality bug (Sonar
+    S1244): a position left with a sub-unit residue would read as open forever,
+    and a quantity a hair above zero would never be treated as closed. The
+    tolerance is absolute and far below any tradable unit (brokers quote to at
+    most 1e-9), so a real position cannot be mistaken for flat.
+
+    Non-finite values are not flat - ``_position_qty`` already refuses them, and
+    a NaN that slipped through must not read as "nothing open".
+    """
+    return math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12)
 
 
 def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
@@ -798,7 +859,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             quantity
             for position in await self.get_positions()
             if str(position.get("symbol") or "").strip().upper() == symbol
-            and (quantity := _to_float(position.get("qty"), default=0.0)) != 0.0
+            and not _is_flat(quantity := _position_qty(position))
         ]
         if not quantities:
             raise ValueError(
@@ -1126,8 +1187,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         sides: dict[str, str] = {}
         for position in await self.get_positions():
             symbol = str(position.get("symbol") or "").strip().upper()
-            qty = _to_float(position.get("qty"), default=0.0)
-            if not symbol or qty == 0.0:
+            qty = _position_qty(position)
+            if not symbol or _is_flat(qty):
                 continue
             sides[symbol] = "sell" if qty > 0 else "buy"
         return sides
@@ -1418,7 +1479,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         positions = [
             position
             for position in await self.get_positions()
-            if _to_float(position.get("qty"), default=0.0) != 0.0
+            if not _is_flat(_position_qty(position))
         ]
         if not positions:
             return ControlOutcome(completed=0)
@@ -1426,8 +1487,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         failed: list[str] = []
         for position in positions:
             symbol = str(position.get("symbol") or "").strip().upper()
-            qty = _to_float(position.get("qty"), default=0.0)
-            if not symbol or qty == 0.0:
+            qty = _position_qty(position)
+            if not symbol or _is_flat(qty):
                 continue
             problem = await self._flatten_symbol(client, symbol, qty)
             if problem is not None:
@@ -1438,7 +1499,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         remaining = [
             position
             for position in await self.get_positions()
-            if _to_float(position.get("qty"), default=0.0) != 0.0
+            if not _is_flat(_position_qty(position))
         ]
         for position in remaining:
             symbol = str(position.get("symbol") or "?")
@@ -1462,7 +1523,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
-            if _to_float(position.get("qty"), default=0.0) != 0.0
+            if not _is_flat(_position_qty(position))
         }
         completed = 0
         unidentified: list[str] = []
@@ -1493,15 +1554,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         rows = await asyncio.to_thread(self._trading_client.get_all_positions)
         payload: list[dict[str, Any]] = []
         for row in rows:
-            payload.append(
-                {
-                    "symbol": str(getattr(row, "symbol", "")).strip().upper(),
-                    "qty": _to_float(getattr(row, "qty", None), default=0.0),
-                    "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
-                    "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
-                    "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
-                }
-            )
+            raw_qty = getattr(row, "qty", None)
+            entry: dict[str, Any] = {
+                "symbol": str(getattr(row, "symbol", "")).strip().upper(),
+                "qty": _to_float(raw_qty, default=0.0),
+                "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
+                "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
+                "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
+            }
+            if raw_qty is not None and not _is_parseable_qty(raw_qty):
+                # Keep the coercion for display consumers, but remember that the
+                # broker's value could not be read: the risk paths that decide
+                # whether an account is flat must fail closed rather than treat
+                # it as a zero position.
+                entry["qty_unparseable"] = True
+                entry["qty_raw"] = raw_qty
+            payload.append(entry)
         return payload
 
     def _parse_trade_update_event(
