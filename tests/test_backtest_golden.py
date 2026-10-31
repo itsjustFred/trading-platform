@@ -31,6 +31,21 @@ GOLDEN_PATH = ROOT / "tests" / "fixtures" / "backtest" / "native_cli_v1.json"
 RESULT_ID = "backtest-golden-native-v1"
 DYNAMIC_CREATED_AT = "<dynamic>"
 MAX_REPORTED_PATHS = 40
+# Every golden run starts a fresh hermetic child: an empty ``PYTHONPYCACHEPREFIX``
+# directory forces CPython to recompile the whole dependency set byte-for-byte
+# (measured: ~30 s instead of ~10 s just for ``import scipy.stats``), the hermetic
+# ``sitecustomize`` empties matplotlib's font cache, and the CLI itself then
+# imports quantstats/seaborn.  One full child therefore costs ~1.5-2.5 minutes on
+# a contended host, so the generation, comparison, blessing and failure paths
+# each get a fixture-scoped budget above the fixed 120 s they used to share.
+CLI_TIMEOUT_SECONDS = 120
+# Blessing regenerates the fixture in-process (the golden CLI run plus stats) and
+# the test reruns the CLI to show the bless is stable: two full children.
+BLESS_TIMEOUT_SECONDS = 600
+# ``pytest.raises`` still has to *finish* the child that is expected to fail, so
+# the failure paths are not cheaper than the passing one.
+FAILING_CLI_TIMEOUT_SECONDS = 300
+SQLITE_SENTINEL_TIMEOUT_SECONDS = 300
 HERMETIC_SITE_SOURCE = '''
 import os
 import socket
@@ -405,7 +420,7 @@ def _assert_isolation_tripwires(
     marker.unlink()
 
 
-def _run_native_cli(tmp_path: Path) -> BacktestResult:
+def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> BacktestResult:
     data_dir, strategy_path, output_path = _build_fixture(tmp_path)
     environment = _child_environment(tmp_path, data_dir)
     marker = Path(environment["GOLDEN_ISOLATION_MARKER"])
@@ -454,7 +469,7 @@ def _run_native_cli(tmp_path: Path) -> BacktestResult:
         env=environment,
         capture_output=True,
         encoding="utf-8",
-        timeout=120,
+        timeout=timeout,
         check=False,
     )
     assert completed.returncode == 0, (
@@ -766,7 +781,7 @@ def main(argv: list[str] | None = None) -> int:
         json.loads(GOLDEN_PATH.read_text(encoding="utf-8")) if GOLDEN_PATH.is_file() else None
     )
     with tempfile.TemporaryDirectory(prefix="backtest-golden-") as directory:
-        result = _run_native_cli(Path(directory))
+        result = _run_native_cli(Path(directory), timeout=BLESS_TIMEOUT_SECONDS)
         _assert_native_cli_semantics(result)
         candidate = _canonicalize(result.to_dict())
 

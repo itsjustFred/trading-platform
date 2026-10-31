@@ -10,6 +10,7 @@ import pytest
 import runner.daily_equity as daily_equity_module
 from runner.daily_equity import (
     _net_pnl_before,
+    _trade_net_pnl,
     _window_starting_equity,
     attach_daily_equity,
     build_daily_equity_curve,
@@ -745,6 +746,72 @@ class TestAttachDailyEquity:
 
             assert _window_starting_equity(result, start) == pytest.approx(engine_equity)
 
+    def test_window_starting_equity_carries_post_reconciliation_pnl(self):
+        """A prior trade after the engine point must reach the window start.
+
+        The engine point agrees within one cent, so the reconciled point is
+        trusted as the running-equity anchor.  The trade that exits *after* it
+        is still prior to the window, and its $250 only arrives at the window
+        start through the reconciliation term.  Dropping that term silently
+        rebases every window return onto an equity $250 too small.
+        """
+        anchored = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        between_point_and_window = make_trade(exit_time="2024-01-20T15:00:00Z", pnl=250.0)
+        between_point_and_window.id = 2
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=125.0)
+        window_trade.id = 3
+        result = make_result(
+            trades=[anchored, between_point_and_window, window_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
+            ],
+        )
+        start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
+
+        # Engine point 100_500 == initial 100_000 + 500 through the point, so the
+        # one-cent agreement holds and the anchor is the engine equity.  The
+        # window start is the ledger's 100_750, not the anchor's 100_500.
+        assert _window_starting_equity(result, start) == pytest.approx(100_750.0)
+
+        attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
+
+        assert result.equity_curve[0].equity == 100_750.0
+        assert result.equity_curve[-1].equity == 100_875.0
+        by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
+        assert by_date["2024-02-10"]["return"] == pytest.approx(125 / 100_750)
+
+    def test_window_starting_equity_between_engine_point_and_window_uses_net_pnl(self):
+        """Both a cent-agreeing anchor and a post-anchor trade, counted once each.
+
+        The engine closes one point at a net +$499.99 (one cent below the
+        ledger), then a further trade nets +$100.02 before the window opens.
+        Trusting the anchor must still add the later trade, and the trade that
+        is *at* the anchor must not be counted twice.
+        """
+        anchored = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        anchored.fees = 0.01
+        anchored.net_pnl = 499.99
+        later = make_trade(exit_time="2024-01-25T15:00:00Z", pnl=100.0)
+        later.fees = 0.0
+        later.net_pnl = 100.02
+        later.id = 2
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=7.0)
+        window_trade.id = 3
+        result = make_result(
+            trades=[anchored, later, window_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_499.99)
+            ],
+        )
+        start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
+
+        assert _window_starting_equity(result, start) == pytest.approx(100_600.01)
+
+        attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
+
+        by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
+        assert by_date["2024-02-10"]["return"] == pytest.approx(7.0 / 100_600.01)
+
     def test_window_starting_equity_rejects_drift_beyond_one_cent(self):
         """Beyond one cent the engine point is ignored and the ledger wins."""
         prior = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
@@ -848,6 +915,57 @@ class TestAttachDailyEquity:
 
         assert result.equity_curve != curve
         assert result.equity_curve[-1].time == "2024-01-31T23:59:59.999999+00:00"
+
+    def test_net_pnl_falls_back_to_gross_minus_fees(self):
+        """With no stored net PnL the ledger fee must be *subtracted*.
+
+        A gross trade (+$120) whose $20 fee is inverted into +$20 turns the
+        winner into a $140 winner, and a losing gross trade (-$50) with a $5
+        fee becomes a $45 winner.  Both flips are visible in the win/loss
+        split, so a `+` where the money path needs a `-` cannot pass.
+        """
+        winner = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=120.0)
+        winner.fees = 20.0
+        winner.net_pnl = None
+        loser = make_trade(exit_time="2024-01-11T15:00:00Z", pnl=-50.0)
+        loser.fees = 5.0
+        loser.net_pnl = None
+        loser.id = 2
+
+        assert _trade_net_pnl(winner) == 100.0
+        assert _trade_net_pnl(loser) == -55.0
+
+        attach_daily_equity(result := make_result(trades=[winner, loser]), end="2024-01-31")
+
+        # 100_000 + 100 - 55: fees reduce equity, they never add to it.
+        assert result.equity_curve[-1].equity == 100_045.0
+        by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
+        assert by_date["2024-01-10"]["equity"] == 100_100.0
+        assert by_date["2024-01-11"]["equity"] == 100_045.0
+
+    def test_net_pnl_fee_fallback_respects_the_day_bucket_and_cutoff(self):
+        """The fee-aware net value is what the window ledger is built from.
+
+        The only exercise of `pnl - fees` also has to reach the prior-PnL
+        reconstruction: a fee-inflated prior balance would drift the window
+        start by exactly twice the fee.
+        """
+        prior = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        prior.fees = 12.0
+        prior.net_pnl = None
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0)
+        window_trade.id = 2
+        result = make_result(trades=[prior, window_trade])
+        start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
+
+        # Ledger: 100_000 + (500 - 12).  An inverted fee gives 100_512 instead.
+        assert _window_starting_equity(result, start) == pytest.approx(100_488.0)
+        assert _net_pnl_before(result, start) == pytest.approx(488.0)
+
+        attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
+
+        assert result.equity_curve[0].equity == 100_488.0
+        assert result.equity_curve[-1].equity == 101_188.0
 
 
 if __name__ == "__main__":
