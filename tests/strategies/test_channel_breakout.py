@@ -91,7 +91,8 @@ def _load_module():
     spec = importlib.util.spec_from_file_location(
         "channel_breakout_unit", STRATEGY_PATH
     )
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

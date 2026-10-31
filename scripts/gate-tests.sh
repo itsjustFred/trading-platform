@@ -50,7 +50,7 @@ EXPECTED=(
     "guarded scripts lint (ruff --select F)"
 )
 
-if [ "${1:-}" = "--list" ]; then
+if [[ "${1:-}" = "--list" ]]; then
     printf '%s\n' "${EXPECTED[@]}"
     exit 0
 fi
@@ -92,13 +92,13 @@ run_one "guarded scripts lint (ruff --select F)" \
 
 gate_roster_check "${EXPECTED[@]}"
 roster_rc=$?
-if [ "$roster_rc" -ne 0 ]; then
+if [[ "$roster_rc" -ne 0 ]]; then
     printf '\n  Exiting 2 - the roster check failed, so the verdict below would be meaningless.\n'
     exit 2
 fi
 
 failed="$(gate_failed_count)"
-if [ "$failed" -eq 0 ]; then
+if [[ "$failed" -eq 0 ]]; then
     printf '\n  ALL %s GATE SUITES PASSED\n' "${#gate_names[@]}"
     exit 0
 fi

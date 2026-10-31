@@ -145,6 +145,43 @@ def test_the_declared_roster_is_not_empty() -> None:
 
 
 @needs_bash
+def test_the_roster_check_prints_the_mismatch_banner() -> None:
+    """The banner is the only thing that names *why* exit 2 happened.
+
+    `test_full_roster` asserts the banner is *absent* on a good run, so a version that never prints
+    it passed everything: the exit code still said 2, the per-side lines still said what differed,
+    and a reader of the logs would see a bare "Exiting 2" with nothing tying it to the roster. The
+    banner is the difference between "the roster moved" and "something, somewhere, failed".
+    """
+    result = _bash(
+        'gate_roster_check "one" "two" > /dev/null 2>&1\n'
+        'printf "roster_rc=%s\\n" "$?"\n'
+        'gate_roster_check "one" "two" 2>&1 > /dev/null\n'
+    )
+    assert "roster_rc=2" in result.stdout, result.stdout + result.stderr
+    assert "ROSTER MISMATCH" in result.stdout, result.stdout + result.stderr
+    assert "describe a roster that does not exist" in result.stdout, result.stdout
+
+
+@needs_bash
+def test_the_roster_check_reports_both_sides_at_once() -> None:
+    """A one-sided scan cannot tell "declared and not run" from "ran and not declared".
+
+    Both can be true in the same run - a gate renamed, so the old name is missing and the new one is
+    extra - and a check that reports only the first side found sends the reader looking for a gate
+    that is right there under a different name.
+    """
+    result = _bash(
+        'run_one "one" true\n'
+        'run_one "surprise" true\n'
+        'gate_roster_check "one" "two" 2>&1 > /dev/null\n'
+        'printf "roster_rc=%s\\n" "$?"\n'
+    )
+    assert "declared but did not run: two" in result.stdout, result.stdout + result.stderr
+    assert "ran but was not declared: surprise" in result.stdout, result.stdout
+
+
+@needs_bash
 def test_full_roster(tmp_path: Path) -> None:
     """End to end: every declared gate exists, runs, and passes.
 

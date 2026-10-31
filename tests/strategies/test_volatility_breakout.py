@@ -96,7 +96,8 @@ def test_warmup_is_day_based_not_bar_counted():
     spec = importlib.util.spec_from_file_location(
         "volatility_breakout_unit", STRATEGY_PATH
     )
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 

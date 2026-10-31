@@ -107,7 +107,8 @@ def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):
 
     path = _write_strategy(tmp_path, name, strategy_text)
     spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None, f"no import spec for {name!r}"
+    assert spec.loader is not None, f"import spec for {name!r} has no loader"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.generate_signals

@@ -552,7 +552,8 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     finally:
         daemon.wait_for_candle_close = original
 
-    assert len(submitted) == 2 and len(set(submitted)) == 2
+    assert len(submitted) == 2, submitted
+    assert len(set(submitted)) == 2, submitted
 
 
 def test_dispatch_respects_each_deployments_own_allowlist() -> None:

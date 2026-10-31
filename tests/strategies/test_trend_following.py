@@ -112,7 +112,8 @@ class TestSourceFidelity:
             }
         )
         _, _, ind, _ = mod.generate_signals(df, {})
-        assert "EMA_Fast" in ind and "SMA_Fast" not in ind
+        assert "EMA_Fast" in ind
+        assert "SMA_Fast" not in ind
         pd.testing.assert_series_equal(
             ind["EMA_Fast"].dropna(),
             close.ewm(span=20, adjust=False).mean().dropna(),

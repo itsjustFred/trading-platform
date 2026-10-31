@@ -11,7 +11,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts._safe_path import under_root
 from validation.statistics.cross_platform import build_comparison_matrix
+
+
+def _safe_output_path(raw: Path) -> Path:
+    """Confine `--output` to the project root, refusing traversal rather than trusting it."""
+    return under_root(raw, root=PROJECT_ROOT, field="--output")
 
 
 def main() -> int:
@@ -47,9 +53,10 @@ def main() -> int:
         reports_dir=args.reports_dir,
         platform_data_dir=args.platform_data_dir,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")
-    print(f"Wrote {args.output}")
+    output = _safe_output_path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")
+    print(f"Wrote {output}")
     return 0
 
 

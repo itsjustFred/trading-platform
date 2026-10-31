@@ -29,7 +29,6 @@ import os
 import re
 import shutil
 import sqlite3
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,36 +43,37 @@ from sqlalchemy.engine import make_url
 
 # isort: split
 
-# --- import-origin guard -------------------------------------------------
-# Running a script puts `scripts/` on `sys.path[0]`, not the repo root, so `import shared` does not
-# find the checkout this file lives in: it falls through to the installed package, which points at a
-# *different* tree. Measured on 2026-10-04: the two were genuinely different revisions, and the
-# installed one carried a *shorter migration set*, so a script run this way applied an older schema
-# than the code believes and then reported success.
-#
-# Refused rather than silently corrected: quietly importing a different tree than the one being
-# edited is the hazard, not the fix. Run from the repo root as
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism -
+# and the reasoning - live in scripts/_import_origin.py; only the invocation is per
+# script. Running this file directly puts scripts/ on sys.path[0], not the repo root,
+# so `shared` never finds this checkout and the guard refuses (exit 2) rather than
+# mutating the wrong tree. See tests/test_script_import_origin.py; run as:
 #     python -m scripts.regenerate_backtests
-# to use this checkout. Pinned by tests/test_script_import_origin.py.
-import shared as _shared_package
+if __package__ in (None, ""):
+    # `python scripts/<name>.py`, or a loader that reads this file by path (e.g.
+    # importlib's spec_from_file_location, which tests/test_script_hygiene.py uses): scripts/ is
+    # not necessarily on sys.path, so make this file's own directory importable. scripts/ only -
+    # never the repo root, which would repair `import shared` and defeat the guard.
+    import sys as _sys
+    from pathlib import Path as _path
 
-_EXPECTED_PKG = Path(__file__).resolve().parent.parent / "shared"
-_ACTUAL_PKG = Path(next(iter(_shared_package.__path__))).resolve()
-if _ACTUAL_PKG != _EXPECTED_PKG:
-    print(
-        "refusing to run: `shared` was imported from the wrong tree.\n"
-        f"  this script lives in : {Path(__file__).resolve().parent.parent}\n"
-        f"  expected shared/     : {_EXPECTED_PKG}\n"
-        f"  actually imported    : {_ACTUAL_PKG}\n"
-        "\n"
-        "Running a script puts scripts/ on sys.path[0], not the repo root, so `import shared`\n"
-        "falls through to the installed package - a different revision, with a shorter\n"
-        "migration set. To run against the checkout being edited, from the repo root:\n"
-        "    python -m scripts.regenerate_backtests\n",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
-# --- end import-origin guard ---------------------------------------------
+    _scripts_dir = str(_path(__file__).resolve().parent)
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    import _import_origin as _guard
+else:  # `python -m scripts.<name>`: the repo root is on sys.path
+    from scripts import _import_origin as _guard
+
+if not _guard.is_own_checkout_file(_guard):
+    _guard = _guard.load_sibling(__file__)
+_guard.ensure_own_checkout("regenerate_backtests")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time -
+# it is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of
+# scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
+# dropping it would take this script off the roster and out of the gate that keeps it alive.
+import shared  # noqa: F401
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
 from runner.stats import compute_stats_for_result

@@ -39,6 +39,54 @@ GUARD_START = "# --- import-origin guard ---"
 GUARD_END = "# --- end import-origin guard ---"
 
 
+def _guarded_script_names() -> list[str]:
+    return sorted(p.stem for p in _scripts_importing_shared())
+
+
+def _run_guarded_script(
+    *args: str, direct: bool, env_extra: dict[str, str] | None = None, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run one guarded script either directly (`python scripts/x.py`) or as a module.
+
+    `direct` is the whole variable under test: a direct run has `scripts/` on `sys.path[0]` and
+    must be refused; a module run has the repo root and must proceed.
+    """
+    name = "recalculate_backtest_stats"
+    argv = (
+        [sys.executable, str(SCRIPTS_DIR / f"{name}.py"), *args]
+        if direct
+        else [sys.executable, "-m", f"scripts.{name}", *args]
+    )
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    for dropped in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES"):
+        env.pop(dropped, None)
+    return subprocess.run(
+        argv, capture_output=True, text=True, cwd=str(cwd or REPO_ROOT), env=env, timeout=600
+    )
+
+
+def _divergent_site(tmp_path: Path) -> Path:
+    """A directory that answers `import shared` with a *copy* of this checkout's tree.
+
+    Prepended to `PYTHONPATH`, it makes the divergence real on a machine where the editable
+    install points at the checkout itself - which is the case the behavioural tests otherwise
+    have to skip. The copy is what makes the guard's answer meaningful rather than incidental:
+    the guard compares resolved paths, so a second copy at a different path must be refused.
+    """
+    site = tmp_path / "divergent_site"
+    site.mkdir()
+    copy = site / "shared"
+    copy.mkdir()
+    for source in (REPO_ROOT / "shared").glob("*.py"):
+        (copy / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    (site / "shared" / "__init__.py").write_text(
+        '"""A different tree that still answers `import shared`."""\n', encoding="utf-8"
+    )
+    return site
+
+
+
 def _probe_env(data_dir: Path) -> dict[str, str]:
     """An environment that cannot reach the live platform.
 
@@ -155,13 +203,25 @@ def test_the_guard_compares_against_the_scripts_own_checkout() -> None:
     A guard comparing against a literal would keep passing after the repo moved, which is the same
     failure as the wiring test that located its guard by bare substring: it stops tracking the thing
     it is protecting.
+
+    The derivation used to sit inline in every script; it now lives once in
+    ``scripts/_import_origin.py`` - the guarantee is unchanged, only its address - so this asserts
+    against the module that carries it. The scripts still hold the marker and the call.
     """
-    text = (SCRIPTS_DIR / "recalculate_backtest_stats.py").read_text(encoding="utf-8")
-    guard = text[text.index(GUARD_START):text.index(GUARD_END)]
-    assert 'Path(__file__).resolve().parent.parent / "shared"' in guard, (
+    helper = SCRIPTS_DIR / "_import_origin.py"
+    assert helper.is_file(), f"the shared guard module is missing: {helper}"
+    expected = 'Path(__file__).resolve().parent.parent / "shared"'
+    assert expected in helper.read_text(encoding="utf-8"), (
         "the guard no longer derives the expected tree from its own location; a literal would "
         "keep passing after the repo moved"
     )
+    for script in _scripts_importing_shared():
+        text = script.read_text(encoding="utf-8")
+        block = text[text.index(GUARD_START):text.index(GUARD_END)]
+        assert "_import_origin" in block, (
+            f"{script.name}: the guard block no longer reaches the shared guard module, so it has "
+            "been reduced to a marker with nothing behind it"
+        )
 
 
 @needs_divergent_tree
@@ -179,11 +239,12 @@ def test_the_two_trees_really_do_differ() -> None:
         pytest.skip("one of the two trees is missing, so there is nothing to compare")
     repo_digest = hashlib.sha256(repo_db.read_bytes()).hexdigest()
     installed_digest = hashlib.sha256(installed_db.read_bytes()).hexdigest()
-    assert repo_digest != installed_digest, (
-        "the checkout and the installed package now hold the same shared/database.py "
-        f"({repo_digest[:12]}). The guard is still correct, but it is no longer preventing a "
-        "difference - worth knowing before treating a refusal as a live problem."
-    )
+    if repo_digest == installed_digest:
+        pytest.skip(
+            "the checkout and the installed package now hold the same shared/database.py "
+            f"({repo_digest[:12]}). The guard is still correct, but it is no longer preventing a "
+            "difference - worth knowing before treating a refusal as a live problem."
+        )
 
 
 @needs_divergent_tree
@@ -240,3 +301,67 @@ def test_the_documented_invocation_still_works(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "refusing to run" not in result.stderr, result.stderr
     assert "Dry run: yes" in result.stdout, result.stdout
+
+
+def test_a_direct_run_is_refused_even_when_the_installed_tree_is_this_checkout(
+    tmp_path: Path,
+) -> None:
+    """The refusal, forced on a machine where the two trees otherwise coincide.
+
+    Every `needs_divergent_tree` case skips here, because this venv's editable install points at the
+    checkout. That means the *behaviour* - the exit code, the two named trees, the call to the
+    shared guard module - went unexercised on exactly the machine the PR was written on, and the
+    extraction of the guard into `scripts/_import_origin.py` could have broken it while the suite
+    stayed green. `PYTHONPATH` supplies a second `shared` tree so the divergence is real and the
+    refusal is observable regardless of how the environment happens to be installed.
+    """
+    site = _divergent_site(tmp_path)
+    env_extra = {"PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")])}
+
+    refused = _run_guarded_script("--dry-run", direct=True, env_extra=env_extra, cwd=tmp_path)
+    assert refused.returncode != 0, (
+        "running the script directly was allowed to proceed while a foreign `shared` was on the "
+        "path; it would apply that tree's migration set\n" + refused.stdout + refused.stderr
+    )
+    assert "refusing to run" in refused.stderr, refused.stderr
+    assert str(REPO_ROOT / "shared") in refused.stderr, refused.stderr
+    assert str(site / "shared") in refused.stderr, refused.stderr
+    # And it must not have pretended to do the work.
+    assert "updated=" not in refused.stdout, refused.stdout
+
+    # The control: the same environment, run the documented way *from the repo root*, must proceed.
+    # From the repo root `sys.path[0]` is the repo root, so `shared` resolves here even with the
+    # foreign tree on `PYTHONPATH`. A guard that refuses whatever the invocation is not a fix.
+    module = _run_guarded_script("--help", direct=False, env_extra=env_extra, cwd=REPO_ROOT)
+    assert module.returncode == 0, module.stdout + module.stderr
+    assert "refusing to run" not in module.stderr, module.stderr
+
+
+def test_every_guarded_script_reaches_the_shared_guard_module(tmp_path: Path) -> None:
+    """The roster, executed rather than read: each script refuses a foreign `shared` itself.
+
+    The static check above only sees that the marker and the call text are present. This runs all
+    ten, so a script whose guard was pasted back incorrectly - a typo in the import, the call
+    dropped, the wrong helper name - fails here instead of in production.
+    """
+    site = _divergent_site(tmp_path)
+    env_extra = {"PYTHONPATH": os.pathsep.join([str(site), os.environ.get("PYTHONPATH", "")])}
+    offenders = []
+    for name in _guarded_script_names():
+        env = dict(os.environ, **env_extra)
+        env.pop("BASE_URL", None)
+        env.pop("PERMA_ALLOW_LIVE_VIEWER_WRITES", None)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / f"{name}.py"), "--help"],
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+            env=env,
+            timeout=600,
+        )
+        if "refusing to run" not in result.stderr or result.returncode == 0:
+            offenders.append(f"{name} (rc={result.returncode})")
+    assert not offenders, (
+        "these scripts import `shared` but did not refuse a foreign tree when run directly, so "
+        f"their guard is not wired to scripts/_import_origin.py: {offenders}"
+    )

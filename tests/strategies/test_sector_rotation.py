@@ -71,8 +71,11 @@ class TestStrategyRegression:
         for trade in backtest_result.trades:
             risk_math = trade.meta.get("risk_math", {})
             stop_distance = risk_math.get("stop_distance")
-            assert stop_distance is not None and stop_distance > 0, (
+            assert stop_distance is not None, (
                 f"Trade {trade.id}: keine Stop-Distanz in risk_math"
+            )
+            assert stop_distance > 0, (
+                f"Trade {trade.id}: Stop-Distanz nicht positiv: {stop_distance}"
             )
             risk_pct = (stop_distance * trade.quantity) / risk_math.get(
                 "equity_at_entry", equity

@@ -35,7 +35,8 @@ EXPECTED_NET_PROFIT = 1110.20
 
 def _load_context_module():
     spec = importlib.util.spec_from_file_location("pynecore_orb_context", CONTEXT_PATH)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
