@@ -2755,14 +2755,20 @@ def update_service_status(
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
-    respect_operator_intent: bool = True,
+    respect_operator_intent: bool = False,
 ) -> Service | None:
     """Write a service's status, with PAUSED as an atomic floor.
 
-    `respect_operator_intent` makes PAUSED a floor: a PAUSED service is never
-    moved to any other status by this function. The pause was set by a person
-    through the API, and nothing the process observes afterwards - a message
-    arriving, a connector failing, a reconnect completing - outranks that.
+    `respect_operator_intent=True` makes PAUSED a floor: a PAUSED service is
+    never moved to any other status by this function. Only automated callers
+    pass it - the pause was set by a person, and nothing the process observes
+    afterwards (a message arriving, a connector failing, a reconnect completing)
+    outranks that.
+
+    The default is `False` because every other caller *is* the operator: the
+    API endpoint that sets and clears a pause, the CLI, a test. Making the floor
+    the default would let it swallow the very request that resumes a paused
+    service - the endpoint would answer 200 while the row stayed PAUSED.
 
     The check is a conditional ``UPDATE`` rather than read-check-write. The
     previous shape read the row, compared in Python, and wrote it back, so a
@@ -2770,9 +2776,6 @@ def update_service_status(
     overwrote PAUSED; `_recover_failed_services` then read FAILED and restarted
     the bot the operator had paused. SQLite serialises writers, so a single
     statement whose ``WHERE`` re-tests the status cannot lose that race.
-
-    Pass `respect_operator_intent=False` only where the caller is *establishing*
-    operator intent, i.e. an API call that is itself setting or clearing a pause.
     """
     normalized_id = str(service_id or "").strip()
     if not normalized_id:

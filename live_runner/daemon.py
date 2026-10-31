@@ -286,7 +286,11 @@ def _recover_failed_services() -> list[Service]:
         # The write is conditional on the row still not being PAUSED, so a
         # pause that landed after the list read wins. Only arm the reconnect
         # floor when the service actually moved to RUNNING.
-        recovered = update_service_status(str(service.id), ServiceStatus.RUNNING)
+        recovered = update_service_status(
+            str(service.id),
+            ServiceStatus.RUNNING,
+            respect_operator_intent=True,
+        )
         if recovered is None or recovered.status != ServiceStatus.RUNNING:
             logger.info(
                 "Not recovering a service whose operator paused it",
@@ -1283,12 +1287,13 @@ async def _renew_submission_claim_until_cancelled(token: str) -> None:
                 renew_live_deployment_submission, token
             )
         except Exception as exc:
+            # Keep trying: a transient DB error must not be what lets the lease
+            # expire under an in-flight order.
             logger.error(
-                "Could not renew the live submission lease; a slow submit may now "
-                "lose it",
+                "Could not renew the live submission lease; retrying next interval",
                 extra={"data": {"token": token, "error": repr(exc)}},
             )
-            return
+            continue
         if not renewed:
             logger.error(
                 "Live submission lease was lost while the order was in flight; "
@@ -1508,7 +1513,16 @@ async def _submit_normalized_discord_signal(
         with contextlib.suppress(asyncio.CancelledError):
             await renew_task
 
-    await asyncio.to_thread(release_live_deployment_submission, claim_token)
+    try:
+        await asyncio.to_thread(release_live_deployment_submission, claim_token)
+    except Exception:
+        # The order is already at the broker, so the lease expiring on its own
+        # is harmless. A cleanup failure must not abort the fan-out or skip the
+        # "submitted" log line below.
+        logger.exception(
+            "Could not release the submission lease; it expires on its own",
+            extra={"data": {"deployment_id": str(deployment.id)}},
+        )
     logger.info(
         "Discord signal submitted",
         extra={
@@ -2834,16 +2848,18 @@ async def _enforce_stopped_deployments(
     Enforced once per transition, not every tick, so a persistently stopped
     deployment does not spam the broker.
 
-    A deployment is recorded as enforced **only when both sweeps report
+    A deployment is recorded as enforced **only when every sweep reports
     ``ControlOutcome.complete``**. `completed > 0` is not success: it is equally
     true of a sweep that closed one of three positions, and recording that as
     stopped is how open exposure survives behind a dashboard that says
     "stopped". A partial sweep is logged with its outstanding items and retried
-    on the next tick.
+    on the next tick. The orphaned-protection sweep counts too: a stop that
+    outlived its position can still trigger and open a new one.
 
     The cancel is the one sweep that does not gate the next step: a surviving
-    order still lets the flatten run, because leaving positions open is worse
-    than leaving an order resting. It does gate the stamp.
+    order - or a cancel call that failed outright - still lets the flatten run,
+    because leaving positions open is worse than leaving an order resting. It
+    does gate the stamp.
     """
     stopped = [
         deployment
@@ -2927,6 +2943,7 @@ async def _enforce_stopped_deployments(
                 )
             continue
 
+        cancel_error: Exception | None = None
         try:
             cancelled = (
                 await adapter.cancel_open_orders()
@@ -2936,8 +2953,15 @@ async def _enforce_stopped_deployments(
         except NotImplementedError:
             cancelled = None
         except Exception as exc:
+            # Still flatten. The cancel failing says nothing about whether the
+            # positions can be closed - the Alpaca flatten cancels its own
+            # per-symbol orders - and leaving exposure open to protect a
+            # cosmetic ordering rule is the wrong trade.
+            cancelled = None
+            cancel_error = exc
             logger.error(
-                "Failed to cancel open orders for stopped deployment",
+                "Failed to cancel open orders for stopped deployment; flattening "
+                "anyway",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
@@ -2946,14 +2970,15 @@ async def _enforce_stopped_deployments(
                     }
                 },
             )
-            continue
 
         # A partial cancel must not stop the flatten: closing the positions is
         # the money-safety action, and the remaining order is retried on the
         # next tick. It does, however, prevent the enforced stamp - the account
         # may still have something resting.
         cancel_ok = cancelled is not None and cancelled.complete
-        if cancelled is None:
+        if cancel_error is not None:
+            pass  # already logged above
+        elif cancelled is None:
             logger.error(
                 "Adapter cannot cancel orders; flattening anyway and keeping the "
                 "deployment unenforced",
@@ -3021,17 +3046,22 @@ async def _enforce_stopped_deployments(
             )
             continue
 
-        # The account is flat. Sweep the protections the flatten detached. This
-        # is cleanliness, not safety - a failure here cannot create exposure -
-        # so it is reported but does not block the enforced stamp.
+        # The account is flat. Sweep the protections the flatten detached.
+        # This is not merely cosmetic: a stop that outlived its position can
+        # still trigger, and a triggered sell-stop with nothing to sell opens a
+        # short. So a sweep that *failed* keeps the deployment unenforced and
+        # retries; only an adapter that has no such concept may stamp without
+        # one.
+        orphan_sweep_unsupported = False
         try:
             orphaned = await adapter.cancel_orphaned_protections()
         except NotImplementedError:
             orphaned = None
+            orphan_sweep_unsupported = True
         except Exception as exc:
-            logger.warning(
+            logger.error(
                 "Failed to sweep protections orphaned by the flatten; the account "
-                "is flat but may still list resting protection orders",
+                "is flat but a resting protection could still trigger",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
@@ -3041,7 +3071,7 @@ async def _enforce_stopped_deployments(
                 },
             )
             orphaned = None
-        if orphaned is None:
+        if orphan_sweep_unsupported:
             logger.warning(
                 "Adapter cannot identify orphaned protections; the account is flat "
                 "but protection orders may still be listed by the broker",
@@ -3052,26 +3082,44 @@ async def _enforce_stopped_deployments(
                     }
                 },
             )
-        elif not orphaned.complete:
-            logger.warning(
-                "Orphaned-protection sweep was incomplete; the account is flat: %s",
+        elif orphaned is not None and not orphaned.complete:
+            logger.error(
+                "Orphaned-protection sweep was incomplete; the account is flat but "
+                "protections may still be resting: %s",
                 orphaned.describe(),
                 extra={"data": {"deployment_id": deployment_id}},
             )
 
-        # Both halves must be complete before the deployment counts as enforced.
-        # The account is flat either way - the money-safety part is done - but a
-        # surviving order means the next tick must try again, and the orphan
-        # sweep above cannot be trusted to have covered it.
+        # Every sweep must be complete before the deployment counts as
+        # enforced. The account is flat either way - the money-safety part is
+        # done - but a surviving order means the next tick must try again.
         if not cancel_ok:
             logger.error(
-                "Not recording STOPPED enforcement: the order cancel was "
-                "incomplete, so orders may still be resting. Retrying next tick: %s",
+                "Not recording STOPPED enforcement: the order cancel did not "
+                "complete, so orders may still be resting. Retrying next tick: %s",
                 (
                     cancelled.describe()
                     if cancelled is not None
-                    else "adapter cannot cancel open orders"
+                    else (
+                        f"cancel failed: {cancel_error!r}"
+                        if cancel_error is not None
+                        else "adapter cannot cancel open orders"
+                    )
                 ),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+        if not orphan_sweep_unsupported and (
+            orphaned is None or not orphaned.complete
+        ):
+            logger.error(
+                "Not recording STOPPED enforcement: the orphaned-protection sweep "
+                "did not complete. Retrying next tick",
                 extra={
                     "data": {
                         "deployment_id": deployment_id,

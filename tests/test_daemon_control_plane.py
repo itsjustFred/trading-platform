@@ -40,6 +40,7 @@ class _ControlAdapter:
     cancel: ControlOutcome = field(default_factory=ControlOutcome)
     flatten: ControlOutcome = field(default_factory=ControlOutcome)
     orphan: ControlOutcome = field(default_factory=ControlOutcome)
+    orphan_error: Exception | None = None
     flatten_error: Exception | None = None
     submit_error: Exception | None = None
     pre_submit_error: Exception | None = None
@@ -62,6 +63,8 @@ class _ControlAdapter:
 
     async def cancel_orphaned_protections(self) -> ControlOutcome:
         self.calls.append("orphan")
+        if self.orphan_error is not None:
+            raise self.orphan_error
         return self.orphan
 
     async def get_balance(self) -> tuple[float, float]:
@@ -186,6 +189,67 @@ def test_adapter_that_cannot_cancel_still_flattens_but_does_not_stamp(
     ledger = _enforce(database, adapter)
 
     assert adapter.calls == ["flatten", "orphan"]
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_incomplete_orphan_sweep_does_not_stamp(isolated_db_sandbox) -> None:
+    """A stop that outlived its position can still trigger and open one.
+
+    Stamping with it resting would mark the deployment enforced and never
+    retry, so the sweep has to be complete too.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter(
+        orphan=ControlOutcome(completed=0, failed=("sl-orphan",))
+    )
+
+    ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_orphan_sweep_failure_does_not_stamp(isolated_db_sandbox) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter(orphan_error=RuntimeError("broker refused the sweep"))
+
+    ledger = _enforce(database, adapter)
+
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_adapter_without_an_orphan_sweep_still_stamps(isolated_db_sandbox) -> None:
+    """No sweep concept means nothing can be left behind; do not block forever."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter(orphan_error=NotImplementedError("not supported"))
+
+    ledger = _enforce(database, adapter)
+
+    assert DEPLOYMENT_ID in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_failed_cancel_still_flattens_but_does_not_stamp(isolated_db_sandbox) -> None:
+    """A cancel that raises says nothing about whether positions can close."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter()
+
+    async def _explode() -> ControlOutcome:
+        adapter.calls.append("cancel")
+        raise RuntimeError("order list unavailable")
+
+    adapter.cancel_open_orders = _explode  # type: ignore[method-assign]
+
+    ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
     assert DEPLOYMENT_ID not in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
 

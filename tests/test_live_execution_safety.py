@@ -3268,20 +3268,23 @@ def test_recover_failed_services_respects_paused_and_stopped(monkeypatch):
         _service("failed-bot", ServiceStatus.FAILED),
         _service("running-bot", ServiceStatus.RUNNING),
     ]
-    updated: list[tuple[str, ServiceStatus]] = []
+    updated: list[tuple[str, ServiceStatus, dict]] = []
+
+    def _record(service_id, status, **kwargs):
+        updated.append((service_id, status, kwargs))
+        return services[2].model_copy(update={"status": status})
 
     monkeypatch.setattr(module, "list_services", lambda: services)
-    monkeypatch.setattr(
-        module,
-        "update_service_status",
-        lambda service_id, status: updated.append((service_id, status)),
-    )
+    monkeypatch.setattr(module, "update_service_status", _record)
 
     module._recover_failed_services()
 
     assert len(updated) == 1
     assert updated[0][0] == str(services[2].id)
     assert updated[0][1] == ServiceStatus.RUNNING
+    # The daemon is the automated caller: it must opt into the PAUSED floor
+    # explicitly, because the default belongs to the operator's own writes.
+    assert updated[0][2] == {"respect_operator_intent": True}
 
 
 # ── Cleanup 15-A: unknown signal actions must never become SELL ────────────────
@@ -4667,7 +4670,9 @@ def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
     monkeypatch.setattr(
         module,
         "update_service_status",
-        lambda *_args: service.model_copy(update={"status": ServiceStatus.RUNNING}),
+        lambda *_args, **_kwargs: service.model_copy(
+            update={"status": ServiceStatus.RUNNING}
+        ),
     )
 
     module._recover_failed_services()

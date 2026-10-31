@@ -25,11 +25,36 @@ def test_paused_service_is_an_atomic_floor_against_a_failed_write(
         )
     )
 
-    failed = update_service_status(str(service.id), ServiceStatus.FAILED)
-    running = update_service_status(str(service.id), ServiceStatus.RUNNING)
+    failed = update_service_status(
+        str(service.id), ServiceStatus.FAILED, respect_operator_intent=True
+    )
+    running = update_service_status(
+        str(service.id), ServiceStatus.RUNNING, respect_operator_intent=True
+    )
 
     assert failed is not None and failed.status == ServiceStatus.PAUSED
     assert running is not None and running.status == ServiceStatus.PAUSED
+
+
+def test_operator_can_resume_a_paused_service_by_default(isolated_db_sandbox) -> None:
+    """The floor belongs to automated callers, not to the operator's own write.
+
+    The API resume path calls this without opting in. If the floor were the
+    default, `PUT /api/services/{id}/status {"status": "running"}` would answer
+    200 and leave the row PAUSED - a paused bot that can never be restarted.
+    """
+    database, _, _ = isolated_db_sandbox
+    service = database.create_service(
+        Service(
+            name="paused-bot",
+            type=ServiceType.DISCORD_BOT,
+            status=ServiceStatus.PAUSED,
+        )
+    )
+
+    resumed = update_service_status(str(service.id), ServiceStatus.RUNNING)
+
+    assert resumed is not None and resumed.status == ServiceStatus.RUNNING
 
 
 def test_prune_keeps_the_in_flight_lease(tmp_path) -> None:

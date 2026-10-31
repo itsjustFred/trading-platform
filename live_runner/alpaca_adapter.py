@@ -1072,10 +1072,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         newest = pd.Timestamp(frame["timestamp"].iloc[-1])
         now = pd.Timestamp.now(tz="UTC")
+        # Intraday bars can legitimately be days old across a market closure: a
+        # Friday close to a Tuesday open is ~89 hours once a holiday Monday is
+        # included, and IEX has no pre/post session to shorten the gap. 72 hours
+        # rejected that valid data; a week still catches a feed that has stopped.
         max_age = (
             timedelta(days=7)
             if str(timeframe).strip().lower() == "1d"
-            else timedelta(hours=72)
+            else timedelta(days=5)
         )
         if newest < now - max_age:
             raise ValueError(
