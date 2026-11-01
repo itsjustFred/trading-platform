@@ -9,29 +9,20 @@ from typing import Any
 # isort: split
 
 # --- import-origin guard ---
-# `shared` must resolve to this checkout, not the installed package. The mechanism -
-# and the reasoning - live in scripts/_import_origin.py; only the invocation is per
-# script. Running this file directly puts scripts/ on sys.path[0], not the repo root,
-# so `shared` never finds this checkout and the guard refuses (exit 2) rather than
-# mutating the wrong tree. See tests/test_script_import_origin.py; run as:
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
 #     python -m scripts.recalculate_backtest_stats
-if __package__ in (None, ""):
-    # `python scripts/<name>.py`, or a loader that reads this file by path (e.g.
-    # importlib's spec_from_file_location, which tests/test_script_hygiene.py uses): scripts/ is
-    # not necessarily on sys.path, so make this file's own directory importable. scripts/ only -
-    # never the repo root, which would repair `import shared` and defeat the guard.
-    import sys as _sys
-    from pathlib import Path as _path
+import sys as _sys
+from pathlib import Path as _path
 
-    _scripts_dir = str(_path(__file__).resolve().parent)
-    if _scripts_dir not in _sys.path:
-        _sys.path.insert(0, _scripts_dir)
-    import _import_origin as _guard
-else:  # `python -m scripts.<name>`: the repo root is on sys.path
-    from scripts import _import_origin as _guard
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
 
-if not _guard.is_own_checkout_file(_guard):
-    _guard = _guard.load_sibling(__file__)
 _guard.ensure_own_checkout("recalculate_backtest_stats")
 # --- end import-origin guard ---
 # The guard module performs `import shared` itself, so this line is no longer read at run time -

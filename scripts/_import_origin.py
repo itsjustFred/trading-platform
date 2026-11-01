@@ -19,11 +19,9 @@ threshold. The behaviour is unchanged; only its address moved.
 How each script reaches this module
 -----------------------------------
 The script's bootstrap cannot assume the repo root is importable, because that is exactly what is in
-doubt. Each script puts ``scripts/`` on the path itself (``sys.path.insert(0, str(Path(__file__)
-.parent))``) and imports ``_import_origin`` from there. If an *installed* copy of that name answered
-first, the script notices (``is_own_checkout_file``) and falls back to loading the sibling
-``scripts/_import_origin.py`` by path, so the check is run by the file the reader is looking at
-rather than by whatever answered first.
+doubt. Each script puts ``scripts/`` at the *front* of ``sys.path`` and imports ``_import_origin``
+from there, so the copy next to the script is the one that runs - an installed module of the same
+name cannot answer first.
 
 The guard does **not** put the repo root on the path. Doing so would repair the divergence and then
 report success, which is the very behaviour it exists to refuse - the original inline block did not
@@ -32,10 +30,8 @@ do it either, and this rewrite must not start.
 
 from __future__ import annotations
 
-import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
 
 
 def repo_root() -> Path:
@@ -101,31 +97,6 @@ def ensure_own_checkout(script: str) -> None:
     expected, actual = resolve_shared()
     if actual != expected:
         refuse(script, expected, actual)
-
-
-def is_own_checkout_file(module: ModuleType) -> bool:
-    """True when an imported `_import_origin` is this file, not an installed copy of it."""
-    origin = getattr(module, "__file__", None)
-    if not origin:
-        return False
-    try:
-        return Path(origin).resolve() == Path(__file__).resolve()
-    except OSError:
-        return False
-
-
-def load_sibling(script_file: str) -> ModuleType:
-    """Load ``scripts/_import_origin.py`` next to `script_file`, ignoring `sys.modules`.
-
-    The fallback for a script whose `scripts/` directory is answered by an installed package first.
-    """
-    path = Path(script_file).resolve().parent / "_import_origin.py"
-    spec = importlib.util.spec_from_file_location("_import_origin_sibling", path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"refusing to run: cannot load the import-origin guard at {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 if __name__ == "__main__":
