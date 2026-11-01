@@ -6,7 +6,7 @@ import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 import pandas as pd
 
@@ -17,6 +17,21 @@ logger = logging.getLogger(__name__)
 MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
 MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
 MIN_PRESERVED_DAY_COVERAGE = 0.5
+
+WindowStartBasis = Literal["engine", "net_ledger"]
+
+
+class WindowStartingEquity(NamedTuple):
+    """Equity at the window start and the basis it was taken from.
+
+    ``basis`` is ``"engine"`` on the normal path and ``"net_ledger"`` when the
+    engine starting point could not be reconciled with the realized net PnL and
+    the ledger had to be used instead. It is published as
+    ``meta.data["window_start_basis"]`` so a report never hides that fallback.
+    """
+
+    equity: float
+    basis: WindowStartBasis
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -121,8 +136,8 @@ def _net_pnl_before(
 def _window_starting_equity(
     result: BacktestResult,
     start_bound: datetime | None,
-) -> float:
-    """Equity at the window start, reconstructed from prior net PnL.
+) -> WindowStartingEquity:
+    """Equity at the window start, plus the basis it was taken from.
 
     A windowed aggregation must start from the equity the account actually had
     at the window start, not from the initial capital: otherwise every return
@@ -130,12 +145,17 @@ def _window_starting_equity(
     curve already carries points before the window, the reconstructed value is
     reconciled against them with a one-cent tolerance and the engine value is
     preferred only when it agrees.
+
+    A disagreement is not silent: it warns once per call (once per attach/run,
+    never per trade or day) and reports ``basis="net_ledger"`` so the published
+    report shows that the window base came from the realized net ledger instead
+    of the engine curve.
     """
     initial_capital = float(result.meta.initial_capital)
     if not math.isfinite(initial_capital):
         raise ValueError("Initial capital must be finite")
     if start_bound is None:
-        return initial_capital
+        return WindowStartingEquity(initial_capital, "engine")
 
     prior_points: list[tuple[datetime, float]] = []
     for point in result.equity_curve:
@@ -147,7 +167,9 @@ def _window_starting_equity(
 
     starting_equity = initial_capital + _net_pnl_before(result, start_bound)
     if not prior_points:
-        return starting_equity
+        # No engine point to reconcile against: the ledger is the only source
+        # and there is no divergence to report.
+        return WindowStartingEquity(starting_equity, "engine")
 
     reconciled_through, reconciled_equity = max(prior_points, key=lambda item: item[0])
     net_through_reconciled = _net_pnl_before(result, reconciled_through, inclusive=True)
@@ -158,14 +180,16 @@ def _window_starting_equity(
         rel_tol=0.0,
         abs_tol=0.01,
     ):
-        # The engine point disagrees with the net ledger: trust the ledger.
-        # Debug level keeps per-window runs quiet; a systematic divergence
-        # (e.g. an engine reporting gross instead of net equity) is visible in
-        # the run log when debugging instead of rebasing every window silently.
-        logger.debug(
-            "Window starting equity not reconciled; using the net ledger",
+        # The engine point disagrees with the net ledger: trust the ledger, but
+        # make the fallback visible. One warning per call keeps a systematic
+        # divergence (e.g. an engine reporting gross instead of net equity)
+        # discoverable without logging once per trade or day.
+        logger.warning(
+            "Engine starting equity disagrees with the net ledger; "
+            "window starts from the realized net ledger",
             extra={
                 "data": {
+                    "window_start_basis": "net_ledger",
                     "engine_equity": reconciled_equity,
                     "ledger_equity": expected_equity,
                     "delta": reconciled_equity - expected_equity,
@@ -173,8 +197,11 @@ def _window_starting_equity(
                 }
             },
         )
-        return starting_equity
-    return reconciled_equity + (starting_equity - initial_capital - net_through_reconciled)
+        return WindowStartingEquity(starting_equity, "net_ledger")
+    return WindowStartingEquity(
+        reconciled_equity + (starting_equity - initial_capital - net_through_reconciled),
+        "engine",
+    )
 
 
 def _strictly_increasing_curve(
@@ -541,6 +568,7 @@ def attach_daily_equity(
         result.meta.data = result.meta.data or {}
         result.meta.data["equity_frequency"] = "unknown"
         result.meta.data.pop("daily_return_count", None)
+        result.meta.data.pop("window_start_basis", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
         result.stats["daily_returns"] = []
@@ -555,12 +583,14 @@ def attach_daily_equity(
     scoped_result = _scoped_view(result, effective_start, effective_end)
     # Unscoped on purpose: the starting equity comes from trades that exited
     # *before* the window, which ``scoped_result`` no longer contains.
-    starting_equity = _window_starting_equity(result, effective_start)
+    window_start = _window_starting_equity(result, effective_start)
+    result.meta.data = result.meta.data or {}
+    result.meta.data["window_start_basis"] = window_start.basis
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
         start=effective_start,
         end=effective_end,
-        starting_equity=starting_equity,
+        starting_equity=window_start.equity,
     )
 
     # If no daily points could be built (e.g., no valid exit times), fallback to existing curve
