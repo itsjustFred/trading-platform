@@ -101,11 +101,11 @@ def find_disagreements(conn: sqlite3.Connection) -> list[tuple[str, str, float, 
     it would overwrite a real number with a different real number - so it is deliberately not here.
     """
     found: list[tuple[str, str, float, float]] = []
-    rows = conn.execute(
-        "select id, " + ", ".join(SENTINELS) + ", stats from backtests"
-    ).fetchall()
-    for backtest_id, *rest in rows:
-        stats = rest[-1]
+    columns = ["id", *SENTINELS, "stats"]
+    rows = conn.execute("select " + ", ".join(columns) + " from backtests").fetchall()
+    for row in rows:
+        record = dict(zip(columns, row))
+        stats = record["stats"]
         if not stats:
             continue
         try:
@@ -118,7 +118,9 @@ def find_disagreements(conn: sqlite3.Connection) -> list[tuple[str, str, float, 
             payload_value = _payload_value(payload, column)
             if payload_value is None:
                 continue
-            column_value = float(rest[list(SENTINELS).index(column)])
+            # By name, not by position: the select list above is built from the same tuple, and a
+            # column added to `SENTINELS` must not silently shift every value one field over.
+            column_value = float(record[column])
             if abs(payload_value - column_value) <= _DISAGREEMENT_TOLERANCE:
                 continue
             if abs(column_value - SENTINELS[column]) > _DISAGREEMENT_TOLERANCE:
@@ -128,7 +130,7 @@ def find_disagreements(conn: sqlite3.Connection) -> list[tuple[str, str, float, 
                 # caller reaching this function directly must not be handed a cell whose overwrite
                 # would destroy a real "never computed" marker. A test caught exactly that.
                 continue
-            found.append((backtest_id, column, column_value, payload_value))
+            found.append((record["id"], column, column_value, payload_value))
     return found
 
 
@@ -208,6 +210,10 @@ def main() -> None:
             )
             for backtest_id, column in withheld[:10]:
                 print(f"  {backtest_id:<44} {column}")
+            # Stop, do not fall through: `--apply` below would write every other disagreement and
+            # the operator would read "Refusing" above a successful exit. Reported first so the
+            # operator can see which rows block the run.
+            raise SystemExit(1)
 
         rows = find_disagreements(conn)
         if args.column:
