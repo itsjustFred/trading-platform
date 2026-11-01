@@ -656,6 +656,16 @@ def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db
         f"is_demo must default to 0, matching production; got {default!r}"
     )
 
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(live_accounts)")}
+    finally:
+        conn.close()
+    assert "ix_live_accounts_is_demo" in indexes, (
+        f"the model declares is_demo with index=True, so a fresh database has "
+        f"ix_live_accounts_is_demo and a migrated one must too; got {sorted(indexes)}"
+    )
+
 
 def test_migrate_schema_parents_smoke_orphans_and_lands_the_foreign_key(legacy_db) -> None:
     """The whole slice, end to end, on a database shaped like production.

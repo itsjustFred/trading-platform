@@ -231,6 +231,21 @@ def test_main_refuses_to_apply_while_a_deliberate_sentinel_exists(
     )
 
 
+def test_the_sentinels_are_the_writer_s_own_table_of_defaults():
+    """The script's table must be the writer's, or a fifth stat silently escapes the backfill.
+
+    `SENTINELS` and `_SCALAR_STAT_COLUMNS` are two spellings of one physical fact. Duplicated on
+    purpose - the operator tool must not import the app's model layer to report on its database -
+    so the drift is pinned here instead.
+    """
+    from shared.database import _SCALAR_STAT_COLUMNS
+
+    module = _load()
+    assert dict(_SCALAR_STAT_COLUMNS) == module.SENTINELS, (
+        "the backfill script's sentinels no longer match the columns the writer maintains"
+    )
+
+
 def test_the_corpus_has_no_declared_undefined_sentinels_today():
     """Zero today, measured. This is the check that makes the refusal path worth keeping.
 

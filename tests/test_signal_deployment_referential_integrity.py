@@ -16,8 +16,10 @@ Measured facts held in place here, because together they are the whole argument 
    signal naming `ctrader-demo-smoke-<account>` and insert no `live_deployments` row at all. It now
    creates the parent first, and keys it on `strategy_name` with a UUID id.
 
-4. **Nothing in the app deletes a deployment**, so the seventh orphan - `4e9bbdab`, a real
-   deployment that is simply gone - was not made by application code removing a row.
+4. **The app cannot orphan a deployment.** It has exactly one deletion path,
+   `delete_live_deployment`, and that refuses while any signal or execution still points at the
+   row. So the seventh orphan - `4e9bbdab`, a real deployment that is simply gone - was not made
+   by application code removing a row.
 
 **So adding the FK has a cost**: every writer of a signal must first write its parent. That is not
 an argument against the constraint - a signal naming a nonexistent deployment is a defect, and
@@ -46,32 +48,40 @@ SMOKE_LABEL = "ctrader-demo-smoke-{account_id}"
 DELETED_REAL_DEPLOYMENT = "4e9bbdab-0d15-4232-91e1-cc459166b764"
 
 
-def test_foreign_keys_are_enabled_for_every_app_connection() -> None:
-    """The premise: the declared FKs are real, so a missing one is a gap and not a convention."""
-    text = DATABASE.read_text(encoding="utf-8")
-    assert "PRAGMA foreign_keys=ON" in text, (
-        "the connect-listener no longer enables foreign keys, so every declared FK is decorative"
+def test_foreign_keys_are_enabled_for_every_app_connection(isolated_db_sandbox) -> None:
+    """The premise: the declared FKs are real, so a missing one is a gap and not a convention.
+
+    Asserted by asking a connection from the app's own engine, not by grepping for the pragma:
+    a source match cannot tell "the pragma is set" from "the pragma is set on a path nothing
+    takes".
+    """
+    database, _engine, _data_dir = isolated_db_sandbox
+    database.init_db()
+    with database.get_engine().connect() as connection:
+        enabled = connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+    assert enabled == 1, (
+        "an app connection has foreign keys off, so every declared FK is decorative"
     )
 
 
 def test_live_signals_declares_the_deployment_foreign_key() -> None:
-    """The gap, closed.
+    """The gap, closed, asserted on the mapped table rather than on the source text.
 
     This file previously asserted the opposite, deliberately: adding the FK had a measured cost in
     the smoke tooling, and the tripwire was there so nobody could add the constraint without seeing
     it. The cost is now paid - `live_smoke._ensure_ctrader_smoke_deployment` writes the parent row
     before the signal - so the assertion is inverted rather than deleted.
     """
-    match = re.search(
-        r"class LiveSignalModel\(SQLModel, table=True\):(.*?)\n\s*@classmethod",
-        DATABASE.read_text(),
-        re.S,
-    )
-    block = match.group(1) if match else ""
-    assert block, "could not locate LiveSignalModel in shared/database.py"
-    assert 'foreign_key="live_deployments.id"' in block, (
-        "live_signals no longer declares a foreign key on deployment_id, so a schema built by "
-        "create_all accepts a signal naming a deployment that does not exist"
+    from shared.database import LiveSignalModel
+
+    targets = {
+        (foreign_key.column.table.name, foreign_key.parent.name)
+        for foreign_key in LiveSignalModel.__table__.foreign_keys
+    }
+    assert ("live_deployments", "deployment_id") in targets, (
+        f"live_signals declares no foreign key from deployment_id to live_deployments, so a "
+        f"schema built by create_all accepts a signal naming a deployment that does not exist: "
+        f"{sorted(targets)}"
     )
 
 
@@ -143,6 +153,42 @@ def test_the_smoke_helper_creates_one_paused_parent_per_account(isolated_db_sand
     assert row.symbols_json == ["XAUUSD"], row.symbols_json
     assert str(UUID(str(row.id))) == str(row.id), "the id is not a UUID"
 
+    # A later run on another symbol must extend the row, not leave `symbols` disagreeing with the
+    # signals the deployment parents.
+    third = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="eurusd")
+    assert third == first
+    with database.get_session() as session:
+        row = session.exec(select(database.LiveDeploymentModel)).one()
+    assert row.symbols_json == ["XAUUSD", "EURUSD"], row.symbols_json
+
+
+def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_no_schema) -> None:
+    """The worker mode reaches the helper before anything else touches the database.
+
+    On a fresh data dir the tables do not exist yet, so without `init_db()` the first SELECT raises
+    "no such table" - a failure that names the wrong problem. The call still fails, by design: the
+    account row is absent and `live_deployments.account_id` carries a foreign key, so writing the
+    deployment would create a second orphan.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    database, engine, _data_dir = isolated_db_no_schema
+    from scripts.live_smoke import _ensure_ctrader_smoke_deployment
+
+    with pytest.raises(IntegrityError):
+        _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert {"live_deployments", "live_accounts"} <= tables, (
+        f"the helper queried a database whose schema was never created: {sorted(tables)}"
+    )
+
 
 def test_the_app_cannot_delete_a_deployment_that_still_has_signals(isolated_db_sandbox) -> None:
     """Why the seventh orphan is a different story from the other six.
@@ -197,10 +243,12 @@ def test_the_app_cannot_delete_a_deployment_that_still_has_signals(isolated_db_s
 
 def test_the_two_orphan_stories_are_recorded_separately() -> None:
     """Six from the smoke tooling, one removed by hand. Collapsing them loses the cause."""
-    assert SMOKE_LABEL.count("smoke") == 1
     assert DELETED_REAL_DEPLOYMENT.startswith("4e9bbdab"), (
         "the deleted real deployment id must stay recorded; it is the only orphan whose cause is "
         "not the smoke tooling"
+    )
+    assert not DELETED_REAL_DEPLOYMENT.startswith("ctrader-demo-smoke-"), (
+        "the hand-removed deployment is being confused with a smoke label"
     )
 
 

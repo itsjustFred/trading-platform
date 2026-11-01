@@ -2,8 +2,14 @@
 
 Production had 7 of 7 signals naming a deployment that does not exist. Six carried the smoke
 convention and could be resolved mechanically; the seventh was a Discord signal whose deployment was
-removed by hand and carries the only in-production instance of the item 1 double-count. So the FK
-lands for the six and stays blocked on exactly one row, and these tests pin both halves.
+removed by hand and carries the only in-production instance of the item 1 double-count.
+
+Both halves are pinned, but the outcome on production is the *refusal*: the backfill parents the
+six, the rebuild lands, and `foreign_key_check` then reports the seventh, so
+`_schema_migration_connection` rolls the whole migration back and `init_db()` raises. Nothing is
+half-applied, and nothing lands until the seventh row is dealt with by an operator. The FK lands
+only on a database whose orphans are all smoke-shaped - which is what the "adopts" and "creates"
+tests below stage.
 """
 
 from __future__ import annotations

@@ -331,7 +331,7 @@ class BacktestRecord(SQLModel, table=True):
     # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
     # and a fresh install would not match the database it is supposed to replace. So the defaults
     # are declared at the schema level too, matching production exactly - verified read-only
-    # against `/home/ubuntu/data/backtests.db`.
+    # against the production database.
     sharpe_ratio: float = Field(
         default=0.0,
         sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
@@ -1427,7 +1427,7 @@ def _add_backtests_stat_columns(connection: Connection) -> None:
     them and a database without them fails outright - which is exactly how this surfaced.
 
     So the columns need the migration they should always have had. Definitions match production
-    exactly, verified read-only against `/home/ubuntu/data/backtests.db`:
+    exactly, verified read-only against the production database:
 
         sharpe_ratio REAL NOT NULL DEFAULT 0.0
         psr         REAL NOT NULL DEFAULT 0.0
@@ -1480,6 +1480,13 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(
             text("ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
         )
+    # The model declares `index=True`, which `create_all` turns into this index. `ADD COLUMN`
+    # cannot, so a migrated database would otherwise differ from a fresh one by exactly the index.
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_accounts_is_demo ON live_accounts (is_demo)"
+        )
+    )
 
 
 def _add_background_task_columns(connection: Connection) -> None:
@@ -1633,9 +1640,11 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
 
     ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
     no deployment row, so those signals were invisible to every deployment-scoped query. This
-    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, with one difference:
-    the ``symbols`` column names every symbol the orphaned signals traded, because the backfill sees
-    all of them at once while a single run only knows its own.
+    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs. Where it has to
+    create one it names every symbol the orphaned signals traded, because the backfill sees all of
+    them at once while a single run only knows its own; an adopted row keeps the symbols it already
+    carries, since rewriting a JSON column inside the migration would turn one malformed value into
+    a startup failure.
 
     Three deliberate restrictions, each a guard against fabricating a trading record:
 
