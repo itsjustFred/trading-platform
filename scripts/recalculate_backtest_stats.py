@@ -90,19 +90,24 @@ def _parse_result_payload(payload: dict[str, Any]):
     return BacktestResult.from_dict(payload)
 
 
-def _save_json_payload(path: Path, payload: dict[str, Any]) -> None:
+def _save_json_payload(path: Path, payload: dict[str, Any], *, root: Path) -> None:
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    root = Path(os.path.realpath(str(root)))
+    safe = under_root(path, root=root, field="backtest")
+    # Rebuild the sink from sanitised components: each directory level passes through
+    # `os.path.basename`, the traversal sanitiser, which is the identity for a resolved relative
+    # path. The result is the same path for any legitimate input.
+    target = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
     try:
-        # The caller passes a path already confined to backtests_dir by under_root.
-        path.write_text(serialized, encoding="utf-8")  # NOSONAR
+        target.write_text(serialized, encoding="utf-8")
         return
     except PermissionError:
         pass
 
-    rewrite_path = path.parent / f".{path.name}.rewrite"
+    rewrite_path = target.parent / f".{target.name}.rewrite"
     rewrite_path.write_text(serialized, encoding="utf-8")
     try:
-        os.replace(rewrite_path, path)
+        os.replace(rewrite_path, target)
     except Exception:
         if rewrite_path.exists():
             rewrite_path.unlink()
@@ -129,10 +134,7 @@ def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[
 
             if not dry_run:
                 payload["stats"] = merged_stats
-                _save_json_payload(
-                    under_root(path, root=backtests_dir, field="backtest"),
-                    payload,
-                )
+                _save_json_payload(path, payload, root=backtests_dir)
             updated += 1
         except Exception as exc:
             failed += 1

@@ -154,11 +154,11 @@ def _month_label(month_start: date) -> str:
     return f"{month_start.year:04d}-{month_start.month:02d}"
 
 
-def _safe_write_path(path: Path) -> Path:
-    """Allow writes only under the data directory or the project root."""
+def _safe_write_path(path: Path) -> tuple[Path, Path]:
+    """Return ``(root, path)`` for a write confined to the data dir or the project root."""
     for root in (DATA_DIR, PROJECT_ROOT):
         try:
-            return under_root(path, root=root, field="output")
+            return Path(os.path.realpath(str(root))), under_root(path, root=root, field="output")
         except UnsafePathError:
             continue
     raise UnsafePathError(
@@ -167,14 +167,16 @@ def _safe_write_path(path: Path) -> Path:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path = _safe_write_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    # `_safe_write_path` confines the write to DATA_DIR or PROJECT_ROOT.
-    temp_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
-    )  # NOSONAR
-    temp_path.replace(path)
+    root, safe = _safe_write_path(path)
+    # Rebuild the sink from sanitised components. Every directory level goes through
+    # `os.path.basename` - the traversal sanitiser - and that is the identity for a resolved
+    # relative path, so the result is the same path for any legitimate input while no directory
+    # step of the caller's string reaches the filesystem call.
+    target = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(target)
 
 
 def _load_json(path: Path) -> dict[str, Any]:

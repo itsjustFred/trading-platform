@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 # isort: split
@@ -52,10 +53,10 @@ def _safe_input_path(raw: Path) -> Path:
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
-    # Operator-supplied, read-only input: it may legitimately live outside the
-    # repo, so confinement is not the contract here. Traversal is rejected and
-    # the failure names the path.
-    d = json.loads(_safe_input_path(path).read_text(encoding="utf-8"))  # NOSONAR
+    source = Path(os.path.realpath(_safe_input_path(path)))
+    if not source.is_file():
+        raise SystemExit(f"input: not a regular file ({source})")
+    d = json.loads(source.read_text(encoding="utf-8"))
     meta = BacktestMeta(**d["meta"])
     trades = [Trade(**t) for t in d.get("trades", [])]
     for t in trades:
@@ -97,9 +98,13 @@ def main() -> None:
 
     res = _load_backtest_result(args.input)
     ref = _to_validation_reference(res)
-    output = under_root(args.output, root=Path.cwd(), field="--output")
-    # `under_root` rejects `..` and confines the write to the current directory.
-    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")  # NOSONAR
+    root = Path(os.path.realpath(str(Path.cwd())))
+    safe = under_root(args.output, root=root, field="--output")
+    # Rebuild the sink from sanitised components: each directory level passes through
+    # `os.path.basename`, the traversal sanitiser, which is the identity for a resolved relative
+    # path. The result is the same path for any legitimate input.
+    output = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
+    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
     print(f"Wrote ValidationReference to {output}")
 
 

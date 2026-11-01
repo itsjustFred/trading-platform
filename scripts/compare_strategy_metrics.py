@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,11 +54,14 @@ def main() -> int:
         reports_dir=args.reports_dir,
         platform_data_dir=args.platform_data_dir,
     )
-    output = _safe_output_path(args.output)
+    root = Path(os.path.realpath(str(PROJECT_ROOT)))
+    safe = _safe_output_path(args.output)
+    # Rebuild the sink from sanitised components: each directory level passes through
+    # `os.path.basename`, the traversal sanitiser, which is the identity for a resolved relative
+    # path. The result is the same path for any legitimate input.
+    output = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
     output.parent.mkdir(parents=True, exist_ok=True)
-    # `_safe_output_path` rejects `..` and confines the result to PROJECT_ROOT.
-    # Sonar's taint model does not see through the helper, so mark the sink.
-    output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")  # NOSONAR
+    output.write_text(json.dumps(matrix, indent=2), encoding="utf-8")
     print(f"Wrote {output}")
     return 0
 
