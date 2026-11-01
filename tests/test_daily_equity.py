@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from datetime import datetime, timezone
 
@@ -16,6 +17,18 @@ from runner.daily_equity import (
     build_daily_equity_curve,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+
+
+@contextlib.contextmanager
+def capture_module_log(caplog):
+    """Capture the module logger, which uses get_logger (propagate=False)."""
+    log = daily_equity_module.logger
+    caplog.set_level(logging.DEBUG, logger=log.name)
+    log.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        log.removeHandler(caplog.handler)
 
 
 def make_result(
@@ -825,12 +838,12 @@ class TestAttachDailyEquity:
             ],
         )
 
-        with caplog.at_level(logging.WARNING, logger="runner.daily_equity"):
+        with capture_module_log(caplog):
             attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
 
         warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
         assert len(warnings) == 1, "the fallback must warn exactly once per run"
-        assert warnings[0].name == "runner.daily_equity"
+        assert warnings[0].name == "trading.runner.daily_equity"
         assert warnings[0].data["window_start_basis"] == "net_ledger"
         assert warnings[0].data["delta"] == pytest.approx(10.0)
         assert result.meta.data["window_start_basis"] == "net_ledger"
@@ -848,15 +861,15 @@ class TestAttachDailyEquity:
             ],
         )
 
-        with caplog.at_level(logging.WARNING, logger="runner.daily_equity"):
+        with capture_module_log(caplog):
             attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
 
         assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
         assert result.meta.data["window_start_basis"] == "engine"
         assert result.equity_curve[0].equity == 100_500.0
 
-    def test_engine_curve_fallback_warns_but_reports_no_daily_basis(self, caplog):
-        """The basis describes the daily base; an engine-curve fallback has none."""
+    def test_engine_curve_fallback_still_reports_the_ledger_basis(self, caplog):
+        """The warning refers to the window base, so the report carries it too."""
         prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
         prior_trade.fees = 10.0
         prior_trade.net_pnl = 490.0
@@ -870,12 +883,13 @@ class TestAttachDailyEquity:
             backtest_end="2024-02-05",
         )
 
-        with caplog.at_level(logging.WARNING, logger="runner.daily_equity"):
+        with capture_module_log(caplog):
             attach_daily_equity(result, start="2024-02-01", end="2024-02-05")
 
-        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the divergence is reported once per run"
         assert result.meta.data["equity_frequency"] == "daily"
-        assert "window_start_basis" not in result.meta.data
+        assert result.meta.data["window_start_basis"] == "net_ledger"
 
     def test_reconciliation_includes_trade_at_engine_point(self):
         """A trade exiting exactly at an engine point is part of that point."""

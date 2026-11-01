@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -10,9 +9,10 @@ from typing import Any, Literal, NamedTuple
 
 import pandas as pd
 
+from shared.logging import get_logger
 from shared.models import BacktestResult, EquityPoint, Trade
 
-logger = logging.getLogger(__name__)
+logger = get_logger("runner.daily_equity")
 
 MAX_PRESERVED_CURVE_GAP = pd.Timedelta(days=4)
 MAX_PRESERVED_BOUNDARY_GAP = pd.Timedelta(days=4)
@@ -24,12 +24,18 @@ WindowStartBasis = Literal["engine", "net_ledger"]
 class WindowStartingEquity(NamedTuple):
     """Equity at the window start and the basis it was taken from.
 
-    ``basis`` is ``"engine"`` on the normal path and ``"net_ledger"`` when the
-    engine starting point could not be reconciled with the realized net PnL and
-    the ledger had to be used instead. It is published as
-    ``meta.data["window_start_basis"]`` whenever the daily build is published,
-    so a report never hides that fallback. The field is absent when the engine
-    curve itself is published instead (no daily base was used).
+    ``basis`` is published as ``meta.data["window_start_basis"]``:
+
+    ``"engine"``
+        No ledger fallback: the configured initial capital, an engine point
+        that agreed with the ledger within one cent, or no engine point at
+        all (nothing to disagree with).
+    ``"net_ledger"``
+        An engine point disagreed with the realized net PnL beyond one cent,
+        so the ledger value was used. Always accompanied by a warning.
+
+    The field is dropped only when no window base is computed at all (no
+    trades and no engine curve).
     """
 
     equity: float
@@ -186,12 +192,13 @@ def _window_starting_equity(
         # make the fallback visible. One warning per call keeps a systematic
         # divergence (e.g. an engine reporting gross instead of net equity)
         # discoverable without logging once per trade or day.
+        basis: WindowStartBasis = "net_ledger"
         logger.warning(
             "Engine starting equity disagrees with the net ledger; "
-            "window starts from the realized net ledger",
+            "using the realized net ledger as the window base",
             extra={
                 "data": {
-                    "window_start_basis": "net_ledger",
+                    "window_start_basis": basis,
                     "engine_equity": reconciled_equity,
                     "ledger_equity": expected_equity,
                     "delta": reconciled_equity - expected_equity,
@@ -199,7 +206,7 @@ def _window_starting_equity(
                 }
             },
         )
-        return WindowStartingEquity(starting_equity, "net_ledger")
+        return WindowStartingEquity(starting_equity, basis)
     return WindowStartingEquity(
         reconciled_equity + (starting_equity - initial_capital - net_through_reconciled),
         "engine",
@@ -586,6 +593,11 @@ def attach_daily_equity(
     # Unscoped on purpose: the starting equity comes from trades that exited
     # *before* the window, which ``scoped_result`` no longer contains.
     window_start = _window_starting_equity(result, effective_start)
+    # Published on every path that computed a window base, including the
+    # engine-curve fallback: the warning refers to this base, so a report must
+    # not show the warning without the basis it is about.
+    result.meta.data = result.meta.data or {}
+    result.meta.data["window_start_basis"] = window_start.basis
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
         start=effective_start,
@@ -610,9 +622,6 @@ def attach_daily_equity(
             result.meta.data["daily_return_count"] = 0
         else:
             result.meta.data.pop("daily_return_count", None)
-        # The published curve is the engine's, so there is no daily base to
-        # report a basis for.
-        result.meta.data.pop("window_start_basis", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
         result.stats["daily_returns"] = []
@@ -625,9 +634,6 @@ def attach_daily_equity(
     # _scoped_view computes exactly this view; reuse it instead of re-filtering.
     preserved_curve = _windowed_curve(result, effective_start, effective_end)
     result.meta.data = result.meta.data or {}
-    # The daily build is published (possibly with an engine curve on top), so
-    # the window base it used is worth reporting.
-    result.meta.data["window_start_basis"] = window_start.basis
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
     if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
         result.equity_curve = preserved_curve
