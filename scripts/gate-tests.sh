@@ -23,6 +23,11 @@
 # fast and that exist in this repository are on it. Adding a slow suite would make the runner the
 # thing people skip.
 #
+# It is a **fast subset, not a replacement for the test suite**. CI runs the full pytest suite, the
+# strategy suite, the packaging checks and these gates; this script answers "did the checks whose
+# failure would be silent actually run" in seconds, which the full suite cannot do on a laptop
+# before a commit. It is wired into `.github/workflows/ci.yml` for that reason.
+#
 # Usage:
 #   scripts/gate-tests.sh                 # run every gate
 #   scripts/gate-tests.sh --list          # print the declared roster, run nothing
@@ -46,6 +51,7 @@ PYTHON="${PYTHON:-python3}"
 
 EXPECTED=(
     "script import origin guard"
+    "output path guard"
     "gate harness self-check"
     "guarded scripts lint (ruff --select F)"
 )
@@ -62,6 +68,12 @@ cd "$REPO_ROOT" || exit 1
 # success - see tests/test_script_import_origin.py.
 run_one "script import origin guard" \
     "$PYTHON" -m pytest -q -p no:cacheprovider tests/test_script_import_origin.py
+
+# The confinement every caller-supplied write path goes through. These scripts rewrite backtest
+# JSON and harvest outputs; a path that climbs out of its root is a write into someone else's tree,
+# and the failure would look like a successful run.
+run_one "output path guard" \
+    "$PYTHON" -m pytest -q -p no:cacheprovider tests/test_safe_path.py
 
 # The runner's own rules. The full-roster case is excluded here: it invokes this script, and a gate
 # that runs the gate that runs it is a cycle, not a check.
