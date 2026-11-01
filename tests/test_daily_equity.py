@@ -855,6 +855,28 @@ class TestAttachDailyEquity:
         assert result.meta.data["window_start_basis"] == "engine"
         assert result.equity_curve[0].equity == 100_500.0
 
+    def test_engine_curve_fallback_warns_but_reports_no_daily_basis(self, caplog):
+        """The basis describes the daily base; an engine-curve fallback has none."""
+        prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        prior_trade.fees = 10.0
+        prior_trade.net_pnl = 490.0
+        result = make_result(
+            trades=[prior_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0),
+                EquityPoint(time="2024-02-03T00:00:00+00:00", equity=100_600.0),
+                EquityPoint(time="2024-02-04T00:00:00+00:00", equity=100_600.0),
+            ],
+            backtest_end="2024-02-05",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="runner.daily_equity"):
+            attach_daily_equity(result, start="2024-02-01", end="2024-02-05")
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert "window_start_basis" not in result.meta.data
+
     def test_reconciliation_includes_trade_at_engine_point(self):
         """A trade exiting exactly at an engine point is part of that point."""
         first_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)

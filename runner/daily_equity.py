@@ -27,7 +27,9 @@ class WindowStartingEquity(NamedTuple):
     ``basis`` is ``"engine"`` on the normal path and ``"net_ledger"`` when the
     engine starting point could not be reconciled with the realized net PnL and
     the ledger had to be used instead. It is published as
-    ``meta.data["window_start_basis"]`` so a report never hides that fallback.
+    ``meta.data["window_start_basis"]`` whenever the daily build is published,
+    so a report never hides that fallback. The field is absent when the engine
+    curve itself is published instead (no daily base was used).
     """
 
     equity: float
@@ -584,8 +586,6 @@ def attach_daily_equity(
     # Unscoped on purpose: the starting equity comes from trades that exited
     # *before* the window, which ``scoped_result`` no longer contains.
     window_start = _window_starting_equity(result, effective_start)
-    result.meta.data = result.meta.data or {}
-    result.meta.data["window_start_basis"] = window_start.basis
     daily_points, daily_returns = build_daily_equity_curve(
         scoped_result,
         start=effective_start,
@@ -610,6 +610,9 @@ def attach_daily_equity(
             result.meta.data["daily_return_count"] = 0
         else:
             result.meta.data.pop("daily_return_count", None)
+        # The published curve is the engine's, so there is no daily base to
+        # report a basis for.
+        result.meta.data.pop("window_start_basis", None)
         result.stats = result.stats or {}
         result.stats["daily_return_count"] = 0
         result.stats["daily_returns"] = []
@@ -622,6 +625,9 @@ def attach_daily_equity(
     # _scoped_view computes exactly this view; reuse it instead of re-filtering.
     preserved_curve = _windowed_curve(result, effective_start, effective_end)
     result.meta.data = result.meta.data or {}
+    # The daily build is published (possibly with an engine curve on top), so
+    # the window base it used is worth reporting.
+    result.meta.data["window_start_basis"] = window_start.basis
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
     if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
         result.equity_curve = preserved_curve
