@@ -787,6 +787,8 @@ class TestAttachDailyEquity:
 
         assert result.equity_curve[0].equity == 100_500.0
         assert result.equity_curve[-1].equity == 101_200.0
+        # No engine point exists, so there is no divergence: the normal path.
+        assert result.meta.data["window_start_basis"] == "engine"
         by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
         assert by_date["2024-02-10"]["return"] == pytest.approx(700 / 100_500)
 
