@@ -301,3 +301,167 @@ extends the PR's scope: both are local to `daily_equity.py`.
 No live bugs were found while reading; each scenario above is a plausible future edit, and
 the "How it was caught" sections are the honest answer to whether today's suite would stop
 it.
+
+---
+
+# Pre-Mortem Cycle 2 — window starting-equity basis
+
+**Scope:** `runner/daily_equity.py` — `WindowStartingEquity`,
+`_window_starting_equity`, `attach_daily_equity` (the basis/warning change)
+**Date:** 2026-11-01
+
+## Summary
+
+The change makes a previously silent accounting decision visible: a warning when the
+engine starting point cannot be reconciled with the realized net ledger, and
+`meta.data["window_start_basis"]` in the report. Four fragilities follow from that:
+the warning can drift out of its once-per-run slot, its level can be quieted back to
+invisibility, the reported basis can describe a curve that was not published, and a
+stale basis can survive a re-attach. The last one was a live inconsistency in the first
+cut of this change and is fixed below.
+
+### 1. The warning becomes a log flood
+
+**Severity:** Medium
+**Component:** `runner/daily_equity.py` — `_window_starting_equity`, the `logger.warning` branch
+**Fragility type:** Implicit ordering dependencies
+
+#### What happened
+
+A walkforward run of 240 windows produced 240 identical warnings, and a large grid
+produced thousands. Operators started filtering `runner.daily_equity` out of the log
+pipeline, which also hid the real divergences.
+
+#### The change that caused it
+
+The warning was moved into `build_daily_equity_curve` ("closer to where the equity is
+used") and then into the per-day loop, because a developer wanted to know *which* day
+was affected.
+
+#### Why it broke
+
+The once-per-run granularity is a property of the call site — `_window_starting_equity`
+runs once per `attach_daily_equity`, while `build_daily_equity_curve` runs per day. The
+docstring states the constraint in prose; nothing enforces it.
+
+#### How it was caught
+
+`test_unreconciled_start_warns_once_and_reports_the_ledger_basis` asserts exactly one
+WARNING record for one attach, so the per-day move fails immediately.
+
+#### Hardening suggestions
+
+- Keep the "exactly one" assertion (present) rather than "at least one".
+- Keep the docstring sentence naming the granularity (present).
+
+### 2. The basis describes a curve that was never published
+
+**Severity:** High
+**Component:** `runner/daily_equity.py` — `attach_daily_equity`, basis assignment
+**Fragility type:** Invisible invariants
+
+#### What happened
+
+A run whose window contained no trades fell back to the engine curve but reported
+`window_start_basis="net_ledger"`. A reconciliation report then compared the engine
+curve against a ledger base it had never been computed from.
+
+#### The change that caused it
+
+The first cut assigned the field right after computing the starting equity, before the
+`if not daily_points` fallback — the natural place if the field is read as "what the
+window base would have been".
+
+#### Why it broke
+
+The field's meaning is "the base the published daily series used". In the fallback the
+published curve is the engine's own curve, so no daily base was used and the field is a
+lie by omission of context.
+
+#### How it was caught
+
+Pre-mortem reading, not a test. Now pinned by
+`test_engine_curve_fallback_warns_but_reports_no_daily_basis`; the fallback pops the key
+and the empty-result path pops it too.
+
+#### Hardening suggestions
+
+- Assign the field only where the daily build is published (done).
+- Keep the warning unconditional: the divergence is real even when the curve is not
+  published (done).
+
+### 3. Someone quiets the warning back to debug
+
+**Severity:** High
+**Component:** `runner/daily_equity.py` — `logger.warning` call
+**Fragility type:** Load-bearing defaults
+
+#### What happened
+
+After a noisy week the level was lowered to `debug` "to reduce log volume", which is
+exactly where this code started. The broker/engine divergence became invisible again.
+
+#### The change that caused it
+
+A one-word edit that looks like a logging preference, not an accounting decision.
+
+#### Why it broke
+
+The visibility of the fallback is the entire point of the change; the log level is the
+only thing carrying it.
+
+#### How it was caught
+
+`caplog.at_level(logging.WARNING, logger="runner.daily_equity")` plus the explicit
+`levelno == logging.WARNING` assertion. Lowering the level makes the record disappear
+from the capture and the test fails.
+
+#### Hardening suggestions
+
+- Keep the level assertion, not just the message assertion (present).
+- The `extra={"data": {"window_start_basis": "net_ledger", ...}}` payload also carries
+  the fact to structured log consumers independent of the message text (present).
+
+### 4. A stale basis survives a re-attach
+
+**Severity:** Medium
+**Component:** `runner/daily_equity.py` — `attach_daily_equity`, stale-field cleanup
+**Fragility type:** Semantic coupling through shared mutable state
+
+#### What happened
+
+`backtest_grid` re-attaches to an existing result (`skip_existing`). The second attach
+fell back to the engine curve, but the report still carried the previous attach's
+`window_start_basis="net_ledger"`.
+
+#### The change that caused it
+
+A future edit adds an early return before the pop, or moves the fallback block above the
+cleanup, mirroring how `daily_return_count` had to be cleaned up in two places.
+
+#### Why it broke
+
+`result.meta.data` is shared mutable state across attaches; every field needs an
+explicit cleanup on each early-return path, and the paths are not centralised.
+
+#### How it was caught
+
+`test_empty_result_clears_stale_daily_fields` (pre-seeded stale value) and
+`test_engine_curve_fallback_warns_but_reports_no_daily_basis` pin the two paths.
+
+#### Hardening suggestions
+
+- Consider one `_clear_daily_meta(result)` helper if a third field is added; today the
+  two pops are cheaper than the indirection.
+
+## Themes and Recommendations
+
+**Observability is now part of the contract.** The basis field and the warning are the
+first things in this module that a human reads rather than a statistic consumes. Both
+are one edit away from being wrong in a way no value assertion would catch, so the tests
+assert *counts and levels*, not just presence.
+
+**Report fields must describe what was published.** Post-mortem 2 generalises: any field
+added next to `equity_frequency`/`daily_return_count` must be set on exactly the paths
+that publish the thing it describes, and cleared on the others. The three early-return
+paths in `attach_daily_equity` are the place to check whenever a field is added.
