@@ -336,6 +336,30 @@ def test_a_tiny_real_value_is_not_mistaken_for_the_sentinel(conn):
     )
 
 
+def test_a_cell_withheld_after_the_scan_is_left_alone(conn):
+    """The producer can change its mind between the scan and the write."""
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute(
+        "update backtests set stats = "
+        '\'{"sharpe_ratio": -37.6644, "undefined_metrics": ["sharpe_ratio"]}\' '
+        "where id = 'stale-column'"
+    )
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "a cell withheld after the scan was still overwritten"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 0.0, value
+
+
 def test_the_sentinels_are_the_writer_s_own_table_of_defaults():
     """The script's table must be the writer's, or a fifth stat silently escapes the backfill.
 

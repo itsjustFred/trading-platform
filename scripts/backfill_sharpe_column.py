@@ -201,6 +201,10 @@ def _reconcile(conn: sqlite3.Connection, rows: list[tuple[str, str, float, float
             continue
         if not isinstance(current_payload, dict):
             continue
+        if _is_declared_undefined(current_payload, column):
+            # The producer now withholds this metric, so the sentinel became deliberate after the
+            # scan. Writing the queued value would destroy a real "never computed" marker.
+            continue
         if _payload_value(current_payload, column) != payload_value:
             continue
         cursor = conn.execute(

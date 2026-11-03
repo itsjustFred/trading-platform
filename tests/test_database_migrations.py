@@ -22,6 +22,7 @@ from shared.models import (
     BacktestMeta,
     BacktestResult,
     EquityPoint as EquityPointModel,
+    LiveAccountConfig,
     LiveSignal,
     Trade,
     TradeExit,
@@ -622,6 +623,36 @@ def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> N
     summary2 = migrate_json_to_sqlite(skip_existing=True)
     assert summary2["migrated"] == 0
     assert summary2["skipped"] == 1
+
+
+def test_upserting_an_existing_account_preserves_is_demo(isolated_db) -> None:
+    """Re-saving an account must not reset the flag it is not carrying.
+
+    `LiveAccountConfig` has no `is_demo`, so `from_live_account` always builds a model with the
+    Python default `False`. That is correct for a *new* account and would silently un-flag a demo
+    account if the update path merged a config-built model. It does not - the update path sets
+    fields explicitly - and this pins that, because the failure would be invisible: the account
+    keeps working, it just stops being reported as demo.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    database.init_db()
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="acct-demo", broker="ctrader", name="demo", is_demo=True
+            )
+        )
+        session.commit()
+
+    database.upsert_live_accounts(
+        [LiveAccountConfig(id="acct-demo", broker="ctrader", name="renamed")]
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acct-demo")
+    assert row is not None
+    assert row.is_demo is True, "re-saving the account reset a stored is_demo flag"
+    assert row.name == "renamed", "the update path stopped applying the fields it does carry"
 
 
 def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db) -> None:

@@ -1718,7 +1718,9 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             new_id = str(existing[0])
         else:
             new_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat(sep=" ")
+            # Naive UTC, like every other timestamp in this schema: an aware ISO string carries a
+            # `+00:00` suffix that sorts and parses differently from the rows around it.
+            now = _utcnow_naive().isoformat(sep=" ")
             connection.execute(
                 text(
                     "INSERT INTO live_deployments "

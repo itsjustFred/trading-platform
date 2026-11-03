@@ -136,6 +136,27 @@ def test_backfill_creates_the_parent_row_for_a_smoke_orphan(conn):
     assert row[6] == "smoke"
 
 
+def test_the_backfilled_timestamps_are_naive_utc(conn):
+    """Every other timestamp in this schema is naive UTC.
+
+    An aware ISO string carries a `+00:00` suffix, which sorts and parses differently from the rows
+    around it - and `created_at`/`updated_at` are read back as datetimes.
+    """
+    _add_account(conn, "44695443")
+    _add_signal(conn, "s1", "ctrader-demo-smoke-44695443")
+
+    _backfill_smoke_deployments(conn)
+
+    created, updated = conn.execute(
+        text("select created_at, updated_at from live_deployments")
+    ).fetchone()
+    assert created and updated, (created, updated)
+    assert "+" not in created and "+" not in updated, (
+        f"the backfill wrote a timezone-aware timestamp: {created!r} / {updated!r}"
+    )
+    assert created == updated
+
+
 def test_one_parent_row_covers_every_signal_of_the_smoke_label(conn):
     """The label identifies a deployment, not a signal.
 
