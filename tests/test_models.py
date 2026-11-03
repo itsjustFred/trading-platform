@@ -240,6 +240,20 @@ class TestBacktestResult:
             assert r2.meta.id == r.meta.id
             assert len(r2.trades) == 2
 
+    def test_available_status_without_a_curve_is_rejected(self):
+        """A payload may not claim equity evidence it does not carry.
+
+        ``equity_evidence_status`` drives the validation reports, so a file that
+        says ``available`` while shipping no curve must fail loudly instead of
+        being read as evidence.
+        """
+        payload = _make_result().to_dict()
+        payload["equity_curve"] = []
+        payload["equity_evidence_status"] = "available"
+
+        with pytest.raises(ValueError, match="requires an equity curve"):
+            BacktestResult.from_dict(payload)
+
     def test_curve_attached_after_construction_serializes_evidence_status(self, tmp_path):
         """A curve attached after construction must not leave a stale status.
 
