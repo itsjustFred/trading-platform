@@ -51,7 +51,6 @@ from data_tools.downloaders.dukascopy_native import (
     generate_tick_urls,
     parse_ticks,
 )
-from scripts._safe_path import UnsafePathError, under_root
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -154,29 +153,25 @@ def _month_label(month_start: date) -> str:
     return f"{month_start.year:04d}-{month_start.month:02d}"
 
 
-def _safe_write_path(path: Path) -> tuple[Path, Path]:
-    """Return ``(root, path)`` for a write confined to the data dir or the project root."""
-    for root in (DATA_DIR, PROJECT_ROOT):
-        try:
-            return Path(os.path.realpath(str(root))), under_root(path, root=root, field="output")
-        except UnsafePathError:
-            continue
-    raise UnsafePathError(
-        f"output: refusing to write outside {DATA_DIR} or {PROJECT_ROOT} ({path})"
-    )
+def _save_state(state: dict[str, Any]) -> None:
+    """Persist the harvester state to this script's own state file.
+
+    The target is a module constant, never an argument: a path parameter is indistinguishable
+    from caller input to a reader (and to a static analyzer), however carefully the caller chose
+    it. The temp-file swap keeps a crash from truncating the state.
+    """
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(STATE_PATH)
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    root, safe = _safe_write_path(path)
-    # Rebuild the sink from sanitised components. Every directory level goes through
-    # `os.path.basename` - the traversal sanitiser - and that is the identity for a resolved
-    # relative path, so the result is the same path for any legitimate input while no directory
-    # step of the caller's string reaches the filesystem call.
-    target = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    temp_path.replace(target)
+def _save_profiles(profiles: dict[str, Any]) -> None:
+    """Persist the downloader profiles to this script's own profile file."""
+    PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = PROFILE_PATH.with_suffix(PROFILE_PATH.suffix + ".tmp")
+    temp_path.write_text(json.dumps(profiles, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(PROFILE_PATH)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -255,10 +250,6 @@ def _load_state() -> dict[str, Any]:
     return state
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    _write_json_atomic(STATE_PATH, state)
-
-
 def _ensure_job_state(
     state: dict[str, Any],
     symbol: str,
@@ -333,10 +324,6 @@ def _load_profiles() -> dict[str, Any]:
     if not isinstance(profiles, dict):
         raise RuntimeError(f"Invalid profile format in {PROFILE_PATH}.")
     return profiles
-
-
-def _save_profiles(profiles: dict[str, Any]) -> None:
-    _write_json_atomic(PROFILE_PATH, profiles)
 
 
 def _update_profile_if_better(

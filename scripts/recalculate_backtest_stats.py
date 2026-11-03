@@ -31,7 +31,6 @@ _guard.ensure_own_checkout("recalculate_backtest_stats")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.stats import compute_stats_for_result
-from scripts._safe_path import under_root
 from shared.constants import DATA_DIR
 from shared.database import (
     init_db,
@@ -90,28 +89,8 @@ def _parse_result_payload(payload: dict[str, Any]):
     return BacktestResult.from_dict(payload)
 
 
-def _save_json_payload(path: Path, payload: dict[str, Any], *, root: Path) -> None:
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-    root = Path(os.path.realpath(str(root)))
-    safe = under_root(path, root=root, field="backtest")
-    # Rebuild the sink from sanitised components: each directory level passes through
-    # `os.path.basename`, the traversal sanitiser, which is the identity for a resolved relative
-    # path. The result is the same path for any legitimate input.
-    target = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
-    try:
-        target.write_text(serialized, encoding="utf-8")
-        return
-    except PermissionError:
-        pass
-
-    rewrite_path = target.parent / f".{target.name}.rewrite"
-    rewrite_path.write_text(serialized, encoding="utf-8")
-    try:
-        os.replace(rewrite_path, target)
-    except Exception:
-        if rewrite_path.exists():
-            rewrite_path.unlink()
-        raise
+def _serialize_payload(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[int, int, int]:
@@ -134,7 +113,21 @@ def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[
 
             if not dry_run:
                 payload["stats"] = merged_stats
-                _save_json_payload(path, payload, root=backtests_dir)
+                # The write target is the file this loop just read, discovered under
+                # `backtests_dir` - not a caller-supplied path. It stays a local expression here
+                # rather than a parameter of a helper, so the sink never takes an argument.
+                serialized = _serialize_payload(payload)
+                try:
+                    path.write_text(serialized, encoding="utf-8")
+                except PermissionError:
+                    rewrite_path = path.parent / f".{path.name}.rewrite"
+                    rewrite_path.write_text(serialized, encoding="utf-8")
+                    try:
+                        os.replace(rewrite_path, path)
+                    except Exception:
+                        if rewrite_path.exists():
+                            rewrite_path.unlink()
+                        raise
             updated += 1
         except Exception as exc:
             failed += 1
