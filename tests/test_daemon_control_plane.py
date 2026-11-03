@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -322,6 +323,22 @@ def test_shared_account_is_not_flattened_for_one_stopped_deployment(
     )
 
     assert adapter.calls == []
+
+
+def test_demo_gate_requires_a_literal_true_flag() -> None:
+    """Fail closed on every uncertainty, not just on a False flag.
+
+    A missing flag, a False flag and an unrecognised adapter all read as "not
+    demo". A falsy-but-present value must not be enough either: `is not None`
+    would accept `paper=False`, which is exactly the live account this gate
+    exists to refuse.
+    """
+    assert daemon._adapter_is_demo(SimpleNamespace()) is False
+    assert daemon._adapter_is_demo(SimpleNamespace(paper=False)) is False
+    assert daemon._adapter_is_demo(SimpleNamespace(demo=False)) is False
+    assert daemon._adapter_is_demo(SimpleNamespace(paper=None)) is False
+    assert daemon._adapter_is_demo(SimpleNamespace(paper=True)) is True
+    assert daemon._adapter_is_demo(SimpleNamespace(demo=True)) is True
 
 
 def test_demo_gate_refuses_a_newly_built_non_demo_adapter(
