@@ -43,6 +43,38 @@
       ],
       "daily_return_count": 3,
       "equity_frequency": "daily",
+      "execution_context": {
+        "data_dir": "<dynamic-path>",
+        "data_source": "",
+        "engine": "native",
+        "initial_capital": 100000.0,
+        "risk_config": {
+          "max_leverage": 1.0,
+          "max_position_exposure_pct": 1.0,
+          "max_position_exposure_semantics": "aggregate_open_risk",
+          "modeling_resolution": "main_timeframe",
+          "risk_per_trade_pct": 0.01,
+          "signal_exit_fill": "close",
+          "warmup_start": ""
+        },
+        "symbols": [
+          "PARITY"
+        ],
+        "timeframe": "1h"
+      },
+      "pnl_basis": {
+        "net_pnl": "net_after_fees",
+        "pnl": "gross"
+      },
+      "risk_config": {
+        "max_leverage": 1.0,
+        "max_position_exposure_pct": 1.0,
+        "max_position_exposure_semantics": "aggregate_open_risk",
+        "modeling_resolution": "main_timeframe",
+        "risk_per_trade_pct": 0.01,
+        "signal_exit_fill": "close",
+        "warmup_start": ""
+      },
       "shared_equity": {},
       "source": "ohlcv",
       "symbols": [
@@ -51,7 +83,33 @@
       "timeframes": [
         "1h"
       ],
-      "universe": ""
+      "universe": "",
+      "universe_provenance": {
+        "as_of": null,
+        "as_of_declared": false,
+        "disclosure": "The symbol list was resolved from cli:--symbols at <dynamic> and the run makes no statement about when its membership was determined. This platform ships no historical (point-in-time) index-membership source. If the list came from a current constituents snapshot, every name removed from or delisted before <dynamic> is missing from the whole window and the result is biased upward; if it is a hand-picked list, membership was constant and the point-in-time concern does not apply. Which of the two is true is unknown, and is recorded as unknown rather than assumed.",
+        "is_point_in_time": null,
+        "membership_basis": "undeclared",
+        "platform_membership_sources": [],
+        "point_in_time_source": "",
+        "provider": "cli:--symbols",
+        "resolved_at": "<dynamic>",
+        "symbol_count": 1,
+        "symbols": [
+          "PARITY"
+        ],
+        "symbols_sha256": "114646257f81c63b78d0d9554ed3c3d1332ba237049dde829b4938a3b21317ac",
+        "undefined_metrics": [
+          "as_of",
+          "membership_basis"
+        ],
+        "version": 1,
+        "window": {
+          "end": "2024-01-03T00:00:00+00:00",
+          "start": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "window_start_basis": "engine"
     },
     "duration_days": 2,
     "engine": "native",
@@ -84,12 +142,12 @@
       },
       {
         "date": "2024-01-02",
-        "equity": 99721.4725953125,
+        "equity": 99721.47,
         "return": -0.0012772026228354651
       },
       {
         "date": "2024-01-03",
-        "equity": 100497.05014802958,
+        "equity": 100497.05,
         "return": 0.007777437822890051
       }
     ],
@@ -100,11 +158,11 @@
     "max_consecutive_wins": 1,
     "max_drawdown_duration": 2,
     "max_drawdown_pct": -0.002785,
-    "p_value": 0.301811,
+    "p_value": 0.320491,
     "profit_factor": 2.7846,
     "risk_free_rate": 0.0,
-    "sharpe_ratio": 8.0582,
-    "sortino_ratio": 57.1276,
+    "sharpe_ratio": 4.9858,
+    "sortino_ratio": 23.1256,
     "total_pnl": 497.05,
     "total_return": 0.00497,
     "total_trades": 3,
@@ -129,7 +187,7 @@
       "fees": 2.851851851851852,
       "holding_bars": 4,
       "id": 1,
-      "mae": -129.62962962962962,
+      "mae": -166.66666666666669,
       "meta": {
         "entry_fill": {
           "order_type": "market",
@@ -179,7 +237,7 @@
       "fees": 2.7161546875,
       "holding_bars": 4,
       "id": 2,
-      "mae": -109.20984375,
+      "mae": -140.41265625,
       "meta": {
         "entry_fill": {
           "order_type": "market",
@@ -251,7 +309,7 @@
         "exit_reason": "signal",
         "sizing_stop_loss": 50.0
       },
-      "mfe": 587.4004550134846,
+      "mfe": 792.3075904833048,
       "net_pnl": 775.5775527170716,
       "pnl": 778.6471147853168,
       "pnl_pct": 46.158777322843065,

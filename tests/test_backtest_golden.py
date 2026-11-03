@@ -30,6 +30,7 @@ from shared.models import BacktestResult  # noqa: E402
 GOLDEN_PATH = ROOT / "tests" / "fixtures" / "backtest" / "native_cli_v1.json"
 RESULT_ID = "backtest-golden-native-v1"
 DYNAMIC_CREATED_AT = "<dynamic>"
+DYNAMIC_PATH = "<dynamic-path>"
 MAX_REPORTED_PATHS = 40
 # Every golden run starts a fresh hermetic child: an empty ``PYTHONPYCACHEPREFIX``
 # directory forces CPython to recompile the whole dependency set byte-for-byte
@@ -227,14 +228,45 @@ def generate_signals(df, params):
 '''
 
 
+def _assert_utc_timestamp(value: str, label: str) -> None:
+    """Check that a dynamic clock value is a real UTC instant, not a constant."""
+    if value == DYNAMIC_CREATED_AT:
+        return
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    assert parsed.tzinfo is not None, f"{label} must be timezone-aware"
+    assert parsed.utcoffset() == timedelta(0), f"{label} must be UTC"
+
+
 def _canonicalize(payload: dict[str, Any]) -> dict[str, Any]:
     canonical = deepcopy(payload)
-    created_at = canonical["meta"]["created_at"]
-    if created_at != DYNAMIC_CREATED_AT:
-        parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
-        assert parsed.tzinfo is not None
-        assert parsed.utcoffset() == timedelta(0)
-    canonical["meta"]["created_at"] = DYNAMIC_CREATED_AT
+    meta = canonical["meta"]
+    _assert_utc_timestamp(meta["created_at"], "meta.created_at")
+    meta["created_at"] = DYNAMIC_CREATED_AT
+
+    # The universe provenance records when the symbol list was resolved and
+    # repeats that instant verbatim inside its disclosure.  Both are wall-clock
+    # values of the run that produced the fixture, so they are normalised here
+    # rather than pinned; a golden that embeds its own generation time can only
+    # ever pass once.
+    provenance = (meta.get("data") or {}).get("universe_provenance")
+    if isinstance(provenance, dict) and provenance.get("resolved_at") is not None:
+        resolved_at = provenance["resolved_at"]
+        _assert_utc_timestamp(resolved_at, "meta.data.universe_provenance.resolved_at")
+        provenance["disclosure"] = str(provenance.get("disclosure") or "").replace(
+            str(resolved_at), DYNAMIC_CREATED_AT
+        )
+        provenance["resolved_at"] = DYNAMIC_CREATED_AT
+
+    # The execution context records the data directory the run read from, which
+    # is the per-test temporary directory.  Canonicalising is idempotent: the
+    # fixture's own placeholder is already the normal form.
+    execution_context = (meta.get("data") or {}).get("execution_context")
+    if isinstance(execution_context, dict) and execution_context.get("data_dir"):
+        if execution_context["data_dir"] != DYNAMIC_PATH:
+            assert Path(execution_context["data_dir"]).is_absolute(), (
+                "execution_context.data_dir must be an absolute path"
+            )
+            execution_context["data_dir"] = DYNAMIC_PATH
     return canonical
 
 
@@ -590,7 +622,10 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
             assert curve_time >= last_exit
         assert curve_point.equity == round(expected_close, 2)
         assert abs(curve_point.equity - expected_close) <= 0.005
-        assert row["equity"] == pytest.approx(expected_close, rel=1e-12, abs=1e-9)
+        # The reported equity is cent-quantised so that the two published views
+        # of the same instant agree; the return still uses the exact balance.
+        assert row["equity"] == round(expected_close, 2)
+        assert row["equity"] == curve_point.equity
         assert row["return"] == pytest.approx(
             day_pnl / running_equity,
             rel=1e-12,
