@@ -582,3 +582,39 @@ trading-platform/
     └── test_viewer_features.py             # Task/API tests
 ```
 
+
+## Result diagnostics (added 2026-09-25)
+
+Every parameter-mode optimization now emits a `diagnostics` block. It does not
+change which parameter is selected; it reports how much the selection should be
+trusted.
+
+```json
+"diagnostics": {
+  "split":      { "train": {}, "embargo": {}, "test": {}, "embargo_bars_equivalent": 12.0 },
+  "walk_forward": [ { "fold": 0, "train": {}, "test": {} } ],
+  "plateau":    { "parameter": "atr_stop_mult", "is_plateau": false, "sensitivity": 0.011 },
+  "multiple_testing": { "n_trials": 8, "bonferroni_threshold": 0.00625,
+                        "expected_max_under_null": 1.397, "survives_selection_bias": false }
+}
+```
+
+- `embargo_pct` (default `0.0`, max `0.4`) drops a gap between the train and test
+  windows **and is applied to the windows that actually run**: `run_optimization`
+  forwards it into `_split_backtest_period`, so no trial ever sees data across the
+  gap. A trade opened just before the split can close inside the test window, so
+  its label is partly test information; without the gap that leaks backwards into
+  training. The gap is additionally reported in bars via the context timeframe.
+- `walk_forward_splits` (default `3`) is **report-only**. The repeated sequential
+  folds are computed and published as a robustness diagnostic, but the selected
+  parameters still come from the single train/test split above; the backtest is
+  not re-run per fold. Folds never overlap and never train on an earlier fold's
+  test window.
+- `plateau.is_plateau` is false when only the winning parameter scores within
+  `tolerance` of the best. A lone spike is the classic overfitting signature.
+- `multiple_testing.survives_selection_bias` compares the observed metric with
+  the expected maximum of N trials under the null. A best-of-N result below that
+  expectation is consistent with pure selection noise, and says so.
+
+Reading a result: `is_plateau: false` **and** `survives_selection_bias: false`
+together mean the selected parameter should not be promoted to live trading.

@@ -40,9 +40,38 @@ Useful options:
 - `--strategy STRATEGY` repeatable to limit the matrix to one or more strategy slugs/names/paths.
 - `--symbols` and `--timeframes` override the default universe.
 - `--start` / `--end` cap the backtest period.
-- `--resume` rehydrates existing cell JSON files, attaches daily equity/returns, recomputes stats, and skips rerunning the cell.
+- `--resume` rehydrates an existing cell JSON file, attaches daily equity/returns, recomputes stats, and skips rerunning the cell — but only when the cell's recorded **grid identity** still holds (see below). A cell that fails the check is recomputed, never reused.
 - `--subprocess` runs each grid cell through `runner.cli run` for isolation.
 - `--skip-sqlite` is recommended for large matrices to avoid SQLite write contention.
+
+## Grid identity: when a cached cell may be reused
+
+Every finished cell stamps its `.trades.json` with
+`meta.data["grid_identity"]` (`runner/grid_identity.py`): the config it was
+produced from (engine, strategy file bytes, symbol, timeframe, resolved window,
+capital, every risk/modelling knob, strategy parameters, data root) and the
+`(mtime, size)` fingerprint of every parquet the cell could have read. Both
+halves are hashed into one `fingerprint`.
+
+`--resume` reuses a cell only when that recorded identity equals the identity
+of the request as it stands now. It refuses — and recomputes — when:
+
+- the artifact carries no identity, or one from another identity version
+  (a legacy artifact promises nothing about what it was computed from);
+- any config field differs, including a strategy file edited after the run and
+  a risk knob the artifact schema cannot express;
+- the underlying frame was re-downloaded or rewritten, even though not one
+  artifact field changed;
+- either data half could not be resolved (missing = unknown, and unknown is a
+  refusal, never "unchanged").
+
+A cell whose identity could not be stamped is reported as **failed**, not
+`ok`: an unstamped artifact is one the next `--resume` is obliged to throw away.
+
+The viewer applies the same rule to what it serves.
+`/api/backtests/matrix/summary` and `/api/grid/{id}` re-stat the data files each
+served row names and answer **409** with the stale rows and the reason, instead
+of presenting a ranking computed from data that no longer exists.
 
 ## Outputs
 

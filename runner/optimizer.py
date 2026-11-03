@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
@@ -20,8 +20,15 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
+from runner.universe_provenance import (
+    UNIVERSE_PROVENANCE_KEY,
+    observe_symbol_coverage,
+    read_universe_provenance,
+    survivorship_bias_diagnostic,
+    unknown_universe_provenance,
+)
 from shared.atomic_io import write_text_atomically
-from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR
+from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
 from shared.models import BacktestResult
 from shared.strategy_registry import find_strategy_entry
 
@@ -33,6 +40,13 @@ ProgressCallback = Callable[[float, str], None]
 # can never collide with (and be filtered away alongside) a real strategy
 # parameter that happens to be called "symbol_universe".
 _INTERNAL_SYMBOL_UNIVERSE_PARAM = "__internal_symbol_universe"
+
+#: Prefix that marks an Optuna param as optimizer bookkeeping rather than a
+#: strategy parameter. Params under it are stripped before the trial rows reach
+#: the plateau / multiple-testing statistics, so an internal param can never be
+#: picked as the axis a "plateau" is reported along, nor counted as a distinct
+#: strategy configuration.
+_INTERNAL_PARAM_PREFIX = "__internal_"
 
 # Upper bound on the number of symbol-subset universes we enumerate. Without a
 # cap the candidate set grows as 2**n and both memory and the Optuna categorical
@@ -242,6 +256,12 @@ class OptimizationConfig(BaseModel):
     min_trades_for_full_credit: int = Field(default=30, ge=1)
     drawdown_penalty_weight: float = Field(default=1.0, ge=0.0)
     embargo_days: int = Field(default=1, ge=0)
+    # Fraction of the window dropped between train and test, on top of
+    # `embargo_days`, so a trade open across the split cannot leak test
+    # information into training. Default 0 keeps `embargo_days` authoritative.
+    embargo_pct: float = Field(default=0.0, ge=0.0, le=0.4)
+    # Number of sequential walk-forward folds reported as a robustness check.
+    walk_forward_splits: int = Field(default=3, ge=1, le=20)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -377,10 +397,21 @@ def run_optimization(
         backtest_end,
         config.train_split_pct,
         embargo_days=config.embargo_days,
+        embargo_pct=float(config.embargo_pct or 0.0),
     )
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
+    # Universe provenance: how this run's symbol list was determined, and when.
+    # A base artifact that predates the recording is reported as unknown rather
+    # than assumed point-in-time — the whole point of the field is that a reader
+    # can tell "we know" from "nobody said".
+    universe_provenance = read_universe_provenance(
+        base_result.meta
+    ) or unknown_universe_provenance(
+        f"base backtest {config.base_backtest_id!r} carries no "
+        f"{UNIVERSE_PROVENANCE_KEY!r} record"
+    )
     initial_capital = float(base_result.meta.initial_capital or 100_000.0)
     candidate_universes = _candidate_symbol_universes(
         configured_universes=config.symbol_universes,
@@ -443,6 +474,24 @@ def run_optimization(
 
     _emit_progress(progress_callback, 0.0, "Starting Optuna optimization.")
 
+    # Sub-periods of the train window, for the per-period stability view, and
+    # the per-symbol data coverage the survivorship diagnostic reports on. Both
+    # are read AFTER the data has been ensured, so what they see is the data
+    # this study actually trades.
+    stability_subperiods = _stability_subperiods(train_period, config, timeframe)
+    stored_context = base_result.meta.data.get("execution_context")
+    data_source = (
+        str(stored_context.get("data_source") or "")
+        if isinstance(stored_context, dict)
+        else ""
+    )
+    universe_coverage = observe_symbol_coverage(
+        required_symbols,
+        timeframe=timeframe,
+        data_dir=data_dir,
+        data_source=data_source,
+    )
+
     last_trial_exception: BaseException | None = None
 
     def _record_failure(trial: optuna.Trial, exc: BaseException) -> NoReturn:
@@ -488,6 +537,10 @@ def run_optimization(
         trial.set_user_attr("effective_parameters", _json_safe(combined_params))
         trial.set_user_attr("symbols", _json_safe(trial_symbols))
         trial.set_user_attr("trade_count", len(train_result.trades))
+        trial.set_user_attr(
+            SUBPERIOD_PNL_ATTR,
+            _json_safe(_trial_subperiod_pnl(train_result, stability_subperiods)),
+        )
 
         if not train_result.trades:
             # No-trade trials (Cleanup 16-D1, AC 2): a trial that never trades
@@ -656,6 +709,7 @@ def run_optimization(
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
         "base_parameters": _json_safe(base_parameters),
+        "universe_provenance": _json_safe(universe_provenance),
         "best_params": _json_safe(best_params),
         "effective_best_parameters": _json_safe(effective_best_params),
         "best_value": _safe_float_or_none(best_value),
@@ -677,11 +731,385 @@ def run_optimization(
             limit=10,
             direction=_study_direction(config.target_metric),
         ),
+        "diagnostics": _json_safe(
+            _build_diagnostics_payload(
+                trials=study.trials,
+                config=config,
+                train_period=train_period,
+                test_period=test_period,
+                target_metric=config.target_metric,
+                timeframe=timeframe,
+                symbols=required_symbols,
+                universe_provenance=universe_provenance,
+                universe_coverage=universe_coverage,
+                subperiods=stability_subperiods,
+                selected_parameters=best_params,
+                backtest_start=backtest_start,
+                backtest_end=backtest_end,
+            )
+        ),
     }
 
     OPTIMIZATIONS_DIR.mkdir(parents=True, exist_ok=True)
     write_text_atomically(output_path, json.dumps(_json_safe(payload), indent=2))
     _emit_progress(progress_callback, 100.0, f"Optimization finished: {output_path.name}")
+    return payload
+
+
+# Canonical platform timeframe labels (as returned by normalize_timeframe) ->
+# bar duration in seconds. Expressed directly rather than via pandas offsets
+# because pd.Timedelta rejects non-fixed frequencies such as "D" and "W".
+#
+# normalize_timeframe passes through both the "5m" and the "m5" spellings, so
+# both families are listed.
+_TIMEFRAME_BAR_SECONDS: dict[str, float] = {
+    "1s": 1.0,
+    "5s": 5.0,
+    "10s": 10.0,
+    "15s": 15.0,
+    "30s": 30.0,
+    "1m": 60.0,
+    "3m": 180.0,
+    "5m": 300.0,
+    "15m": 900.0,
+    "30m": 1800.0,
+    "1h": 3600.0,
+    "2h": 7200.0,
+    "3h": 10800.0,
+    "4h": 14400.0,
+    "6h": 21600.0,
+    "8h": 28800.0,
+    "12h": 43200.0,
+    "1d": 86400.0,
+    "1w": 604800.0,
+    # "<unit><n>" spellings that normalize_timeframe leaves untouched.
+    "s1": 1.0,
+    "s5": 5.0,
+    "s10": 10.0,
+    "s15": 15.0,
+    "s30": 30.0,
+    "m1": 60.0,
+    "m3": 180.0,
+    "m5": 300.0,
+    "m15": 900.0,
+    "m30": 1800.0,
+    "h1": 3600.0,
+    "h2": 7200.0,
+    "h3": 10800.0,
+    "h4": 14400.0,
+    "h6": 21600.0,
+    "h8": 28800.0,
+    "h12": 43200.0,
+    "d1": 86400.0,
+    "w1": 604800.0,
+}
+
+
+def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
+    """Bar duration for a timeframe label, used to express the embargo in bars."""
+    seconds = _TIMEFRAME_BAR_SECONDS.get(normalize_timeframe(timeframe))
+    if seconds is None:
+        return None
+    return pd.Timedelta(seconds=seconds)
+
+
+#: Optuna user attr holding each trial's realized result per stability
+#: sub-period. A dedicated attr (rather than a derived field of train_stats)
+#: because the sub-period split is a reporting decision: it must not change what
+#: the study optimises, only what can be said about the choice afterwards.
+SUBPERIOD_PNL_ATTR = "subperiod_pnl"
+
+
+def _stability_subperiods(
+    train_period: Mapping[str, str],
+    config: OptimizationConfig,
+    timeframe: str | None,
+) -> list[dict[str, Any]]:
+    """The sub-periods a parameter's stability is measured over.
+
+    Taken from the walk-forward folds of the TRAIN window — the window the
+    trials were actually scored on — so the comparison is like-for-like. The
+    reported walk-forward folds cover train+test, so the sub-periods here are
+    deliberately a different, narrower set; both are reported, and each carries
+    its own bounds.
+
+    Returns [] when the window is too short for a fold. That is a reportable
+    absence, not a failure: the stability view then says "unknown".
+    """
+    from runner.optimization_diagnostics import (
+        subperiods_from_walk_forward,
+        walk_forward_splits,
+    )
+
+    try:
+        folds = walk_forward_splits(
+            train_period["start"],
+            train_period["end"],
+            n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
+            train_fraction=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=_timeframe_bar_duration(timeframe),
+        )
+        return subperiods_from_walk_forward(folds)
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.info("No stability sub-periods available: %s", exc)
+        return []
+
+
+def _trade_realization_time(trade: Any) -> str:
+    """When a trade's result was realized: its last exit, else its entry.
+
+    Attribution follows the exit, not the entry: a sub-period must be charged
+    with the result it actually produced, and a trade opened in one sub-period
+    and closed in the next belongs to the second.
+    """
+    exits = list(getattr(trade, "exits", None) or [])
+    for exit_ in reversed(exits):
+        stamp = str(getattr(exit_, "time", "") or "").strip()
+        if stamp:
+            return stamp
+    return str(getattr(trade, "entry_time", "") or "").strip()
+
+
+def _trade_net_pnl(trade: Any) -> float:
+    """Net PnL of a trade, using the same gross-minus-fees convention as the CLI.
+
+    An unreadable PnL becomes NaN rather than 0.0: 0.0 would be charged to a
+    sub-period as a real result, while NaN is dropped by the attribution, so an
+    unreadable number cannot quietly become a flat performance.
+    """
+    net_pnl = getattr(trade, "net_pnl", None)
+    try:
+        if net_pnl is not None:
+            return float(net_pnl)
+        pnl = float(getattr(trade, "pnl", 0.0) or 0.0)
+        fees = getattr(trade, "fees", None)
+        return pnl - (float(fees) if fees is not None else 0.0)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]]) -> dict[str, float]:
+    """Realized net PnL of one trial, per stability sub-period."""
+    if not subperiods:
+        return {}
+    from runner.optimization_diagnostics import realized_pnl_by_subperiod
+
+    return realized_pnl_by_subperiod(
+        ((_trade_realization_time(trade), _trade_net_pnl(trade)) for trade in result.trades),
+        subperiods,
+    )
+
+
+def _build_diagnostics_payload(
+    *,
+    trials: Sequence[Any],
+    config: OptimizationConfig,
+    train_period: Mapping[str, str],
+    test_period: Mapping[str, str],
+    target_metric: str,
+    timeframe: str | None = None,
+    symbols: Sequence[str] | None = None,
+    universe_provenance: Mapping[str, Any] | None = None,
+    universe_coverage: Mapping[str, Any] | None = None,
+    subperiods: Sequence[Mapping[str, Any]] | None = None,
+    selected_parameters: Mapping[str, Any] | None = None,
+    backtest_start: str = "",
+    backtest_end: str = "",
+) -> dict[str, Any]:
+    """Attach honesty checks to the optimization result.
+
+    Reports how much the selected parameter should be trusted: whether the
+    optimum sits on a stable plateau, how much of the score is explained by
+    picking the best of many trials, what the split/embargo actually was, and —
+    because a universe that is not point-in-time makes all of the above read
+    better than it should — what the symbol universe was and how far its
+    membership can be trusted. Never changes the selection; only annotates it.
+
+    The universe arguments are optional so a caller with no coverage
+    information still gets a payload that says so (the survivorship view
+    reports "unknown" rather than silently disappearing).
+    """
+    from runner.optimization_diagnostics import (
+        embargo_split,
+        multiple_testing_correction,
+        plateau_analysis,
+        subperiod_parameter_stability,
+        walk_forward_splits,
+    )
+
+    payload: dict[str, Any] = {}
+    bar_duration = _timeframe_bar_duration(timeframe)
+
+    # 1. Split geometry, including the gap between train and test.
+    try:
+        split = embargo_split(
+            train_period["start"],
+            test_period["end"],
+            train_split_pct=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+        reported = split.as_dict()
+        # The gap is `embargo_days` PLUS `embargo_pct` - `_split_backtest_period`
+        # applies both, and `embargo_split` models only the percentage. So this
+        # re-derived split was not the one that ran: with the default
+        # embargo_days=1 the reported test start came out a full day earlier than
+        # the real one, and `embargo_bars_equivalent` read 0.0 for a study that
+        # dropped a day.
+        #
+        # `9d6a29c` removed one fiction from this payload and left another of the
+        # opposite sign, and the artifact carried both answers - the correct
+        # `train_period`/`test_period` beside this one. The fix is to report the
+        # windows that ran rather than recompute them, and to take the embargo
+        # geometry from the same place they came from.
+        actual_gap = pd.Timedelta(
+            pd.Timestamp(test_period["start"]) - pd.Timestamp(train_period["end"])
+        )
+        reported["test"] = dict(test_period)
+        reported["embargo"] = {
+            "start": train_period["end"],
+            "end": test_period["start"],
+        }
+        reported["embargo_bars_equivalent"] = (
+            float(actual_gap / bar_duration) if bar_duration else 0.0
+        )
+        payload["split"] = reported
+    except (ValueError, KeyError) as exc:
+        payload["split"] = {"error": str(exc)}
+
+    # 2. Walk-forward folds, so the result is not a single lucky split.
+    try:
+        payload["walk_forward"] = walk_forward_splits(
+            train_period["start"],
+            test_period["end"],
+            n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
+            train_fraction=config.train_split_pct,
+            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
+            bar_duration=bar_duration,
+        )
+    except (ValueError, KeyError) as exc:
+        payload["walk_forward"] = {"error": str(exc)}
+
+    # 3. Plateau stability and selection bias over the evaluated trials.
+    # Two classes of row are NOT strategy performances and must not reach
+    # either statistic:
+    #  - no-trade ("penalty") trials, which carry a sentinel value. The
+    #    sentinel is *dynamic* (`_no_trade_penalty_value`), so the value-level
+    #    `penalty_floor` filter below catches only the very first trial's
+    #    -1e9 and lets every later `min(values) - 1.0` through — which put a
+    #    sentinel in the sample mean/spread and in the plateau's neighbour
+    #    list, where it made `sensitivity` a ratio against a penalty rather
+    #    than against the nearest real parameter value. The `penalty_applied`
+    #    user attr is the definitive marker, so filter on that.
+    #  - internal bookkeeping params (`__internal_symbol_universe`), which are
+    #    optimizer plumbing, not strategy parameters: they must not be chosen
+    #    as the plateau axis, and a row carrying nothing but internal params is
+    #    not a trial at all.
+    trial_rows: list[dict[str, Any]] = []
+    stability_rows: list[dict[str, Any]] = []
+    excluded_no_trade_trials = 0
+    for trial in trials or []:
+        if bool(getattr(trial, "user_attrs", {}).get("penalty_applied", False)):
+            excluded_no_trade_trials += 1
+            continue
+        params = getattr(trial, "params", None)
+        value = getattr(trial, "value", None)
+        if not isinstance(params, dict) or not isinstance(value, (int, float)):
+            continue
+        row = {
+            key: item
+            for key, item in params.items()
+            if not str(key).startswith(_INTERNAL_PARAM_PREFIX)
+        }
+        if not row:
+            continue
+        row["metric"] = value
+        trial_rows.append(row)
+        # Same row filter for the stability view: a no-trade trial's realized
+        # PnL is a flat 0.0 in every sub-period, and including it would let a
+        # parameter value that never traded "win" a sub-period.
+        subperiod_pnl = getattr(trial, "user_attrs", {}).get(SUBPERIOD_PNL_ATTR)
+        if isinstance(subperiod_pnl, dict) and subperiod_pnl:
+            stability_rows.append({"params": row, "subperiod_pnl": subperiod_pnl})
+
+    # A plateau is only meaningful along a parameter that actually varied.
+    varied: dict[str, set[Any]] = {}
+    for row in trial_rows:
+        for key, value in row.items():
+            if key == "metric":
+                continue
+            varied.setdefault(key, set()).add(value)
+    candidates = [name for name, values in varied.items() if len(values) > 1]
+    # Pick the parameter explored most broadly: that is where a plateau (or its
+    # absence) says the most about robustness — and the same axis the sub-period
+    # stability view ranks on, so the two views cannot disagree about which
+    # parameter they are talking about.
+    parameter = max(candidates, key=lambda name: len(varied[name])) if candidates else None
+    if parameter is not None:
+        plateau = plateau_analysis(trial_rows, parameter=parameter, metric="metric")
+        payload["plateau"] = (
+            {"parameter": parameter, **plateau.as_dict()} if plateau else None
+        )
+    else:
+        payload["plateau"] = None
+
+    # penalty_floor is the second line of defence for a sentinel that reached
+    # the metrics list without the marker (a caller that synthesised trials).
+    # The direction has to travel with the numbers: `p_value` is a minimize
+    # target, and correcting a minimize study against the maximum end of the
+    # sample reports the search bias of its *worst* trial, which inverts the
+    # verdict rather than merely mis-scaling it.
+    multiple_testing = multiple_testing_correction(
+        [float(row["metric"]) for row in trial_rows],
+        penalty_floor=_NO_TRADE_PENALTY,
+        direction=METRIC_DIRECTIONS.get(str(target_metric or ""), "maximize"),
+    )
+    # The rows were already filtered above, so the function's own count is zero
+    # here; the honest number is how many were kept out.
+    multiple_testing["n_penalty_trials_excluded"] = int(
+        multiple_testing.get("n_penalty_trials_excluded") or 0
+    ) + excluded_no_trade_trials
+    payload["multiple_testing"] = multiple_testing
+    # Never let the sample shrink silently: a reader has to be able to see that
+    # the reported statistics describe fewer rows than the study ran.
+    payload["n_no_trade_trials_excluded"] = excluded_no_trade_trials
+
+    # 4. Survivorship bias: what the stored data says about a universe that
+    #    may not be point-in-time, and the direction/magnitude of the bias.
+    payload["survivorship"] = survivorship_bias_diagnostic(
+        symbols=list(symbols or []),
+        coverage=universe_coverage,
+        window_start=backtest_start or train_period.get("start", ""),
+        window_end=backtest_end or test_period.get("end", ""),
+        provenance=universe_provenance,
+    )
+
+    # 5. Per-sub-period parameter stability: does the value that won the study
+    #    also win in each sub-period of the window it was scored on? Reported
+    #    against the same axis as the plateau, and "unknown" (never a guess)
+    #    when no trial carries sub-period results.
+    if parameter is not None and stability_rows:
+        observations = [
+            {"period": period, "params": row["params"], "metric": period_pnl}
+            for row in stability_rows
+            for period, period_pnl in row["subperiod_pnl"].items()
+        ]
+        payload["subperiod_stability"] = subperiod_parameter_stability(
+            observations,
+            parameter=parameter,
+            metric_name="realized_net_pnl_per_subperiod",
+            selected_parameters=selected_parameters,
+            subperiods=list(subperiods or []),
+        )
+    else:
+        payload["subperiod_stability"] = subperiod_parameter_stability(
+            [],
+            parameter=parameter or "",
+            metric_name="realized_net_pnl_per_subperiod",
+            subperiods=list(subperiods or []),
+        )
+    payload["target_metric"] = target_metric
     return payload
 
 
@@ -710,7 +1138,20 @@ def _split_backtest_period(
     end_value: str,
     train_split_pct: float,
     embargo_days: int = 1,
+    embargo_pct: float = 0.0,
 ) -> tuple[dict[str, str], dict[str, str]]:
+    """Split into train / embargo-gap / test windows.
+
+    ``embargo_pct`` drops a gap between the two windows, on top of the fixed
+    ``embargo_days``. A trade opened just before the split can still be open
+    during the test window, so its label contains test information; without the
+    gap that leaks backwards into training. The gap is applied here, to the
+    windows that actually run, rather than only being reported by the
+    diagnostics.
+    """
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
     start_ts = _parse_period_boundary(start_value, is_end=False)
     end_ts = _parse_period_boundary(end_value, is_end=True)
     if end_ts <= start_ts:
@@ -728,16 +1169,20 @@ def _split_backtest_period(
             "train_split_pct produces an empty train or test period for the base backtest range"
         )
 
-    # C3: embargo gap — the test window starts `embargo_days` after the
-    # split so no bar (and no indicator warmup overlap) is shared. The old
-    # split+1µs boundary leaked the split bar into both segments.
-    embargo = pd.Timedelta(days=max(int(embargo_days), 0))
+    # C3: embargo gap — the test window starts after the split so no bar
+    # (and no indicator warmup overlap) is shared. The old split+1µs
+    # boundary leaked the split bar into both segments. `embargo_pct` scales
+    # the gap with the length of the backtest; `embargo_days` is the fixed
+    # component. Both are applied to the windows that run, not just reported.
+    embargo = pd.Timedelta(days=max(int(embargo_days), 0)) + (
+        (end_ts - start_ts) * float(embargo_pct)
+    )
     test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
     train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
     if test_start_ts >= end_ts:
         raise ValueError(
-            "train_split_pct + embargo_days leave an empty test period for "
-            "the base backtest range"
+            "train_split_pct/embargo_days/embargo_pct leave an empty train or "
+            "test period for the base backtest range"
         )
     test_period = {
         "start": test_start_ts.isoformat(),
