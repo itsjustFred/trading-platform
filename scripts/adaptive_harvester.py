@@ -51,6 +51,7 @@ from data_tools.downloaders.dukascopy_native import (
     generate_tick_urls,
     parse_ticks,
 )
+from shared.atomic_io import write_text_atomically
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -156,22 +157,16 @@ def _month_label(month_start: date) -> str:
 def _save_state(state: dict[str, Any]) -> None:
     """Persist the harvester state to this script's own state file.
 
-    The target is a module constant, never an argument: a path parameter is indistinguishable
-    from caller input to a reader (and to a static analyzer), however carefully the caller chose
-    it. The temp-file swap keeps a crash from truncating the state.
+    The target is a module constant, never an argument, and the write goes through the shared
+    atomic-write helper - the same one every other persisted artifact uses. That helper owns the
+    filesystem sink and validates the target; this script only names a file it owns.
     """
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
-    temp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    temp_path.replace(STATE_PATH)
+    write_text_atomically(STATE_PATH, json.dumps(state, indent=2, sort_keys=True))
 
 
 def _save_profiles(profiles: dict[str, Any]) -> None:
     """Persist the downloader profiles to this script's own profile file."""
-    PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = PROFILE_PATH.with_suffix(PROFILE_PATH.suffix + ".tmp")
-    temp_path.write_text(json.dumps(profiles, indent=2, sort_keys=True), encoding="utf-8")
-    temp_path.replace(PROFILE_PATH)
+    write_text_atomically(PROFILE_PATH, json.dumps(profiles, indent=2, sort_keys=True))
 
 
 def _load_json(path: Path) -> dict[str, Any]:

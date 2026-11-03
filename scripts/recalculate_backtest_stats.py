@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +30,7 @@ _guard.ensure_own_checkout("recalculate_backtest_stats")
 # dropping it would take this script off the roster and out of the gate that keeps it alive.
 import shared  # noqa: F401
 from runner.stats import compute_stats_for_result
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR
 from shared.database import (
     init_db,
@@ -113,21 +113,11 @@ def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[
 
             if not dry_run:
                 payload["stats"] = merged_stats
-                # The write target is the file this loop just read, discovered under
-                # `backtests_dir` - not a caller-supplied path. It stays a local expression here
-                # rather than a parameter of a helper, so the sink never takes an argument.
-                serialized = _serialize_payload(payload)
-                try:
-                    path.write_text(serialized, encoding="utf-8")
-                except PermissionError:
-                    rewrite_path = path.parent / f".{path.name}.rewrite"
-                    rewrite_path.write_text(serialized, encoding="utf-8")
-                    try:
-                        os.replace(rewrite_path, path)
-                    except Exception:
-                        if rewrite_path.exists():
-                            rewrite_path.unlink()
-                        raise
+                # The write target is the file this loop just read, and the write goes through
+                # the shared atomic helper: it stages a temp file in the same directory and
+                # renames it, so a read-only file no longer needs the old `.rewrite` fallback
+                # and a crash cannot truncate the artifact.
+                write_text_atomically(path, _serialize_payload(payload))
             updated += 1
         except Exception as exc:
             failed += 1
