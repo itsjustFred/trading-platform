@@ -1304,6 +1304,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ) from exc
         return OrderSide, TimeInForce, StopOrderRequest
 
+    @staticmethod
+    def _has_working_stop(orders: list[Any], symbol: str) -> bool:
+        for order in orders:
+            if _order_symbol(order) != symbol:
+                continue
+            order_type = str(_order_attr(order, "order_type", "") or "").lower()
+            if "stop" in order_type:
+                return True
+        return False
+
     async def _restore_stop(
         self,
         client: Any,
@@ -1318,7 +1328,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         otherwise leave the position naked. Restoring the stop the strategy had
         is the only acceptable outcome short of a fill; failing to do so is
         logged at CRITICAL because it means live unprotected exposure.
+
+        Returns whether the position is protected afterwards, which is also true
+        when a stop still works at the broker. Re-submitting in that case would
+        leave two stops on one position, and the second becomes an orphan the
+        moment the first fills - an orphaned sell-stop opens a short.
         """
+        try:
+            working = await self._list_open_orders(client)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not re-read orders before restoring a stop; restoring anyway",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            working = None
+        if working is not None and self._has_working_stop(working, symbol):
+            logger.warning(
+                "Not restoring a stop: one still works at the broker",
+                extra={"data": {"symbol": symbol}},
+            )
+            return True
         if stop_price is None:
             logger.critical(
                 "Cannot restore a stop: the cancelled orders carried no stop price, "

@@ -269,6 +269,36 @@ def test_cancel_failure_after_a_partial_sweep_restores_the_stop() -> None:
     assert stops[0].stop_price == 190.0
 
 
+def test_a_cancel_the_broker_ignores_blocks_the_close() -> None:
+    """An accepted-but-unapplied cancel still reserves the quantity.
+
+    The re-read after the cancel is what makes that visible; without it the
+    adapter would call close_position and rely on the broker to refuse.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    # The broker acknowledges the cancel and keeps the order working.
+    client.cancel_order_by_id = lambda order_id: client.cancelled.append(  # type: ignore[method-assign]
+        order_id
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert client.close_calls == []
+    assert any("orders-still-working" in item for item in outcome.failed)
+    # The stop still works, so no second stop is submitted on top of it.
+    assert [order.id for order in client.orders] == ["sl-1"]
+    assert client.submitted == []
+
+
 def test_close_all_positions_reports_a_partial_flatten() -> None:
     client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
     adapter = _adapter(client)
