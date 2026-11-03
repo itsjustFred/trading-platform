@@ -297,7 +297,7 @@ def test_a_withheld_cell_outside_the_requested_columns_does_not_block(conn):
 
 
 def test_a_cell_whose_payload_changed_after_the_scan_is_left_alone(conn):
-    """The other half of the race: the column is unchanged, the payload it was read against is not."""
+    """The other half of the race: the column is unchanged, the payload it was read from is not."""
     module = _load()
     rows = module.find_disagreements(conn)
     target = next(
