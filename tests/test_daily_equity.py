@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -16,6 +18,18 @@ from runner.daily_equity import (
     build_daily_equity_curve,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+
+
+@contextlib.contextmanager
+def capture_module_log(caplog):
+    """Capture the module logger, which uses get_logger (propagate=False)."""
+    log = daily_equity_module.logger
+    caplog.set_level(logging.DEBUG, logger=log.name)
+    log.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        log.removeHandler(caplog.handler)
 
 
 def make_result(
@@ -581,6 +595,7 @@ class TestAttachDailyEquity:
         result = make_result()
         result.stats["daily_returns"] = [{"stale": True}]
         result.meta.data["daily_return_count"] = 7
+        result.meta.data["window_start_basis"] = "net_ledger"
 
         attach_daily_equity(result)
 
@@ -588,6 +603,7 @@ class TestAttachDailyEquity:
         assert result.stats["daily_return_count"] == 0
         assert result.stats["daily_returns"] == []
         assert "daily_return_count" not in result.meta.data
+        assert "window_start_basis" not in result.meta.data
 
     def test_fallback_clears_stale_daily_returns(self):
         """The no-daily-points fallback keeps the count and the list consistent."""
@@ -834,6 +850,8 @@ class TestAttachDailyEquity:
 
         assert result.equity_curve[0].equity == 100_500.0
         assert result.equity_curve[-1].equity == 101_200.0
+        # No engine point exists, so there is no divergence: the normal path.
+        assert result.meta.data["window_start_basis"] == "engine"
         by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
         assert by_date["2024-02-10"]["return"] == pytest.approx(700 / 100_500)
 
@@ -856,6 +874,72 @@ class TestAttachDailyEquity:
         assert result.equity_curve[-1].equity == 101_190.0
         by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
         assert by_date["2024-02-10"]["return"] == pytest.approx(700 / 100_490)
+
+    def test_unreconciled_start_warns_once_and_reports_the_ledger_basis(self, caplog):
+        """Falling back to the realized ledger must be visible, not silent."""
+        prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        prior_trade.fees = 10.0
+        prior_trade.net_pnl = 490.0
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
+        result = make_result(
+            trades=[prior_trade, window_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
+            ],
+        )
+
+        with capture_module_log(caplog):
+            attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
+
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the fallback must warn exactly once per run"
+        assert warnings[0].name == "trading.runner.daily_equity"
+        assert warnings[0].data["window_start_basis"] == "net_ledger"
+        assert warnings[0].data["delta"] == pytest.approx(10.0)
+        assert result.meta.data["window_start_basis"] == "net_ledger"
+        assert result.equity_curve[0].equity == 100_490.0
+        assert result.equity_curve[-1].equity == 101_190.0
+
+    def test_reconciled_start_reports_the_engine_basis_without_warning(self, caplog):
+        """The normal path stays quiet and reports the engine basis."""
+        prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
+        result = make_result(
+            trades=[prior_trade, window_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
+            ],
+        )
+
+        with capture_module_log(caplog):
+            attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
+
+        assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+        assert result.meta.data["window_start_basis"] == "engine"
+        assert result.equity_curve[0].equity == 100_500.0
+
+    def test_engine_curve_fallback_still_reports_the_ledger_basis(self, caplog):
+        """The warning refers to the window base, so the report carries it too."""
+        prior_trade = make_trade(exit_time="2024-01-10T15:00:00Z", pnl=500.0)
+        prior_trade.fees = 10.0
+        prior_trade.net_pnl = 490.0
+        result = make_result(
+            trades=[prior_trade],
+            equity_curve=[
+                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0),
+                EquityPoint(time="2024-02-03T00:00:00+00:00", equity=100_600.0),
+                EquityPoint(time="2024-02-04T00:00:00+00:00", equity=100_600.0),
+            ],
+            backtest_end="2024-02-05",
+        )
+
+        with capture_module_log(caplog):
+            attach_daily_equity(result, start="2024-02-01", end="2024-02-05")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "the divergence is reported once per run"
+        assert result.meta.data["equity_frequency"] == "daily"
+        assert result.meta.data["window_start_basis"] == "net_ledger"
 
     def test_reconciliation_includes_trade_at_engine_point(self):
         """A trade exiting exactly at an engine point is part of that point."""
@@ -903,11 +987,12 @@ class TestAttachDailyEquity:
             ],
         )
 
+        window_start = _window_starting_equity(result, start)
+
         # rel=0: pytest's default rel=1e-6 would allow 0.1 currency units of
         # slack here, which is exactly the tolerance under test.
-        assert _window_starting_equity(result, start) == pytest.approx(
-            engine_equity, rel=0, abs=1e-9
-        )
+        assert window_start.equity == pytest.approx(engine_equity, rel=0, abs=1e-9)
+        assert window_start.basis == "engine"
 
     def test_window_starting_equity_carries_post_reconciliation_pnl(self):
         """A prior trade after the engine point must reach the window start.
@@ -934,7 +1019,7 @@ class TestAttachDailyEquity:
         # Engine point 100_500 == initial 100_000 + 500 through the point, so the
         # one-cent agreement holds and the anchor is the engine equity.  The
         # window start is the ledger's 100_750, not the anchor's 100_500.
-        assert _window_starting_equity(result, start) == pytest.approx(100_750.0)
+        assert _window_starting_equity(result, start).equity == pytest.approx(100_750.0)
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
 
@@ -968,7 +1053,7 @@ class TestAttachDailyEquity:
         )
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
 
-        assert _window_starting_equity(result, start) == pytest.approx(100_600.01)
+        assert _window_starting_equity(result, start).equity == pytest.approx(100_600.01)
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
 
@@ -991,9 +1076,10 @@ class TestAttachDailyEquity:
             ],
         )
 
-        assert _window_starting_equity(result, start) == pytest.approx(
-            100_500.0, rel=0, abs=1e-9
-        )
+        window_start = _window_starting_equity(result, start)
+
+        assert window_start.equity == pytest.approx(100_500.0, rel=0, abs=1e-9)
+        assert window_start.basis == "net_ledger"
 
     def test_window_starting_equity_cent_tolerance_is_absolute_on_high_priced_account(self):
         """One cent stays one cent: a relative tolerance would hide $0.02 here."""
@@ -1011,9 +1097,12 @@ class TestAttachDailyEquity:
             ],
         )
 
-        assert _window_starting_equity(result, start) == pytest.approx(
+        window_start = _window_starting_equity(result, start)
+
+        assert window_start.equity == pytest.approx(
             initial_capital + 500.0, rel=0, abs=1e-6
         )
+        assert window_start.basis == "net_ledger"
 
     def _assert_endpoint_drift(self, *, drift, preserved, initial_capital):
         """Attach a 31-day curve whose endpoint is off by ``drift`` and check the outcome."""
@@ -1145,7 +1234,7 @@ class TestAttachDailyEquity:
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
 
         # Ledger: 100_000 + (500 - 12).  An inverted fee gives 100_512 instead.
-        assert _window_starting_equity(result, start) == pytest.approx(100_488.0)
+        assert _window_starting_equity(result, start).equity == pytest.approx(100_488.0)
         assert _net_pnl_before(result, start) == pytest.approx(488.0)
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
