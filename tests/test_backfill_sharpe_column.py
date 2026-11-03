@@ -48,6 +48,7 @@ def conn(tmp_path):
             ("legacy-key", 0.0, 0.0, 0.0, 1.0, '{"sharpe": -2.5}'),
             ("payload-missing", 0.0, 0.0, 0.0, 1.0, '{"total_trades": 3}'),
             ("unparseable-value", 0.0, 0.0, 0.0, 1.0, '{"p_value": "n/a"}'),
+            ("nonfinite-value", 0.0, 0.0, 0.0, 1.0, '{"p_value": NaN}'),
         ],
     )
     db.commit()
@@ -71,6 +72,10 @@ def test_it_finds_exactly_the_disagreeing_rows(conn):
     assert ("unparseable-value", "p_value") not in found, (
         "a payload value that is not a number was treated as a disagreement; coercing it would "
         "write a fabricated 0.0 into the column"
+    )
+    assert ("nonfinite-value", "p_value") not in found, (
+        "a NaN payload value was queued for an UPDATE; the column would hold a number that breaks "
+        "every comparison and any JSON read of the row"
     )
 
 
@@ -229,6 +234,32 @@ def test_main_refuses_to_apply_while_a_deliberate_sentinel_exists(
     assert values == {"withheld": 0.0, "stale": 0.0}, (
         f"the script announced a refusal and wrote anyway: {values}"
     )
+
+
+def test_a_cell_changed_after_the_scan_is_left_alone(conn):
+    """The UPDATE carries the value it read, so a concurrent write is not clobbered.
+
+    The scan and the write are separate statements and the write runs later still, so between them
+    another process can put a real number in the column. Overwriting it with a payload value
+    compared against the old sentinel would destroy the newer, real number - the one failure mode
+    this tool must not have.
+    """
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute("update backtests set sharpe_ratio = 9.5 where id = 'stale-column'")
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "the tool reported a correction it did not make"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 9.5, "a value written after the scan was overwritten"
 
 
 def test_the_sentinels_are_the_writer_s_own_table_of_defaults():

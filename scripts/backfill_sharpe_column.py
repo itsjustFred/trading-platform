@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 from collections import Counter
@@ -82,9 +83,13 @@ def _payload_value(payload: dict, column: str) -> float | None:
     if raw is None:
         return None
     try:
-        return float(raw)
+        number = float(raw)
     except (TypeError, ValueError):
         return None
+    # `NaN` and `Infinity` are number-shaped and json.loads accepts them, so they would be queued
+    # for an UPDATE into a NOT NULL REAL column, where they poison every later comparison and any
+    # JSON read of the row. Not a number the column can hold honestly, so treated as absent.
+    return number if math.isfinite(number) else None
 
 
 def _is_declared_undefined(payload: dict, column: str) -> bool:
@@ -161,14 +166,21 @@ def find_declared_undefined(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def _reconcile(conn: sqlite3.Connection, rows: list[tuple[str, str, float, float]]) -> int:
-    """Write each payload value into its column. Returns how many cells were corrected."""
+    """Write each payload value into its column. Returns how many cells were corrected.
+
+    The value that was read is part of the UPDATE's condition, so a cell another writer changed
+    between the scan and the write keeps its new value instead of being overwritten with a payload
+    number computed against the old one. The count comes from the statement's own rowcount for the
+    same reason: it reports what was written, not what was queued.
+    """
     corrected = 0
-    for backtest_id, column, _column_value, payload_value in rows:
-        conn.execute(
-            f"update backtests set {column} = ? where id = ?",  # noqa: S608 - column from SENTINELS
-            (payload_value, backtest_id),
+    for backtest_id, column, column_value, payload_value in rows:
+        cursor = conn.execute(
+            # noqa: S608 - column from SENTINELS, values are bound
+            f"update backtests set {column} = ? where id = ? and {column} = ?",
+            (payload_value, backtest_id, column_value),
         )
-        corrected += 1
+        corrected += cursor.rowcount
     return corrected
 
 
