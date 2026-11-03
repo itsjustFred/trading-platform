@@ -262,6 +262,80 @@ def test_a_cell_changed_after_the_scan_is_left_alone(conn):
     assert value == 9.5, "a value written after the scan was overwritten"
 
 
+def test_a_withheld_metric_whose_column_already_agrees_does_not_block(conn):
+    """The refusal is about cells that would be overwritten, not about the word appearing.
+
+    A row can name a metric in ``undefined_metrics`` and still hold a column that agrees with the
+    payload. Nothing would be written there, so it must not stop the run - otherwise the tool
+    refuses on rows it would never touch.
+    """
+    conn.execute(
+        "insert into backtests values ('withheld-agreeing', 1.0, 0.0, 0.0, 1.0, "
+        '\'{"sharpe_ratio": 1.0, "undefined_metrics": ["sharpe_ratio"]}\')'
+    )
+    conn.commit()
+
+    module = _load()
+    assert ("withheld-agreeing", "sharpe_ratio") not in module.find_declared_undefined(conn)
+    found = {(row[0], row[1]) for row in module.find_disagreements(conn)}
+    assert ("withheld-agreeing", "sharpe_ratio") not in found
+
+
+def test_a_withheld_cell_outside_the_requested_columns_does_not_block(conn):
+    """`--column` scopes the refusal too, not only the write."""
+    conn.execute(
+        "insert into backtests values ('withheld-psr', 0.0, 0.0, 0.0, 1.0, "
+        '\'{"psr": 0.42, "undefined_metrics": ["psr"]}\')'
+    )
+    conn.commit()
+
+    module = _load()
+    assert module.find_declared_undefined(conn, ["psr"]) == [("withheld-psr", "psr")]
+    assert module.find_declared_undefined(conn, ["sharpe_ratio"]) == [], (
+        "a withheld cell in a column the operator did not ask about blocked the run"
+    )
+
+
+def test_a_cell_whose_payload_changed_after_the_scan_is_left_alone(conn):
+    """The other half of the race: the column is unchanged, the payload it was read against is not."""
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute("update backtests set stats = '{\"sharpe_ratio\": 7.5}' where id = 'stale-column'")
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "the tool wrote a value computed against a payload that no longer exists"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 0.0, value
+
+
+def test_a_tiny_real_value_is_not_mistaken_for_the_sentinel(conn):
+    """A Sharpe of 1e-12 is a computed zero, not a missing one.
+
+    The sentinel test has to be exact. A tolerance around ``0.0`` would swallow every value smaller
+    than it and overwrite a real result with the payload's number - the failure this tool exists to
+    prevent.
+    """
+    conn.execute(
+        "update backtests set sharpe_ratio = 1e-12, stats = '{\"sharpe_ratio\": 0.5}' "
+        "where id = 'stale-column'"
+    )
+    conn.commit()
+
+    module = _load()
+    found = {(row[0], row[1]) for row in module.find_disagreements(conn)}
+    assert ("stale-column", "sharpe_ratio") not in found, (
+        "a real value of 1e-12 was treated as the sentinel and queued for overwriting"
+    )
+
+
 def test_the_sentinels_are_the_writer_s_own_table_of_defaults():
     """The script's table must be the writer's, or a fifth stat silently escapes the backfill.
 

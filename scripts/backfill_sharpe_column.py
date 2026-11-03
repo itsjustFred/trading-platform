@@ -51,6 +51,7 @@ import math
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 
 # Resolve the data directory the same way the application does, rather than assuming `~/data`: a
@@ -98,18 +99,26 @@ def _is_declared_undefined(payload: dict, column: str) -> bool:
     return isinstance(undefined, list) and column in undefined
 
 
-def find_disagreements(conn: sqlite3.Connection) -> list[tuple[str, str, float, float]]:
-    """Every stale-sentinel disagreement, as ``(id, column, column_value, payload_value)``.
+def _scan(
+    conn: sqlite3.Connection, columns: list[str] | None = None
+) -> Iterator[tuple[str, str, float, float, bool]]:
+    """Every cell that sits on its sentinel while the payload holds a different number.
 
-    Only rows where the column still holds its sentinel are returned. A row where the column holds a
-    real value that differs from the payload is recomputation drift, not staleness, and reconciling
-    it would overwrite a real number with a different real number - so it is deliberately not here.
+    Yields ``(id, column, column_value, payload_value, withheld)``. ``withheld`` is True when the
+    producer named the metric in ``undefined_metrics``, which makes the sentinel deliberate: the
+    cell qualifies for the same reason as a stale one but must not be written.
+
+    The sentinel test is exact. A tolerance would treat a real, tiny value - a Sharpe of ``1e-12``
+    is a computed zero, not a missing one - as the sentinel and overwrite it, which is the one
+    failure this tool exists to avoid.
     """
-    found: list[tuple[str, str, float, float]] = []
-    columns = ["id", *SENTINELS, "stats"]
-    rows = conn.execute("select " + ", ".join(columns) + " from backtests").fetchall()
+    selected = list(columns or SENTINELS)
+    names = ["id", *selected, "stats"]
+    rows = conn.execute("select " + ", ".join(names) + " from backtests").fetchall()
     for row in rows:
-        record = dict(zip(columns, row))
+        # By name, not by position: the select list is built from the same list, and a column added
+        # to `SENTINELS` must not silently shift every value one field over.
+        record = dict(zip(names, row))
         stats = record["stats"]
         if not stats:
             continue
@@ -119,62 +128,81 @@ def find_disagreements(conn: sqlite3.Connection) -> list[tuple[str, str, float, 
             continue
         if not isinstance(payload, dict):
             continue
-        for column in SENTINELS:
+        for column in selected:
             payload_value = _payload_value(payload, column)
             if payload_value is None:
                 continue
-            # By name, not by position: the select list above is built from the same tuple, and a
-            # column added to `SENTINELS` must not silently shift every value one field over.
             column_value = float(record[column])
+            if column_value != SENTINELS[column]:
+                continue  # a real value: drift, not staleness
             if abs(payload_value - column_value) <= _DISAGREEMENT_TOLERANCE:
                 continue
-            if abs(column_value - SENTINELS[column]) > _DISAGREEMENT_TOLERANCE:
-                continue  # a real value that differs: drift, not staleness
-            if _is_declared_undefined(payload, column):
-                # The sentinel here is deliberate. Excluded here and not only in main(), because a
-                # caller reaching this function directly must not be handed a cell whose overwrite
-                # would destroy a real "never computed" marker. A test caught exactly that.
-                continue
-            found.append((record["id"], column, column_value, payload_value))
-    return found
+            yield (
+                record["id"],
+                column,
+                column_value,
+                payload_value,
+                _is_declared_undefined(payload, column),
+            )
 
 
-def find_declared_undefined(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    """Rows that would have qualified but where the producer withheld the metric.
+def find_disagreements(
+    conn: sqlite3.Connection, columns: list[str] | None = None
+) -> list[tuple[str, str, float, float]]:
+    """Every stale-sentinel disagreement, as ``(id, column, column_value, payload_value)``.
 
-    Reported rather than applied. Measured today this is empty; if it is ever not, overwriting those
-    sentinels would destroy a real "never computed" marker and the script must stop.
+    Only cells where the column still holds its sentinel are returned. A cell holding a real value
+    that differs from the payload is recomputation drift, not staleness, and reconciling it would
+    overwrite a real number with a different real number - so it is deliberately not here. Cells the
+    producer declared undefined are excluded here and not only in ``main()``, because a caller
+    reaching this function directly must not be handed a cell whose overwrite would destroy a real
+    "never computed" marker.
     """
-    found: list[tuple[str, str]] = []
-    rows = conn.execute("select id, stats from backtests").fetchall()
-    for backtest_id, stats in rows:
-        if not stats:
-            continue
-        try:
-            payload = json.loads(stats)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        for column in SENTINELS:
-            if (
-                _is_declared_undefined(payload, column)
-                and _payload_value(payload, column) is not None
-            ):
-                found.append((backtest_id, column))
-    return found
+    return [row[:4] for row in _scan(conn, columns) if not row[4]]
+
+
+def find_declared_undefined(
+    conn: sqlite3.Connection, columns: list[str] | None = None
+) -> list[tuple[str, str]]:
+    """Cells that would otherwise be reconciled but where the producer withheld the metric.
+
+    Same qualification as ``find_disagreements`` - the column sits on its sentinel and the payload
+    holds a different number - so a row that merely names a metric in ``undefined_metrics`` while
+    its column already agrees does not block the run. Reported rather than applied: overwriting
+    those sentinels would destroy a real "never computed" marker.
+    """
+    return [(row[0], row[1]) for row in _scan(conn, columns) if row[4]]
 
 
 def _reconcile(conn: sqlite3.Connection, rows: list[tuple[str, str, float, float]]) -> int:
     """Write each payload value into its column. Returns how many cells were corrected.
 
-    The value that was read is part of the UPDATE's condition, so a cell another writer changed
-    between the scan and the write keeps its new value instead of being overwritten with a payload
-    number computed against the old one. The count comes from the statement's own rowcount for the
-    same reason: it reports what was written, not what was queued.
+    Each cell is re-checked against the row as it is *now* before it is written, and the value that
+    was read is part of the UPDATE's condition. The scan and the write are separate statements, so
+    another writer can recompute a backtest in between; writing the queued number then would
+    overwrite a newer value with one compared against the old payload. ``main`` holds
+    ``BEGIN IMMEDIATE`` across this function, so the re-read and the write cannot be interleaved
+    either. The count comes from the statement's own rowcount for the same reason: it reports what
+    was written, not what was queued.
     """
     corrected = 0
     for backtest_id, column, column_value, payload_value in rows:
+        # The column is guarded by the UPDATE's own condition; the payload is not, so it is
+        # re-read here. A row whose stats changed since the scan no longer holds the number this
+        # payload value was computed from.
+        current = conn.execute(
+            "select stats from backtests where id = ?", (backtest_id,)
+        ).fetchone()
+        if current is None:
+            continue
+        try:
+            current_payload = json.loads(current[0]) if current[0] else {}
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(current_payload, dict):
+            continue
+        if _payload_value(current_payload, column) != payload_value:
+            continue
         cursor = conn.execute(
             # noqa: S608 - column from SENTINELS, values are bound
             f"update backtests set {column} = ? where id = ? and {column} = ?",
@@ -213,7 +241,9 @@ def main() -> None:
         raise SystemExit(f"No backtests.db at {db_path}")
 
     with sqlite3.connect(db_path) as conn:
-        withheld = find_declared_undefined(conn)
+        # Both scans are scoped to the requested columns: a withheld cell in a column the operator
+        # did not ask about must not block the run.
+        withheld = find_declared_undefined(conn, args.column)
         if withheld:
             print(
                 f"Refusing: {len(withheld)} cell(s) sit on a sentinel the producer explicitly "
@@ -227,9 +257,7 @@ def main() -> None:
             # operator can see which rows block the run.
             raise SystemExit(1)
 
-        rows = find_disagreements(conn)
-        if args.column:
-            rows = [row for row in rows if row[1] in set(args.column)]
+        rows = find_disagreements(conn, args.column)
         if not rows:
             print("No stale sentinel disagreement between the columns and the stats payload.")
             return
