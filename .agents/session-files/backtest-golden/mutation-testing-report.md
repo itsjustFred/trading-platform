@@ -1,19 +1,46 @@
 # Backtest Golden Mutation Report
 
-Date: 2026-09-25
+Date: 2026-09-25 (historical draft run) — current cycle 2026-11-03
 
-> **Provenance and current status (added on port to `main`).**
-> This is a historical record produced on the draft commit `1867c93`
-> (`agent/backtest-golden-current`, based on the stale `origin/pr-103`).
-> It scores mutants in `runner/daily_equity.py` and `runner/stats.py`, i.e. the
-> accounting code that now lives in the separate G1 slice — not in the golden
-> test or fixture.
->
-> The recorded baseline SHA-256 values do **not** match the files on `main`
-> after G1 (measured `ada89ea3…` for `runner/daily_equity.py` and `87f03c93…`
-> for `runner/stats.py`), so this evidence does not apply to the current
-> branch and must not be cited as proof. Mutation testing was **not** re-run in
-> this slice; the rerun is scheduled with the mutation/harness slice.
+## Current cycle (2026-11-03) — PR #108 after the accounting stack merge
+
+Scope: the production files changed by this PR against `fix/perma-accounting`:
+`shared/models.py` and `runner/daily_equity.py`. Test files are not mutated.
+
+Baseline: `114 passed` (`tests/test_models.py`, `tests/test_daily_equity.py`).
+Every mutation was applied alone, tested, and reverted with the original bytes
+restored; `git status` was clean after each revert.
+
+| # | File | Mutation | Result | Diagnostic | Caught by |
+|---:|---|---|---|---|---|
+| M1 | `shared/models.py` | `_derived_equity_evidence_status` returns the raw attribute instead of deriving `available` | Killed | Clear | `test_curve_attached_after_construction_serializes_evidence_status` |
+| M2 | `shared/models.py` | `to_dict` serialises the stale attribute instead of the derived status | Killed | Clear | same |
+| M3 | `shared/models.py` | drop the `available requires a curve` invariant | Killed (after fix) | Clear | `test_available_status_without_a_curve_is_rejected` — **added this cycle** |
+| M4 | `runner/daily_equity.py` | a ledger/engine disagreement reports `basis="engine"` | Killed | Clear | `test_unreconciled_start_warns_once_and_reports_the_ledger_basis` |
+| M5 | `runner/daily_equity.py` | never publish `meta.data["window_start_basis"]` | Killed | Clear | `test_reconciled_start_reports_the_engine_basis_without_warning` |
+| M6 | `runner/daily_equity.py` | leave a stale `window_start_basis` on the empty-result path | Killed | Clear | `test_empty_result_clears_stale_daily_fields` |
+| M7 | `runner/daily_equity.py` | publish the unquantised `running_equity` in the daily-return row | Killed | Clear | `test_daily_returns_equity_is_cent_quantised`, `test_daily_returns_equity_matches_the_published_curve_close` |
+| M8 | `runner/daily_equity.py` | drop the float64 accumulation term from the reconciliation tolerance | Killed | Clear | `TestReconciliationTolerance` |
+| M9 | `runner/daily_equity.py` | demote the basis-fallback warning to `debug` | Killed | Clear | `test_unreconciled_start_warns_once_and_reports_the_ledger_basis` |
+
+**Score: 9/9 killed (100%), 0 survivors.** M3 survived the first pass and the
+missing test was added rather than the mutant accepted: a payload claiming
+`equity_evidence_status="available"` with no curve feeds the validation reports
+with evidence that does not exist, so the guard needs a test of its own.
+
+No tolerance was widened to kill a mutant.
+
+---
+
+# Historical draft run (2026-09-25)
+
+> **Provenance.** This section is a historical record produced on the draft
+> commit `1867c93` (`agent/backtest-golden-current`, based on the stale
+> `origin/pr-103`). It scores mutants in `runner/daily_equity.py` and
+> `runner/stats.py`, i.e. the accounting code that now lives in the separate
+> G1/113/107 slices. Its recorded baseline SHA-256 values no longer match the
+> files on this branch, so it is kept for provenance only and is superseded by
+> the 2026-11-03 cycle above.
 
 ## Current result
 

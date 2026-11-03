@@ -16,6 +16,147 @@ Added when the golden was ported to `main` on top of the accounting slice (G1):
 - **A dependency upgrade increases tolerances** — unchanged: the tolerance ceilings in `_assert_json_equal` are untouched. Curve closes are now asserted against the exact cent-rounded value rather than a slack tolerance.
 
 
+## Cycle 2 (2026-11-03) — after merging PR 107 and PR 113
+
+Scope: the production files this PR changes — `shared/models.py` and
+`runner/daily_equity.py`. Hardening was limited to what the changed code owns;
+nothing here is a request to redesign the accounting slices.
+
+### The in-memory equity evidence status diverges from the serialised one
+
+**Severity:** Medium
+**Component:** `shared/models.py::BacktestResult.to_dict`, `runner/daily_equity.py::attach_daily_equity`
+**Fragility type:** Invisible invariants
+
+#### What happened
+
+A validation run reported "equity evidence: missing" for a backtest that had a
+4-point daily equity curve. The report was produced in-process right after the
+backtest, so it read `result.equity_evidence_status`, which was still
+`"unknown"`; the JSON that was written to disk said `"available"`.
+
+#### The change that caused it
+
+A developer added an in-process validation summary to avoid re-reading the
+result file, calling `validator.validate(platform=result)` on the object the
+runner had just finished building.
+
+#### Why it broke
+
+`to_dict()` derives the status from the curve (`_derived_equity_evidence_status`),
+but the dataclass attribute is only written in `__post_init__`. `attach_daily_equity`
+attaches the curve afterwards and never touches the attribute, so the object
+carries `"unknown"` for the rest of its life while serialising `"available"`.
+Any consumer that reads the attribute instead of `to_dict()` — `validation/cli.py`
+already compares `platform.equity_evidence_status == "available"` — sees the
+stale value.
+
+#### How it was caught
+
+Nothing catches it today. Every existing path either serialises the object or
+loads it from disk (`from_dict` → `__post_init__` recomputes correctly), so the
+window between attach and save is currently unobserved. A test that asserts the
+attribute after `attach_daily_equity` would pin it.
+
+### The window basis is published before the curve build can fail
+
+**Severity:** Medium
+**Component:** `runner/daily_equity.py::attach_daily_equity`
+**Fragility type:** Non-atomic compound operations
+
+#### What happened
+
+A run aborted with `Daily equity accumulation is non-finite`. The exception was
+handled upstream and the partially mutated result was still written by a retry
+path, which now claimed `meta.data["window_start_basis"] == "net_ledger"` while
+carrying the *previous* run's equity curve.
+
+#### The change that caused it
+
+A developer moved `result.meta.data["window_start_basis"] = window_start.basis`
+next to the other early metadata writes to keep the "publish before return"
+pattern consistent.
+
+#### Why it broke
+
+`attach_daily_equity` writes `window_start_basis` into `result.meta.data` before
+calling `build_daily_equity_curve`, which can raise on a non-finite balance.
+The write is not rolled back, so a failed attach leaves the result with new
+metadata and an old curve. The function mutates the caller's object in place and
+has no transactional boundary.
+
+#### How it was caught
+
+Only by the exception text; no test asserts the state of `result.meta.data`
+after a failed attach. A test that raises through `attach_daily_equity` and
+checks `window_start_basis` would pin the atomicity requirement.
+
+### Published equity is quantised but the published return is not
+
+**Severity:** Medium
+**Component:** `runner/daily_equity.py::build_daily_equity_curve`
+**Fragility type:** Invisible invariants
+
+#### What happened
+
+A viewer recomputed daily returns as `equity[i] / equity[i-1] - 1` from the
+published `daily_returns` rows and showed a -0.1277% day as -0.1277% but the
+third day off in the fifth decimal, then disagreed with the platform's
+`total_return` in a reconciliation report.
+
+#### The change that caused it
+
+A developer computed a "gross return" column from the published equity values
+because the rows already carry both `equity` and `return`, assuming they are
+consistent with each other.
+
+#### Why it broke
+
+`build_daily_equity_curve` publishes `equity = round(running_equity, 2)` but
+`return = (running_equity - previous) / previous` from the *unrounded* balance.
+The two fields in the same row are not related by the identity a reader assumes.
+The golden test pins both values, but nothing states the invariant in the
+production code.
+
+#### How it was caught
+
+The golden fixture compares exactly, so any change to either convention fails
+there. A downstream consumer outside this repo would not be warned.
+
+### The reconciliation tolerance is a stack of load-bearing constants
+
+**Severity:** High
+**Component:** `runner/daily_equity.py::_reconciliation_tolerance`
+**Fragility type:** Load-bearing defaults
+
+#### What happened
+
+An engine upgrade changed its equity rounding from cents to mills. The
+reconciliation still passed, and a 3-cent drift per trade accumulated into a
+$900 difference between the published curve and the trade ledger before anyone
+noticed.
+
+#### The change that caused it
+
+A developer bumped `FLOAT64_ACCUMULATION_SAFETY` from 8.0 to 64.0 while chasing
+a flaky large-account test, on the grounds that "more headroom is safer".
+
+#### Why it broke
+
+The tolerance is assembled from `EQUITY_HALF_CENT`, a per-trade cent term, and
+`FLOAT64_EPSILON * expected_final * trade_count * FLOAT64_ACCUMULATION_SAFETY`.
+Each term is individually justified in a comment, but nothing tests the
+*combination* against a real engine/ledger disagreement at scale. Raising the
+safety factor widens every reconciliation silently, and the engine curve is then
+adopted even though it disagrees with the net ledger.
+
+#### How it was caught
+
+`TestReconciliationTolerance` pins the cliff at a small account and a
+trillion-dollar account, so a constant change fails there. It does not pin the
+per-trade term for a large trade count, which is where the safety factor
+actually bites.
+
 ## Post-Mortems
 
 ### Golden regeneration masks an economic regression
