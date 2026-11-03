@@ -339,6 +339,20 @@ def test_demo_gate_requires_a_literal_true_flag() -> None:
     assert daemon._adapter_is_demo(SimpleNamespace(paper=None)) is False
     assert daemon._adapter_is_demo(SimpleNamespace(paper=True)) is True
     assert daemon._adapter_is_demo(SimpleNamespace(demo=True)) is True
+    # The real adapter goes through its own branch, which a SimpleNamespace
+    # double never reaches; `paper=False` must stay "not demo" there too.
+    assert (
+        daemon._adapter_is_demo(
+            AlpacaLiveAdapter(api_key="k", secret_key="s", paper=False)
+        )
+        is False
+    )
+    assert (
+        daemon._adapter_is_demo(
+            AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+        )
+        is True
+    )
 
 
 def test_demo_gate_refuses_a_newly_built_non_demo_adapter(
