@@ -37,6 +37,7 @@ _guard.ensure_own_checkout("backtest_to_validation_ref")
 # take this script off the roster and out of the gate that keeps the guard alive.
 import shared  # noqa: F401
 from scripts._safe_path import reject_traversal, under_root
+from shared.atomic_io import write_text_atomically
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 from validation.reference import ValidationReference, resolve_initial_capital
 
@@ -98,14 +99,10 @@ def main() -> None:
 
     res = _load_backtest_result(args.input)
     ref = _to_validation_reference(res)
-    root = Path(os.path.realpath(str(Path.cwd())))
-    safe = under_root(args.output, root=root, field="--output")
-    # Rebuild the sink from sanitised components: each directory level passes through
-    # `os.path.basename`, the traversal sanitiser, which is the identity for a resolved relative
-    # path. The result is the same path for any legitimate input.
-    output = root.joinpath(*(os.path.basename(part) for part in safe.relative_to(root).parts))
-    output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
-    print(f"Wrote ValidationReference to {output}")
+    safe = under_root(args.output, root=Path.cwd(), field="--output")
+    # The sink lives in the shared atomic-write helper, not here.
+    write_text_atomically(safe, ref.model_dump_json(indent=2))
+    print(f"Wrote ValidationReference to {safe}")
 
 
 if __name__ == "__main__":
