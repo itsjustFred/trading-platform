@@ -8,7 +8,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 # isort: split
@@ -37,7 +36,7 @@ _guard.ensure_own_checkout("backtest_to_validation_ref")
 import shared  # noqa: F401
 from scripts._safe_path import under_root
 from shared.atomic_io import write_text_atomically
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestResult
 from validation.reference import ValidationReference, resolve_initial_capital
 
 
@@ -52,22 +51,17 @@ def _safe_input_path(raw: Path) -> Path:
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
+    """Read a BacktestResult through the model's own loader.
+
+    The loader already owns "open this file and build the result", and it builds the typed
+    `EquityPoint`/`IndicatorSeries` values this script previously left as raw dicts. Keeping the
+    read there also keeps the filesystem sink out of a script whose only job is the conversion.
+    """
     source = _safe_input_path(path)
-    if not source.is_file():
-        raise SystemExit(f"input: not a regular file ({source})")
-    d = json.loads(source.read_text(encoding="utf-8"))
-    meta = BacktestMeta(**d["meta"])
-    trades = [Trade(**t) for t in d.get("trades", [])]
-    for t in trades:
-        t.exits = [TradeExit(**e) for e in t.exits]
-    return BacktestResult(
-        meta=meta,
-        trades=trades,
-        equity_curve=d.get("equity_curve", []),
-        stats=d.get("stats", {}),
-        indicators=d.get("indicators", []),
-        drawings=d.get("drawings", []),
-    )
+    try:
+        return BacktestResult.load(source)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"input: not a regular file ({source})") from exc
 
 
 def _to_validation_reference(result: BacktestResult) -> ValidationReference:
