@@ -133,3 +133,59 @@ Worst Standards issue: the duplicated `format="mixed"` parse incantation, which
 this PR had to touch in three of four sites and left inlined.
 
 Spec: 0 missing, 0 creep, 0 wrong. Worst Spec issue: none.
+
+---
+
+# Code Review — Cycle 2 (window starting-equity basis)
+
+Fixed point: `main`. Diff: `git diff main...HEAD`.
+Cycle-2 commits: `2e28e64`, `7fcf7ac`, `77bfaa4`, `c5e748f`, `7671b81`.
+Standards sources: `AGENTS.md`, `docs/logging_guide.md`. Spec: the Kimi finding plus
+the user's decision (warning once per run, `window_start_basis` in the report, one test
+covering fallback + warning + field).
+
+## Standards
+
+**Hard violation (fixed).** The new warning used `logging.getLogger(__name__)` while
+`docs/logging_guide.md` ("Alle Services nutzen dasselbe Format") requires
+`shared.logging.get_logger` for anything that passes `extra={"data": ...}`. Consequence:
+`get_logger` sets `propagate=False` and owns its handlers, so the stdlib record fell
+through to `logging.lastResort` — plain text on stderr, payload dropped, nothing in
+`logs/runner.daily_equity.log`. Fixed in `7671b81`; the test now asserts the logger name
+`trading.runner.daily_equity`, so a revert fails.
+
+**Judgement calls.**
+- `"engine"` is returned for a base that is ledger-derived when no engine point exists
+  (`_window_starting_equity`, no-`prior_points` branch). The spec defines exactly two
+  values and reserves `"net_ledger"` for the fallback, so the label is kept and the
+  exact meaning of both values is documented in `WindowStartingEquity`. Flagged to the
+  user: a third value would be more honest about provenance but would make
+  `"net_ledger"` stop being a divergence signal.
+- The basis literal was hard-coded twice (payload and return). Fixed with one local.
+- The warning text claimed "window starts from the realized net ledger", which is
+  inaccurate on the engine-curve fallback where that base is not published. Reworded to
+  "using the realized net ledger as the window base".
+- Pre-existing, out of scope: `runner/stats.py:318` (`_equity_to_returns_series`) still
+  calls `pd.to_datetime` without a format, the same NaT trap this PR fixes elsewhere.
+  Reported, not fixed.
+
+## Spec
+
+**Partial (fixed).** The field was missing on the engine-curve fallback, contradicting
+"normal path = engine" and leaving a warning without the basis it refers to. Reverted in
+`7671b81`: the field is set on every path that computed a window base.
+
+**Partial (kept, flagged).** "Once per run" is implemented as once per
+`attach_daily_equity`, i.e. once per window/fold; a walkforward emits one warning per
+fold. Kept deliberately: the base is decided per window, the field is per result, and
+silencing after the first fold would hide divergences in later windows. A process-level
+dedupe can be added if the user prefers fewer lines.
+
+**Wrong label (kept, flagged).** See Standards: ledger-derived base reported as
+`"engine"` when no engine point exists.
+
+## Summary
+
+Standards: 1 hard violation (fixed), 3 judgement calls (2 fixed, 1 flagged).
+Spec: 2 partial (1 fixed, 1 kept as an explicit interpretation), 1 label ambiguity
+flagged. No test weakening; every fix is pinned by a falsified test.
