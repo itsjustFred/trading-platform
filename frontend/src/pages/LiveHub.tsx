@@ -785,8 +785,23 @@ export function LiveHubPage() {
     }
     setDeploymentBusy(card.id, true);
     try {
-      await deleteLiveDeployment(card.id);
+      const result = await deleteLiveDeployment(card.id);
       await refreshDeployments(true);
+      // The row is gone either way. A drain that ended IN_FLIGHT or
+      // INDETERMINATE means an order may still reach the broker, and the
+      // deployment that would have explained it no longer exists - so the
+      // warning is the only thing standing between the operator and an
+      // unexplained fill. Reporting a bare "deleted" here hides it.
+      if (result.submission_drain_complete === false) {
+        showToast(
+          result.warning ??
+            `${card.strategy_name} was deleted, but ${
+              result.in_flight_submissions ?? 0
+            } submission(s) may still reach the broker. Verify the broker account.`,
+          "warning",
+        );
+        return;
+      }
       showToast(`${card.strategy_name} deleted.`, "success");
     } catch (error_: unknown) {
       const message =

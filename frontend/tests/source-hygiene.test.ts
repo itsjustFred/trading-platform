@@ -189,6 +189,47 @@ test("a pause that had to wait out submissions is never reported as a failure", 
   );
 });
 
+test("a delete with a non-clean drain is never reported as a plain success", async () => {
+  // The row is removed either way, so a drain that ended IN_FLIGHT or
+  // INDETERMINATE is the only evidence that an order may still reach the broker -
+  // and the deployment that would have explained it is gone. The delete response
+  // carried that verdict all along; the UI dropped it and said "deleted".
+  const types = stripComments(await read("../src/api/types.ts"));
+  const client = stripComments(await read("../src/api/client.ts"));
+  const liveHub = await read("../src/pages/LiveHub.tsx");
+
+  assert.match(types, /interface LiveDeploymentDeleteResponse/);
+  for (const field of [
+    "submission_drain_complete",
+    "in_flight_submissions",
+    "expired_unreleased_submissions",
+    "warning",
+  ]) {
+    const block = types.match(/interface LiveDeploymentDeleteResponse \{[\s\S]*?\n\}/);
+    assert.ok(block, "the delete response type must exist");
+    assert.ok(
+      block[0].includes(field),
+      `the delete response must type ${field}, or the UI cannot read it`,
+    );
+  }
+
+  // Scoped to the function body: a match anywhere in the file would let the type
+  // sit on a different endpoint.
+  assert.match(
+    functionSource(client, "deleteLiveDeployment"),
+    /fetchJSON<LiveDeploymentDeleteResponse>/,
+  );
+
+  const handler = liveHub.match(
+    /const handleDelete = useCallback\([\s\S]*?\n {2}\}, \[refreshDeployments, showToast\]\);/,
+  );
+  assert.ok(handler, "the delete handler must exist");
+  assert.match(handler[0], /const result = await deleteLiveDeployment/);
+  assert.match(handler[0], /submission_drain_complete === false/);
+  assert.match(handler[0], /result\.warning/);
+  assert.match(handler[0], /"warning"/);
+});
+
 test("an absent portfolio metric is never coerced to a numeric zero", async () => {
   const page = stripComments(await read("../src/pages/PortfolioDetailPage.tsx"));
 

@@ -605,6 +605,24 @@ export interface LiveDeploymentStatusUpdateResponse extends LiveDeploymentConfig
   warning?: string;
 }
 
+/**
+ * The answer to a DELETE.
+ *
+ * Deleting an ACTIVE deployment drains its submission leases first, and the drain
+ * can end without a clean verdict. The row is gone either way, so the only way the
+ * operator can learn that an order may still reach the broker is this payload -
+ * dropping it and reporting a bare "deleted" hides exactly the case that matters.
+ */
+export interface LiveDeploymentDeleteResponse {
+  status: string;
+  id: string;
+  submission_drain_outcome?: "DRAINED" | "IN_FLIGHT" | "INDETERMINATE";
+  submission_drain_complete?: boolean;
+  in_flight_submissions?: number;
+  expired_unreleased_submissions?: number;
+  warning?: string;
+}
+
 export interface LiveDeploymentCreateRequest {
   strategy_name?: string;
   account_id: string;

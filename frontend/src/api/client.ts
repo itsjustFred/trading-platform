@@ -18,6 +18,7 @@ import type {
   LiveBalancesResponse,
   LiveDeploymentCreateRequest,
   LiveDeploymentConfig,
+  LiveDeploymentDeleteResponse,
   LiveDeploymentStatusUpdateResponse,
   LiveSignalLogResponse,
   LivePositionsResponse,
@@ -402,7 +403,7 @@ export const updateLiveDeploymentStatus = (
     },
   );
 export const deleteLiveDeployment = (deploymentId: string) =>
-  fetchJSON<{ status: string; id: string }>(
+  fetchJSON<LiveDeploymentDeleteResponse>(
     // DELETE carries no body by convention, so the confirmation travels as a
     // query parameter rather than in a JSON payload.
     `/live/deployments/${encodeURIComponent(deploymentId)}` +

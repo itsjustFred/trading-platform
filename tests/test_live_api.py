@@ -1981,6 +1981,59 @@ def test_an_omitted_confirmation_reports_428_precondition_required(
     assert entries[0]["detail"].get("reason") == "no confirmation supplied"
 
 
+def test_a_refused_repoint_is_audited(isolated_db_sandbox):
+    """A re-point that was refused is a live control that did not happen.
+
+    It changes which broker account real orders reach, so an attempt to move a
+    deployment has to be answerable after the fact even when it was refused. The
+    endpoint used to raise the 400 straight out of the DB guard, leaving the only
+    trace in the caller's own logs.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-src", "alpaca", is_demo=True)
+
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    did = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(did),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-src",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status="PAUSED",
+            signal_source_type="internal",
+        )
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{did}/account",
+        json={
+            "account_id": "acc-does-not-exist",
+            "confirmation": {"confirmed_deployment_id": did},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == did and not entry.get("succeeded")
+    ]
+    assert entries, "the refused re-point must be audited"
+    assert entries[0]["action"] == "deployment.account"
+    assert "unknown account" in entries[0]["detail"].get("reason", "")
+
+
 def test_a_failed_service_records_that_it_was_actually_tried(isolated_db_sandbox):
     """`last_activity` only advances on success, so it cannot answer this.
 

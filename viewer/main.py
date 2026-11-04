@@ -13002,6 +13002,18 @@ async def update_live_deployment_account_endpoint(
             allow_active=bool(payload.allow_active),
         )
     except ValueError as exc:
+        # A refused re-point is a live control that did not happen, and the audit
+        # contract covers refusals too: without this entry the only trace of an
+        # attempt to move a deployment to another account is the 400 the caller
+        # saw.
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": _public_value_error_detail(exc)},
+        )
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
