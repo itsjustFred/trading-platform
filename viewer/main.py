@@ -2585,6 +2585,7 @@ def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     net_profit = _safe_float(stats.get("net_profit"), 0.0)
     total_return = _safe_float(stats.get("total_return"), 0.0)
     win_rate = _normalize_win_rate(stats.get("win_rate")) or 0.0
+    p_value = _optional_float(stats.get("p_value"))
     components = payload.get("components") if isinstance(payload.get("components"), list) else []
     return {
         "id": str(payload.get("id") or ""),
@@ -2600,7 +2601,7 @@ def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "net_profit": round(net_profit, 2),
         "net_profit_pct": round(net_profit / account_capital * 100, 2) if account_capital else 0.0,
         "psr": stats.get("psr"),
-        "p_value": round(_safe_float(stats.get("p_value"), 1.0), 6),
+        "p_value": round(p_value, 6) if p_value is not None else None,
         "win_rate": round(win_rate * 100.0, 2),
         "trade_count": int(_safe_float(stats.get("trade_count"), len(normalized_trades))),
         "equity_mini": _portfolio_equity_preview(payload.get("combined_equity", []), limit=50),
@@ -3476,7 +3477,7 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
-        "cagr": _safe_float(meta.get("cagr"), 0.0),
+        "cagr": _optional_float(meta.get("cagr")),
         "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
@@ -11707,7 +11708,7 @@ def _portfolio_combined_metrics(
             "total_return": 0.0,
             "max_drawdown_duration": 0,
             "psr": 0.0,
-            "p_value": 1.0,
+            "p_value": None,
         }
 
     return correlation_matrix, combined_equity_points, stats_result
@@ -11767,7 +11768,7 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
             total_return=stats_result.get("total_return", 0),
             max_drawdown_duration=stats_result.get("max_drawdown_duration", 0),
             psr=stats_result.get("psr"),
-            p_value=stats_result.get("p_value", 1.0),
+            p_value=resolve_defined_stat(stats_result, "p_value", None),
             correlation_matrix=correlation_matrix,
         ).to_dict(),
         "combined_equity": [point.to_dict() for point in combined_equity_points],
@@ -13093,7 +13094,10 @@ async def update_live_deployment_account_endpoint(
     pending_leases = await asyncio.to_thread(
         list_live_deployment_submission_claims, deployment_id
     )
-    acknowledged_leases = len(pending_leases)
+    # Only an expired lease carries an unknown outcome the operator acknowledged;
+    # a live lease would have refused the re-point, so counting every claim
+    # overstates the accepted risk in the audit.
+    acknowledged_leases = sum(1 for lease in pending_leases if lease.expired)
 
     try:
         updated = await asyncio.to_thread(

@@ -530,7 +530,15 @@ export function PortfolioDetailPage() {
           value={stats.psr}
           format="percent"
           percentScale={requireMetricScale("portfolio_combined_stats", "psr")}
-          color={Number(stats.psr) > 0.95 ? "#3fb950" : Number(stats.psr) > 0.5 ? "#d29922" : "#f85149"}
+          color={
+            stats.psr == null
+              ? undefined
+              : Number(stats.psr) > 0.95
+                ? "#3fb950"
+                : Number(stats.psr) > 0.5
+                  ? "#d29922"
+                  : "#f85149"
+          }
         />
         <StatCard
           label="p-Value (lower = better)"

@@ -827,10 +827,10 @@ export interface BacktestMetadataItem {
   symbols: string[];
   timeframe: string;
   total_return: number;
-  sharpe_ratio: number;
-  psr: number;
-  p_value: number;
-  cagr: number;
+  sharpe_ratio: number | null;
+  psr: number | null;
+  p_value: number | null;
+  cagr: number | null;
   max_drawdown: number;
   trade_count: number;
   win_rate: number | null;
@@ -1255,8 +1255,8 @@ export interface PortfolioSummary {
   trade_count?: number;
   net_profit: number;
   net_profit_pct?: number;
-  psr?: number;
-  p_value?: number;
+  psr?: number | null;
+  p_value?: number | null;
   equity_mini?: number[];
   created_at: string;
 }
@@ -1306,7 +1306,7 @@ export interface PortfolioDetail {
     max_drawdown: number | null;
     net_profit: number;
     psr?: number | null;
-    p_value?: number;
+    p_value?: number | null;
     correlation_matrix: Record<string, Record<string, number>>;
   };
   combined_equity: { time: string; equity: number }[];

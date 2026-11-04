@@ -1660,7 +1660,9 @@ export function BacktestsPage() {
             const totalReturnPct =
               toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0;
             const cagrPct =
-              toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0;
+              item.cagr == null
+                ? null
+                : (toPercentPointsForKey("backtest_list", "cagr", item.cagr) ?? 0);
             const maxDrawdownPct =
               toPercentPointsForKey(
                 "backtest_list",

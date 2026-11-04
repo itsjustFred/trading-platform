@@ -84,8 +84,6 @@ def test_core_stats_payload_exposes_whole_backtest_winners_and_losers():
 
 
 def test_main_stats_endpoint_serves_exact_extremes(viewer_client, tmp_path):
-    import viewer.main as viewer_app_module
-
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _result(_trades()).save(backtests_dir / "stats-demo.trades.json")
@@ -495,3 +493,48 @@ def test_quick_stats_keep_undefined_ratios_absent():
     # Zero profit and zero drawdown *are* measured facts.
     assert payload["net_profit"] == 0
     assert payload["max_drawdown_pct"] == 0
+
+
+def test_backtest_all_item_preserves_an_undefined_cagr():
+    """The list card must not turn a missing CAGR into a measured 0.00%.
+
+    `_safe_float(meta.get("cagr"), 0.0)` made an empty or too-short run render a
+    green "+0.00%" next to Sharpe/PSR/p-value that correctly read "N/A".
+    """
+    import viewer.main as viewer_main_module
+
+    item = viewer_main_module._backtest_all_item_from_meta(
+        {
+            "id": "undef-cagr",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "cagr": None,
+        }
+    )
+
+    assert item["cagr"] is None
+
+
+def test_portfolio_summary_preserves_an_undefined_p_value():
+    """An empty portfolio has no p-value; 1.0 is the worst measured value."""
+    import viewer.main as viewer_main_module
+
+    summary = viewer_main_module._portfolio_summary_from_payload(
+        {
+            "account_capital": 100000.0,
+            "combined_stats": {},
+            "trades": [],
+        }
+    )
+
+    assert summary["p_value"] is None
+
+
+def test_portfolio_stats_round_trip_preserves_an_undefined_p_value():
+    """`from_dict`/`to_dict` must not resurrect the old 1.0 default."""
+    from shared.models import PortfolioStats
+
+    stats = PortfolioStats.from_dict({"p_value": None})
+
+    assert stats.p_value is None
+    assert stats.to_dict()["p_value"] is None

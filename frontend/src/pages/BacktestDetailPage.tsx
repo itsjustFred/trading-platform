@@ -718,11 +718,13 @@ export function BacktestDetailPage() {
             format="percent"
             percentScale={requireMetricScale("backtest_stats", "psr")}
             color={
-              (stats.psr ?? 0) > 0.95
-                ? "#3fb950"
-                : (stats.psr ?? 0) > 0.5
-                  ? "#d29922"
-                  : "#f85149"
+              stats.psr == null
+                ? undefined
+                : stats.psr > 0.95
+                  ? "#3fb950"
+                  : stats.psr > 0.5
+                    ? "#d29922"
+                    : "#f85149"
             }
           />
           <StatCard

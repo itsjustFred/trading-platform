@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test:optimization-evidence": "node --test tests/optimizationEvidence.test.ts",
-    "test:focused": "node --test tests/frontendResilience.test.ts tests/liveTerminal.test.ts tests/optimizationEvidence.test.ts tests/liveControlConfirmation.test.ts tests/compareStats.test.ts",
+    "test:focused": "node --test tests/frontendResilience.test.ts tests/liveTerminal.test.ts tests/optimizationEvidence.test.ts tests/liveControlConfirmation.test.ts tests/compareStats.test.ts tests/stats.test.ts",
     "lint": "eslint .",
     "preview": "vite preview"
   },

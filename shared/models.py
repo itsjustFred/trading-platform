@@ -799,7 +799,10 @@ class PortfolioStats:
     total_return: float = 0.0
     max_drawdown_duration: int = 0
     psr: float | None = None
-    p_value: float = 1.0
+    # `1.0` is the worst attainable p-value, not a neutral default: a portfolio
+    # whose p-value was never computed must stay absent instead of reading as a
+    # measured result.
+    p_value: float | None = None
     correlation_matrix: dict[str, Any] = field(default_factory=dict)
     extras: dict[str, Any] = field(default_factory=dict)
 
