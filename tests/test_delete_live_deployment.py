@@ -2,8 +2,8 @@
 
 The defect: `delete_live_deployment` attempted the delete unconditionally. Once
 `live_signals.deployment_id` carries a foreign key, any deployment with signals raised a raw
-`sqlite3.IntegrityError` out of the ORM. The viewer set the deployment PAUSED first and then turned
-that exception into a 500, so the operator got an error *and* a deployment stuck in PAUSED.
+`sqlite3.IntegrityError` out of the ORM. The viewer did not catch it either, so the operator got a
+500 for what is a deliberate refusal.
 
 The behaviour chosen here is a typed refusal with counts, not a cascade. A cascade would "work" and
 would silently delete the execution record of real trades - the one thing this database exists to
@@ -187,3 +187,30 @@ def test_the_refusal_does_not_depend_on_the_foreign_key_being_present(isolated_d
         assert _deployment_exists(database, deployment_id)
     finally:
         database.event.listen(engine, "connect", database._configure_sqlite_connection)
+
+
+def test_the_endpoint_reports_a_refusal_as_a_conflict(monkeypatch) -> None:
+    """The typed refusal has to survive the HTTP boundary.
+
+    Raising `LiveDeploymentInUseError` in the storage layer only helps if the endpoint catches it.
+    It did not, so FastAPI answered 500 and the operator saw a server fault for a deliberate,
+    data-preserving refusal. The counts are part of the answer: they say what is holding the row.
+    """
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    def _refuse(deployment_id: str) -> bool:
+        raise viewer_main_module.LiveDeploymentInUseError(
+            deployment_id, signal_count=1, execution_count=2
+        )
+
+    monkeypatch.setattr(viewer_main_module, "delete_live_deployment", _refuse)
+    client = TestClient(viewer_main_module.app)
+
+    response = client.delete("/api/live/deployments/dep-keep")
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert "1 signal(s)" in detail
+    assert "2 execution(s)" in detail

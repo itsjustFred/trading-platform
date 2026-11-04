@@ -83,6 +83,7 @@ from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
 from shared.database import (
+    LiveDeploymentInUseError,
     DB_PATH as BACKTEST_DB_PATH,
     create_live_deployment,
     delete_background_task_record,
@@ -12239,7 +12240,19 @@ async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
         "/api/live/deployments/{deployment_id}",
         deployment_id=deployment_id,
     )
-    deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
+    try:
+        deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
+    except LiveDeploymentInUseError as exc:
+        # A refusal is a decision the operator can act on, not a server fault: the deployment
+        # still has history, nothing was deleted, and the counts say what is holding it.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Live deployment {deployment_id} still has "
+                f"{exc.signal_count} signal(s) and {exc.execution_count} execution(s); "
+                "nothing was deleted"
+            ),
+        ) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
     return {"status": "deleted", "id": deployment_id}
