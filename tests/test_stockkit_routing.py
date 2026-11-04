@@ -206,7 +206,16 @@ def test_each_route_is_validated_against_its_own_account() -> None:
 
 @pytest.mark.parametrize(
     "channel_id",
-    ["", "REPLACE_ME_DISCORD_CHANNEL_ID", "123456789", "1234567890123456"],
+    [
+        "",
+        "REPLACE_ME_DISCORD_CHANNEL_ID",
+        "123456789",
+        "1234567890123456",
+        # Length-plausible scaffolding: rejected only by the placeholder list,
+        # not by the snowflake length check.
+        "111111111111111111",
+        "000000000000000000",
+    ],
 )
 def test_impossible_channel_ids_are_rejected(channel_id: str) -> None:
     with pytest.raises(ValueError):
