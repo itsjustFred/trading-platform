@@ -114,9 +114,9 @@ def _write_record(
     The write itself goes through the shared atomic-write helper, the same one every
     other persisted artifact uses: it owns the filesystem sink and validates the
     target, and a crash cannot leave a half-written allowlist behind. The helper
-    refuses ``..`` and symlinked parents, so the destination is resolved first -
-    ``--out ../durable/authors.json`` still lands where the operator pointed, it
-    just arrives as an absolute path the helper can validate.
+    refuses ``..`` and symlinked parents, so the destination's *directory* is
+    resolved first - ``--out ../durable/authors.json`` still lands where the operator
+    pointed, and the file name stays the one that was asked for.
     """
     if out is None:
         return
@@ -128,7 +128,7 @@ def _write_record(
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bots": results,
     }
-    target = Path(os.path.realpath(out))
+    target = Path(os.path.realpath(out.parent)) / out.name
     write_text_atomically(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"recorded to {target}", file=sys.stderr)
 
