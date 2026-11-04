@@ -34,20 +34,22 @@ _guard.ensure_own_checkout("backtest_to_validation_ref")
 # that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
 # take this script off the roster and out of the gate that keeps the guard alive.
 import shared  # noqa: F401
-from scripts._safe_path import under_root
+from scripts._safe_path import reject_traversal, under_root
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 from validation.reference import ValidationReference, resolve_initial_capital
 
 
 def _safe_input_path(raw: Path) -> Path:
-    """Confine the caller-supplied input path to the working tree.
+    """Refuse a traversal segment in the caller-supplied input path.
 
-    The input is read, not written, but it is still a path a runbook may have quoted from an LLM,
-    and a read outside the tree the operator is working in is never what the invocation meant. The
-    same confinement as the output, so both ends of the conversion say the same thing.
+    The input is read, not written, and may legitimately live outside the repo - an exported
+    backtest result is not required to sit in this checkout - so this is the traversal check only,
+    not the ``under_root`` confinement the output gets. The point is the legible failure: a runbook
+    quoting a path an LLM produced gets "name the directory directly" instead of a confusing
+    half-populated result.
     """
-    return under_root(raw, root=Path.cwd(), field="input")
+    return reject_traversal(raw, field="input")
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
