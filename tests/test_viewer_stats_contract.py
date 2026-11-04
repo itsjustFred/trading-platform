@@ -370,3 +370,31 @@ def test_non_finite_stats_are_not_published_as_measurements():
 
     # A numeric string is a real measurement written by an older producer.
     assert _stat_number_or_undefined({"sharpe_ratio": "1.25"}, "sharpe_ratio", 0.0) == 1.25
+
+
+def test_the_backtest_info_payload_publishes_the_artifact_provenance():
+    """`/api/backtest/{id}/info` must report where the data came from.
+
+    The same rule as the stats: an empty `data_source` is a claim ("no source"),
+    not an absence. The payload publishes what the artifact carries so the
+    dashboard can show it instead of guessing, and leaves the rest empty rather
+    than inventing a value.
+    """
+    from viewer.core import _backtest_info_payload
+
+    result = _result([_trade(1, 10.0)])
+    result.meta.data.update(
+        {
+            "source": "dukascopy",
+            "requested_data_source": "dukascopy",
+            "asset_classes": ["forex"],
+            "data_files": ["EURUSD.csv"],
+        }
+    )
+
+    payload = _backtest_info_payload(result)
+
+    assert payload["data_source"] == "dukascopy"
+    assert payload["requested_data_source"] == "dukascopy"
+    assert payload["asset_classes"] == ["forex"]
+    assert payload["data_files"] == ["EURUSD.csv"]
