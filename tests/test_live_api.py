@@ -2571,3 +2571,198 @@ def test_a_stopped_deployment_reports_open_exposure_until_enforcement_completes(
         _deployment("ACTIVE", None)
     )
     assert active["exposure_may_be_open"] is False
+
+
+def _repoint_fixture(database_module, *, status: str = "PAUSED"):
+    """A deployment on ``acc-old`` plus the viewer client, for re-point tests."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module.ensure_live_account("acc-old", "ctrader", is_demo=True)
+    database_module.ensure_live_account("acc-new", "ctrader", is_demo=True)
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-old",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            status=status,
+            signal_source_type="discord",
+        )
+    )
+    return deployment_id, TestClient(viewer_main_module.app), viewer_main_module
+
+
+def test_a_repoint_of_an_active_deployment_is_refused(isolated_db_sandbox, monkeypatch):
+    """The running listener still holds the old account until the next sync.
+
+    Re-pointing underneath it would report the new account while real orders
+    keep reaching the previous one, so pausing is a precondition - not an
+    opt-in escape hatch.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did, client, viewer_main_module = _repoint_fixture(database_module, status="ACTIVE")
+
+    broker_calls: list[str] = []
+
+    async def _verified(account_id: str) -> bool:
+        broker_calls.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _verified
+    )
+
+    response = client.put(
+        f"/api/live/deployments/{did}/account",
+        json={
+            "account_id": "acc-new",
+            "confirmation": {"confirmed_deployment_id": did},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert database_module.get_live_deployment(did).account_id == "acc-old"
+    assert broker_calls == [], (
+        "an ACTIVE re-point must be refused before spending a broker round-trip"
+    )
+
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == did and not entry.get("succeeded")
+    ]
+    assert entries, "the refusal must be audited"
+    assert "ACTIVE" in entries[0]["detail"].get("reason", "")
+
+
+def test_a_repoint_is_refused_when_the_broker_cannot_confirm_the_target(
+    isolated_db_sandbox, monkeypatch
+):
+    """A stored row is not evidence that the broker still reports the account."""
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did, client, viewer_main_module = _repoint_fixture(database_module)
+
+    async def _refuse(_account_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _refuse
+    )
+
+    response = client.put(
+        f"/api/live/deployments/{did}/account",
+        json={
+            "account_id": "acc-new",
+            "confirmation": {"confirmed_deployment_id": did},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "demo account" in response.json()["detail"]
+    assert database_module.get_live_deployment(did).account_id == "acc-old"
+
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == did and not entry.get("succeeded")
+    ]
+    assert entries, "the refusal must be audited"
+    assert entries[0]["detail"].get("reason") == "broker could not confirm a demo account"
+
+
+def _expire_a_submission_lease(database_module, deployment_id: str) -> None:
+    """Leave one lease behind whose TTL elapsed without a release."""
+    import time
+
+    assert database_module.claim_live_deployment_submission(
+        deployment_id, "token-expired", ttl_seconds=0.01
+    ), "precondition: the lease must be taken while the deployment is ACTIVE"
+    time.sleep(0.05)
+    database_module.update_live_deployment_status(deployment_id, "PAUSED")
+
+
+def test_a_repoint_is_refused_while_an_expired_lease_leaves_the_outcome_unknown(
+    isolated_db_sandbox, monkeypatch
+):
+    """An expired, unreleased lease means the broker outcome was never observed.
+
+    That is not "nothing was in flight": the order may have reached the old
+    account. The re-point must not silently drop that evidence.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did, client, viewer_main_module = _repoint_fixture(database_module, status="ACTIVE")
+    _expire_a_submission_lease(database_module, did)
+
+    async def _verified(_account_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _verified
+    )
+
+    response = client.put(
+        f"/api/live/deployments/{did}/account",
+        json={
+            "account_id": "acc-new",
+            "confirmation": {"confirmed_deployment_id": did},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "expired" in response.json()["detail"]
+    assert database_module.get_live_deployment(did).account_id == "acc-old"
+
+
+def test_an_acknowledged_expired_lease_allows_the_repoint_and_is_audited(
+    isolated_db_sandbox, monkeypatch
+):
+    """The operator can resolve the unknown outcome and then move the deployment.
+
+    The acknowledgement is the audit record: without it the re-point would be a
+    silent acceptance of an order whose fate was never observed.
+    """
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    did, client, viewer_main_module = _repoint_fixture(database_module, status="ACTIVE")
+    _expire_a_submission_lease(database_module, did)
+
+    async def _verified(_account_id: str) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _verified
+    )
+
+    response = client.put(
+        f"/api/live/deployments/{did}/account",
+        json={
+            "account_id": "acc-new",
+            "acknowledge_unreconciled_submissions": True,
+            "confirmation": {"confirmed_deployment_id": did},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert database_module.get_live_deployment(did).account_id == "acc-new"
+    # The acknowledged stale lease has served its purpose as evidence; keeping
+    # it would make every later control read the outcome as unknown forever.
+    assert database_module.list_live_deployment_submission_claims(did) == []
+
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == did and entry.get("succeeded")
+    ]
+    assert entries, "the accepted risk must be audited"
+    assert entries[0]["detail"].get("unreconciled_submissions_acknowledged") == 1

@@ -674,7 +674,13 @@ export function BacktestDetailPage() {
           <StatCard
             label="Sortino Ratio"
             value={stats.sortino?.toFixed(3)}
-            color={stats.sortino > 1 ? "#3fb950" : "#d29922"}
+            color={
+              stats.sortino == null
+                ? undefined
+                : stats.sortino > 1
+                  ? "#3fb950"
+                  : "#d29922"
+            }
           />
           <StatCard
             label="Max DD (lower = better)"
@@ -698,7 +704,13 @@ export function BacktestDetailPage() {
           <StatCard
             label="Calmar"
             value={stats.calmar?.toFixed(2)}
-            color={stats.calmar > 1 ? "#3fb950" : "#d29922"}
+            color={
+              stats.calmar == null
+                ? undefined
+                : stats.calmar > 1
+                  ? "#3fb950"
+                  : "#d29922"
+            }
           />
           <StatCard
             label="PSR (higher = better)"

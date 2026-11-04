@@ -9055,8 +9055,8 @@ async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     stats1 = backtest1.get("stats", {})
     stats2 = backtest2.get("stats", {})
 
-    def delta(metric: str) -> float:
-        return round(_safe_float(stats2.get(metric), 0.0) - _safe_float(stats1.get(metric), 0.0), 6)
+    def delta(metric: str) -> float | None:
+        return _compare_stat_delta(stats1, stats2, metric)
 
     return {
         "ids": unique_ids,
@@ -9953,6 +9953,23 @@ def _compare_backtests_payload(ids: str) -> dict[str, Any]:
     return legacy_viewer.compare_backtests(strategies)
 
 
+def _compare_stat_delta(
+    left: dict[str, Any], right: dict[str, Any], metric: str
+) -> float | None:
+    """``right - left`` for a compare metric, or ``None`` when either side is unknown.
+
+    Coercing an absent side to 0.0 manufactured a delta out of a value that was
+    never measured, so the comparison read as a real change. A metric the
+    producer named in ``undefined_metrics`` is not a zero, and it cannot be
+    compared.
+    """
+    left_value = left.get(metric)
+    right_value = right.get(metric)
+    if left_value is None or right_value is None:
+        return None
+    return round(_safe_float(right_value, 0.0) - _safe_float(left_value, 0.0), 6)
+
+
 def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -9977,11 +9994,16 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
             else "1h"
         )
     )
-    win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
+    win_rate_value = _normalize_win_rate(
+        legacy_viewer._defined_stat_value(raw, "win_rate")
+    )
     winning_trades = sum(
         1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
     )
     losing_trades = max(len(result.trades) - winning_trades, 0)
+    max_drawdown = legacy_viewer._defined_stat_value(
+        raw, "max_drawdown_pct", scale=100.0, digits=6
+    )
 
     return {
         "id": backtest_id,
@@ -9991,14 +10013,23 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         "symbols": symbols,
         "timeframe": timeframe,
         "stats": {
-            "total_return": round(_safe_float(raw.get("total_return"), 0.0), 6),
-            "net_profit": round(_safe_float(raw.get("total_pnl"), 0.0), 6),
-            "sharpe_ratio": round(_safe_float(raw.get("sharpe_ratio"), 0.0), 6),
-            "psr": round(_safe_float(raw.get("psr"), 0.0) * 100.0, 6),
-            "p_value": round(_safe_float(raw.get("p_value"), 1.0), 6),
-            "cagr": round(_safe_float(raw.get("cagr"), 0.0) * 100.0, 6),
-            "max_drawdown": round(abs(_safe_float(raw.get("max_drawdown_pct"), 0.0)) * 100.0, 6),
-            "win_rate": round(win_rate * 100.0, 6),
+            # Every value here goes through resolve_defined_stat: a metric the
+            # producer could not compute is published as null, not as the old
+            # 0.0 / 1.0 default that made an unmeasured run look comparable.
+            "total_return": legacy_viewer._defined_stat_value(
+                raw, "total_return", digits=6
+            ),
+            "net_profit": legacy_viewer._defined_stat_value(raw, "total_pnl", digits=6),
+            "sharpe_ratio": legacy_viewer._defined_stat_value(raw, "sharpe_ratio", digits=6),
+            "psr": legacy_viewer._defined_stat_value(raw, "psr", scale=100.0, digits=6),
+            "p_value": legacy_viewer._defined_stat_value(raw, "p_value", digits=6),
+            "cagr": legacy_viewer._defined_stat_value(raw, "cagr", scale=100.0, digits=6),
+            "max_drawdown": abs(max_drawdown) if max_drawdown is not None else None,
+            "win_rate": (
+                round(win_rate_value * 100.0, 6)
+                if win_rate_value is not None
+                else None
+            ),
             "trade_count": int(_safe_float(raw.get("total_trades"), len(result.trades))),
         },
         "equity_curve": equity_curve,
@@ -12978,9 +13009,10 @@ async def update_live_deployment_account_endpoint(
 ) -> dict[str, Any]:
     """Re-point a deployment at a different broker account.
 
-    Guarded on the DB side: the target must be a known, verified demo account,
-    the deployment must not be ACTIVE unless explicitly overridden, and any
-    in-flight submissions must have drained first.
+    Guarded on the DB side: the target must be a known account, the deployment
+    must not be ACTIVE, and no submission lease may leave an order in flight or
+    an outcome unknown. The target is re-verified against the broker here, the
+    same check arming performs.
     """
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}/account",
@@ -12994,12 +13026,83 @@ async def update_live_deployment_account_endpoint(
         confirmation=payload.confirmation,
         request=request,
     )
+
+    deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    # An ACTIVE deployment's listener still holds the old account until the next
+    # sync. Moving the row underneath it would report the new account while real
+    # orders keep reaching the previous one, so pausing is a precondition.
+    if str(deployment.status or "").strip().upper() == "ACTIVE":
+        reason = "deployment is ACTIVE; pause it before re-pointing"
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": reason, "account_id": str(payload.account_id or "")},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to re-point an ACTIVE deployment; pause it first so the "
+                "running listener cannot keep trading the old account"
+            ),
+        )
+
+    # A stored row is not evidence that the broker still reports the account.
+    # Re-pointing moves real orders, so it gets the same demo re-verification as
+    # arming, immediately before the write.
+    if await asyncio.to_thread(get_live_account, payload.account_id) is None:
+        reason = f"Refusing to re-point at unknown account '{payload.account_id}'"
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": reason, "account_id": str(payload.account_id or "")},
+        )
+        raise HTTPException(status_code=400, detail=reason)
+
+    if not await _reverify_account_against_broker(payload.account_id):
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "broker could not confirm a demo account",
+                "account_id": str(payload.account_id or ""),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Broker could not confirm the target account is a demo account; "
+                "refusing to re-point"
+            ),
+        )
+
+    # A lease that expired without a release is evidence that an order's outcome
+    # was never observed. The DB guard refuses it unless the caller acknowledged
+    # it; the count goes on the success audit so the accepted risk stays visible.
+    pending_leases = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    acknowledged_leases = len(pending_leases)
+
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_account,
             deployment_id,
             payload.account_id,
-            allow_active=bool(payload.allow_active),
+            acknowledge_unreconciled=bool(
+                payload.acknowledge_unreconciled_submissions
+            ),
         )
     except ValueError as exc:
         # A refused re-point is a live control that did not happen, and the audit
@@ -13022,7 +13125,10 @@ async def update_live_deployment_account_endpoint(
         target_type="live_deployment",
         target_id=deployment_id,
         request=request,
-        detail={"account_id": str(updated.account_id or "")},
+        detail={
+            "account_id": str(updated.account_id or ""),
+            "unreconciled_submissions_acknowledged": acknowledged_leases,
+        },
     )
     return _serialize_live_deployment_payload(updated)
 

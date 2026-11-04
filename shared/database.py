@@ -3306,28 +3306,29 @@ def update_live_deployment_account(
     deployment_id: str,
     account_id: str,
     *,
-    allow_active: bool = False,
+    acknowledge_unreconciled: bool = False,
 ) -> LiveDeploymentConfig | None:
     """Re-point a deployment at a different broker account.
 
     This is a safety-critical operation, so it is deliberately narrow:
 
     * the target account must exist;
-    * an ACTIVE deployment is never re-pointed unless ``allow_active`` is set
-      explicitly, because the running listener and its adapter still hold the
-      old account until the next sync;
-    * submissions already in flight for the old account are refused, since
-      letting them land would trade the old account after the re-point.
+    * an ACTIVE deployment is never re-pointed, because the running listener and
+      its adapter still hold the old account until the next sync - the caller has
+      to pause it first;
+    * a live submission lease blocks the write, since the order would land on the
+      *old* account after the re-point;
+    * a lease that expired without being released blocks it too: the broker
+      outcome was never observed, so whether that order reached the old account is
+      unknown. The operator can verify the old account and retry with
+      ``acknowledge_unreconciled=True``; the acknowledgement is audited by the
+      caller.
 
     Returns None when the deployment does not exist.
 
-    The upstream slice additionally required the target account to be a
-    *broker-verified* demo account. That verification (``demo_verified_at`` plus
-    an identity fingerprint, enforced per dispatch) lives in the daemon control
-    plane and is not part of this viewer slice, so the check cannot be invented
-    here without its schema. What remains is the set of guards that do not
-    depend on it, and the absence of the stronger one is a property of the
-    stack, not a decision made here.
+    The target account is re-verified against the broker by the viewer endpoint
+    immediately before this call, the same check arming performs. The stronger
+    daemon-side ``demo_verified_at`` fingerprint is not part of this slice.
     """
     normalized_deployment = str(deployment_id or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -3355,27 +3356,50 @@ def update_live_deployment_account(
                 )
 
             current_status = str(record.status or "").strip().upper()
-            if current_status == "ACTIVE" and not allow_active:
+            if current_status == "ACTIVE":
                 raise ValueError(
-                    "Refusing to re-point an ACTIVE deployment; pause it first "
-                    "(or pass allow_active=True once the listener is stopped)"
+                    "Refusing to re-point an ACTIVE deployment; pause it first so "
+                    "the running listener cannot keep trading the old account"
                 )
 
-            # Only an unexpired lease is genuinely in flight. Counting every claim
-            # regardless of expiry meant a lease whose TTL had elapsed still
-            # blocked a re-point with "in-flight submissions; drain them first" -
-            # an error the operator cannot act on, because there is nothing left
-            # to drain.
-            in_flight = session.exec(
-                select(func.count(LiveDeploymentSubmissionClaimModel.token)).where(
-                    (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_deployment)
-                    & (LiveDeploymentSubmissionClaimModel.expires_at > _utcnow_naive())
+            # A live lease means a submission may be on its way to the old
+            # account. A lease whose TTL elapsed without a release is worse, not
+            # better: the outcome was never observed, so whether the order
+            # reached the broker is unknown. Neither may be dropped silently by
+            # a re-point.
+            now = _utcnow_naive()
+            leases = session.exec(
+                select(LiveDeploymentSubmissionClaimModel.expires_at).where(
+                    LiveDeploymentSubmissionClaimModel.deployment_id
+                    == normalized_deployment
                 )
-            ).one()
-            if int(in_flight or 0) > 0:
+            ).all()
+            in_flight = sum(1 for expires_at in leases if expires_at > now)
+            expired = len(leases) - in_flight
+            if in_flight > 0:
                 raise ValueError(
                     "Refusing to re-point a deployment with in-flight submissions; "
                     "drain them first"
+                )
+            if expired > 0 and not acknowledge_unreconciled:
+                raise ValueError(
+                    f"Refusing to re-point: {expired} submission lease(s) expired "
+                    "without being released, so whether those orders reached the "
+                    "old account is unknown. Verify the old account, then retry "
+                    "with acknowledge_unreconciled=true"
+                )
+            if expired > 0:
+                # The operator confirmed the old account was checked, so the
+                # stale lease has served its purpose as evidence. Keeping it
+                # would make every later control read the outcome as unknown.
+                session.exec(
+                    delete(LiveDeploymentSubmissionClaimModel).where(
+                        (
+                            LiveDeploymentSubmissionClaimModel.deployment_id
+                            == normalized_deployment
+                        )
+                        & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+                    )
                 )
 
             record.account_id = normalized_account

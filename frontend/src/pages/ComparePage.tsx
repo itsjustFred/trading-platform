@@ -21,6 +21,7 @@ import {
   type PercentScale,
 } from "../api/metricScale";
 import type { BacktestsCompareResponse } from "../api/types";
+import { compareRow } from "../lib/compareStats";
 import { describeError } from "../lib/errorMessage";
 
 const COLORS = ["#58a6ff", "#3fb950"];
@@ -82,8 +83,8 @@ const METRICS: MetricConfig[] = [
   { key: "trade_count", label: "Trade Count", better: "higher", format: "integer" },
 ];
 
-function formatMetric(value: number, metric: MetricConfig): string {
-  if (!Number.isFinite(value)) return "—";
+function formatMetric(value: number | null, metric: MetricConfig): string {
+  if (value === null || !Number.isFinite(value)) return "—";
   if (metric.format === "currency") {
     return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toLocaleString(
       "en-US",
@@ -102,15 +103,15 @@ function formatMetric(value: number, metric: MetricConfig): string {
 }
 
 /** Neutral for a flat delta, otherwise green/red by which side is better. */
-function deltaColorFor(delta: number, betterSecond: boolean): string {
-  if (delta === 0) {
+function deltaColorFor(delta: number | null, betterSecond: boolean): string {
+  if (delta === null || delta === 0) {
     return "#c9d1d9";
   }
   return betterSecond ? "#3fb950" : "#f85149";
 }
 
-function formatMetricRaw(value: number, metric: MetricConfig): string {
-  if (!Number.isFinite(value)) return "—";
+function formatMetricRaw(value: number | null, metric: MetricConfig): string {
+  if (value === null || !Number.isFinite(value)) return "—";
   if (metric.format === "currency") {
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   }
@@ -336,23 +337,23 @@ export function ComparePage() {
             </thead>
             <tbody>
               {METRICS.map((metric) => {
-                const left = Number(data.backtest1.stats[metric.key] || 0);
-                const right = Number(data.backtest2.stats[metric.key] || 0);
-                const delta = right - left;
-                const betterSecond =
-                  metric.better === "higher" ? right > left : right < left;
-                const deltaColor = deltaColorFor(delta, betterSecond);
+                const row = compareRow(
+                  data.backtest1.stats[metric.key],
+                  data.backtest2.stats[metric.key],
+                  metric.better,
+                );
+                const deltaColor = deltaColorFor(row.delta, row.betterSecond);
                 return (
                   <tr key={metric.key}>
                     <td style={tdStyle}>{metric.label}</td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(left, metric)}
+                      {formatMetricRaw(row.left, metric)}
                     </td>
                     <td style={tdStyle}>
-                      {formatMetricRaw(right, metric)}
+                      {formatMetricRaw(row.right, metric)}
                     </td>
                     <td style={{ ...tdStyle, color: deltaColor }}>
-                      {formatMetric(delta, metric)}
+                      {formatMetric(row.delta, metric)}
                     </td>
                   </tr>
                 );

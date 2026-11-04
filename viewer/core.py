@@ -60,6 +60,7 @@ from shared.models import (  # noqa: F401 - re-exported for viewer/main.py and t
     EquityPoint,
     PortfolioStats,
     Trade,
+    resolve_defined_stat,
 )
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
@@ -1193,6 +1194,29 @@ def _canonical_stats_from_result(result: BacktestResult) -> dict:
     return {**cached_stats, **computed}
 
 
+def _defined_stat_value(
+    stats: dict | None,
+    key: str,
+    *,
+    scale: float = 1.0,
+    digits: int | None = None,
+) -> float | None:
+    """A stat the producer actually measured, or ``None``.
+
+    ``dict.get(key, 0)`` cannot tell "computed as zero" from "never computed";
+    :func:`resolve_defined_stat` can, because the producer names what it could
+    not compute in ``undefined_metrics``. A leftover ``NaN``/``Infinity`` (or a
+    non-numeric string) is not a measurement either, so it resolves to ``None``
+    as well. The client renders ``None`` as unavailable instead of grading it.
+    """
+    value = resolve_defined_stat(stats, key, None)
+    numeric = _safe_float(value, float("nan"))
+    if not math.isfinite(numeric):
+        return None
+    scaled = numeric * scale
+    return round(scaled, digits) if digits is not None else scaled
+
+
 # ─── API ──────────────────────────────────────────────────────────────────────
 
 
@@ -1206,14 +1230,18 @@ def _quick_stats_and_equity(
 ) -> dict:
     """Build lightweight list-card stats from persisted runner stats when available."""
     if not trades and not equity_curve:
+        # No trades means no return series, so Sharpe, CAGR, PSR and p-value were
+        # never computed. Reporting 0 / 0 / 1.0 here would present an empty run
+        # as a measured result (and 1.0 is the worst attainable p-value). The
+        # zeroes that *are* real - no profit, no drawdown - stay zero.
         return {
-            "sharpe": 0,
-            "cagr": 0,
+            "sharpe": None,
+            "cagr": None,
             "max_drawdown_pct": 0,
             "net_profit": 0,
             "net_profit_pct": 0,
             "total_return": 0,
-            "p_value": 1.0,
+            "p_value": None,
             "psr": None,
             "equity_mini": [],
         }
@@ -1291,11 +1319,14 @@ def _quick_stats_and_equity(
                 max_dd = dd
         max_drawdown_pct = round(max_dd * 100, 2)
 
-    cagr = round(_safe_float(derived_stats.get("cagr")) * 100, 2)
-    sharpe = round(_safe_float(derived_stats.get("sharpe_ratio")), 3)
+    cagr_value = _defined_stat_value(derived_stats, "cagr")
+    cagr = round(cagr_value * 100, 2) if cagr_value is not None else None
+    sharpe_value = _defined_stat_value(derived_stats, "sharpe_ratio")
+    sharpe = round(sharpe_value, 3) if sharpe_value is not None else None
 
-    psr_val = derived_stats.get("psr")
-    p_value = round(_safe_float(derived_stats.get("p_value"), 1.0), 6)
+    psr_val = _defined_stat_value(derived_stats, "psr")
+    p_value_value = _defined_stat_value(derived_stats, "p_value")
+    p_value = round(p_value_value, 6) if p_value_value is not None else None
 
     equity_mini = _downsample_numeric_minmax([float(v) for v in equity if isinstance(v, (int, float))], limit=50)
 
@@ -1394,6 +1425,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
             / (result.meta.initial_capital or 100000)
         )
 
+    cagr_value = _defined_stat_value(raw, "cagr")
     stats = {
         "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
         "net_profit_pct": round(
@@ -1402,9 +1434,12 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
             * 100,
             2,
         ),
-        "sharpe": raw.get("sharpe_ratio", 0),
-        "sortino": raw.get("sortino_ratio", 0),
-        "calmar": raw.get("calmar_ratio", 0),
+        # Risk-adjusted ratios are named in `undefined_metrics` when the return
+        # series was too short to compute them. `raw.get(key, 0)` published that
+        # absence as a measured 0, so the detail card graded an unmeasurable run.
+        "sharpe": _defined_stat_value(raw, "sharpe_ratio"),
+        "sortino": _defined_stat_value(raw, "sortino_ratio"),
+        "calmar": _defined_stat_value(raw, "calmar_ratio"),
         "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
         "win_rate": round(
             (win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)) * 100,
@@ -1425,7 +1460,7 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
         "best_trade": best_trade,
         "worst_trade": worst_trade,
-        "cagr": round(_safe_float(raw.get("cagr")) * 100, 2),
+        "cagr": round(cagr_value * 100, 2) if cagr_value is not None else None,
         "total_return": round(total_return_fraction, 6),
         "expectancy": 0,  # computed below
     }
@@ -1437,8 +1472,8 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         wr * winner_average + (1 - wr) * loser_average, 2
     )
     # PSR / p-value
-    stats["psr"] = raw.get("psr")
-    stats["p_value"] = raw.get("p_value", 1.0)
+    stats["psr"] = _defined_stat_value(raw, "psr")
+    stats["p_value"] = _defined_stat_value(raw, "p_value")
     return stats
 
 

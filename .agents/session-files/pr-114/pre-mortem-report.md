@@ -38,8 +38,10 @@ signal ids. The response carries a warning and the UI toasts it
 delete there is nothing in the application that says *which* submission was in
 flight, so reconciling the broker fill with a deployment is manual archaeology.
 
-**Status:** accepted, documented in the endpoint. Recommended follow-up: put the
-in-flight claim ids (or signal ids) into the audit detail before the delete.
+**Status:** the delete handler now reads the drain verdict and toasts a non-clean
+one (dc5dcd4); it used to discard the response. The evidence gap remains: the
+audit keeps counts only. Recommended follow-up: put the in-flight claim ids (or
+signal ids) into the audit detail before the delete.
 
 ### F3 — Re-pointing an ACTIVE deployment leaves the listener on the old account (low likelihood, medium impact)
 
@@ -49,8 +51,12 @@ submission is in flight (`shared/database.py:3349`). An idle-but-ACTIVE deployme
 can therefore move accounts while the running listener still holds the old one
 until the next sync. The frontend never sets the flag, so this is an API-only path.
 
-**Status:** deliberate and documented at the model. Worth one line in the PR body
-so the reviewer does not read it as an oversight.
+**Status:** resolved after the review round. `allow_active` is gone: an ACTIVE
+deployment is refused outright (the listener holds the old account, so pausing is
+a precondition), and the target account is re-verified against the broker
+immediately before the write, like arming. Tests:
+`test_a_repoint_of_an_active_deployment_is_refused`,
+`test_a_repoint_is_refused_when_the_broker_cannot_confirm_the_target`.
 
 ### F4 — A live control is issued twice because the first call is slow (low impact)
 

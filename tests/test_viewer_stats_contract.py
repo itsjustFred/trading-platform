@@ -398,3 +398,100 @@ def test_the_backtest_info_payload_publishes_the_artifact_provenance():
     assert payload["requested_data_source"] == "dukascopy"
     assert payload["asset_classes"] == ["forex"]
     assert payload["data_files"] == ["EURUSD.csv"]
+
+
+def test_compare_payload_keeps_an_undefined_metric_absent(monkeypatch):
+    """The compare endpoint must not turn an unmeasured metric into a 0.
+
+    `_safe_float(raw.get("sharpe_ratio"), 0.0)` published an undefined Sharpe as
+    a measured zero, and an undefined p-value as the worst attainable 1.0. The
+    side-by-side view then ranked a run that could not be measured. The payload
+    carries null instead, and a real zero survives as zero.
+    """
+    import viewer.main as viewer_main_module
+
+    result = _result([])
+    result.stats = {
+        "total_pnl": 0.0,
+        "total_return": 0.0,
+        "cagr": 0.0,
+        "max_drawdown_pct": 0.0,
+        "win_rate": 0.0,
+        "total_trades": 0,
+        "sharpe_ratio": None,
+        "psr": None,
+        "p_value": None,
+        "undefined_metrics": ["sharpe_ratio", "psr", "p_value"],
+    }
+    monkeypatch.setattr(viewer_main_module, "_load_result", lambda _id: result)
+
+    payload = viewer_main_module._backtest_compare_payload("undef-compare")
+
+    assert payload["stats"]["sharpe_ratio"] is None
+    assert payload["stats"]["psr"] is None
+    assert payload["stats"]["p_value"] is None
+    # A measured zero is still a measurement, not an absence.
+    assert payload["stats"]["total_return"] == 0.0
+    assert payload["stats"]["max_drawdown"] == 0.0
+
+
+def test_compare_delta_is_absent_when_either_side_is_undefined():
+    """An unknown side has no delta; 0.0 would invent one."""
+    from viewer.main import _compare_stat_delta
+
+    left = {"sharpe_ratio": 1.0, "p_value": None}
+    right = {"sharpe_ratio": 2.0, "p_value": 0.04}
+
+    assert _compare_stat_delta(left, right, "sharpe_ratio") == 1.0
+    assert _compare_stat_delta(left, right, "p_value") is None
+    assert _compare_stat_delta({}, right, "sharpe_ratio") is None
+
+
+def test_detail_stats_payload_keeps_undefined_ratios_absent():
+    """The detail card must show an em dash, not grade a failed computation."""
+    from viewer import core
+
+    result = _result(_trades())
+    result.stats = {
+        "total_pnl": 0.0,
+        "total_return": 0.0,
+        "cagr": None,
+        "max_drawdown_pct": 0.0,
+        "sharpe_ratio": None,
+        "sortino_ratio": None,
+        "calmar_ratio": None,
+        "psr": None,
+        "p_value": None,
+        "undefined_metrics": [
+            "cagr",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "calmar_ratio",
+            "psr",
+            "p_value",
+        ],
+    }
+
+    payload = core._stats_payload_from_result(result)
+
+    assert payload["sharpe"] is None
+    assert payload["sortino"] is None
+    assert payload["calmar"] is None
+    assert payload["cagr"] is None
+    assert payload["psr"] is None
+    assert payload["p_value"] is None
+
+
+def test_quick_stats_keep_undefined_ratios_absent():
+    """An empty backtest has no return series, so its ratios are not zero."""
+    from viewer import core
+
+    payload = core._quick_stats_and_equity([], 100000.0, "2021-01-01", "2021-02-01")
+
+    assert payload["sharpe"] is None
+    assert payload["cagr"] is None
+    assert payload["p_value"] is None
+    assert payload["psr"] is None
+    # Zero profit and zero drawdown *are* measured facts.
+    assert payload["net_profit"] == 0
+    assert payload["max_drawdown_pct"] == 0

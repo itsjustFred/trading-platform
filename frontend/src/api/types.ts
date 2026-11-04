@@ -405,9 +405,11 @@ export interface OptimizationDetail {
 export interface BacktestStats {
   net_profit: number;
   net_profit_pct: number;
-  cagr: number;
-  sharpe: number;
-  sortino: number;
+  // null when the return series was too short to compute the metric; the card
+  // renders an em dash instead of grading it.
+  cagr: number | null;
+  sharpe: number | null;
+  sortino: number | null;
   max_drawdown_pct: number;
   max_drawdown_duration: string;
   win_rate: number;
@@ -419,10 +421,10 @@ export interface BacktestStats {
   best_trade: number;
   worst_trade: number;
   avg_bars_held: number;
-  calmar: number;
+  calmar: number | null;
   expectancy: number;
-  psr?: number;
-  p_value?: number;
+  psr?: number | null;
+  p_value?: number | null;
   [key: string]: unknown;
 }
 
@@ -1549,14 +1551,16 @@ export interface AgentConvertRequest {
 }
 
 export interface BacktestCompareStats {
-  total_return: number;
-  net_profit: number;
-  sharpe_ratio: number;
-  psr: number;
-  p_value: number;
-  cagr: number;
-  max_drawdown: number;
-  win_rate: number;
+  // null means the producer could not compute the metric; it must render as
+  // unavailable, never as a measured zero.
+  total_return: number | null;
+  net_profit: number | null;
+  sharpe_ratio: number | null;
+  psr: number | null;
+  p_value: number | null;
+  cagr: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
   trade_count: number;
 }
 
@@ -1581,14 +1585,15 @@ export interface BacktestsCompareResponse {
   backtest1: BacktestCompareSide;
   backtest2: BacktestCompareSide;
   comparison: {
-    delta_return: number;
-    delta_net_profit: number;
-    delta_sharpe: number;
-    delta_psr: number;
-    delta_p_value: number;
-    delta_cagr: number;
-    delta_max_drawdown: number;
-    delta_win_rate: number;
+    // null when either side is unavailable: an unknown value has no delta.
+    delta_return: number | null;
+    delta_net_profit: number | null;
+    delta_sharpe: number | null;
+    delta_psr: number | null;
+    delta_p_value: number | null;
+    delta_cagr: number | null;
+    delta_max_drawdown: number | null;
+    delta_win_rate: number | null;
     delta_trade_count: number;
   };
 }

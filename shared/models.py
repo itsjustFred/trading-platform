@@ -254,9 +254,14 @@ class LiveDeploymentAccountUpdateRequest(BaseModel):
     """Payload for re-pointing a deployment at a different broker account."""
 
     account_id: str
-    # Re-pointing an ACTIVE deployment leaves the running listener holding the
-    # old account until the next sync, so it must be opted into explicitly.
-    allow_active: bool = False
+    # Re-pointing is refused while the deployment is ACTIVE: the running
+    # listener and its adapter still hold the old account, so the row would move
+    # while real orders keep reaching the previous one. Pause first.
+    #
+    # A lease that expired without a release means the broker outcome was never
+    # observed. That is not "nothing was in flight", so the re-point is refused
+    # unless the operator confirms they checked the old account.
+    acknowledge_unreconciled_submissions: bool = False
     # Re-pointing moves which account real orders reach. Required.
     confirmation: LiveControlConfirmation | None = None
 
