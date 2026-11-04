@@ -200,6 +200,52 @@ def test_refused_close_restores_the_stop_it_cancelled() -> None:
     assert restored[0].stop_price == 190.0
 
 
+def test_a_wrong_side_stop_does_not_count_as_protection() -> None:
+    """A buy stop on a long is an entry, not protection.
+
+    The flatten cancels the position's sell stop first, but a buy stop on the same
+    symbol can still be working - another intent's entry, or a cancel the broker
+    accepted without applying. Counting it as protection reports the long as
+    protected while it is naked, so the restore has to look at the side.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "buy-stop", "AAPL", "buy", order_type="stop", qty=10.0, stop_price=210.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    restored = asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0))
+
+    assert restored is True
+    submitted = [order for order in client.submitted if order.stop_price == 190.0]
+    assert len(submitted) == 1, "the long was left without a reducing-side stop"
+    assert str(getattr(submitted[0].side, "value", submitted[0].side)).lower() == "sell"
+
+
+def test_a_reducing_side_stop_is_not_duplicated() -> None:
+    """The other half: a stop that does protect the position is left alone.
+
+    Re-submitting next to it would leave two stops on one position, and the second
+    becomes an orphan the moment the first fills.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    assert client.submitted == []
+
+
 def test_refused_close_without_a_restorable_stop_is_reported_as_naked() -> None:
     client = _FakeTradingClient(
         orders=[

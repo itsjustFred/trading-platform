@@ -91,6 +91,13 @@ def _order_symbol(order: Any) -> str:
     return str(_order_attr(order, "symbol", "") or "").strip().upper()
 
 
+def _order_side(order: Any) -> str:
+    """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
+    raw = _order_attr(order, "side", "")
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
 def _alpaca_timeframe(value: str):
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -1305,13 +1312,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return OrderSide, TimeInForce, StopOrderRequest
 
     @staticmethod
-    def _has_working_stop(orders: list[Any], symbol: str) -> bool:
+    def _has_working_stop(orders: list[Any], symbol: str, side: str) -> bool:
+        """Whether a stop that actually protects this position is still working.
+
+        The side matters. A buy stop on a long is an entry for a different intent,
+        not a protection: treating it as one after the position's own sell stop was
+        cancelled reports the position as protected while it is naked. Only a stop
+        on the reducing side counts, and a bracket's leg counts only if that leg
+        itself is on the reducing side.
+        """
+        wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
         for order in orders:
             if _order_symbol(order) != symbol:
                 continue
-            order_type = str(_order_attr(order, "order_type", "") or "").lower()
-            if "stop" in order_type:
-                return True
+            for candidate in (order, *_order_legs(order)):
+                candidate_symbol = _order_symbol(candidate)
+                if candidate_symbol not in {"", symbol}:
+                    continue
+                order_type = str(_order_attr(candidate, "order_type", "") or "").lower()
+                if "stop" not in order_type:
+                    continue
+                if _order_side(candidate) == wanted:
+                    return True
         return False
 
     async def _restore_stop(
@@ -1342,7 +1364,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
             )
             working = None
-        if working is not None and self._has_working_stop(working, symbol):
+        if working is not None and self._has_working_stop(working, symbol, side):
             logger.warning(
                 "Not restoring a stop: one still works at the broker",
                 extra={"data": {"symbol": symbol}},
