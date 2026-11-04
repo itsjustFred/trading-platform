@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 # isort: split
@@ -36,25 +35,24 @@ _guard.ensure_own_checkout("backtest_to_validation_ref")
 # that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
 # take this script off the roster and out of the gate that keeps the guard alive.
 import shared  # noqa: F401
-from scripts._safe_path import reject_traversal, under_root
+from scripts._safe_path import under_root
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 from validation.reference import ValidationReference, resolve_initial_capital
 
 
 def _safe_input_path(raw: Path) -> Path:
-    """Refuse a traversal segment in the caller-supplied input path.
+    """Confine the caller-supplied input path to the working tree.
 
-    The input is read, not written, and may legitimately live outside the repo - so this is the
-    traversal check only, not the ``under_root`` confinement ``compare_strategy_metrics.py`` applies
-    to its output. The point is the legible failure: a runbook quoting a path an LLM produced gets
-    "name the directory directly" instead of a confusing half-populated result.
+    The input is read, not written, but it is still a path a runbook may have quoted from an LLM,
+    and a read outside the tree the operator is working in is never what the invocation meant. The
+    same confinement as the output, so both ends of the conversion say the same thing.
     """
-    return reject_traversal(raw, field="input")
+    return under_root(raw, root=Path.cwd(), field="input")
 
 
 def _load_backtest_result(path: Path) -> BacktestResult:
-    source = Path(os.path.realpath(_safe_input_path(path)))
+    source = _safe_input_path(path)
     if not source.is_file():
         raise SystemExit(f"input: not a regular file ({source})")
     d = json.loads(source.read_text(encoding="utf-8"))
