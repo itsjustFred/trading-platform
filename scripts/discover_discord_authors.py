@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,7 +113,10 @@ def _write_record(
 
     The write itself goes through the shared atomic-write helper, the same one every
     other persisted artifact uses: it owns the filesystem sink and validates the
-    target, and a crash cannot leave a half-written allowlist behind.
+    target, and a crash cannot leave a half-written allowlist behind. The helper
+    refuses ``..`` and symlinked parents, so the destination is resolved first -
+    ``--out ../durable/authors.json`` still lands where the operator pointed, it
+    just arrives as an absolute path the helper can validate.
     """
     if out is None:
         return
@@ -124,8 +128,9 @@ def _write_record(
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bots": results,
     }
-    write_text_atomically(out, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(f"recorded to {out}", file=sys.stderr)
+    target = Path(os.path.realpath(out))
+    write_text_atomically(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"recorded to {target}", file=sys.stderr)
 
 
 def _build_parser() -> argparse.ArgumentParser:

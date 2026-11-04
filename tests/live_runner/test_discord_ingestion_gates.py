@@ -3122,6 +3122,32 @@ class TestAuthorDiscoveryRecord:
         assert "401" in record["bots"][0]["error"]
         assert record["bots"][0]["channel_id"] == "111"
 
+    def test_a_relative_parent_path_still_lands_where_the_operator_pointed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`--out ../durable/authors.json` has to keep working.
+
+        The shared atomic-write helper refuses `..` components and symlinked
+        parents, but that is a property of the helper, not of this tool's contract:
+        the operator named a destination and the record has to land there, durable
+        copy included. The destination is resolved before the helper sees it.
+        """
+        import json
+        from pathlib import Path
+
+        module = self._script()
+        working = tmp_path / "work"
+        durable = tmp_path / "durable"
+        working.mkdir()
+        durable.mkdir()
+        monkeypatch.chdir(working)
+
+        module._write_record([], Path("..") / "durable" / "authors.json")
+
+        written = durable / "authors.json"
+        assert written.is_file(), "the record did not land at the requested destination"
+        assert json.loads(written.read_text(encoding="utf-8"))["bots"] == []
+
     def test_the_default_path_is_gitignored(self) -> None:
         """An author id is the ingestion allowlist, so it must never be committed.
 
