@@ -538,3 +538,23 @@ def test_portfolio_stats_round_trip_preserves_an_undefined_p_value():
 
     assert stats.p_value is None
     assert stats.to_dict()["p_value"] is None
+
+
+def test_empty_portfolio_does_not_invent_a_worst_case_psr_or_p_value():
+    """No component returns means neither ratio was computed.
+
+    `0.0` for PSR and `1.0` for p-value are the worst attainable readings, not
+    neutral defaults; an empty portfolio must publish them as absent.
+    """
+    from datetime import datetime, timezone
+
+    import viewer.main as viewer_main_module
+
+    _correlation, _equity, stats = viewer_main_module._portfolio_combined_metrics(
+        [],
+        account_capital=100000.0,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert stats["psr"] is None
+    assert stats["p_value"] is None

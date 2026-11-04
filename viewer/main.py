@@ -11707,7 +11707,7 @@ def _portfolio_combined_metrics(
             "calmar_ratio": 0.0,
             "total_return": 0.0,
             "max_drawdown_duration": 0,
-            "psr": 0.0,
+            "psr": None,
             "p_value": None,
         }
 
