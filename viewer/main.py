@@ -12106,7 +12106,16 @@ async def get_live_accounts() -> list[dict[str, Any]]:
             )
         )
     if persisted:
-        await asyncio.to_thread(upsert_live_accounts, persisted)
+        try:
+            await asyncio.to_thread(upsert_live_accounts, persisted)
+        except Exception as exc:  # pragma: no cover - defensive
+            # Discovery already succeeded; failing to write the rows must not turn
+            # the read into a 500. The accounts are still returned, and the next
+            # call retries the upsert.
+            logger.warning(
+                "Could not persist the discovered live accounts",
+                extra={"data": {"accounts": len(persisted), "error": repr(exc)}},
+            )
     return discovered
 
 

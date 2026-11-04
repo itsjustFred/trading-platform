@@ -112,6 +112,16 @@ test("StatCard delegates formatting instead of formatting inline", async () => {
   assert.doesNotMatch(statCard, /\$\$\{abs\.toLocaleString/);
 });
 
+test("StatCard treats an infinite value as unavailable, not as a huge gain", async () => {
+  // `!Number.isNaN(Infinity)` is true, so the NaN check let an infinite stat
+  // through as a measurement: it rendered "Infinity%" through the percent branch
+  // and was coloured as a gain. An infinite value is a failed computation.
+  const statCard = await read("../src/components/StatCard.tsx");
+
+  assert.match(statCard, /const finite = Number\.isFinite\(numVal\)/);
+  assert.doesNotMatch(statCard, /const finite = !Number\.isNaN\(numVal\)/);
+});
+
 test("a pause that had to wait out submissions is never reported as a failure", async () => {
   // The backend answers 200 with the new status plus an explicit, possibly
   // non-clean drain outcome. Typing that as LiveDeploymentConfig dropped the

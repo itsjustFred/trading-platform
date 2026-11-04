@@ -44,7 +44,10 @@ export const StatCard = memo(function StatCard({
   percentScale = "points",
 }: StatCardProps) {
   const numVal = typeof value === "number" ? value : parseFloat(String(value ?? ""));
-  const finite = !Number.isNaN(numVal);
+  // `Number.isFinite`, not `!Number.isNaN`: `Infinity` is not NaN, so the NaN
+  // check let it through as a real measurement - it rendered "Infinity%" and was
+  // coloured as a gain. An infinite stat is a failed computation, not a result.
+  const finite = Number.isFinite(numVal);
   // An unavailable metric renders as an em dash, never as 0 / $0 / 0.00%, so a
   // missing value is never mistaken for a genuine zero.
   const unavailable = isUnavailableStatValue(value);

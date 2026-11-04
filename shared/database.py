@@ -2727,6 +2727,13 @@ def ensure_live_account(
 
 
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
+    """Persist what discovery reported, without erasing what it did not.
+
+    Discovery only sees what the broker answered. A missing ``broker_login`` or
+    ``ctid`` therefore means "not observed this time", not "forget it": those two
+    fields are the identity a deployment is armed against, so writing ``None``
+    over them would silently unarm an account that is still trading.
+    """
     init_db()
     with get_session() as session:
         for account in accounts:
@@ -2736,8 +2743,10 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
                 continue
             current.broker = account.broker
             current.name = account.name
-            current.ctid = account.ctid
-            current.broker_login = account.broker_login
+            if account.ctid is not None:
+                current.ctid = account.ctid
+            if account.broker_login is not None:
+                current.broker_login = account.broker_login
             session.add(current)
         session.commit()
 

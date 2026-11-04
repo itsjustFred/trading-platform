@@ -1418,6 +1418,59 @@ def test_get_live_accounts_still_creates_unknown_accounts(isolated_db, monkeypat
         assert row.name == "new"
 
 
+def test_discovery_does_not_erase_a_stored_identity(isolated_db, monkeypatch) -> None:
+    """A read must not forget the broker identity it cannot re-derive.
+
+    Discovery reports what the broker answered. An account whose ``broker_login``
+    or ``ctid`` is missing from that answer was not observed *this time* - writing
+    ``None`` over the stored value would unarm a deployment that is still trading,
+    and no later read could put the identity back.
+    """
+    database = isolated_db[0]
+    database.ensure_live_account(
+        "acc-keep",
+        "ctrader",
+        name="keep",
+        ctid="ctid-keep",
+        broker_login="login-keep",
+        is_demo=True,
+    )
+
+    _call_get_live_accounts(
+        monkeypatch,
+        [{"id": "acc-keep", "broker": "ctrader", "name": "renamed"}],
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acc-keep")
+        assert row.name == "renamed", "the observed field should still be updated"
+        assert row.ctid == "ctid-keep"
+        assert row.broker_login == "login-keep"
+        assert row.is_demo is True
+
+
+def test_a_failed_persist_does_not_fail_the_read(isolated_db, monkeypatch) -> None:
+    """The read already succeeded; a write failure must not turn it into a 500.
+
+    Persisting is a side effect of discovery, not its purpose. Losing it costs the
+    account a deployment-target row until the next call, which is strictly better
+    than an accounts page that cannot load because a write failed.
+    """
+    import viewer.main as viewer_main_module
+
+    def _explode(_accounts) -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(viewer_main_module, "upsert_live_accounts", _explode)
+
+    payload = _call_get_live_accounts(
+        monkeypatch,
+        [{"id": "acc-1", "broker": "alpaca", "name": "One", "is_demo": True}],
+    )
+
+    assert [item["id"] for item in payload] == ["acc-1"]
+
+
 def test_discovered_payload_without_is_demo_reports_it_as_unasserted(
     isolated_db, monkeypatch
 ) -> None:
