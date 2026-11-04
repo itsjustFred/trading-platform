@@ -38,6 +38,7 @@ from live_runner.credential_env import (
 )
 from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 from live_runner.signal_sources.discord_source import DiscordSignalSource
+from shared.atomic_io import write_text_atomically
 
 
 async def _observe(
@@ -106,9 +107,12 @@ def _write_record(
     ``--out`` is an operator-supplied path and is honoured as given - a tool that
     silently redirected an explicit destination would be worse than useless when
     the whole point is to put the record somewhere durable. What is refused is a
-    *non-file* target: the write is opened in a create/truncate mode, so pointing
-    it at a device, a socket, or a directory is a way to hang the process or
-    scribble on something that is not a record.
+    *non-file* target: pointing it at a directory, a device or a socket is a way to
+    hang the process or scribble on something that is not a record.
+
+    The write itself goes through the shared atomic-write helper, the same one every
+    other persisted artifact uses: it owns the filesystem sink and validates the
+    target, and a crash cannot leave a half-written allowlist behind.
     """
     if out is None:
         return
@@ -116,14 +120,11 @@ def _write_record(
         raise ValueError(
             f"--out {out} is an existing directory; give a file path for the record"
         )
-    out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bots": results,
     }
-    out.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_text_atomically(out, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"recorded to {out}", file=sys.stderr)
 
 
