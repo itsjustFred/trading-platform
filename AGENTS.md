@@ -2,7 +2,7 @@
 
 This repo executes live trades as well as critical backtests and has a very high standard for correctness, reliability, clarity, maintainability and testing.
 Keep scripts and paths portable across Linux, Windows and macOS.
-When creating an issue or PR, mention model as well as harness at the bottom of its body.
+When creating an issue or PR, mention model as well as harness at the bottom of its body. If using t3code, include that as well, but don't leave out original harness.
 Unless explicitly told, never push directly to main.
 Use conventional commit style messages unless not appropriate.
 If making changes, also check if you need to update other things as docs, skills, etc.
