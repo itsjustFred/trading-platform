@@ -1404,3 +1404,204 @@ def test_an_unclassified_failure_does_not_name_a_cause(caplog) -> None:
     assert "auth" not in joined.lower().replace("not classified", ""), (
         "the fallback guessed a cause, which is what sent operators to refresh a working token"
     )
+
+
+def test_an_unreadable_cumulative_volume_is_not_treated_as_a_quantity() -> None:
+    """`executedVolume` feeds the persistence cap and the dedupe key, so only a real fill counts.
+
+    An unset protobuf field reads back as `0.0`, and a broker bug could send a negative or a
+    NaN. Returning those verbatim would let a `0` cumulative produce the key
+    `...:cum:0` and hand `save_live_execution_up_to_cumulative` a cap of zero - both are
+    "no readable quantity" and must collapse to `0.0` so the caller takes its no-cumulative path.
+    """
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(None) == 0.0
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(SimpleNamespace()) == 0.0
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=0)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=-500_000)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("nan"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("inf"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume="not-a-number")
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=500_000)
+        )
+        == 500_000.0
+    )
+
+
+# ─── Reconciliation parity with the stream path, and commission scaling ──────
+
+
+def _reconcile_adapter():
+    adapter = _execution_adapter()
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=2, PARTIALLY_FILLED=3)
+    return adapter
+
+
+def _recovered_deal(deal_id: int, volume: int, **extra):
+    return SimpleNamespace(
+        dealId=deal_id,
+        dealStatus=2,
+        orderId=45678,
+        symbolId=1,
+        filledVolume=volume,
+        executionPrice=1.2345,
+        executionTimestamp=1_700_000_000_000 + deal_id,
+        utcLastUpdateTimestamp=0,
+        commission=0,
+        **extra,
+    )
+
+
+def _reconcile(adapter, signal_id: str, deals, cumulative: int | None) -> int:
+    from uuid import UUID
+
+    order = SimpleNamespace(executedVolume=cumulative) if cumulative is not None else None
+    details = SimpleNamespace(order=[order] if order is not None else [], deal=list(deals))
+    return asyncio.run(
+        adapter._persist_recovered_deals(
+            signal_id=signal_id,
+            signal_uuid=UUID(signal_id),
+            broker_order_id="45678",
+            details_res=details,
+        )
+    )
+
+
+def test_reconciliation_grows_a_deal_amended_to_a_larger_volume(isolated_db) -> None:
+    """Same dealId, larger filled volume: the stored quantity grows once, nothing double counts."""
+    database = isolated_db[0]
+    signal_id = "55555555-5555-4555-8555-555555555555"
+    _seed_signal(database, signal_id)
+    adapter = _reconcile_adapter()
+
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 400_000)], 400_000) == 1
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 1_000_000)], 1_000_000) == 1
+    # A repeat of the amended state is a redelivery.
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 1_000_000)], 1_000_000) == 0
+
+    rows = _rows(database)
+    assert [row[0] for row in rows] == ["ctrader:deal:2001"], rows
+    assert rows[0][2] == pytest.approx(1000.0)
+
+
+def test_reconciliation_heals_an_out_of_order_stream(isolated_db) -> None:
+    """Deal 2 (cumulative 1,000,000) arrives before deal 1 (cumulative 400,000).
+
+    The stream path stores deal 2's 600 and then cannot fit deal 1 under the older, lower
+    cumulative, so only 600 of 1000 is stored. Reconciliation re-reads the order with its final
+    cumulative and stores the missing 400 - once.
+    """
+    database = isolated_db[0]
+    signal_id = "66666666-6666-4666-8666-666666666666"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    def _event(deal_id: int, deal_volume: int, cumulative: int):
+        event = _fill_event(signal_id=signal_id, deal_id=deal_id, volume=deal_volume)
+        event.order = SimpleNamespace(
+            orderId=45678, clientOrderId=signal_id, executedVolume=cumulative
+        )
+        return event
+
+    asyncio.run(adapter._persist_execution_event(_event(3002, 600_000, 1_000_000)))
+    asyncio.run(adapter._persist_execution_event(_event(3001, 400_000, 400_000)))
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(600.0), (
+        "the premise of the scenario changed: the stale event was expected to be skipped"
+    )
+
+    healer = _reconcile_adapter()
+    deals = [_recovered_deal(3001, 400_000), _recovered_deal(3002, 600_000)]
+    assert _reconcile(healer, signal_id, deals, 1_000_000) == 1
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(1000.0)
+    # Running it again changes nothing.
+    assert _reconcile(healer, signal_id, deals, 1_000_000) == 0
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(1000.0)
+
+
+def _commission_rows(database) -> list[float]:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return [row[0] for row in conn.execute("SELECT commission FROM live_executions")]
+    finally:
+        conn.close()
+
+
+def test_stream_commission_is_scaled_by_the_deals_money_digits(isolated_db) -> None:
+    """`ProtoOADeal.commission` is int64 minor units: 350 with moneyDigits=2 is 3.50."""
+    database = isolated_db[0]
+    signal_id = "77777777-7777-4777-8777-777777777777"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+    event = _fill_event(signal_id=signal_id, deal_id=4001)
+    event.deal.commission = 350
+    event.deal.moneyDigits = 2
+
+    asyncio.run(adapter._persist_execution_event(event))
+
+    assert _commission_rows(database) == [pytest.approx(3.5)]
+
+
+def test_reconciled_commission_is_scaled_by_the_deals_money_digits(isolated_db) -> None:
+    database = isolated_db[0]
+    signal_id = "88888888-8888-4888-8888-888888888888"
+    _seed_signal(database, signal_id)
+    adapter = _reconcile_adapter()
+
+    deal = _recovered_deal(5001, 500_000, moneyDigits=5)
+    deal.commission = 350_000
+
+    assert _reconcile(adapter, signal_id, [deal], None) == 1
+    assert _commission_rows(database) == [pytest.approx(3.5)]
+
+
+def test_commission_scaling_uses_real_protobuf_presence() -> None:
+    """With a real `ProtoOADeal`, an unset commission is zero and needs no moneyDigits."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+    from live_runner.ctrader_adapter import _deal_commission
+
+    assert _deal_commission(None) == 0.0
+    assert _deal_commission(ProtoOADeal()) == 0.0
+    deal = ProtoOADeal(commission=-1234, moneyDigits=3)
+    assert _deal_commission(deal) == pytest.approx(-1.234)
+    # A genuine moneyDigits of 0 is honoured, not replaced by the default.
+    assert _deal_commission(ProtoOADeal(commission=7, moneyDigits=0)) == pytest.approx(7.0)
+
+
+def test_money_digits_fallback_is_logged(caplog) -> None:
+    from live_runner.base_adapter import DEFAULT_MONEY_DIGITS, money_digits_from_trader
+
+    with caplog.at_level("WARNING"):
+        digits = money_digits_from_trader(SimpleNamespace())
+    assert digits == DEFAULT_MONEY_DIGITS
+    assert any("moneyDigits" in record.getMessage() for record in caplog.records), (
+        "the fallback to the default scale was silent"
+    )

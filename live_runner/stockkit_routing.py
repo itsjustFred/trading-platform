@@ -47,6 +47,9 @@ def expected_account_number_for_route(
        label matches the route. This keeps routing correct when paper accounts
        are re-created, which silently invalidates any hardcoded number.
     3. The static fallback table.
+
+    Raises ``ValueError`` when step 2 is ambiguous (several blocks share the label but
+    name different account numbers); that must never resolve by file order.
     """
     normalized = normalize_stockkit_route(route)
     if not normalized:
@@ -57,6 +60,7 @@ def expected_account_number_for_route(
     if explicit:
         return explicit
 
+    labelled: dict[str, str] = {}
     for key, value in env.items():
         match = _INDEXED_BLOCK.match(str(key))
         if match is None:
@@ -65,7 +69,19 @@ def expected_account_number_for_route(
             continue
         number = str(env.get(f"ALPACA_ACCOUNT_NUMBER_ACC{match.group('index')}", "")).strip()
         if number:
-            return number
+            labelled[str(key)] = number
+    if len(set(labelled.values())) > 1:
+        # Two blocks carry the same label but name different accounts. Picking the first
+        # in file order would route real orders to whichever block happens to come first,
+        # and falling through to the static table would hide the misconfiguration. Refuse.
+        raise ValueError(
+            f"Ambiguous {normalized.title()} route: {len(labelled)} ALPACA_ACCOUNT_NAME_ACC{{N}} "
+            f"blocks carry that label ({', '.join(sorted(labelled))}) and name different "
+            "account numbers; give each account a unique label or set "
+            f"STOCKKIT_ACCOUNT_NUMBER_{normalized.upper()}"
+        )
+    if labelled:
+        return next(iter(labelled.values()))
 
     return STOCKKIT_ACCOUNT_ROUTES.get(normalized, "")
 

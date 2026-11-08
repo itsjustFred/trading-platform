@@ -8626,7 +8626,10 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Failed to rename strategy %s: %s", _log_safe(name), exc)
+        logger.exception(
+            "Failed to rename strategy",
+            extra={"data": {"strategy": _log_safe(name), "error": str(exc)}},
+        )
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
@@ -11426,7 +11429,10 @@ async def get_optimization(optimization_id: str) -> dict[str, Any]:
     try:
         payload = _load_optimization_payload(optimization_id)
     except (OSError, TypeError, ValueError) as exc:
-        logger.exception("Failed to load optimization '%s': %s", _log_safe(optimization_id), exc)
+        logger.exception(
+            "Failed to load optimization",
+            extra={"data": {"optimization": _log_safe(optimization_id), "error": str(exc)}},
+        )
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "optimization load")) from exc
 
     if payload is None:
@@ -11879,7 +11885,10 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
-        logger.exception("Failed to rename portfolio '%s': %s", _log_safe(portfolio_id), exc)
+        logger.exception(
+            "Failed to rename portfolio",
+            extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+        )
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "portfolio rename")) from exc
 
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
@@ -12579,6 +12588,45 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
     }
 
 
+def _validate_live_deployment_route(
+    deployment: LiveDeploymentConfig, account_payload: dict[str, Any]
+) -> None:
+    """Run the shared routing check, mapping its refusal onto a 400.
+
+    The accounts-env values are loaded here rather than left to the shared
+    resolver's ``os.environ`` fallback: ``.accounts.env`` is never installed into
+    the environment, so without them the per-route account number resolves empty
+    and the check cannot run at all. ``account_broker_login`` is the
+    *broker-reported* number, not the local account id - they are different
+    identifier spaces, and comparing the local id would reject every correctly
+    routed deployment.
+    """
+    from live_runner.credential_env import load_accounts_env_values
+    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+    try:
+        accounts_env_values = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    except Exception as exc:
+        # Same fallback the database layer uses: validation still runs and fails
+        # closed for a route it can no longer resolve, but it is not silent.
+        logger.warning(
+            "Could not load the accounts env for StockKit route validation: %s", exc
+        )
+        accounts_env_values = {}
+    try:
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=str(
+                account_payload.get("broker_login") or account_payload.get("ctid") or ""
+            ),
+            accounts_env_values=accounts_env_values,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=_public_value_error_detail(exc)
+        ) from exc
+
+
 @app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
@@ -12653,38 +12701,7 @@ async def create_live_deployment_endpoint(
         signal_config=signal_config_payload,
         settings=payload.settings or {},
     )
-    try:
-        # Same resolution order the database and daemon use: the configured
-        # account number, else the static table.
-        #
-        # Omitting it meant the API - the path an operator walks to create a
-        # Discord deployment - resolved `STOCKKIT_ACCOUNT_ROUTES`, the table
-        # a182e50 itself describes as matching none of the configured paper
-        # accounts. A correctly routed deployment was refused, and the refusal
-        # named a broker account the deployment was not on. The check is the
-        # shared chokepoint; its arguments were not, so this one call site
-        # validated against a different answer than every other.
-        try:
-            from live_runner.credential_env import load_accounts_env_values
-            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
-
-            route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
-        except Exception:
-            route_env = {}
-        validate_stockkit_deployment_route(
-            deployment,
-            # Routing compares BROKER identity, not the local account id. Without
-            # this the validator has nothing to compare against and fails closed,
-            # so every Discord create was rejected.
-            account_broker_login=str(
-                account_payload.get("broker_login")
-                or account_payload.get("ctid")
-                or ""
-            ),
-            accounts_env_values=route_env,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    _validate_live_deployment_route(deployment, account_payload)
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:

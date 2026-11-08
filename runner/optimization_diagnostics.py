@@ -223,9 +223,11 @@ class PlateauAnalysis:
     total_evaluated: int
     sensitivity: float | None = None
     neighbours: list[dict[str, Any]] = field(default_factory=list)
+    direction: str = "maximize"
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "direction": self.direction,
             "is_plateau": self.is_plateau,
             "plateau_width": self.plateau_width,
             "best_value": self.best_value,
@@ -243,17 +245,27 @@ def plateau_analysis(
     metric: str,
     tolerance: float = 0.01,
     min_neighbours: int = 1,
+    direction: str = "maximize",
 ) -> PlateauAnalysis | None:
     """Decide whether the winning parameter sits on a stable plateau.
 
     ``trials`` are mappings with at least ``parameter`` and ``metric``. The best
-    trial is the one with the highest metric. A genuine edge usually has several
+    trial is the one the study would select: the highest metric for
+    ``direction="maximize"``, the lowest for ``"minimize"`` (``p_value`` is a
+    minimize target; centring its plateau on the highest value would analyse the
+    WORST trial). Deltas are reported in "higher is better" space, so a trial
+    that is worse than the best has a negative ``delta`` in either direction;
+    the raw ``metric`` is carried unchanged. A genuine edge usually has several
     neighbouring parameter values scoring within ``tolerance`` (relative) of the
     best; a lone spike is the classic overfitting signature and is reported as
     ``is_plateau=False``.
 
     Returns None when there is nothing to analyse.
     """
+    normalised_direction = str(direction or "").strip().lower()
+    if normalised_direction not in {"maximize", "minimize"}:
+        raise ValueError("direction must be 'maximize' or 'minimize'")
+    sign = -1.0 if normalised_direction == "minimize" else 1.0
     rows = [
         trial
         for trial in trials
@@ -268,7 +280,7 @@ def plateau_analysis(
             numeric = float(value)
         except (TypeError, ValueError):
             return float("-inf")
-        return numeric if math.isfinite(numeric) else float("-inf")
+        return sign * numeric if math.isfinite(numeric) else float("-inf")
 
     best = max(rows, key=_score)
     best_score = _score(best)
@@ -324,6 +336,7 @@ def plateau_analysis(
         total_evaluated=len(rows),
         sensitivity=sensitivity,
         neighbours=neighbours[:10],
+        direction=normalised_direction,
     )
 
 

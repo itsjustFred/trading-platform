@@ -3268,20 +3268,23 @@ def test_recover_failed_services_respects_paused_and_stopped(monkeypatch):
         _service("failed-bot", ServiceStatus.FAILED),
         _service("running-bot", ServiceStatus.RUNNING),
     ]
-    updated: list[tuple[str, ServiceStatus]] = []
+    updated: list[tuple[str, ServiceStatus, dict]] = []
+
+    def _record(service_id, status, **kwargs):
+        updated.append((service_id, status, kwargs))
+        return services[2].model_copy(update={"status": status})
 
     monkeypatch.setattr(module, "list_services", lambda: services)
-    monkeypatch.setattr(
-        module,
-        "update_service_status",
-        lambda service_id, status: updated.append((service_id, status)),
-    )
+    monkeypatch.setattr(module, "update_service_status", _record)
 
     module._recover_failed_services()
 
     assert len(updated) == 1
     assert updated[0][0] == str(services[2].id)
     assert updated[0][1] == ServiceStatus.RUNNING
+    # The daemon is the automated caller: it must opt into the PAUSED floor
+    # explicitly, because the default belongs to the operator's own writes.
+    assert updated[0][2] == {"respect_operator_intent": True}
 
 
 # ── Cleanup 15-A: unknown signal actions must never become SELL ────────────────
@@ -4667,9 +4670,58 @@ def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
     monkeypatch.setattr(
         module,
         "update_service_status",
-        lambda *_args: service.model_copy(update={"status": ServiceStatus.RUNNING}),
+        lambda *_args, **_kwargs: service.model_copy(
+            update={"status": ServiceStatus.RUNNING}
+        ),
     )
 
     module._recover_failed_services()
 
     assert str(service.id) in module._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE
+
+
+def test_create_live_deployment_validates_against_the_broker_identity(
+    isolated_db, monkeypatch
+) -> None:
+    """A Discord deployment is validated against its account's broker number.
+
+    The check compares the account's *broker-reported* identity with the number
+    configured for the route. If the caller passes an empty identity, every
+    correctly routed deployment is rejected; if it skips the accounts-env, the
+    route resolves to the stale static table instead of the configured label.
+    """
+    database = isolated_db
+    monkeypatch.setattr(
+        "live_runner.credential_env.load_accounts_env_values",
+        lambda *_args, **_kwargs: {
+            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
+        },
+    )
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_source_type="discord",
+        signal_source_id="RAMJET",
+        signal_config={
+            "service_name": "ramjet",
+            "channel_id": "100000000000000002",
+        },
+        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+    )
+
+    database.ensure_live_account("acc-1", "alpaca", broker_login="PA-LABELLED-RAMJET")
+    created = database.create_live_deployment(deployment)
+    assert str(created.id) == str(deployment.id)
+
+    # An account on a different broker number must be refused, not stored.
+    database.ensure_live_account("acc-2", "alpaca", broker_login="PA-SOMEONE-ELSE")
+    with pytest.raises(ValueError, match="must route to Alpaca account"):
+        database.create_live_deployment(
+            deployment.model_copy(update={"id": str(uuid4()), "account_id": "acc-2"})
+        )

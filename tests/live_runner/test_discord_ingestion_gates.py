@@ -8,7 +8,7 @@ ID per source; that check is the source gate.
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -167,6 +167,11 @@ def test_price_rejects_malformed_digit_groups() -> None:
     """`$12,34` is not a price format (single comma, two trailing digits);
     accepting it as 12.34 corrupts sizing. The matcher must refuse it."""
     assert ds._extract_price("Price: $12,34") is None
+    # A thousands group is exactly three digits. `$1,2345` is not 12345 and must
+    # not be reinterpreted as one - accepting any length >= 3 turns a typo into a
+    # ten-times-wrong entry price.
+    assert ds._extract_price("Price: $1,2345") is None
+    assert ds._extract_price("Price: $1,234,56") is None
 
 
 def test_parser_rejects_signal_with_thousands_corrupted_price() -> None:
@@ -546,6 +551,9 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         _deployment_for_test("dep-2", symbols=["AAPL"]),
         _deployment_for_test("dep-3", symbols=["MSFT"]),
     ]
+    for deployment in deployments:
+        # A deployment without its own allowlist trusts nobody (fail closed).
+        deployment.signal_config["trusted_author_ids"] = ["bot-1"]
     signal = TradeSignal(
         action="buy",
         symbol="AAPL",
@@ -2368,16 +2376,14 @@ class TestAuthorRejectionIsCountable:
         assert refused is None
 
 
-class TestRejectionStreakFailsTheService:
+class TestRejectionStreakIsLoggedNotFatal:
     """Counting rejections is only useful if it reaches the operator.
 
-    The counter alone would sit in memory. What an operator actually sees is the
-    service record on the dashboard, so a bot that has rejected every message it
-    received is marked FAILED there.
-
-    Failing the *service* is the right lever rather than refusing to ingest: the
-    refusal is already correct and unchanged, and the point is to stop the
-    dashboard reporting a healthy bot that is silently not trading.
+    A streak of rejections raises one ERROR alert (with the rejected author ids) but
+    never changes the service status: the rejected authors are untrusted by
+    definition, and if three of their messages could mark the service FAILED, any
+    channel member could take the bot out of service (the daemon stops every discord
+    service that is not RUNNING).
     """
 
     NITRO_AUTHOR = "1484753770645553192"
@@ -2495,7 +2501,7 @@ class TestRejectionStreakFailsTheService:
         assert source._consecutive_author_rejections == 0
         assert source._author_rejection_alerted is False
 
-    def test_one_alert_per_streak_not_one_per_message(self):
+    def test_one_alert_per_streak_not_one_per_message(self, caplog):
         """The latch is taken when the threshold is crossed, not when it runs.
 
         Without the schedule-time latch the coroutine re-tests the flag on a later
@@ -2520,15 +2526,17 @@ class TestRejectionStreakFailsTheService:
                 if coro is not None:
                     await coro
 
-        asyncio.run(_reject_all())
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(_reject_all())
 
-        failures = [s for s in self.statuses if "FAILED" in s]
-        assert len(failures) == 1, (
-            f"{len(failures)} alerts for one continuous streak of {count}; "
-            "a busy channel would rewrite the status on every message"
+        assert self.statuses == [], "an untrusted-author streak must not write service status"
+        alerts = [r for r in caplog.records if "rejected every recent message" in r.message]
+        assert len(alerts) == 1, (
+            f"{len(alerts)} alerts for one continuous streak of {count}; "
+            "a busy channel would log on every message"
         )
 
-    def test_a_corrected_allowlist_clears_the_failure_it_raised(self):
+    def test_a_corrected_allowlist_is_logged_and_never_touches_status(self):
         """Recovery was only ever possible by restarting the daemon.
 
         Once the streak alert latched, the service was left FAILED and nothing
@@ -2560,10 +2568,8 @@ class TestRejectionStreakFailsTheService:
 
         asyncio.run(_reject_then_accept())
 
-        assert any("FAILED" in s for s in self.statuses), "precondition: the alert fired"
-        assert any("RUNNING" in s for s in self.statuses), (
-            "a corrected allowlist left the service FAILED with no way back "
-            f"short of a daemon restart; statuses were {self.statuses}"
+        assert self.statuses == [], (
+            f"the rejection alert/recovery wrote service status: {self.statuses}"
         )
 
     def test_recovery_never_resumes_a_paused_service(self, monkeypatch) -> None:
@@ -2636,16 +2642,21 @@ class TestRejectionStreakFailsTheService:
         # `update_service_status` is called with the enum, not a string.
         assert written == [ServiceStatus.RUNNING]
 
-    def test_a_wrong_allowlist_fails_the_service(self):
+    def test_untrusted_messages_never_fail_the_service(self, caplog):
+        """Any channel member can post: their messages must not change service status."""
         from live_runner.signal_sources.discord_source import (
             AUTHOR_REJECTION_STREAK_THRESHOLD,
         )
 
         source = self._source(self.WRONG_AUTHOR)
-        asyncio.run(self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD))
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(
+                self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 5)
+            )
 
-        assert any("FAILED" in status for status in self.statuses), (
-            f"a bot rejecting every message still looked healthy: {self.statuses}"
+        assert self.statuses == [], f"untrusted messages changed service status: {self.statuses}"
+        assert any("rejected every recent message" in r.message for r in caplog.records), (
+            "the operator-facing alert was lost along with the status write"
         )
 
     def test_a_correct_allowlist_is_never_failed(self):
@@ -2702,16 +2713,20 @@ class TestRejectionStreakFailsTheService:
         assert summary["rejected_author_ids"] == [self.NITRO_AUTHOR]
         assert summary["rejected_count"] >= AUTHOR_REJECTION_STREAK_THRESHOLD
 
-    def test_the_alert_fires_once_not_per_message(self):
+    def test_the_alert_fires_once_not_per_message(self, caplog):
         from live_runner.signal_sources.discord_source import (
             AUTHOR_REJECTION_STREAK_THRESHOLD,
         )
 
         source = self._source(self.WRONG_AUTHOR)
-        asyncio.run(self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 4))
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(
+                self._feed(source, self.NITRO_AUTHOR, AUTHOR_REJECTION_STREAK_THRESHOLD * 4)
+            )
 
-        failed = [s for s in self.statuses if "FAILED" in s]
-        assert len(failed) == 1, f"repeated failure writes: {self.statuses}"
+        alerts = [r for r in caplog.records if "rejected every recent message" in r.message]
+        assert len(alerts) == 1, f"repeated alerts: {len(alerts)}"
+        assert self.statuses == []
 
 
 class TestObserveChannelAuthors:
@@ -3117,6 +3132,32 @@ class TestAuthorDiscoveryRecord:
         assert "401" in record["bots"][0]["error"]
         assert record["bots"][0]["channel_id"] == "111"
 
+    def test_a_relative_parent_path_still_lands_where_the_operator_pointed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """`--out ../durable/authors.json` has to keep working.
+
+        The shared atomic-write helper refuses `..` components and symlinked
+        parents, but that is a property of the helper, not of this tool's contract:
+        the operator named a destination and the record has to land there, durable
+        copy included. The destination is resolved before the helper sees it.
+        """
+        import json
+        from pathlib import Path
+
+        module = self._script()
+        working = tmp_path / "work"
+        durable = tmp_path / "durable"
+        working.mkdir()
+        durable.mkdir()
+        monkeypatch.chdir(working)
+
+        module._write_record([], Path("..") / "durable" / "authors.json")
+
+        written = durable / "authors.json"
+        assert written.is_file(), "the record did not land at the requested destination"
+        assert json.loads(written.read_text(encoding="utf-8"))["bots"] == []
+
     def test_the_default_path_is_gitignored(self) -> None:
         """An author id is the ingestion allowlist, so it must never be committed.
 
@@ -3238,8 +3279,10 @@ class TestAuthorDiscoveryRecord:
         )
         payload = json.loads(capsys.readouterr().out)
         assert payload[0]["error"]
-        # Still recorded, so a later session can see what failed.
-        assert out.exists()
+        # The failure is still recorded for a later session, but beside the real record,
+        # never over it.
+        assert not out.exists()
+        assert (tmp_path / "record.failed.json").exists()
 
     def test_text_output_exits_nonzero_when_a_channel_failed(self, tmp_path, monkeypatch):
         module = self._script()
@@ -3453,6 +3496,7 @@ class TestStandardsReviewFindings:
         )
 
         for raw in ("111,222", "111 222", "111,222 333", " 111 , 222 ", "111,,222"):
+            expected = {part for part in raw.replace(",", " ").split() if part}
             for key in (
                 "DISCORD_TRUSTED_AUTHOR_IDS",
                 "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS",
@@ -3468,6 +3512,13 @@ class TestStandardsReviewFindings:
                     f"{key}={raw!r} resolved differently: "
                     f"service={sorted(via_service)} "
                     f"deployment={sorted(via_deployment)}"
+                )
+                # Agreement alone is not enough: a comma-only splitter on both
+                # paths agrees on `{"111 222"}` and trusts nobody real. The
+                # whitespace form is the one the live config uses.
+                assert via_service == expected, (
+                    f"{key}={raw!r} resolved to {sorted(via_service)}, "
+                    f"expected {sorted(expected)}"
                 )
 
 
@@ -3705,3 +3756,637 @@ def test_the_discovery_tool_reports_a_missing_token_instead_of_hiding_it(monkeyp
 
     assert result["authors"] == []
     assert "token" in result["error"].lower()
+
+
+# ─── Routing identity, deployment observability and the age budget ───────────
+
+
+def test_dispatch_routes_on_the_accounts_broker_identity(monkeypatch) -> None:
+    """The dispatch must hand routing the broker-reported number, not the local id.
+
+    `_live_account_broker_login` is the only thing that maps a local account id
+    to the number the broker reports; if the dispatch drops it, routing compares
+    against nothing and fails closed for every StockKit deployment.
+    """
+    import asyncio
+
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        daemon, "_live_account_broker_login", lambda _account_id: "PA-BROKER-1"
+    )
+
+    def _block(deployment, metadata, **kwargs):
+        captured.update(kwargs)
+        return False
+
+    monkeypatch.setattr(daemon, "_deployment_matches_stockkit_route", _block)
+
+    deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "bot-1",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    env = {"DISCORD_TRUSTED_AUTHOR_IDS": "bot-1"}
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1", object(), [deployment], signal, accounts_env_values=env
+        )
+    )
+
+    assert captured["account_broker_login"] == "PA-BROKER-1"
+    assert captured["accounts_env_values"] == env
+
+
+def test_broker_login_falls_back_to_ctid_and_fails_closed(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import live_runner.daemon as daemon
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_account",
+        lambda _account_id: SimpleNamespace(broker_login="PA-1", ctid=None),
+    )
+    assert daemon._live_account_broker_login("acc-1") == "PA-1"
+
+    monkeypatch.setattr(
+        daemon,
+        "get_live_account",
+        lambda _account_id: SimpleNamespace(broker_login=None, ctid="CT-1"),
+    )
+    assert daemon._live_account_broker_login("acc-1") == "CT-1"
+
+    monkeypatch.setattr(daemon, "get_live_account", lambda _account_id: None)
+    assert daemon._live_account_broker_login("acc-1") == ""
+
+
+def test_service_id_for_a_deployment_requires_a_unique_match(monkeypatch) -> None:
+    """Ambiguity must not attach a listener to the wrong bot's service row."""
+    from types import SimpleNamespace
+
+    import live_runner.daemon as daemon
+
+    deployment = SimpleNamespace(
+        id="d1",
+        settings={},
+        signal_config={"service_name": "nitro"},
+        signal_source_id="nitro",
+    )
+    one = SimpleNamespace(id="service-1", name="NITRO")
+    two = SimpleNamespace(id="service-2", name="Nitro")
+
+    monkeypatch.setattr(daemon, "list_services", lambda **_kwargs: [one])
+    assert daemon._service_id_for_discord_deployment(deployment) == "service-1"
+
+    monkeypatch.setattr(daemon, "list_services", lambda **_kwargs: [one, two])
+    assert daemon._service_id_for_discord_deployment(deployment) is None
+
+    monkeypatch.setattr(daemon, "list_services", lambda **_kwargs: [])
+    assert daemon._service_id_for_discord_deployment(deployment) is None
+
+
+def test_the_age_budget_scales_with_the_signal_timeframe() -> None:
+    """One hour is stale on a 1m deployment and fresh on a 1h one.
+
+    A fixed 300 s budget would refuse every valid signal on a slower timeframe;
+    the budget is `max(300, 2 x candle)`, so this pins the scaling.
+    """
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={"received_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()},
+    )
+    deployment = _gate_deployment()
+
+    daemon._validate_signal_age_before_wait(
+        signal, deployment, timeframe="1h", require_producer_timestamp=True
+    )
+    with pytest.raises(ValueError, match="stale"):
+        daemon._validate_signal_age_before_wait(
+            signal, deployment, timeframe="1m", require_producer_timestamp=True
+        )
+
+
+def test_a_timestamp_far_in_the_future_is_refused() -> None:
+    """A clock-skewed or forged stamp must not buy unlimited freshness."""
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    deployment = _gate_deployment()
+
+    def _signal(offset: timedelta) -> TradeSignal:
+        return TradeSignal(
+            action="buy",
+            symbol="AAPL",
+            entry_price=200.0,
+            stop_loss=195.0,
+            take_profit=210.0,
+            timeframe="1h",
+            metadata={"received_at": (datetime.now(timezone.utc) + offset).isoformat()},
+        )
+
+    daemon._validate_signal_age_before_wait(
+        _signal(timedelta(minutes=1)), deployment, timeframe="1h", require_producer_timestamp=True
+    )
+    with pytest.raises(ValueError, match="future"):
+        daemon._validate_signal_age_before_wait(
+            _signal(timedelta(minutes=10)),
+            deployment,
+            timeframe="1h",
+            require_producer_timestamp=True,
+        )
+
+
+def test_a_zero_price_is_not_a_price() -> None:
+    """`$0` must not become an entry price: it sizes a position off nothing."""
+    assert ds._extract_price("Price: $0") is None
+    assert ds._extract_price("Price: $0.00") is None
+
+
+def test_the_parser_stamps_the_discord_producer_source() -> None:
+    """The provenance value is `discord`; the listener overwrites it with the bot name.
+
+    Pinned because the daemon's age gate used to sniff this exact string and a
+    rename silently disabled that branch.
+    """
+    message = _message(
+        "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+        author_id="bot-1",
+    )
+    signal = _parse_trade_signal_from_message(
+        message, default_timeframe="1h", trusted_author_ids={"bot-1"}
+    )
+    assert signal is not None
+    assert signal.metadata["source"] == "discord"
+
+
+def test_poll_emits_messages_in_chronological_order() -> None:
+    """A multi-page burst must reach the queue oldest-first.
+
+    Discord returns newest-first and a burst spans pages. Emitting page by page
+    in API order would hand the daemon the batch in reverse, so an entry and its
+    exit in the same burst would execute backwards.
+    """
+    import asyncio
+
+    source = _source(trusted_author_ids={"bot-1"})
+    # A cursor below every fetched id forces the backfill branch, so the poll
+    # actually builds two pages.
+    source._last_seen_message_ids["channel-1"] = "100000000000000050"
+
+    def _row(message_id: int) -> dict[str, object]:
+        return {
+            "id": str(message_id),
+            "channel_id": "channel-1",
+            "timestamp": "2026-09-01T12:00:00Z",
+            "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+            "author": {"id": "bot-1", "bot": True},
+        }
+
+    newest_page = [_row(100000000000000119 - index) for index in range(20)]
+    older_page = [_row(100000000000000099 - index) for index in range(3)]
+
+    async def _fetch(_channel_id, before=None):
+        if before is None:
+            return newest_page
+        if before == "100000000000000100":
+            return older_page
+        return []
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+
+    queued = [source._queue.get_nowait() for _ in range(23)]
+    ids = [item.metadata["discord_message_id"] for item in queued]
+    assert ids[0] == "100000000000000097"
+    assert ids[:3] == [
+        "100000000000000097",
+        "100000000000000098",
+        "100000000000000099",
+    ]
+    assert ids == sorted(ids), f"burst was not emitted oldest-first: {ids[:5]}..."
+
+
+def test_the_poll_cursor_never_moves_backwards() -> None:
+    """A page of older messages must not rewind the cursor.
+
+    The cursor feeds gap detection. Moving it backwards would make the next poll
+    treat already-drained history as new and log a phantom gap (or, with a
+    cursor-based emit filter, re-emit it).
+    """
+    import asyncio
+
+    source = _source(trusted_author_ids={"bot-1"})
+    source._last_seen_message_ids["channel-1"] = "100000000000000200"
+
+    async def _fetch(_channel_id, before=None):
+        if before is not None:
+            return []
+        return [
+            {
+                "id": "100000000000000150",
+                "channel_id": "channel-1",
+                "timestamp": "2026-09-01T12:00:00Z",
+                "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+                "author": {"id": "bot-1", "bot": True},
+            }
+        ]
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+
+    assert source._last_seen_message_ids["channel-1"] == "100000000000000200"
+
+
+def test_the_source_reads_the_per_bot_auth_scheme(monkeypatch) -> None:
+    """The per-bot scheme must win over the global one, and the global one is used.
+
+    A bot token sent raw (or an account token sent as `Bot ...`) is a 401, so the
+    key the operator set for *this* bot has to be the one that is read.
+    """
+    monkeypatch.setenv("DISCORD_BOT_NITRO_AUTH_SCHEME", "bot")
+    monkeypatch.setenv("DISCORD_AUTH_SCHEME", "account")
+
+    assert _source(bot_name="nitro", auth_scheme=None).auth_scheme == "bot"
+
+    monkeypatch.delenv("DISCORD_BOT_NITRO_AUTH_SCHEME")
+    assert _source(bot_name="nitro", auth_scheme=None).auth_scheme == "account"
+
+
+# ── Dispatch-time author gate fails closed; status writes respect operator intent ──
+
+
+def _named_deployment(index: int, service_name: str):
+    deployment = _deployment_for_test(
+        f"dep-{index}",
+        symbols=["AAPL"],
+        channel_id="channel-1",
+        service_name=service_name,
+    )
+    return deployment
+
+
+def test_blank_per_bot_allowlist_trusts_nobody_at_dispatch() -> None:
+    """docs/signal_bots.md: a present-but-blank per-bot list means 'this bot trusts nobody'.
+
+    The resolver returns an empty set for it, and the dispatch gate used to read an empty
+    set as 'no restriction', accepting every author the merged listener let through.
+    """
+    deployment = _named_deployment(0, "NITRO")
+    env = {
+        "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "",
+        "DISCORD_TRUSTED_AUTHOR_IDS": "1,2,3",
+    }
+
+    assert daemon._deployment_trusted_author_ids(deployment, accounts_env_values=env) == set()
+    for author in ("1", "2", "999"):
+        assert not daemon._deployment_accepts_signal_author(
+            deployment, author, accounts_env_values=env
+        )
+
+
+def test_unresolvable_allowlist_trusts_nobody_at_dispatch() -> None:
+    deployment = _named_deployment(0, "NITRO")
+
+    assert (
+        daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values={})
+        is False
+    )
+    # No accounts env at all (a caller that forgot to thread it): still nobody.
+    assert (
+        daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values=None)
+        is False
+    )
+
+
+def test_unset_per_bot_allowlist_still_uses_the_shared_list_at_dispatch() -> None:
+    deployment = _named_deployment(0, "NITRO")
+    env = {"DISCORD_TRUSTED_AUTHOR_IDS": "1,2"}
+
+    assert daemon._deployment_accepts_signal_author(deployment, "1", accounts_env_values=env)
+    assert not daemon._deployment_accepts_signal_author(
+        deployment, "9", accounts_env_values=env
+    )
+
+
+def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
+    """The merged listener lets both authors in; each deployment still enforces its own list."""
+    import asyncio
+
+    from risk import TradeSignal
+
+    nitro = _named_deployment(0, "NITRO")
+    other = _named_deployment(1, "OTHER")
+    blank = _named_deployment(2, "BLANK")
+    env = {
+        "DISCORD_BOT_NITRO_TRUSTED_AUTHOR_IDS": "nitro-author",
+        "DISCORD_BOT_OTHER_TRUSTED_AUTHOR_IDS": "other-author",
+        "DISCORD_BOT_BLANK_TRUSTED_AUTHOR_IDS": "",
+    }
+    merged = set()
+    for deployment in (nitro, other, blank):
+        merged |= daemon._deployment_trusted_author_ids(deployment, accounts_env_values=env)
+    assert merged == {"nitro-author", "other-author"}
+
+    submitted: list[str] = []
+
+    class _Adapter:
+        async def submit_order(self, signal, *, qty: float | None = None):
+            submitted.append(str(signal.deployment_id))
+            return "order-1"
+
+        async def get_balance(self):
+            return 100_000.0, 100_000.0
+
+        async def get_positions(self):
+            return []
+
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "other-author",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    async def _no_wait(_signal, _timeframe):
+        return None
+
+    original = daemon.wait_for_candle_close
+    daemon.wait_for_candle_close = _no_wait
+    try:
+        asyncio.run(
+            daemon._dispatch_discord_trade_signal(
+                "acc-1",
+                _Adapter(),
+                [nitro, other, blank],
+                signal,
+                accounts_env_values=env,
+            )
+        )
+    finally:
+        daemon.wait_for_candle_close = original
+
+    assert submitted == [str(other.id)], (
+        "only the deployment that trusts 'other-author' may trade on its signal; "
+        f"submitted for {submitted}"
+    )
+
+
+class TestSourceStatusWritesRespectOperatorIntent:
+    @staticmethod
+    def _source():
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+
+        return DiscordSignalSource(
+            token="t", channel_ids={"c"}, service_id="svc", trusted_author_ids=["bot-1"]
+        )
+
+    @pytest.mark.parametrize("operator_status", ["PAUSED", "STOPPED"])
+    @pytest.mark.parametrize("automated_status", ["RUNNING", "FAILED"])
+    def test_automated_status_never_overwrites_paused_or_stopped(
+        self, monkeypatch, operator_status, automated_status
+    ) -> None:
+        from live_runner.signal_sources import discord_source as module
+        from shared.models import ServiceStatus
+
+        written: list[object] = []
+        monkeypatch.setattr(
+            module,
+            "get_service",
+            lambda _sid: SimpleNamespace(status=ServiceStatus[operator_status]),
+        )
+        monkeypatch.setattr(
+            module, "update_service_status", lambda sid, status, **_kw: written.append(status)
+        )
+
+        asyncio.run(self._source()._set_service_status(ServiceStatus[automated_status]))
+
+        assert written == []
+
+    def test_writes_carry_the_atomic_operator_intent_guard(self, monkeypatch) -> None:
+        from live_runner.signal_sources import discord_source as module
+        from shared.models import ServiceStatus
+
+        kwargs_seen: list[dict] = []
+        monkeypatch.setattr(
+            module, "get_service", lambda _sid: SimpleNamespace(status=ServiceStatus.FAILED)
+        )
+        monkeypatch.setattr(
+            module,
+            "update_service_status",
+            lambda sid, status, **kw: kwargs_seen.append(kw),
+        )
+
+        asyncio.run(self._source()._set_service_status(ServiceStatus.RUNNING))
+
+        assert kwargs_seen and kwargs_seen[0].get("respect_operator_intent") is True
+
+    def test_pausing_is_still_written(self, monkeypatch) -> None:
+        from live_runner.signal_sources import discord_source as module
+        from shared.models import ServiceStatus
+
+        written: list[object] = []
+        monkeypatch.setattr(
+            module, "get_service", lambda _sid: SimpleNamespace(status=ServiceStatus.RUNNING)
+        )
+        monkeypatch.setattr(
+            module, "update_service_status", lambda sid, status, **_kw: written.append(status)
+        )
+
+        asyncio.run(self._source()._set_service_status(ServiceStatus.PAUSED))
+
+        assert written == [ServiceStatus.PAUSED]
+
+    def test_a_normal_teardown_does_not_write_failed(self, monkeypatch) -> None:
+        from live_runner.signal_sources import discord_source as module
+        from shared.models import ServiceStatus
+
+        written: list[object] = []
+        monkeypatch.setattr(
+            module, "get_service", lambda _sid: SimpleNamespace(status=ServiceStatus.RUNNING)
+        )
+        monkeypatch.setattr(
+            module, "update_service_status", lambda sid, status, **_kw: written.append(status)
+        )
+
+        asyncio.run(self._source().disconnect())
+
+        assert written == [], f"an ordinary teardown wrote service status: {written}"
+
+    def test_an_explicit_failed_teardown_still_writes_failed(self, monkeypatch) -> None:
+        from live_runner.signal_sources import discord_source as module
+        from shared.models import ServiceStatus
+
+        written: list[object] = []
+        monkeypatch.setattr(
+            module, "get_service", lambda _sid: SimpleNamespace(status=ServiceStatus.RUNNING)
+        )
+        monkeypatch.setattr(
+            module, "update_service_status", lambda sid, status, **_kw: written.append(status)
+        )
+
+        asyncio.run(self._source().disconnect(failed=True))
+
+        assert written == [ServiceStatus.FAILED]
+
+    @pytest.mark.parametrize("operator_status", ["PAUSED", "STOPPED"])
+    def test_real_database_keeps_operator_status_through_connect_and_teardown(
+        self, isolated_db_sandbox, monkeypatch, operator_status
+    ) -> None:
+        from live_runner.signal_sources.discord_source import DiscordSignalSource
+        from shared.database import create_service, get_service, update_service_status
+        from shared.models import Service, ServiceStatus, ServiceType
+
+        service = create_service(
+            Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
+        )
+        update_service_status(str(service.id), ServiceStatus[operator_status])
+        source = DiscordSignalSource(
+            token="t",
+            channel_ids={"c"},
+            service_id=str(service.id),
+            trusted_author_ids=["bot-1"],
+        )
+
+        asyncio.run(source._set_service_status(ServiceStatus.RUNNING))
+        asyncio.run(source.disconnect())
+        asyncio.run(source.disconnect(failed=True))
+
+        assert get_service(str(service.id)).status == ServiceStatus[operator_status]
+
+
+# ─── discover_discord_authors main(): record safety and bot-only suggestions ──
+
+
+def _load_discovery_module(name: str):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "discover_discord_authors.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _patch_discovery(monkeypatch, module, results):
+    monkeypatch.setattr(module.service_discovery, "DEFAULT_ACCOUNTS_ENV", "x", raising=False)
+    monkeypatch.setattr(module, "load_accounts_env_values", lambda _path: {})
+    monkeypatch.setattr(
+        module.service_discovery,
+        "discover_discord_bots_from_env",
+        lambda: [{"name": entry["bot"], "channel_id": entry["channel_id"]} for entry in results],
+    )
+    queue = list(results)
+
+    async def _fake_observe(bot, pages, *, env_values=None):
+        return queue.pop(0)
+
+    monkeypatch.setattr(module, "_observe", _fake_observe)
+
+
+def test_a_failed_discovery_does_not_overwrite_the_last_good_record(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    module = _load_discovery_module("discover_authors_no_overwrite")
+    record = tmp_path / "authors.json"
+    record.write_text('{"bots": "last-known-good"}\n', encoding="utf-8")
+    _patch_discovery(
+        monkeypatch,
+        module,
+        [
+            {"bot": "NITRO", "channel_id": "1", "authors": [], "error": "401 Unauthorized"},
+        ],
+    )
+
+    exit_code = module.main(["--out", str(record)])
+
+    assert exit_code == 1
+    assert record.read_text(encoding="utf-8") == '{"bots": "last-known-good"}\n'
+    assert "not overwriting" in capsys.readouterr().err
+    failed_record = json.loads((tmp_path / "authors.failed.json").read_text(encoding="utf-8"))
+    assert failed_record["bots"][0]["error"] == "401 Unauthorized"
+
+
+def test_a_complete_discovery_is_recorded(monkeypatch, tmp_path) -> None:
+    module = _load_discovery_module("discover_authors_records")
+    record = tmp_path / "authors.json"
+    rows = [{"author_id": "42", "message_count": 3, "is_bot": True, "username": "nitro"}]
+    _patch_discovery(
+        monkeypatch,
+        module,
+        [{"bot": "NITRO", "channel_id": "1", "authors": rows, "error": None}],
+    )
+
+    assert module.main(["--out", str(record)]) == 0
+    assert '"42"' in record.read_text(encoding="utf-8")
+
+
+def test_the_suggested_allowlist_contains_bot_authors_only(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    module = _load_discovery_module("discover_authors_bots_only")
+    rows = [
+        {"author_id": "111", "message_count": 9, "is_bot": True, "username": "nitro-bot"},
+        {"author_id": "222", "message_count": 5, "is_bot": False, "username": "a-human"},
+    ]
+    _patch_discovery(
+        monkeypatch,
+        module,
+        [{"bot": "NITRO", "channel_id": "1", "authors": rows, "error": None}],
+    )
+
+    assert module.main(["--out", str(tmp_path / "authors.json")]) == 0
+
+    out = capsys.readouterr().out
+    suggestion = [line for line in out.splitlines() if "_TRUSTED_AUTHOR_IDS=" in line]
+    assert len(suggestion) == 1
+    assert suggestion[0].strip().endswith("=111"), suggestion
+    assert "222" in out, "the human must still be listed in the table for review"
+    assert "222" not in suggestion[0]
+
+
+def test_no_allowlist_is_suggested_when_only_humans_were_seen(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    module = _load_discovery_module("discover_authors_humans_only")
+    rows = [{"author_id": "222", "message_count": 5, "is_bot": False, "username": "a-human"}]
+    _patch_discovery(
+        monkeypatch,
+        module,
+        [{"bot": "NITRO", "channel_id": "1", "authors": rows, "error": None}],
+    )
+
+    assert module.main(["--out", str(tmp_path / "authors.json")]) == 0
+
+    out = capsys.readouterr().out
+    assert "_TRUSTED_AUTHOR_IDS=" not in out
+    assert "no bot authors" in out

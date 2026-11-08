@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +39,7 @@ from live_runner.credential_env import (
 )
 from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 from live_runner.signal_sources.discord_source import DiscordSignalSource
+from shared.atomic_io import write_text_atomically
 
 
 async def _observe(
@@ -102,18 +104,33 @@ def _write_record(
     So the observation gets written down. Author ids, counts and channel ids only
     - no message content, no tokens - and the default path is gitignored, because
     an author id is a small secret: it is the ingestion allowlist.
+
+    ``--out`` is an operator-supplied path and is honoured as given - a tool that
+    silently redirected an explicit destination would be worse than useless when
+    the whole point is to put the record somewhere durable. What is refused is a
+    *non-file* target: pointing it at a directory, a device or a socket is a way to
+    hang the process or scribble on something that is not a record.
+
+    The write itself goes through the shared atomic-write helper, the same one every
+    other persisted artifact uses: it owns the filesystem sink and validates the
+    target, and a crash cannot leave a half-written allowlist behind. The helper
+    refuses ``..`` and symlinked parents, so the destination's *directory* is
+    resolved first - ``--out ../durable/authors.json`` still lands where the operator
+    pointed, and the file name stays the one that was asked for.
     """
     if out is None:
         return
-    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.is_dir():
+        raise ValueError(
+            f"--out {out} is an existing directory; give a file path for the record"
+        )
     payload = {
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bots": results,
     }
-    out.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    print(f"recorded to {out}", file=sys.stderr)
+    target = Path(os.path.realpath(out.parent)) / out.name
+    write_text_atomically(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"recorded to {target}", file=sys.stderr)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -170,20 +187,35 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(_observe(bot, args.pages, env_values=env_values)) for bot in bots
     ]
 
-    # Recorded before the format branch, not inside the --json arm. --out has a
-    # default, so the record was silently skipped for the default text output -
-    # and the text output is what the operator actually runs. The whole reason
-    # this file exists is that the author allowlist used to live only in terminal
-    # scrollback, which the 2026-09-26 credential outage destroyed. Writing the
-    # record only in the mode nobody uses defeats that.
-    _write_record(results, args.out)
-
     # Counted once, here, and reported in both formats. --json returned a flat 0
     # no matter what it had just printed, so a caller reading the exit status saw
     # success next to a JSON body full of `error` fields. An allowlist silently
     # missing channels is the failure this tool exists to prevent, and returning
     # 0 for it made that failure invisible to any wrapper.
     failed = sum(1 for entry in results if entry["error"])
+
+    # Recorded before the format branch, not inside the --json arm. --out has a
+    # default, so the record was silently skipped for the default text output -
+    # and the text output is what the operator actually runs. The whole reason
+    # this file exists is that the author allowlist used to live only in terminal
+    # scrollback, which the 2026-09-26 credential outage destroyed. Writing the
+    # record only in the mode nobody uses defeats that.
+    #
+    # But never over a good record with a failed discovery: an outage (the very
+    # situation the record exists for) would replace the last known-good author
+    # ids with empty `error` entries. A run with any unreadable channel is written
+    # to a sibling `<name>.failed<suffix>` file instead, so the failure is still
+    # recorded and the last complete record is left untouched.
+    if failed:
+        failed_out = args.out.with_name(f"{args.out.stem}.failed{args.out.suffix}")
+        print(
+            f"{failed} of {len(results)} channels could not be read, so this run is "
+            f"not a complete record: not overwriting {args.out}",
+            file=sys.stderr,
+        )
+        _write_record(results, failed_out)
+    else:
+        _write_record(results, args.out)
 
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
@@ -204,8 +236,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"  {row['author_id']:22} {row['message_count']:>9}  "
                 f"{'yes' if row['is_bot'] else 'no':5} {row['username']}"
             )
-        ids = ",".join(row["author_id"] for row in entry["authors"])
-        print("\n  # review the above, then set:")
+        # Bot authors only. A human in the channel is not a signal source, and putting
+        # a human's id in the allowlist would let that person's messages trade.
+        # Humans stay in the table above (labelled `bot? no`) for the operator to judge.
+        ids = ",".join(
+            row["author_id"] for row in entry["authors"] if row.get("is_bot")
+        )
+        if not ids:
+            print(
+                "\n  # no bot authors seen in this channel; not suggesting an allowlist."
+                "\n  # If the signal source is a user account, add its id by hand after"
+                " verifying it."
+            )
+            continue
+        print("\n  # bot authors only (humans are listed above, never suggested); review, then set:")
         # Through the helper. This is the variable the operator is told to set, so
         # a key built any other way emits something the daemon will never read -
         # and the bot then falls back to the shared list, which is exactly the

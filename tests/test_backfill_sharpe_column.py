@@ -47,6 +47,8 @@ def conn(tmp_path):
             ("unparseable-stats", 0.0, 0.0, 0.0, 1.0, "{not json"),
             ("legacy-key", 0.0, 0.0, 0.0, 1.0, '{"sharpe": -2.5}'),
             ("payload-missing", 0.0, 0.0, 0.0, 1.0, '{"total_trades": 3}'),
+            ("unparseable-value", 0.0, 0.0, 0.0, 1.0, '{"p_value": "n/a"}'),
+            ("nonfinite-value", 0.0, 0.0, 0.0, 1.0, '{"p_value": NaN}'),
         ],
     )
     db.commit()
@@ -67,6 +69,14 @@ def test_it_finds_exactly_the_disagreeing_rows(conn):
     assert ("no-stats", "sharpe_ratio") not in found
     assert ("unparseable-stats", "sharpe_ratio") not in found
     assert ("payload-missing", "sharpe_ratio") not in found
+    assert ("unparseable-value", "p_value") not in found, (
+        "a payload value that is not a number was treated as a disagreement; coercing it would "
+        "write a fabricated 0.0 into the column"
+    )
+    assert ("nonfinite-value", "p_value") not in found, (
+        "a NaN payload value was queued for an UPDATE; the column would hold a number that breaks "
+        "every comparison and any JSON read of the row"
+    )
 
 
 def test_each_column_is_reconciled_independently(conn):
@@ -93,6 +103,39 @@ def test_each_column_is_reconciled_independently(conn):
         conn.execute("select id, psr from backtests where id = 'agreeing'").fetchall()
     )
     assert values["agreeing"] == pytest.approx(0.33)
+
+
+def test_a_metric_other_than_the_withheld_one_is_still_reconciled(conn):
+    """``undefined_metrics`` names *which* metric was withheld, and only that one.
+
+    A row that declares ``psr`` undefined still has a stale ``sharpe_ratio``, and skipping the whole
+    row would leave that stale. The count matters too: the operator-facing line reports
+    ``corrected of total``, so a counter that stops incrementing misreports the write.
+    """
+    conn.execute(
+        "insert into backtests (id, sharpe_ratio, psr, cagr, p_value, stats) "
+        "values ('partial', 0.0, 0.0, 0.0, 1.0, "
+        "'{\"sharpe_ratio\": -4.0, \"undefined_metrics\": [\"psr\"]}')"
+    )
+    conn.commit()
+
+    module = _load()
+    found = {(r[0], r[1]) for r in module.find_disagreements(conn)}
+    assert ("partial", "sharpe_ratio") in found, (
+        "the row was skipped entirely because a different metric was declared undefined"
+    )
+    assert ("partial", "psr") not in found, "the withheld metric must not be reconciled"
+    assert ("partial", "sharpe_ratio") not in module.find_declared_undefined(conn)
+
+    all_rows = module.find_disagreements(conn)
+    assert module._reconcile(conn, all_rows) == len(all_rows), (
+        "the reported count no longer matches the number of cells written"
+    )
+    conn.commit()
+    corrected = conn.execute(
+        "select sharpe_ratio from backtests where id = 'partial'"
+    ).fetchone()[0]
+    assert corrected == pytest.approx(-4.0)
 
 
 def test_p_value_uses_its_own_sentinel_of_one_not_zero(conn):
@@ -149,6 +192,187 @@ def test_declared_undefined_rows_are_reported_and_never_applied(conn):
 
     value = conn.execute("select sharpe_ratio from backtests where id = 'withheld'").fetchone()[0]
     assert value == 0.0, "the deliberate 'never computed' marker was overwritten"
+
+
+def test_main_refuses_to_apply_while_a_deliberate_sentinel_exists(
+    tmp_path, monkeypatch, capsys
+):
+    """The refusal must stop the run, not just print above a successful write.
+
+    ``--apply`` writes every other disagreement, so falling through leaves the operator reading
+    "Refusing:" at the top of a run that exited zero and wrote anyway.
+    """
+    import sys
+
+    db = sqlite3.connect(tmp_path / "backtests.db")
+    db.execute(
+        "create table backtests (id text primary key, sharpe_ratio real not null default 0.0, "
+        "psr real not null default 0.0, cagr real not null default 0.0, "
+        "p_value real not null default 1.0, stats text)"
+    )
+    db.execute(
+        "insert into backtests values ('withheld', 0.0, 0.0, 0.0, 1.0, "
+        "'{\"sharpe_ratio\": -5.0, \"undefined_metrics\": [\"sharpe_ratio\"]}')"
+    )
+    db.execute(
+        "insert into backtests values ('stale', 0.0, 0.0, 0.0, 1.0, '{\"sharpe_ratio\": -2.0}')"
+    )
+    db.commit()
+    db.close()
+
+    module = _load()
+    monkeypatch.setattr(sys, "argv", ["backfill", "--data-dir", str(tmp_path), "--apply"])
+    with pytest.raises(SystemExit) as exit_info:
+        module.main()
+    assert exit_info.value.code != 0, "the refusal exited zero, so automation cannot see it"
+
+    db = sqlite3.connect(f"file:{tmp_path / 'backtests.db'}?mode=ro", uri=True)
+    try:
+        values = dict(db.execute("select id, sharpe_ratio from backtests").fetchall())
+    finally:
+        db.close()
+    assert values == {"withheld": 0.0, "stale": 0.0}, (
+        f"the script announced a refusal and wrote anyway: {values}"
+    )
+
+
+def test_a_cell_changed_after_the_scan_is_left_alone(conn):
+    """The UPDATE carries the value it read, so a concurrent write is not clobbered.
+
+    The scan and the write are separate statements and the write runs later still, so between them
+    another process can put a real number in the column. Overwriting it with a payload value
+    compared against the old sentinel would destroy the newer, real number - the one failure mode
+    this tool must not have.
+    """
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute("update backtests set sharpe_ratio = 9.5 where id = 'stale-column'")
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "the tool reported a correction it did not make"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 9.5, "a value written after the scan was overwritten"
+
+
+def test_a_withheld_metric_whose_column_already_agrees_does_not_block(conn):
+    """The refusal is about cells that would be overwritten, not about the word appearing.
+
+    A row can name a metric in ``undefined_metrics`` and still hold a column that agrees with the
+    payload. Nothing would be written there, so it must not stop the run - otherwise the tool
+    refuses on rows it would never touch.
+    """
+    conn.execute(
+        "insert into backtests values ('withheld-agreeing', 1.0, 0.0, 0.0, 1.0, "
+        '\'{"sharpe_ratio": 1.0, "undefined_metrics": ["sharpe_ratio"]}\')'
+    )
+    conn.commit()
+
+    module = _load()
+    assert ("withheld-agreeing", "sharpe_ratio") not in module.find_declared_undefined(conn)
+    found = {(row[0], row[1]) for row in module.find_disagreements(conn)}
+    assert ("withheld-agreeing", "sharpe_ratio") not in found
+
+
+def test_a_withheld_cell_outside_the_requested_columns_does_not_block(conn):
+    """`--column` scopes the refusal too, not only the write."""
+    conn.execute(
+        "insert into backtests values ('withheld-psr', 0.0, 0.0, 0.0, 1.0, "
+        '\'{"psr": 0.42, "undefined_metrics": ["psr"]}\')'
+    )
+    conn.commit()
+
+    module = _load()
+    assert module.find_declared_undefined(conn, ["psr"]) == [("withheld-psr", "psr")]
+    assert module.find_declared_undefined(conn, ["sharpe_ratio"]) == [], (
+        "a withheld cell in a column the operator did not ask about blocked the run"
+    )
+
+
+def test_a_cell_whose_payload_changed_after_the_scan_is_left_alone(conn):
+    """The other half of the race: the column is unchanged, the payload it was read from is not."""
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute("update backtests set stats = '{\"sharpe_ratio\": 7.5}' where id = 'stale-column'")
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "the tool wrote a value computed against a payload that no longer exists"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 0.0, value
+
+
+def test_a_tiny_real_value_is_not_mistaken_for_the_sentinel(conn):
+    """A Sharpe of 1e-12 is a computed zero, not a missing one.
+
+    The sentinel test has to be exact. A tolerance around ``0.0`` would swallow every value smaller
+    than it and overwrite a real result with the payload's number - the failure this tool exists to
+    prevent.
+    """
+    conn.execute(
+        "update backtests set sharpe_ratio = 1e-12, stats = '{\"sharpe_ratio\": 0.5}' "
+        "where id = 'stale-column'"
+    )
+    conn.commit()
+
+    module = _load()
+    found = {(row[0], row[1]) for row in module.find_disagreements(conn)}
+    assert ("stale-column", "sharpe_ratio") not in found, (
+        "a real value of 1e-12 was treated as the sentinel and queued for overwriting"
+    )
+
+
+def test_a_cell_withheld_after_the_scan_is_left_alone(conn):
+    """The producer can change its mind between the scan and the write."""
+    module = _load()
+    rows = module.find_disagreements(conn)
+    target = next(
+        row for row in rows if row[0] == "stale-column" and row[1] == "sharpe_ratio"
+    )
+    conn.execute(
+        "update backtests set stats = "
+        '\'{"sharpe_ratio": -37.6644, "undefined_metrics": ["sharpe_ratio"]}\' '
+        "where id = 'stale-column'"
+    )
+    conn.commit()
+
+    corrected = module._reconcile(conn, [target])
+    conn.commit()
+
+    assert corrected == 0, "a cell withheld after the scan was still overwritten"
+    value = conn.execute(
+        "select sharpe_ratio from backtests where id = 'stale-column'"
+    ).fetchone()[0]
+    assert value == 0.0, value
+
+
+def test_the_sentinels_are_the_writer_s_own_table_of_defaults():
+    """The script's table must be the writer's, or a fifth stat silently escapes the backfill.
+
+    `SENTINELS` and `_SCALAR_STAT_COLUMNS` are two spellings of one physical fact. Duplicated on
+    purpose - the operator tool must not import the app's model layer to report on its database -
+    so the drift is pinned here instead.
+    """
+    from shared.database import _SCALAR_STAT_COLUMNS
+
+    module = _load()
+    assert dict(_SCALAR_STAT_COLUMNS) == module.SENTINELS, (
+        "the backfill script's sentinels no longer match the columns the writer maintains"
+    )
 
 
 def test_the_corpus_has_no_declared_undefined_sentinels_today():

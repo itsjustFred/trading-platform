@@ -2,8 +2,8 @@
 
 The defect: `delete_live_deployment` attempted the delete unconditionally. Once
 `live_signals.deployment_id` carries a foreign key, any deployment with signals raised a raw
-`sqlite3.IntegrityError` out of the ORM. The viewer set the deployment PAUSED first and then turned
-that exception into a 500, so the operator got an error *and* a deployment stuck in PAUSED.
+`sqlite3.IntegrityError` out of the ORM. The viewer did not catch it either, so the operator got a
+500 for what is a deliberate refusal.
 
 The behaviour chosen here is a typed refusal with counts, not a cascade. A cascade would "work" and
 would silently delete the execution record of real trades - the one thing this database exists to
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -96,6 +97,26 @@ def test_an_absent_deployment_reports_false(isolated_db) -> None:
     assert database.delete_live_deployment("never-existed") is False
 
 
+def test_a_blank_id_is_refused_without_touching_the_database(isolated_db) -> None:
+    """An empty or whitespace id is not a lookup, so it must not reach the session.
+
+    `session.get(Model, "")` is a legal call that simply finds nothing, so the guard reads as
+    cosmetic - but a blank id reaching the delete path would let a caller who lost the real id
+    delete *something* if the normalization ever changed, and it means every "no id" caller still
+    opens a transaction. The guard is asserted directly, with a real deployment present to prove the
+    blank id is not resolved to it.
+    """
+    database, _engine, _data_dir = isolated_db
+    database.init_db()
+    deployment_id = _deployment(database)
+
+    for blank in ("", "   ", None):
+        assert database.delete_live_deployment(blank) is False, blank
+    assert _deployment_exists(database, deployment_id), (
+        "a blank id deleted a real deployment, so the normalization guard is not load-bearing"
+    )
+
+
 def test_a_deployment_with_signals_refuses_with_a_typed_error(isolated_db) -> None:
     """The regression: no `IntegrityError` escapes, and nothing is half-deleted."""
     database, _engine, _data_dir = isolated_db
@@ -167,3 +188,47 @@ def test_the_refusal_does_not_depend_on_the_foreign_key_being_present(isolated_d
         assert _deployment_exists(database, deployment_id)
     finally:
         database.event.listen(engine, "connect", database._configure_sqlite_connection)
+
+
+def test_the_endpoint_reports_a_refusal_as_a_conflict(monkeypatch) -> None:
+    """The typed refusal has to survive the HTTP boundary.
+
+    Raising `LiveDeploymentInUseError` in the storage layer only helps if the endpoint catches it.
+    It did not, so FastAPI answered 500 and the operator saw a server fault for a deliberate,
+    data-preserving refusal. The counts are part of the answer: they say what is holding the row.
+    """
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    def _refuse(deployment_id: str) -> bool:
+        raise viewer_main_module.LiveDeploymentInUseError(
+            deployment_id, signal_count=1, execution_count=2
+        )
+
+    monkeypatch.setattr(viewer_main_module, "delete_live_deployment", _refuse)
+    # The endpoint reads the row (to remember its status and to know whether the claim gate
+    # needs closing) before deleting. A STOPPED row needs no gate write, so this isolates the
+    # refusal path from the drain machinery.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda deployment_id: SimpleNamespace(status="STOPPED"),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda deployment_id: []
+    )
+    client = TestClient(viewer_main_module.app)
+
+    # Delete is a confirmed live control, so the request names the deployment it removes.
+    response = client.delete(
+        "/api/live/deployments/dep-keep?confirm_deployment_id=dep-keep"
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    # The refusal is structured so the operator (and the UI) can act on the counts.
+    assert detail["error"] == "deployment_in_use"
+    assert detail["signal_count"] == 1
+    assert detail["execution_count"] == 2
+    assert detail["status_restored"] is None

@@ -333,7 +333,7 @@ class BacktestRecord(SQLModel, table=True):
     # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
     # and a fresh install would not match the database it is supposed to replace. So the defaults
     # are declared at the schema level too, matching production exactly - verified read-only
-    # against `/home/ubuntu/data/backtests.db`.
+    # against the production database.
     sharpe_ratio: float = Field(
         default=0.0,
         sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
@@ -1405,6 +1405,51 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     _create_live_signal_discord_indexes(connection)
 
 
+_FK_VIOLATION_REPORT_LIMIT = 10
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _describe_foreign_key_violations(connection: Connection, violations: list) -> str:
+    """Build the fail-closed error for a failed ``PRAGMA foreign_key_check``.
+
+    Names the blocking rows (table, rowid, the dangling value and the parent it points at, capped)
+    and says how to fix them, so an operator can act instead of guessing. Never raises: a problem
+    while describing must not mask the violation itself.
+    """
+    lines: list[str] = []
+    for violation in violations[:_FK_VIOLATION_REPORT_LIMIT]:
+        table, rowid, parent, fkid = violation[0], violation[1], violation[2], violation[3]
+        detail = ""
+        try:
+            fk_rows = connection.exec_driver_sql(
+                f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+            ).fetchall()
+            column = next((row[3] for row in fk_rows if row[0] == fkid), None)
+            if column is not None and rowid is not None:
+                value = connection.exec_driver_sql(
+                    f"SELECT {_quote_identifier(column)} FROM {_quote_identifier(table)} "
+                    "WHERE rowid = ?",
+                    (rowid,),
+                ).scalar()
+                detail = f", {column}={value!r}"
+        except Exception:  # pragma: no cover - best-effort description only
+            logger.debug("Could not describe foreign key violation %r", violation, exc_info=True)
+        lines.append(f"  {table} rowid={rowid}{detail} -> missing row in {parent}")
+    extra = len(violations) - len(lines)
+    if extra > 0:
+        lines.append(f"  ... and {extra} more")
+    return (
+        f"Cannot safely migrate schema: foreign key violations remain "
+        f"({len(violations)} row(s); nothing was changed):\n"
+        + "\n".join(lines)
+        + "\nFix: re-point each row at an existing parent row, restore the missing parent, or "
+        "delete the orphan row after backing up the database, then restart."
+    )
+
+
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
@@ -1425,9 +1470,7 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 yield connection
                 violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
                 if violations:
-                    raise RuntimeError(
-                        "Cannot safely migrate schema: foreign key violations remain"
-                    )
+                    raise RuntimeError(_describe_foreign_key_violations(connection, violations))
             except BaseException:
                 connection.rollback()
                 raise
@@ -1522,7 +1565,7 @@ def _add_backtests_stat_columns(connection: Connection) -> None:
     them and a database without them fails outright - which is exactly how this surfaced.
 
     So the columns need the migration they should always have had. Definitions match production
-    exactly, verified read-only against `/home/ubuntu/data/backtests.db`:
+    exactly, verified read-only against the production database:
 
         sharpe_ratio REAL NOT NULL DEFAULT 0.0
         psr         REAL NOT NULL DEFAULT 0.0
@@ -1575,6 +1618,13 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(
             text("ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
         )
+    # The model declares `index=True`, which `create_all` turns into this index. `ADD COLUMN`
+    # cannot, so a migrated database would otherwise differ from a fresh one by exactly the index.
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_accounts_is_demo ON live_accounts (is_demo)"
+        )
+    )
 
 
 def _add_service_columns(connection: Connection) -> None:
@@ -1767,8 +1817,11 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
 
     ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
     no deployment row, so those signals were invisible to every deployment-scoped query. This
-    recreates exactly the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, so history
-    and future runs agree.
+    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs. Where it has to
+    create one it names every symbol the orphaned signals traded, because the backfill sees all of
+    them at once while a single run only knows its own; an adopted row keeps the symbols it already
+    carries, since rewriting a JSON column inside the migration would turn one malformed value into
+    a startup failure.
 
     Three deliberate restrictions, each a guard against fabricating a trading record:
 
@@ -1834,15 +1887,38 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             )
             continue
         # A readable lookup keys on `strategy_name`, because the id is a UUID.
-        existing = connection.execute(
-            text("SELECT id FROM live_deployments WHERE strategy_name = :name"),
+        # `strategy_name` is not unique, so adoption must be unambiguous: more than one candidate,
+        # or a candidate that belongs to a different account, would make "the" parent a guess.
+        # Re-parenting signals onto the wrong deployment is worse than refusing to start.
+        candidates = connection.execute(
+            text(
+                "SELECT id, account_id FROM live_deployments "
+                "WHERE strategy_name = :name ORDER BY id"
+            ),
             {"name": deployment_id},
-        ).first()
+        ).fetchall()
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"Cannot safely adopt a parent for smoke signals labelled {deployment_id!r}: "
+                f"{len(candidates)} live_deployments rows share that strategy_name "
+                f"(ids: {', '.join(str(c[0]) for c in candidates[:10])}). Remove or rename the "
+                "extra rows so exactly one remains, then restart."
+            )
+        if candidates and str(candidates[0][1]) != account_id:
+            raise RuntimeError(
+                f"Cannot safely adopt live_deployments row {candidates[0][0]} for smoke signals "
+                f"labelled {deployment_id!r}: it belongs to account {candidates[0][1]!r}, the "
+                f"label names account {account_id!r}. Fix the row's account_id or rename it, "
+                "then restart."
+            )
+        existing = candidates[0] if candidates else None
         if existing is not None:
             new_id = str(existing[0])
         else:
             new_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat(sep=" ")
+            # Naive UTC, like every other timestamp in this schema: an aware ISO string carries a
+            # `+00:00` suffix that sorts and parses differently from the rows around it.
+            now = _utcnow_naive().isoformat(sep=" ")
             connection.execute(
                 text(
                     "INSERT INTO live_deployments "
@@ -1892,8 +1968,10 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
       refused *even when every dependent row has been removed*, because the surviving executions
       point at rows inside the table being dropped. Measured on a production clone: the migration
       failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
-      swap and restored in a ``finally``; the surrounding ``foreign_key_check`` is what still makes
-      a bad swap fail closed.
+      swap; ``_schema_migration_connection`` turns it back on after the commit, and this function
+      restores both pragmas best-effort in a ``finally``. That restore is only real for
+      ``legacy_alter_table``: SQLite ignores a ``foreign_keys`` change made inside a transaction,
+      so for a direct caller inside one the outer context manager is what re-enables it.
 
     Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
     On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
@@ -1969,8 +2047,9 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
 
     # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
     # pragma while a transaction is open, so setting it mid-transaction leaves enforcement ON and
-    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN;
-    # this is here for callers that do not, and is restored in the finally below either way.
+    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN and
+    # re-enables it after the commit; the pair below is for callers that do not, and only the
+    # `legacy_alter_table` half takes effect inside a transaction.
     #
     # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
     foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
@@ -2103,6 +2182,9 @@ def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
 
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
+        # The column migrations must stay ahead of the backfill: `_backfill_smoke_deployments`
+        # inserts a `live_deployments` row naming `signal_source`, `settings` and friends, which do
+        # not exist on a legacy table until `_add_live_deployment_columns` has run.
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
@@ -2829,19 +2911,33 @@ def list_services(*, service_type: ServiceType | str | None = None) -> list[Serv
     return [row.to_service() for row in rows]
 
 
+#: Statuses only an operator sets. Automated writers (`respect_operator_intent=True`) never
+#: move a service out of one of them.
+_OPERATOR_INTENT_SERVICE_STATUSES = (
+    ServiceStatus.PAUSED.value,
+    ServiceStatus.STOPPED.value,
+)
+
+
 def update_service_status(
     service_id: str,
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
-    respect_operator_intent: bool = True,
+    respect_operator_intent: bool = False,
 ) -> Service | None:
-    """Write a service's status, with PAUSED as an atomic floor.
+    """Write a service's status, with PAUSED and STOPPED as an atomic floor.
 
-    `respect_operator_intent` makes PAUSED a floor: a PAUSED service is never
-    moved to any other status by this function. The pause was set by a person
-    through the API, and nothing the process observes afterwards - a message
-    arriving, a connector failing, a reconnect completing - outranks that.
+    `respect_operator_intent=True` makes PAUSED and STOPPED a floor: a service in
+    either state is never moved to any other status by this function. Only automated callers
+    pass it - the pause was set by a person, and nothing the process observes
+    afterwards (a message arriving, a connector failing, a reconnect completing)
+    outranks that.
+
+    The default is `False` because every other caller *is* the operator: the
+    API endpoint that sets and clears a pause, the CLI, a test. Making the floor
+    the default would let it swallow the very request that resumes a paused
+    service - the endpoint would answer 200 while the row stayed PAUSED.
 
     The check is a conditional ``UPDATE`` rather than read-check-write. The
     previous shape read the row, compared in Python, and wrote it back, so a
@@ -2849,9 +2945,6 @@ def update_service_status(
     overwrote PAUSED; `_recover_failed_services` then read FAILED and restarted
     the bot the operator had paused. SQLite serialises writers, so a single
     statement whose ``WHERE`` re-tests the status cannot lose that race.
-
-    Pass `respect_operator_intent=False` only where the caller is *establishing*
-    operator intent, i.e. an API call that is itself setting or clearing a pause.
     """
     normalized_id = str(service_id or "").strip()
     if not normalized_id:
@@ -2876,12 +2969,12 @@ def update_service_status(
         )
         if (
             respect_operator_intent
-            and normalized_status != ServiceStatus.PAUSED.value
+            and normalized_status not in _OPERATOR_INTENT_SERVICE_STATUSES
         ):
             # Re-tested in the same statement as the write, so a concurrent
-            # PAUSE cannot be overwritten by a FAILED/RUNNING landing after it.
+            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING landing after it.
             statement = statement.where(
-                ServiceModel.status != ServiceStatus.PAUSED.value
+                ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES)
             )
         applied = session.execute(statement)
         if not applied.rowcount:
@@ -2985,7 +3078,15 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 
             route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
-        except Exception:
+        except Exception as exc:
+            # Routing validation still runs (and fails closed for a route it can no longer
+            # resolve), but an unreadable accounts env must not be silent: it changes which
+            # account number a route resolves to.
+            logger.warning(
+                "Could not load the accounts env for StockKit route validation; "
+                "falling back to the static route table: %s",
+                exc,
+            )
             route_env = {}
         validate_stockkit_deployment_route(
             deployment,
@@ -3057,21 +3158,40 @@ def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
 
     Only called when the adapter's cancel/flatten sweeps were *complete*; a
     partial sweep must stay unmarked so the next tick retries it.
+
+    The stamp is written by a single conditional ``UPDATE`` and refused (returns
+    ``False``, nothing written) unless, at that instant,
+
+    * the deployment is still ``STOPPED`` - a resume between the sweep and the
+      write must not leave a stamp on a live deployment, because the stamp is
+      what disables the next enforcement; and
+    * no submission lease exists for it, live *or* expired-but-unreleased. A
+      lease means a submit may still be in flight at the broker and can fill
+      after the flatten, and an expired lease means an outcome was never
+      observed. Persisting the stamp then would stop the daemon retrying the
+      flatten for exactly the fill it has not seen yet. New leases cannot be
+      taken once the deployment is ``STOPPED`` (the claim is status-gated), so
+      checking here, atomically with the write, is sufficient.
     """
     normalized = str(deployment_id or "").strip()
     if not normalized:
         return False
     init_db()
+    now = _utcnow_naive()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, normalized)
-        if record is None:
-            return False
-        now = _utcnow_naive()
-        record.stopped_enforced_at = now
-        record.updated_at = now
-        session.add(record)
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET stopped_enforced_at = :now, updated_at = :now "
+                "WHERE id = :deployment_id AND UPPER(status) = 'STOPPED' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM live_deployment_submission_claims "
+                "  WHERE deployment_id = :deployment_id)"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
         session.commit()
-    return True
+        return int(result.rowcount or 0) == 1
 
 
 def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
@@ -3863,7 +3983,7 @@ _SCALAR_STAT_COLUMNS: tuple[tuple[str, float], ...] = (
 
 
 def _scalar_stats_for_save(
-    session: Any, backtest_id: str, stats: dict[str, Any]
+    session: Session, backtest_id: str, stats: dict[str, Any]
 ) -> dict[str, float]:
     """The values the four scalar stat columns should hold after this save.
 
@@ -3880,12 +4000,12 @@ def _scalar_stats_for_save(
     absence and is logged.
     """
     current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
+    # Built from the same tuple that names the columns, not spelled out: the zip below pairs by
+    # position, so a fifth entry added to `_SCALAR_STAT_COLUMNS` alone would silently shift every
+    # value into the wrong column instead of failing.
     row = session.exec(
         select(
-            BacktestRecord.sharpe_ratio,
-            BacktestRecord.psr,
-            BacktestRecord.cagr,
-            BacktestRecord.p_value,
+            *(getattr(BacktestRecord, name) for name, _default in _SCALAR_STAT_COLUMNS)
         ).where(BacktestRecord.id == backtest_id)
     ).first()
     if row is not None:
@@ -4015,10 +4135,7 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
 
         backtest_record = BacktestRecord(
             id=backtest_id,
-            sharpe_ratio=scalar_stats["sharpe_ratio"],
-            psr=scalar_stats["psr"],
-            cagr=scalar_stats["cagr"],
-            p_value=scalar_stats["p_value"],
+            **scalar_stats,
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,

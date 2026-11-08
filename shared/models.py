@@ -769,11 +769,11 @@ def resolve_defined_stat(
     tell "computed as zero" from "never computed" and returns 0 for the omitted
     key.
 
-    It lives here rather than in the database or viewer layer because both need
-    it and the convention belongs to the data model. It has already bitten twice
-    - once for PSR, where the default was the *worst* attainable value, and once
-    for the portfolio combined stats - each time because the default was applied
-    somewhere new.
+    It lives here rather than in the database or viewer layer because the
+    convention belongs to the data model and every consumer has to apply it the
+    same way. It has already bitten twice - once for PSR, where the default was
+    the *worst* attainable value, and once for the portfolio combined stats -
+    each time because the default was applied somewhere new.
     """
     if not isinstance(stats, dict):
         return default

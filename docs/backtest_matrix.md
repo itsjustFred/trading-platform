@@ -63,7 +63,13 @@ of the request as it stands now. It refuses — and recomputes — when:
 - the underlying frame was re-downloaded or rewritten, even though not one
   artifact field changed;
 - either data half could not be resolved (missing = unknown, and unknown is a
-  refusal, never "unchanged").
+  refusal, never "unchanged");
+- the cell was computed under another **accounting version**
+  (`ACCOUNTING_VERSION` in `runner/grid_identity.py`, part of the config half):
+  the same request, strategy and data can publish different PnL, equity and
+  ratios after an accounting change. Cells written before the field existed
+  carry no version and are therefore recomputed once on the next `--resume`.
+  Bump the constant in any change that moves published numbers.
 
 A cell whose identity could not be stamped is reported as **failed**, not
 `ok`: an unstamped artifact is one the next `--resume` is obliged to throw away.

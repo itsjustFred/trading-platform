@@ -978,9 +978,17 @@ def _build_diagnostics_payload(
     except (ValueError, KeyError) as exc:
         payload["split"] = {"error": str(exc)}
 
-    # 2. Walk-forward folds, so the result is not a single lucky split.
+    # 2. Walk-forward fold BOUNDARIES (train/test windows per fold). This is
+    #    the geometry used to cut the sub-periods for the stability view below;
+    #    no parameter is re-fitted per fold and no per-fold performance is
+    #    computed, so it is not walk-forward evidence. The key says so (it was
+    #    ``walk_forward``, which read like a result).
+    payload["walk_forward_note"] = (
+        "Fold boundaries only: no per-fold performance was computed, so this is "
+        "not walk-forward evidence."
+    )
     try:
-        payload["walk_forward"] = walk_forward_splits(
+        payload["walk_forward_folds"] = walk_forward_splits(
             train_period["start"],
             test_period["end"],
             n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
@@ -989,7 +997,7 @@ def _build_diagnostics_payload(
             bar_duration=bar_duration,
         )
     except (ValueError, KeyError) as exc:
-        payload["walk_forward"] = {"error": str(exc)}
+        payload["walk_forward_folds"] = {"error": str(exc)}
 
     # 3. Plateau stability and selection bias over the evaluated trials.
     # Two classes of row are NOT strategy performances and must not reach
@@ -1047,7 +1055,14 @@ def _build_diagnostics_payload(
     # parameter they are talking about.
     parameter = max(candidates, key=lambda name: len(varied[name])) if candidates else None
     if parameter is not None:
-        plateau = plateau_analysis(trial_rows, parameter=parameter, metric="metric")
+        plateau = plateau_analysis(
+            trial_rows,
+            parameter=parameter,
+            metric="metric",
+            # The plateau must centre on the trial the study selects, i.e. the
+            # same direction the multiple-testing correction below uses.
+            direction=METRIC_DIRECTIONS.get(str(target_metric or ""), "maximize"),
+        )
         payload["plateau"] = (
             {"parameter": parameter, **plateau.as_dict()} if plateau else None
         )
