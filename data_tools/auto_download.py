@@ -7,7 +7,7 @@ import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -85,58 +85,18 @@ US_EQUITY_CALENDAR_SOURCES = frozenset(
 
 @lru_cache(maxsize=None)
 def _nyse_holidays(year: int) -> frozenset[str]:
-    def observed(month: int, day: int) -> date:
-        day_date = date(year, month, day)
-        if day_date.weekday() == 5 and (month, day) != (1, 1):
-            return day_date - timedelta(days=1)
-        if day_date.weekday() == 6:
-            return day_date + timedelta(days=1)
-        return day_date
+    """ISO dates of the NYSE closures in ``year``.
 
-    def nth_weekday(month: int, weekday: int, occurrence: int) -> date:
-        first = date(year, month, 1)
-        offset = (weekday - first.weekday()) % 7
-        return first + timedelta(days=offset + 7 * (occurrence - 1))
-
-    def last_weekday(month: int, weekday: int) -> date:
-        probe = (
-            date(year + 1, 1, 1) - timedelta(days=1)
-            if month == 12
-            else date(year, month + 1, 1) - timedelta(days=1)
-        )
-        offset = (probe.weekday() - weekday) % 7
-        return probe - timedelta(days=offset)
-
-    easter = _easter_sunday(year)
-    holidays = {
-        observed(1, 1),
-        nth_weekday(1, 0, 3),
-        nth_weekday(2, 0, 3),
-        last_weekday(5, 0),
-        observed(7, 4),
-        nth_weekday(9, 0, 1),
-        nth_weekday(11, 3, 4),
-        observed(12, 25),
-        date(year, *easter) - timedelta(days=2),
-    }
-    if year >= 2022:
-        holidays.add(observed(6, 19))
-    return frozenset(day.isoformat() for day in holidays)
-
-
-def _easter_sunday(year: int) -> tuple[int, int]:
-    a = year % 19
-    b, c = divmod(year, 100)
-    d, e = divmod(b, 4)
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i, k = divmod(c, 4)
-    weekday_correction = (32 + 2 * e + 2 * i - h - k) % 7
-    month_adjustment = (a + 11 * h + 22 * weekday_correction) // 451
-    month = (h + weekday_correction - 7 * month_adjustment + 114) // 31
-    day = ((h + weekday_correction - 7 * month_adjustment + 114) % 31) + 1
-    return month, day
+    Delegates to :mod:`shared.market_calendar`, the single holiday model in this
+    repo, so the coverage gate, the validator and the walk-forward runner cannot
+    disagree about which days were closed. A hand-written second copy used to live
+    here; it matched the calendar's scheduled holidays for 2000-2030 but did not
+    know the special closures (September 2001, Sandy, the 2025 Carter day).
+    """
+    return frozenset(
+        day.isoformat()
+        for day in market_calendar.holidays(date(year, 1, 1), date(year, 12, 31))
+    )
 
 
 def is_us_equity_holiday(value: object) -> bool:
@@ -381,9 +341,14 @@ class InternalGap:
     start: str
     end: str
     gap_days: float
+    # The exact UTC instants of the bars either side of the hole. `start`/`end`
+    # above are their UTC *dates*, which is the wrong calendar day for a US
+    # session that runs past 19:00 Eastern - see `_session_dates_of_gap`.
+    start_ts: str | None = None
+    end_ts: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        report: dict[str, object] = {
             "start": self.start,
             "end": self.end,
             "gap_days": round(self.gap_days, 2),
@@ -394,6 +359,10 @@ class InternalGap:
             # a rounded number.
             "gap_seconds": round(self.gap_days * 86_400.0),
         }
+        if self.start_ts is not None and self.end_ts is not None:
+            report["start_ts"] = self.start_ts
+            report["end_ts"] = self.end_ts
+        return report
 
 
 def _coverage_window_from_env(env_value: str | None, default: str) -> str:
@@ -807,6 +776,8 @@ def _find_gaps_inside_file(
                 start=series[index - 1].date().isoformat(),
                 end=series[index].date().isoformat(),
                 gap_days=diffs[index].total_seconds() / 86_400,
+                start_ts=series[index - 1].isoformat(),
+                end_ts=series[index].isoformat(),
             )
         )
 
@@ -887,6 +858,8 @@ def find_internal_gaps(
                     start=previous_end.date().isoformat(),
                     end=next_start.date().isoformat(),
                     gap_days=gap_days,
+                    start_ts=previous_end.isoformat(),
+                    end_ts=next_start.isoformat(),
                 )
             )
 
@@ -1285,6 +1258,38 @@ def closure_hole_allowance_seconds(
     )
 
 
+def _session_dates_of_gap(
+    gap: dict[str, object], timeframe: str | None, start: date, end: date
+) -> tuple[date, date]:
+    """The US trading dates of the bars either side of a hole.
+
+    A gap report stores the *UTC* date of each bar. For an intraday US series that
+    is the wrong day whenever extended-hours trading runs past 19:00 Eastern
+    (00:00 UTC in winter, 23:00 UTC in summer): the last bar of a Friday session
+    before a Monday holiday is stamped on Saturday UTC, and the calendar - which
+    asks whether the hole *starts on a session* - refused a legitimate holiday
+    weekend. So when the exact instants are present they are converted to
+    America/New_York. Daily and longer bars are left on their stamped date: a
+    daily bar is labelled by a date, not an instant, and shifting a midnight-UTC
+    stamp back into the previous evening would mis-date it.
+
+    Reports without the instants (hand-built, or from before they existed) keep
+    their UTC dates, which is the previous behaviour.
+    """
+    if timeframe_nominal_days(timeframe) >= 1.0:
+        return start, end
+    raw_start_ts = gap.get("start_ts")
+    raw_end_ts = gap.get("end_ts")
+    if not raw_start_ts or not raw_end_ts:
+        return start, end
+    zone = market_calendar.US_EASTERN
+    start_ts = pd.Timestamp(str(raw_start_ts))
+    end_ts = pd.Timestamp(str(raw_end_ts))
+    if start_ts.tzinfo is None or end_ts.tzinfo is None:
+        raise ValueError("gap instants must be timezone-aware")
+    return start_ts.tz_convert(zone).date(), end_ts.tz_convert(zone).date()
+
+
 def _gap_is_market_closure(
     gap: dict[str, object],
     *,
@@ -1334,6 +1339,9 @@ def _gap_is_market_closure(
         start_date = date.fromisoformat(raw_start)
         end_date = date.fromisoformat(raw_end)
         gap_seconds = float(gap["gap_seconds"])
+        start_date, end_date = _session_dates_of_gap(
+            gap, timeframe, start_date, end_date
+        )
     except (TypeError, ValueError):
         return False
     if not market_calendar.closure_explains_hole(start_date, end_date):

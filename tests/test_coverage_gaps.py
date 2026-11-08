@@ -7,6 +7,7 @@ fail. Proposed default (open): internal gap > 3 calendar days fails.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -1170,6 +1171,48 @@ def _one_minute_report(tmp_path, before: str, after: str, start: str, end: str):
         root,
         DataRequirement(symbol="AAPL", timeframe="1m", start=start, end=end),
     )
+
+
+def test_extended_hours_past_19_eastern_do_not_hide_a_holiday_weekend(tmp_path):
+    """Friday's post-market bars run to 20:00 Eastern. In winter that is 01:00 UTC
+    on Saturday, so the gap report's UTC *date* for the last bar is a Saturday and
+    the calendar saw a hole that did not start on a session. MLK Day 2026 (Monday
+    19 January) with extended-hours data therefore hard-failed a legitimate
+    holiday weekend. The exact instants are now converted to Eastern first."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-01-17 00:59",   # Friday 19:59 EST, the last post-market bar
+        after="2026-01-20 09:00",    # Tuesday 04:00 EST, first pre-market bar
+        start="2026-01-17",
+        end="2026-01-20",
+    )
+
+    assert report["gaps"][0]["start"] == "2026-01-17", "the report keeps UTC dates"
+    assert report["status"] != "failed", f"a real MLK weekend was refused: {report}"
+    assert not report["failed_downloads"]
+
+
+def test_extended_hours_conversion_does_not_excuse_a_real_outage(tmp_path):
+    """Same stamp shape, but a live Tuesday session sits inside the hole."""
+    report = _one_minute_report(
+        tmp_path,
+        before="2026-01-14 00:59",   # Tuesday 13 January 19:59 EST
+        after="2026-01-17 12:00",    # Saturday: Wed, Thu, Fri sessions all missing
+        start="2026-01-14",
+        end="2026-01-17",
+    )
+
+    assert report["status"] == "failed" and report["failed_downloads"], report
+
+
+def test_session_dates_of_gap_leaves_daily_bars_on_their_stamped_date():
+    from data_tools.auto_download import _session_dates_of_gap
+
+    gap = {"start_ts": "2026-01-16T00:00:00+00:00", "end_ts": "2026-01-20T00:00:00+00:00"}
+    start, end = date(2026, 1, 16), date(2026, 1, 20)
+    assert _session_dates_of_gap(gap, "1d", start, end) == (start, end)
+    assert _session_dates_of_gap(gap, "1m", start, end) == (date(2026, 1, 15), date(2026, 1, 19))
+    assert _session_dates_of_gap({}, "1m", start, end) == (start, end)
 
 
 def test_a_3_6_day_hole_in_1m_data_still_fails_coverage(tmp_path):

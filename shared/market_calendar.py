@@ -32,11 +32,15 @@ observe. It is deliberately *not* claimed to be complete:
   when the real one was 13:00, so a measured closure is up to three hours
   shorter than the truth. That error is in the safe direction: a shorter
   closure limit excuses fewer holes, never more.
-* **Unscheduled closures are absent.** No published calendar contains a
-  National Day of Mourning, a hurricane shutdown or a funeral closure, and no
-  API enumerates them in advance. The tolerance a staleness gate must add is
-  derived from, and documented against, this gap -- see
-  ``AD_HOC_CLOSURE_TOLERANCE_SESSIONS``.
+* **Unscheduled closures are modelled only once they have happened.** The
+  full-day special closures since 2000 are listed in :data:`SPECIAL_CLOSURES`
+  (11-14 September 2001, Reagan 2004, Ford 2007, Sandy 2012, Bush 2018, Carter
+  2025), so history that crosses them is not misread as a data hole. No
+  calendar can contain the *next* National Day of Mourning or hurricane
+  shutdown, and no API enumerates them in advance; the tolerance a staleness
+  gate must add for that is derived from, and documented against, this gap --
+  see ``AD_HOC_CLOSURE_TOLERANCE_SESSIONS``. Closures before 2000 are not
+  listed.
 * **Non-US venues are not modelled.** This calendar answers questions about US
   equities, which is what both callers ask. The repo also stores FX, metals and
   index CFDs, whose trading week differs; nothing here should be used to judge
@@ -70,6 +74,7 @@ from pandas.tseries.holiday import (
 __all__ = [
     "AD_HOC_CLOSURE_TOLERANCE_SESSIONS",
     "SESSION_CLOSE",
+    "SPECIAL_CLOSURES",
     "SESSION_OPEN",
     "US_EASTERN",
     "bar_covering_session",
@@ -152,10 +157,34 @@ _HOLIDAY_RULES: tuple[Holiday, ...] = (
 )
 
 
+#: Full-day unscheduled NYSE closures since 2000, which no procedural rule can
+#: produce. Each is a day the exchange did not open at all (not an early close):
+#: the September 11 attacks (Tue 2001-09-11 to Fri 2001-09-14, reopening on
+#: Monday the 17th), the National Day of Mourning for Ronald Reagan (Fri
+#: 2004-06-11), for Gerald Ford (Tue 2007-01-02), Hurricane Sandy (Mon-Tue
+#: 2012-10-29/30), the mourning day for George H. W. Bush (Wed 2018-12-05) and
+#: for Jimmy Carter (Thu 2025-01-09). A future closure has to be appended here
+#: once it happens; until then it is covered only by the staleness tolerance.
+SPECIAL_CLOSURES: frozenset[dt.date] = frozenset(
+    {
+        dt.date(2001, 9, 11),
+        dt.date(2001, 9, 12),
+        dt.date(2001, 9, 13),
+        dt.date(2001, 9, 14),
+        dt.date(2004, 6, 11),
+        dt.date(2007, 1, 2),
+        dt.date(2012, 10, 29),
+        dt.date(2012, 10, 30),
+        dt.date(2018, 12, 5),
+        dt.date(2025, 1, 9),
+    }
+)
+
+
 @lru_cache(maxsize=8)
 def holidays(start: dt.date, end: dt.date) -> frozenset[dt.date]:
-    """Scheduled US equity closures in the inclusive range ``[start, end]``."""
-    found: set[dt.date] = set()
+    """US equity closures (scheduled and known special) in ``[start, end]``."""
+    found: set[dt.date] = {day for day in SPECIAL_CLOSURES if start <= day <= end}
     for rule in _HOLIDAY_RULES:
         for moment in rule.dates(
             dt.datetime(start.year - 1, 1, 1), dt.datetime(end.year + 1, 12, 31)

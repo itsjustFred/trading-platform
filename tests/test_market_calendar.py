@@ -267,3 +267,125 @@ def test_session_span_seconds_is_the_modelled_regular_session():
     assert market_calendar.session_span_seconds(dt.date(2026, 9, 8)) == pytest.approx(
         6.5 * 3600.0
     )
+
+
+# ---------------------------------------------------------------------------
+# Special (unscheduled) full-day closures
+# ---------------------------------------------------------------------------
+
+SPECIAL_CLOSURE_DATES = [
+    ("2001-09-11", "September 11 attacks, Tuesday"),
+    ("2001-09-12", "September 11 attacks, Wednesday"),
+    ("2001-09-13", "September 11 attacks, Thursday"),
+    ("2001-09-14", "September 11 attacks, Friday"),
+    ("2004-06-11", "National Day of Mourning, Reagan"),
+    ("2007-01-02", "National Day of Mourning, Ford"),
+    ("2012-10-29", "Hurricane Sandy, Monday"),
+    ("2012-10-30", "Hurricane Sandy, Tuesday"),
+    ("2018-12-05", "National Day of Mourning, Bush"),
+    ("2025-01-09", "National Day of Mourning, Carter"),
+]
+
+
+@pytest.mark.parametrize(("day", "why"), SPECIAL_CLOSURE_DATES)
+def test_special_closures_are_not_sessions(day, why):
+    value = dt.date.fromisoformat(day)
+    assert value.weekday() < 5, "a special closure is a weekday by construction"
+    assert not market_calendar.is_session(value), why
+    assert value in market_calendar.holidays(value, value), why
+
+
+def test_special_closure_list_is_exactly_the_documented_ten_days():
+    assert market_calendar.SPECIAL_CLOSURES == {
+        dt.date.fromisoformat(day) for day, _ in SPECIAL_CLOSURE_DATES
+    }
+
+
+@pytest.mark.parametrize(
+    ("last_bar_day", "first_bar_day"),
+    [
+        ("2001-09-10", "2001-09-17"),  # four closed sessions, then reopening Monday
+        ("2012-10-26", "2012-10-31"),  # Friday -> Wednesday across Sandy
+        ("2025-01-08", "2025-01-10"),  # Wednesday -> Friday across Carter day
+        ("2018-12-04", "2018-12-06"),
+        ("2006-12-29", "2007-01-03"),  # New Year's Monday, then the Ford day
+    ],
+)
+def test_a_hole_over_a_special_closure_is_explained(last_bar_day, first_bar_day):
+    start = dt.date.fromisoformat(last_bar_day)
+    end = dt.date.fromisoformat(first_bar_day)
+    assert market_calendar.closure_explains_hole(start, end)
+
+
+def test_the_day_after_a_special_closure_is_a_session_again():
+    assert market_calendar.is_session(dt.date(2001, 9, 17))
+    assert market_calendar.is_session(dt.date(2025, 1, 10))
+    assert market_calendar.is_session(dt.date(2007, 1, 3))
+
+
+def _reference_nyse_holidays(year: int) -> frozenset[str]:
+    """Frozen copy of the hand-written table `data_tools.auto_download` used to carry.
+
+    Kept verbatim as the oracle for the delegation to `shared.market_calendar`.
+    """
+
+    def observed(month: int, day: int) -> dt.date:
+        day_date = dt.date(year, month, day)
+        if day_date.weekday() == 5 and (month, day) != (1, 1):
+            return day_date - dt.timedelta(days=1)
+        if day_date.weekday() == 6:
+            return day_date + dt.timedelta(days=1)
+        return day_date
+
+    def nth_weekday(month: int, weekday: int, occurrence: int) -> dt.date:
+        first = dt.date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + dt.timedelta(days=offset + 7 * (occurrence - 1))
+
+    def last_weekday(month: int, weekday: int) -> dt.date:
+        probe = (
+            dt.date(year + 1, 1, 1) - dt.timedelta(days=1)
+            if month == 12
+            else dt.date(year, month + 1, 1) - dt.timedelta(days=1)
+        )
+        return probe - dt.timedelta(days=(probe.weekday() - weekday) % 7)
+
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    wc = (32 + 2 * e + 2 * i - h - k) % 7
+    ma = (a + 11 * h + 22 * wc) // 451
+    easter = (
+        (h + wc - 7 * ma + 114) // 31,
+        ((h + wc - 7 * ma + 114) % 31) + 1,
+    )
+    found = {
+        observed(1, 1),
+        nth_weekday(1, 0, 3),
+        nth_weekday(2, 0, 3),
+        last_weekday(5, 0),
+        observed(7, 4),
+        nth_weekday(9, 0, 1),
+        nth_weekday(11, 3, 4),
+        observed(12, 25),
+        dt.date(year, *easter) - dt.timedelta(days=2),
+    }
+    if year >= 2022:
+        found.add(observed(6, 19))
+    return frozenset(day.isoformat() for day in found)
+
+
+@pytest.mark.parametrize("year", range(2000, 2031))
+def test_auto_download_holidays_equal_the_old_table_plus_special_closures(year):
+    from data_tools.auto_download import _nyse_holidays
+
+    special = {
+        day.isoformat()
+        for day in market_calendar.SPECIAL_CLOSURES
+        if day.year == year
+    }
+    assert _nyse_holidays(year) == _reference_nyse_holidays(year) | special
