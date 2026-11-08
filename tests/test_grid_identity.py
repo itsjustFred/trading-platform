@@ -253,6 +253,34 @@ def test_identity_names_the_config_fields_that_changed(tmp_path):
     assert "capital" in reason
 
 
+def test_the_accounting_version_is_part_of_the_identity(tmp_path, monkeypatch):
+    """A cell computed under older accounting must not satisfy a resume."""
+    import runner.grid_identity as grid_identity
+
+    current = _identity(tmp_path)
+    assert current["config"]["accounting_version"] == grid_identity.ACCOUNTING_VERSION
+
+    monkeypatch.setattr(grid_identity, "ACCOUNTING_VERSION", grid_identity.ACCOUNTING_VERSION + 1)
+    bumped = _identity(tmp_path)
+
+    assert bumped["fingerprint"] != current["fingerprint"]
+    ok, reason = identity_matches(current, bumped)
+    assert not ok
+    assert "accounting_version" in reason
+
+
+def test_a_pre_accounting_version_identity_is_refused_on_resume(tmp_path):
+    """Artifacts written before the field existed carry no accounting version."""
+    current = _identity(tmp_path)
+    legacy_config = {k: v for k, v in current["config"].items() if k != "accounting_version"}
+    legacy = {**current, "config": legacy_config}
+
+    ok, reason = identity_matches(legacy, current)
+
+    assert not ok
+    assert "accounting_version" in reason
+
+
 def test_read_identity_ignores_anything_it_cannot_parse(tmp_path):
     broken = tmp_path / "broken.trades.json"
     broken.write_text("{not json", encoding="utf-8")
