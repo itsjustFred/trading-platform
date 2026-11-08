@@ -297,3 +297,131 @@ def test_discover_configured_accounts_uses_shared_ctrader_credentials(monkeypatc
 
     assert captured == [("app", "secret", "token")]
     assert [account.id for account in accounts] == ["47644617"]
+
+
+# ── moneyDigits: a genuine zero is not a missing field ────────────────────────────────────────
+#
+# `ProtoOATrader.moneyDigits` is a `uint32` **with presence**, so an unset field reads back as
+# 0 - the same value the broker sends for an account with no minor units. The previous
+# `int(getattr(trader, "moneyDigits", 2) or 2)` collapsed both onto 2, so a 0-decimal account's
+# balance was reported 100x too small. These tests pin the two cases apart on the wire
+# representation that actually produces them, not on a hand-made dict.
+
+
+def _proto_trader(*, money_digits: int | None, balance: int):
+    """A real `ProtoOATrader`, so `HasField` answers the way the broker's payload does."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrader
+
+    trader = ProtoOATrader()
+    trader.balance = balance
+    if money_digits is not None:
+        trader.moneyDigits = money_digits
+    return trader
+
+
+def test_a_broker_sent_zero_money_digits_means_no_minor_units():
+    """The blocker: 0 decimals must not be read as 2.
+
+    Balance 123456 with `moneyDigits=0` is 123456 currency units. The old collapse divided it
+    by 100 and reported 1234.56.
+    """
+    trader = _proto_trader(money_digits=0, balance=123_456)
+
+    assert account_discovery._trader_balance(trader) == pytest.approx(123_456.0), (
+        "a broker-sent moneyDigits=0 was scaled by 100, so the balance is 100x too small"
+    )
+
+
+def test_two_money_digits_still_scale_by_a_hundred():
+    trader = _proto_trader(money_digits=2, balance=123_456)
+
+    assert account_discovery._trader_balance(trader) == pytest.approx(1_234.56)
+
+
+def test_an_omitted_money_digits_keeps_the_conventional_default():
+    """The other half of the pair: absent is not zero.
+
+    An unset `moneyDigits` reads back as 0, so a value-only test cannot tell it from a genuine
+    zero. `HasField` can, and this asserts the distinction survives.
+    """
+    trader = _proto_trader(money_digits=None, balance=123_456)
+
+    assert trader.HasField("moneyDigits") is False
+    assert trader.moneyDigits == 0
+    assert account_discovery._trader_balance(trader) == pytest.approx(1_234.56), (
+        "an omitted moneyDigits was honoured as 0, so the default no longer applies"
+    )
+
+
+def test_a_payload_without_presence_is_taken_at_its_word():
+    """`SimpleNamespace` doubles and replay adapters have no `HasField`.
+
+    There the attribute being present at all is the only signal available, so its value is
+    taken as sent - including 0. A missing attribute still means "not sent".
+    """
+    assert account_discovery._trader_balance(
+        SimpleNamespace(moneyDigits=0, balance=123_456)
+    ) == pytest.approx(123_456.0)
+    assert account_discovery._trader_balance(
+        SimpleNamespace(moneyDigits=2, balance=123_456)
+    ) == pytest.approx(1_234.56)
+    assert account_discovery._trader_balance(SimpleNamespace(balance=123_456)) == pytest.approx(
+        1_234.56
+    ), "a payload that never carried moneyDigits must still fall back to the default"
+
+
+@pytest.mark.parametrize("money_digits", [13, 20, -1, -5, True, "not a number"])
+def test_an_unusable_money_digits_count_falls_back_to_two(money_digits):
+    """A value outside the scaleable range is not a decimal count; the default applies."""
+    trader = SimpleNamespace(moneyDigits=money_digits, balance=123_456)
+
+    assert account_discovery._trader_balance(trader) == pytest.approx(1_234.56)
+
+
+def test_the_adapter_balance_uses_the_same_resolution():
+    """`get_balance` must agree with discovery, or the viewer and the daemon disagree.
+
+    Both call `money_digits_from_trader`; this asserts the second call site behaves the same on
+    the wire payload rather than relying on a source-level check.
+    """
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+
+    class _TraderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    trader = _proto_trader(money_digits=0, balance=123_456)
+    adapter._ProtoOATraderReq = _TraderReq
+    adapter._ProtoOATraderRes = type("_TraderRes", (), {})
+
+    response = adapter._ProtoOATraderRes()
+    response.trader = trader
+
+    async def _send_response(_request, **_kwargs):
+        return response
+
+    adapter._send_request = _send_response
+
+    balance, equity = asyncio.run(adapter.get_balance())
+
+    assert balance == pytest.approx(123_456.0)
+    assert equity == pytest.approx(123_456.0)
+
+
+def test_a_negative_login_is_refused_not_accepted():
+    """`"-1".isdigit()` is False, so the old `isdigit() and int(...) <= 0` guard passed it.
+
+    `traderLogin` is an int64, so a negative is an ordinary wire value and every downstream
+    validator rejects it; this guard must too, or the bad value reaches them as a login.
+    """
+    assert account_discovery._ctrader_extract_login(SimpleNamespace(traderLogin=-1)) == ""
+    assert account_discovery._ctrader_extract_login(SimpleNamespace(traderLogin=0)) == ""
+    assert account_discovery._ctrader_extract_login(SimpleNamespace(traderLogin=46736452)) == (
+        "46736452"
+    )

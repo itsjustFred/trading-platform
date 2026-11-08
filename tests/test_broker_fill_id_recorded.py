@@ -306,3 +306,82 @@ def test_the_migration_adds_the_column_and_is_idempotent(isolated_db: Any) -> No
     with database.get_engine().connect() as writable:
         database._add_live_executions_broker_fill_id(writable)
         writable.commit()
+
+
+def test_an_actual_price_verdict_survives_the_round_trip(signal_id: str) -> None:
+    """`actual_price_observed` must survive both directions of the model mapping.
+
+    The row exists to say whether a stored `0.0` price means "the broker sent zero" or "the
+    broker sent nothing", so a write-only column is worthless: the model has to hand the verdict
+    back to a reader. `LiveExecutionModel.from_live_execution` and `to_live_execution` are the two
+    halves of that, and each is asserted separately - a mapping that drops the field on the way in
+    stores NULL, and one that drops it on the way out hides a verdict that is sitting on the row.
+
+    `None` is checked too, because "no verdict" is a real state (rows written before the column
+    existed, and adapters like Alpaca that do not classify) and must not be turned into a verdict
+    on the way through.
+    """
+    from sqlalchemy import text
+    from sqlmodel import select
+
+    from shared.models import PRICE_ABSENT, PRICE_OBSERVED, PRICE_SENT_BAD
+
+    records = [
+        (PRICE_OBSERVED, "ctrader:deal:7101", 7101),
+        (PRICE_SENT_BAD, "ctrader:deal:7102", 7102),
+        (PRICE_ABSENT, "ctrader:deal:7103", 7103),
+    ]
+    for verdict, dedupe_key, fill_id in records:
+        execution = _fill(signal_id, fill_id=fill_id, dedupe_key=dedupe_key)
+        execution.actual_price_observed = verdict
+        assert database.save_live_execution(execution), dedupe_key
+
+    # The value actually reached the column.
+    with database.get_engine().connect() as conn:
+        stored = {
+            row[0]: row[1]
+            for row in conn.execute(
+                text("SELECT dedupe_key, actual_price_observed FROM live_executions")
+            )
+        }
+    assert stored == {
+        "ctrader:deal:7101": PRICE_OBSERVED,
+        "ctrader:deal:7102": PRICE_SENT_BAD,
+        "ctrader:deal:7103": PRICE_ABSENT,
+    }, stored
+
+    # And the model hands each one back, so a reader never has to re-derive it.
+    with database.get_session() as session:
+        by_key = {
+            record.dedupe_key: record.to_live_execution()
+            for record in session.exec(select(database.LiveExecutionModel))
+        }
+    assert by_key["ctrader:deal:7101"].actual_price_observed == PRICE_OBSERVED
+    assert by_key["ctrader:deal:7102"].actual_price_observed == PRICE_SENT_BAD
+    assert by_key["ctrader:deal:7103"].actual_price_observed == PRICE_ABSENT
+
+
+def test_no_verdict_stays_no_verdict_through_the_mapping() -> None:
+    """An unclassified execution must not acquire a verdict on the way through the model.
+
+    `None` means "nobody classified this row" and is deliberately different from `observed`. A
+    mapping that substituted a default would fabricate evidence for every adapter that does not
+    classify, including rows written before the column existed.
+    """
+    execution = LiveExecution(
+        signal_id=uuid.UUID(str(uuid.uuid4())),
+        actual_price=0.0,
+        filled_qty=1.0,
+        commission=0.0,
+        timestamp=datetime.now(timezone.utc),
+        broker_order_id="unclassified",
+    )
+    assert execution.actual_price_observed is None
+
+    record = database.LiveExecutionModel.from_live_execution(execution)
+    assert record.actual_price_observed is None, (
+        "an unclassified execution gained a verdict on the way into the model"
+    )
+    assert record.to_live_execution().actual_price_observed is None, (
+        "an unclassified execution gained a verdict on the way back out of the model"
+    )

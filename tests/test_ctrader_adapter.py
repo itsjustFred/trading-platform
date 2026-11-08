@@ -845,3 +845,764 @@ def test_get_balance_marks_terminal_auth_failure_for_not_authorized() -> None:
 
     assert adapter._terminal_auth_failure_code == "TRADING_ACCOUNT_IS_NOT_AUTHORIZED"
     assert "not authorized" in adapter._terminal_auth_failure_reason.lower()
+
+
+# ── Fill identity: two real fills must not collapse onto one dedupe key ──────────────────────
+#
+# The adapter used to derive the key from `(order, timestamp, volume)` whenever the broker sent
+# no deal id. Two genuine equal-sized fills on one order therefore produced the *same* key, and
+# the second was logged as a duplicate and dropped - the position ended up short with a log line
+# arguing against it. These tests drive the real persistence path against a throwaway database,
+# because the defect only exists once the key reaches the unique index.
+
+
+def _seed_signal(database, signal_id: str, *, broker_order_id: str = "45678") -> None:
+    from datetime import datetime, timezone
+
+    with database.get_session() as session:
+        session.add(database.LiveAccountModel(id="acc-1", broker="ctrader", name="acc-1"))
+        session.add(
+            database.LiveDeploymentModel(
+                id="acc-1",
+                strategy_name="fill-identity",
+                account_id="acc-1",
+                symbols_json=["EURUSD"],
+                timeframe="1m",
+            )
+        )
+        session.add(
+            database.LiveSignalModel(
+                id=signal_id,
+                deployment_id="acc-1",
+                symbol="EURUSD",
+                action="BUY",
+                theoretical_price=1.2345,
+                source="internal",
+                broker_order_id=broker_order_id,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+
+def _execution_adapter():
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter.account_config_id = "acc-1"
+    adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._order_id_to_symbol[45678] = "EURUSD"
+    return adapter
+
+
+def _fill_event(
+    *,
+    signal_id: str,
+    deal_id: int,
+    volume: int = 500_000,
+    timestamp: int = 1_700_000_000_000,
+):
+    """A fill whose deal carries the broker's per-fill id."""
+    return SimpleNamespace(
+        executionType=1,
+        order=None,
+        deal=SimpleNamespace(
+            dealId=deal_id,
+            orderId=45678,
+            symbolId=1,
+            filledVolume=volume,
+            executionPrice=1.2345,
+            executionTimestamp=timestamp,
+            commission=0.0,
+        ),
+        HasField=lambda field: field == "deal",
+    )
+
+
+def _order_fill_event(*, signal_id: str, executed_volume: int, timestamp: int = 1_700_000_000_000):
+    """An order-level fill: no deal, so the only quantity is the order's cumulative volume."""
+    return SimpleNamespace(
+        executionType=2,
+        order=SimpleNamespace(
+            orderId=45678,
+            clientOrderId=signal_id,
+            executedVolume=executed_volume,
+            utcLastUpdateTimestamp=timestamp,
+        ),
+        deal=None,
+        HasField=lambda field: field == "order",
+    )
+
+
+def _rows(database) -> list[tuple[str | None, int | None, float]]:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return list(
+            conn.execute(
+                "SELECT dedupe_key, broker_fill_id, filled_qty FROM live_executions ORDER BY rowid"
+            )
+        )
+    finally:
+        conn.close()
+
+
+def test_two_distinct_fills_with_equal_size_and_timestamp_are_two_rows(isolated_db) -> None:
+    """**The blocker.** Equal size, same millisecond, one order - only the broker id separates them.
+
+    Both fills must be stored. Before the fix the second one's key collided with the first and
+    `save_live_execution` refused it as a duplicate that it was not.
+    """
+    database = isolated_db[0]
+    signal_id = "11111111-1111-4111-8111-111111111111"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    asyncio.run(adapter._persist_execution_event(_fill_event(signal_id=signal_id, deal_id=1001)))
+    asyncio.run(adapter._persist_execution_event(_fill_event(signal_id=signal_id, deal_id=1002)))
+
+    rows = _rows(database)
+    assert [row[0] for row in rows] == ["ctrader:deal:1001", "ctrader:deal:1002"], rows
+    assert [row[1] for row in rows] == [1001, 1002], rows
+    assert sum(row[2] for row in rows) == pytest.approx(1000.0)
+
+
+def test_a_redelivered_fill_is_stored_once(isolated_db) -> None:
+    """The other half: the same fill arriving twice must not be counted twice."""
+    database = isolated_db[0]
+    signal_id = "22222222-2222-4222-8222-222222222222"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = _fill_event(signal_id=signal_id, deal_id=1003)
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(event))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][1] == 1003
+    assert rows[0][2] == pytest.approx(500.0)
+
+
+def test_an_order_level_fill_is_identified_by_the_cumulative_volume(isolated_db) -> None:
+    """With no deal id, identity comes from the order's cumulative executed volume.
+
+    That number strictly increases per fill, so two genuine fills are distinguishable, and the
+    persistence cap keeps the second row at the increment rather than re-storing the total.
+    """
+    database = isolated_db[0]
+    signal_id = "33333333-3333-4333-8333-333333333333"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    asyncio.run(
+        adapter._persist_execution_event(
+            _order_fill_event(signal_id=signal_id, executed_volume=500_000)
+        )
+    )
+    asyncio.run(
+        adapter._persist_execution_event(
+            _order_fill_event(signal_id=signal_id, executed_volume=1_000_000)
+        )
+    )
+
+    rows = _rows(database)
+    assert len(rows) == 2, rows
+    assert rows[0][0] == "ctrader:order:45678:cum:500000"
+    assert rows[1][0] == "ctrader:order:45678:cum:1000000"
+    assert [row[2] for row in rows] == [pytest.approx(500.0), pytest.approx(500.0)], (
+        "the order's executedVolume is cumulative; storing it whole would double-count the "
+        "first fill"
+    )
+    assert sum(row[2] for row in rows) == pytest.approx(1000.0)
+
+
+def test_a_redelivered_order_level_fill_adds_nothing(isolated_db) -> None:
+    database = isolated_db[0]
+    signal_id = "44444444-4444-4444-8444-444444444444"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = _order_fill_event(signal_id=signal_id, executed_volume=500_000)
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(event))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][2] == pytest.approx(500.0)
+
+
+def test_a_fill_with_no_identity_at_all_is_refused_not_collided() -> None:
+    """No deal id, no cumulative volume, no timestamp: the key cannot separate two fills.
+
+    Inventing one would either lose a real fill (a colliding key) or double-count a redelivery
+    (a unique key per event). The event is refused so it is retained for reconciliation, which
+    reads deals that do carry ids.
+    """
+    deal = SimpleNamespace(dealId=0)
+    with pytest.raises(ValueError, match="no deal id, no cumulative order volume and no timestamp"):
+        CTraderLiveAdapter._build_dedupe_key(
+            deal,
+            order_id=123,
+            timestamp_ms=0,
+            filled_volume=500.0,
+            order_cumulative_volume=0.0,
+        )
+
+
+def test_the_fallback_key_separates_every_component_it_carries() -> None:
+    """A timestamp-only fallback still has to separate two fills that differ in any component."""
+    base = CTraderLiveAdapter._build_dedupe_key(
+        SimpleNamespace(dealId=0),
+        order_id=123,
+        timestamp_ms=1000,
+        filled_volume=500.0,
+    )
+    assert base == "ctrader:order:123:1000:500"
+    for changed in (
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=124, timestamp_ms=1000, filled_volume=500.0
+        ),
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=2000, filled_volume=500.0
+        ),
+        CTraderLiveAdapter._build_dedupe_key(
+            SimpleNamespace(dealId=0), order_id=123, timestamp_ms=1000, filled_volume=501.0
+        ),
+    ):
+        assert changed != base, f"a distinct fill produced the same key {base}"
+
+
+def test_a_deal_that_grows_is_amended_not_dropped(isolated_db) -> None:
+    """A dealId repeated with a larger quantity is the broker amending the fill.
+
+    `ProtoOADeal.filledVolume` can grow for a deal already reported. Dropping the repeat as a
+    duplicate freezes the stored quantity at its first-seen value and loses the rest of the
+    fill, which is what the plain insert path did.
+    """
+    database = isolated_db[0]
+    signal_id = "55555555-5555-4555-8555-555555555555"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    event = SimpleNamespace(
+        executionType=1,
+        order=SimpleNamespace(
+            orderId=45678,
+            clientOrderId=signal_id,
+            executedVolume=500_000,
+            utcLastUpdateTimestamp=1_700_000_000_000,
+        ),
+        deal=SimpleNamespace(
+            dealId=2001,
+            orderId=45678,
+            symbolId=1,
+            filledVolume=300_000,
+            executionPrice=1.2345,
+            executionTimestamp=1_700_000_000_000,
+            commission=0.0,
+        ),
+        HasField=lambda field: field == "order",
+    )
+    amended = SimpleNamespace(**{**event.__dict__})
+    amended.deal = SimpleNamespace(
+        dealId=2001,
+        orderId=45678,
+        symbolId=1,
+        filledVolume=500_000,
+        executionPrice=1.2345,
+        executionTimestamp=1_700_000_000_000,
+        commission=0.0,
+    )
+
+    asyncio.run(adapter._persist_execution_event(event))
+    asyncio.run(adapter._persist_execution_event(amended))
+
+    rows = _rows(database)
+    assert len(rows) == 1, rows
+    assert rows[0][0] == "ctrader:deal:2001"
+    assert rows[0][2] == pytest.approx(500.0), (
+        "the amendment was dropped, so the stored quantity is stuck at its first-seen value"
+    )
+
+
+# ── Execution price: 0.0 is not a price ──────────────────────────────────────────────────────
+#
+# `_resolve_execution_price` returns 0.0 as its "could not be read" sentinel, so an omitted
+# price, an explicitly-sent zero and a genuine zero all stored the same value. The classifier
+# below is what makes the three countable, and it is persisted beside the price.
+
+
+def _deal_with_price(price: float | None):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+    deal = ProtoOADeal()
+    if price is not None:
+        deal.executionPrice = price
+    return deal
+
+
+def test_a_real_price_is_observed() -> None:
+    deal = _deal_with_price(261.7)
+
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "observed"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == pytest.approx(
+        261.7
+    )
+
+
+def test_a_price_of_exactly_zero_is_sent_but_unusable() -> None:
+    """The case that looks like a price. `0.0` must never be classified as observed."""
+    deal = _deal_with_price(0.0)
+
+    assert deal.HasField("executionPrice") is True
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "sent_bad"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == 0.0
+
+
+def test_an_omitted_price_is_absent_not_zero() -> None:
+    """`optional double` carries presence, so an unset field is distinguishable from a sent 0."""
+    deal = _deal_with_price(None)
+
+    assert deal.HasField("executionPrice") is False
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "absent"
+
+
+@pytest.mark.parametrize("price", [-1.0, float("nan"), float("inf")])
+def test_an_unusable_price_is_never_returned_as_the_price(price: float) -> None:
+    """A negative or non-finite price used to pass `if value:` - NaN did, and poisoned averages."""
+    deal = _deal_with_price(price)
+
+    assert CTraderLiveAdapter._execution_price_presence(order=None, deal=deal) == "sent_bad"
+    assert CTraderLiveAdapter._resolve_execution_price(order=None, deal=deal) == 0.0
+
+
+def test_the_deal_price_wins_over_the_order_price() -> None:
+    """Precedence, and the verdict follows the source that answered."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.executionPrice = 1.0
+    deal = _deal_with_price(2.0)
+
+    assert CTraderLiveAdapter._resolve_execution_price(order=order, deal=deal) == pytest.approx(
+        2.0
+    )
+    assert CTraderLiveAdapter._execution_price_presence(order=order, deal=deal) == "observed"
+
+
+def test_the_verdict_is_persisted_beside_the_price(isolated_db) -> None:
+    """The column is only worth having if the fill path writes it."""
+    database = isolated_db[0]
+    signal_id = "66666666-6666-4666-8666-666666666666"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    def _fill(deal_id: int, price: float | None):
+        from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+        deal = ProtoOADeal()
+        deal.dealId = deal_id
+        deal.orderId = 45678
+        deal.symbolId = 1
+        deal.filledVolume = 500_000
+        deal.executionTimestamp = 1_700_000_000_000
+        if price is not None:
+            deal.executionPrice = price
+        return SimpleNamespace(
+            executionType=1,
+            order=None,
+            deal=deal,
+            HasField=lambda field: field == "deal",
+        )
+
+    asyncio.run(adapter._persist_execution_event(_fill(3001, 261.7)))
+    asyncio.run(adapter._persist_execution_event(_fill(3002, 0.0)))
+    asyncio.run(adapter._persist_execution_event(_fill(3003, None)))
+
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT broker_fill_id, actual_price, actual_price_observed "
+                "FROM live_executions ORDER BY rowid"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert rows == [(3001, 261.7, "observed"), (3002, 0.0, "sent_bad"), (3003, 0.0, "absent")], (
+        rows
+    )
+
+
+def test_the_column_is_additive_nullable_and_has_no_default(isolated_db) -> None:
+    """No verdict is not a verdict of `observed`, so the column must be nullable and defaultless."""
+    import sqlite3
+
+    database = isolated_db[0]
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(live_executions)")}
+    finally:
+        conn.close()
+
+    assert "actual_price_observed" in columns, (
+        "live_executions has no actual_price_observed column, so a 0.0 price stays "
+        "indistinguishable from an omitted one"
+    )
+    notnull, default = columns["actual_price_observed"][3], columns["actual_price_observed"][4]
+    assert notnull == 0, "existing rows have no verdict and must be allowed to stay NULL"
+    assert default is None, (
+        "a database default would fabricate a verdict for rows nobody classified"
+    )
+
+
+def test_the_migration_adds_the_column_and_is_idempotent(isolated_db) -> None:
+    """Staged by dropping the column, so this exercises the ALTER rather than `create_all`."""
+    import sqlite3
+
+    database = isolated_db[0]
+    db_path = database.DB_PATH
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE live_executions DROP COLUMN actual_price_observed")
+        conn.commit()
+        missing = "actual_price_observed" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(live_executions)")
+        }
+    finally:
+        conn.close()
+    assert missing, "could not stage a table without the column, so this proves nothing"
+
+    with database.get_engine().connect() as writable:
+        database._add_live_executions_actual_price_observed(writable)
+        writable.commit()
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        after = {row[1] for row in conn.execute("PRAGMA table_info(live_executions)")}
+    finally:
+        conn.close()
+    assert "actual_price_observed" in after, "the migration did not add the column"
+
+    with database.get_engine().connect() as writable:
+        database._add_live_executions_actual_price_observed(writable)
+        writable.commit()
+
+
+# ── Connection auth state ────────────────────────────────────────────────────────────────────
+
+
+def test_a_new_connection_cannot_inherit_authentication() -> None:
+    """A connect event means a socket that has not been authenticated yet.
+
+    `_authenticate` short-circuits on `_authenticated and _symbol_name_to_id`, and a dozen gates
+    - including the order paths - test `not self._authenticated`. A stale True plus a populated
+    symbol cache would let a trade go out on a connection the broker never authenticated.
+    """
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    client = object()
+    adapter._client = client
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._already_logged_in_notified = True
+
+    adapter._on_connected(client)
+
+    assert adapter._connected is True, "the connection is real; only the auth state is stale"
+    assert adapter._authenticated is False
+    assert adapter._already_logged_in_notified is False
+
+
+def test_a_blanked_demo_switch_is_refused_not_defaulted() -> None:
+    """`resolve_env_value` keeps "blanked" distinct from "absent"; the adapter must too.
+
+    With `default=False` the same blank would select live trading silently.
+    """
+    with pytest.raises(ValueError, match="CTRADER_DEMO"):
+        CTraderLiveAdapter(
+            app_id="app",
+            app_secret="secret",
+            access_token="token",
+            account_id="1",
+            env_values={"CTRADER_DEMO": ""},
+        )
+
+
+def test_an_absent_demo_switch_still_defaults_to_demo(monkeypatch) -> None:
+    monkeypatch.delenv("CTRADER_DEMO", raising=False)
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1", env_values={}
+    )
+
+    assert adapter.demo is True
+
+
+def test_an_explicit_demo_argument_beats_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("CTRADER_DEMO", "true")
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1", demo=False
+    )
+
+    assert adapter.demo is False
+
+
+# ── Connect-failure classification ──────────────────────────────────────────────────────────
+
+
+def test_a_deferred_response_timeout_is_not_reported_as_authentication(caplog) -> None:
+    """`(15, 'Deferred')` is Twisted's response timeout, not a credential problem.
+
+    It contains neither "token" nor "timeout", so it used to fall into the fallback that named
+    authentication - once per retry, forever, for a token that worked.
+    """
+    import logging
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    exc = Exception(15, "Deferred")
+
+    with caplog.at_level(logging.INFO, logger="live-runner"):
+        adapter._log_connect_failure(exc, str(exc), str(exc).lower())
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("NO RESPONSE" in message and "15s" in message for message in messages), messages
+    assert not any("authentication" in message.lower() for message in messages), (
+        "a response timeout was reported as an authentication problem"
+    )
+
+
+def test_a_similar_message_is_not_claimed_as_a_response_timeout() -> None:
+    from live_runner.ctrader_adapter import _classify_deferred_response_timeout
+
+    assert _classify_deferred_response_timeout(Exception(), "(15, 'Deferred')") == (True, 15)
+    assert _classify_deferred_response_timeout(Exception(), "(15, 'Other')") == (False, None)
+    assert _classify_deferred_response_timeout(Exception(), "error 15 Deferred") == (False, None)
+
+
+def test_an_unclassified_failure_does_not_name_a_cause(caplog) -> None:
+    import logging
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    with caplog.at_level(logging.INFO, logger="live-runner"):
+        adapter._log_connect_failure(RuntimeError("x"), "something new", "something new")
+
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert "NOT CLASSIFIED" in joined
+    assert "auth" not in joined.lower().replace("not classified", ""), (
+        "the fallback guessed a cause, which is what sent operators to refresh a working token"
+    )
+
+
+def test_an_unreadable_cumulative_volume_is_not_treated_as_a_quantity() -> None:
+    """`executedVolume` feeds the persistence cap and the dedupe key, so only a real fill counts.
+
+    An unset protobuf field reads back as `0.0`, and a broker bug could send a negative or a
+    NaN. Returning those verbatim would let a `0` cumulative produce the key
+    `...:cum:0` and hand `save_live_execution_up_to_cumulative` a cap of zero - both are
+    "no readable quantity" and must collapse to `0.0` so the caller takes its no-cumulative path.
+    """
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(None) == 0.0
+    assert CTraderLiveAdapter._resolve_order_cumulative_volume(SimpleNamespace()) == 0.0
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=0)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=-500_000)
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("nan"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=float("inf"))
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume="not-a-number")
+        )
+        == 0.0
+    )
+    assert (
+        CTraderLiveAdapter._resolve_order_cumulative_volume(
+            SimpleNamespace(executedVolume=500_000)
+        )
+        == 500_000.0
+    )
+
+
+# ─── Reconciliation parity with the stream path, and commission scaling ──────
+
+
+def _reconcile_adapter():
+    adapter = _execution_adapter()
+    adapter._ProtoOADealStatus = SimpleNamespace(FILLED=2, PARTIALLY_FILLED=3)
+    return adapter
+
+
+def _recovered_deal(deal_id: int, volume: int, **extra):
+    return SimpleNamespace(
+        dealId=deal_id,
+        dealStatus=2,
+        orderId=45678,
+        symbolId=1,
+        filledVolume=volume,
+        executionPrice=1.2345,
+        executionTimestamp=1_700_000_000_000 + deal_id,
+        utcLastUpdateTimestamp=0,
+        commission=0,
+        **extra,
+    )
+
+
+def _reconcile(adapter, signal_id: str, deals, cumulative: int | None) -> int:
+    from uuid import UUID
+
+    order = SimpleNamespace(executedVolume=cumulative) if cumulative is not None else None
+    details = SimpleNamespace(order=[order] if order is not None else [], deal=list(deals))
+    return asyncio.run(
+        adapter._persist_recovered_deals(
+            signal_id=signal_id,
+            signal_uuid=UUID(signal_id),
+            broker_order_id="45678",
+            details_res=details,
+        )
+    )
+
+
+def test_reconciliation_grows_a_deal_amended_to_a_larger_volume(isolated_db) -> None:
+    """Same dealId, larger filled volume: the stored quantity grows once, nothing double counts."""
+    database = isolated_db[0]
+    signal_id = "55555555-5555-4555-8555-555555555555"
+    _seed_signal(database, signal_id)
+    adapter = _reconcile_adapter()
+
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 400_000)], 400_000) == 1
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 1_000_000)], 1_000_000) == 1
+    # A repeat of the amended state is a redelivery.
+    assert _reconcile(adapter, signal_id, [_recovered_deal(2001, 1_000_000)], 1_000_000) == 0
+
+    rows = _rows(database)
+    assert [row[0] for row in rows] == ["ctrader:deal:2001"], rows
+    assert rows[0][2] == pytest.approx(1000.0)
+
+
+def test_reconciliation_heals_an_out_of_order_stream(isolated_db) -> None:
+    """Deal 2 (cumulative 1,000,000) arrives before deal 1 (cumulative 400,000).
+
+    The stream path stores deal 2's 600 and then cannot fit deal 1 under the older, lower
+    cumulative, so only 600 of 1000 is stored. Reconciliation re-reads the order with its final
+    cumulative and stores the missing 400 - once.
+    """
+    database = isolated_db[0]
+    signal_id = "66666666-6666-4666-8666-666666666666"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+
+    def _event(deal_id: int, deal_volume: int, cumulative: int):
+        event = _fill_event(signal_id=signal_id, deal_id=deal_id, volume=deal_volume)
+        event.order = SimpleNamespace(
+            orderId=45678, clientOrderId=signal_id, executedVolume=cumulative
+        )
+        return event
+
+    asyncio.run(adapter._persist_execution_event(_event(3002, 600_000, 1_000_000)))
+    asyncio.run(adapter._persist_execution_event(_event(3001, 400_000, 400_000)))
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(600.0), (
+        "the premise of the scenario changed: the stale event was expected to be skipped"
+    )
+
+    healer = _reconcile_adapter()
+    deals = [_recovered_deal(3001, 400_000), _recovered_deal(3002, 600_000)]
+    assert _reconcile(healer, signal_id, deals, 1_000_000) == 1
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(1000.0)
+    # Running it again changes nothing.
+    assert _reconcile(healer, signal_id, deals, 1_000_000) == 0
+    assert sum(row[2] for row in _rows(database)) == pytest.approx(1000.0)
+
+
+def _commission_rows(database) -> list[float]:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return [row[0] for row in conn.execute("SELECT commission FROM live_executions")]
+    finally:
+        conn.close()
+
+
+def test_stream_commission_is_scaled_by_the_deals_money_digits(isolated_db) -> None:
+    """`ProtoOADeal.commission` is int64 minor units: 350 with moneyDigits=2 is 3.50."""
+    database = isolated_db[0]
+    signal_id = "77777777-7777-4777-8777-777777777777"
+    _seed_signal(database, signal_id)
+    adapter = _execution_adapter()
+    event = _fill_event(signal_id=signal_id, deal_id=4001)
+    event.deal.commission = 350
+    event.deal.moneyDigits = 2
+
+    asyncio.run(adapter._persist_execution_event(event))
+
+    assert _commission_rows(database) == [pytest.approx(3.5)]
+
+
+def test_reconciled_commission_is_scaled_by_the_deals_money_digits(isolated_db) -> None:
+    database = isolated_db[0]
+    signal_id = "88888888-8888-4888-8888-888888888888"
+    _seed_signal(database, signal_id)
+    adapter = _reconcile_adapter()
+
+    deal = _recovered_deal(5001, 500_000, moneyDigits=5)
+    deal.commission = 350_000
+
+    assert _reconcile(adapter, signal_id, [deal], None) == 1
+    assert _commission_rows(database) == [pytest.approx(3.5)]
+
+
+def test_commission_scaling_uses_real_protobuf_presence() -> None:
+    """With a real `ProtoOADeal`, an unset commission is zero and needs no moneyDigits."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
+
+    from live_runner.ctrader_adapter import _deal_commission
+
+    assert _deal_commission(None) == 0.0
+    assert _deal_commission(ProtoOADeal()) == 0.0
+    deal = ProtoOADeal(commission=-1234, moneyDigits=3)
+    assert _deal_commission(deal) == pytest.approx(-1.234)
+    # A genuine moneyDigits of 0 is honoured, not replaced by the default.
+    assert _deal_commission(ProtoOADeal(commission=7, moneyDigits=0)) == pytest.approx(7.0)
+
+
+def test_money_digits_fallback_is_logged(caplog) -> None:
+    from live_runner.base_adapter import DEFAULT_MONEY_DIGITS, money_digits_from_trader
+
+    with caplog.at_level("WARNING"):
+        digits = money_digits_from_trader(SimpleNamespace())
+    assert digits == DEFAULT_MONEY_DIGITS
+    assert any("moneyDigits" in record.getMessage() for record in caplog.records), (
+        "the fallback to the default scale was silent"
+    )

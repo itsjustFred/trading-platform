@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import math
 import os
+import re
 import tempfile
 import time
 from collections import deque
@@ -18,8 +19,11 @@ from uuid import UUID
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    ControlOutcome,
     coerce_positive_live_qty,
     is_unbounded_tp,
+    money_digits_from_trader,
+    money_scale,
 )
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
@@ -30,11 +34,18 @@ from shared.database import (
     get_live_signal_timestamp,
     list_live_signal_ids_for_reconciliation,
     save_live_execution,
+    save_live_execution_up_to_cumulative,
     save_live_signal,
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
-from shared.models import LiveExecution, LiveSignal
+from shared.models import (
+    PRICE_ABSENT,
+    PRICE_OBSERVED,
+    PRICE_SENT_BAD,
+    LiveExecution,
+    LiveSignal,
+)
 
 logger = get_logger("live-runner")
 
@@ -73,6 +84,19 @@ def _parse_bool_env(name: str, value: str | None, *, default: bool) -> bool:
     raise ValueError(
         f"Invalid boolean value for {name}: {value!r}. Valid values are: {valid}."
     )
+
+
+def _format_key_quantity(value: float) -> str:
+    """A stable text form for a quantity inside a dedupe key.
+
+    `:g` switches to exponent notation at 1e6, so two different volumes could still render
+    differently depending on magnitude and a key built yesterday would stop matching one built
+    today. Integral volumes are rendered as integers, everything else at full precision.
+    """
+    numeric = float(value)
+    if numeric.is_integer():
+        return str(int(numeric))
+    return repr(numeric)
 
 
 def _to_datetime_from_ms(timestamp_ms: int | float | None) -> datetime:
@@ -323,7 +347,78 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
+def _deal_commission(deal: Any | None) -> float:
+    """A deal's commission in account currency.
+
+    ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
+    ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
+    integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
+    commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
+    only a real charge can trigger the "digits missing" fallback warning.
+    """
+    if deal is None:
+        return 0.0
+    raw = _to_float(getattr(deal, "commission", 0))
+    # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
+    if not raw or not math.isfinite(raw):
+        return 0.0
+    return raw / money_scale(money_digits_from_trader(deal))
+
+
 _NOT_AUTHORIZED_MARKER = "not authorized"
+
+#: `str()` of the exception cTrader's client raises on a response timeout:
+#: ``(15, 'Deferred')`` - see `_classify_deferred_response_timeout`.
+_RESPONSE_TIMEOUT_SHAPE = re.compile(r"^\(\s*(\d+)\s*,\s*['\"]Deferred['\"]\s*\)$")
+
+
+def _twisted_deferred_timeout_class() -> type[BaseException] | None:
+    """`twisted.internet.defer.TimeoutError`, or None if Twisted cannot be imported.
+
+    Imported lazily and by name: this module is loaded by the test suite and by deployments
+    without a cTrader install, and a module-scope Twisted import would be a side effect this
+    file otherwise does not have.
+    """
+    try:
+        from twisted.internet import defer
+    except Exception:  # pragma: no cover - Twisted is absent
+        return None
+    return getattr(defer, "TimeoutError", None)
+
+
+def _classify_deferred_response_timeout(
+    exc: BaseException, error_text: str
+) -> tuple[bool, int | None]:
+    """Is `exc` cTrader's *response* timeout, and how long did it wait?
+
+    `ctrader_open_api/client.py` calls `responseDeferred.addTimeout(...)`, and Twisted answers
+    expiry with `raise TimeoutError(timeout, "Deferred")`. So `args == (15, "Deferred")`,
+    `str(exc)` is `(15, 'Deferred')`, and 15 is the configured response timeout. The request
+    reached a socket that accepted it and nothing came back - so it is neither a credentials
+    problem nor a TLS failure, and reporting it as "auth" sends an operator to refresh a token
+    that works.
+
+    Two signals, because either alone is incomplete. The class is authoritative when Twisted is
+    importable; the string shape covers the case where it is not, and is deliberately narrow -
+    anchored at both ends and requiring the literal `Deferred`, so a merely-similar message falls
+    through to the other branches. Twisted's `TimeoutError` is its own class deriving straight
+    from `Exception`, not the builtin, which on 3.11+ is also `asyncio.TimeoutError` - so an
+    `isinstance(exc, asyncio.TimeoutError)` test cannot recognise it.
+    """
+    seconds: int | None = None
+    match = _RESPONSE_TIMEOUT_SHAPE.match(str(error_text).strip())
+    if match:
+        seconds = int(match.group(1))
+
+    timeout_class = _twisted_deferred_timeout_class()
+    if timeout_class is None or not isinstance(exc, timeout_class):
+        return bool(match), seconds
+
+    if seconds is None:
+        args = getattr(exc, "args", ())
+        if args and isinstance(args[0], int) and not isinstance(args[0], bool):
+            seconds = int(args[0])
+    return True, seconds
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
 
@@ -508,9 +603,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
+        # Presence is checked separately from the value on purpose. `resolve_env_value` returns
+        # "" both for a key that is absent and for one an operator deliberately blanked, and it is
+        # built to keep those apart - "present-but-empty stays empty". Passing its result through
+        # `or None` collapsed the blanked case into "absent", so the strict parser never saw the
+        # empty string and applied the default instead. preflight and daemon both refuse on
+        # `CTRADER_DEMO=""`; this is the reader that opens the socket, and with `default=False`
+        # the same blank would have selected live trading silently.
+        demo_configured = (env_values is not None and "CTRADER_DEMO" in env_values) or (
+            "CTRADER_DEMO" in os.environ
+        )
         self.demo = (
             _parse_bool_env(
-                "CTRADER_DEMO", resolve_env_value(env_values, "CTRADER_DEMO") or None, default=True
+                "CTRADER_DEMO",
+                resolve_env_value(env_values, "CTRADER_DEMO") if demo_configured else None,
+                default=True,
             )
             if demo is None
             else demo
@@ -568,6 +675,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq: Any = None
         self._ProtoOASymbolsListRes: Any = None
         self._ProtoOANewOrderReq: Any = None
+        self._ProtoOACancelOrderReq: Any = None
         self._ProtoOAClosePositionReq: Any = None
         self._ProtoOAExecutionEvent: Any = None
         self._ProtoOAOrderErrorEvent: Any = None
@@ -586,6 +694,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOARefreshTokenRes: Any = None
         self._ProtoOADealStatus: Any = None
         self._ProtoOAPositionStatus: Any = None
+        self._ProtoOAOrderStatus: Any = None
         self._ProtoOAOrderType: Any = None
         self._ProtoOATradeSide: Any = None
         self._ProtoOAExecutionType: Any = None
@@ -609,6 +718,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAAccountAuthRes,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
+                ProtoOACancelOrderReq,
                 ProtoOAClosePositionReq,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
@@ -632,6 +742,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
                 ProtoOAExecutionType,
+                ProtoOAOrderStatus,
                 ProtoOAOrderType,
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
@@ -654,6 +765,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASymbolsListReq = ProtoOASymbolsListReq
         self._ProtoOASymbolsListRes = ProtoOASymbolsListRes
         self._ProtoOANewOrderReq = ProtoOANewOrderReq
+        self._ProtoOACancelOrderReq = ProtoOACancelOrderReq
         self._ProtoOAClosePositionReq = ProtoOAClosePositionReq
         self._ProtoOAExecutionEvent = ProtoOAExecutionEvent
         self._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
@@ -672,6 +784,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOARefreshTokenRes = ProtoOARefreshTokenRes
         self._ProtoOADealStatus = ProtoOADealStatus
         self._ProtoOAPositionStatus = ProtoOAPositionStatus
+        self._ProtoOAOrderStatus = ProtoOAOrderStatus
         self._ProtoOAOrderType = ProtoOAOrderType
         self._ProtoOATradeSide = ProtoOATradeSide
         self._ProtoOAExecutionType = ProtoOAExecutionType
@@ -799,6 +912,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _on_connected(self, client: Any) -> None:
         if client is not self._client:
             return
+        # A connect event describes a socket that has not been authenticated yet, so the
+        # per-connection auth state starts clean here. Disconnect and teardown both clear these
+        # flags already; what neither covers is a transport that reconnects without reporting the
+        # disconnect. Leaving `_authenticated` True would let `_authenticate` return before
+        # sending a request - it short-circuits on `_authenticated and _symbol_name_to_id` - and
+        # every `not self._authenticated` gate, including the order paths, would then pass on a
+        # connection the broker never authenticated.
+        self._authenticated = False
+        self._already_logged_in_notified = False
         self._connected = True
         self._connected_event.set()
         logger.info(
@@ -1377,7 +1499,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
     ) -> None:
-        if "token" in message or "auth" in message:
+        # A response timeout is checked FIRST, and as its own case, because it is categorically
+        # not a credentials problem: the socket is up and the request was written to it. Routing
+        # it into the token branch is how an operator ends up refreshing a credential that works.
+        is_response_timeout, response_timeout_s = _classify_deferred_response_timeout(
+            exc, error_text
+        )
+        if is_response_timeout:
+            waited = (
+                f"within {response_timeout_s}s"
+                if response_timeout_s is not None
+                else "within the configured response timeout"
+            )
+            logger.info(
+                "cTrader request written but NO RESPONSE %s; the transport is up, so this is "
+                "not a credentials problem and not a TLS handshake failure. The request reached "
+                "the socket and nothing came back.",
+                waited,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": error_text,
+                        "response_timeout_s": response_timeout_s,
+                    }
+                },
+            )
+        elif "token" in message or "auth" in message:
             logger.info(
                 "cTrader authentication unavailable; verify token/credentials, "
                 "daemon will retry",
@@ -1399,8 +1546,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
         else:
+            # A fallback fires precisely when the cause could not be classified, so it must not
+            # name one. This message used to say "connect/auth unavailable", which pointed an
+            # operator at a token that was demonstrably fine; the `error` field carries the real
+            # text, so nothing is lost by saying so.
             logger.info(
-                "cTrader connect/auth unavailable; daemon will retry",
+                "cTrader connect failed; cause NOT CLASSIFIED - read the error field rather than "
+                "assuming credentials. daemon will retry",
                 extra={
                     "data": {
                         "account_id": self.ctid_trader_account_id,
@@ -1687,6 +1839,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
         return details_res
 
+    def _reconciled_deal_symbol(
+        self, deal: Any, *, broker_order_id: str, order: Any | None
+    ) -> str | None:
+        """The symbol a reconciled deal trades, or ``None`` when it cannot be determined."""
+        deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
+        if not deal_symbol_id and order is not None:
+            deal_symbol_id = int(getattr(order, "symbolId", 0) or 0)
+        deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
+        if deal_symbol is None:
+            try:
+                deal_symbol = self._order_id_to_symbol.get(int(broker_order_id))
+            except (TypeError, ValueError):
+                deal_symbol = None
+        return deal_symbol
+
     def _build_reconciled_execution(
         self,
         deal: Any,
@@ -1710,15 +1877,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # Unit contract: persist filled_qty in qty units (broker volume per
         # the symbol scale, #80), the same unit the risk engine sized and
         # the viewer consumes.
-        deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
-        if not deal_symbol_id and order is not None:
-            deal_symbol_id = int(getattr(order, "symbolId", 0) or 0)
-        deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
-        if deal_symbol is None:
-            try:
-                deal_symbol = self._order_id_to_symbol.get(int(broker_order_id))
-            except (TypeError, ValueError):
-                deal_symbol = None
+        deal_symbol = self._reconciled_deal_symbol(
+            deal, broker_order_id=broker_order_id, order=order
+        )
         if deal_symbol is None:
             raise ValueError(
                 "cTrader deal carries no symbolId; refusing to scale its "
@@ -1736,9 +1897,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         return LiveExecution(
             signal_id=signal_uuid,
-            actual_price=_to_float(getattr(deal, "executionPrice", 0)),
+            # The same guarded resolver and the same presence verdict as the live fill path:
+            # this one read the raw field, so a NaN or a negative price from a reconciled deal
+            # was stored as-is while the stream path refused it.
+            actual_price=self._resolve_execution_price(order=order, deal=deal),
+            actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_to_float(getattr(deal, "commission", 0)),
+            commission=_deal_commission(deal),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -1768,7 +1933,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if execution is None:
                 continue
-            if await asyncio.to_thread(save_live_execution, execution):
+            # Same semantics as the stream path: when the order states its cumulative executed
+            # volume, persist only what that cumulative still lacks. Plain `save_live_execution`
+            # treats a repeated dedupe key as a duplicate, so a deal that was first stored with a
+            # smaller volume and has since been amended upward would never grow here - and a deal
+            # skipped by the stream's cumulative cap (out-of-order delivery) is healed here
+            # because the order's *final* cumulative leaves room for it.
+            cumulative_qty = 0.0
+            cumulative_volume = self._resolve_order_cumulative_volume(details_order)
+            if cumulative_volume > 0:
+                deal_symbol = self._reconciled_deal_symbol(
+                    deal, broker_order_id=broker_order_id, order=details_order
+                )
+                if deal_symbol is not None:
+                    cumulative_qty = _broker_volume_to_qty(
+                        cumulative_volume, self._scale_for(deal_symbol).volume_per_qty
+                    )
+            if cumulative_qty > 0:
+                persisted = (
+                    await asyncio.to_thread(
+                        save_live_execution_up_to_cumulative, execution, cumulative_qty
+                    )
+                    > 0.0
+                )
+            else:
+                persisted = await asyncio.to_thread(save_live_execution, execution)
+            if persisted:
                 recovered += 1
                 logger.info(
                     "Reconciled missed cTrader fill",
@@ -2201,13 +2391,384 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
 
         trader = trader_res.trader
-        money_digits = int(getattr(trader, "moneyDigits", 2) or 2)
-        scale = 10**money_digits if 0 <= money_digits <= 12 else 100
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
         balance = _to_float(getattr(trader, "balance", 0)) / scale
         equity = balance
         if hasattr(trader, "equity"):
             equity = _to_float(getattr(trader, "equity", balance)) / scale
         return balance, equity
+
+    @property
+    def supports_cancel_orders(self) -> bool:
+        return True
+
+    @property
+    def supports_flatten(self) -> bool:
+        return True
+
+    async def _reconcile_state(self) -> Any:
+        """The account's current orders and positions, from one call.
+
+        Reconcile, not OrderList. `ProtoOAOrderListReq` is a historical query bounded by
+        `fromTimestamp`/`toTimestamp`; 0/0 does not mean "now", so it can answer with nothing -
+        and a cancel that finds nothing reports success while leaving the order resting - or
+        with unrelated history. Reconcile takes no time bounds and is by definition current
+        state, which is the same call `_fetch_open_positions` already makes for positions.
+
+        Shared by the blanket cancel, the orphan sweep and the flatten so all three see one
+        consistent snapshot: a sweep that read positions and orders from two different
+        snapshots could cancel a protection for a position that had just been closed and
+        re-opened.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+
+        reconcile_req = self._ProtoOAReconcileReq()
+        reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            reconcile_res = await self._send_request_with_refresh_retry(
+                reconcile_req, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(reconcile_res, self._ProtoOAReconcileRes):
+            raise RuntimeError(
+                f"Unexpected reconcile response: {type(reconcile_res).__name__}"
+            )
+        return reconcile_res
+
+    async def _fetch_open_positions(self) -> list[Any]:
+        """Every open position, including ones whose trade data is unreadable.
+
+        The unreadable ones are deliberately *not* filtered out here: `get_positions` skips them
+        because it cannot describe them, but the flatten has to report them, or a position the
+        adapter could not read would count as one that does not exist.
+        """
+        reconcile_res = await self._reconcile_state()
+        open_positions: list[Any] = []
+        for position in getattr(reconcile_res, "position", []) or []:
+            status = int(getattr(position, "positionStatus", 0) or 0)
+            if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                continue
+            open_positions.append(position)
+        return open_positions
+
+    def _unrecognised_status_wire_value(self, order: Any) -> int | None:
+        """The status number the broker sent, when this client has no name for it.
+
+        An enum value this build does not know is not lost: protobuf keeps it in the message's
+        unknown fields, under `orderStatus`'s own field number, with the original value intact.
+        A status that was never sent leaves no unknown field at all. So "the broker sent nothing"
+        and "the broker sent a status this client cannot name" are distinguishable, and this
+        asks the question rather than treating the second as the first - which would read a
+        future terminal status as ACCEPTED and cancel it.
+
+        Returns None for anything that cannot carry the fingerprint - a test double, or a build
+        without explicit presence - so the ordinary path is unaffected.
+        """
+        unknown_fields = getattr(order, "UnknownFields", None)
+        fields_by_name = getattr(getattr(order, "DESCRIPTOR", None), "fields_by_name", None)
+        if unknown_fields is None or fields_by_name is None:
+            return None
+        wanted = {
+            fields_by_name[name].number
+            for name in ("orderStatus", "status")
+            if name in fields_by_name
+        }
+        if not wanted:
+            return None
+        try:
+            unknown = list(unknown_fields())
+        except TypeError:
+            return None
+        for field in unknown:
+            # Wire type 0 is varint, which is how an enum arrives on the wire.
+            if field.field_number in wanted and field.wire_type == 0:
+                return int(field.data)
+        return None
+
+    def _is_working_order(self, order: Any) -> bool:
+        """Whether an order is still ACCEPTED, i.e. a cancel would be legal.
+
+        A filled or already-cancelled order must not be sent for cancellation: cTrader rejects
+        it, and the rejection is a per-order failure the sweep has to record rather than an
+        abort. Only ACCEPTED orders are working; anything else is already terminal.
+
+        Three "cannot tell" paths, all resolved in the direction that leaves nothing resting,
+        because that is the unsafe direction for a sweep that exists to disarm the account:
+        no status enum, no status field, and a status this client has no name for. The last one
+        arrives looking exactly like ACCEPTED; it is detected and logged, while the decision
+        stays as it was - which failure is cheaper here is a trading judgement.
+        """
+        unrecognised = self._unrecognised_status_wire_value(order)
+        if unrecognised is not None:
+            logger.warning(
+                "cTrader sent order status %s, which this client has no name for. It reads as "
+                "ACCEPTED, so this order is being cancelled on a status nobody here could "
+                "interpret; if that status is terminal the broker may refuse the cancel.",
+                unrecognised,
+            )
+        status_enum = getattr(self, "_ProtoOAOrderStatus", None)
+        if status_enum is None:
+            logger.warning(
+                "cTrader client exposes no order-status enum, so every order is treated as "
+                "working and a cancel sweep will send a cancel for each",
+                extra={"data": {"account_id": self.ctid_trader_account_id}},
+            )
+            return True
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            logger.warning(
+                "cTrader order carries no status field; treating it as ACCEPTED, so it will be "
+                "cancelled if a sweep runs",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                    }
+                },
+            )
+            return True
+        try:
+            return int(raw_status) == int(status_enum.ORDER_STATUS_ACCEPTED)
+        except (TypeError, ValueError):
+            # The one path that resolves *against* cancelling, and the only silent one. It is
+            # logged because it disagrees with the other three: an order whose status cannot be
+            # parsed would otherwise be left resting with no trace at all.
+            logger.warning(
+                "cTrader order status %r is not an integer, so it is treated as NOT working and "
+                "will not be cancelled by a sweep; this resolves in the opposite direction from "
+                "the other unrecognised-status paths, which assume working",
+                raw_status,
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "order_id": getattr(order, "orderId", None),
+                    }
+                },
+            )
+            return False
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        """`int(value)` when it is a positive integer, else None.
+
+        The proto fields these feed (`orderId`, `positionId`, `volume`) are int64: assigning the
+        string form raises TypeError on the wire, and 0 is rejected by the broker. Both are
+        "unidentifiable" for the sweep's purposes, not "nothing to do".
+        """
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _raise_if_order_error_event(self, response: Any) -> None:
+        """Turn a trading refusal into a `CTraderApiError`.
+
+        `_send_request` only raises for `ProtoOAErrorRes`. cTrader reports trading refusals
+        (``MARKET_CLOSED``, ``POSITION_NOT_FOUND``, ``TRADING_BAD_VOLUME``, ...) as a
+        `ProtoOAOrderErrorEvent`, which arrives as an ordinary *successful* response. A control
+        sweep that only watches for `CTraderApiError` would count a refused close or cancel as
+        completed, and the daemon would then stamp the deployment as enforced while the position
+        is still open. The submit path performs the same check in `_submit_new_order_request`.
+        """
+        event_type = self._ProtoOAOrderErrorEvent
+        if event_type is not None and isinstance(response, event_type):
+            raise CTraderApiError(
+                error_code=str(getattr(response, "errorCode", "")),
+                description=str(getattr(response, "description", "")) or "no description",
+            )
+
+    async def _cancel_order_id(self, order_id: int) -> None:
+        """Send one cancel for a validated positive order id.
+
+        Raises `CTraderApiError` for both an API error response and a trading refusal.
+        """
+        cancel_req = self._ProtoOACancelOrderReq()
+        cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
+        cancel_req.orderId = order_id
+        try:
+            response = await self._send_request_with_refresh_retry(cancel_req, timeout_seconds=10)
+            self._raise_if_order_error_event(response)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel every working *detached* order for this cTrader account.
+
+        `STOP_LOSS_TAKE_PROFIT` is deliberately not cancellable here. That type is not a resting
+        entry: it is the stop and target attached to an open position, and cancelling it leaves
+        that position with no stop and no target. A blanket cancel runs before the flatten, so
+        the naked-position window is not a formality - if the flatten then fails, the position
+        survives with every risk control removed. Protections that outlive their position are
+        removed by :meth:`cancel_orphaned_protections` instead.
+
+        One refusal does not strand the rest: the remaining orders still need cancelling, and a
+        rejection on one says nothing about the next. Every refusal and every unaddressable
+        order is reported in the outcome, because a caller cannot tell a complete sweep from a
+        partial one by the count alone.
+        """
+        reconcile_res = await self._reconcile_state()
+
+        # Market and market-range orders fill immediately and cannot be cancelled.
+        cancellable = {
+            int(self._ProtoOAOrderType.LIMIT),
+            int(self._ProtoOAOrderType.STOP),
+            int(self._ProtoOAOrderType.STOP_LIMIT),
+        }
+        cancelled = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        # `ProtoOAReconcileRes` names the repeated field `order`, not `orders`.
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            if order_type not in cancellable:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is None:
+                unidentified.append(f"order:{getattr(order, 'orderId', None)!r}")
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                # `CTraderAuthTerminalError` is a RuntimeError, not a CTraderApiError, so an
+                # auth-terminal failure still propagates and ends the sweep - correct, because
+                # the connection is no longer usable and the remaining cancels would fail too.
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                logger.warning(
+                    "cTrader refused to cancel order %s: %s. Continuing the sweep - the "
+                    "remaining orders still need cancelling.",
+                    order_id,
+                    exc,
+                )
+                continue
+            cancelled += 1
+        return ControlOutcome(
+            completed=cancelled,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel attached SL/TP orders whose position no longer exists.
+
+        `cancel_open_orders` never disarms a live position, so closing a position leaves its
+        protection behind: it can no longer fill, it holds an order slot, and it makes a
+        flattened account look like something is still resting. This removes exactly those and
+        nothing else:
+
+        - the order type must be STOP_LOSS_TAKE_PROFIT (no other type is attached);
+        - its `positionId` must be a positive integer *absent* from the open-position set of
+          the same snapshot. An unset or unreadable `positionId` is left alone: "I cannot tell
+          which position this belongs to" must never resolve to "cancel the stop on a position
+          that is still open";
+        - it must be ACCEPTED, exactly like the blanket cancel.
+        """
+        reconcile_res = await self._reconcile_state()
+        open_position_ids: set[int] = set()
+        for position in getattr(reconcile_res, "position", []) or []:
+            if int(getattr(position, "positionStatus", 0) or 0) != (
+                self._ProtoOAPositionStatus.POSITION_STATUS_OPEN
+            ):
+                continue
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            if position_id is not None:
+                open_position_ids.add(position_id)
+
+        cancelled = 0
+        failed: list[str] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if order_type != int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT):
+                continue
+            position_id = self._positive_int(getattr(order, "positionId", 0))
+            if position_id is None or position_id in open_position_ids:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is None:
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                continue
+            cancelled += 1
+        return ControlOutcome(completed=cancelled, failed=tuple(failed))
+
+    async def close_all_positions(self) -> ControlOutcome:
+        """Flatten every open position for this cTrader account, at market.
+
+        A position whose id or volume cannot be read is reported as unidentifiable rather than
+        skipped: it is still open, and a caller that only sees a count would read the sweep as
+        successful while exposure remains. The same holds for a broker refusal - the other
+        positions are still attempted, and the refusal is named in the outcome.
+        """
+        positions = await self._fetch_open_positions()
+        closed = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for position in positions:
+            # `positionId` and `volume` are protobuf int64 fields: the string form cannot be
+            # assigned, a float raises TypeError, and an unset volume serializes as 0, which
+            # cTrader rejects instead of closing.
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            if position_id is None:
+                unidentified.append(f"position:{getattr(position, 'positionId', None)!r}")
+                continue
+            trade_data = getattr(position, "tradeData", None)
+            volume = self._positive_int(
+                _to_float(getattr(trade_data, "volume", 0)) if trade_data is not None else 0
+            )
+            if volume is None:
+                unidentified.append(f"position:{position_id}:volume")
+                continue
+            close_req = self._ProtoOAClosePositionReq()
+            close_req.ctidTraderAccountId = self.ctid_trader_account_id
+            close_req.positionId = position_id
+            close_req.volume = volume
+            try:
+                response = await self._send_request_with_refresh_retry(
+                    close_req, timeout_seconds=15
+                )
+                self._raise_if_order_error_event(response)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(position_id))
+                logger.warning(
+                    "cTrader refused to close position %s: %s. Continuing the flatten - the "
+                    "remaining positions are still open.",
+                    position_id,
+                    exc,
+                )
+                continue
+            closed += 1
+        return ControlOutcome(
+            completed=closed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
 
     async def get_positions(self) -> list[dict[str, Any]]:
         """Return open positions with signed qty for exposure limits and exit-only sizing.
@@ -2218,25 +2779,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         current_price/unrealized_pnl are not available without a spot
         subscription and are reported as 0.0.
         """
-        self._raise_if_terminal_auth_failed()
-        if not self._connected or not self._authenticated:
-            await self.connect()
-
-        self._raise_if_terminal_auth_failed()
-        reconcile_req = self._ProtoOAReconcileReq()
-        reconcile_req.ctidTraderAccountId = self.ctid_trader_account_id
-        try:
-            reconcile_res = await self._send_request_with_refresh_retry(
-                reconcile_req,
-                timeout_seconds=15,
-            )
-        except CTraderApiError as exc:
-            self._raise_terminal_auth_from_api_error(exc)
-            raise
-        if not isinstance(reconcile_res, self._ProtoOAReconcileRes):
-            raise RuntimeError(
-                f"Unexpected reconcile response: {type(reconcile_res).__name__}"
-            )
+        open_positions = await self._fetch_open_positions()
 
         symbol_id_to_name = {
             symbol_id: name for name, symbol_id in self._symbol_name_to_id.items()
@@ -2244,10 +2787,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         payload: list[dict[str, Any]] = []
         observed_position_ids: dict[str, list[int]] = {}
         self._position_ids_by_symbol = {}
-        for position in getattr(reconcile_res, "position", []):
-            status = int(getattr(position, "positionStatus", 0) or 0)
-            if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
-                continue
+        for position in open_positions:
             trade_data = getattr(position, "tradeData", None)
             if trade_data is None:
                 continue
@@ -2337,31 +2877,70 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         filled_qty = _broker_volume_to_qty(
             filled_volume, self._scale_for(fill_symbol).volume_per_qty
         )
+        # The order's `executedVolume` is *cumulative* for the order, not this fill's slice, and
+        # it is the only quantity the broker states that lets `save_live_execution_up_to_cumulative`
+        # tell a redelivery from an amendment. Converted with the same symbol scale as the fill so
+        # the cap and the stored rows are in one unit.
+        cumulative_volume = self._resolve_order_cumulative_volume(order)
+        cumulative_qty = (
+            _broker_volume_to_qty(
+                cumulative_volume, self._scale_for(fill_symbol).volume_per_qty
+            )
+            if cumulative_volume > 0
+            else 0.0
+        )
         execution = LiveExecution(
             signal_id=signal_id,
             actual_price=self._resolve_execution_price(order=order, deal=deal),
+            # Stored beside the price, because `0.0` alone cannot say whether the broker omitted
+            # the field, sent zero, or sent something unusable. Without it every consumer of
+            # `actual_price` treats a non-answer as a price.
+            actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_to_float(getattr(deal, "commission", 0.0)) if deal is not None else 0.0,
+            commission=_deal_commission(deal),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
-                deal, order_id=order_id, timestamp_ms=timestamp_ms,
+                deal,
+                order_id=order_id,
+                timestamp_ms=timestamp_ms,
                 filled_volume=filled_volume,
+                order_cumulative_volume=cumulative_volume,
             ),
-            # Recorded so a later collision between two equal-sized fills is decidable from the
-            # table, rather than by taking the dedupe key apart again. `None` when the broker sent
-            # no deal - the case the key builder already handles by deriving a key instead.
+            # The broker's own per-fill id, so a later collision between two equal-sized fills is
+            # decidable from the table rather than by taking the dedupe key apart again. `None`
+            # when the broker sent no deal - the case the key builder handles by deriving a key.
+            # `_deal_id_or_none` keeps the protobuf `0` sentinel out of the column, so "the broker
+            # told us nothing" stays distinguishable from "the broker said zero".
             broker_fill_id=_deal_id_or_none(deal),
         )
-        persisted = await asyncio.to_thread(save_live_execution, execution)
+        if cumulative_qty > 0:
+            # P1's amendment semantics, not a second insert: the same key with a *larger*
+            # quantity amends the stored row, the same quantity is a redelivery, and nothing is
+            # stored past the broker's own cumulative. That last part is what stops a repeated
+            # order-level snapshot - whose volume is cumulative, not incremental - from being
+            # added to the rows already stored for the signal.
+            persisted_qty = await asyncio.to_thread(
+                save_live_execution_up_to_cumulative, execution, cumulative_qty
+            )
+            persisted = persisted_qty > 0.0
+        else:
+            persisted = await asyncio.to_thread(save_live_execution, execution)
         if not persisted:
+            # Either a redelivery of a fill already stored, or - when deals arrive out of order -
+            # a fill the broker's cumulative cap has no room for yet (a later deal with a larger
+            # cumulative was stored first). Nothing is lost in the second case: reconciliation
+            # re-reads the order with its final cumulative and stores the missing slice.
             logger.info(
-                "Skipped duplicate cTrader execution fill",
+                "Skipped cTrader execution fill (duplicate, or beyond the broker cumulative so "
+                "far; reconciliation recovers the latter)",
                 extra={
                     "data": {
                         "signal_id": str(execution.signal_id),
                         "broker_order_id": execution.broker_order_id,
                         "execution_type": execution_type,
+                        "dedupe_key": execution.dedupe_key,
+                        "broker_fill_id": execution.broker_fill_id,
                     }
                 },
             )
@@ -2433,15 +3012,71 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     @staticmethod
     def _resolve_execution_price(*, order: Any | None, deal: Any | None) -> float:
+        """The best readable execution price, or 0.0 when none is readable.
+
+        Guarded exactly as `_resolve_filled_volume` below: finite and positive. It used to test
+        truthiness alone, which admitted a negative price and - worse - NaN, because `if value:`
+        is true for NaN. A NaN row makes `avg(actual_price)` NaN and makes `WHERE actual_price >
+        x` silently skip it, so neither was a cosmetic problem.
+
+        0.0 remains the "could not be read" answer rather than an error: refusing the row would
+        drop `filled_qty`, and a fill the database never saw is how a duplicate live order gets
+        submitted. What a reader needs is to know that the price is not evidence, and that is
+        `_execution_price_presence`, stored in `actual_price_observed`.
+        """
         if deal is not None:
             value = _to_float(getattr(deal, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         if order is not None:
             value = _to_float(getattr(order, "executionPrice", 0.0))
-            if value:
+            if math.isfinite(value) and value > 0:
                 return value
         return 0.0
+
+    @staticmethod
+    def _execution_price_presence(*, order: Any | None, deal: Any | None) -> str:
+        """Whether a price was observed, sent-but-unusable, or never sent at all.
+
+        Three states, not two, and the third is why this exists. `_resolve_execution_price`
+        returns `0.0` for two different situations and a reader of the stored row cannot tell
+        them apart:
+
+            observed   a finite, positive price was read from the deal or the order
+            sent_bad   the broker sent a price and it is unusable (zero, negative, non-finite)
+            absent     no price was sent at all, on either payload
+
+        `0.0` is therefore never `observed`. A price of exactly zero is `sent_bad`, which is the
+        point: it looks like a price and is not one.
+
+        The deal is checked before the order because that is the resolver's own precedence - a
+        deal price is the executed one, an order price a fallback.
+
+        Read-only and side-effect free: it logs nothing, so a caller may ask without a second
+        copy of whatever `_resolve_execution_price` already said.
+        """
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            raw = getattr(payload, "executionPrice", None)
+            if raw is None:
+                continue
+            # `executionPrice` is an `optional double`, so presence separates a sent zero from an
+            # omitted field. A payload without `HasField` (a test double, a replay adapter) has
+            # only the attribute being present at all, which is the same fallback the resolver
+            # uses - the value test below still decides.
+            has_field = getattr(payload, "HasField", None)
+            if has_field is not None:
+                try:
+                    if not bool(has_field("executionPrice")):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            value = _to_float(raw)
+            if math.isfinite(value) and value > 0:
+                return PRICE_OBSERVED
+            return PRICE_SENT_BAD
+        return PRICE_ABSENT
 
     @staticmethod
     def _resolve_filled_volume(*, order: Any | None, deal: Any | None) -> float:
@@ -2470,17 +3105,69 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         return 0
 
     @staticmethod
+    def _resolve_order_cumulative_volume(order: Any | None) -> float:
+        """The order's cumulative executed volume, in broker units, or 0.0 when unreadable.
+
+        `ProtoOAOrder.executedVolume` is the total filled on the order so far - not this
+        event's slice. It is what the persistence cap compares against, and it strictly
+        increases per fill, which is why it is also part of the fill's identity when the broker
+        sent no per-fill id.
+        """
+        if order is None:
+            return 0.0
+        value = _to_float(getattr(order, "executedVolume", 0.0))
+        if math.isfinite(value) and value > 0:
+            return value
+        return 0.0
+
+    @staticmethod
     def _build_dedupe_key(
         deal: Any | None,
         *,
         order_id: int | None,
         timestamp_ms: int,
         filled_volume: float,
+        order_cumulative_volume: float = 0.0,
     ) -> str:
+        """A key that separates two fills without ever counting one twice.
+
+        The broker's `dealId` is the only identifier that is unique per fill by construction,
+        so it is used whenever it is present. When it is not, identity has to come from
+        something else, and the previous fallback - `(order, timestamp, volume)` - collided on
+        exactly the fills it existed to separate: two equal-sized fills in the same millisecond
+        on one order produced one key, and the second was logged as a duplicate and dropped.
+        The position then ends up short with a log line arguing against it.
+
+        Two stronger fallbacks, in order:
+
+        - the order's **cumulative** executed volume, which strictly increases per fill, so two
+          distinct fills always differ and a repeat of the same value is a redelivery of the
+          same order state;
+        - a millisecond timestamp plus the volume, which is adequate but not proof.
+
+        When none of the three is available the key cannot be derived at all, and this raises
+        instead of inventing one. The neighbouring checks in `_persist_execution_event` refuse
+        the same way for a non-positive volume and an unresolvable symbol; the event is then
+        retained for reconciliation, which reads deals that *do* carry ids. Silently colliding
+        would lose a real fill, and inventing a per-event unique key would count a redelivery
+        twice - both are money errors, so neither is chosen.
+        """
         deal_id = int(getattr(deal, "dealId", 0) or 0) if deal is not None else 0
         if deal_id > 0:
             return f"ctrader:deal:{deal_id}"
-        return f"ctrader:order:{order_id or ''}:{timestamp_ms}:{filled_volume}"
+        if order_cumulative_volume > 0:
+            cumulative_text = _format_key_quantity(order_cumulative_volume)
+            return f"ctrader:order:{order_id or ''}:cum:{cumulative_text}"
+        if timestamp_ms > 0:
+            return (
+                f"ctrader:order:{order_id or ''}:{timestamp_ms}:"
+                f"{_format_key_quantity(filled_volume)}"
+            )
+        raise ValueError(
+            "cTrader fill carries no deal id, no cumulative order volume and no timestamp, so "
+            "two distinct fills on this order would be indistinguishable; retaining the event "
+            "for reconciliation rather than storing it under a key that may collide."
+        )
 
     def _requeue_execution_event(self, event: Any) -> bool:
         key = id(event)

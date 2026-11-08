@@ -816,3 +816,449 @@ def test_dedupe_executions_idempotent_on_clean_table(isolated_db):
     with database.get_session() as session:
         rows = session.exec(database.select(database.LiveExecutionModel)).all()
     assert len(rows) == 2
+
+
+# ─── STOPPED controls: cancel and flatten must report honestly ────────────────
+#
+# The adapter used to skip unreadable positions and orders and log the rest, so the caller saw
+# a count and could not tell a complete sweep from a partial one. `ControlOutcome` carries the
+# items it could not address and the items the broker refused; only `complete` may be read as
+# "the account is disarmed".
+
+
+def _control_adapter(*, orders=(), positions=()):
+    """An adapter wired to real proto messages and a fixed reconcile snapshot."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOACancelOrderReq,
+        ProtoOAClosePositionReq,
+        ProtoOAOrderErrorEvent,
+        ProtoOAReconcileRes,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+        ProtoOAPositionStatus,
+    )
+
+    from live_runner.ctrader_adapter import CTraderApiError, CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter.ctid_trader_account_id = 46736452
+    adapter._terminal_auth_failure_reason = ""
+    adapter._terminal_auth_failure_code = ""
+    adapter._ProtoOACancelOrderReq = ProtoOACancelOrderReq
+    adapter._ProtoOAClosePositionReq = ProtoOAClosePositionReq
+    adapter._ProtoOAOrderType = ProtoOAOrderType
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+    adapter._ProtoOAPositionStatus = ProtoOAPositionStatus
+    adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
+    adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
+    adapter.sent: list[Any] = []
+    adapter.refuse: set[int] = set()
+    # Targets answered with a real `ProtoOAOrderErrorEvent` (how cTrader reports a trading
+    # refusal: a *successful* response, not a `ProtoOAErrorRes`).
+    adapter.refuse_event: dict[int, str] = {}
+
+    snapshot = ProtoOAReconcileRes()
+    for order in orders:
+        snapshot.order.append(order)
+    for position in positions:
+        snapshot.position.append(position)
+
+    async def _reconcile_state():
+        return snapshot
+
+    async def _send(request, **_kwargs):
+        adapter.sent.append(request)
+        target = int(getattr(request, "orderId", 0) or getattr(request, "positionId", 0) or 0)
+        if target in adapter.refuse:
+            raise CTraderApiError("ORDER_REJECTED", f"refused {target}")
+        if target in adapter.refuse_event:
+            return ProtoOAOrderErrorEvent(
+                ctidTraderAccountId=46736452,
+                errorCode=adapter.refuse_event[target],
+                description=f"refused {target}",
+            )
+        return request
+
+    adapter._reconcile_state = _reconcile_state
+    adapter._send_request_with_refresh_retry = _send
+    return adapter
+
+
+def _trade_data(volume: int = 1000):
+    """`ProtoOATradeData` with its required fields set (symbolId, volume, tradeSide)."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOATradeData,
+        ProtoOATradeSide,
+    )
+
+    trade_data = ProtoOATradeData()
+    trade_data.symbolId = 1
+    trade_data.volume = volume
+    trade_data.tradeSide = ProtoOATradeSide.BUY
+    return trade_data
+
+
+def _order(order_id: int, order_type: int, *, status: int | None = 1, position_id: int = 0):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+    )
+
+    order = ProtoOAOrder()
+    order.orderId = order_id
+    order.orderType = order_type
+    order.tradeData.CopyFrom(_trade_data())
+    # `orderStatus` is a proto2 required field: set it unless the test is exercising its
+    # absence, and even then the message must be encodable.
+    order.orderStatus = status if status is not None else ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    if position_id:
+        order.positionId = position_id
+    return order
+
+
+def _position(position_id: int, volume: int, *, status: int = 1):
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition
+
+    position = ProtoOAPosition()
+    position.positionId = position_id
+    position.positionStatus = status
+    position.tradeData.CopyFrom(_trade_data(volume))
+    position.swap = 0
+    return position
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_cancel_skips_market_orders_and_reports_the_rest_complete() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(101, ProtoOAOrderType.MARKET),
+            _order(102, ProtoOAOrderType.LIMIT),
+            _order(103, ProtoOAOrderType.STOP_LIMIT),
+        ]
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 2
+    assert outcome.complete is True
+    assert sorted(int(request.orderId) for request in adapter.sent) == [102, 103], (
+        "a market order fills immediately and cannot be cancelled"
+    )
+
+
+def test_cancel_never_disarms_a_live_position() -> None:
+    """SL/TP is attached to a position; cancelling it leaves that position unprotected."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(201, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=900),
+            _order(202, ProtoOAOrderType.LIMIT),
+        ]
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert [int(request.orderId) for request in adapter.sent] == [202], (
+        "the blanket cancel disarmed a position that the flatten may not manage to close"
+    )
+
+
+def test_cancel_skips_terminal_orders() -> None:
+    """A filled or cancelled order is not working; sending a cancel for it only earns a refusal."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    adapter = _control_adapter(
+        orders=[
+            _order(301, ProtoOAOrderType.LIMIT, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED),
+            _order(302, ProtoOAOrderType.LIMIT, status=ProtoOAOrderStatus.ORDER_STATUS_CANCELLED),
+            _order(303, ProtoOAOrderType.LIMIT),
+        ]
+    )
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert [int(request.orderId) for request in adapter.sent] == [303]
+
+
+def test_one_refused_cancel_does_not_strand_the_others() -> None:
+    """A refusal is recorded, not raised, and the remaining orders are still attempted."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(401, ProtoOAOrderType.LIMIT),
+            _order(402, ProtoOAOrderType.LIMIT),
+            _order(403, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter.refuse = {402}
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 2
+    assert outcome.failed == ("402",)
+    assert outcome.complete is False, (
+        "a sweep with a refused order is not complete, and a caller must not read it as one"
+    )
+    assert sorted(int(request.orderId) for request in adapter.sent) == [401, 402, 403]
+
+
+def test_an_order_with_an_unreadable_id_is_reported_not_skipped() -> None:
+    """`orderId` is an int64; 0 cannot be addressed, and silently skipping hides the order."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(orders=[_order(0, ProtoOAOrderType.LIMIT)])
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 0
+    assert outcome.unidentified, "an unaddressable order was reported as nothing to do"
+    assert outcome.complete is False
+
+
+def test_flatten_closes_every_open_position_with_its_volume() -> None:
+    adapter = _control_adapter(positions=[_position(901, 1000), _position(902, 2500)])
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 2
+    assert outcome.complete is True
+    sent = [(int(r.positionId), int(r.volume)) for r in adapter.sent]
+    assert sent == [(901, 1000), (902, 2500)], (
+        "an unset volume serializes as 0, which cTrader rejects instead of closing"
+    )
+
+
+def test_a_position_without_readable_volume_is_a_failure_not_a_skip() -> None:
+    """The blocker: partial flatten reported as success leaves open exposure behind."""
+    position = _position(903, 0)
+
+    adapter = _control_adapter(positions=[_position(901, 1000), position])
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.unidentified == ("position:903:volume",)
+    assert outcome.complete is False, (
+        "a position that could not be read is still open; reporting the sweep as complete is "
+        "how a stopped deployment keeps its exposure"
+    )
+
+
+def test_a_position_without_trade_data_is_a_failure_not_a_skip() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAPosition
+
+    position = ProtoOAPosition()
+    position.positionId = 904
+    position.positionStatus = 1
+    position.tradeData.symbolId = 1
+    position.tradeData.volume = 0
+    position.tradeData.tradeSide = 1
+    position.swap = 0
+
+    adapter = _control_adapter(positions=[position])
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 0
+    assert outcome.unidentified == ("position:904:volume",)
+    assert outcome.complete is False
+
+
+def test_one_refused_close_does_not_stop_the_others() -> None:
+    adapter = _control_adapter(positions=[_position(911, 1000), _position(912, 1000)])
+    adapter.refuse = {911}
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("911",)
+    assert outcome.complete is False
+    assert sorted(int(request.positionId) for request in adapter.sent) == [911, 912]
+
+
+def test_a_close_refused_with_an_order_error_event_is_a_failure() -> None:
+    """The blocker: cTrader answers a refused close with `ProtoOAOrderErrorEvent`.
+
+    That is a successful response as far as the transport is concerned, so only an explicit check
+    keeps `MARKET_CLOSED` from being counted as a completed close and the position from being
+    reported as flat.
+    """
+    adapter = _control_adapter(positions=[_position(921, 1000), _position(922, 1000)])
+    adapter.refuse_event = {921: "MARKET_CLOSED"}
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("921",)
+    assert outcome.complete is False
+    assert sorted(int(r.positionId) for r in adapter.sent) == [921, 922]
+
+
+def test_a_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(601, ProtoOAOrderType.LIMIT),
+            _order(602, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter.refuse_event = {601: "ORDER_NOT_FOUND"}
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("601",)
+    assert outcome.complete is False
+
+
+def test_orphaned_protection_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(701, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999)],
+    )
+    adapter.refuse_event = {701: "ORDER_NOT_FOUND"}
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 0
+    assert outcome.failed == ("701",)
+    assert outcome.complete is False
+
+
+def test_an_empty_sweep_is_complete() -> None:
+    """Nothing to do is success; that is why the flag is not `completed > 0`."""
+    adapter = _control_adapter()
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 0
+    assert outcome.complete is True
+
+
+def test_orphaned_protections_are_cancelled_but_live_ones_are_kept() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(501, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=900),
+            _order(502, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999),
+        ],
+        positions=[_position(900, 1000)],
+    )
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 1
+    assert outcome.complete is True
+    assert [int(request.orderId) for request in adapter.sent] == [502], (
+        "the protection of a live position was cancelled, leaving it naked"
+    )
+
+
+def test_an_unreadable_order_status_is_detected_from_the_wire() -> None:
+    """An enum value this build has no name for is kept in the unknown fields, not dropped.
+
+    Without this the two cases - "the broker sent nothing" and "the broker sent a status this
+    client cannot name" - would be the same observation, and a future terminal status would read
+    as ACCEPTED and be cancelled.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    wire = ProtoOAOrder()
+    wire.orderId = 601
+    wire.orderType = 2
+    wire.orderStatus = 1
+    wire.tradeData.CopyFrom(_trade_data())
+    raw = bytearray(wire.SerializeToString())
+    # Append an unknown varint field with field number 4 (orderStatus) and value 9.
+    raw += bytes([4 << 3 | 0, 9])
+    parsed = ProtoOAOrder()
+    parsed.ParseFromString(bytes(raw))
+
+    adapter = _control_adapter()
+
+    assert adapter._unrecognised_status_wire_value(parsed) == 9
+    assert adapter._unrecognised_status_wire_value(wire) is None, (
+        "an order that never carried a status must not look like an unrecognised one"
+    )
+
+
+def test_the_base_adapter_does_not_claim_the_controls() -> None:
+    from live_runner.base_adapter import BaseLiveAdapter
+
+    class _Minimal(BaseLiveAdapter):
+        async def connect(self) -> None:
+            return None
+
+        async def submit_order(self, signal, *, qty=None) -> str:
+            return ""
+
+        async def listen_executions(self) -> None:
+            return None
+
+        async def get_balance(self) -> tuple[float, float]:
+            return 0.0, 0.0
+
+    adapter = _Minimal()
+
+    assert adapter.supports_cancel_orders is False
+    assert adapter.supports_flatten is False
+    cancel_call = adapter.cancel_open_orders()
+    with pytest.raises(NotImplementedError):
+        _run(cancel_call)
+    close_call = adapter.close_all_positions()
+    with pytest.raises(NotImplementedError):
+        _run(close_call)
+
+
+def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None:
+    """`describe` is the operator-facing sentence, so its two branches must not be interchangeable.
+
+    The complete branch says nothing is outstanding; the partial branch must name every
+    unidentifiable and refused item, because that line is how an operator learns that a stopped
+    deployment still holds exposure. Swapping the predicate would have a partial sweep read as
+    clean - the exact failure `ControlOutcome` exists to prevent.
+    """
+    from live_runner.base_adapter import ControlOutcome
+
+    clean = ControlOutcome(completed=3)
+    assert clean.complete is True
+    assert clean.describe() == "3 completed, nothing outstanding"
+
+    empty = ControlOutcome()
+    assert empty.complete is True
+    assert empty.describe() == "0 completed, nothing outstanding"
+
+    partial = ControlOutcome(completed=1, unidentified=("order:None",), failed=("7",))
+    assert partial.complete is False
+    description = partial.describe()
+    assert "nothing outstanding" not in description, description
+    assert "1 completed" in description, description
+    assert "1 unidentifiable" in description, description
+    assert "order:None" in description, description
+    assert "1 refused" in description, description
+    assert "7" in description, description
+
+    unidentified_only = ControlOutcome(completed=0, unidentified=("position:None:volume",))
+    assert unidentified_only.complete is False
+    assert "nothing outstanding" not in unidentified_only.describe()
+
+    failed_only = ControlOutcome(completed=0, failed=("42",))
+    assert failed_only.complete is False
+    assert "nothing outstanding" not in failed_only.describe()
