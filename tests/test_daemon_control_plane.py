@@ -726,13 +726,17 @@ def test_automated_writers_never_overwrite_operator_intent(
     service = database.create_service(
         Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
     )
-    update_service_status(str(service.id), operator_status)
+    update_service_status(
+        str(service.id), operator_status, respect_operator_intent=False
+    )  # the operator establishes the pause/stop
 
     update_service_status(str(service.id), automated_status, respect_operator_intent=True)
 
     assert database.get_service(str(service.id)).status == operator_status
-    # The operator (default) can still change it.
-    update_service_status(str(service.id), ServiceStatus.RUNNING)
+    # The operator (respect_operator_intent=False) can still change it.
+    update_service_status(
+        str(service.id), ServiceStatus.RUNNING, respect_operator_intent=False
+    )
     assert database.get_service(str(service.id)).status == ServiceStatus.RUNNING
 
 
@@ -744,7 +748,9 @@ def test_discord_reconnect_does_not_mark_an_operator_paused_or_stopped_bot_runni
     service = database.create_service(
         Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.FAILED)
     )
-    update_service_status(str(service.id), operator_status)
+    update_service_status(
+        str(service.id), operator_status, respect_operator_intent=False
+    )  # the operator establishes the pause/stop
     service_id = str(service.id)
 
     class _Source:
@@ -771,7 +777,9 @@ def test_discord_terminal_listener_failure_does_not_overwrite_operator_intent(
     service = database.create_service(
         Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
     )
-    update_service_status(str(service.id), operator_status)
+    update_service_status(
+        str(service.id), operator_status, respect_operator_intent=False
+    )  # the operator establishes the pause/stop
 
     class _Source:
         is_paused = False

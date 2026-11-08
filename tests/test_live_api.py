@@ -1671,15 +1671,12 @@ def test_a_paused_service_cannot_be_moved_by_the_process(isolated_db_sandbox):
     assert paused.status == database_module.ServiceStatus.PAUSED
 
     # Nothing the process observes afterwards may move it off PAUSED.
-    # (A write *of* PAUSED or STOPPED is itself an operator-intent status and is
-    # not refused by the floor, so only statuses that would un-pause are listed.)
     for status in (
         database_module.ServiceStatus.RUNNING,
         database_module.ServiceStatus.FAILED,
+        database_module.ServiceStatus.STOPPED,
     ):
-        after = database_module.update_service_status(
-            str(service.id), status, respect_operator_intent=True
-        )
+        after = database_module.update_service_status(str(service.id), status)
         assert after.status == database_module.ServiceStatus.PAUSED, (
             f"the process moved a PAUSED service to {status}; an operator pause "
             "must survive anything the process observes"
@@ -2278,9 +2275,7 @@ def test_a_refused_status_change_is_still_recorded_as_an_attempt(isolated_db_san
     assert after_pause is not None
 
     refused = database_module.update_service_status(
-        str(service.id),
-        database_module.ServiceStatus.RUNNING,
-        respect_operator_intent=True,
+        str(service.id), database_module.ServiceStatus.RUNNING
     )
 
     assert refused.status == database_module.ServiceStatus.PAUSED, (

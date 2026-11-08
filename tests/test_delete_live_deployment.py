@@ -232,3 +232,24 @@ def test_the_endpoint_reports_a_refusal_as_a_conflict(monkeypatch) -> None:
     assert detail["signal_count"] == 1
     assert detail["execution_count"] == 2
     assert detail["status_restored"] is None
+
+
+def test_an_unconfirmed_delete_is_refused_before_any_delete_is_attempted(monkeypatch) -> None:
+    """Without `confirm_deployment_id` the request is refused (428) and nothing is touched."""
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    attempts: list[str] = []
+
+    def _record(deployment_id: str) -> bool:
+        attempts.append(deployment_id)
+        return True
+
+    monkeypatch.setattr(viewer_main_module, "delete_live_deployment", _record)
+    client = TestClient(viewer_main_module.app)
+
+    response = client.delete("/api/live/deployments/dep-keep")
+
+    assert response.status_code == 428, response.text
+    assert attempts == []

@@ -2924,20 +2924,23 @@ def update_service_status(
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
-    respect_operator_intent: bool = False,
+    respect_operator_intent: bool = True,
 ) -> Service | None:
     """Write a service's status, with PAUSED and STOPPED as an atomic floor.
 
-    `respect_operator_intent=True` makes PAUSED and STOPPED a floor: a service in
-    either state is never moved to any other status by this function. Only automated callers
-    pass it - the pause was set by a person, and nothing the process observes
-    afterwards (a message arriving, a connector failing, a reconnect completing)
-    outranks that.
+    By default (`respect_operator_intent=True`) PAUSED and STOPPED are a floor: a
+    service in either state is never moved to a *different* status by this
+    function, whatever the target - including an automated STOPPED landing on
+    PAUSED and vice versa. Writing the status the row already has is a harmless
+    no-op. The pause or stop was set by a person, and nothing the process
+    observes afterwards (a message arriving, a connector failing, a reconnect
+    completing, a scheduler tick) outranks that.
 
-    The default is `False` because every other caller *is* the operator: the
-    API endpoint that sets and clears a pause, the CLI, a test. Making the floor
-    the default would let it swallow the very request that resumes a paused
-    service - the endpoint would answer 200 while the row stayed PAUSED.
+    The default is fail-safe: a caller that forgets the flag cannot overwrite
+    operator intent. Pass `False` only when *establishing* operator intent - the
+    viewer status API that sets and clears a pause or stop. Making the floor
+    apply there would swallow the very request that resumes a paused service:
+    the endpoint would answer 200 while the row stayed PAUSED.
 
     The check is a conditional ``UPDATE`` rather than read-check-write. The
     previous shape read the row, compared in Python, and wrote it back, so a
@@ -2967,14 +2970,15 @@ def update_service_status(
             .where(ServiceModel.id == normalized_id)
             .values(**values)
         )
-        if (
-            respect_operator_intent
-            and normalized_status not in _OPERATOR_INTENT_SERVICE_STATUSES
-        ):
+        if respect_operator_intent:
             # Re-tested in the same statement as the write, so a concurrent
-            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING landing after it.
+            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING (or the other
+            # operator state) landing after it. Same-status writes still apply.
             statement = statement.where(
-                ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES)
+                or_(
+                    ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES),
+                    ServiceModel.status == normalized_status,
+                )
             )
         applied = session.execute(statement)
         if not applied.rowcount:
