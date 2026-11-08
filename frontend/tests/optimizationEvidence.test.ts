@@ -3,10 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+
   classifyOptimizationOosEvidence,
   resolveCompatibleInSampleValue,
   resolveOptimizationMetricKey,
 } from "../src/lib/optimizationEvidence.ts";
+
+import { stripComments } from "./sourceRegion.ts";
 
 function classifyAvailable(
   targetMetric: string,
@@ -27,7 +30,16 @@ const pageSources = Promise.all([
 ]);
 
 test("optimization pages identify scores and parameters as in-sample selected", async () => {
-  const [listPage, detailPage] = await pageSources;
+  const [listRaw, detailRaw] = await pageSources;
+  // Comments are stripped before any assertion here. These are whole-file
+  // presence assertions, and a comment satisfies one: measured, renaming the
+  // `In-sample selected score` label to `Selected score` and dropping the
+  // `oos_status ?? "unavailable"` coalesce left every test in this file green,
+  // because a comment at the end of the file still mentioned both. That label is
+  // the disclosure telling an operator the displayed score came from the training
+  // window, so a comment standing in for it is not cosmetic.
+  const listPage = stripComments(listRaw);
+  const detailPage = stripComments(detailRaw);
 
   assert.match(listPage, /In-sample selected score/);
   assert.doesNotMatch(listPage, />\s*Best score\s*</);

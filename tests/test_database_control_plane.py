@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import create_engine, text
 
 from shared.database import _prune_duplicate_submission_claims, update_service_status
@@ -36,12 +37,15 @@ def test_paused_service_is_an_atomic_floor_against_a_failed_write(
     assert running is not None and running.status == ServiceStatus.PAUSED
 
 
-def test_operator_can_resume_a_paused_service_by_default(isolated_db_sandbox) -> None:
-    """The floor belongs to automated callers, not to the operator's own write.
+def test_operator_can_resume_a_paused_service_when_establishing_intent(
+    isolated_db_sandbox,
+) -> None:
+    """The floor is the default; the operator's own write opts out of it.
 
-    The API resume path calls this without opting in. If the floor were the
-    default, `PUT /api/services/{id}/status {"status": "running"}` would answer
-    200 and leave the row PAUSED - a paused bot that can never be restarted.
+    The API resume path passes `respect_operator_intent=False` explicitly (as the
+    viewer status endpoint does). Without the opt-out the floor would swallow the
+    request: `PUT /api/services/{id}/status {"status": "running"}` would answer 200
+    and leave the row PAUSED - a paused bot that can never be restarted.
     """
     database, _, _ = isolated_db_sandbox
     service = database.create_service(
@@ -52,9 +56,60 @@ def test_operator_can_resume_a_paused_service_by_default(isolated_db_sandbox) ->
         )
     )
 
-    resumed = update_service_status(str(service.id), ServiceStatus.RUNNING)
+    resumed = update_service_status(
+        str(service.id), ServiceStatus.RUNNING, respect_operator_intent=False
+    )
 
     assert resumed is not None and resumed.status == ServiceStatus.RUNNING
+
+
+@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
+@pytest.mark.parametrize(
+    "automated_status",
+    [ServiceStatus.RUNNING, ServiceStatus.FAILED, ServiceStatus.PAUSED, ServiceStatus.STOPPED],
+)
+def test_the_floor_is_the_default_and_strict(
+    isolated_db_sandbox, operator_status, automated_status
+) -> None:
+    """A caller that forgets the flag cannot move PAUSED/STOPPED to a different status.
+
+    That includes PAUSED <-> STOPPED; writing the same status is a harmless no-op.
+    """
+    database, _, _ = isolated_db_sandbox
+    service = database.create_service(
+        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
+    )
+    update_service_status(
+        str(service.id), operator_status, respect_operator_intent=False
+    )  # the operator sets it
+
+    result = update_service_status(str(service.id), automated_status)
+
+    assert result is not None and result.status == operator_status
+
+
+def test_scheduler_writes_do_not_overwrite_operator_pause_or_stop(
+    isolated_db_sandbox,
+) -> None:
+    """The scheduler's RUNNING/FAILED writes pass no flag and must lose to the operator."""
+    database, _, _ = isolated_db_sandbox
+    for operator_status in (ServiceStatus.PAUSED, ServiceStatus.STOPPED):
+        service = database.create_service(
+            Service(
+                name=f"sched-{operator_status.value}",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+            )
+        )
+        update_service_status(
+            str(service.id), operator_status, respect_operator_intent=False
+        )
+        for scheduler_status in (ServiceStatus.RUNNING, ServiceStatus.FAILED):
+            # Exactly the shape of the scheduler's calls: no respect_operator_intent.
+            update_service_status(
+                str(service.id), scheduler_status, last_activity=None
+            )
+            assert database.get_service(str(service.id)).status == operator_status
 
 
 def test_claim_refuses_a_deployment_that_is_not_active(isolated_db_sandbox) -> None:

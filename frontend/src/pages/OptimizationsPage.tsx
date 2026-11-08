@@ -4,6 +4,8 @@ import { ArrowUpRight, Target, Telescope } from "lucide-react";
 
 import { getOptimizations } from "../api/client";
 import type { OptimizationSummary } from "../api/types";
+import { toPercentPointsForKey } from "../api/metricScale";
+import { describeError } from "../lib/errorMessage";
 import {
   classifyOptimizationOosEvidence,
   resolveCompatibleInSampleValue,
@@ -14,7 +16,9 @@ function formatMetricValue(metric: string, value: number | string | boolean | nu
     return value == null ? "—" : String(value);
   }
   if (["cagr", "win_rate", "max_drawdown_pct"].includes(metric)) {
-    return `${(value * 100).toFixed(2)}%`;
+    return `${(
+      toPercentPointsForKey("optimization_panel_stats", metric as "cagr", value) ?? 0
+    ).toFixed(2)}%`;
   }
   if (metric === "total_pnl") {
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
@@ -45,7 +49,7 @@ export function OptimizationsPage() {
         setLoading(false);
       })
       .catch((caughtError) => {
-        setError(caughtError instanceof Error ? caughtError.message : "Could not load optimizations.");
+        setError(describeError(caughtError, "Could not load optimizations."));
         setLoading(false);
       });
   }, []);

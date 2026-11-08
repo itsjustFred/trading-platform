@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArrowRight, Download, Loader2, RotateCcw } from "lucide-react";
 
@@ -7,8 +7,8 @@ import type { DukascopyGenesisResponse } from "../api/types";
 import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
-import { renderTaskStatusIcon } from "./ResampleModal";
-import { useToast } from "./ToastProvider";
+import { renderTaskStatusIcon } from "./taskStatusIcon";
+import { useToast } from "./toastContext";
 import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 const TIMEFRAME_OPTIONS = [
@@ -95,6 +95,15 @@ function normalizeGenesisTimeframe(timeframe: string): string {
 }
 
 type DukascopyCoverageMap = DukascopyGenesisResponse["coverage"];
+
+const EMPTY_COVERAGE: DukascopyCoverageMap = {};
+
+interface CoverageResult {
+  key: string;
+  coverage: DukascopyCoverageMap;
+  loaded: boolean;
+  error: string;
+}
 
 interface DukascopyTimeframeCoverageRow {
   timeframe: string;
@@ -764,6 +773,7 @@ export function DownloadModal({
     [defaultTimeframes],
   );
   const [source, setSource] = useState(defaultSource);
+  const [wasOpen, setWasOpen] = useState(open);
   const [symbols, setSymbols] = useState(defaultSymbols);
   const [selectedTimeframes, setSelectedTimeframes] = useState<string[]>(
     normalizedDefaultTimeframes,
@@ -779,11 +789,18 @@ export function DownloadModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  const [completionNotified, setCompletionNotified] = useState(false);
-  const [dukascopyCoverage, setDukascopyCoverage] =
-    useState<DukascopyCoverageMap>({});
-  const [dukascopyCoverageLoaded, setDukascopyCoverageLoaded] = useState(false);
-  const [dukascopyCoverageError, setDukascopyCoverageError] = useState("");
+  // Job whose terminal status has already been reported upstream.
+  // Job whose terminal status has already been reported upstream. A ref, not
+  // state: the dedupe has to be exact at the instant the callback runs, and a
+  // state copy read through the closure can still hold the previous value when
+  // two status transitions land in one batch - which would report the same job
+  // to the parent twice. Keeping it out of state also means a status line does
+  // not re-render this modal; the callback's identity is held by useCallback.
+  const notifiedJobIdRef = useRef<string | null>(null);
+  // Coverage is stored per request key and read through the current key, so a
+  // changed request drops the stale map without a state write in an effect.
+  const [coverageResult, setCoverageResult] =
+    useState<CoverageResult | null>(null);
 
   const isDukascopy = source === "dukascopy";
   const isJForex = source === "jforex";
@@ -795,7 +812,6 @@ export function DownloadModal({
         ? "EURUSD, XAUUSD, US500"
         : "AAPL, MSFT";
   const isStreaming = jobId !== null;
-  const defaultTimeframesKey = normalizedDefaultTimeframes.join("|");
   const parsedSymbols = useMemo(
     () =>
       symbols
@@ -818,6 +834,27 @@ export function DownloadModal({
     return ordered;
   }, [selectedTimeframes]);
   const debouncedCoverageSymbols = useDebouncedValue(parsedSymbols, COVERAGE_DEBOUNCE_MS);
+  // The key names the debounced list, so it must be gated on that list too. The
+  // debounce is seeded from the value at mount (empty while the modal is shut),
+  // so on the first typed symbol `parsedSymbols` is already non-empty while
+  // `debouncedCoverageSymbols` is still []: keying on the parsed list sent a
+  // zero-symbol coverage request and filed its answer under a key that claimed
+  // those symbols, then refetched once the debounce settled.
+  const coverageRequestKey =
+    open &&
+    isDukascopy &&
+    !isStreaming &&
+    parsedSymbols.length > 0 &&
+    debouncedCoverageSymbols.length > 0 &&
+    requestedTimeframes.length > 0
+      ? `${debouncedCoverageSymbols.join(",")}|${requestedTimeframes.join(",")}`
+      : null;
+  const coverageMatches = coverageResult !== null && coverageResult.key === coverageRequestKey;
+  const dukascopyCoverage: DukascopyCoverageMap = coverageMatches
+    ? coverageResult.coverage
+    : EMPTY_COVERAGE;
+  const dukascopyCoverageLoaded = coverageMatches && coverageResult.loaded;
+  const dukascopyCoverageError = coverageMatches ? coverageResult.error : "";
 
   const dukascopyMinStart = useMemo(() => {
     if (parsedSymbols.length === 0 || requestedTimeframes.length === 0) {
@@ -894,91 +931,89 @@ export function DownloadModal({
     });
   }, [dukascopyCoverage, isDukascopy, parsedSymbols, requestedTimeframes]);
 
-  useEffect(() => {
-    if (!open) {
-      return;
+  // Reopening starts a fresh form; adjusting during render beats a
+  // setState-in-effect cascade. `notifiedJobIdRef` is deliberately not cleared
+  // here - writing a ref during render is unsafe, and it does not need clearing:
+  // the dedupe compares it against the *current* job id, which is null until a
+  // new job is queued and then a fresh id.
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) {
+      setSource(defaultSource);
+      setSymbols(defaultSymbols);
+      setSelectedTimeframes(normalizedDefaultTimeframes);
+      setStartDate("");
+      setEndDate("");
+      setPriceType("bid");
+      setMergeTick(false);
+      setMergeS1(false);
+      setShowAdvancedSettings(false);
+      setBatchSize(10);
+      setPauseMs(1000);
+      setError("");
+      setJobId(null);
+      setJobStatus("idle");
     }
-    setSource(defaultSource);
-    setSymbols(defaultSymbols);
-    setSelectedTimeframes(normalizedDefaultTimeframes);
-    setStartDate("");
-    setEndDate("");
-    setPriceType("bid");
-    setMergeTick(false);
-    setMergeS1(false);
-    setShowAdvancedSettings(false);
-    setBatchSize(10);
-    setPauseMs(1000);
-    setError("");
-    setJobId(null);
-    setJobStatus("idle");
-    setCompletionNotified(false);
-    setDukascopyCoverage({});
-    setDukascopyCoverageLoaded(false);
-    setDukascopyCoverageError("");
-  }, [
-    defaultSource,
-    defaultSymbols,
-    defaultTimeframesKey,
-    normalizedDefaultTimeframes,
-    open,
-  ]);
+  }
 
   useEffect(() => {
-    if (!open || !isDukascopy || isStreaming) {
-      return;
-    }
-    if (debouncedCoverageSymbols.length === 0 || requestedTimeframes.length === 0) {
-      setDukascopyCoverage({});
-      setDukascopyCoverageLoaded(false);
-      setDukascopyCoverageError("");
+    if (coverageRequestKey === null) {
       return;
     }
 
     let cancelled = false;
-    setDukascopyCoverageLoaded(false);
-    setDukascopyCoverageError("");
     getDukascopyGenesis(debouncedCoverageSymbols, selectedTimeframes)
       .then((res) => {
         if (!cancelled) {
-          setDukascopyCoverage(res.coverage || {});
-          setDukascopyCoverageLoaded(true);
-          setDukascopyCoverageError("");
+          setCoverageResult({
+            key: coverageRequestKey,
+            coverage: res.coverage || {},
+            loaded: true,
+            error: "",
+          });
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setDukascopyCoverage({});
-          setDukascopyCoverageLoaded(true);
-          setDukascopyCoverageError(
-            "Could not load Dukascopy coverage right now. Start-date guardrails may be less strict.",
-          );
+          setCoverageResult({
+            key: coverageRequestKey,
+            coverage: EMPTY_COVERAGE,
+            loaded: true,
+            error:
+              "Could not load Dukascopy coverage right now. Start-date guardrails may be less strict.",
+          });
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [
-    debouncedCoverageSymbols,
-    isDukascopy,
-    isStreaming,
-    open,
-    requestedTimeframes,
-    selectedTimeframes,
-  ]);
+  }, [coverageRequestKey, debouncedCoverageSymbols, selectedTimeframes]);
 
-  useEffect(() => {
-    if (!jobId || completionNotified) {
-      return;
-    }
-    if (isTerminalTaskStatus(jobStatus)) {
-      if (jobStatus === "completed" || jobStatus === "failed") {
-        onTaskFinished?.(jobStatus, jobId);
+  // The task feed reports each status transition once, so the terminal status is
+  // forwarded from the callback rather than mirrored by an effect. Every
+  // terminal status closes the stream, but only a clean finish or a failure is
+  // reported upstream, so a partial run is never counted as a failure.
+  //
+  // Memoised on the two values it reads, so a status line arriving does not hand
+  // the terminal a new callback identity for a job that has not changed.
+  const handleStatusChange = useCallback(
+    (status: string) => {
+      setJobStatus(status);
+      if (
+        !jobId ||
+        notifiedJobIdRef.current === jobId ||
+        !isTerminalTaskStatus(status)
+      ) {
+        return;
       }
-      setCompletionNotified(true);
-    }
-  }, [completionNotified, jobId, jobStatus, onTaskFinished]);
+      notifiedJobIdRef.current = jobId;
+      if (status === "completed" || status === "failed") {
+        onTaskFinished?.(status, jobId);
+      }
+    },
+    [jobId, onTaskFinished],
+  );
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
@@ -1001,7 +1036,7 @@ export function DownloadModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setCompletionNotified(false);
+    notifiedJobIdRef.current = null;
     setError("");
   };
 
@@ -1338,7 +1373,7 @@ export function DownloadModal({
               </div>
             </div>
 
-            <LiveTerminal jobId={jobId} onStatusChange={setJobStatus} />
+            <LiveTerminal jobId={jobId} onStatusChange={handleStatusChange} />
 
             <div
               style={{

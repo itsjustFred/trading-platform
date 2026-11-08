@@ -1,16 +1,26 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Link } from "react-router-dom";
-import { Activity, ArrowRight, Pause, RefreshCw, Square } from "lucide-react";
+import {
+  Activity,
+  ArrowRight,
+  Pause,
+  Play,
+  RefreshCw,
+  Square,
+} from "lucide-react";
 
 import {
   cancelDataTask,
   listTasks,
   pauseDataTask,
   restartDataTask,
+  resumeDataTask,
 } from "../api/client";
 import type { DataTaskStatusResponse } from "../api/types";
-import { useToast } from "../components/ToastProvider";
+// `useToast` lives in the context module so this page and the provider do not
+// have to import each other (react-refresh/only-export-components).
+import { useToast } from "../components/toastContext";
 import {
   isActiveTaskStatus,
   isFailedTaskStatus,
@@ -20,6 +30,17 @@ import {
 
 const TASK_POLL_MS = 3000;
 const TERMINAL_TASK_LIMIT = 100;
+/**
+ * Cap for the "Needs Attention" group: jobs whose status is neither active nor
+ * a recognised terminal state.
+ *
+ * The database still holds rows written by older builds (e.g. 430 tasks in
+ * `manual_required`). Any status the current UI does not model used to be
+ * dropped from every list, so those jobs became completely invisible: an
+ * operator had no way to know they existed. Anything unrecognised is now
+ * surfaced explicitly instead of silently disappearing.
+ */
+const ATTENTION_TASK_LIMIT = 100;
 
 function formatDuration(seconds?: number | null) {
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
@@ -164,14 +185,32 @@ export function TaskHubPage() {
     [tasks],
   );
 
+  // Anything the shared classification does not place in the active or the
+  // terminal list, so a job this build cannot interpret is still visible.
+  const attentionTasks = useMemo(
+    () =>
+      tasks
+        .filter(
+          (task) =>
+            !isActiveTaskStatus(task.status) &&
+            !isTerminalTaskStatus(task.status),
+        )
+        .sort(byNewest)
+        .slice(0, ATTENTION_TASK_LIMIT),
+    [tasks],
+  );
+
   const summary = useMemo(() => {
-    const counts = { running: 0, queued: 0, completed: 0, failed: 0 };
+    const counts = { running: 0, queued: 0, completed: 0, failed: 0, attention: 0 };
     for (const task of tasks) {
       const status = normalizeTaskStatus(task.status);
       if (status === "queued") counts.queued += 1;
       else if (isActiveTaskStatus(status)) counts.running += 1;
       if (status === "completed") counts.completed += 1;
       if (isFailedTaskStatus(status)) counts.failed += 1;
+      if (!isActiveTaskStatus(status) && !isTerminalTaskStatus(status)) {
+        counts.attention += 1;
+      }
     }
     return counts;
   }, [tasks]);
@@ -189,9 +228,12 @@ export function TaskHubPage() {
       );
       showToast(success, "info");
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "Task action failed.";
-      showToast(message, "error");
+      showToast(
+        error instanceof Error && error.message
+          ? error.message
+          : "Task action failed.",
+        "error",
+      );
     } finally {
       setBusy((current) => ({ ...current, [taskId]: false }));
     }
@@ -242,7 +284,7 @@ export function TaskHubPage() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+          gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
           gap: "10px",
         }}
       >
@@ -250,6 +292,7 @@ export function TaskHubPage() {
         <SummaryCard label="Queued" value={summary.queued} />
         <SummaryCard label="Completed" value={summary.completed} />
         <SummaryCard label="Failed" value={summary.failed} failed />
+        <SummaryCard label="Needs attention" value={summary.attention} failed />
       </div>
 
       <section style={{ display: "grid", gap: "10px" }}>
@@ -326,6 +369,23 @@ export function TaskHubPage() {
                   <div
                     style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}
                   >
+                    {task.can_resume ? (
+                      <button
+                        type="button"
+                        disabled={isBusy || !taskId}
+                        onClick={() =>
+                          taskId &&
+                          void runAction(
+                            taskId,
+                            () => resumeDataTask(taskId),
+                            "Task resumed.",
+                          )
+                        }
+                        style={buttonStyle("#bbf7d0")}
+                      >
+                        <Play size={14} /> Resume
+                      </button>
+                    ) : null}
                     {task.can_pause ? (
                       <button
                         type="button"
@@ -360,7 +420,9 @@ export function TaskHubPage() {
                         <Square size={14} /> Cancel
                       </button>
                     ) : null}
-                    {!task.can_pause && !task.can_cancel ? (
+                    {!task.can_pause &&
+                    !task.can_resume &&
+                    !task.can_cancel ? (
                       <span
                         style={{
                           color: "var(--color-text-muted)",
@@ -396,6 +458,55 @@ export function TaskHubPage() {
               </div>
             );
           })}
+      </section>
+
+      <section style={{ display: "grid", gap: "10px" }}>
+        <div style={{ fontWeight: 700, fontSize: "1.03rem" }}>
+          Needs Attention
+          <span
+            style={{
+              marginLeft: "8px",
+              fontSize: "0.78rem",
+              fontWeight: 400,
+              color: "var(--color-text-muted)",
+            }}
+          >
+            jobs whose status this build does not recognise
+          </span>
+        </div>
+        {!loading && attentionTasks.length === 0 && (
+          <div style={cardStyle()}>No unrecognised jobs.</div>
+        )}
+        {!loading &&
+          attentionTasks.map((task) => (
+            <div
+              key={task.id || `${task.name}-${task.created_at}`}
+              style={cardStyle()}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  alignItems: "baseline",
+                }}
+              >
+                <strong>{task.name || task.id || "Task"}</strong>
+                <span
+                  style={{
+                    fontSize: "0.75rem",
+                    color: "var(--color-text-muted)",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {String(task.status || "unknown")}
+                </span>
+              </div>
+              <div style={{ fontSize: "0.8rem", color: "var(--color-text-muted)" }}>
+                {taskMessage(task) || task.description || "No message recorded."}
+              </div>
+            </div>
+          ))}
       </section>
 
       <section style={{ display: "grid", gap: "10px" }}>

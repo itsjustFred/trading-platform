@@ -10,6 +10,8 @@ import {
   resolveCompatibleInSampleValue,
 } from "../lib/optimizationEvidence";
 import { stringifyUnknownValue } from "../lib/unknownValue";
+import { toPercentPointsForKey } from "../api/metricScale";
+import { describeError } from "../lib/errorMessage";
 
 const COMPARISON_ROWS = [
   { key: "sharpe_ratio", label: "Sharpe" },
@@ -36,7 +38,9 @@ function formatComparisonValue(
     return `$${value.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   }
   if (["cagr", "win_rate", "max_drawdown_pct"].includes(key)) {
-    return `${(value * 100).toFixed(2)}%`;
+    return `${(
+      toPercentPointsForKey("optimization_panel_stats", key as "cagr", value) ?? 0
+    ).toFixed(2)}%`;
   }
   if (key === "total_trades") {
     return value.toFixed(0);
@@ -86,9 +90,7 @@ export function OptimizationResultsPage() {
       })
       .catch((caughtError) => {
         setError(
-          caughtError instanceof Error
-            ? caughtError.message
-            : "Could not load optimization.",
+          describeError(caughtError, "Could not load optimization."),
         );
         setLoadedId(id);
       });

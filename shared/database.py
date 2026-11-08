@@ -535,6 +535,15 @@ def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def utcnow_naive() -> datetime:
+    """Public alias for :func:`_utcnow_naive`.
+
+    The viewer needs the same clock the database writes with, and reaching into
+    a private name from another module is how two clocks start to drift.
+    """
+    return _utcnow_naive()
+
+
 def _normalize_optional_id(value: Any) -> str | None:
     """Normalize an optional external id to a real ``None`` or a clean string.
 
@@ -752,6 +761,35 @@ class LiveAccountModel(SQLModel, table=True):
         )
 
 
+class LiveControlAuditModel(SQLModel, table=True):
+    """Durable record of every state-changing live control.
+
+    Arming, stopping, re-pointing and deleting a live deployment are the
+    operations with real consequences, and until now nothing recorded that they
+    happened. The request log is a debug line: it is not queryable, it does not
+    survive a log rotation, and it cannot answer "what changed, and when".
+
+    ``actor`` is attribution by claim, not authentication - this platform has no
+    auth, so the value comes from an operator-supplied header and is only as
+    trustworthy as the operator. It is recorded rather than inferred because an
+    unattributed change is worse than a self-declared one.
+    """
+
+    __tablename__ = "live_control_audit"
+
+    id: str = Field(primary_key=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    actor: str = Field(default="unknown", index=True)
+    action: str = Field(index=True)
+    target_type: str = Field(index=True)
+    target_id: str = Field(index=True)
+    succeeded: bool = Field(default=True, index=True)
+    detail_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("detail", JSON, nullable=False),
+    )
+
+
 class ServiceModel(SQLModel, table=True):
     __tablename__ = "services"
     __table_args__ = (UniqueConstraint("name", "type", name="uq_services_name_type"),)
@@ -765,6 +803,10 @@ class ServiceModel(SQLModel, table=True):
         sa_column=Column("config", JSON, nullable=False),
     )
     last_activity: datetime | None = Field(default=None, index=True)
+    # When the service was last *tried*, successfully or not. `last_activity`
+    # only advances on a successful read, so a service failing for days keeps
+    # showing the last time it worked and reads as idle when it is retrying.
+    last_attempt_at: datetime | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
     updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
 
@@ -782,6 +824,7 @@ class ServiceModel(SQLModel, table=True):
             ),
             config_json=dict(service.config or {}),
             last_activity=service.last_activity,
+            last_attempt_at=service.last_attempt_at,
             created_at=service.created_at,
             updated_at=now,
         )
@@ -804,6 +847,7 @@ class ServiceModel(SQLModel, table=True):
             status=parsed_status,
             config=dict(self.config_json or {}),
             last_activity=self.last_activity,
+            last_attempt_at=self.last_attempt_at,
             created_at=self.created_at,
         )
 
@@ -1583,6 +1627,22 @@ def _add_live_account_columns(connection: Connection) -> None:
     )
 
 
+def _add_service_columns(connection: Connection) -> None:
+    """Add `services.last_attempt_at` to legacy tables.
+
+    Separate from `last_activity` on purpose: that column only advances on a
+    successful read, so a service failing for days shows the last time it worked.
+    The two questions - "when did this last work?" and "when did anyone last try?"
+    - need different answers, and conflating them makes a working retry look like
+    an idle process.
+    """
+    column_names = _table_column_names(connection, "services")
+    if "last_attempt_at" not in column_names:
+        connection.execute(
+            text("ALTER TABLE services ADD COLUMN last_attempt_at DATETIME")
+        )
+
+
 def _add_background_task_columns(connection: Connection) -> None:
     """Add tracking columns to legacy background_tasks tables."""
     column_names = _table_column_names(connection, "background_tasks")
@@ -2131,6 +2191,7 @@ def _migrate_schema() -> None:
         _add_backtests_tags_column(connection)
         _add_backtests_stat_columns(connection)
         _add_live_account_columns(connection)
+        _add_service_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
 
@@ -2659,6 +2720,7 @@ def _create_live_account_record(
     name: str,
     ctid: str | None,
     broker_login: str | None,
+    is_demo: bool | None = None,
 ) -> LiveAccountConfig:
     """Insert a brand-new live account row."""
     account = LiveAccountModel(
@@ -2667,6 +2729,7 @@ def _create_live_account_record(
         name=name or account_id,
         ctid=_optional_trimmed(ctid),
         broker_login=_optional_trimmed(broker_login),
+        is_demo=bool(is_demo),
     )
     session.add(account)
     session.commit()
@@ -2682,6 +2745,7 @@ def _apply_live_account_updates(
     name: str,
     ctid: str | None,
     broker_login: str | None,
+    is_demo: bool | None = None,
 ) -> bool:
     """Overwrite non-empty fields on an existing live account row."""
     changed = False
@@ -2699,6 +2763,9 @@ def _apply_live_account_updates(
     if broker_login is not None and current.broker_login != normalized_broker_login:
         current.broker_login = normalized_broker_login
         changed = True
+    if is_demo is not None and bool(current.is_demo) != bool(is_demo):
+        current.is_demo = bool(is_demo)
+        changed = True
     if changed:
         session.add(current)
         session.commit()
@@ -2713,6 +2780,7 @@ def ensure_live_account(
     name: str = "",
     ctid: str | None = None,
     broker_login: str | None = None,
+    is_demo: bool | None = None,
 ) -> LiveAccountConfig:
     init_db()
     with get_session() as session:
@@ -2725,6 +2793,7 @@ def ensure_live_account(
                 name=name,
                 ctid=ctid,
                 broker_login=broker_login,
+                is_demo=is_demo,
             )
 
         _apply_live_account_updates(
@@ -2734,11 +2803,19 @@ def ensure_live_account(
             name=name,
             ctid=ctid,
             broker_login=broker_login,
+            is_demo=is_demo,
         )
         return current.to_live_account()
 
 
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
+    """Persist what discovery reported, without erasing what it did not.
+
+    Discovery only sees what the broker answered. A missing ``broker_login`` or
+    ``ctid`` therefore means "not observed this time", not "forget it": those two
+    fields are the identity a deployment is armed against, so writing ``None``
+    over them would silently unarm an account that is still trading.
+    """
     init_db()
     with get_session() as session:
         for account in accounts:
@@ -2748,8 +2825,10 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
                 continue
             current.broker = account.broker
             current.name = account.name
-            current.ctid = account.ctid
-            current.broker_login = account.broker_login
+            if account.ctid is not None:
+                current.ctid = account.ctid
+            if account.broker_login is not None:
+                current.broker_login = account.broker_login
             session.add(current)
         session.commit()
 
@@ -2845,20 +2924,23 @@ def update_service_status(
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
-    respect_operator_intent: bool = False,
+    respect_operator_intent: bool = True,
 ) -> Service | None:
     """Write a service's status, with PAUSED and STOPPED as an atomic floor.
 
-    `respect_operator_intent=True` makes PAUSED and STOPPED a floor: a service in
-    either state is never moved to any other status by this function. Only automated callers
-    pass it - the pause was set by a person, and nothing the process observes
-    afterwards (a message arriving, a connector failing, a reconnect completing)
-    outranks that.
+    By default (`respect_operator_intent=True`) PAUSED and STOPPED are a floor: a
+    service in either state is never moved to a *different* status by this
+    function, whatever the target - including an automated STOPPED landing on
+    PAUSED and vice versa. Writing the status the row already has is a harmless
+    no-op. The pause or stop was set by a person, and nothing the process
+    observes afterwards (a message arriving, a connector failing, a reconnect
+    completing, a scheduler tick) outranks that.
 
-    The default is `False` because every other caller *is* the operator: the
-    API endpoint that sets and clears a pause, the CLI, a test. Making the floor
-    the default would let it swallow the very request that resumes a paused
-    service - the endpoint would answer 200 while the row stayed PAUSED.
+    The default is fail-safe: a caller that forgets the flag cannot overwrite
+    operator intent. Pass `False` only when *establishing* operator intent - the
+    viewer status API that sets and clears a pause or stop. Making the floor
+    apply there would swallow the very request that resumes a paused service:
+    the endpoint would answer 200 while the row stayed PAUSED.
 
     The check is a conditional ``UPDATE`` rather than read-check-write. The
     previous shape read the row, compared in Python, and wrote it back, so a
@@ -2875,6 +2957,10 @@ def update_service_status(
     values: dict[str, Any] = {
         "status": normalized_status,
         "updated_at": _utcnow_naive(),
+        # Any status write is an attempt, successful or not. Without this the
+        # only record that anything tried is `updated_at`, which is a
+        # row-modification timestamp rather than a statement about the service.
+        "last_attempt_at": _utcnow_naive(),
     }
     if last_activity is not None:
         values["last_activity"] = last_activity
@@ -2884,16 +2970,29 @@ def update_service_status(
             .where(ServiceModel.id == normalized_id)
             .values(**values)
         )
-        if (
-            respect_operator_intent
-            and normalized_status not in _OPERATOR_INTENT_SERVICE_STATUSES
-        ):
+        if respect_operator_intent:
             # Re-tested in the same statement as the write, so a concurrent
-            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING landing after it.
+            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING (or the other
+            # operator state) landing after it. Same-status writes still apply.
             statement = statement.where(
-                ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES)
+                or_(
+                    ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES),
+                    ServiceModel.status == normalized_status,
+                )
             )
-        session.execute(statement)
+        applied = session.execute(statement)
+        if not applied.rowcount:
+            # A refusal by the PAUSED floor matches no rows, so the
+            # `last_attempt_at` carried by that statement is rolled back with it -
+            # and the refused attempt is exactly the one worth seeing ("something
+            # kept trying to un-pause a service an operator paused"). Record it on
+            # its own, in the same transaction. The status stays untouched: this is
+            # observation, not enforcement.
+            session.execute(
+                update(ServiceModel)
+                .where(ServiceModel.id == normalized_id)
+                .values(last_attempt_at=_utcnow_naive())
+            )
         session.commit()
         record = session.get(ServiceModel, normalized_id)
         if record is None:
@@ -3050,6 +3149,12 @@ def update_live_deployment_status(
 #: :func:`renew_live_deployment_submission`), so this is not a hard cap on
 #: submission duration.
 LIVE_SUBMISSION_CLAIM_TTL_SECONDS = 30.0
+
+#: How long an operator's PAUSE/DELETE may wait for in-flight submissions to
+#: drain. Derived from the claim TTL rather than written independently: a drain
+#: budget shorter than one lease would report a merely slow submission as "still
+#: in flight". Two TTLs cover a full remaining lease plus one more lease window.
+LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS = LIVE_SUBMISSION_CLAIM_TTL_SECONDS * 2.0
 
 
 def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
@@ -3319,6 +3424,197 @@ class LiveDeploymentInUseError(RuntimeError):
         self.deployment_id = deployment_id
         self.signal_count = signal_count
         self.execution_count = execution_count
+
+
+def update_live_deployment_account(
+    deployment_id: str,
+    account_id: str,
+    *,
+    acknowledge_unreconciled: bool = False,
+) -> LiveDeploymentConfig | None:
+    """Re-point a deployment at a different broker account.
+
+    This is a safety-critical operation, so it is deliberately narrow:
+
+    * the target account must exist;
+    * an ACTIVE deployment is never re-pointed, because the running listener and
+      its adapter still hold the old account until the next sync - the caller has
+      to pause it first;
+    * a live submission lease blocks the write, since the order would land on the
+      *old* account after the re-point;
+    * a lease that expired without being released blocks it too: the broker
+      outcome was never observed, so whether that order reached the old account is
+      unknown. The operator can verify the old account and retry with
+      ``acknowledge_unreconciled=True``; the acknowledgement is audited by the
+      caller.
+
+    Returns None when the deployment does not exist.
+
+    The target account is re-verified against the broker by the viewer endpoint
+    immediately before this call, the same check arming performs. The stronger
+    daemon-side ``demo_verified_at`` fingerprint is not part of this slice.
+    """
+    normalized_deployment = str(deployment_id or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_deployment or not normalized_account:
+        raise ValueError("deployment_id and account_id are required")
+    init_db()
+    with get_session() as session:
+        # Take the write lock before the in-flight check, not after it. A deferred
+        # transaction only reads here, so a dispatcher could insert a claim between
+        # the count and the commit: the re-point would then succeed with a
+        # submission already on its way to the *old* account, which is the exact
+        # thing the check exists to prevent. BEGIN IMMEDIATE serialises the check
+        # against claim insertion, the same way save_live_execution does.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveDeploymentModel, normalized_deployment)
+            if record is None:
+                session.rollback()
+                return None
+
+            account = session.get(LiveAccountModel, normalized_account)
+            if account is None:
+                raise ValueError(
+                    f"Refusing to re-point at unknown account '{account_id}'"
+                )
+
+            current_status = str(record.status or "").strip().upper()
+            if current_status == "ACTIVE":
+                raise ValueError(
+                    "Refusing to re-point an ACTIVE deployment; pause it first so "
+                    "the running listener cannot keep trading the old account"
+                )
+
+            # A live lease means a submission may be on its way to the old
+            # account. A lease whose TTL elapsed without a release is worse, not
+            # better: the outcome was never observed, so whether the order
+            # reached the broker is unknown. Neither may be dropped silently by
+            # a re-point.
+            now = _utcnow_naive()
+            leases = session.exec(
+                select(LiveDeploymentSubmissionClaimModel.expires_at).where(
+                    LiveDeploymentSubmissionClaimModel.deployment_id
+                    == normalized_deployment
+                )
+            ).all()
+            in_flight = sum(1 for expires_at in leases if expires_at > now)
+            expired = len(leases) - in_flight
+            if in_flight > 0:
+                raise ValueError(
+                    "Refusing to re-point a deployment with in-flight submissions; "
+                    "drain them first"
+                )
+            if expired > 0 and not acknowledge_unreconciled:
+                raise ValueError(
+                    f"Refusing to re-point: {expired} submission lease(s) expired "
+                    "without being released, so whether those orders reached the "
+                    "old account is unknown. Verify the old account, then retry "
+                    "with acknowledge_unreconciled=true"
+                )
+            if expired > 0:
+                # The operator confirmed the old account was checked, so the
+                # stale lease has served its purpose as evidence. Keeping it
+                # would make every later control read the outcome as unknown.
+                session.exec(
+                    delete(LiveDeploymentSubmissionClaimModel).where(
+                        (
+                            LiveDeploymentSubmissionClaimModel.deployment_id
+                            == normalized_deployment
+                        )
+                        & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+                    )
+                )
+
+            record.account_id = normalized_account
+            record.updated_at = _utcnow_naive()
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+        except Exception:
+            session.rollback()
+            raise
+    return record.to_live_deployment()
+
+
+def record_live_control_audit(
+    *,
+    action: str,
+    target_type: str,
+    target_id: str,
+    actor: str = "unknown",
+    succeeded: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append one state-changing live control to the audit trail.
+
+    Written on the failure path as well as the success path, and deliberately
+    never raises: an audit write that could abort the operation it is recording
+    would be a worse failure than the missing record, so a failure here is logged
+    and the caller carries on.
+    """
+    payload = {
+        "id": str(uuid4()),
+        "actor": str(actor or "unknown").strip() or "unknown",
+        "action": str(action or "").strip(),
+        "target_type": str(target_type or "").strip(),
+        "target_id": str(target_id or "").strip(),
+        "succeeded": bool(succeeded),
+        "detail": dict(detail or {}),
+    }
+    try:
+        init_db()
+        with get_session() as session:
+            session.add(
+                LiveControlAuditModel(
+                    id=payload["id"],
+                    actor=payload["actor"],
+                    action=payload["action"],
+                    target_type=payload["target_type"],
+                    target_id=payload["target_id"],
+                    succeeded=payload["succeeded"],
+                    detail_json=payload["detail"],
+                )
+            )
+            session.commit()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error(
+            "Could not write the live control audit record; the change itself stands",
+            extra={"data": {"action": payload["action"], "error": repr(exc)}},
+        )
+    return payload
+
+
+def list_live_control_audit(
+    *,
+    limit: int = 100,
+    target_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Most recent first. Read-only; there is no delete path on purpose."""
+    bounded = max(1, min(int(limit or 100), 1000))
+    init_db()
+    with get_session() as session:
+        statement = select(LiveControlAuditModel)
+        if target_id:
+            statement = statement.where(
+                LiveControlAuditModel.target_id == str(target_id).strip()
+            )
+        rows = session.exec(
+            statement.order_by(LiveControlAuditModel.created_at.desc()).limit(bounded)
+        ).all()
+    return [
+        {
+            "id": row.id,
+            "created_at": row.created_at.isoformat(),
+            "actor": row.actor,
+            "action": row.action,
+            "target_type": row.target_type,
+            "target_id": row.target_id,
+            "succeeded": row.succeeded,
+            "detail": row.detail_json or {},
+        }
+        for row in rows
+    ]
 
 
 def delete_live_deployment(deployment_id: str) -> bool:
@@ -4034,6 +4330,34 @@ def _safe_stat_number(value: Any, default: float = 0.0) -> float:
     return numeric
 
 
+def _stat_number_or_undefined(
+    stats: dict[str, Any], key: str, default: float
+) -> float | None:
+    """Resolve a stat, honouring the producer's ``undefined_metrics`` list.
+
+    Delegates to :func:`shared.models.resolve_defined_stat`, which owns the
+    convention. Substituting a numeric default here turns an undefined PSR into
+    0.0 - the *worst* attainable value - so a backtest with no trades is listed
+    as a measured 0.0 PSR. A default p_value of 1.0 has the same shape.
+
+    The default is only applied to a metric the producer did not name, so
+    artifacts written before the convention keep their previous values.
+
+    A resolved value that is not a finite number is reported as undefined, not
+    coerced: an artifact carrying ``NaN``/``Infinity`` (or a string) has no
+    measurable value for that key, and publishing it as-is puts a non-JSON number
+    in the payload while still reading as a measurement.
+    """
+    resolved = resolve_defined_stat(stats, key, default)
+    if resolved is None:
+        return None
+    try:
+        numeric = float(resolved)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
     data = backtest.data or {}
     stats = backtest.stats or {}
@@ -4058,9 +4382,9 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "end_date": str(backtest.backtest_end or ""),
         "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
         "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
-        "sharpe_ratio": _safe_stat_number(stats.get("sharpe_ratio"), 0.0),
-        "psr": _safe_stat_number(stats.get("psr"), 0.0),
-        "p_value": _safe_stat_number(stats.get("p_value"), 1.0),
+        "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
+        "psr": _stat_number_or_undefined(stats, "psr", 0.0),
+        "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
         "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),

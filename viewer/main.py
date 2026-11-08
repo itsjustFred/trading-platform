@@ -15,10 +15,12 @@ import time
 import traceback
 import uuid
 import weakref
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
@@ -38,16 +40,17 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field as PydanticField, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 from sqlmodel import SQLModel
 from starlette.middleware.gzip import GZipMiddleware
 
-from data_tools.catalog_builder import merge_ohlcv_entries
-from data_tools import cache_manager
 from data_tools import auto_download as _auto_download_config
+from data_tools import cache_manager
 from data_tools.auto_download import reload_coverage_windows
+from data_tools.catalog_builder import merge_ohlcv_entries
 from data_tools.signal_import import load_signals_from_csv
 from shared.atomic_io import write_text_atomically
 
@@ -58,7 +61,11 @@ os.environ.setdefault("PYNE_SAVE_SCRIPT_TOML", "0")
 
 from shared.constants import (
     DATA_DIR as RESOLVED_DATA_DIR,
+)
+from shared.constants import (
     LOG_DIR as RESOLVED_LOG_DIR,
+)
+from shared.constants import (
     normalize_timeframe,
 )
 
@@ -69,97 +76,126 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
+from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.stockkit_routing import validate_stockkit_deployment_route
+from risk.config import RiskConfig
+from runner.agent_process import build_backtest_child_env
+from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from runner.grid_identity import data_staleness_reason, read_identity
+from shared.database import (
+    DB_PATH as BACKTEST_DB_PATH,
+)
+from shared.database import (
+    LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    LiveDeploymentInUseError,
+    LiveDeploymentSubmissionClaim,
+    create_live_deployment,
+    create_service,
+    delete_background_task_record,
+    delete_backtest,
+    delete_live_deployment,
+    delete_service,
+    ensure_live_account,
+    get_background_task_record,
+    get_latest_live_balances,
+    get_live_account,
+    get_live_deployment,
+    get_service,
+    init_db,
+    list_background_task_records,
+    list_backtest_fingerprint_rows,
+    list_backtest_ids,  # noqa: F401 - monkeypatch target for the shared viewer_client fixture
+    list_backtest_metadata_rows,
+    list_live_accounts,
+    list_live_balances,
+    list_live_control_audit,
+    list_live_deployment_submission_claims,
+    list_live_deployments,
+    list_live_deployments_for_account,
+    list_live_signal_executions_for_deployments,
+    list_live_signals_for_deployments,
+    list_live_signals_for_replay,
+    list_services,
+    list_verification_evidence_records,
+    list_verification_evidence_summary,
+    load_backtest_equity_preview_map,
+    load_backtest_equity_preview_points,
+    load_backtest_metadata_row,
+    load_backtest_result,
+    load_live_account_stats_inputs,
+    mark_background_tasks_interrupted,
+    migrate_json_to_sqlite,
+    normalize_task_status,
+    record_live_control_audit,
+    save_result_to_sqlite,
+    update_live_deployment_account,
+    update_live_deployment_status,
+    update_service_status,
+    upsert_background_task_record,
+    upsert_live_accounts,
+    upsert_verification_evidence,
+    utcnow_naive,
+)
+from shared.database import (
+    delete_portfolio as delete_portfolio_record,
+)
+from shared.database import (
+    list_portfolios as list_portfolio_records,
+)
+from shared.database import (
+    load_portfolio as load_portfolio_record,
+)
+from shared.database import (
+    save_portfolio as save_portfolio_record,
+)
 from shared.logging import get_logger, redact_text, redact_value
-from shared.sentry import initialize_sentry
 from shared.models import (
     BacktestResult,
     EquityPoint,
+    LiveAccountConfig,
     Service,
     ServiceStatus,
     ServiceType,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+    resolve_defined_stat,
+)
+from shared.models import (
     Portfolio as PortfolioModel,
+)
+from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
-from shared.database import (
-    LiveDeploymentInUseError,
-    DB_PATH as BACKTEST_DB_PATH,
-    create_live_deployment,
-    delete_background_task_record,
-    delete_backtest,
-    delete_portfolio as delete_portfolio_record,
-    delete_live_deployment,
-    ensure_live_account,
-    get_background_task_record,
-    get_live_account,
-    get_service,
-    get_latest_live_balance,
-    get_latest_live_balances,
-    init_db,
-    list_backtest_ids,
-    list_backtest_fingerprint_rows,
-    list_backtest_metadata_rows,
-    list_portfolios as list_portfolio_records,
-    list_verification_evidence_records,
-    list_verification_evidence_summary,
-    list_background_task_records,
-    list_live_accounts,
-    list_live_balances,
-    list_live_deployments,
-    list_live_deployments_for_account,
-    list_services,
-    list_live_signals_for_replay,
-    list_live_signals_for_deployments,
-    list_live_signal_executions_for_deployments,
-    load_backtest_metadata_row,
-    load_backtest_equity_preview_points,
-    load_backtest_equity_preview_map,
-    load_live_account_stats_inputs,
-    load_backtest_result,
-    load_portfolio as load_portfolio_record,
-    mark_background_tasks_interrupted,
-    migrate_json_to_sqlite,
-    normalize_task_status,
-    save_result_to_sqlite,
-    save_portfolio as save_portfolio_record,
-    upsert_verification_evidence,
-    upsert_background_task_record,
-    create_service,
-    delete_service,
-    update_live_deployment_status,
-    update_service_status,
-)
-from runner.agent_process import build_backtest_child_env
-from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
-from risk.config import RiskConfig
+from shared.sentry import initialize_sentry
 from signal_bots.registry import get_signal_processor, list_signal_processor_options
-from live_runner.ctrader_deployment import build_ctrader_deployment_plan
-from live_runner.stockkit_routing import validate_stockkit_deployment_route
+
 try:
     from live_runner.account_discovery import discover_configured_accounts
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for account discovery
     async def discover_configured_accounts() -> list[dict[str, Any]]:
         return []
+
+from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.market_data_stream import LiveMarketDataStreamService
+from runner.capm import align_return_series, calculate_capm
 from shared.models import (
+    LiveControlConfirmation,
+    LiveDeploymentAccountUpdateRequest,
     LiveDeploymentConfig,
     LiveDeploymentCreateRequest,
     LiveDeploymentStatusUpdateRequest,
 )
-from runner.capm import align_return_series, calculate_capm
 from shared.strategy_registry import (
     DEFAULT_STRATEGIES_DIR,
     StrategyEntry,
     iter_strategy_files,
     load_strategy_meta,
     matches_strategy_identifier,
-    strategy_identifier_aliases,
     strategy_documentation_path,
+    strategy_identifier_aliases,
     strategy_relative_file,
     strategy_slug_for_path,
 )
-from live_runner.market_data_stream import LiveMarketDataStreamService
-from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from viewer import core as legacy_viewer
 
 initialize_sentry(
@@ -224,16 +260,10 @@ REPLAY_MAX_BARS_PER_EVENT = (BARS_BEFORE * 2) + (BARS_AFTER * 3)
 BACKTEST_WATCHDOG_TIMEOUT_SECONDS = float(os.environ.get("BACKTEST_TIMEOUT_SECONDS", "300"))
 BACKTEST_WATCHDOG_POLL_SECONDS = 2.0
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
-_SINGLEFLIGHT_PERSISTED_KEYS = (
-    "download_request_key",
-    "owner_pid",
-    "owner_thread_id",
-    "owner_token",
-    "singleflight_owner_boot_id",
-    "singleflight_heartbeat_at",
-    "singleflight_lease_until",
-    "singleflight_lease_expires_at",
-)
+# One definition, in viewer/core.py, next to the clear that must agree with it.
+# See the note there: this list is persisted and that one is popped, so a key
+# present here but absent there is a reservation that is never released.
+_SINGLEFLIGHT_PERSISTED_KEYS = legacy_viewer._SINGLEFLIGHT_RUNTIME_KEYS
 _TASK_LOG_WS_CHUNK_BYTES = 64 * 1024
 _TASK_LOG_WS_MAX_BYTES = 2 * 1024 * 1024
 _TASK_LOG_RESPONSE_MAX_LINES = 2000
@@ -310,6 +340,12 @@ DATA_TASKS = legacy_viewer.DATA_TASKS
 DATA_TASKS_LOCK = legacy_viewer.DATA_TASKS_LOCK
 ACTIVE_TASK_STATUSES = legacy_viewer.ACTIVE_TASK_STATUSES
 FINAL_TASK_STATUSES = legacy_viewer.FINAL_TASK_STATUSES
+# A task can only be paused while it is actually pending or executing. This must
+# stay in lockstep with `viewer.core._task_controls_payload`'s `can_pause` set:
+# the flag is the contract the UI renders from, so the endpoint accepting a
+# status the flag hides leaves the operator unable to act, and accepting a status
+# the flag offers but should not is a silent no-op reported as success.
+PAUSABLE_TASK_STATUSES = frozenset({"running", "starting"})
 _running_jobs = legacy_viewer._running_jobs
 _JOBS_LOCK = legacy_viewer._JOBS_LOCK
 _JOBS_TIMESTAMP = legacy_viewer._JOBS_TIMESTAMP
@@ -578,7 +614,17 @@ async def _prewarm_jforex_jvm_background() -> None:
     try:
         from data_tools.downloaders import jforex_dl
 
-        await asyncio.to_thread(jforex_dl.prewarm_jvm)
+        # Called directly, NOT via asyncio.to_thread: JPype requires the JVM to
+        # be started from the main thread, and this coroutine already runs there
+        # because the lifespan schedules it with asyncio.create_task. Handing it
+        # to a worker thread starts the JVM off the main thread, and JPype's
+        # atexit shutdown then deadlocks - the process hangs forever after the
+        # tests report success, holding its RAM. Verified both directions: a
+        # main-thread start exits in ~1s, a worker-thread start hangs, and a
+        # main-thread shutdownJVM() does not rescue a worker-thread start.
+        # Losing the ~1s of loop blocking is the point: it is a background task,
+        # so the server is not delayed by it.
+        jforex_dl.prewarm_jvm()
         logger.info("JVM prewarmed for JForex")
     except ImportError:
         logger.info("JPype not available, JForex disabled")
@@ -687,6 +733,7 @@ class _BacktestRecoveryParameters(BaseModel):
     engine: str = "native"
     symbols: list[str]
     timeframe: str = "1d"
+    data_source: str = ""
     start: str = ""
     end: str = ""
     capital: float = 100000.0
@@ -875,6 +922,7 @@ def _backtest_request_from_recovery_spec(
         engine=engine,
         symbols=symbols,
         timeframe=timeframe,
+        data_source=str(payload.get("data_source") or ""),
         start=str(payload.get("start") or ""),
         end=str(payload.get("end") or ""),
         capital=capital,
@@ -1345,12 +1393,13 @@ class BacktestRunRequest(SQLModel):
     engine: str = "native"
     symbols: list[str]
     timeframe: str = "1d"
+    data_source: str = ""
     start: str = ""
     end: str = ""
     capital: float = 100000.0
-    risk_per_trade_pct: float | None = None
-    max_position_pct: float | None = None
-    max_leverage: float | None = None
+    risk_per_trade_pct: float | None = PydanticField(default=None, ge=0.0, lt=1.0)
+    max_position_pct: float | None = PydanticField(default=None, gt=0.0, le=1.0)
+    max_leverage: float | None = PydanticField(default=None, gt=0.0)
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
     parameters: dict[str, Any] = {}
@@ -2158,6 +2207,35 @@ def _safe_float(value: object, default: float = 0.0) -> float:
     return numeric
 
 
+def _optional_float(value: object) -> float | None:
+    """Coerce to float, but let an absent value stay absent.
+
+    ``_safe_float`` substitutes a default, which for psr and p_value means an
+    undefined metric becomes the *worst* attainable value (psr 0.0, p_value 1.0)
+    and so reads as a measured result rather than a missing one. runner/stats.py
+    already names what it could not compute in ``stats["undefined_metrics"]``, and
+    shared/database.py now lets that None through; this keeps it intact on the
+    way to the client, where the UI already renders "N/A" for it.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _round_optional(value: float | None, digits: int) -> float | None:
+    """Round a value that may legitimately be absent.
+
+    ``round(None, 4)`` is a TypeError, and it fired as a 500 on the backtests
+    list the moment an undefined PSR was allowed to stay None. An absent metric
+    has to survive formatting as well as parsing.
+    """
+    return None if value is None else round(value, digits)
+
+
 @lru_cache(maxsize=8192)
 def _parse_iso_datetime_cached(text: str) -> datetime | None:
     normalized = str(text or "").strip()
@@ -2507,6 +2585,7 @@ def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     net_profit = _safe_float(stats.get("net_profit"), 0.0)
     total_return = _safe_float(stats.get("total_return"), 0.0)
     win_rate = _normalize_win_rate(stats.get("win_rate")) or 0.0
+    p_value = _optional_float(stats.get("p_value"))
     components = payload.get("components") if isinstance(payload.get("components"), list) else []
     return {
         "id": str(payload.get("id") or ""),
@@ -2522,7 +2601,7 @@ def _portfolio_summary_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "net_profit": round(net_profit, 2),
         "net_profit_pct": round(net_profit / account_capital * 100, 2) if account_capital else 0.0,
         "psr": stats.get("psr"),
-        "p_value": round(_safe_float(stats.get("p_value"), 1.0), 6),
+        "p_value": round(p_value, 6) if p_value is not None else None,
         "win_rate": round(win_rate * 100.0, 2),
         "trade_count": int(_safe_float(stats.get("trade_count"), len(normalized_trades))),
         "equity_mini": _portfolio_equity_preview(payload.get("combined_equity", []), limit=50),
@@ -3330,10 +3409,17 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     start = str(meta.get("start_date") or "")
     end = str(meta.get("end_date") or "")
     total_return_decimal = _safe_float(meta.get("total_return"), 0.0)
+    total_pnl = _safe_float(meta.get("total_pnl"), 0.0)
+    initial_capital = _safe_float(meta.get("initial_capital"), 0.0)
+    net_profit_pct = (
+        total_pnl / initial_capital * 100.0
+        if initial_capital > 0
+        else total_return_decimal * 100.0
+    )
     cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
-    sharpe_ratio = _safe_float(meta.get("sharpe_ratio"), 0.0)
-    psr = _safe_float(meta.get("psr"), 0.0)
-    p_value = _safe_float(meta.get("p_value"), 1.0)
+    sharpe_ratio = _optional_float(meta.get("sharpe_ratio"))
+    psr = _optional_float(meta.get("psr"))
+    p_value = _optional_float(meta.get("p_value"))
     max_drawdown_decimal = abs(_safe_float(meta.get("max_drawdown"), 0.0))
     trade_count = max(int(meta.get("trade_count", 0) or 0), 0)
     backtest_id = str(meta.get("id") or "").strip()
@@ -3359,10 +3445,10 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "sharpe_ratio": sharpe_ratio,
         "cagr": round(cagr_decimal * 100.0, 2),
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
-        "net_profit": 0.0,
-        "net_profit_pct": round(total_return_decimal * 100.0, 2),
-        "psr": round(psr, 4),
-        "p_value": round(p_value, 6),
+        "net_profit": round(total_pnl, 6),
+        "net_profit_pct": round(net_profit_pct, 2),
+        "psr": _round_optional(psr, 4),
+        "p_value": _round_optional(p_value, 6),
         "win_rate": round(win_rate, 6) if win_rate is not None else None,
         "equity_mini": [],
     }
@@ -3388,10 +3474,10 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
         "total_return": _safe_float(meta.get("total_return"), 0.0),
-        "sharpe_ratio": _safe_float(meta.get("sharpe_ratio"), 0.0),
-        "psr": _safe_float(meta.get("psr"), 0.0),
-        "p_value": _safe_float(meta.get("p_value"), 1.0),
-        "cagr": _safe_float(meta.get("cagr"), 0.0),
+        "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
+        "psr": _optional_float(meta.get("psr")),
+        "p_value": _optional_float(meta.get("p_value")),
+        "cagr": _optional_float(meta.get("cagr")),
         "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
@@ -3506,39 +3592,71 @@ def _apply_backtest_numeric_filters(
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("total_return"), 0.0), total_return_min, total_return_max)
+            if item.get("total_return") is not None
+            and in_range(
+                _safe_float(item.get("total_return"), 0.0),
+                total_return_min,
+                total_return_max,
+            )
         ]
     if sharpe_min is not None or sharpe_max is not None:
+        # An unmeasurable metric is not a metric of zero. These payload fields are
+        # None by design - a run with too few daily returns has no Sharpe - and the
+        # psr and p_value filters just below already skip None for exactly that
+        # reason. Coercing to 0.0 made `?sharpe_max=1.0` return a backtest whose
+        # Sharpe was never computed, rendering as null, and rank it worst-in-class
+        # instead of excluding it: a screen meant to drop unmeasurable results
+        # promoted them. The same argument applies to the four filters below.
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("sharpe_ratio"), 0.0), sharpe_min, sharpe_max)
+            if item.get("sharpe_ratio") is not None
+            and in_range(
+                _safe_float(item.get("sharpe_ratio"), 0.0), sharpe_min, sharpe_max
+            )
         ]
     if psr_min is not None or psr_max is not None:
         filtered = [
-            item for item in filtered if in_range(_safe_float(item.get("psr"), 0.0), psr_min, psr_max)
+            item
+            for item in filtered
+            if item.get("psr") is not None
+            and in_range(float(item["psr"]), psr_min, psr_max)
         ]
     if p_value_min is not None or p_value_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(_safe_float(item.get("p_value"), 1.0), p_value_min, p_value_max)
+            if item.get("p_value") is not None
+            and in_range(float(item["p_value"]), p_value_min, p_value_max)
         ]
     if cagr_min is not None or cagr_max is not None:
         filtered = [
-            item for item in filtered if in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
+            item
+            for item in filtered
+            if item.get("cagr") is not None
+            and in_range(_safe_float(item.get("cagr"), 0.0), cagr_min, cagr_max)
         ]
     if win_rate_min is not None or win_rate_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(_normalize_win_rate(item.get("win_rate")) or 0.0, win_rate_min, win_rate_max)
+            if item.get("win_rate") is not None
+            and in_range(
+                _normalize_win_rate(item.get("win_rate")) or 0.0,
+                win_rate_min,
+                win_rate_max,
+            )
         ]
     if max_drawdown_min is not None or max_drawdown_max is not None:
         filtered = [
             item
             for item in filtered
-            if in_range(abs(_safe_float(item.get("max_drawdown"), 0.0)), max_drawdown_min, max_drawdown_max)
+            if item.get("max_drawdown") is not None
+            and in_range(
+                abs(_safe_float(item.get("max_drawdown"), 0.0)),
+                max_drawdown_min,
+                max_drawdown_max,
+            )
         ]
     return filtered
 
@@ -4803,6 +4921,16 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
 
 
 def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+    # STOPPED is a request, not a fact. The daemon marks
+    # `stopped_enforced_at` only after a *complete* cancel-and-flatten sweep, so
+    # a STOPPED row without that stamp still has exposure at the broker. The
+    # payload says so explicitly; a bare `status: STOPPED` is what let the
+    # dashboard report a stop that had only partially happened.
+    stopped_enforced_at = deployment.stopped_enforced_at
+    exposure_may_be_open = (
+        str(deployment.status or "").strip().upper() == "STOPPED"
+        and stopped_enforced_at is None
+    )
     payload = {
         "id": str(deployment.id),
         "strategy_name": deployment.strategy_name,
@@ -4810,6 +4938,10 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "symbols": deployment.symbols,
         "timeframe": deployment.timeframe,
         "status": deployment.status,
+        "stopped_enforced_at": (
+            stopped_enforced_at.isoformat() if stopped_enforced_at is not None else None
+        ),
+        "exposure_may_be_open": exposure_may_be_open,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,
         "symbol_filter": deployment.symbol_filter,
@@ -4821,7 +4953,25 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
     return safe_payload if isinstance(safe_payload, dict) else {}
 
 
+#: A service that has not reported activity for this long is reported stale. The
+#: daemon's poll interval is 10s, so this is a wide multiple of it: it is meant to
+#: catch a dead or wedged process, not to flicker on one slow loop.
+SERVICE_STALE_AFTER_SECONDS = 120
+
+
 def _serialize_service_payload(service: Service) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    last_activity = service.last_activity
+    if last_activity is not None and last_activity.tzinfo is None:
+        # Stored naive-UTC; comparing it against an aware `now` would raise.
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    age_seconds = (now - last_activity).total_seconds() if last_activity else None
+    last_attempt = service.last_attempt_at
+    if last_attempt is not None and last_attempt.tzinfo is None:
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    attempt_age = (
+        (now - last_attempt).total_seconds() if last_attempt else None
+    )
     payload = {
         "id": str(service.id),
         "name": service.name,
@@ -4829,6 +4979,20 @@ def _serialize_service_payload(service: Service) -> dict[str, Any]:
         "status": service.status.value,
         "config": service.config or {},
         "last_activity": service.last_activity.isoformat() if service.last_activity else None,
+        # "When did this last work?" and "when did anyone last try?" are different
+        # questions. Only the second one tells an operator whether the process is
+        # still making an effort - a service failing for days shows a stale
+        # `last_activity` and looks idle, when it is retrying.
+        "last_attempt_at": (
+            service.last_attempt_at.isoformat() if service.last_attempt_at else None
+        ),
+        "last_attempt_age_seconds": (
+            None if attempt_age is None else max(0.0, attempt_age)
+        ),
+        # `status` alone cannot distinguish a live-but-idle service from a dead
+        # one, which is exactly the ambiguity a heartbeat exists to remove.
+        "last_activity_age_seconds": None if age_seconds is None else max(0.0, age_seconds),
+        "is_stale": last_activity is None or age_seconds > SERVICE_STALE_AFTER_SECONDS,
         "created_at": service.created_at.isoformat(),
     }
     safe_payload = redact_value(payload)
@@ -4848,36 +5012,49 @@ def _discover_live_accounts_payload() -> list[dict[str, Any]]:
                 if account.get("broker_login") or account.get("login")
                 else None
             )
+            normalized_ctid = (
+                str(account.get("ctid")).strip() if account.get("ctid") else None
+            )
+            # Only a real boolean counts as the source asserting demo-ness. A
+            # missing or non-boolean value is reported to the client as
+            # unasserted rather than invented into a False.
+            raw_is_demo = account.get("is_demo")
+            is_demo = raw_is_demo if isinstance(raw_is_demo, bool) else None
             payload.append(
                 {
                     "id": account_id,
                     "name": str(account.get("name") or account_id),
                     "broker": str(account.get("broker") or "unknown"),
                     "balance": _safe_float(account.get("balance"), 0.0),
-                    "is_demo": bool(account.get("is_demo", False)),
+                    "is_demo": bool(is_demo),
+                    "is_demo_asserted": is_demo is not None,
                     "broker_login": normalized_login,
                     "login": normalized_login,
-                    "ctid": (
-                        str(account.get("ctid")).strip() if account.get("ctid") else None
-                    ),
+                    "ctid": normalized_ctid,
                 }
             )
             continue
         normalized_login = (
             str(account.broker_login).strip() if getattr(account, "broker_login", None) else None
         )
+        normalized_ctid = (
+            str(account.ctid).strip() if getattr(account, "ctid", None) else None
+        )
+        is_demo = bool(account.is_demo)
         payload.append(
             {
                 "id": account.id,
                 "name": account.name,
                 "broker": account.broker,
                 "balance": float(account.balance),
-                "is_demo": bool(account.is_demo),
+                "is_demo": is_demo,
+                # A LiveAccount always carries a real boolean, so the source did
+                # assert the flag. Spelled out so the persistence path below has
+                # one rule to read instead of inferring it per branch.
+                "is_demo_asserted": True,
                 "broker_login": normalized_login,
                 "login": normalized_login,
-                "ctid": (
-                    str(account.ctid).strip() if getattr(account, "ctid", None) else None
-                ),
+                "ctid": normalized_ctid,
             }
         )
     return payload
@@ -5078,12 +5255,12 @@ def _resolve_signal_replay_timeframe(
 
     intraday_timeframes = {"1m", "5m", "15m", "30m", "1h", "4h"}
     has_intraday = False
-    for signal in normalized_signals:
-        signal_timeframe = normalize_timeframe(str(signal.get("timeframe") or "").strip())
+    for candidate in normalized_signals:
+        signal_timeframe = normalize_timeframe(str(candidate.get("timeframe") or "").strip())
         if signal_timeframe in intraday_timeframes:
             has_intraday = True
             break
-        if _signal_has_intraday_timestamp(signal):
+        if _signal_has_intraday_timestamp(candidate):
             has_intraday = True
             break
 
@@ -5125,6 +5302,118 @@ def _waiting_countdown(signal_metadata: dict[str, Any], signal_time_unix: float)
     close_unix = ((int(signal_reference) // timeframe_seconds) + 1) * timeframe_seconds
     remaining = int(max(0, math.ceil(close_unix - now)))
     return remaining
+
+
+def _live_control_actor(request: Request | None = None) -> str:
+    """Who to attribute a live control to.
+
+    There is no authentication on this platform, so this is attribution by
+    claim, not proof. It is recorded rather than left blank because an
+    unattributed change to a live deployment is worse than a self-declared one:
+    "who did this" is answerable, and a wrong answer is visible.
+    """
+    header = None
+    if request is not None:
+        try:
+            header = request.headers.get("X-Operator")
+        except Exception:  # pragma: no cover - defensive
+            header = None
+    return str(header or "local-operator").strip() or "local-operator"
+
+
+async def _require_live_control_confirmation(
+    *,
+    action: str,
+    deployment_id: str,
+    confirmation: LiveControlConfirmation | None,
+    request: Request | None,
+) -> None:
+    """Refuse a state-changing live control that was not explicitly confirmed.
+
+    A confirmation dialog in the UI is not a control. The API is directly
+    callable, by a script, a stale tab, or anything that can reach the port - so
+    the constraint has to live here, on the server, or it constrains nothing but
+    the UI's own politeness.
+
+    Two things are checked, and the second is the one that matters. Presence
+    alone is satisfied by a client that always sends the field; echoing the
+    deployment id back proves the operator confirmed *this* row, which is the
+    mistake that actually happens when several similar deployments are stacked
+    in a list and the wrong one is deleted or re-pointed.
+
+    A missing confirmation is reported as 428 Precondition Required rather than
+    400, so a caller can tell "you did not confirm this" apart from "your
+    payload was malformed" - the first is a deliberate step, not a bug.
+    """
+    if confirmation is None:
+        await _audit_live_control(
+            action=action,
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no confirmation supplied"},
+        )
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                f"'{action}' changes live trading state and must be confirmed. "
+                f"Send confirmation.confirmed_deployment_id='{deployment_id}'."
+            ),
+        )
+    confirmed = str(confirmation.confirmed_deployment_id or "").strip()
+    if confirmed != str(deployment_id).strip():
+        await _audit_live_control(
+            action=action,
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "confirmation named a different deployment",
+                "confirmed_deployment_id": confirmed,
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Confirmation does not match this deployment "
+                f"(confirmed '{confirmed}', requested '{deployment_id}')."
+            ),
+        )
+
+
+async def _audit_live_control(
+    *,
+    action: str,
+    target_type: str,
+    target_id: str,
+    request: Request | None = None,
+    succeeded: bool = True,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Record one state-changing live control, success or refusal alike.
+
+    A refused attempt is the more interesting half: it is how you find out that
+    something was trying to arm a deployment it should not have been able to.
+
+    Never raises. An audit write that could abort the operation it is recording
+    would be a worse failure than the missing record, and
+    ``record_live_control_audit`` already swallows its own database errors; this
+    is the belt to that braces.
+    """
+    try:
+        await asyncio.to_thread(
+            record_live_control_audit,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            actor=_live_control_actor(request),
+            succeeded=succeeded,
+            detail=detail or {},
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Could not audit a live control: %r", exc)
 
 
 def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
@@ -6410,9 +6699,9 @@ def _portfolio_contribution_payload(
         "trade_count": trade_count,
         "win_rate": round(metric_win_rate * 100.0, 2),
         "wins": wins,
-        "sharpe_ratio": round(sharpe_ratio, 6),
-        "psr": round(psr, 6),
-        "p_value": round(p_value, 6),
+        "sharpe_ratio": _round_optional(sharpe_ratio, 6),
+        "psr": _round_optional(psr, 6),
+        "p_value": _round_optional(p_value, 6),
         "max_drawdown": round(max_drawdown, 6),
         "cagr": round(cagr, 6),
         "pnl_total": round(pnl_value, 6),
@@ -8351,6 +8640,85 @@ def _matrix_result_path(filename: str) -> Path:
     return MATRIX_RESULTS_DIR / normalized
 
 
+def _stale_grid_findings(
+    rows: list[dict[str, Any]], *, source: str
+) -> list[dict[str, Any]]:
+    """Re-verify every served grid row against the data its numbers came from.
+
+    A grid/matrix result is a cached artifact, and its numbers are only
+    meaningful for the data that produced them. Each cell records a grid
+    identity (config fingerprint + the fingerprint of every parquet it could
+    have read, see ``runner/grid_identity.py``); this re-stats those files, so
+    a re-downloaded or rewritten frame -- or a cell whose identity was never
+    stamped, which is equally unknowable -- is reported instead of served as
+    current.
+    """
+    findings: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # Only a row that claims a RESULT is verifiable. A failed cell carries
+        # an `output` path for an artifact that was never written, and there is
+        # nothing to be stale about; refusing the whole payload over it would
+        # turn a loud failure into an outage.
+        if str(row.get("status") or "") not in {"ok", "skipped_existing"}:
+            continue
+        output = str(row.get("output") or "").strip()
+        if not output:
+            continue
+        label = ":".join(
+            str(row.get(key) or "")
+            for key in ("strategy", "symbol", "timeframe")
+        ).strip(":")
+        artifact = Path(output)
+        if not artifact.exists():
+            findings.append(
+                {"row": label or output, "output": output, "reason": "artifact is gone"}
+            )
+            continue
+        reason = data_staleness_reason(read_identity(output))
+        if reason:
+            findings.append(
+                {"row": label or output, "output": output, "reason": reason}
+            )
+    if findings:
+        logger.warning(
+            "Refusing to serve %s: %d grid row(s) no longer match the data they "
+            "were computed from.",
+            source,
+            len(findings),
+            extra={"data": {"findings": findings[:20]}},
+        )
+    return findings
+
+
+def _refuse_stale_grid_rows(
+    rows: list[dict[str, Any]], *, source: str
+) -> None:
+    """409 on a stale grid instead of a table that looks current.
+
+    A warning would leave the trap armed: the operator still sees a Sharpe
+    ranking and no reason to doubt it. The refusal names the rows and the
+    reason so the fix ("re-run the grid") is obvious.
+    """
+    findings = _stale_grid_findings(rows, source=source)
+    if not findings:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "stale_grid_results",
+            "message": (
+                f"{source} contains grid results that no longer match the data "
+                "they were computed from; refusing to serve them as current. "
+                "Re-run the grid/matrix to refresh them."
+            ),
+            "stale_rows": findings[:50],
+            "stale_row_count": len(findings),
+        },
+    )
+
+
 def _matrix_summary_payload() -> dict[str, Any]:
     summary_path = MATRIX_RESULTS_DIR / "matrix_summary.json"
     if not summary_path.exists():
@@ -8359,6 +8727,8 @@ def _matrix_summary_payload() -> dict[str, Any]:
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
+    runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
+    _refuse_stale_grid_rows(runs, source="matrix summary")
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -8389,6 +8759,8 @@ def _load_matrix_grid_overview_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix grid overview")) from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="Invalid matrix grid overview payload")
+    rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+    _refuse_stale_grid_rows(rows, source="matrix grid overview")
     payload["api_source"] = str(path)
     return payload
 
@@ -8687,8 +9059,8 @@ async def compare_two_backtests(ids: str = Query(default="")) -> dict[str, Any]:
     stats1 = backtest1.get("stats", {})
     stats2 = backtest2.get("stats", {})
 
-    def delta(metric: str) -> float:
-        return round(_safe_float(stats2.get(metric), 0.0) - _safe_float(stats1.get(metric), 0.0), 6)
+    def delta(metric: str) -> float | None:
+        return _compare_stat_delta(stats1, stats2, metric)
 
     return {
         "ids": unique_ids,
@@ -9585,6 +9957,23 @@ def _compare_backtests_payload(ids: str) -> dict[str, Any]:
     return legacy_viewer.compare_backtests(strategies)
 
 
+def _compare_stat_delta(
+    left: dict[str, Any], right: dict[str, Any], metric: str
+) -> float | None:
+    """``right - left`` for a compare metric, or ``None`` when either side is unknown.
+
+    Coercing an absent side to 0.0 manufactured a delta out of a value that was
+    never measured, so the comparison read as a real change. A metric the
+    producer named in ``undefined_metrics`` is not a zero, and it cannot be
+    compared.
+    """
+    left_value = left.get(metric)
+    right_value = right.get(metric)
+    if left_value is None or right_value is None:
+        return None
+    return round(_safe_float(right_value, 0.0) - _safe_float(left_value, 0.0), 6)
+
+
 def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
     result = _load_result(backtest_id)
     if result is None:
@@ -9609,11 +9998,16 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
             else "1h"
         )
     )
-    win_rate = _normalize_win_rate(raw.get("win_rate")) or 0.0
+    win_rate_value = _normalize_win_rate(
+        legacy_viewer._defined_stat_value(raw, "win_rate")
+    )
     winning_trades = sum(
         1 for trade in result.trades if legacy_viewer._trade_net_pnl(trade) > 0
     )
     losing_trades = max(len(result.trades) - winning_trades, 0)
+    max_drawdown = legacy_viewer._defined_stat_value(
+        raw, "max_drawdown_pct", scale=100.0, digits=6
+    )
 
     return {
         "id": backtest_id,
@@ -9623,14 +10017,23 @@ def _backtest_compare_payload(backtest_id: str) -> dict[str, Any]:
         "symbols": symbols,
         "timeframe": timeframe,
         "stats": {
-            "total_return": round(_safe_float(raw.get("total_return"), 0.0) * 100.0, 6),
-            "net_profit": round(_safe_float(raw.get("total_pnl"), 0.0), 6),
-            "sharpe_ratio": round(_safe_float(raw.get("sharpe_ratio"), 0.0), 6),
-            "psr": round(_safe_float(raw.get("psr"), 0.0) * 100.0, 6),
-            "p_value": round(_safe_float(raw.get("p_value"), 1.0), 6),
-            "cagr": round(_safe_float(raw.get("cagr"), 0.0) * 100.0, 6),
-            "max_drawdown": round(abs(_safe_float(raw.get("max_drawdown_pct"), 0.0)) * 100.0, 6),
-            "win_rate": round(win_rate * 100.0, 6),
+            # Every value here goes through resolve_defined_stat: a metric the
+            # producer could not compute is published as null, not as the old
+            # 0.0 / 1.0 default that made an unmeasured run look comparable.
+            "total_return": legacy_viewer._defined_stat_value(
+                raw, "total_return", digits=6
+            ),
+            "net_profit": legacy_viewer._defined_stat_value(raw, "total_pnl", digits=6),
+            "sharpe_ratio": legacy_viewer._defined_stat_value(raw, "sharpe_ratio", digits=6),
+            "psr": legacy_viewer._defined_stat_value(raw, "psr", scale=100.0, digits=6),
+            "p_value": legacy_viewer._defined_stat_value(raw, "p_value", digits=6),
+            "cagr": legacy_viewer._defined_stat_value(raw, "cagr", scale=100.0, digits=6),
+            "max_drawdown": abs(max_drawdown) if max_drawdown is not None else None,
+            "win_rate": (
+                round(win_rate_value * 100.0, 6)
+                if win_rate_value is not None
+                else None
+            ),
             "trade_count": int(_safe_float(raw.get("total_trades"), len(result.trades))),
         },
         "equity_curve": equity_curve,
@@ -9920,6 +10323,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
 
     engine = str(payload.engine or "native").strip() or "native"
     timeframe = normalize_timeframe(str(payload.timeframe or "1d"))
+    data_source = str(payload.data_source or "").strip()
     start = str(payload.start or "")
     end = str(payload.end or "")
     capital = float(payload.capital or 100000.0)
@@ -9967,6 +10371,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         "engine": engine,
         "symbols": symbols,
         "timeframe": timeframe,
+        "data_source": data_source,
         "start": start,
         "end": end,
         "capital": capital,
@@ -10006,6 +10411,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             *symbols,
             "--timeframe",
             timeframe,
+            *([] if not data_source else ["--data-source", data_source]),
             "--capital",
             str(capital),
             "--progress-stdout",
@@ -10024,10 +10430,7 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
             cmd.extend(["--max-leverage", str(max_leverage)])
         if modeling_resolution:
             cmd.extend(["--intrabar-resolution", modeling_resolution])
-        with DATA_TASKS_LOCK:
-            task = DATA_TASKS.get(task_id)
-            if task is not None:
-                task["command"] = list(cmd)
+        _update_task_fields(task_id, command=list(cmd))
         return cmd
 
     def _run() -> None:
@@ -10764,21 +11167,21 @@ async def _load_and_filter_csv_signals(
     source_label = f"csv:{Path(file_path).name}"
     filtered_signals: list[dict[str, Any]] = []
     signal_inputs: list[SignalReplayInput] = []
-    for signal in loaded_signals:
-        signal_time = pd.to_datetime(signal.get("timestamp"), utc=True, errors="coerce")
+    for row in loaded_signals:
+        signal_time = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
         if pd.isna(signal_time):
             continue
         signal_dt = pd.Timestamp(signal_time).to_pydatetime()
         if signal_dt < start_dt or signal_dt > end_dt:
             continue
 
-        action = str(signal.get("action") or "").strip().lower()
+        action = str(row.get("action") or "").strip().lower()
         if action not in {"buy", "sell", "long", "short"}:
             continue
-        if _safe_float(signal.get("entry_price"), 0.0) <= 0:
+        if _safe_float(row.get("entry_price"), 0.0) <= 0:
             continue
 
-        signal_payload = _replay_signal_payload(signal, signal_time, source_label, file_path)
+        signal_payload = _replay_signal_payload(row, signal_time, source_label, file_path)
         filtered_signals.append(signal_payload)
         signal_inputs.append(
             SignalReplayInput(
@@ -11310,8 +11713,8 @@ def _portfolio_combined_metrics(
             "calmar_ratio": 0.0,
             "total_return": 0.0,
             "max_drawdown_duration": 0,
-            "psr": 0.0,
-            "p_value": 1.0,
+            "psr": None,
+            "p_value": None,
         }
 
     return correlation_matrix, combined_equity_points, stats_result
@@ -11356,18 +11759,22 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
         "account_capital": account_capital,
         "components": components,
         "combined_stats": legacy_viewer.PortfolioStats(
-            sharpe=stats_result.get("sharpe_ratio", 0),
-            sortino=stats_result.get("sortino_ratio", 0),
-            cagr=stats_result.get("cagr", 0),
-            max_drawdown=stats_result.get("max_drawdown_pct", 0),
+            # resolve_defined_stat, not .get(key, 0): compute_stats omits a metric
+            # it could not compute and names it in undefined_metrics, so a plain 0
+            # default reports "measured as zero" for a number that was never
+            # measured. psr below already worked this way; the rest did not.
+            sharpe=resolve_defined_stat(stats_result, "sharpe_ratio", 0),
+            sortino=resolve_defined_stat(stats_result, "sortino_ratio", 0),
+            cagr=resolve_defined_stat(stats_result, "cagr", 0),
+            max_drawdown=resolve_defined_stat(stats_result, "max_drawdown_pct", 0),
             net_profit=stats_result.get("total_pnl", 0),
             win_rate=stats_result.get("win_rate", 0),
             profit_factor=stats_result.get("profit_factor", 0),
-            calmar=stats_result.get("calmar_ratio", 0),
+            calmar=resolve_defined_stat(stats_result, "calmar_ratio", 0),
             total_return=stats_result.get("total_return", 0),
             max_drawdown_duration=stats_result.get("max_drawdown_duration", 0),
             psr=stats_result.get("psr"),
-            p_value=stats_result.get("p_value", 1.0),
+            p_value=resolve_defined_stat(stats_result, "p_value", None),
             correlation_matrix=correlation_matrix,
         ).to_dict(),
         "combined_equity": [point.to_dict() for point in combined_equity_points],
@@ -11715,7 +12122,42 @@ async def _live_positions_payload(account_id: str) -> dict[str, Any]:
 @app.get("/api/live/accounts")
 async def get_live_accounts() -> list[dict[str, Any]]:
     _log_live_endpoint_request("/api/live/accounts")
-    return await asyncio.to_thread(_cached_live_accounts_payload)
+    discovered = await asyncio.to_thread(_cached_live_accounts_payload)
+    # Persist what discovery just learned: the guarded account re-point
+    # operates on stored account rows, so an account that was only ever seen in
+    # a discovery response could not be a deployment target.
+    #
+    # Only fields discovery actually reported are forwarded. `is_demo` is
+    # deliberately not written here: the stored flag is owned by the arming
+    # path, and a read that guessed at it would be a write with side effects.
+    persisted: list[LiveAccountConfig] = []
+    for item in discovered:
+        broker = str(item.get("broker") or "").strip().lower()
+        account_id = str(item.get("id") or "").strip()
+        if broker not in {"alpaca", "ctrader"} or not account_id:
+            continue
+        persisted.append(
+            LiveAccountConfig(
+                id=account_id,
+                broker=broker,
+                name=str(item.get("name") or account_id),
+                broker_login=str(item.get("broker_login") or item.get("login") or "").strip()
+                or None,
+                ctid=str(item.get("ctid") or "").strip() or None,
+            )
+        )
+    if persisted:
+        try:
+            await asyncio.to_thread(upsert_live_accounts, persisted)
+        except Exception as exc:  # pragma: no cover - defensive
+            # Discovery already succeeded; failing to write the rows must not turn
+            # the read into a 500. The accounts are still returned, and the next
+            # call retries the upsert.
+            logger.warning(
+                "Could not persist the discovered live accounts",
+                extra={"data": {"accounts": len(persisted), "error": repr(exc)}},
+            )
+    return discovered
 
 
 @app.get("/api/services")
@@ -11762,7 +12204,15 @@ async def update_service_status_endpoint(
     payload: ServiceStatusUpdateRequest,
 ) -> dict[str, Any]:
     try:
-        updated = await asyncio.to_thread(update_service_status, service_id, payload.status)
+        # This endpoint IS the operator setting or clearing a pause, so the
+        # PAUSED floor does not apply here - it is the one caller allowed to
+        # overwrite a paused row, and it has to be explicit that it is.
+        updated = await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            payload.status,
+            respect_operator_intent=False,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
@@ -12155,12 +12605,21 @@ def _validate_live_deployment_route(
     from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 
     try:
+        accounts_env_values = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    except Exception as exc:
+        # Same fallback the database layer uses: validation still runs and fails
+        # closed for a route it can no longer resolve, but it is not silent.
+        logger.warning(
+            "Could not load the accounts env for StockKit route validation: %s", exc
+        )
+        accounts_env_values = {}
+    try:
         validate_stockkit_deployment_route(
             deployment,
             account_broker_login=str(
                 account_payload.get("broker_login") or account_payload.get("ctid") or ""
             ),
-            accounts_env_values=load_accounts_env_values(DEFAULT_ACCOUNTS_ENV),
+            accounts_env_values=accounts_env_values,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -12250,15 +12709,241 @@ async def create_live_deployment_endpoint(
     return _serialize_live_deployment_payload(created)
 
 
+class LiveSubmissionDrainOutcome(str, Enum):
+    """What a PAUSE can honestly claim about orders that were already at the broker."""
+
+    #: Every lease held when the status changed was released before its TTL.
+    DRAINED = "DRAINED"
+    #: A dispatcher still holds a live lease, so an order may still be in flight.
+    IN_FLIGHT = "IN_FLIGHT"
+    #: A lease expired without being released, so whether its order landed is
+    #: unknown. Never reported as a clean drain.
+    INDETERMINATE = "INDETERMINATE"
+
+
+@dataclass(frozen=True)
+class LiveSubmissionDrainResult:
+    outcome: LiveSubmissionDrainOutcome
+    in_flight: int
+    expired_unreleased: int
+
+    @property
+    def complete(self) -> bool:
+        return self.outcome is LiveSubmissionDrainOutcome.DRAINED
+
+
+async def _drain_live_deployment_submissions(
+    deployment_id: str,
+    *,
+    timeout_seconds: float = LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
+    initial_claims: Sequence[LiveDeploymentSubmissionClaim] | None = None,
+) -> LiveSubmissionDrainResult:
+    """Wait out the submission leases held when a status change was applied.
+
+    The budget defaults to :data:`LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS`, which is
+    derived from the claim TTL so the drain can always outlast the lease it is
+    waiting on. A drain that gave up before the lease expired would report "in
+    flight" for perfectly healthy submissions.
+
+    ``initial_claims`` is the inventory taken *before* the status write and seeds
+    the ledger. Without it there is a window in which a lease could expire and be
+    reaped by a later claim attempt before the first poll ever saw it, and the
+    drain would then report a clean stop for a submission nobody observed. Seeds
+    and observations together cover every lease: a lease taken after the snapshot
+    is seen by the poll loop, and one that existed at the snapshot is accounted
+    for by the ledger.
+
+    The verdict is deliberately one-directional. ``DRAINED`` is returned only
+    when every lease seen during the drain was still within its TTL at the
+    moment it disappeared, i.e. it was released by a live claimor. A lease that
+    was ever observed expired, or that vanished only after its TTL had passed, is
+    reported as ``INDETERMINATE`` instead: the row disappearing proves nothing,
+    because the reaper in ``claim_live_deployment_submission`` deletes exactly the
+    same rows. Under-reporting progress is safe here; under-reporting the doubt
+    is not, so an ambiguous end state can never be reported as a clean stop.
+    Exactly one lease can exist per deployment (``UNIQUE(deployment_id)`` on the
+    claim table), so a lease that is still live is the only thing worth waiting
+    for.
+    """
+    deadline = asyncio.get_running_loop().time() + max(float(timeout_seconds), 0.0)
+    expired_seen: set[str] = set()
+    leases: dict[str, datetime] = {}
+    for claim in initial_claims or ():
+        leases[claim.token] = claim.expires_at
+        if claim.expired:
+            expired_seen.add(claim.token)
+    while True:
+        observed = await asyncio.to_thread(
+            list_live_deployment_submission_claims, deployment_id
+        )
+        present: dict[str, datetime] = {}
+        for claim in observed:
+            present[claim.token] = claim.expires_at
+            if claim.expired:
+                expired_seen.add(claim.token)
+        # A lease that vanished after its own TTL lapsed was either reaped or
+        # released too late to tell apart, so it can no longer vouch for a stop.
+        for token, expires_at in leases.items():
+            if token not in present and utcnow_naive() >= expires_at:
+                expired_seen.add(token)
+        leases = present
+
+        if not present:
+            if expired_seen:
+                return LiveSubmissionDrainResult(
+                    outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                    in_flight=0,
+                    expired_unreleased=len(expired_seen),
+                )
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.DRAINED,
+                in_flight=0,
+                expired_unreleased=0,
+            )
+        # A lease that has already outlived its TTL settles the verdict on its
+        # own: waiting cannot help, because a claimor that releases it later is
+        # still indistinguishable from the reaper deleting it. Say so now rather
+        # than holding the operator's request open for the whole budget.
+        if all(token in expired_seen for token in present):
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                in_flight=0,
+                expired_unreleased=len(expired_seen),
+            )
+        if asyncio.get_running_loop().time() >= deadline:
+            if expired_seen:
+                return LiveSubmissionDrainResult(
+                    outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+                    in_flight=len([t for t in present if t not in expired_seen]),
+                    expired_unreleased=len(expired_seen),
+                )
+            return LiveSubmissionDrainResult(
+                outcome=LiveSubmissionDrainOutcome.IN_FLIGHT,
+                in_flight=len(present),
+                expired_unreleased=0,
+            )
+        await asyncio.sleep(0.05)
+
+
+async def _reverify_account_against_broker(account_id: str) -> bool:
+    """Ask the broker whether ``account_id`` is still a demo account.
+
+    Returns True only when discovery positively reports the account as demo and
+    the fresh verification is persisted. Any error, missing account, or non-demo
+    answer returns False so the caller fails closed.
+    """
+    try:
+        discovered = await asyncio.to_thread(_discover_live_accounts_payload)
+    except Exception as exc:
+        logger.error(
+            "Broker re-verification failed; refusing activation",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return False
+
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if not bool(account.get("is_demo")):
+            logger.error(
+                "Broker reports account is not a demo account; refusing activation",
+                extra={"data": {"account_id": account_id}},
+            )
+            return False
+        return True
+
+    logger.error(
+        "Broker discovery did not return the account; refusing activation",
+        extra={"data": {"account_id": account_id}},
+    )
+    return False
+
+
 @app.put("/api/live/deployments/{deployment_id}/status")
 async def update_live_deployment_status_endpoint(
-    deployment_id: str, payload: LiveDeploymentStatusUpdateRequest
+    deployment_id: str,
+    payload: LiveDeploymentStatusUpdateRequest,
+    request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}/status",
         deployment_id=deployment_id,
         status=payload.status,
     )
+    requested_status = str(payload.status or "").strip().upper()
+    pending_claims: list[LiveDeploymentSubmissionClaim] = []
+
+    await _require_live_control_confirmation(
+        action="deployment.status",
+        deployment_id=deployment_id,
+        confirmation=payload.confirmation,
+        request=request,
+    )
+
+    if requested_status == "ACTIVE":
+        deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+        if deployment is None:
+            raise HTTPException(status_code=404, detail="Live deployment not found")
+
+        # Check what can actually trade before spending a broker round-trip on
+        # it. An internal-source deployment has no live evaluator, so no account
+        # verification can make it capable of trading, and a 409 naming that
+        # reason is far more actionable than a broker error.
+        source_type = str(deployment.signal_source_type or "").strip().lower()
+        if source_type == "internal":
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "internal signal source has no live evaluator",
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment uses the 'internal' signal source, which has "
+                    "no live evaluator, so it can never produce a signal. Arming "
+                    "it would report it as trading while it never can. Use a "
+                    "Discord signal source, or build the evaluator first."
+                ),
+            )
+
+        # Re-verify the account against the broker immediately before arming so
+        # a stale identity can never be reused to arm a deployment.
+        if not await _reverify_account_against_broker(deployment.account_id):
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "broker could not confirm a demo account",
+                    "account_id": str(deployment.account_id or ""),
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Broker could not confirm the account is a demo account; "
+                    "refusing to activate"
+                ),
+            )
+
+    # Inventory the leases to account for *before* the write, so a lease that is
+    # reaped in the window between the commit and the drain's first poll is still
+    # part of the ledger and cannot be mistaken for "nothing was in flight".
+    if requested_status != "ACTIVE":
+        pending_claims = await asyncio.to_thread(
+            list_live_deployment_submission_claims, deployment_id
+        )
+
     try:
         updated = await asyncio.to_thread(
             update_live_deployment_status, deployment_id, payload.status
@@ -12267,31 +12952,417 @@ async def update_live_deployment_status_endpoint(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     if updated is None:
         raise HTTPException(status_code=404, detail="Live deployment not found")
+    # The applied change, not only the refused one: "what is armed, and who armed
+    # it" has to be answerable after the fact.
+    await _audit_live_control(
+        action="deployment.status",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        # The refusal path above forwards this; the applied change has to as well,
+        # or the audit records who was stopped but never who acted.
+        request=request,
+        detail={
+            "requested_status": requested_status,
+            "applied_status": str(updated.status or ""),
+            "account_id": str(updated.account_id or ""),
+        },
+    )
+    payload = _serialize_live_deployment_payload(updated)
+    if updated.status != "ACTIVE":
+        # The status write above has already committed, and it is what stops new
+        # claims: `claim_live_deployment_submission` only inserts while the row
+        # reads ACTIVE. The pause therefore *has* taken effect by the time we get
+        # here, and the drain is an observation of orders that were already at
+        # the broker, not a precondition for the change. Reporting a failure
+        # here would tell an operator that a stop which succeeded did not happen,
+        # and their obvious response - clicking ACTIVE - re-arms the bot through
+        # a fresh broker verification. So the response states what is true: the
+        # new status is in effect, plus an explicit, non-clean outcome for the
+        # submissions that were already in flight.
+        drain = await _drain_live_deployment_submissions(
+            deployment_id, initial_claims=pending_claims
+        )
+        payload["submission_drain_outcome"] = drain.outcome.value
+        payload["submission_drain_complete"] = drain.complete
+        payload["in_flight_submissions"] = drain.in_flight
+        payload["expired_unreleased_submissions"] = drain.expired_unreleased
+        payload["status_change_applied"] = True
+        if drain.outcome is LiveSubmissionDrainOutcome.IN_FLIGHT:
+            payload["warning"] = (
+                f"Status is now {updated.status}, but {drain.in_flight} "
+                "submission(s) were already in flight when the change was applied. "
+                "The new status blocks any further orders; the in-flight "
+                "submission(s) may still reach the broker. Verify the broker "
+                "before resuming."
+            )
+        elif drain.outcome is LiveSubmissionDrainOutcome.INDETERMINATE:
+            payload["warning"] = (
+                f"Status is now {updated.status}, but {drain.expired_unreleased} "
+                "submission lease(s) expired without being released, so whether "
+                "those orders reached the broker is unknown. Verify the broker "
+                "before resuming."
+            )
+        if not drain.complete:
+            logger.error(
+                "Live deployment status persisted; submission drain did not "
+                "complete cleanly",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "status": updated.status,
+                        "submission_drain_outcome": drain.outcome.value,
+                        "in_flight_submissions": drain.in_flight,
+                        "expired_unreleased_submissions": drain.expired_unreleased,
+                    }
+                },
+            )
+    return payload
+
+
+@app.put("/api/live/deployments/{deployment_id}/account")
+async def update_live_deployment_account_endpoint(
+    deployment_id: str,
+    payload: LiveDeploymentAccountUpdateRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Re-point a deployment at a different broker account.
+
+    Guarded on the DB side: the target must be a known account, the deployment
+    must not be ACTIVE, and no submission lease may leave an order in flight or
+    an outcome unknown. The target is re-verified against the broker here, the
+    same check arming performs.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/account",
+        deployment_id=deployment_id,
+    )
+    # Re-pointing changes which broker account real orders reach, so it carries
+    # the same confirmation requirement as arming and deleting.
+    await _require_live_control_confirmation(
+        action="deployment.account",
+        deployment_id=deployment_id,
+        confirmation=payload.confirmation,
+        request=request,
+    )
+
+    deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if deployment is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    # An ACTIVE deployment's listener still holds the old account until the next
+    # sync. Moving the row underneath it would report the new account while real
+    # orders keep reaching the previous one, so pausing is a precondition.
+    if str(deployment.status or "").strip().upper() == "ACTIVE":
+        reason = "deployment is ACTIVE; pause it before re-pointing"
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": reason, "account_id": str(payload.account_id or "")},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to re-point an ACTIVE deployment; pause it first so the "
+                "running listener cannot keep trading the old account"
+            ),
+        )
+
+    # A stored row is not evidence that the broker still reports the account.
+    # Re-pointing moves real orders, so it gets the same demo re-verification as
+    # arming, immediately before the write.
+    if await asyncio.to_thread(get_live_account, payload.account_id) is None:
+        reason = f"Refusing to re-point at unknown account '{payload.account_id}'"
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": reason, "account_id": str(payload.account_id or "")},
+        )
+        raise HTTPException(status_code=400, detail=reason)
+
+    if not await _reverify_account_against_broker(payload.account_id):
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "broker could not confirm a demo account",
+                "account_id": str(payload.account_id or ""),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Broker could not confirm the target account is a demo account; "
+                "refusing to re-point"
+            ),
+        )
+
+    # A lease that expired without a release is evidence that an order's outcome
+    # was never observed. The DB guard refuses it unless the caller acknowledged
+    # it; the count goes on the success audit so the accepted risk stays visible.
+    pending_leases = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    # Only an expired lease carries an unknown outcome the operator acknowledged;
+    # a live lease would have refused the re-point, so counting every claim
+    # overstates the accepted risk in the audit.
+    acknowledged_leases = sum(1 for lease in pending_leases if lease.expired)
+
+    try:
+        updated = await asyncio.to_thread(
+            update_live_deployment_account,
+            deployment_id,
+            payload.account_id,
+            acknowledge_unreconciled=bool(
+                payload.acknowledge_unreconciled_submissions
+            ),
+        )
+    except ValueError as exc:
+        # A refused re-point is a live control that did not happen, and the audit
+        # contract covers refusals too: without this entry the only trace of an
+        # attempt to move a deployment to another account is the 400 the caller
+        # saw.
+        await _audit_live_control(
+            action="deployment.account",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": _public_value_error_detail(exc)},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    await _audit_live_control(
+        action="deployment.account",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        request=request,
+        detail={
+            "account_id": str(updated.account_id or ""),
+            "unreconciled_submissions_acknowledged": acknowledged_leases,
+        },
+    )
     return _serialize_live_deployment_payload(updated)
 
 
 @app.delete("/api/live/deployments/{deployment_id}")
-async def delete_live_deployment_endpoint(deployment_id: str) -> dict[str, Any]:
+async def delete_live_deployment_endpoint(
+    deployment_id: str,
+    request: Request = None,  # type: ignore[assignment]
+    confirm_deployment_id: str | None = Query(
+        default=None,
+        description=(
+            "Must equal deployment_id, so a stray or replayed delete request "
+            "cannot remove a row the operator did not name."
+        ),
+    ),
+) -> dict[str, Any]:
     _log_live_endpoint_request(
         "/api/live/deployments/{deployment_id}",
         deployment_id=deployment_id,
     )
+    # Taken from the query string, not a body: DELETE carries no body by
+    # convention in most HTTP clients, so requiring one would make the control
+    # callable only from a hand-rolled request.
+    await _require_live_control_confirmation(
+        action="deployment.delete",
+        deployment_id=deployment_id,
+        confirmation=(
+            LiveControlConfirmation(confirmed_deployment_id=confirm_deployment_id)
+            if confirm_deployment_id is not None
+            else None
+        ),
+        request=request,
+    )
+    # Drain before the delete, not after. PAUSE and STOP snapshot the leases, apply
+    # the change, drain, and report a verdict; DELETE did none of that - it removed
+    # every claim and the row, and answered `{"status": "deleted"}`. An operator who
+    # deleted an ACTIVE deployment with a live lease was told it was deleted while
+    # the dispatcher still held its order at the broker, and the reap that later
+    # removed the claim row meant no code path could ever classify the outcome.
+    # That is the ambiguity the drain verdict exists to make observable, and this
+    # was the one state-changing live control that skipped it.
+    #
+    # The drain has to come first because `delete_live_deployment` deletes the claim
+    # rows as part of the delete: draining afterwards would find nothing left to
+    # account for and report a clean stop for submissions it never observed.
+    pending_claims = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+
+    # Remember the status we found, because the gate below overwrites it. If the
+    # delete is refused for having history, the deployment must be left as it was
+    # rather than stuck PAUSED by a request that changed nothing.
+    existing = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+    original_status = str(existing.status or "").strip().upper()
+
+    # Close the claim gate *before* draining, not just delete afterwards.
+    # `claim_live_deployment_submission` only inserts a lease while the row reads
+    # ACTIVE, and DELETE never changed the status - so the gate was open for the
+    # whole drain. A dispatcher could claim, submit and release inside it, and the
+    # response then read DRAINED, complete, in_flight 0, with no warning key at all.
+    # That is the exact false assurance this drain was added to remove.
+    #
+    # PAUSE and STOP get this right by committing the status write first and
+    # draining second. Deleting straight from ACTIVE skipped that step, so the same
+    # ordering is reproduced here: snapshot, write a non-ACTIVE status, drain, then
+    # delete. The intermediate PAUSED is transient - the row is about to go - and it
+    # is the same status the status endpoint writes before its own drain.
+    #
+    # Only an ACTIVE row needs the write. The claim gate is already closed for any
+    # other status, and rewriting it would be a real side effect on a row the
+    # request may still fail to delete: a STOPPED deployment carries the P3
+    # `stopped_enforced_at` stamp, and moving it to PAUSED clears that stamp, so a
+    # refused delete would silently turn a proven stop back into an unproven one.
+    gated = existing
+    status_gated = original_status == "ACTIVE"
+    if status_gated:
+        try:
+            gated = await asyncio.to_thread(
+                update_live_deployment_status, deployment_id, "PAUSED"
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=_public_value_error_detail(exc)
+            ) from exc
+        if gated is None:
+            raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    drain = await _drain_live_deployment_submissions(
+        deployment_id, initial_claims=pending_claims
+    )
+
     try:
         deleted = await asyncio.to_thread(delete_live_deployment, deployment_id)
     except LiveDeploymentInUseError as exc:
-        # A refusal is a decision the operator can act on, not a server fault: the deployment
-        # still has history, nothing was deleted, and the counts say what is holding it.
+        # A deployment with signals or executions cannot be deleted without
+        # destroying the record of real trades, so the database refuses. That
+        # refusal used to escape as an `IntegrityError` and become a 500 - after
+        # the gate above had already written PAUSED - leaving the operator with an
+        # error and a deployment silently disarmed. The refusal is now a typed
+        # answer with the counts that explain it, and the status is put back so a
+        # failed delete has no side effects at all.
+        #
+        # Only a gate write is undone. Restoring a status that was never changed
+        # would itself be a write: for a STOPPED row it re-runs the transition
+        # that clears `stopped_enforced_at`, so the "restore" would erase the
+        # stamp the refused delete was supposed to leave alone.
+        restored_to: str | None = None
+        if status_gated:
+            try:
+                await asyncio.to_thread(
+                    update_live_deployment_status, deployment_id, original_status
+                )
+                restored_to = original_status
+            except Exception as restore_exc:  # pragma: no cover - defensive
+                logger.error(
+                    "Delete was refused and the previous status could not be restored",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "previous_status": original_status,
+                            "error": repr(restore_exc),
+                        }
+                    },
+                )
+        await _audit_live_control(
+            action="deployment.delete",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "deployment still has records",
+                "signal_count": exc.signal_count,
+                "execution_count": exc.execution_count,
+                "status_restored": restored_to,
+                "submission_drain_outcome": drain.outcome.value,
+            },
+        )
         raise HTTPException(
             status_code=409,
-            detail=(
-                f"Live deployment {deployment_id} still has "
-                f"{exc.signal_count} signal(s) and {exc.execution_count} execution(s); "
-                "nothing was deleted"
-            ),
+            detail={
+                "error": "deployment_in_use",
+                "message": str(exc),
+                "deployment_id": deployment_id,
+                "signal_count": exc.signal_count,
+                "execution_count": exc.execution_count,
+                "status_restored": restored_to,
+            },
         ) from exc
     if not deleted:
         raise HTTPException(status_code=404, detail="Live deployment not found")
-    return {"status": "deleted", "id": deployment_id}
+    await _audit_live_control(
+        action="deployment.delete",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        request=request,
+        detail={
+            "submission_drain_outcome": drain.outcome.value,
+            "in_flight_submissions": drain.in_flight,
+            "expired_unreleased_submissions": drain.expired_unreleased,
+        },
+    )
+    result: dict[str, Any] = {
+        "status": "deleted",
+        "id": deployment_id,
+        "submission_drain_outcome": drain.outcome.value,
+        "submission_drain_complete": drain.complete,
+        "in_flight_submissions": drain.in_flight,
+        "expired_unreleased_submissions": drain.expired_unreleased,
+    }
+    if drain.outcome is LiveSubmissionDrainOutcome.IN_FLIGHT:
+        result["warning"] = (
+            f"Deployment deleted, but {drain.in_flight} submission(s) were in "
+            "flight when it was removed and may still reach the broker. Verify "
+            "the broker account."
+        )
+    elif drain.outcome is LiveSubmissionDrainOutcome.INDETERMINATE:
+        result["warning"] = (
+            f"Deployment deleted, but {drain.expired_unreleased} submission "
+            "lease(s) expired without being released, so whether those orders "
+            "reached the broker is unknown. Verify the broker account."
+        )
+    if not drain.complete:
+        logger.error(
+            "Live deployment deleted; submission drain did not complete cleanly",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "submission_drain_outcome": drain.outcome.value,
+                    "in_flight_submissions": drain.in_flight,
+                    "expired_unreleased_submissions": drain.expired_unreleased,
+                }
+            },
+        )
+    return result
+
+
+@app.get("/api/live/audit")
+async def get_live_control_audit(
+    limit: int = Query(default=100, ge=1, le=1000),
+    target_id: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """Read-only history of state-changing live controls, newest first.
+
+    Refused attempts are included: a gate that stopped something is exactly the
+    event worth seeing. There is no write, update or delete route on purpose --
+    an audit trail that can be edited is not one.
+    """
+    return await asyncio.to_thread(
+        list_live_control_audit, limit=limit, target_id=target_id
+    )
 
 
 @app.get("/api/live/balances/{account_id}")
@@ -13125,7 +14196,20 @@ async def pause_data_task(task_id: str) -> dict[str, Any]:
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be paused")
     if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+        # Answer honestly: a finished task cannot be paused. Returning 200 here
+        # reported success for a no-op while `can_pause` was already false.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task already finished (status={task.get('status')!r})",
+        )
+    # Only a task that is actually pending or executing can be paused. Without
+    # this guard an already paused task was silently "paused" again, so the UI
+    # advertised can_pause for a task the endpoint would not act on.
+    if _task_status_or_manual(task.get("status")) not in PAUSABLE_TASK_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task cannot be paused from status {task.get('status')!r}",
+        )
 
     task["pause_event"].set()
     if task.get("control_mode") == "process":
@@ -13145,8 +14229,17 @@ async def resume_data_task(task_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=TASK_NOT_FOUND_DETAIL)
     if not task.get("supports_control", False):
         raise HTTPException(status_code=409, detail="Task cannot be resumed")
-    if _task_status_or_manual(task.get("status")) in FINAL_TASK_STATUSES:
-        return _task_action_payload(task_id)
+    # Only a paused task can be resumed. Previously the endpoint only
+    # short-circuited on final statuses, so POSTing resume against a `starting`
+    # or `queued` task promoted it to `running`: the task was reported as
+    # executing when it had not begun, and its elapsed/ETA figures were wrong.
+    # A finished task cannot be resumed either, so it gets the same honest 409
+    # rather than a 200 for a no-op that `can_resume` already hid.
+    if _task_status_or_manual(task.get("status")) != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task is not paused (status={task.get('status')!r})",
+        )
 
     task["pause_event"].clear()
     if task.get("control_mode") == "process":

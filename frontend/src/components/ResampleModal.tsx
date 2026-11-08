@@ -1,44 +1,12 @@
-import { useEffect, useState } from "react";
-import type { CSSProperties, ReactElement } from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  Loader2,
-  RefreshCw,
-  RotateCcw,
-  XCircle,
-} from "lucide-react";
+import { useCallback, useRef, useState } from "react";
+import type { CSSProperties } from "react";
+import { ArrowRight, RefreshCw, RotateCcw } from "lucide-react";
 
 import { resampleData } from "../api/client";
 import { isTerminalTaskStatus } from "../lib/taskStatus";
 import { LiveTerminal } from "./LiveTerminal";
 import { Modal } from "./Modal";
-
-const STATUS_ICON_COLORS = {
-  ok: "#86efac",
-  failed: "#fda4af",
-  running: "#67e8f9",
-} as const;
-
-/** Shared task-status glyph used by the data-task modals. */
-export function renderTaskStatusIcon(
-  status: string | null | undefined,
-  size = 18,
-): ReactElement {
-  if (status === "completed") {
-    return <CheckCircle2 size={size} color={STATUS_ICON_COLORS.ok} />;
-  }
-  if (isTerminalTaskStatus(status)) {
-    return <XCircle size={size} color={STATUS_ICON_COLORS.failed} />;
-  }
-  return (
-    <Loader2
-      size={size}
-      className="animate-spin"
-      color={STATUS_ICON_COLORS.running}
-    />
-  );
-}
+import { renderTaskStatusIcon } from "./taskStatusIcon";
 
 interface ResampleModalProps {
   open: boolean;
@@ -64,31 +32,55 @@ export function ResampleModal({
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStatus, setJobStatus] = useState("idle");
-  const [completionNotified, setCompletionNotified] = useState(false);
+  // Job whose terminal status has already been reported upstream. A ref, not
+  // state: the dedupe has to be exact at the instant the callback runs, and a
+  // state copy read through the closure can still hold the previous value when
+  // two status transitions land in one batch - which would report the same job
+  // to the parent twice. Keeping it out of state also means a status line does
+  // not re-render this modal; the callback's identity is held by useCallback.
+  const notifiedJobIdRef = useRef<string | null>(null);
+  const [wasOpen, setWasOpen] = useState(open);
 
-  useEffect(() => {
-    if (!open) {
-      return;
+  // Reopening starts a fresh form; adjusting during render beats a
+  // setState-in-effect cascade. `notifiedJobIdRef` is deliberately not cleared
+  // here - writing a ref during render is unsafe, and it does not need clearing:
+  // the dedupe compares it against the *current* job id, which is null until a
+  // new job is queued and then a fresh id.
+  if (wasOpen !== open) {
+    setWasOpen(open);
+    if (open) {
+      setSourcePath(defaultSourcePath);
+      setTargetTimeframes(defaultTargetTimeframes);
+      setError("");
+      setJobId(null);
+      setJobStatus("idle");
     }
-    setSourcePath(defaultSourcePath);
-    setTargetTimeframes(defaultTargetTimeframes);
-    setError("");
-    setJobId(null);
-    setJobStatus("idle");
-    setCompletionNotified(false);
-  }, [defaultSourcePath, defaultTargetTimeframes, open]);
+  }
 
-  useEffect(() => {
-    if (!jobId || completionNotified) {
-      return;
-    }
-    if (isTerminalTaskStatus(jobStatus)) {
-      if (jobStatus === "completed" || jobStatus === "failed") {
-        onTaskFinished?.(jobStatus, jobId);
+  // The task feed reports each status transition once, so the terminal status is
+  // forwarded from the callback rather than mirrored by an effect. Every
+  // terminal status closes the stream, but only a clean finish or a failure is
+  // reported upstream, so a partial run is never counted as a failure.
+  //
+  // Memoised on the two values it reads, so a status line arriving does not hand
+  // the terminal a new callback identity for a job that has not changed.
+  const handleStatusChange = useCallback(
+    (status: string) => {
+      setJobStatus(status);
+      if (
+        !jobId ||
+        notifiedJobIdRef.current === jobId ||
+        !isTerminalTaskStatus(status)
+      ) {
+        return;
       }
-      setCompletionNotified(true);
-    }
-  }, [completionNotified, jobId, jobStatus, onTaskFinished]);
+      notifiedJobIdRef.current = jobId;
+      if (status === "completed" || status === "failed") {
+        onTaskFinished?.(status, jobId);
+      }
+    },
+    [jobId, onTaskFinished],
+  );
 
   const inputStyle: CSSProperties = {
     background: "rgba(15, 23, 42, 0.75)",
@@ -102,7 +94,7 @@ export function ResampleModal({
   const resetStream = () => {
     setJobId(null);
     setJobStatus("idle");
-    setCompletionNotified(false);
+    notifiedJobIdRef.current = null;
     setError("");
   };
 
@@ -120,10 +112,14 @@ export function ResampleModal({
       });
       setJobId(res.task_id);
       setJobStatus(res.status || "starting");
-      setCompletionNotified(false);
+      notifiedJobIdRef.current = null;
       onTaskStarted?.(res.task_id);
-    } catch (err: any) {
-      setError(err.message || "Failed to start resample task.");
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start resample task.",
+      );
     }
   };
 
@@ -334,7 +330,7 @@ export function ResampleModal({
               </div>
             </div>
 
-            <LiveTerminal jobId={jobId} onStatusChange={setJobStatus} />
+            <LiveTerminal jobId={jobId} onStatusChange={handleStatusChange} />
 
             <div
               style={{

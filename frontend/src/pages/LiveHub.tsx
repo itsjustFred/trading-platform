@@ -37,8 +37,8 @@ import type {
   Service,
   StrategyMeta,
 } from "../api/types";
-import { useToast } from "../components/ToastProvider";
-import { applyFillToPosition } from "./LiveDetail";
+import { useToast } from "../components/toastContext";
+import { applyFillToPosition } from "../lib/livePositionMath";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import { formatSignedUsd } from "../lib/statFormat";
 
@@ -174,6 +174,10 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
   onStop: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
   onDelete: (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
+  // A STOPPED deployment whose enforcement sweep has not completed still has
+  // exposure at the broker. Rendering the raw status would report a stop that
+  // only partly happened.
+  const stopPending = card.status === "STOPPED" && Boolean(card.exposure_may_be_open);
   return (
     <div
       key={card.id}
@@ -195,7 +199,16 @@ const LiveDeploymentCard = memo(function LiveDeploymentCard({
       />
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontWeight: 600, fontSize: "0.87rem" }}>{card.strategy_name}</div>
-        <div style={statusChipStyle(card.status)}>{card.status}</div>
+        <div
+          style={stopPending ? stopPendingChipStyle : statusChipStyle(card.status)}
+          title={
+            stopPending
+              ? "The daemon has not confirmed a complete cancel-and-flatten yet, so positions may still be open at the broker."
+              : undefined
+          }
+        >
+          {stopPending ? "STOPPING" : card.status}
+        </div>
       </div>
       <div style={{ color: "var(--color-text-muted)", fontSize: "0.8rem", margin: "6px 0 8px" }}>
         {card.timeframe} · {card.symbols.join(", ")}
@@ -548,8 +561,24 @@ export function LiveHubPage() {
 
     setDeploymentBusy(card.id, true);
     try {
-      await updateLiveDeploymentStatus(card.id, targetStatus);
+      const result = await updateLiveDeploymentStatus(card.id, targetStatus);
       await refreshDeployments(true);
+      // A PAUSE that had to wait out submissions still succeeded: the status is
+      // in effect and blocks new orders. Saying "success" and hiding the
+      // leftovers would be as dishonest as the old red error, and an operator
+      // who reads a warning as a failure clicks ACTIVE - which re-arms the bot
+      // they were trying to stop. So the status change and the leftovers are
+      // reported as two separate facts.
+      if (result.submission_drain_complete === false) {
+        showToast(
+          result.warning ??
+            `${card.strategy_name} switched to ${targetStatus.toLowerCase()}, but ${
+              result.in_flight_submissions ?? 0
+            } submission(s) were still settling. Verify the broker before resuming.`,
+          "warning",
+        );
+        return;
+      }
       showToast(
         `${card.strategy_name} switched to ${targetStatus.toLowerCase()}.`,
         "success",
@@ -557,6 +586,25 @@ export function LiveHubPage() {
     } catch (error_: unknown) {
       const message =
         error_ instanceof Error ? error_.message : "Failed to update deployment status";
+      // The request may have been applied and its response lost, in which case
+      // an error toast would tell the operator a stop failed when it did not.
+      // Re-read the deployment before believing the failure.
+      const applied = await getLiveDeployments()
+        .then((deployments) =>
+          deployments.some((deployment) => deployment.id === card.id && deployment.status === targetStatus),
+        )
+        .catch(() => false);
+      if (applied) {
+        // The status change did land, so the card has to show it: leaving the
+        // stale ACTIVE row on screen next to a toast saying it stopped invites
+        // the operator to click the action again.
+        await refreshDeployments(true);
+        showToast(
+          `${card.strategy_name} is ${targetStatus.toLowerCase()}, but the viewer could not confirm the submission drain. Verify the broker before resuming.`,
+          "warning",
+        );
+        return;
+      }
       showToast(message, "error");
     } finally {
       setDeploymentBusy(card.id, false);
@@ -725,10 +773,35 @@ export function LiveHubPage() {
 
   const handleDelete = useCallback(async (card: DeploymentCard, event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
+    // The server refuses an unconfirmed delete regardless - that is the control
+    // that actually holds, since the API is callable directly. This dialog is
+    // here so the operator sees a deliberate step rather than discovering one.
+    if (
+      !window.confirm(
+        `Delete ${card.strategy_name}?\n\nThis removes the deployment and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
     setDeploymentBusy(card.id, true);
     try {
-      await deleteLiveDeployment(card.id);
+      const result = await deleteLiveDeployment(card.id);
       await refreshDeployments(true);
+      // The row is gone either way. A drain that ended IN_FLIGHT or
+      // INDETERMINATE means an order may still reach the broker, and the
+      // deployment that would have explained it no longer exists - so the
+      // warning is the only thing standing between the operator and an
+      // unexplained fill. Reporting a bare "deleted" here hides it.
+      if (result.submission_drain_complete === false) {
+        showToast(
+          result.warning ??
+            `${card.strategy_name} was deleted, but ${
+              result.in_flight_submissions ?? 0
+            } submission(s) may still reach the broker. Verify the broker account.`,
+          "warning",
+        );
+        return;
+      }
       showToast(`${card.strategy_name} deleted.`, "success");
     } catch (error_: unknown) {
       const message =
@@ -1734,6 +1807,24 @@ function statusChipStyle(status: LiveDeploymentStatus): React.CSSProperties {
     letterSpacing: "0.03em",
   };
 }
+
+/**
+ * A STOPPED deployment whose cancel/flatten sweep has not completed. Deliberately
+ * not the STOPPED colour: the stop was requested, the exposure is not confirmed
+ * gone, and the two must not look alike.
+ */
+const stopPendingChipStyle: React.CSSProperties = {
+  marginBottom: "8px",
+  fontSize: "0.7rem",
+  display: "inline-flex",
+  alignItems: "center",
+  borderRadius: "999px",
+  padding: "3px 8px",
+  border: "1px solid rgba(251, 146, 60, 0.45)",
+  background: "rgba(251, 146, 60, 0.16)",
+  color: "#fdba74",
+  letterSpacing: "0.03em",
+};
 
 const addDeploymentBtnStyle: React.CSSProperties = {
   display: "inline-flex",

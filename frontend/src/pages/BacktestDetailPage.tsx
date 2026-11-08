@@ -41,24 +41,24 @@ import type {
   EquityPoint,
   Trade,
 } from "../api/types";
+import { requireMetricScale } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
+import { describeError } from "../lib/errorMessage";
 
 const BENCHMARK_SYMBOLS = ["SPY", "QQQ", "IWM", "DIA", "GLD", "TLT", "XAUUSD"];
 const TRADE_PAGE_SIZE = 100;
 
-function normalizeEquityPoints(
-  points: EquityPoint[] | null | undefined,
-): EquityPoint[] {
+/** Accepts the untyped equity payloads the API returns and coerces them to numbers. */
+function normalizeEquityPoints(points: unknown): EquityPoint[] {
   if (!Array.isArray(points)) return [];
   const normalized = points
-    .map((point) => {
+    .map((point: unknown) => {
+      const record = (point ?? {}) as { time?: unknown; equity?: unknown };
       const time =
-        typeof point?.time === "number" ? point.time : Number(point?.time);
+        typeof record.time === "number" ? record.time : Number(record.time);
       const equity =
-        typeof point?.equity === "number"
-          ? point.equity
-          : Number(point?.equity);
+        typeof record.equity === "number" ? record.equity : Number(record.equity);
       if (!Number.isFinite(time) || !Number.isFinite(equity)) return null;
       return { time, equity };
     })
@@ -150,7 +150,7 @@ export function BacktestDetailPage() {
   const [tradesLoading, setTradesLoading] = useState(false);
   const [equity, setEquity] = useState<EquityPoint[]>([]);
   const [benchmarkSymbol, setBenchmarkSymbol] = useState("");
-  const [benchmarkData, setBenchmarkData] = useState<any[]>([]);
+  const [benchmarkData, setBenchmarkData] = useState<EquityPoint[]>([]);
   const [capmData, setCapmData] = useState<BacktestCapmResponse | null>(null);
   const [capmLoading, setCapmLoading] = useState(false);
   const [capmError, setCapmError] = useState("");
@@ -209,7 +209,7 @@ export function BacktestDetailPage() {
     const start = info?.timeframe?.start?.slice(0, 10) || "";
     const end = info?.timeframe?.end?.slice(0, 10) || "";
     getBenchmark(benchmarkSymbol, start, end)
-      .then((data: any) =>
+      .then((data) =>
         setBenchmarkData(normalizeEquityPoints(data.equity || [])),
       )
       .catch(() => setBenchmarkData([]));
@@ -227,10 +227,7 @@ export function BacktestDetailPage() {
         setCapmData(payload);
       })
       .catch((error_: unknown) => {
-        const message =
-          error_ instanceof Error && error_.message
-            ? error_.message
-            : "Could not load CAPM data";
+        const message = describeError(error_, "Could not load CAPM data");
         setCapmError(message);
         setCapmData(null);
       })
@@ -248,8 +245,8 @@ export function BacktestDetailPage() {
       const refreshed = await getBacktestInfo(id);
       setInfo(refreshed);
       setShowRenameModal(false);
-    } catch (renameIssue: any) {
-      setRenameError(renameIssue.message || "Could not rename backtest");
+    } catch (renameIssue: unknown) {
+      setRenameError(describeError(renameIssue, "Could not rename backtest"));
     } finally {
       setSavingRename(false);
     }
@@ -265,10 +262,7 @@ export function BacktestDetailPage() {
       showToast("Backtest deleted.", "success");
       navigate("/backtests", { replace: true });
     } catch (error_: unknown) {
-      const message =
-        error_ instanceof Error && error_.message
-          ? error_.message
-          : "Could not delete backtest";
+      const message = describeError(error_, "Could not delete backtest");
       showToast(message, "error");
       setDeleting(false);
     }
@@ -664,13 +658,13 @@ export function BacktestDetailPage() {
             label="Net Profit %"
             value={stats.net_profit_pct}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "net_profit_pct")}
           />
           <StatCard
             label="CAGR (higher = better)"
             value={stats.cagr}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "cagr")}
           />
           <StatCard
             label="Sharpe (higher = better)"
@@ -680,20 +674,26 @@ export function BacktestDetailPage() {
           <StatCard
             label="Sortino Ratio"
             value={stats.sortino?.toFixed(3)}
-            color={stats.sortino > 1 ? "#3fb950" : "#d29922"}
+            color={
+              stats.sortino == null
+                ? undefined
+                : stats.sortino > 1
+                  ? "#3fb950"
+                  : "#d29922"
+            }
           />
           <StatCard
             label="Max DD (lower = better)"
             value={stats.max_drawdown_pct}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "max_drawdown_pct")}
             color="#f85149"
           />
           <StatCard
             label="Win Rate (higher = better)"
             value={stats.win_rate}
             format="percent"
-            percentScale="points"
+            percentScale={requireMetricScale("backtest_stats", "win_rate")}
             color={stats.win_rate > 50 ? "#3fb950" : "#f85149"}
           />
           <StatCard
@@ -704,19 +704,27 @@ export function BacktestDetailPage() {
           <StatCard
             label="Calmar"
             value={stats.calmar?.toFixed(2)}
-            color={stats.calmar > 1 ? "#3fb950" : "#d29922"}
+            color={
+              stats.calmar == null
+                ? undefined
+                : stats.calmar > 1
+                  ? "#3fb950"
+                  : "#d29922"
+            }
           />
           <StatCard
             label="PSR (higher = better)"
             value={stats.psr}
             format="percent"
-            percentScale="fraction"
+            percentScale={requireMetricScale("backtest_stats", "psr")}
             color={
-              (stats.psr ?? 0) > 0.95
-                ? "#3fb950"
-                : (stats.psr ?? 0) > 0.5
-                  ? "#d29922"
-                  : "#f85149"
+              stats.psr == null
+                ? undefined
+                : stats.psr > 0.95
+                  ? "#3fb950"
+                  : stats.psr > 0.5
+                    ? "#d29922"
+                    : "#f85149"
             }
           />
           <StatCard
@@ -1105,6 +1113,8 @@ function EquityChart({
     dd: string;
     ret: string;
   } | null>(null);
+  // Chart container width, tracked by the chart's ResizeObserver.
+  const [containerWidth, setContainerWidth] = useState(0);
 
   useEffect(() => {
     const normalizedData = normalizeEquityPoints(data);
@@ -1222,7 +1232,7 @@ function EquityChart({
         setTooltip(null);
         return;
       }
-      const eq = (eqVal as any).value as number;
+      const eq = (eqVal as { value: unknown }).value as number;
       const initial = normalizedData[0].equity;
       const ret = (((eq - initial) / initial) * 100).toFixed(2);
       // Find drawdown
@@ -1248,7 +1258,11 @@ function EquityChart({
     chart.timeScale().fitContent();
 
     const resizeObserver = new ResizeObserver(() => {
-      if (container.clientWidth > 0) chart.resize(container.clientWidth, 340);
+      if (container.clientWidth > 0) {
+        chart.resize(container.clientWidth, 340);
+        // Tracked in state so the tooltip can be placed during render.
+        setContainerWidth(container.clientWidth);
+      }
     });
     resizeObserver.observe(container);
 
@@ -1266,10 +1280,7 @@ function EquityChart({
         <div
           style={{
             position: "absolute",
-            left: Math.min(
-              tooltip.x + 16,
-              (containerRef.current?.clientWidth || 800) - 180,
-            ),
+            left: Math.min(tooltip.x + 16, (containerWidth || 800) - 180),
             top: Math.max(tooltip.y - 80, 4),
             background: "rgba(22,27,34,0.95)",
             border: "1px solid var(--color-border)",

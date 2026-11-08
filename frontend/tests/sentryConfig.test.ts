@@ -2,14 +2,16 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { stripComments } from "./sourceRegion.ts";
+
 import {
   FRONTEND_SERVICE_TAG,
   resolveFrontendSentryOptions,
   resolveFrontendSentryRelease,
 } from "../src/lib/sentryConfig.ts";
 
-const viteConfig = readFile(new URL("../vite.config.ts", import.meta.url), "utf8");
-const mainTsx = readFile(new URL("../src/main.tsx", import.meta.url), "utf8");
+const viteConfig = readFile(new URL("../vite.config.ts", import.meta.url), "utf8").then(stripComments);
+const mainTsx = readFile(new URL("../src/main.tsx", import.meta.url), "utf8").then(stripComments);
 
 // Sentry DSNs are public-by-design (project IDs, not credentials), but tests
 // use a Sentry-published dummy DSN instead of the live shared project.
@@ -110,6 +112,14 @@ test("malformed and out-of-range rates fall back to safe defaults instead of rea
   }
 });
 
+// Both sources are read with comments stripped. Every assertion in this file is a
+// whole-file presence or absence check, and a comment is not code:
+//
+// - `doesNotMatch(source, /addEventListener\(\s*"error"/)` is the worse direction. It
+//   exists so a manual global handler cannot double-report alongside the Sentry SDK's
+//   own, and a comment containing `addEventListener("error"` satisfied it.
+// - the init-before-render ordering is an `indexOf` comparison, so a comment
+//   mentioning `initFrontendSentry()` ahead of `createRoot(` satisfied the order too.
 test("vite injects the app version and git sha define globals used for the Sentry release", async () => {
   const config = await viteConfig;
 

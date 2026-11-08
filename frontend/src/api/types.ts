@@ -1,5 +1,18 @@
 export type StrategyParameterValue = number | string | boolean | null;
 
+/**
+ * Free-form tag bag a strategy file declares. The keys the UI reads are typed;
+ * anything else is allowed but must be narrowed before use.
+ */
+export interface StrategyTags {
+  type?: string[];
+  source?: string;
+  asset_class?: string[];
+  complexity?: string;
+  link?: string;
+  [key: string]: unknown;
+}
+
 export interface StrategyMeta {
   slug: string;
   name: string;
@@ -8,7 +21,7 @@ export interface StrategyMeta {
   created_at: string;
   source_url: string;
   notes: string;
-  tags: Record<string, any>;
+  tags: StrategyTags;
   type: string[];
   source: string;
   asset_class: string[];
@@ -111,6 +124,8 @@ export interface BacktestSummary {
   total_pnl: number;
   win_rate: number;
   created_at: string;
+  psr?: number;
+  p_value?: number;
 }
 
 export interface BacktestMeta {
@@ -130,7 +145,7 @@ export interface BacktestMeta {
     universe: string;
     source: string;
   };
-  parameters: Record<string, any>;
+  parameters: Record<string, StrategyParameterValue>;
   tags: string[];
   notes: string;
 }
@@ -390,9 +405,11 @@ export interface OptimizationDetail {
 export interface BacktestStats {
   net_profit: number;
   net_profit_pct: number;
-  cagr: number;
-  sharpe: number;
-  sortino: number;
+  // null when the return series was too short to compute the metric; the card
+  // renders an em dash instead of grading it.
+  cagr: number | null;
+  sharpe: number | null;
+  sortino: number | null;
   max_drawdown_pct: number;
   max_drawdown_duration: string;
   win_rate: number;
@@ -404,11 +421,11 @@ export interface BacktestStats {
   best_trade: number;
   worst_trade: number;
   avg_bars_held: number;
-  calmar: number;
+  calmar: number | null;
   expectancy: number;
-  psr?: number;
-  p_value?: number;
-  [key: string]: any;
+  psr?: number | null;
+  p_value?: number | null;
+  [key: string]: unknown;
 }
 
 export interface CapmScatterPoint {
@@ -436,6 +453,12 @@ export interface EquityPoint {
   equity: number;
 }
 
+export interface BenchmarkResponse {
+  symbol: string;
+  timeframe: string;
+  equity: Record<string, number>[];
+}
+
 export interface LiveAccount {
   id: string;
   name: string;
@@ -449,7 +472,7 @@ export interface LiveAccount {
 
 export type LiveDeploymentStatus = "ACTIVE" | "PAUSED" | "STOPPED";
 export type LiveSignalSource = "internal" | "discord";
-export type ServiceType = "discord_bot" | "scheduled_job";
+export type ServiceType = "discord_bot" | "scheduled_job" | "trading_daemon";
 export type ServiceStatus = "running" | "paused" | "failed" | "stopped";
 export type VerificationEvidenceStatus =
   | "success"
@@ -464,6 +487,13 @@ export interface Service {
   status: ServiceStatus;
   config: Record<string, unknown>;
   last_activity?: string | null;
+  /**
+   * When anyone last *tried* this service, which is a different question from
+   * `last_activity`. A service that has failed keeps re-reading as failed long
+   * after its listener is gone, so "when did it last do anything?" cannot answer
+   * "is it still trying?". Mirrors `shared.models.Service`.
+   */
+  last_attempt_at?: string | null;
   created_at: string;
 }
 
@@ -540,12 +570,59 @@ export interface LiveDeploymentConfig {
   symbols: string[];
   timeframe: string;
   status: LiveDeploymentStatus;
+  /**
+   * When the daemon last completed a *complete* cancel-and-flatten sweep for a
+   * STOPPED deployment. `null` while STOPPED means the stop is still only a
+   * request: exposure may be open at the broker.
+   */
+  stopped_enforced_at?: string | null;
+  /**
+   * `status === "STOPPED"` with no enforcement stamp. The status alone is not a
+   * fact about exposure, so the UI must not present this deployment as stopped.
+   */
+  exposure_may_be_open?: boolean;
   signal_source_type?: LiveSignalSource;
   signal_source_id?: string | null;
   symbol_filter?: string[];
   signal_source: LiveSignalSource;
   signal_config: Record<string, unknown>;
   settings: Record<string, unknown>;
+}
+
+export interface LiveDeploymentStatusUpdateResponse extends LiveDeploymentConfig {
+  /**
+   * Only present on a status change that is not ACTIVE. `DRAINED` means every
+   * submission lease held when the status changed was released before its TTL.
+   * `IN_FLIGHT` means a dispatcher still held one, `INDETERMINATE` means a lease
+   * expired without being released so whether the order reached the broker is
+   * unknown. A non-`DRAINED` outcome is still a *successful* status change - the
+   * pause is in effect and blocks further orders - and must never be shown to
+   * the operator as a failed pause.
+   */
+  submission_drain_outcome?: "DRAINED" | "IN_FLIGHT" | "INDETERMINATE";
+  submission_drain_complete?: boolean;
+  in_flight_submissions?: number;
+  expired_unreleased_submissions?: number;
+  status_change_applied?: boolean;
+  warning?: string;
+}
+
+/**
+ * The answer to a DELETE.
+ *
+ * Deleting an ACTIVE deployment drains its submission leases first, and the drain
+ * can end without a clean verdict. The row is gone either way, so the only way the
+ * operator can learn that an order may still reach the broker is this payload -
+ * dropping it and reporting a bare "deleted" hides exactly the case that matters.
+ */
+export interface LiveDeploymentDeleteResponse {
+  status: string;
+  id: string;
+  submission_drain_outcome?: "DRAINED" | "IN_FLIGHT" | "INDETERMINATE";
+  submission_drain_complete?: boolean;
+  in_flight_submissions?: number;
+  expired_unreleased_submissions?: number;
+  warning?: string;
 }
 
 export interface LiveDeploymentCreateRequest {
@@ -750,10 +827,10 @@ export interface BacktestMetadataItem {
   symbols: string[];
   timeframe: string;
   total_return: number;
-  sharpe_ratio: number;
-  psr: number;
-  p_value: number;
-  cagr: number;
+  sharpe_ratio: number | null;
+  psr: number | null;
+  p_value: number | null;
+  cagr: number | null;
   max_drawdown: number;
   trade_count: number;
   win_rate: number | null;
@@ -1178,8 +1255,8 @@ export interface PortfolioSummary {
   trade_count?: number;
   net_profit: number;
   net_profit_pct?: number;
-  psr?: number;
-  p_value?: number;
+  psr?: number | null;
+  p_value?: number | null;
   equity_mini?: number[];
   created_at: string;
 }
@@ -1208,20 +1285,29 @@ export interface PortfolioDetail {
   account_capital: number;
   components: PortfolioComponent[];
   strategies: PortfolioStrategy[];
+  /**
+   * Mirrors `shared.models.PortfolioStats`. The nullable members are nullable
+   * *upstream*, not optionally: the backend emits `null` for a statistic it could
+   * not compute, and `isUnavailableStatValue` in `lib/statFormat.ts` exists to
+   * render that as unavailable rather than as zero. Declaring them `number` while
+   * the code checks them for null is a type lie that `tsc` cannot catch in the
+   * other direction - it rejects the correct handling and permits arithmetic on
+   * a null at runtime.
+   */
   combined_stats: {
-    sharpe: number;
-    sortino?: number;
-    cagr: number;
+    sharpe: number | null;
+    sortino?: number | null;
+    cagr: number | null;
     total_return?: number;
     max_drawdown_duration?: number;
     win_rate?: number;
-    profit_factor?: number;
-    calmar?: number;
-    max_drawdown: number;
+    profit_factor?: number | null;
+    calmar?: number | null;
+    max_drawdown: number | null;
     net_profit: number;
-    psr?: number;
-    p_value?: number;
-    correlation_matrix: Record<string, any>;
+    psr?: number | null;
+    p_value?: number | null;
+    correlation_matrix: Record<string, Record<string, number>>;
   };
   combined_equity: { time: string; equity: number }[];
   strategy_contributions: {
@@ -1465,14 +1551,16 @@ export interface AgentConvertRequest {
 }
 
 export interface BacktestCompareStats {
-  total_return: number;
-  net_profit: number;
-  sharpe_ratio: number;
-  psr: number;
-  p_value: number;
-  cagr: number;
-  max_drawdown: number;
-  win_rate: number;
+  // null means the producer could not compute the metric; it must render as
+  // unavailable, never as a measured zero.
+  total_return: number | null;
+  net_profit: number | null;
+  sharpe_ratio: number | null;
+  psr: number | null;
+  p_value: number | null;
+  cagr: number | null;
+  max_drawdown: number | null;
+  win_rate: number | null;
   trade_count: number;
 }
 
@@ -1497,14 +1585,15 @@ export interface BacktestsCompareResponse {
   backtest1: BacktestCompareSide;
   backtest2: BacktestCompareSide;
   comparison: {
-    delta_return: number;
-    delta_net_profit: number;
-    delta_sharpe: number;
-    delta_psr: number;
-    delta_p_value: number;
-    delta_cagr: number;
-    delta_max_drawdown: number;
-    delta_win_rate: number;
+    // null when either side is unavailable: an unknown value has no delta.
+    delta_return: number | null;
+    delta_net_profit: number | null;
+    delta_sharpe: number | null;
+    delta_psr: number | null;
+    delta_p_value: number | null;
+    delta_cagr: number | null;
+    delta_max_drawdown: number | null;
+    delta_win_rate: number | null;
     delta_trade_count: number;
   };
 }

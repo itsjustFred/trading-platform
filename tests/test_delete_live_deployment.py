@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -206,11 +207,49 @@ def test_the_endpoint_reports_a_refusal_as_a_conflict(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(viewer_main_module, "delete_live_deployment", _refuse)
+    # The endpoint reads the row (to remember its status and to know whether the claim gate
+    # needs closing) before deleting. A STOPPED row needs no gate write, so this isolates the
+    # refusal path from the drain machinery.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda deployment_id: SimpleNamespace(status="STOPPED"),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda deployment_id: []
+    )
+    client = TestClient(viewer_main_module.app)
+
+    # Delete is a confirmed live control, so the request names the deployment it removes.
+    response = client.delete(
+        "/api/live/deployments/dep-keep?confirm_deployment_id=dep-keep"
+    )
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    # The refusal is structured so the operator (and the UI) can act on the counts.
+    assert detail["error"] == "deployment_in_use"
+    assert detail["signal_count"] == 1
+    assert detail["execution_count"] == 2
+    assert detail["status_restored"] is None
+
+
+def test_an_unconfirmed_delete_is_refused_before_any_delete_is_attempted(monkeypatch) -> None:
+    """Without `confirm_deployment_id` the request is refused (428) and nothing is touched."""
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    attempts: list[str] = []
+
+    def _record(deployment_id: str) -> bool:
+        attempts.append(deployment_id)
+        return True
+
+    monkeypatch.setattr(viewer_main_module, "delete_live_deployment", _record)
     client = TestClient(viewer_main_module.app)
 
     response = client.delete("/api/live/deployments/dep-keep")
 
-    assert response.status_code == 409, response.text
-    detail = response.json()["detail"]
-    assert "1 signal(s)" in detail
-    assert "2 execution(s)" in detail
+    assert response.status_code == 428, response.text
+    assert attempts == []

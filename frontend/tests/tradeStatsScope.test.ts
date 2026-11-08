@@ -2,13 +2,19 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { stripComments } from "./sourceRegion.ts";
+
 const pageSource = readFile(
   new URL("../src/pages/BacktestDetailPage.tsx", import.meta.url),
   "utf8",
 );
 
 test("page-scoped trade stats are labeled, not presented as whole-backtest", async () => {
-  const source = await pageSource;
+  // Comments are stripped where the source is consumed. A whole-file presence
+  // assertion is satisfied by a comment, so `stats?.total_trades` - or the
+  // `Math.max(...trades.map` this file also asserts is *absent* - could be
+  // reintroduced as prose and this file would pass.
+  const source = stripComments(await pageSource);
 
   // The page must know whether stats cover the whole backtest.
   assert.match(source, /statsAreWholeBacktest/);
@@ -20,7 +26,7 @@ test("page-scoped trade stats are labeled, not presented as whole-backtest", asy
 });
 
 test("best/worst trade render N/A instead of page-scoped stand-ins", async () => {
-  const source = await pageSource;
+  const source = stripComments(await pageSource);
 
   // The old code silently fell back to Math.max/min over the loaded page.
   assert.doesNotMatch(source, /Math\.max\(\.\.\.trades\.map/);
@@ -31,14 +37,30 @@ test("best/worst trade render N/A instead of page-scoped stand-ins", async () =>
 test("PSR renders as a fraction per the backend contract", async () => {
   const { metricScale } = await import("../src/api/metricScale.ts");
   const { toPercentPoints } = await import("../src/api/metricScale.ts");
-  const source = await pageSource;
+  const source = stripComments(await pageSource);
 
-  // The backend serves psr as a probability (0..1); the card must convert it,
-  // not render 0.95 as "0.95%".
-  assert.equal(metricScale("psr"), "fraction");
+  // The stats payload serves psr as a probability (0..1); the card must convert
+  // it, not render 0.95 as "0.95%". The unit is declared per payload, and this
+  // page reads `backtest_stats`, so the call has to name that payload.
+  assert.equal(metricScale("backtest_stats", "psr"), "fraction");
   assert.equal(toPercentPoints(0.95, "fraction"), 95);
   assert.match(
     source,
-    /label="PSR \(higher = better\)"[\s\S]{0,200}percentScale="fraction"/,
+    /label="PSR \(higher = better\)"[\s\S]{0,200}requireMetricScale\("backtest_stats", "psr"\)/,
   );
+});
+
+test("portfolio contributions render an absent win rate as a dash, not 0.00%", async () => {
+  const source = stripComments(
+    await readFile(
+      new URL("../src/pages/PortfolioDetailPage.tsx", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  // The neighbouring PSR, max-drawdown and CAGR cells all branch on `!= null`
+  // and print an em dash. Win rate fell through to `?? 0`, so a portfolio whose
+  // win rate could not be computed was listed as a measured 0.00% - a losing
+  // result that was never observed.
+  assert.match(source, /\{row\.win_rate != null[\s\S]{0,160}: "—"\}/);
 });

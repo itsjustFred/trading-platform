@@ -84,8 +84,6 @@ def test_core_stats_payload_exposes_whole_backtest_winners_and_losers():
 
 
 def test_main_stats_endpoint_serves_exact_extremes(viewer_client, tmp_path):
-    import viewer.main as viewer_app_module
-
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _result(_trades()).save(backtests_dir / "stats-demo.trades.json")
@@ -313,3 +311,250 @@ def test_optimization_summary_preserves_zero_oos_baseline():
     assert summary["train_stats"]["total_pnl"] == 0.0
     assert summary["test_stats"]["total_pnl"] == 0.0
     assert summary["oos_status"] == "available"
+
+
+def test_backtest_summary_keeps_an_undefined_metric_absent():
+    """An unmeasurable Sharpe/PSR/p-value must stay null, not become 0.
+
+    `_safe_float(value, 0.0)` turns an undefined PSR into the worst attainable
+    value and an undefined p-value into 1.0, so a run with too few daily returns
+    is listed as a measured result. The list payload has to carry the absence
+    through to the client, which renders it as unavailable.
+    """
+    import viewer.main as viewer_main_module
+
+    summary = viewer_main_module._backtest_summary_from_meta(
+        {
+            "id": "undef-1",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "initial_capital": 100000.0,
+            "total_pnl": 0.0,
+            "total_return": 0.0,
+            "sharpe_ratio": None,
+            "psr": None,
+            "p_value": None,
+        }
+    )
+
+    assert summary["sharpe"] is None
+    assert summary["psr"] is None
+    assert summary["p_value"] is None
+
+
+def test_undefined_metrics_are_not_published_as_zero():
+    """The database layer must tell "declared undefined" from "computed as 0"."""
+    from shared.database import _stat_number_or_undefined
+
+    assert _stat_number_or_undefined({"undefined_metrics": ["psr"]}, "psr", 0.0) is None
+    # A producer that named the metric with a real zero keeps that zero.
+    assert _stat_number_or_undefined({"psr": 0.0}, "psr", 0.0) == 0.0
+    # And an artifact written before the convention keeps its old default.
+    assert _stat_number_or_undefined({}, "psr", 0.0) == 0.0
+
+
+def test_non_finite_stats_are_not_published_as_measurements():
+    """NaN/Infinity in an artifact has no measurable value, so it stays absent.
+
+    These are the same class of lie as the 0.0 default: `float("nan")` serialises
+    to a bare `NaN` token that strict JSON clients reject, and `Infinity` reads as
+    an impossibly good Sharpe. Both mean "could not compute", so they resolve to
+    None like a named undefined metric - not to the caller's default.
+    """
+    from shared.database import _stat_number_or_undefined
+
+    for value in (float("nan"), float("inf"), float("-inf"), "n/a"):
+        assert _stat_number_or_undefined({"sharpe_ratio": value}, "sharpe_ratio", 0.0) is None
+
+    # A numeric string is a real measurement written by an older producer.
+    assert _stat_number_or_undefined({"sharpe_ratio": "1.25"}, "sharpe_ratio", 0.0) == 1.25
+
+
+def test_the_backtest_info_payload_publishes_the_artifact_provenance():
+    """`/api/backtest/{id}/info` must report where the data came from.
+
+    The same rule as the stats: an empty `data_source` is a claim ("no source"),
+    not an absence. The payload publishes what the artifact carries so the
+    dashboard can show it instead of guessing, and leaves the rest empty rather
+    than inventing a value.
+    """
+    from viewer.core import _backtest_info_payload
+
+    result = _result([_trade(1, 10.0)])
+    result.meta.data.update(
+        {
+            "source": "dukascopy",
+            "requested_data_source": "dukascopy",
+            "asset_classes": ["forex"],
+            "data_files": ["EURUSD.csv"],
+        }
+    )
+
+    payload = _backtest_info_payload(result)
+
+    assert payload["data_source"] == "dukascopy"
+    assert payload["requested_data_source"] == "dukascopy"
+    assert payload["asset_classes"] == ["forex"]
+    assert payload["data_files"] == ["EURUSD.csv"]
+
+
+def test_compare_payload_keeps_an_undefined_metric_absent(monkeypatch):
+    """The compare endpoint must not turn an unmeasured metric into a 0.
+
+    `_safe_float(raw.get("sharpe_ratio"), 0.0)` published an undefined Sharpe as
+    a measured zero, and an undefined p-value as the worst attainable 1.0. The
+    side-by-side view then ranked a run that could not be measured. The payload
+    carries null instead, and a real zero survives as zero.
+    """
+    import viewer.main as viewer_main_module
+
+    result = _result([])
+    result.stats = {
+        "total_pnl": 0.0,
+        "total_return": 0.0,
+        "cagr": 0.0,
+        "max_drawdown_pct": 0.0,
+        "win_rate": 0.0,
+        "total_trades": 0,
+        "sharpe_ratio": None,
+        "psr": None,
+        "p_value": None,
+        "undefined_metrics": ["sharpe_ratio", "psr", "p_value"],
+    }
+    monkeypatch.setattr(viewer_main_module, "_load_result", lambda _id: result)
+
+    payload = viewer_main_module._backtest_compare_payload("undef-compare")
+
+    assert payload["stats"]["sharpe_ratio"] is None
+    assert payload["stats"]["psr"] is None
+    assert payload["stats"]["p_value"] is None
+    # A measured zero is still a measurement, not an absence.
+    assert payload["stats"]["total_return"] == 0.0
+    assert payload["stats"]["max_drawdown"] == 0.0
+
+
+def test_compare_delta_is_absent_when_either_side_is_undefined():
+    """An unknown side has no delta; 0.0 would invent one."""
+    from viewer.main import _compare_stat_delta
+
+    left = {"sharpe_ratio": 1.0, "p_value": None}
+    right = {"sharpe_ratio": 2.0, "p_value": 0.04}
+
+    assert _compare_stat_delta(left, right, "sharpe_ratio") == 1.0
+    assert _compare_stat_delta(left, right, "p_value") is None
+    assert _compare_stat_delta({}, right, "sharpe_ratio") is None
+
+
+def test_detail_stats_payload_keeps_undefined_ratios_absent():
+    """The detail card must show an em dash, not grade a failed computation."""
+    from viewer import core
+
+    result = _result(_trades())
+    result.stats = {
+        "total_pnl": 0.0,
+        "total_return": 0.0,
+        "cagr": None,
+        "max_drawdown_pct": 0.0,
+        "sharpe_ratio": None,
+        "sortino_ratio": None,
+        "calmar_ratio": None,
+        "psr": None,
+        "p_value": None,
+        "undefined_metrics": [
+            "cagr",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "calmar_ratio",
+            "psr",
+            "p_value",
+        ],
+    }
+
+    payload = core._stats_payload_from_result(result)
+
+    assert payload["sharpe"] is None
+    assert payload["sortino"] is None
+    assert payload["calmar"] is None
+    assert payload["cagr"] is None
+    assert payload["psr"] is None
+    assert payload["p_value"] is None
+
+
+def test_quick_stats_keep_undefined_ratios_absent():
+    """An empty backtest has no return series, so its ratios are not zero."""
+    from viewer import core
+
+    payload = core._quick_stats_and_equity([], 100000.0, "2021-01-01", "2021-02-01")
+
+    assert payload["sharpe"] is None
+    assert payload["cagr"] is None
+    assert payload["p_value"] is None
+    assert payload["psr"] is None
+    # Zero profit and zero drawdown *are* measured facts.
+    assert payload["net_profit"] == 0
+    assert payload["max_drawdown_pct"] == 0
+
+
+def test_backtest_all_item_preserves_an_undefined_cagr():
+    """The list card must not turn a missing CAGR into a measured 0.00%.
+
+    `_safe_float(meta.get("cagr"), 0.0)` made an empty or too-short run render a
+    green "+0.00%" next to Sharpe/PSR/p-value that correctly read "N/A".
+    """
+    import viewer.main as viewer_main_module
+
+    item = viewer_main_module._backtest_all_item_from_meta(
+        {
+            "id": "undef-cagr",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "cagr": None,
+        }
+    )
+
+    assert item["cagr"] is None
+
+
+def test_portfolio_summary_preserves_an_undefined_p_value():
+    """An empty portfolio has no p-value; 1.0 is the worst measured value."""
+    import viewer.main as viewer_main_module
+
+    summary = viewer_main_module._portfolio_summary_from_payload(
+        {
+            "account_capital": 100000.0,
+            "combined_stats": {},
+            "trades": [],
+        }
+    )
+
+    assert summary["p_value"] is None
+
+
+def test_portfolio_stats_round_trip_preserves_an_undefined_p_value():
+    """`from_dict`/`to_dict` must not resurrect the old 1.0 default."""
+    from shared.models import PortfolioStats
+
+    stats = PortfolioStats.from_dict({"p_value": None})
+
+    assert stats.p_value is None
+    assert stats.to_dict()["p_value"] is None
+
+
+def test_empty_portfolio_does_not_invent_a_worst_case_psr_or_p_value():
+    """No component returns means neither ratio was computed.
+
+    `0.0` for PSR and `1.0` for p-value are the worst attainable readings, not
+    neutral defaults; an empty portfolio must publish them as absent.
+    """
+    from datetime import datetime, timezone
+
+    import viewer.main as viewer_main_module
+
+    _correlation, _equity, stats = viewer_main_module._portfolio_combined_metrics(
+        [],
+        account_capital=100000.0,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert stats["psr"] is None
+    assert stats["p_value"] is None

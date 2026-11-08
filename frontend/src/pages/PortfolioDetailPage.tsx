@@ -26,6 +26,12 @@ import type {
   PortfolioTrade,
 } from "../api/types";
 import {
+  UNAVAILABLE_STAT_TEXT,
+  formatRatioStat,
+  sharpeTone,
+  isUnavailableStatValue,
+} from "../lib/statFormat";
+import {
   deletePortfolio,
   getPortfolioContributions,
   getPortfolioDetail,
@@ -35,7 +41,8 @@ import {
 import { RenameModal } from "../components/RenameModal";
 import { StatCard } from "../components/StatCard";
 import { TradeTable, type TradeTableRow } from "../components/TradeTable";
-import { useToast } from "../components/ToastProvider";
+import { useToast } from "../components/toastContext";
+import { requireMetricScale, toPercentPointsForKey } from "../api/metricScale";
 import { formatPValue, pValueColor } from "../utils/stats";
 
 type GroupBy = "component" | "strategy" | "symbol" | "timeframe";
@@ -47,6 +54,7 @@ type ContributionSort = {
 
 type EquityPoint = { time: string; equity: number };
 type PortfolioStatsView = NonNullable<PortfolioDetail["combined_stats"]>;
+
 type ChartTooltip = {
   x: number;
   y: number;
@@ -500,29 +508,37 @@ export function PortfolioDetailPage() {
       >
         <StatCard
           label="Total Return"
-          value={stats.total_return ?? 0}
+          value={stats.total_return}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "total_return")}
         />
-        <StatCard label="Net Profit" value={stats.net_profit || 0} format="currency" />
+        <StatCard label="Net Profit" value={stats.net_profit} format="currency" />
         <StatCard
           label="Sharpe (higher = better)"
-          value={(stats.sharpe || 0).toFixed(3)}
-          color={stats.sharpe > 1 ? "#3fb950" : "#d29922"}
+          value={formatRatioStat(stats.sharpe)}
+          color={sharpeTone(stats.sharpe)}
         />
-        <StatCard label="Sortino" value={(stats.sortino || 0).toFixed(3)} color="#58a6ff" />
+        <StatCard label="Sortino" value={formatRatioStat(stats.sortino)} color="#58a6ff" />
         <StatCard
           label="CAGR (higher = better)"
-          value={stats.cagr ?? 0}
+          value={stats.cagr}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "cagr")}
         />
         <StatCard
           label="PSR (higher = better)"
           value={stats.psr}
           format="percent"
-          percentScale="fraction"
-          color={Number(stats.psr) > 0.95 ? "#3fb950" : Number(stats.psr) > 0.5 ? "#d29922" : "#f85149"}
+          percentScale={requireMetricScale("portfolio_combined_stats", "psr")}
+          color={
+            stats.psr == null
+              ? undefined
+              : Number(stats.psr) > 0.95
+                ? "#3fb950"
+                : Number(stats.psr) > 0.5
+                  ? "#d29922"
+                  : "#f85149"
+          }
         />
         <StatCard
           label="p-Value (lower = better)"
@@ -531,17 +547,23 @@ export function PortfolioDetailPage() {
         />
         <StatCard
           label="Max DD (lower = better)"
-          value={stats.max_drawdown ?? 0}
+          value={stats.max_drawdown}
           format="percent"
-          percentScale="fraction"
+          percentScale={requireMetricScale("portfolio_combined_stats", "max_drawdown")}
           color="#f85149"
         />
         <StatCard
           label="Win Rate (higher = better)"
           value={stats.win_rate}
           format="percent"
-          percentScale="fraction"
-          color={(stats.win_rate || 0) >= 0.5 ? "#3fb950" : "#f85149"}
+          percentScale={requireMetricScale("portfolio_combined_stats", "win_rate")}
+          color={
+            isUnavailableStatValue(stats.win_rate)
+              ? undefined
+              : Number(stats.win_rate) >= 0.5
+                ? "#3fb950"
+                : "#f85149"
+          }
         />
       </div>
 
@@ -887,11 +909,11 @@ function ContributionTable({
                 {(row.drawdown_contribution * 100).toFixed(2)}%
               </td>
               <td style={tdStyle}>
-                {Number(row.sharpe_ratio ?? 0).toFixed(3)}
+                {row.sharpe_ratio != null ? Number(row.sharpe_ratio).toFixed(3) : UNAVAILABLE_STAT_TEXT}
               </td>
               <td style={tdStyle}>
                 {row.psr != null
-                  ? `${(Number(row.psr) * 100).toFixed(1)}%`
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "psr", Number(row.psr)) ?? 0).toFixed(1)}%`
                   : "—"}
               </td>
               <td style={tdStyle}>
@@ -899,7 +921,7 @@ function ContributionTable({
               </td>
               <td style={{ ...tdStyle, color: "#f85149" }}>
                 {row.max_drawdown != null
-                  ? `-${(Number(row.max_drawdown) * 100).toFixed(2)}%`
+                  ? `-${(toPercentPointsForKey("portfolio_contributions", "max_drawdown", Number(row.max_drawdown)) ?? 0).toFixed(2)}%`
                   : "—"}
               </td>
               <td
@@ -909,10 +931,20 @@ function ContributionTable({
                 }}
               >
                 {row.cagr != null
-                  ? `${(Number(row.cagr) * 100).toFixed(2)}%`
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "cagr", Number(row.cagr)) ?? 0).toFixed(2)}%`
                   : "—"}
               </td>
-              <td style={tdStyle}>{row.win_rate.toFixed(2)}%</td>
+              {/* This payload rescales win_rate to percent points while the
+                  portfolio's combined_stats serves a fraction: the flat
+                  `* 100` this cell used to hard-code is what made the two
+                  disagree. A missing win rate is rendered like the PSR, max
+                  drawdown and CAGR cells beside it: `?? 0` would report an
+                  unmeasured win rate as a measured 0.00%. */}
+              <td style={tdStyle}>
+                {row.win_rate != null
+                  ? `${(toPercentPointsForKey("portfolio_contributions", "win_rate", row.win_rate) ?? 0).toFixed(2)}%`
+                  : "—"}
+              </td>
               <td style={tdStyle}>{row.trade_count}</td>
               <td
                 style={{
@@ -967,6 +999,8 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const [tooltip, setTooltip] = useState<ChartTooltip | null>(null);
+  // Chart container width, tracked by the chart's ResizeObserver.
+  const [containerWidth, setContainerWidth] = useState(0);
 
   useEffect(() => {
     if (!containerRef.current || !data.length) return;
@@ -1090,7 +1124,11 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
 
     chart.timeScale().fitContent();
     const resizeObserver = new ResizeObserver(() => {
-      if (container.clientWidth > 0) chart.resize(container.clientWidth, 340);
+      if (container.clientWidth > 0) {
+        chart.resize(container.clientWidth, 340);
+        // Tracked in state so the tooltip can be placed during render.
+        setContainerWidth(container.clientWidth);
+      }
     });
     resizeObserver.observe(container);
 
@@ -1108,10 +1146,7 @@ function PortfolioEquityChart({ data }: Readonly<{ data: EquityPoint[] }>) {
         <div
           style={{
             position: "absolute",
-            left: Math.min(
-              tooltip.x + 16,
-              (containerRef.current?.clientWidth || 800) - 180,
-            ),
+            left: Math.min(tooltip.x + 16, (containerWidth || 800) - 180),
             top: Math.max(tooltip.y - 80, 4),
             background: "rgba(22,27,34,0.95)",
             border: "1px solid var(--color-border)",

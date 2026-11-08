@@ -1,30 +1,17 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useMemo,
-  useRef,
-  type ReactNode,
-} from "react";
+import { useCallback, useMemo, useRef } from "react";
+import type { ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { getStrategies } from "../api/client";
 import { useStrategies } from "../api/queries";
-import type { StrategyMeta } from "../api/types";
 
-interface StrategiesContextValue {
-  strategies: StrategyMeta[];
-  loading: boolean;
-  refresh: () => Promise<void>;
-  ensureLoaded: () => Promise<void>;
-}
-
-const StrategiesContext = createContext<StrategiesContextValue | null>(null);
+import { StrategiesContext } from "./strategiesContext";
 
 export function StrategiesProvider({ children }: Readonly<{ children: ReactNode }>) {
   const queryClient = useQueryClient();
   const strategiesQuery = useStrategies({ enabled: false });
-  const strategies = strategiesQuery.data ?? [];
+  const strategiesData = strategiesQuery.data;
+  const strategies = useMemo(() => strategiesData ?? [], [strategiesData]);
   const loading = strategiesQuery.isFetching;
   const loaded = strategiesQuery.data !== undefined;
   const pendingLoadRef = useRef<Promise<void> | null>(null);
@@ -71,12 +58,4 @@ export function StrategiesProvider({ children }: Readonly<{ children: ReactNode 
   );
 
   return <StrategiesContext.Provider value={value}>{children}</StrategiesContext.Provider>;
-}
-
-export function useStrategiesCache() {
-  const context = useContext(StrategiesContext);
-  if (!context) {
-    throw new Error("useStrategiesCache must be used inside StrategiesProvider");
-  }
-  return context;
 }

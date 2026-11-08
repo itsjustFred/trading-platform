@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useSymbols } from "../api/queries";
 import { ChevronDown, ChevronRight } from "lucide-react";
 
@@ -26,7 +26,6 @@ export function SymbolInput({
   placeholder,
   style,
 }: Readonly<SymbolInputProps>) {
-  const [categories, setCategories] = useState<Record<string, string[]>>({});
   const [query, setQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
   const [expandedCats, setExpandedCats] = useState<Record<string, boolean>>({});
@@ -34,19 +33,16 @@ export function SymbolInput({
   const inputRef = useRef<HTMLInputElement>(null);
   const symbolsQuery = useSymbols();
 
-  useEffect(() => {
-    const data = symbolsQuery.data;
-    if (!data) {
-      return;
-    }
-    setCategories(data.categories || {});
-    const cats = Object.keys(data.categories || {});
-    if (cats.length < 5) {
-      const init: Record<string, boolean> = {};
-      cats.forEach((c) => (init[c] = true));
-      setExpandedCats(init);
-    }
-  }, [symbolsQuery.data]);
+  const categories = useMemo(
+    () => symbolsQuery.data?.categories || {},
+    [symbolsQuery.data],
+  );
+  // A short category list starts fully expanded; an explicit toggle wins.
+  const defaultExpanded = useMemo(
+    () => Object.keys(categories).length < 5,
+    [categories],
+  );
+  const isExpanded = (cat: string) => expandedCats[cat] ?? defaultExpanded;
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -94,7 +90,10 @@ export function SymbolInput({
 
   const toggleCategory = (cat: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setExpandedCats((prev) => ({ ...prev, [cat]: !prev[cat] }));
+    setExpandedCats((prev) => ({
+      ...prev,
+      [cat]: !(prev[cat] ?? defaultExpanded),
+    }));
   };
 
   // Filter categories based on query
@@ -171,7 +170,7 @@ export function SymbolInput({
                     userSelect: "none",
                   }}
                 >
-                  {expandedCats[cat] ? (
+                  {isExpanded(cat) ? (
                     <ChevronDown size={14} />
                   ) : (
                     <ChevronRight size={14} />
@@ -190,7 +189,7 @@ export function SymbolInput({
                     {syms.length}
                   </span>
                 </button>
-                {expandedCats[cat] && (
+                {isExpanded(cat) && (
                   <div style={{ padding: "4px 0" }}>
                     {syms.slice(0, 100).map((sym) => (
                       <button
