@@ -1977,3 +1977,50 @@ class TestEngineCurvePublishedContract:
         attach_daily_equity(result)
 
         assert "engine_curve_reconciliation" not in result.meta.data
+
+    def test_first_engine_observation_after_day_one_still_counts_day_one(self):
+        """The engine's FIRST observation may fall days after the window start.
+
+        With no point on 01-01 or 01-02 the gap fill must start from the day
+        before the baseline, otherwise day one (flat, zero return) is silently
+        dropped and the window publishes one return too few.
+        """
+        from runner.daily_equity import _daily_points_from_engine_curve
+
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        curve = [
+            EquityPoint(time="2024-01-04T15:00:00+00:00", equity=100_500.0),
+            EquityPoint(time="2024-01-06T15:00:00+00:00", equity=100_500.0),
+            EquityPoint(time="2024-01-08T15:00:00+00:00", equity=100_100.0),
+        ]
+        result = make_result(
+            trades=[
+                make_trade(exit_time="2024-01-04T15:00:00Z", pnl=500.0, id=12),
+                make_trade(exit_time="2024-01-08T15:00:00Z", pnl=-400.0, id=13),
+            ],
+            equity_curve=curve,
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-10",
+        )
+
+        _calendar_points, calendar_returns = build_daily_equity_curve(
+            result, start=start, end=datetime(2024, 1, 10, 23, 59, 59, 999999, tzinfo=timezone.utc)
+        )
+        engine = _daily_points_from_engine_curve(
+            result, start=start, end=datetime(2024, 1, 10, tzinfo=timezone.utc)
+        )
+        assert engine is not None
+        engine_points, engine_returns = engine
+
+        assert len(engine_returns) == 10
+        assert [row["date"] for row in engine_returns] == [
+            f"2024-01-{day:02d}" for day in range(1, 11)
+        ]
+        assert engine_returns[0] == {"date": "2024-01-01", "return": 0.0, "equity": 100_000.0}
+        for engine_row, calendar_row in zip(engine_returns, calendar_returns):
+            assert engine_row["date"] == calendar_row["date"]
+            assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-12)
+            assert engine_row["equity"] == calendar_row["equity"]
+        timestamps = [point.time for point in engine_points]
+        assert len(set(timestamps)) == len(timestamps)
+        assert timestamps == sorted(timestamps)
