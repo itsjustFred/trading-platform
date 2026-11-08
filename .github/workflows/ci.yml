@@ -55,6 +55,11 @@ jobs:
       - name: Strategy tests
         if: runner.os == 'Linux'
         run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies
+      - name: Harness gates
+        if: runner.os == 'Linux'
+        run: |
+          PYTHON="$(uv run --no-sync --no-build python -c 'import sys; print(sys.executable)')" \
+            bash scripts/gate-tests.sh
       - name: Build wheel
         run: uv build --wheel --out-dir dist --no-create-gitignore
       - name: Wheel and import smoke

@@ -23,7 +23,6 @@ Decision Records (Cleanup 16-A, 2026-08-31):
 """
 
 from __future__ import annotations
-from tests.helpers import with_zero_fees
 
 import shutil
 import subprocess
@@ -48,10 +47,14 @@ from runner.engines.contract import (
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.pynecore_adapter import (
     PyneCoreAdapter,
-    _parse_stats_csv as _real_parse_stats_csv,
-    _parse_trade_csv as _parse_pyne_trade_csv,
     _pyne_cli_end_bound,
     _pyne_cli_start_bound,
+)
+from runner.engines.pynecore_adapter import (
+    _parse_stats_csv as _real_parse_stats_csv,
+)
+from runner.engines.pynecore_adapter import (
+    _parse_trade_csv as _parse_pyne_trade_csv,
 )
 from runner.engines.signal_replay_adapter import (
     ReplaySignal,
@@ -61,6 +64,7 @@ from runner.engines.signal_replay_adapter import (
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import compute_stats
 from shared.models import VALID_TIMEFRAMES, Trade, TradeExit
+from tests.helpers import with_zero_fees
 
 # ─── Shared fixture builders ─────────────────────────────────────────────────
 

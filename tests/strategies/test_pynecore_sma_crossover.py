@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import PyneCoreAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "pynecore_sma_crossover" / "pynecore_sma_crossover.py")
 TEST_START = "2025-10-01"
 TEST_END = "2025-12-31"
@@ -32,7 +31,7 @@ EXPECTED_NET_PROFIT = 2178.03
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = PyneCoreAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="pynecore_sma_crossover",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

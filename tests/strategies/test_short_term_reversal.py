@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "short_term_reversal" / "short_term_reversal.py")
 TEST_START = "2025-07-01"
 TEST_END = "2025-09-30"
@@ -36,7 +35,7 @@ EXPECTED_NET_PROFIT = 477.06
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="short_term_reversal",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

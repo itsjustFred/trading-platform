@@ -27,7 +27,7 @@ def _write_ohlcv(tmp_path: Path, symbol: str) -> None:
 
 
 def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
-    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"}, 
+    return BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
         strategy_name="pyne_demo",
         symbols=symbols,
         timeframe="1d",
@@ -130,7 +130,7 @@ def test_stats_are_merged_across_symbols(tmp_path, monkeypatch):
             "metric,value\n"
             + f"total_pnl,{100.0 if symbol == 'SPY' else 200.0}\n"
             + f"sharpe_ratio,{1.0 if symbol == 'SPY' else 2.0}\n"
-            + (f"spy_only,42.0\n" if symbol == "SPY" else "qqq_only,7.0\n"),
+            + ("spy_only,42.0\n" if symbol == "SPY" else "qqq_only,7.0\n"),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")

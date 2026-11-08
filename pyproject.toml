@@ -90,9 +90,49 @@ packages = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Not Python, or deliberately broken. These are inputs to other tools, not
+# source we own:
+#   tests/fixtures/sample_strategy.py is Pine Script (//@version=5, strategy()),
+#   tests/fixtures/invalid_strategies/syntax_error.py is an explicit negative
+#     control -- "deliberately unparseable" -- for the invalid-strategy path, so
+#     repairing it would destroy the thing it exists to test.
+#   strategy-comparisons/ holds QuantConnect algorithms, which the QC platform
+#     requires to use `from AlgorithmImports import *`; rewriting that import
+#     would break them on the platform.
+extend-exclude = [
+    "tests/fixtures",
+    "strategy-comparisons",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+# E402 is "module level import not at top of file", and every occurrence here is
+# load-order the module genuinely depends on. None are accidental: these files
+# cannot be reordered without changing behaviour, which is the only reason the
+# rule exists.
+#
+#   strategies/*   STRATEGY_META is parsed from source with `ast` WITHOUT
+#                  executing the module (shared/strategy_registry.py), so the
+#                  metadata literal has to sit above the numpy/pynecore imports.
+#                  Importing those first would make a metadata read cost a full
+#                  dependency load, and would break the deliberate
+#                  "parse without importing" property the registry depends on.
+#   scripts/*      sys.path insertion before the project imports it enables,
+#                  plus the import-origin guard that must run before the first
+#                  `shared` import (tests/test_script_import_origin.py).
+#   viewer/main.py dotenv load and env setup before the imports that read them.
+#   signal_bots/   constant that the registry resolves before the processors.
+#                  registry.py
+#
+# Moving any of these imports above its bootstrap is the exact bug the ordering
+# prevents. Scoped per path rather than switched off: E402 still fires everywhere
+# else, so a genuinely misplaced import in a new file is still an error.
+[tool.ruff.lint.per-file-ignores]
+"strategies/*" = ["E402"]
+"scripts/*" = ["E402"]
+"signal_bots/registry.py" = ["E402"]
+"viewer/main.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

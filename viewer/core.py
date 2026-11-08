@@ -2875,7 +2875,7 @@ def _task_progress_payload(task: dict[str, Any], log_content: str = "") -> dict[
         detail["failed"] = log_content.count("❌")
 
     percent = float(task.get("progress", detail.get("percent", 0.0)) or 0.0)
-    if detail["total"] > 0 and percent == 0.0:
+    if detail["total"] > 0 and math.isclose(percent, 0.0, abs_tol=1e-12):
         done = int(detail.get("completed", 0) or 0) + int(detail.get("failed", 0) or 0)
         if done > 0:
             percent = min(100.0, done / detail["total"] * 100.0)

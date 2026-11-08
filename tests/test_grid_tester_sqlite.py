@@ -303,9 +303,8 @@ def test_trading_run_without_trade_count_reports_presence_not_zero(monkeypatch, 
     an explicit stats count wins; the observed-trades fallback surfaces the
     REAL number of trades on the result, never a fabricated zero, minimum (1)
     or loss of magnitude (a 50-trade cell must not persist as 1)."""
-    from shared.models import BacktestMeta, BacktestResult
-
     import runner.grid_tester as grid_tester_module
+    from shared.models import BacktestMeta, BacktestResult
 
     class TradingEngineNoCount:
         name = "fake"

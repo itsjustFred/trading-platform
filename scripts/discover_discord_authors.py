@@ -9,9 +9,9 @@ So read the value instead of guessing it. This is read-only: it fetches recent
 messages through the same path the listener uses, builds no signal, mutates no
 state and submits nothing. Tokens are never printed.
 
-    python scripts/discover_discord_authors.py
-    python scripts/discover_discord_authors.py --pages 5
-    python scripts/discover_discord_authors.py --json
+    python -m scripts.discover_discord_authors
+    python -m scripts.discover_discord_authors --pages 5
+    python -m scripts.discover_discord_authors --json
 
 Review the output before pasting it. A channel can carry other traffic, so the
 loudest author is not automatically the signal bot - the `is_bot` column and the
@@ -28,9 +28,30 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-if __package__ in (None, ""):  # pragma: no cover - script entry point
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# isort: split
 
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.discover_discord_authors
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("discover_discord_authors")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time -
+# it is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of
+# scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
+# dropping it would take this script off the roster and out of the gate that keeps it alive.
+import shared  # noqa: F401
 from live_runner import service_discovery
 from live_runner.credential_env import (
     discord_bot_env_key,
@@ -249,7 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                 " verifying it."
             )
             continue
-        print("\n  # bot authors only (humans are listed above, never suggested); review, then set:")
+        print(
+            "\n  # bot authors only (humans are listed above, never suggested); review, then set:"
+        )
         # Through the helper. This is the variable the operator is told to set, so
         # a key built any other way emits something the daemon will never read -
         # and the bot then falls back to the shared list, which is exactly the

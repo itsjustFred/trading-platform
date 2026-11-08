@@ -2,11 +2,35 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.recalculate_backtest_stats
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("recalculate_backtest_stats")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time -
+# it is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of
+# scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
+# dropping it would take this script off the roster and out of the gate that keeps it alive.
+import shared  # noqa: F401
 from runner.stats import compute_stats_for_result
+from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR
 from shared.database import (
     init_db,
@@ -65,22 +89,8 @@ def _parse_result_payload(payload: dict[str, Any]):
     return BacktestResult.from_dict(payload)
 
 
-def _save_json_payload(path: Path, payload: dict[str, Any]) -> None:
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-    try:
-        path.write_text(serialized, encoding="utf-8")
-        return
-    except PermissionError:
-        pass
-
-    rewrite_path = path.parent / f".{path.name}.rewrite"
-    rewrite_path.write_text(serialized, encoding="utf-8")
-    try:
-        os.replace(rewrite_path, path)
-    except Exception:
-        if rewrite_path.exists():
-            rewrite_path.unlink()
-        raise
+def _serialize_payload(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[int, int, int]:
@@ -103,7 +113,11 @@ def _recalculate_json_backtests(backtests_dir: Path, *, dry_run: bool) -> tuple[
 
             if not dry_run:
                 payload["stats"] = merged_stats
-                _save_json_payload(path, payload)
+                # The write target is the file this loop just read, and the write goes through
+                # the shared atomic helper: it stages a temp file in the same directory and
+                # renames it, so a read-only file no longer needs the old `.rewrite` fallback
+                # and a crash cannot truncate the artifact.
+                write_text_atomically(path, _serialize_payload(payload))
             updated += 1
         except Exception as exc:
             failed += 1

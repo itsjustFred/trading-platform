@@ -1,34 +1,69 @@
 """Convert a platform BacktestResult JSON into a ValidationReference JSON.
 
 Usage:
-    python scripts/backtest_to_validation_ref.py \
+    python -m scripts.backtest_to_validation_ref \
         data/backtests/result.json \
         data/backtests/result_vref.json
 """
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.backtest_to_validation_ref
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("backtest_to_validation_ref")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time - it
+# is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of scripts
+# that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
+# take this script off the roster and out of the gate that keeps the guard alive.
+import shared  # noqa: F401
+from scripts._safe_path import reject_traversal, under_root
+from shared.atomic_io import write_text_atomically
+from shared.models import BacktestResult
 from validation.reference import ValidationReference, resolve_initial_capital
 
 
+def _safe_input_path(raw: Path) -> Path:
+    """Refuse a traversal segment in the caller-supplied input path.
+
+    The input is read, not written, and may legitimately live outside the repo - an exported
+    backtest result is not required to sit in this checkout - so this is the traversal check only,
+    not the ``under_root`` confinement the output gets. The point is the legible failure: a runbook
+    quoting a path an LLM produced gets "name the directory directly" instead of a confusing
+    half-populated result.
+    """
+    return reject_traversal(raw, field="input")
+
+
 def _load_backtest_result(path: Path) -> BacktestResult:
-    d = json.loads(path.read_text(encoding="utf-8"))
-    meta = BacktestMeta(**d["meta"])
-    trades = [Trade(**t) for t in d.get("trades", [])]
-    for t in trades:
-        t.exits = [TradeExit(**e) for e in t.exits]
-    return BacktestResult(
-        meta=meta,
-        trades=trades,
-        equity_curve=d.get("equity_curve", []),
-        stats=d.get("stats", {}),
-        indicators=d.get("indicators", []),
-        drawings=d.get("drawings", []),
-    )
+    """Read a BacktestResult through the model's own loader.
+
+    The loader already owns "open this file and build the result", and it builds the typed
+    `EquityPoint`/`IndicatorSeries` values this script previously left as raw dicts. Keeping the
+    read there also keeps the filesystem sink out of a script whose only job is the conversion.
+    """
+    source = _safe_input_path(path)
+    try:
+        return BacktestResult.load(source)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"input: not a regular file ({source})") from exc
 
 
 def _to_validation_reference(result: BacktestResult) -> ValidationReference:
@@ -58,8 +93,10 @@ def main() -> None:
 
     res = _load_backtest_result(args.input)
     ref = _to_validation_reference(res)
-    args.output.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
-    print(f"Wrote ValidationReference to {args.output}")
+    safe = under_root(args.output, root=Path.cwd(), field="--output")
+    # The sink lives in the shared atomic-write helper, not here.
+    write_text_atomically(safe, ref.model_dump_json(indent=2))
+    print(f"Wrote ValidationReference to {safe}")
 
 
 if __name__ == "__main__":

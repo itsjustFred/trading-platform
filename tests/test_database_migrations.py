@@ -23,11 +23,13 @@ from shared.database import (
 from shared.models import (
     BacktestMeta,
     BacktestResult,
-    EquityPoint as EquityPointModel,
     LiveAccountConfig,
     LiveSignal,
     Trade,
     TradeExit,
+)
+from shared.models import (
+    EquityPoint as EquityPointModel,
 )
 from tests.conftest import seed_live_deployments
 

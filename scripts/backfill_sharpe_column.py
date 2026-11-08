@@ -50,21 +50,40 @@ import argparse
 import json
 import math
 import sqlite3
-import sys
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.backfill_sharpe_column
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("backfill_sharpe_column")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time -
+# it is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of
+# scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
+# dropping it would take this script off the roster and out of the gate that keeps it alive.
+import shared  # noqa: F401
+from shared.constants import DATA_DIR
+
 # Resolve the data directory the same way the application does, rather than assuming `~/data`: a
 # hard-coded home path is not portable (Windows, macOS) and silently aims `--apply` at whatever
 # happens to live there. `shared.constants` reads `DATA_DIR` from the environment and is the single
-# place that decision is made; the bootstrap above it keeps `python scripts/...` working from any
-# cwd.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from shared.constants import DATA_DIR  # noqa: E402, I001 - after the sys.path bootstrap
+# place that decision is made. (The import-origin guard above ensures `shared` is this checkout's.)
 _DISAGREEMENT_TOLERANCE = 1e-9
 
 # Each column's physically-stored "never computed" default. `p_value` is 1.0, not 0.0, because

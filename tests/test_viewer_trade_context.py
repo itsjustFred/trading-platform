@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+
 from shared.models import BacktestMeta, BacktestResult, IndicatorSeries, Trade, TradeExit
 
 sys.path.insert(0, str(Path(__file__).parent.parent))

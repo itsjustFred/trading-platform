@@ -6,11 +6,11 @@ import json
 import logging
 import os
 import sys
-from io import StringIO
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 

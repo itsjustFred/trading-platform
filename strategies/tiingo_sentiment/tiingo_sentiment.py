@@ -16,7 +16,6 @@ README.md for the required data adapter.
 
 import pandas as pd
 
-
 STRATEGY_META = {
     "name": "Tiingo News Sentiment Long-Short (Blocked Skeleton)",
     "version": "0.1.0",

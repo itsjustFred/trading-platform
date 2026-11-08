@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "gold_momentum" / "gold_momentum.py")
 TEST_START = "2025-10-01"
 TEST_END = "2025-12-31"
@@ -37,7 +36,7 @@ EXPECTED_NET_PROFIT = 2503.90
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="gold_momentum",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -77,8 +76,11 @@ class TestStrategyRegression:
         for trade in backtest_result.trades:
             risk_math = trade.meta.get("risk_math", {})
             stop_distance = risk_math.get("stop_distance")
-            assert stop_distance is not None and stop_distance > 0, (
+            assert stop_distance is not None, (
                 f"Trade {trade.id}: keine Stop-Distanz in risk_math"
+            )
+            assert stop_distance > 0, (
+                f"Trade {trade.id}: Stop-Distanz nicht positiv: {stop_distance}"
             )
             risk_pct = (stop_distance * trade.quantity) / risk_math.get(
                 "equity_at_entry", equity

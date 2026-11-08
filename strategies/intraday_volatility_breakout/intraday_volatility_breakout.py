@@ -15,10 +15,9 @@ Logic:
 - sl_price is emitted per entry bar as ATR-based distance from the entry close.
 """
 
+import logging
 from datetime import timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-import logging
 
 import numpy as np
 import pandas as pd

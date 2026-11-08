@@ -20,6 +20,30 @@ import aiohttp
 import pandas as pd
 from dotenv import load_dotenv
 
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of mutating another tree's schema. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.adaptive_harvester
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("adaptive_harvester")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time -
+# it is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of
+# scripts that must carry the guard. Kept deliberately, and silenced rather than removed:
+# dropping it would take this script off the roster and out of the gate that keeps it alive.
+import shared  # noqa: F401
 from data_tools.downloaders.dukascopy_native import (
     SYMBOL_CONFIG,
     _get_decimal_factor,
@@ -27,6 +51,7 @@ from data_tools.downloaders.dukascopy_native import (
     generate_tick_urls,
     parse_ticks,
 )
+from shared.atomic_io import write_text_atomically
 from shared.constants import resolve_genesis_path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -129,11 +154,19 @@ def _month_label(month_start: date) -> str:
     return f"{month_start.year:04d}-{month_start.month:02d}"
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    temp_path.replace(path)
+def _save_state(state: dict[str, Any]) -> None:
+    """Persist the harvester state to this script's own state file.
+
+    The target is a module constant, never an argument, and the write goes through the shared
+    atomic-write helper - the same one every other persisted artifact uses. That helper owns the
+    filesystem sink and validates the target; this script only names a file it owns.
+    """
+    write_text_atomically(STATE_PATH, json.dumps(state, indent=2, sort_keys=True))
+
+
+def _save_profiles(profiles: dict[str, Any]) -> None:
+    """Persist the downloader profiles to this script's own profile file."""
+    write_text_atomically(PROFILE_PATH, json.dumps(profiles, indent=2, sort_keys=True))
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -212,10 +245,6 @@ def _load_state() -> dict[str, Any]:
     return state
 
 
-def _save_state(state: dict[str, Any]) -> None:
-    _write_json_atomic(STATE_PATH, state)
-
-
 def _ensure_job_state(
     state: dict[str, Any],
     symbol: str,
@@ -290,10 +319,6 @@ def _load_profiles() -> dict[str, Any]:
     if not isinstance(profiles, dict):
         raise RuntimeError(f"Invalid profile format in {PROFILE_PATH}.")
     return profiles
-
-
-def _save_profiles(profiles: dict[str, Any]) -> None:
-    _write_json_atomic(PROFILE_PATH, profiles)
 
 
 def _update_profile_if_better(
@@ -534,7 +559,7 @@ async def _download_month(
             if penalties_this_batch:
                 penalty_count += 1
                 logger.warning("Rate limit hit! Backing off.")
-                cooldown_seconds = random.randint(15, 30)
+                cooldown_seconds = random.SystemRandom().randint(15, 30)
                 await asyncio.sleep(cooldown_seconds)
                 tuning.batch_size = max(MIN_BATCH_SIZE, tuning.batch_size // 2)
                 tuning.delay_ms = min(MAX_DELAY_MS, tuning.delay_ms * 2)

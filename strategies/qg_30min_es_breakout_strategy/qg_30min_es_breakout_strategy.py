@@ -7,7 +7,6 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-
 STRATEGY_META = {
     "name": "QG-30Min ES Breakout Strategy",
     "version": "1.0.0",

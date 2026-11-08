@@ -14,7 +14,6 @@ behavior so discovery/portfolio tooling does not route it as pairs trading.
 import numpy as np
 import pandas as pd
 
-
 STRATEGY_META = {
     "name": "Single-Leg Z-Score Mean Reversion",
     "version": "1.2.0",

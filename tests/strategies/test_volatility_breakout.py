@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "volatility_breakout" / "volatility_breakout.py")
 # Window retargeted: the old window (2025-01-01..2025-03-31) predates the local
 # US500/1h dataset (starts 2025-04-01) and is uncovered everywhere locally.
@@ -41,7 +40,7 @@ EXPECTED_NET_PROFIT = 38.85
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="volatility_breakout",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -97,7 +96,8 @@ def test_warmup_is_day_based_not_bar_counted():
     spec = importlib.util.spec_from_file_location(
         "volatility_breakout_unit", STRATEGY_PATH
     )
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 

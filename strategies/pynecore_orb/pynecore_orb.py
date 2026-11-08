@@ -49,11 +49,20 @@ STRATEGY_META = {
 }
 
 from pynecore import Series
-from pynecore.lib import script, input, strategy
-from pynecore.lib import high, low
-from pynecore.lib import time, hour, minute, dayofmonth, month, year
-from pynecore.lib import timeframe
-
+from pynecore.lib import (
+    dayofmonth,
+    high,
+    hour,
+    input,
+    low,
+    minute,
+    month,
+    script,
+    strategy,
+    time,
+    timeframe,
+    year,
+)
 
 _TZ = "America/New_York"
 _OR_START_MINUTES = 9 * 60 + 30  # 09:30 ET

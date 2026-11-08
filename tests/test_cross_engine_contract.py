@@ -20,9 +20,10 @@ import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.engines.native_adapter import NativeAdapter
-from tests.helpers import write_ohlcv as _write_ohlcv, with_zero_fees
+from runner.engines.vectorbt_adapter import VectorbtAdapter
+from tests.helpers import with_zero_fees
+from tests.helpers import write_ohlcv as _write_ohlcv
 
 
 def _frame(*, spread: float = 0.0) -> pd.DataFrame:
@@ -106,7 +107,8 @@ def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):
 
     path = _write_strategy(tmp_path, name, strategy_text)
     spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None, f"no import spec for {name!r}"
+    assert spec.loader is not None, f"import spec for {name!r} has no loader"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.generate_signals
@@ -395,9 +397,8 @@ class TestSharedEquityReplayMath:
         assert summary["peak_open_notional_usd"] == pytest.approx(20_000.0)
 
     def test_replay_scales_fees_with_quantity(self):
-        from shared.models import Trade, TradeExit
-
         from runner.engines._shared import replay_shared_equity
+        from shared.models import Trade, TradeExit
 
         def _fee_trade(trade_id, symbol, entry, exit, qty, fees):
             pnl = (110.0 - 100.0) * qty

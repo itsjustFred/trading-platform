@@ -23,7 +23,6 @@ defaults below are the code values (30 / 25 / 30 points).
 import numpy as np
 import pandas as pd
 
-
 STRATEGY_META = {
     "name": "US100 Intraday Scalper",
     "version": "1.0.0",

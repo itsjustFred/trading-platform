@@ -10,8 +10,8 @@ Aufruf:  python tests/compare_metrics_quantstats.py
 from __future__ import annotations
 
 import math
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import quantstats as qs
 
-from runner.stats import _sharpe, _sortino, _max_drawdown_pct, _daily_returns, compute_stats
+from runner.stats import _daily_returns, _max_drawdown_pct, _sharpe, _sortino, compute_stats
 from shared.models import EquityPoint, Trade, TradeExit
 
 RISK_FREE_RATE = 0.04  # annual

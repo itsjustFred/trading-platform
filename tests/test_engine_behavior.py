@@ -15,7 +15,6 @@ Covers Cleanup 16-D1 findings on ``runner/engine.py``:
 """
 
 from __future__ import annotations
-from tests.helpers import with_zero_fees
 
 from pathlib import Path
 
@@ -24,7 +23,7 @@ import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
-
+from tests.helpers import with_zero_fees
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 

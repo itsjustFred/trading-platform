@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 
-
 STRATEGY_PATH = str(Path(__file__).parent.parent.parent / "strategies" / "channel_breakout" / "channel_breakout.py")
 # Window start moved 2025-04-01 -> 2025-04-02: the local US500/1h dataset starts
 # 2025-04-01 04:00 UTC, so the data gate rejects a 00:00 start bound.
@@ -42,7 +41,7 @@ EXPECTED_NET_PROFIT = -688.18
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"}, 
+    config = BacktestConfig(parameters={"fees": "zero"},
         strategy_name="channel_breakout",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -92,7 +91,8 @@ def _load_module():
     spec = importlib.util.spec_from_file_location(
         "channel_breakout_unit", STRATEGY_PATH
     )
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

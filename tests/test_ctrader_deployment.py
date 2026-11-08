@@ -1,8 +1,7 @@
-from shared.models import LiveAccountConfig
-
 import pytest
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan, top_backtests_for_ctrader
+from shared.models import LiveAccountConfig
 
 
 def test_top_backtests_for_ctrader_ranks_by_live_score() -> None:
