@@ -592,8 +592,9 @@ trusted.
 ```json
 "diagnostics": {
   "split":      { "train": {}, "embargo": {}, "test": {}, "embargo_bars_equivalent": 12.0 },
-  "walk_forward": [ { "fold": 0, "train": {}, "test": {} } ],
-  "plateau":    { "parameter": "atr_stop_mult", "is_plateau": false, "sensitivity": 0.011 },
+  "walk_forward_folds": [ { "fold": 0, "train": {}, "test": {} } ],
+  "walk_forward_note": "Fold boundaries only: no per-fold performance was computed, ...",
+  "plateau":    { "parameter": "atr_stop_mult", "direction": "maximize", "is_plateau": false, "sensitivity": 0.011 },
   "multiple_testing": { "n_trials": 8, "bonferroni_threshold": 0.00625,
                         "expected_max_under_null": 1.397, "survives_selection_bias": false }
 }
@@ -609,7 +610,12 @@ trusted.
   folds are computed and published as a robustness diagnostic, but the selected
   parameters still come from the single train/test split above; the backtest is
   not re-run per fold. Folds never overlap and never train on an earlier fold's
-  test window.
+  test window. The block is published as `walk_forward_folds` (fold boundaries
+  only, with a `walk_forward_note` saying so); it was called `walk_forward`,
+  which read like a performance result.
+- `plateau` is centred on the trial the study selects: the highest metric for a
+  maximize target, the lowest for a minimize target (`p_value`); the direction is
+  published in `plateau.direction`.
 - `plateau.is_plateau` is false when only the winning parameter scores within
   `tolerance` of the best. A lone spike is the classic overfitting signature.
 - `multiple_testing.survives_selection_bias` compares the observed metric with

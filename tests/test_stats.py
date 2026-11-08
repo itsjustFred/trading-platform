@@ -11,6 +11,7 @@ from runner.stats import (
     _max_consecutive,
     _max_drawdown_pct_manual,
     _period_risk_free_rate,
+    _resolve_backtest_period_bounds,
     _sharpe_manual,
     _sortino_manual,
     compute_stats,
@@ -263,7 +264,7 @@ class TestComputeStats:
         stats = compute_stats([], equity_curve=equity)
 
         expected = (101_000.0 / 100_000.0) ** (365.25 / 3.0) - 1.0
-        assert stats["cagr"] == pytest.approx(expected, abs=1e-6)
+        assert stats["cagr"] == pytest.approx(expected, rel=0, abs=1e-6)
 
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the
@@ -582,23 +583,21 @@ class TestCalmarAndQsFallback:
             "definition, shared by both code paths)"
         )
 
-    def test_qs_installed_but_unparseable_times_still_yields_sharpe(self):
-        """Unparseable timestamps must not change the Sharpe that is published.
+    def test_qs_installed_but_unparseable_times_declare_the_ratios_undefined(self):
+        """Unparseable timestamps must not publish an annualised ratio.
 
-        **Why this test was rewritten.** The original asserted only
-        ``stats["sharpe_ratio"] != 0.0``. That cannot distinguish an annualized
-        Sharpe from a per-observation ratio — the defect published a per-period
-        ratio of 0.20 for a daily Sharpe of 3.2, which is very much "not
-        0.0" — so the assertion locked the defect in. The premise behind it,
-        that the fall-through exists to keep the number non-zero, was wrong:
-        under ADR D5 the two code paths must publish the SAME Sharpe for the
-        same returns, so the contract to pin is parity with the `"daily"`
-        branch, not the absence of a zero.
+        **Why this test was rewritten (it pinned wrong behaviour).** The earlier
+        version asserted that the unparseable curve published the SAME
+        sqrt(252)-annualised Sharpe as the daily one (ADR D5 parity). That
+        parity is only true if the bars happen to be daily, which is exactly
+        what an unreadable clock makes unknowable: hourly bars annualised with
+        252 periods per year overstate Sharpe by ~sqrt(6.5), weekly bars
+        understate it. A number that looks measured but rests on a guessed
+        period is worse than no number, so the ratios are now declared
+        undefined (and not silently published as 0.0 without the flag).
 
-        The fixture below builds two curves with identical equity values: one
-        with daily timestamps (the `daily` branch, quantstats) and one with
-        timestamps nothing can parse (the fall-through). Same returns in, same
-        Sharpe out.
+        The p-value is a t-test on the raw observation returns and does not
+        depend on the period, so it stays defined and equal to the daily one.
         """
         returns = [
             0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
@@ -631,19 +630,13 @@ class TestCalmarAndQsFallback:
         assert daily_stats["sharpe_ratio"] == pytest.approx(
             _sharpe_manual(returns, 0.04), abs=1e-4
         )
-        assert unknown["sharpe_ratio"] == pytest.approx(
-            daily_stats["sharpe_ratio"], abs=1e-4
-        ), (
-            "a per-observation ratio was published as a Sharpe: "
-            f"{unknown['sharpe_ratio']} instead of {daily_stats['sharpe_ratio']}"
-        )
-        assert unknown["sortino_ratio"] == pytest.approx(
-            daily_stats["sortino_ratio"], abs=1e-4
-        )
-        # Not merely "non-zero": the annualized value, ~13.75x the per-period
-        # ratio the defect produced for these returns.
-        assert unknown["sharpe_ratio"] > 1.0
-        assert "sharpe_ratio" not in unknown["undefined_metrics"]
+        assert "sharpe_ratio" not in daily_stats["undefined_metrics"]
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
+            assert metric in unknown["undefined_metrics"], metric
+        assert unknown["sharpe_ratio"] == 0.0
+        assert unknown["sortino_ratio"] == 0.0
+        assert "p_value" not in unknown["undefined_metrics"]
+        assert unknown["p_value"] == pytest.approx(daily_stats["p_value"], abs=1e-6)
 
     def test_unknown_frequency_states_why_the_period_assumption_is_unverified(self):
         """`equity_return_frequency` must name the reason, not just "unknown"."""
@@ -707,3 +700,141 @@ class TestCalmarAndQsFallback:
             * math.sqrt(252)
         )
         assert annualized != pytest.approx(annualized / math.sqrt(252))
+
+
+class TestWithoutQuantStats:
+    """The fallback path a bare install runs.
+
+    `runner.stats` branches on `HAS_QUANTSTATS`; with quantstats installed the
+    manual branch is dead code in this environment, so a regression there would
+    only surface on a machine that lacks the optional dependency. These tests
+    force the flag off and pin the same parity contract as the QS path.
+    """
+
+    @staticmethod
+    def _compute_without_quantstats(monkeypatch, **kwargs):
+        import runner.stats as stats_module
+
+        monkeypatch.setattr(stats_module, "HAS_QUANTSTATS", False)
+        return stats_module.compute_stats(**kwargs)
+
+    def test_fallback_matches_the_quantstats_definition_for_a_daily_curve(self, monkeypatch):
+        """No optional dependency must not mean a different Sharpe.
+
+        Both branches are documented to publish the daily-resampled, 252-period
+        annualized ratio. Force the flag off and compare against the manual
+        helpers directly: a fallback that silently returned the default 0.0
+        would pass any "is a number" assertion but not this one.
+        """
+        returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002, -0.003, 0.009]
+        curve = _equity_curve_from_returns(returns)
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=curve, risk_free_rate=0.04
+        )
+
+        assert stats["equity_return_frequency"] == "daily"
+        # The payload rounds `sharpe_ratio` to four decimals (stats.py:262),
+        # so the tolerance is that rounding floor, not the float equality.
+        assert stats["sharpe_ratio"] == pytest.approx(
+            _sharpe_manual(returns, 0.04), abs=1e-4
+        )
+        assert stats["sortino_ratio"] == pytest.approx(
+            _sortino_manual(returns, 0.04), abs=1e-4
+        )
+        assert "sharpe_ratio" not in stats["undefined_metrics"]
+
+    def test_fallback_declares_the_ratios_undefined_when_the_clock_is_unparseable(
+        self, monkeypatch
+    ):
+        """The no-quantstats path must agree with the quantstats path.
+
+        Same contract as the quantstats-installed test above, on the branch a
+        bare install executes: no period can be read, so no annualised ratio is
+        published (it used to be sqrt(252)-annualised on the raw bars, wrong for
+        any non-daily spacing).
+        """
+        returns = [
+            0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
+            -0.003, 0.009, 0.001, -0.002, 0.005, -0.001,
+        ]
+        values = [100_000.0]
+        for value in returns:
+            values.append(values[-1] * (1 + value))
+        unparseable = [
+            EquityPoint(time=f"not-a-timestamp-{index}", equity=equity)
+            for index, equity in enumerate(values)
+        ]
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=unparseable, risk_free_rate=0.04
+        )
+
+        assert stats["equity_return_frequency"] == (
+            "unknown:unparseable_equity_timestamps"
+        )
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
+            assert metric in stats["undefined_metrics"], metric
+        assert stats["sharpe_ratio"] == 0.0
+        assert stats["sortino_ratio"] == 0.0
+        assert "p_value" not in stats["undefined_metrics"]
+
+    def test_fallback_declares_metrics_undefined_for_a_one_point_curve(self, monkeypatch):
+        """One observation cannot produce a ratio; the payload must say so.
+
+        `undefined_metrics` is the machine-readable half of the contract, so an
+        empty set here would let a consumer read the default 0.0 as a real
+        measurement.
+        """
+        curve = [EquityPoint(time="2021-01-01T00:00:00+00:00", equity=100_000.0)]
+
+        stats = self._compute_without_quantstats(
+            monkeypatch, trades=[], equity_curve=curve, risk_free_rate=0.04
+        )
+
+        assert stats["undefined_metrics"] is not None
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr", "p_value"):
+            assert metric in stats["undefined_metrics"]
+
+    def test_fallback_without_a_curve_marks_the_whole_metric_set_undefined(self, monkeypatch):
+        """No equity curve at all is the extreme case of "cannot be computed"."""
+        stats = self._compute_without_quantstats(monkeypatch, trades=[], equity_curve=[])
+
+        assert stats["equity_return_frequency"] == "none"
+        assert stats["undefined_metrics"] is not None
+        for metric in (
+            "max_drawdown_pct",
+            "sharpe_ratio",
+            "sortino_ratio",
+            "calmar_ratio",
+            "cagr",
+            "total_return",
+            "psr",
+            "p_value",
+        ):
+            assert metric in stats["undefined_metrics"]
+
+
+class TestPeriodBounds:
+    """The annualization window must cover the whole configured end day."""
+
+    def test_date_only_end_is_extended_to_end_of_day(self):
+        start_dt, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31",
+        )
+
+        assert start_dt.isoformat() == "2024-01-01T00:00:00+00:00"
+        assert end_dt.isoformat() == "2024-12-31T23:59:59.999999+00:00"
+
+    def test_explicit_end_instant_is_not_extended(self):
+        _, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31T12:00:00+00:00",
+        )
+
+        assert end_dt.isoformat() == "2024-12-31T12:00:00+00:00"

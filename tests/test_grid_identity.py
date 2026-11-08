@@ -64,8 +64,20 @@ def _identity(tmp_path: Path, *, rewrite_inputs: bool = False, **overrides) -> d
 
 
 def test_identical_requests_produce_identical_identities(tmp_path):
+    """Two runs over untouched inputs must agree, or the reuse gate is a coin flip.
+
+    The two identities are built in separate calls and compared field by field
+    (not a fingerprint compared to itself), so a non-deterministic half -- an
+    insertion-ordered dict, a timestamp, an unstable hash -- is actually caught.
+    """
     _setup(tmp_path)
-    assert _identity(tmp_path)["fingerprint"] == _identity(tmp_path)["fingerprint"]
+    first = _identity(tmp_path)
+    second = _identity(tmp_path)
+
+    assert first["config"] == second["config"]
+    assert first["config_fingerprint"] == second["config_fingerprint"]
+    assert first["data"] == second["data"]
+    assert first["fingerprint"] == second["fingerprint"]
 
 
 @pytest.mark.parametrize(
@@ -130,25 +142,104 @@ def test_data_fingerprint_is_none_when_a_file_cannot_be_read(tmp_path):
     assert data_fingerprint([missing]) is None
 
 
+def test_the_data_fingerprint_describes_every_candidate_frame(tmp_path):
+    """A second source for the same symbol is part of what the cell read.
+
+    The selector may pick a different winner once another copy appears, so the
+    identity must describe every candidate. The invariant asserted here is the
+    one `data_staleness_reason` re-checks at read time: the recorded fingerprint
+    is the hash of the recorded file list, not of some prefix of it.
+    """
+    _setup(tmp_path)
+    primary_only = _identity(tmp_path)["data"]
+
+    _write_frame(
+        tmp_path / "data" / "ohlcv" / "other" / "equity" / "US" / "AAPL" / "1d.parquet"
+    )
+    with_rival = _identity(tmp_path)["data"]
+
+    assert primary_only is not None
+    assert len(primary_only["files"]) == 1
+    assert len(with_rival["files"]) == 2
+    # Both halves must agree with their own file list, and the second rival
+    # must actually have moved the fingerprint.
+    assert primary_only["fingerprint"] == fingerprint_of(primary_only["files"])
+    assert with_rival["fingerprint"] == fingerprint_of(with_rival["files"])
+    assert with_rival["fingerprint"] != primary_only["fingerprint"]
+
+
+def test_the_symbol_is_matched_case_insensitively(tmp_path):
+    """A lower-case request must find the same frame a upper-case one does."""
+    _write_frame(
+        tmp_path / "data" / "ohlcv" / "yfinance" / "equity" / "US" / "AAPL" / "1d.parquet"
+    )
+
+    upper = _identity(tmp_path, symbol="AAPL")
+
+    assert upper["data"] is not None
+    assert len(upper["data"]["files"]) == 1
+
+    lower = _identity(tmp_path, symbol="aapl")
+
+    assert lower["data"] == upper["data"]
+
+
+def test_the_candidate_frame_order_is_deterministic(tmp_path):
+    """Two runs over the same tree must produce the same identity.
+
+    `_candidate_frames` has one caller and `data_fingerprint` re-sorts its
+    input, so the raw discovery order is not itself observable -- but the
+    identity it feeds must still be stable run to run, or every comparison is
+    a coin flip.
+    """
+    for source in ("yfinance", "other"):
+        _write_frame(
+            tmp_path / "data" / "ohlcv" / source / "equity" / "US" / "AAPL" / "1d.parquet"
+        )
+
+    first = _identity(tmp_path)["data"]
+    second = _identity(tmp_path)["data"]
+
+    assert first is not None
+    assert len(first["files"]) == 2
+    assert first == second
+    assert first["fingerprint"] == fingerprint_of(first["files"])
+
+
+def test_empty_params_have_a_stable_canonical_form(tmp_path):
+    """No params and an empty params map must describe the same request."""
+    _setup(tmp_path)
+
+    no_params = _identity(tmp_path)
+    explicit_empty = _identity(tmp_path, params={})
+
+    assert no_params["config"]["params"] == "{}"
+    assert no_params["fingerprint"] == explicit_empty["fingerprint"]
+
+
 def test_identity_refuses_when_either_half_is_unknown(tmp_path):
     identity = _identity(tmp_path)
     unknown = {**identity, "data": None}
 
     assert identity_matches(identity, identity) == (True, "")
     ok, reason = identity_matches(identity, unknown)
-    assert not ok and "data half" in reason
+    assert not ok
+    assert "data half" in reason
     ok, reason = identity_matches(unknown, identity)
-    assert not ok and "data half" in reason
+    assert not ok
+    assert "data half" in reason
 
 
 def test_identity_refuses_an_absent_or_older_recorded_identity(tmp_path):
     identity = _identity(tmp_path)
 
     ok, reason = identity_matches(None, identity)
-    assert not ok and "no grid identity" in reason
+    assert not ok
+    assert "no grid identity" in reason
 
     ok, reason = identity_matches({**identity, "version": GRID_IDENTITY_VERSION + 1}, identity)
-    assert not ok and "version" in reason
+    assert not ok
+    assert "version" in reason
 
 
 def test_identity_names_the_config_fields_that_changed(tmp_path):
@@ -160,6 +251,34 @@ def test_identity_names_the_config_fields_that_changed(tmp_path):
     assert not ok
     assert "config changed" in reason
     assert "capital" in reason
+
+
+def test_the_accounting_version_is_part_of_the_identity(tmp_path, monkeypatch):
+    """A cell computed under older accounting must not satisfy a resume."""
+    import runner.grid_identity as grid_identity
+
+    current = _identity(tmp_path)
+    assert current["config"]["accounting_version"] == grid_identity.ACCOUNTING_VERSION
+
+    monkeypatch.setattr(grid_identity, "ACCOUNTING_VERSION", grid_identity.ACCOUNTING_VERSION + 1)
+    bumped = _identity(tmp_path)
+
+    assert bumped["fingerprint"] != current["fingerprint"]
+    ok, reason = identity_matches(current, bumped)
+    assert not ok
+    assert "accounting_version" in reason
+
+
+def test_a_pre_accounting_version_identity_is_refused_on_resume(tmp_path):
+    """Artifacts written before the field existed carry no accounting version."""
+    current = _identity(tmp_path)
+    legacy_config = {k: v for k, v in current["config"].items() if k != "accounting_version"}
+    legacy = {**current, "config": legacy_config}
+
+    ok, reason = identity_matches(legacy, current)
+
+    assert not ok
+    assert "accounting_version" in reason
 
 
 def test_read_identity_ignores_anything_it_cannot_parse(tmp_path):
@@ -186,7 +305,8 @@ def test_data_staleness_reason_reports_a_changed_frame(tmp_path):
 
     reason = data_staleness_reason(identity)
 
-    assert reason is not None and "changed" in reason
+    assert reason is not None
+    assert "changed" in reason
 
 
 def test_data_staleness_reason_reports_a_deleted_frame(tmp_path):
@@ -198,7 +318,8 @@ def test_data_staleness_reason_reports_a_deleted_frame(tmp_path):
 
     reason = data_staleness_reason(identity)
 
-    assert reason is not None and "gone" in reason
+    assert reason is not None
+    assert "gone" in reason
 
 
 def test_data_staleness_reason_detects_a_tampered_file_list(tmp_path):
@@ -209,7 +330,8 @@ def test_data_staleness_reason_detects_a_tampered_file_list(tmp_path):
 
     reason = data_staleness_reason(tampered)
 
-    assert reason is not None and "fingerprint" in reason
+    assert reason is not None
+    assert "fingerprint" in reason
 
 
 def test_data_staleness_reason_refuses_a_malformed_recorded_stat(tmp_path):
@@ -232,7 +354,8 @@ def test_data_staleness_reason_refuses_a_malformed_recorded_stat(tmp_path):
 
     reason = data_staleness_reason(malformed)
 
-    assert reason is not None and "unreadable" in reason
+    assert reason is not None
+    assert "unreadable" in reason
 
 
 @pytest.mark.parametrize(

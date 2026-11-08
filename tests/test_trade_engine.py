@@ -849,9 +849,8 @@ def test_a_multi_level_ladder_is_credited_with_the_furthest_level_reached():
     )
 
     reached = {e.reason for e in trade.exits}
-    assert "tp1" in reached and "tp2" in reached, (
-        f"the fixture must fill both levels, got {reached}"
-    )
+    assert "tp1" in reached, f"the fixture must fill tp1, got {reached}"
+    assert "tp2" in reached, f"the fixture must fill tp2, got {reached}"
     assert trade.mfe == pytest.approx(
         (115.0 - trade.entry_price) * trade.quantity
     ), (
