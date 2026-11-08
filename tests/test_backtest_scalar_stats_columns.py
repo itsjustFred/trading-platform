@@ -163,6 +163,29 @@ def test_an_unparsable_value_is_treated_as_undefined(isolated_db: tuple) -> None
     assert _columns("junk-1")["sharpe_ratio"] == 0.8, _columns("junk-1")
 
 
+def test_resolve_defined_stat_distinguishes_the_three_routes_to_no_number() -> None:
+    """The helper every caller relies on, tested where it is defined rather than only via a save.
+
+    Three routes must stay distinguishable: a value the producer computed, a value it declared
+    undefined, and a key it never mentioned. Conflating any two is what the convention exists to
+    prevent - an `undefined_metrics` list must not swallow the metrics *not* named in it, and an
+    absent key must resolve to the caller's default rather than to `None`.
+    """
+    from shared.models import resolve_defined_stat
+
+    computed = {"sharpe_ratio": 1.5, "undefined_metrics": ["psr"]}
+    assert resolve_defined_stat(computed, "sharpe_ratio") == 1.5, (
+        "a metric the producer computed was treated as undefined because another one was"
+    )
+    assert resolve_defined_stat({"psr": 0.4, "undefined_metrics": ["psr"]}, "psr", 0.9) is None
+    assert resolve_defined_stat({"psr": 0.4}, "cagr", 0.7) == 0.7, (
+        "a key the producer never mentioned must resolve to the caller's default"
+    )
+    assert resolve_defined_stat({"psr": None}, "psr", 0.7) == 0.7
+    assert resolve_defined_stat(None, "psr", 0.7) == 0.7
+    assert resolve_defined_stat(["not", "a", "dict"], "psr", 0.7) == 0.7
+
+
 def test_p_value_defaults_to_one_not_zero(isolated_db: tuple) -> None:
     """``1.0`` means "no evidence against the null hypothesis"; ``0.0`` means the opposite.
 

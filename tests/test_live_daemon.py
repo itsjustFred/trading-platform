@@ -867,7 +867,8 @@ def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
         status=status,
         signal_source="discord",
         signal_source_type="discord",
-        signal_config={"channel_id": "channel-1"},
+        # A deployment without its own allowlist trusts nobody and never trades.
+        signal_config={"channel_id": "channel-1", "trusted_author_ids": ["bot-1"]},
     )
 
 

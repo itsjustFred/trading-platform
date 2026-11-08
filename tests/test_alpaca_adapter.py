@@ -200,6 +200,52 @@ def test_refused_close_restores_the_stop_it_cancelled() -> None:
     assert restored[0].stop_price == 190.0
 
 
+def test_a_wrong_side_stop_does_not_count_as_protection() -> None:
+    """A buy stop on a long is an entry, not protection.
+
+    The flatten cancels the position's sell stop first, but a buy stop on the same
+    symbol can still be working - another intent's entry, or a cancel the broker
+    accepted without applying. Counting it as protection reports the long as
+    protected while it is naked, so the restore has to look at the side.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "buy-stop", "AAPL", "buy", order_type="stop", qty=10.0, stop_price=210.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    restored = asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0))
+
+    assert restored is True
+    submitted = [order for order in client.submitted if order.stop_price == 190.0]
+    assert len(submitted) == 1, "the long was left without a reducing-side stop"
+    assert str(getattr(submitted[0].side, "value", submitted[0].side)).lower() == "sell"
+
+
+def test_a_reducing_side_stop_is_not_duplicated() -> None:
+    """The other half: a stop that does protect the position is left alone.
+
+    Re-submitting next to it would leave two stops on one position, and the second
+    becomes an orphan the moment the first fills.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    assert client.submitted == []
+
+
 def test_refused_close_without_a_restorable_stop_is_reported_as_naked() -> None:
     client = _FakeTradingClient(
         orders=[
@@ -267,6 +313,36 @@ def test_cancel_failure_after_a_partial_sweep_restores_the_stop() -> None:
     stops = [order for order in client.orders if order.order_type == "stop"]
     assert len(stops) == 1
     assert stops[0].stop_price == 190.0
+
+
+def test_a_cancel_the_broker_ignores_blocks_the_close() -> None:
+    """An accepted-but-unapplied cancel still reserves the quantity.
+
+    The re-read after the cancel is what makes that visible; without it the
+    adapter would call close_position and rely on the broker to refuse.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    # The broker acknowledges the cancel and keeps the order working.
+    client.cancel_order_by_id = lambda order_id: client.cancelled.append(  # type: ignore[method-assign]
+        order_id
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert client.close_calls == []
+    assert any("orders-still-working" in item for item in outcome.failed)
+    # The stop still works, so no second stop is submitted on top of it.
+    assert [order.id for order in client.orders] == ["sl-1"]
+    assert client.submitted == []
 
 
 def test_close_all_positions_reports_a_partial_flatten() -> None:
@@ -404,6 +480,80 @@ def test_bulk_response_shape_is_not_read_as_zero() -> None:
 
     with pytest.raises(RuntimeError, match="unrecognised shape"):
         asyncio.run(adapter.cancel_open_orders())
+
+
+def test_positions_mark_an_unparseable_qty_instead_of_reading_it_as_flat() -> None:
+    """A broker row whose qty cannot be read is flagged, not silently zeroed."""
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+    )
+    adapter = _adapter(client)
+
+    positions = asyncio.run(adapter.get_positions())
+
+    assert positions[0]["qty"] == 0.0
+    assert positions[0]["qty_unparseable"] is True
+    assert positions[0]["qty_raw"] == "not-a-number"
+
+
+def test_flatten_refuses_to_treat_an_unparseable_qty_as_flat() -> None:
+    """The STOPPED stamp is only safe if a malformed qty cannot pass as flat.
+
+    If ``close_all_positions`` read an unreadable qty as zero it would report a
+    successful flatten while real exposure stayed open, and the daemon would
+    stamp the deployment stopped over a live position.
+    """
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+    )
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unparseable"):
+        asyncio.run(adapter.close_all_positions())
+
+
+def test_cancel_orphaned_protections_refuses_an_unparseable_qty() -> None:
+    """The orphan sweep must not treat an unreadable position as flat.
+
+    Reading the row as zero would make its protection look orphaned and cancel a
+    stop that is guarding a live position.
+    """
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="nan-ish")],
+        orders=[_FakeOrder(id="stop-1", symbol="AAPL", side="sell", order_type="stop")],
+    )
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unparseable"):
+        asyncio.run(adapter.cancel_orphaned_protections())
+
+
+def test_is_flat_uses_a_tolerance_and_rejects_non_finite() -> None:
+    """S1244: comparing a broker quantity to 0.0 with `==` is not a flat test."""
+    from live_runner.alpaca_adapter import _is_flat
+
+    assert _is_flat(0.0) is True
+    assert _is_flat(-0.0) is True
+    assert _is_flat(1e-13) is True
+    assert _is_flat(-1e-13) is True
+    # Far below any tradable unit but still a real quantity.
+    assert _is_flat(1e-9) is False
+    assert _is_flat(0.5) is False
+    assert _is_flat(float("nan")) is False
+    assert _is_flat(float("inf")) is False
+
+
+def test_a_sub_unit_residue_position_is_treated_as_flat() -> None:
+    """A residue must not keep a stopped deployment unflattened forever."""
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("sl-1", "AAPL", "sell", order_type="stop", qty=1e-13)],
+        positions=[_FakePosition("AAPL", 1e-13)],
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.close_calls == []
 
 
 def _entry_signal() -> LiveSignal:

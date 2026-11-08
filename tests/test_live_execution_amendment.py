@@ -194,6 +194,27 @@ def test_an_amendment_within_the_headroom_is_booked(db):
     assert float(total) == pytest.approx(1.7)
 
 
+def test_an_amendment_supplies_a_price_the_first_row_lacked(db):
+    """The first report of a fill can carry no price; the amendment is the second chance.
+
+    ``actual_price`` is NOT NULL with a default of ``0.0``, so "no price yet" is stored as zero
+    rather than NULL. Filling it in on the amendment is the only way that row ever gains a price,
+    and dropping it leaves the row permanently priced at zero.
+    """
+    engine, signal_id = db
+    unpriced = _execution(signal_id, 1.0)
+    unpriced.actual_price = 0.0
+    save_live_execution_up_to_cumulative(unpriced, 1.0)
+
+    save_live_execution_up_to_cumulative(_execution(signal_id, 2.0), 2.0)
+
+    with Session(engine) as session:
+        stored = session.exec(text("select actual_price from live_executions")).scalar()
+    assert float(stored) == pytest.approx(261.7), (
+        "the amendment left the execution priced at zero even though it carried a real price"
+    )
+
+
 def test_commission_is_added_only_for_the_incremental_slice(db):
     engine, signal_id = db
     first = _execution(signal_id, 1.0)

@@ -77,8 +77,14 @@ def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
             return _FakeAccount()
 
     fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
-    monkeypatch.setitem(__import__("sys").modules, "alpaca", SimpleNamespace(trading=SimpleNamespace(client=fake_module)))
-    monkeypatch.setitem(__import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module))
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "alpaca",
+        SimpleNamespace(trading=SimpleNamespace(client=fake_module)),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module)
+    )
     monkeypatch.setitem(__import__("sys").modules, "alpaca.trading.client", fake_module)
 
     accounts = account_discovery.discover_alpaca_accounts("k", "s", True)
@@ -116,7 +122,9 @@ def test_is_expected_ctrader_host_route_error_ignores_unrelated_errors():
 
 
 def test_is_ctrader_account_not_authorized_error_detects_phrase():
-    error_text = "RuntimeError('TRADING_ACCOUNT_IS_NOT_AUTHORIZED: Trading account is not authorized')"
+    error_text = (
+        "RuntimeError('TRADING_ACCOUNT_IS_NOT_AUTHORIZED: Trading account is not authorized')"
+    )
     assert account_discovery._is_ctrader_account_not_authorized_error(error_text)
 
 

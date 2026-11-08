@@ -109,6 +109,17 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   niemandem" und fällt **nicht** auf die gemeinsame Liste zurück. Ein
   unauflösbarer Wert (keine `.accounts.env`-Zuordnung) ergibt ebenfalls eine
   leere Allowlist; `os.environ` wird dafür bewusst nicht gelesen.
+- **Dispatch-Gate pro Deployment (fail-closed).** Die zusammengeführte Allowlist
+  eines Kanals ist nur der Ingestion-Filter. Vor jeder Order muss der Autor in der
+  *eigenen* Allowlist des Ziel-Deployments stehen. Ein Deployment mit leerer,
+  leerer-aber-gesetzter oder nicht auflösbarer Allowlist handelt für niemanden;
+  der Autor eines anderen Bots kann also nie auf diesem Deployment handeln.
+- Autoren, die nicht in der Allowlist stehen, werden verworfen und geloggt. Eine
+  Serie solcher Nachrichten löst einen einmaligen ERROR-Log mit den abgelehnten
+  Autor-IDs aus, setzt den Service aber **nicht** auf `FAILED` (sonst könnte jedes
+  Kanalmitglied den Bot stilllegen). Vom Operator gesetztes `PAUSED`/`STOPPED`
+  wird von automatischen Status-Schreibvorgängen (Connect, Reconnect, Teardown)
+  nie überschrieben; ein normaler Teardown schreibt kein `FAILED`.
 - Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
   verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
