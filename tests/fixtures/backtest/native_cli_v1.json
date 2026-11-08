@@ -109,7 +109,7 @@
           "start": "2024-01-01T00:00:00+00:00"
         }
       },
-      "window_start_basis": "engine"
+      "window_start_basis": "ledger_only"
     },
     "duration_days": 2,
     "engine": "native",

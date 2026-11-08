@@ -25,7 +25,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from shared.atomic_io import write_text_atomically  # noqa: E402
-from shared.models import BacktestResult  # noqa: E402
+from shared.models import (  # noqa: E402
+    BacktestMeta,
+    BacktestResult,
+    EquityPoint,
+    Trade,
+    TradeExit,
+)
 
 GOLDEN_PATH = ROOT / "tests" / "fixtures" / "backtest" / "native_cli_v1.json"
 RESULT_ID = "backtest-golden-native-v1"
@@ -788,6 +794,204 @@ def test_native_cli_pipeline_matches_golden(tmp_path: Path) -> None:
     expected = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
     BacktestResult.from_dict(expected)
     _assert_json_equal(_canonicalize(result.to_dict()), _canonicalize(expected))
+
+
+# --- In-process oracle for the windowed / engine-curve daily-equity paths -------
+#
+# The CLI golden above starts at the first bar with no earlier history and
+# adopts the native engine's own dense curve, so it cannot see two things the
+# accounting depends on: a window whose starting equity is DERIVED from trades
+# that closed before it, and a sparse engine curve compacted by the engine-curve
+# path. This oracle pins both with hand-computed numbers (no code under test is
+# used to produce an expectation) and cross-checks the two daily builders against
+# each other.
+
+ORACLE_INITIAL_CAPITAL = 100_000.0
+# (exit time, net PnL, fees). The first trade closes before the window and is the
+# only source of the window's starting equity: 100_000 + 1_500 = 101_500.
+ORACLE_PRIOR_TRADE = ("2024-01-10T15:00:00+00:00", 1_500.0, 10.0)
+ORACLE_START_EQUITY = 101_500.0
+ORACLE_DAYS = [f"2024-02-{day:02d}" for day in range(1, 11)]
+# Window trades whose first day carries a move (the common case), and the same
+# economics shifted so that the FIRST day of the window is flat.
+ORACLE_TRADES_DAY_ONE_MOVE = (
+    ("2024-02-01T12:00:00+00:00", 609.0, 1.0),
+    ("2024-02-04T12:00:00+00:00", -812.0, 1.0),
+    ("2024-02-07T12:00:00+00:00", 406.0, 1.0),
+)
+ORACLE_TRADES_FLAT_FIRST_DAY = (
+    ("2024-02-03T12:00:00+00:00", 609.0, 1.0),
+    ("2024-02-04T12:00:00+00:00", -812.0, 1.0),
+    ("2024-02-07T12:00:00+00:00", 406.0, 1.0),
+)
+ORACLE_SCENARIOS = {
+    "day_one_move_intraday_stamps": (ORACLE_TRADES_DAY_ONE_MOVE, "T12:00:00+00:00"),
+    # An engine that stamps a close at the start of the day it closes: the first
+    # curve point then sits at the window-start midnight AND differs from the
+    # starting equity.
+    "day_one_move_midnight_stamps": (ORACLE_TRADES_DAY_ONE_MOVE, "T00:00:00+00:00"),
+    "flat_first_day": (ORACLE_TRADES_FLAT_FIRST_DAY, "T12:00:00+00:00"),
+}
+
+
+def _oracle_trade(trade_id: int, exit_time: str, net: float, fees: float) -> Trade:
+    gross = net + fees
+    trade = Trade(
+        id=trade_id,
+        symbol="PARITY",
+        direction="LONG",
+        entry_time="2024-01-02T09:00:00+00:00",
+        entry_price=100.0,
+        quantity=10.0,
+        exits=[TradeExit(time=exit_time, price=101.0, quantity=10.0, pnl=gross)],
+        pnl=gross,
+    )
+    trade.fees = fees
+    trade.net_pnl = net
+    return trade
+
+
+def _oracle_result(
+    window_trades: tuple[tuple[str, float, float], ...], engine_curve: list[EquityPoint]
+) -> BacktestResult:
+    trades = [_oracle_trade(1, *ORACLE_PRIOR_TRADE)] + [
+        _oracle_trade(index, *row) for index, row in enumerate(window_trades, start=2)
+    ]
+    return BacktestResult(
+        meta=BacktestMeta(
+            id="oracle-window",
+            created_at="2024-03-01T00:00:00+00:00",
+            engine="native",
+            strategies=["oracle"],
+            initial_capital=ORACLE_INITIAL_CAPITAL,
+            backtest_start="2024-02-01",
+            backtest_end="2024-02-10",
+        ),
+        trades=trades,
+        equity_curve=engine_curve,
+    )
+
+
+def _oracle_engine_curve(
+    window_trades: tuple[tuple[str, float, float], ...], stamp: str
+) -> list[EquityPoint]:
+    """A sparse engine curve (three in-window points over ten days).
+
+    Too thin for the density gate, so the reconciling engine-curve path adopts
+    it. The first point is the earlier trade's close, which reconciles the
+    starting equity.
+    """
+    points = [EquityPoint(time=ORACLE_PRIOR_TRADE[0], equity=ORACLE_START_EQUITY)]
+    equity = ORACLE_START_EQUITY
+    for exit_time, net, _fees in window_trades:
+        equity += net
+        points.append(EquityPoint(time=exit_time[:10] + stamp, equity=equity))
+    return points
+
+
+def _expected_oracle_returns(
+    window_trades: tuple[tuple[str, float, float], ...],
+) -> list[tuple[str, float, float]]:
+    """(date, return, cent-quantised close) per window day, from first principles."""
+    pnl_by_day = {row[0][:10]: row[1] for row in window_trades}
+    equity = ORACLE_START_EQUITY
+    rows: list[tuple[str, float, float]] = []
+    for day in ORACLE_DAYS:
+        pnl = pnl_by_day.get(day, 0.0)
+        rows.append((day, pnl / equity, round(equity + pnl, 2)))
+        equity += pnl
+    return rows
+
+
+def _assert_oracle_series(
+    result: BacktestResult, window_trades: tuple[tuple[str, float, float], ...]
+) -> None:
+    expected = _expected_oracle_returns(window_trades)
+    # One return per calendar day of the ten-day window, the first day included.
+    assert result.stats["daily_return_count"] == len(ORACLE_DAYS) == 10
+    assert [row["date"] for row in result.stats["daily_returns"]] == ORACLE_DAYS
+    for row, (_day, expected_return, expected_close) in zip(
+        result.stats["daily_returns"], expected
+    ):
+        assert row["return"] == pytest.approx(expected_return, rel=1e-12, abs=1e-15)
+        assert row["equity"] == expected_close
+    final = ORACLE_START_EQUITY + sum(row[1] for row in window_trades)
+    compounded = ORACLE_START_EQUITY
+    for row in result.stats["daily_returns"]:
+        compounded *= 1.0 + row["return"]
+    assert compounded == pytest.approx(final, rel=1e-12)
+    curve = result.equity_curve
+    assert curve[0].equity == ORACLE_START_EQUITY
+    assert curve[-1].equity == final
+    times = [point.time for point in curve]
+    assert len(set(times)) == len(times), "no timestamp may be published twice"
+    assert times == sorted(times)
+
+
+@pytest.mark.parametrize("scenario", sorted(ORACLE_SCENARIOS))
+def test_oracle_engine_curve_path_from_a_start_equity_derived_from_earlier_trades(
+    scenario: str,
+) -> None:
+    from runner.daily_equity import attach_daily_equity
+
+    window_trades, stamp = ORACLE_SCENARIOS[scenario]
+    result = _oracle_result(window_trades, _oracle_engine_curve(window_trades, stamp))
+
+    attach_daily_equity(result, start="2024-02-01", end="2024-02-10")
+
+    # The earlier engine point reconciles with the earlier net ledger, so the
+    # base is engine-confirmed: 100_000 + 1_500 (net of the 10 in fees).
+    assert result.meta.data["window_start_basis"] == "engine"
+    _assert_oracle_series(result, window_trades)
+    # The engine path was taken (not the calendar fill): it published the drift
+    # it accepted, which is zero for this exactly reconciling curve.
+    reconciliation = result.meta.data["engine_curve_reconciliation"]
+    assert reconciliation["drift"] == pytest.approx(0.0, abs=1e-9)
+    assert reconciliation["expected_final_equity"] == pytest.approx(
+        ORACLE_START_EQUITY + sum(row[1] for row in window_trades)
+    )
+    assert result.meta.data["equity_frequency"] == "daily"
+    assert result.equity_evidence_status == "available"
+    assert result.to_dict()["equity_evidence_status"] == "available"
+
+
+@pytest.mark.parametrize("scenario", sorted(ORACLE_SCENARIOS))
+def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -> None:
+    """The same economics, with no engine curve to adopt, give the same series."""
+    from runner.daily_equity import attach_daily_equity
+    from runner.stats import compute_stats
+
+    window_trades, stamp = ORACLE_SCENARIOS[scenario]
+    engine = _oracle_result(window_trades, _oracle_engine_curve(window_trades, stamp))
+    attach_daily_equity(engine, start="2024-02-01", end="2024-02-10")
+    # No engine point at all: the base comes from the ledger alone, is labelled
+    # so, and the numbers are identical.
+    calendar = _oracle_result(window_trades, [])
+    attach_daily_equity(calendar, start="2024-02-01", end="2024-02-10")
+
+    assert calendar.meta.data["window_start_basis"] == "ledger_only"
+    assert "engine_curve_reconciliation" not in calendar.meta.data
+    _assert_oracle_series(calendar, window_trades)
+    for engine_row, calendar_row in zip(
+        engine.stats["daily_returns"], calendar.stats["daily_returns"]
+    ):
+        assert engine_row["date"] == calendar_row["date"]
+        assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-15)
+        assert engine_row["equity"] == calendar_row["equity"]
+
+    ratios = {
+        name: compute_stats(
+            trades=result.trades,
+            initial_capital=ORACLE_START_EQUITY,
+            equity_curve=result.equity_curve,
+            backtest_start="2024-02-01",
+            backtest_end="2024-02-10",
+        )
+        for name, result in (("engine", engine), ("calendar", calendar))
+    }
+    for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
+        assert ratios["engine"][key] == pytest.approx(ratios["calendar"][key], abs=1e-9), key
+    assert ratios["engine"]["duplicate_equity_timestamps"] == 0
 
 
 def main(argv: list[str] | None = None) -> int:
