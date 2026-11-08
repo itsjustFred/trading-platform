@@ -792,3 +792,45 @@ def test_discord_terminal_listener_failure_does_not_overwrite_operator_intent(
     asyncio.run(daemon._run_discord_bot_service_listener(service, _Source()))
 
     assert database.get_service(str(service.id)).status == operator_status
+
+
+def test_resumed_and_restopped_deployment_with_a_stale_ledger_still_needs_enforcement(
+    isolated_db_sandbox,
+) -> None:
+    """Resume + re-stop between ticks, sole deployment on its account, stale ledger.
+
+    The resume cleared the persisted stamp, but the daemon never observed the deployment leave
+    STOPPED, so its in-memory ledger still lists it. Two things must not trust that ledger:
+
+    * account selection, otherwise the account gets no adapter and the stop is never enforced;
+    * the ledger itself, which must be cleaned so a failed sweep this tick does not leave the
+      stale entry behind to hide the deployment on later ticks.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    ledger = _enforce(database, _ControlAdapter())
+    assert DEPLOYMENT_ID in ledger
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    deployment = _deployment(database)
+    assert deployment.stopped_enforced_at is None
+
+    needing = daemon._account_ids_needing_stopped_enforcement([deployment], set(ledger))
+    assert needing == {ACCOUNT_ID}, "a stale ledger kept the account from getting an adapter"
+
+    # A sweep that fails this tick must still leave the ledger without the stale entry.
+    failing = _ControlAdapter(flatten=ControlOutcome(completed=0, failed=("pos-1",)))
+    ledger = _enforce(database, failing, already=ledger)
+    assert failing.calls[:2] == ["cancel", "flatten"]
+    assert DEPLOYMENT_ID not in ledger, "the stale ledger entry survived a re-stop"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_a_stamped_deployment_in_the_ledger_needs_no_adapter(isolated_db_sandbox) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    ledger = _enforce(database, _ControlAdapter())
+
+    assert (
+        daemon._account_ids_needing_stopped_enforcement([_deployment(database)], ledger) == set()
+    )
