@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import filelock as filelock_module
 import pytest
 
 
@@ -139,16 +140,101 @@ def test_acquire_lock_never_deletes_a_live_lock(queue_runner) -> None:
     assert module.LOCK_PATH.read_text(encoding="utf-8").startswith("held\n")
 
 
+#: Content a peer leaves in queue.lock that acquisition must never adopt as ours.
+_FOREIGN_LOCK_CONTENT = "operator-metadata\n"
+#: filelock 4.0.x truncates the lock file once it owns it; 4.2.1+ leaves a
+#: pre-existing file untouched (upstream #835). Either is acceptable, but the
+#: runner's own metadata must never end up in queue.lock, and must never be
+#: appended to content this process did not write.
+_ACCEPTED_LOCK_CONTENT = ("", _FOREIGN_LOCK_CONTENT)
+
+
 def test_acquire_lock_does_not_overwrite_lock_file_metadata(queue_runner) -> None:
     module = queue_runner
     module.MATRIX_DIR.mkdir(parents=True, exist_ok=True)
-    module.LOCK_PATH.write_text("operator-metadata\n", encoding="utf-8")
+    module.LOCK_PATH.write_text(_FOREIGN_LOCK_CONTENT, encoding="utf-8")
 
     assert module.acquire_lock() is True
-    assert module.LOCK_PATH.read_text(encoding="utf-8") == ""
-    metadata = json.loads(module._lock_metadata_path().read_text(encoding="utf-8"))
-    assert metadata["pid"] > 0
-    module.release_lock()
+    try:
+        # Back the membership assertion with an explicit not-in check, so a
+        # single added byte cannot ride along inside a substring match.
+        lock_text = module.LOCK_PATH.read_text(encoding="utf-8")
+        assert lock_text in _ACCEPTED_LOCK_CONTENT, f"runner rewrote queue.lock with {lock_text!r}"
+        assert "pid" not in lock_text
+        assert "acquired_at" not in lock_text
+
+        # The never-overwrite half has real teeth: the accepted-set check above
+        # passes even if the runner rewrote a foreign file, since both accepted
+        # values are candidates. Pin the full contract down with a tracking
+        # FileLock -- the runner itself never rewrites the lock path: whatever
+        # the backend leaves there (foreign content under 4.2.x, an emptied
+        # file under 4.0.x) is the backend's doing and stays within the same
+        # accepted set.
+        spy_path = module.LOCK_PATH.with_name("queue.lock.spy")
+        spy_path.write_text(_FOREIGN_LOCK_CONTENT, encoding="utf-8")
+        real_file_lock = filelock_module.FileLock
+        seen: list[str] = []
+
+        def tracking_file_lock(*args, **kwargs):
+            lock = real_file_lock(*args, **kwargs)
+            assert Path(lock.lock_file).read_text(encoding="utf-8") == _FOREIGN_LOCK_CONTENT
+            real_acquire = lock.acquire
+
+            def tracked_acquire(*acquire_args, **acquire_kwargs):
+                outcome = real_acquire(*acquire_args, **acquire_kwargs)
+                after = Path(lock.lock_file).read_text(encoding="utf-8")
+                assert after in _ACCEPTED_LOCK_CONTENT, f"unexpected lock content {after!r}"
+                seen.append(str(lock.lock_file))
+                return outcome
+
+            lock.acquire = tracked_acquire
+            return lock
+
+        with patch.object(module, "FileLock", tracking_file_lock), patch.object(
+            module, "LOCK_PATH", spy_path
+        ):
+            metadata_path = module._lock_metadata_path()
+            assert metadata_path == Path(str(spy_path) + ".metadata")
+            # The sidecar must start clean so the pid we assert on below can
+            # only have been written by the acquisition under test.
+            metadata_path.unlink(missing_ok=True)
+
+            assert module.acquire_lock() is True
+            try:
+                assert seen == [str(spy_path)], "the queue lock must be acquired exactly once"
+                assert spy_path.read_text(encoding="utf-8") in _ACCEPTED_LOCK_CONTENT
+                assert metadata_path.exists(), "metadata must live in the sidecar, not queue.lock"
+            finally:
+                module.release_lock()
+
+        metadata = json.loads(module._lock_metadata_path().read_text(encoding="utf-8"))
+        assert metadata["pid"] > 0
+    finally:
+        module.release_lock()
+
+
+def test_acquire_lock_preserves_foreign_content_under_real_filelock(queue_runner) -> None:
+    """A lock path a peer already wrote must never be lengthened by acquisition.
+
+    This is the same never-overwrite contract as above, but asserted against the
+    real filelock backend instead of a tracking stub, so it holds whatever the
+    installed filelock version does to a pre-existing lock file.
+    """
+    module = queue_runner
+    module.MATRIX_DIR.mkdir(parents=True, exist_ok=True)
+    foreign = "x" * 4096
+    module.LOCK_PATH.write_text(foreign, encoding="utf-8")
+    before = module.LOCK_PATH.stat().st_size
+
+    assert module.acquire_lock() is True
+    try:
+        after = module.LOCK_PATH.read_text(encoding="utf-8")
+        assert len(after) <= before, "acquisition appended to a pre-existing lock file"
+        assert after in ("", foreign), f"acquisition rewrote the lock file with {after!r}"
+        metadata = json.loads(module._lock_metadata_path().read_text(encoding="utf-8"))
+        assert metadata["pid"] > 0
+    finally:
+        module.release_lock()
 
 
 def test_release_lock_removes_only_own_lock(queue_runner) -> None:
