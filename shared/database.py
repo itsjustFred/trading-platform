@@ -1320,6 +1320,51 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     _create_live_signal_discord_indexes(connection)
 
 
+_FK_VIOLATION_REPORT_LIMIT = 10
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _describe_foreign_key_violations(connection: Connection, violations: list) -> str:
+    """Build the fail-closed error for a failed ``PRAGMA foreign_key_check``.
+
+    Names the blocking rows (table, rowid, the dangling value and the parent it points at, capped)
+    and says how to fix them, so an operator can act instead of guessing. Never raises: a problem
+    while describing must not mask the violation itself.
+    """
+    lines: list[str] = []
+    for violation in violations[:_FK_VIOLATION_REPORT_LIMIT]:
+        table, rowid, parent, fkid = violation[0], violation[1], violation[2], violation[3]
+        detail = ""
+        try:
+            fk_rows = connection.exec_driver_sql(
+                f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+            ).fetchall()
+            column = next((row[3] for row in fk_rows if row[0] == fkid), None)
+            if column is not None and rowid is not None:
+                value = connection.exec_driver_sql(
+                    f"SELECT {_quote_identifier(column)} FROM {_quote_identifier(table)} "
+                    "WHERE rowid = ?",
+                    (rowid,),
+                ).scalar()
+                detail = f", {column}={value!r}"
+        except Exception:  # pragma: no cover - best-effort description only
+            logger.debug("Could not describe foreign key violation %r", violation, exc_info=True)
+        lines.append(f"  {table} rowid={rowid}{detail} -> missing row in {parent}")
+    extra = len(violations) - len(lines)
+    if extra > 0:
+        lines.append(f"  ... and {extra} more")
+    return (
+        f"Cannot safely migrate schema: foreign key violations remain "
+        f"({len(violations)} row(s); nothing was changed):\n"
+        + "\n".join(lines)
+        + "\nFix: re-point each row at an existing parent row, restore the missing parent, or "
+        "delete the orphan row after backing up the database, then restart."
+    )
+
+
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
@@ -1340,9 +1385,7 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 yield connection
                 violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
                 if violations:
-                    raise RuntimeError(
-                        "Cannot safely migrate schema: foreign key violations remain"
-                    )
+                    raise RuntimeError(_describe_foreign_key_violations(connection, violations))
             except BaseException:
                 connection.rollback()
                 raise
@@ -1710,10 +1753,31 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             )
             continue
         # A readable lookup keys on `strategy_name`, because the id is a UUID.
-        existing = connection.execute(
-            text("SELECT id FROM live_deployments WHERE strategy_name = :name"),
+        # `strategy_name` is not unique, so adoption must be unambiguous: more than one candidate,
+        # or a candidate that belongs to a different account, would make "the" parent a guess.
+        # Re-parenting signals onto the wrong deployment is worse than refusing to start.
+        candidates = connection.execute(
+            text(
+                "SELECT id, account_id FROM live_deployments "
+                "WHERE strategy_name = :name ORDER BY id"
+            ),
             {"name": deployment_id},
-        ).first()
+        ).fetchall()
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"Cannot safely adopt a parent for smoke signals labelled {deployment_id!r}: "
+                f"{len(candidates)} live_deployments rows share that strategy_name "
+                f"(ids: {', '.join(str(c[0]) for c in candidates[:10])}). Remove or rename the "
+                "extra rows so exactly one remains, then restart."
+            )
+        if candidates and str(candidates[0][1]) != account_id:
+            raise RuntimeError(
+                f"Cannot safely adopt live_deployments row {candidates[0][0]} for smoke signals "
+                f"labelled {deployment_id!r}: it belongs to account {candidates[0][1]!r}, the "
+                f"label names account {account_id!r}. Fix the row's account_id or rename it, "
+                "then restart."
+            )
+        existing = candidates[0] if candidates else None
         if existing is not None:
             new_id = str(existing[0])
         else:

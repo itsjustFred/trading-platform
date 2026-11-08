@@ -29,7 +29,8 @@ the only safe direction. The reverse would erase thousands of real computed valu
 
 Two cases are deliberately NOT reconciled, because they are not staleness:
 
-    a row declaring its metric undefined      the sentinel is deliberate - skipped, reported
+    a row declaring its metric undefined      the sentinel is deliberate - the run REFUSES
+                                              (exit 1, nothing written) and lists the rows
     a column holding a real value             recomputation drift, not staleness - skipped, reported
 
 ``cagr`` is the one column where the second case is common: 54 rows where both sides are non-zero

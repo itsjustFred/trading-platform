@@ -447,8 +447,16 @@ def test_init_db_still_refuses_while_a_non_smoke_orphan_remains(isolated_db_sand
         )
         connection.commit()
 
-    with pytest.raises(RuntimeError, match="foreign key violations remain"):
+    with pytest.raises(RuntimeError, match="foreign key violations remain") as excinfo:
         database.init_db()
+    # The operator must be able to act on the error: it names the table, the rowid, the dangling
+    # deployment_id and the remedy.
+    message = str(excinfo.value)
+    assert "live_signals" in message
+    assert DELETED_REAL_DEPLOYMENT in message
+    assert "rowid=" in message
+    assert "Fix:" in message
+    assert "1 row(s)" in message
 
     # Nothing half-applied: the key did not land and the rows survived.
     with engine.connect() as connection:
@@ -653,3 +661,72 @@ class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
             assert check.execute("PRAGMA foreign_key_check").fetchall() == []
         finally:
             check.close()
+
+
+def test_foreign_key_violation_report_is_capped(isolated_db_sandbox) -> None:
+    """Many orphans must not produce an unbounded error message."""
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        for index in range(15):
+            connection.exec_driver_sql(
+                "INSERT INTO live_signals "
+                "(id, deployment_id, symbol, action, theoretical_price, timestamp, metadata) "
+                f"VALUES ('sig-o{index}', 'ghost-{index}', 'AAPL', 'buy', 1.0, "
+                "'2026-04-10 15:16:17', '{}')"
+            )
+        connection.commit()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        database.init_db()
+
+    message = str(excinfo.value)
+    assert "15 row(s)" in message
+    assert "... and 5 more" in message
+    assert message.count("live_signals rowid=") == 10
+
+
+def test_init_db_refuses_to_adopt_when_several_parents_share_the_smoke_label(
+    isolated_db_sandbox,
+) -> None:
+    """`strategy_name` is not unique: adoption must not silently pick one of several."""
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    first, second = str(uuid4()), str(uuid4())
+    _seed_smoke_parent(engine, account_id="acct-5", parent_id=first)
+    label = SMOKE_LABEL.format(account_id="acct-5")
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO live_deployments "
+            "(id, strategy_name, account_id, symbols, timeframe, status, created_at, updated_at)"
+            f" VALUES ('{second}', '{label}', 'acct-5', '[]', '1m', 'PAUSED', '', '')"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="share that strategy_name") as excinfo:
+        database.init_db()
+    assert first in str(excinfo.value) and second in str(excinfo.value)
+
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT deployment_id FROM live_signals WHERE id = 'sig-1'"
+        ).scalar_one() == label, "the signal was re-pointed despite the ambiguity"
+
+
+def test_init_db_refuses_to_adopt_a_parent_of_a_different_account(isolated_db_sandbox) -> None:
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    parent_id = str(uuid4())
+    _seed_smoke_parent(engine, account_id="acct-6", parent_id=parent_id)
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO live_accounts (id, broker, name) VALUES ('other', 'ctrader', 'other')"
+        )
+        connection.exec_driver_sql(
+            f"UPDATE live_deployments SET account_id = 'other' WHERE id = '{parent_id}'"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="belongs to account"):
+        database.init_db()
