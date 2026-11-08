@@ -221,6 +221,68 @@ def test_plateau_works_with_negative_best_metric():
     assert result.is_plateau is True
 
 
+def test_plateau_centres_on_the_lowest_trial_for_a_minimize_study():
+    """`p_value` is minimised: the best trial and its plateau are at the LOW end."""
+    trials = [
+        {"window": 2, "p": 0.60},
+        {"window": 3, "p": 0.0502},
+        {"window": 4, "p": 0.050},
+        {"window": 5, "p": 0.0501},
+    ]
+    result = plateau_analysis(trials, parameter="window", metric="p", direction="minimize")
+    assert result is not None
+    assert result.direction == "minimize"
+    assert result.best_value == 4, "must not centre on the worst (highest) p-value"
+    assert result.is_plateau is True
+    assert result.plateau_width == 3
+    by_value = {item["value"]: item for item in result.neighbours}
+    assert by_value[4]["is_best"] is True
+    # Worse trials are negative in "higher is better" space, in either direction.
+    assert by_value[2]["delta"] < 0
+    assert result.as_dict()["direction"] == "minimize"
+
+    maximised = plateau_analysis(trials, parameter="window", metric="p")
+    assert maximised is not None
+    assert maximised.direction == "maximize"
+    assert maximised.best_value == 2
+    assert maximised.is_plateau is False
+
+
+def test_plateau_rejects_an_unknown_direction():
+    with pytest.raises(ValueError, match="direction"):
+        plateau_analysis([{"a": 1, "m": 1.0}], parameter="a", metric="m", direction="down")
+
+
+def test_diagnostics_payload_centres_the_plateau_on_the_minimum_for_p_value():
+    from types import SimpleNamespace
+
+    import runner.optimizer as opt
+
+    config = opt.OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="p_value",
+        n_trials=4,
+        train_split_pct=0.7,
+        embargo_pct=0.05,
+        walk_forward_splits=2,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 5}},
+    )
+    trials = [
+        SimpleNamespace(params={"window": w}, value=v)
+        for w, v in [(2, 0.60), (3, 0.42), (4, 0.31), (5, 0.05)]
+    ]
+    payload = opt._build_diagnostics_payload(
+        trials=trials,
+        config=config,
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
+        target_metric="p_value",
+        timeframe="1h",
+    )
+    assert payload["plateau"]["direction"] == "minimize"
+    assert payload["plateau"]["best_value"] == 5, "the plateau is centred on the lowest p-value"
+
+
 # ─── multiple_testing_correction ─────────────────────────────────────────────
 
 
@@ -389,7 +451,10 @@ def test_diagnostics_payload_reports_embargo_in_bars():
         "the reported test window is not the one that ran; the payload carries a "
         "re-derived split rather than the actual embargo"
     )
-    assert len(payload["walk_forward"]) == 2
+    assert len(payload["walk_forward_folds"]) == 2
+    # Fold geometry must not be mistaken for walk-forward performance evidence.
+    assert "walk_forward" not in payload
+    assert "not walk-forward evidence" in payload["walk_forward_note"]
     assert payload["plateau"]["parameter"] == "window"
     assert payload["multiple_testing"]["n_trials"] == 4
     assert payload["multiple_testing"]["direction"] == "maximize"
