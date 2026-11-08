@@ -800,10 +800,23 @@ class TestAttachDailyEquity:
 
         assert result.equity_curve[0].equity == 100_500.0
         assert result.equity_curve[-1].equity == 101_200.0
-        # No engine point exists, so there is no divergence: the normal path.
-        assert result.meta.data["window_start_basis"] == "engine"
+        # No engine point exists: the base is ledger-derived and labelled so,
+        # not "engine" (there is no divergence to warn about either).
+        assert result.meta.data["window_start_basis"] == "ledger_only"
         by_date = {daily["date"]: daily for daily in result.stats["daily_returns"]}
         assert by_date["2024-02-10"]["return"] == pytest.approx(700 / 100_500)
+
+    def test_unwindowed_start_reports_the_initial_capital_basis(self):
+        """Without a start bound the base is the configured capital, not the engine."""
+        result = make_result(
+            trades=[make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0)],
+            backtest_start=None,
+            backtest_end=None,
+        )
+
+        attach_daily_equity(result)
+
+        assert result.meta.data["window_start_basis"] == "initial_capital"
 
     def test_window_rebases_from_net_pnl_not_gross_engine_point(self):
         """The reconciliation must prefer the net ledger over a gross engine point."""
