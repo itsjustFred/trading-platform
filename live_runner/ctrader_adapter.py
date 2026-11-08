@@ -360,7 +360,8 @@ def _deal_commission(deal: Any | None) -> float:
     if deal is None:
         return 0.0
     raw = _to_float(getattr(deal, "commission", 0))
-    if raw == 0.0 or not math.isfinite(raw):
+    # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
+    if not raw or not math.isfinite(raw):
         return 0.0
     return raw / money_scale(money_digits_from_trader(deal))
 
