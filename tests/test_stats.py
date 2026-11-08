@@ -9,6 +9,7 @@ from runner.stats import (
     _daily_returns_from_equity_curve,
     _max_consecutive,
     _max_drawdown_pct_manual,
+    _resolve_backtest_period_bounds,
     compute_stats,
     compute_stats_for_result,
 )
@@ -153,6 +154,21 @@ class TestComputeStats:
 
         expected = (121000.0 / 100000.0) ** (365.25 / 731) - 1
         assert math.isclose(stats["cagr"], expected, rel_tol=1e-3, abs_tol=1e-3)
+
+    def test_cagr_handles_mixed_fractional_curve_timestamps(self):
+        # Daily equity curves mix second-resolution inception points with
+        # microsecond-resolution closes; without format="mixed" every close
+        # coerces to NaT and the CAGR window silently falls back.
+        equity = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-02T23:59:59.999999+00:00", equity=99_000.0),
+            EquityPoint(time="2024-01-03T23:59:59.999999+00:00", equity=101_000.0),
+        ]
+
+        stats = compute_stats([], equity_curve=equity)
+
+        expected = (101_000.0 / 100_000.0) ** (365.25 / 3.0) - 1.0
+        assert stats["cagr"] == pytest.approx(expected, rel=0, abs=1e-6)
 
     def test_cagr_uses_fractional_days_from_trade_bounds(self):
         # #84: calendar window — 2024 is a leap year (366 days), not the
@@ -361,3 +377,28 @@ class TestCalmarAndQsFallback:
             "unparseable equity timestamps must fall back to the manual Sharpe "
             "path (raw period returns), not silently publish 0.0"
         )
+
+
+class TestPeriodBounds:
+    """The annualization window must cover the whole configured end day."""
+
+    def test_date_only_end_is_extended_to_end_of_day(self):
+        start_dt, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31",
+        )
+
+        assert start_dt.isoformat() == "2024-01-01T00:00:00+00:00"
+        assert end_dt.isoformat() == "2024-12-31T23:59:59.999999+00:00"
+
+    def test_explicit_end_instant_is_not_extended(self):
+        _, end_dt = _resolve_backtest_period_bounds(
+            equity_curve=[],
+            trades=[],
+            backtest_start="2024-01-01",
+            backtest_end="2024-12-31T12:00:00+00:00",
+        )
+
+        assert end_dt.isoformat() == "2024-12-31T12:00:00+00:00"
