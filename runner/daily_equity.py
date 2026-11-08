@@ -45,7 +45,7 @@ FLOAT64_EPSILON = 2.0**-52
 #: magnitude larger than any of these terms).
 FLOAT64_ACCUMULATION_SAFETY = 8.0
 
-WindowStartBasis = Literal["engine", "net_ledger"]
+WindowStartBasis = Literal["engine", "net_ledger", "ledger_only", "initial_capital"]
 
 
 class WindowStartingEquity(NamedTuple):
@@ -54,12 +54,18 @@ class WindowStartingEquity(NamedTuple):
     ``basis`` is published as ``meta.data["window_start_basis"]``:
 
     ``"engine"``
-        No ledger fallback: the configured initial capital, an engine point
-        that agreed with the ledger within one cent, or no engine point at
-        all (nothing to disagree with).
+        An engine point before the window agreed with the realized net ledger
+        within one cent, so the engine value (plus later ledger PnL up to the
+        window start) is the base.
     ``"net_ledger"``
         An engine point disagreed with the realized net PnL beyond one cent,
         so the ledger value was used. Always accompanied by a warning.
+    ``"ledger_only"``
+        The window has a start but the engine curve has no point before it, so
+        the base is the initial capital plus the realized net PnL of earlier
+        trades. Nothing to reconcile against, hence no warning.
+    ``"initial_capital"``
+        The window has no start bound: the configured initial capital.
 
     The field is dropped only when no window base is computed at all (no
     trades and no engine curve).
@@ -419,7 +425,7 @@ def _window_starting_equity(
     if not math.isfinite(initial_capital):
         raise ValueError("Initial capital must be finite")
     if start_bound is None:
-        return WindowStartingEquity(initial_capital, "engine")
+        return WindowStartingEquity(initial_capital, "initial_capital")
 
     prior_points: list[tuple[datetime, float]] = []
     for point in result.equity_curve:
@@ -432,8 +438,8 @@ def _window_starting_equity(
     starting_equity = initial_capital + _net_pnl_before(result, start_bound)
     if not prior_points:
         # No engine point to reconcile against: the ledger is the only source
-        # and there is no divergence to report.
-        return WindowStartingEquity(starting_equity, "engine")
+        # and there is no divergence to report; label it truthfully.
+        return WindowStartingEquity(starting_equity, "ledger_only")
 
     reconciled_through, reconciled_equity = max(prior_points, key=lambda item: item[0])
     net_through_reconciled = _net_pnl_before(result, reconciled_through, inclusive=True)
