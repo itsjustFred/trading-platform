@@ -29,6 +29,7 @@ Thumbs.db
 .claude/worktrees/
 .claude/settings.json
 .claude/settings.local.json
+CLAUDE.local.md
 .codex/
 .hermes/
 .opencode/
