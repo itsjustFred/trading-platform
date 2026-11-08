@@ -615,3 +615,172 @@ def test_alpaca_stopped_never_leaves_a_naked_position_when_the_flatten_fails(
     assert stops[0].side == "sell"
     assert stops[0].qty == 10.0
     assert stops[0].stop_price == 190.0
+
+
+# ─── Enforcement stamp: leases, status guard, persisted-stamp authority ──────
+
+
+def test_stamp_is_refused_while_a_live_submission_lease_exists(isolated_db_sandbox) -> None:
+    """An in-flight submit can still fill after the flatten; stamping would stop the retry."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-live") is True
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    adapter = _ControlAdapter()
+
+    ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"], "the flatten must still run"
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+    # Once the submission outcome is known the lease is released and the next tick stamps.
+    assert database.release_live_deployment_submission("tok-live") is True
+    retry = _ControlAdapter()
+    ledger = _enforce(database, retry)
+    assert retry.calls == ["cancel", "flatten", "orphan"]
+    assert DEPLOYMENT_ID in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_stamp_is_refused_while_an_expired_but_unreleased_lease_exists(
+    isolated_db_sandbox,
+) -> None:
+    """An expired lease means an outcome was never observed - not that nothing happened."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    assert (
+        database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-old", ttl_seconds=0.01)
+        is True
+    )
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    import time
+
+    time.sleep(0.05)
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID)[0].expired is True
+
+    ledger = _enforce(database, _ControlAdapter())
+
+    assert DEPLOYMENT_ID not in ledger
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_mark_enforced_only_writes_while_the_deployment_is_stopped(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="PAUSED")
+
+    assert database.mark_live_deployment_stopped_enforced(DEPLOYMENT_ID) is False
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert database.mark_live_deployment_stopped_enforced(DEPLOYMENT_ID) is True
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_resume_and_restop_between_ticks_is_reenforced_despite_the_ledger(
+    isolated_db_sandbox,
+) -> None:
+    """The in-memory ledger never saw the deployment leave STOPPED; the stamp did."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    ledger = _enforce(database, _ControlAdapter())
+    assert DEPLOYMENT_ID in ledger
+
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+    second = _ControlAdapter()
+    _enforce(database, second, already=ledger)
+
+    assert second.calls == ["cancel", "flatten", "orphan"], (
+        "a stale in-memory ledger skipped enforcement of a freshly re-stopped deployment"
+    )
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_a_persisted_stamp_skips_enforcement_even_with_an_empty_ledger(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    _enforce(database, _ControlAdapter())
+
+    again = _ControlAdapter()
+    _enforce(database, again, already=set())
+
+    assert again.calls == []
+
+
+# ─── Operator intent on service status ───────────────────────────────────────
+
+
+@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
+@pytest.mark.parametrize("automated_status", [ServiceStatus.FAILED, ServiceStatus.RUNNING])
+def test_automated_writers_never_overwrite_operator_intent(
+    isolated_db_sandbox, operator_status, automated_status
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    service = database.create_service(
+        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
+    )
+    update_service_status(str(service.id), operator_status)
+
+    update_service_status(str(service.id), automated_status, respect_operator_intent=True)
+
+    assert database.get_service(str(service.id)).status == operator_status
+    # The operator (default) can still change it.
+    update_service_status(str(service.id), ServiceStatus.RUNNING)
+    assert database.get_service(str(service.id)).status == ServiceStatus.RUNNING
+
+
+@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
+def test_discord_reconnect_does_not_mark_an_operator_paused_or_stopped_bot_running(
+    isolated_db_sandbox, operator_status
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    service = database.create_service(
+        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.FAILED)
+    )
+    update_service_status(str(service.id), operator_status)
+    service_id = str(service.id)
+
+    class _Source:
+        is_connected = False
+
+        async def reconnect(self) -> None:
+            return None
+
+    daemon._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
+    asyncio.run(
+        daemon._reconnect_discord_bot_source(
+            service, _Source(), service_id, running_task=None
+        )
+    )
+
+    assert database.get_service(service_id).status == operator_status
+
+
+@pytest.mark.parametrize("operator_status", [ServiceStatus.PAUSED, ServiceStatus.STOPPED])
+def test_discord_terminal_listener_failure_does_not_overwrite_operator_intent(
+    isolated_db_sandbox, operator_status
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    service = database.create_service(
+        Service(name="bot", type=ServiceType.DISCORD_BOT, status=ServiceStatus.RUNNING)
+    )
+    update_service_status(str(service.id), operator_status)
+
+    class _Source:
+        is_paused = False
+
+        async def listen_signals(self):
+            raise RuntimeError("401 Unauthorized: improper token")
+            yield  # pragma: no cover
+
+    assert daemon._is_terminal_discord_runtime_error(RuntimeError("401 Unauthorized"))
+    asyncio.run(daemon._run_discord_bot_service_listener(service, _Source()))
+
+    assert database.get_service(str(service.id)).status == operator_status

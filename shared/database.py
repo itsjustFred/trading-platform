@@ -2832,6 +2832,14 @@ def list_services(*, service_type: ServiceType | str | None = None) -> list[Serv
     return [row.to_service() for row in rows]
 
 
+#: Statuses only an operator sets. Automated writers (`respect_operator_intent=True`) never
+#: move a service out of one of them.
+_OPERATOR_INTENT_SERVICE_STATUSES = (
+    ServiceStatus.PAUSED.value,
+    ServiceStatus.STOPPED.value,
+)
+
+
 def update_service_status(
     service_id: str,
     status: ServiceStatus | str,
@@ -2839,10 +2847,10 @@ def update_service_status(
     last_activity: datetime | None = None,
     respect_operator_intent: bool = False,
 ) -> Service | None:
-    """Write a service's status, with PAUSED as an atomic floor.
+    """Write a service's status, with PAUSED and STOPPED as an atomic floor.
 
-    `respect_operator_intent=True` makes PAUSED a floor: a PAUSED service is
-    never moved to any other status by this function. Only automated callers
+    `respect_operator_intent=True` makes PAUSED and STOPPED a floor: a service in
+    either state is never moved to any other status by this function. Only automated callers
     pass it - the pause was set by a person, and nothing the process observes
     afterwards (a message arriving, a connector failing, a reconnect completing)
     outranks that.
@@ -2878,12 +2886,12 @@ def update_service_status(
         )
         if (
             respect_operator_intent
-            and normalized_status != ServiceStatus.PAUSED.value
+            and normalized_status not in _OPERATOR_INTENT_SERVICE_STATUSES
         ):
             # Re-tested in the same statement as the write, so a concurrent
-            # PAUSE cannot be overwritten by a FAILED/RUNNING landing after it.
+            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING landing after it.
             statement = statement.where(
-                ServiceModel.status != ServiceStatus.PAUSED.value
+                ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES)
             )
         session.execute(statement)
         session.commit()
@@ -3026,21 +3034,40 @@ def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
 
     Only called when the adapter's cancel/flatten sweeps were *complete*; a
     partial sweep must stay unmarked so the next tick retries it.
+
+    The stamp is written by a single conditional ``UPDATE`` and refused (returns
+    ``False``, nothing written) unless, at that instant,
+
+    * the deployment is still ``STOPPED`` - a resume between the sweep and the
+      write must not leave a stamp on a live deployment, because the stamp is
+      what disables the next enforcement; and
+    * no submission lease exists for it, live *or* expired-but-unreleased. A
+      lease means a submit may still be in flight at the broker and can fill
+      after the flatten, and an expired lease means an outcome was never
+      observed. Persisting the stamp then would stop the daemon retrying the
+      flatten for exactly the fill it has not seen yet. New leases cannot be
+      taken once the deployment is ``STOPPED`` (the claim is status-gated), so
+      checking here, atomically with the write, is sufficient.
     """
     normalized = str(deployment_id or "").strip()
     if not normalized:
         return False
     init_db()
+    now = _utcnow_naive()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, normalized)
-        if record is None:
-            return False
-        now = _utcnow_naive()
-        record.stopped_enforced_at = now
-        record.updated_at = now
-        session.add(record)
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET stopped_enforced_at = :now, updated_at = :now "
+                "WHERE id = :deployment_id AND UPPER(status) = 'STOPPED' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM live_deployment_submission_claims "
+                "  WHERE deployment_id = :deployment_id)"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
         session.commit()
-    return True
+        return int(result.rowcount or 0) == 1
 
 
 def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:

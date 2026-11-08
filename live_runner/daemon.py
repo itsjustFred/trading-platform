@@ -2035,6 +2035,7 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
                     update_service_status,
                     service_id,
                     ServiceStatus.FAILED,
+                    respect_operator_intent=True,
                 )
                 return
             logger.warning(
@@ -2167,6 +2168,7 @@ async def _reconnect_discord_bot_source(
             service_id,
             ServiceStatus.RUNNING,
             last_activity=datetime.now(timezone.utc),
+            respect_operator_intent=True,
         )
         _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
         logger.info(
@@ -2186,7 +2188,12 @@ async def _reconnect_discord_bot_source(
                     }
                 },
             )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+            await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
             return
         # Transient failure: keep the service recoverable. The next sync tick
         # retries after the backoff floor instead of the old behavior of
@@ -2304,7 +2311,12 @@ async def _sync_running_discord_bot(
                 }
             },
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
 
     trusted_author_ids = _resolve_discord_service_trusted_author_ids(
@@ -2315,7 +2327,12 @@ async def _sync_running_discord_bot(
             "Discord service missing trusted_author_ids; refusing open gate",
             extra={"data": {"service_id": service_id, "service_name": service.name}},
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
     service_config = service.config if isinstance(service.config, dict) else {}
     auth_scheme = str(
@@ -2327,7 +2344,12 @@ async def _sync_running_discord_bot(
             "Discord service has unknown discord_auth_scheme",
             extra={"data": {"service_id": service_id, "auth_scheme": auth_scheme}},
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
 
     await _ensure_discord_bot_source(
@@ -2875,6 +2897,17 @@ async def _enforce_stopped_deployments(
         if deployment_id not in stopped_ids
     }
     already_enforced.difference_update(left_stopped)
+    # The persisted stamp is authoritative, not this process's ledger: a deployment
+    # that was resumed and stopped again between two ticks was never observed
+    # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the
+    # resume, transactionally) is gone and its positions are open again.
+    already_enforced.difference_update(
+        {
+            str(deployment.id)
+            for deployment in stopped
+            if deployment.stopped_enforced_at is None
+        }
+    )
     for deployment_id in sorted(left_stopped):
         try:
             await asyncio.to_thread(
@@ -2897,7 +2930,8 @@ async def _enforce_stopped_deployments(
 
     for deployment in stopped:
         deployment_id = str(deployment.id)
-        if deployment_id in already_enforced:
+        if deployment.stopped_enforced_at is not None:
+            already_enforced.add(deployment_id)
             continue
 
         if deployment.account_id in position_owning_accounts:
@@ -3129,16 +3163,33 @@ async def _enforce_stopped_deployments(
             )
             continue
 
-        already_enforced.add(deployment_id)
         try:
-            await asyncio.to_thread(
+            stamped = await asyncio.to_thread(
                 mark_live_deployment_stopped_enforced, deployment_id
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
-                "Could not record STOPPED enforcement for a deployment",
+                "Could not record STOPPED enforcement for a deployment; retrying next tick",
                 extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
             )
+            continue
+        if not stamped:
+            # Refused by the database: the deployment left STOPPED, or a submission
+            # lease (live or expired-but-unreleased) says an order may still fill.
+            # Either way the sweep does not count yet; the next tick runs it again.
+            logger.warning(
+                "Not recording STOPPED enforcement: the deployment is no longer STOPPED "
+                "or a submission lease is outstanding, so an in-flight order could still "
+                "fill. Retrying next tick",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+        already_enforced.add(deployment_id)
         logger.warning(
             "Enforced STOPPED deployment: orders cancelled and positions flattened",
             extra={
