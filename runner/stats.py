@@ -152,13 +152,15 @@ def compute_stats(
         else:
             return_frequency = UNKNOWN_RETURN_FREQUENCY
             return_frequency_reason = UNPARSEABLE_EQUITY_TIMESTAMPS
-            # Sharpe/Sortino/PSR/p-value are NOT undefined on this path: the
-            # fall-throughs below compute all four on the raw observation
-            # returns. This block used to mark them undefined unconditionally,
-            # so the payload both published a number and declared it
-            # unavailable — two consumers of the same dict reached opposite
-            # conclusions about the same metric. The reason the period could not
-            # be verified is reported in `equity_return_frequency` instead.
+            # Without a readable clock the observation spacing is unknown, so
+            # the annualisation factor is unknown too: sqrt(252) is right for
+            # daily bars and wrong by a large factor for hourly or weekly ones.
+            # Sharpe, Sortino and PSR (which is built on Sharpe) are therefore
+            # declared undefined below instead of being published as numbers
+            # that look measured. The p-value is a t-test on the raw
+            # observation returns and does not depend on the period, so it
+            # stays defined. The reason is in `equity_return_frequency`.
+            undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr"})
             if len(daily_returns) <= 1:
                 undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
 
@@ -190,18 +192,10 @@ def compute_stats(
                 # _safe_qs call return 0.0 silently. Treat QS as unusable.
                 qs_usable = False
             if not qs_usable:
-                if return_frequency == UNKNOWN_RETURN_FREQUENCY and len(daily_returns) > 1:
-                    # Unparseable timestamps leave no way to resample to
-                    # daily, so the manual definition runs on the raw
-                    # observation returns. It is annualised exactly like the
-                    # daily path (ADR D5: one definition per metric on both
-                    # code paths) — publishing the un-annualised ratio under
-                    # the name "Sharpe" reported a daily 3.2 as 0.20.
-                    sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
-                    sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
-                    psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
-                else:
+                if return_frequency != UNKNOWN_RETURN_FREQUENCY:
                     undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
+                # else: unparseable timestamps; the ratios were already declared
+                # undefined above and p_value is period-free.
             elif len(returns_series) > 1:
                 sharpe_ratio = _safe_qs(
                     qs.stats.sharpe,
@@ -221,13 +215,8 @@ def compute_stats(
                 sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
                 sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
-            elif return_frequency == UNKNOWN_RETURN_FREQUENCY and len(daily_returns) > 1:
-                # Same definition as the daily branch above, and the same
-                # reason: an unparseable timestamp must not change the number
-                # that is published (ADR D5).
-                sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
-                sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
-                psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
+            elif return_frequency == UNKNOWN_RETURN_FREQUENCY:
+                pass  # ratios already declared undefined above; p_value is period-free
             else:
                 undefined_metrics.update({"sharpe_ratio", "sortino_ratio", "psr", "p_value"})
     else:
@@ -566,8 +555,8 @@ def _describe_return_frequency(frequency: str, reason: str | None) -> str:
 
     A bare ``"unknown"`` told a consumer nothing beyond "something was off", so
     the reason is carried in the same field: ``"unknown:unparseable_equity_
-    timestamps"`` says the equity curve had no readable clock, which is what
-    forced the raw-observation return series. Known frequencies are reported
+    timestamps"`` says the equity curve had no readable clock, which is why
+    Sharpe, Sortino and PSR are declared undefined. Known frequencies are reported
     unchanged so existing consumers keep matching on them.
     """
     if not reason:

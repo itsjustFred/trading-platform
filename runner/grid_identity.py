@@ -44,10 +44,22 @@ from shared.constants import DATA_DIR
 #: another version cannot be compared field-by-field, so it is refused.
 GRID_IDENTITY_VERSION = 1
 
+#: Version of the accounting that produced a cell's numbers. It is part of the
+#: config half of the identity, so a ``--resume`` never reuses a cell computed
+#: under older accounting: the same request, strategy and data would otherwise
+#: look unchanged while its PnL, equity curve and ratios differ. Bump it in any
+#: change that moves published backtest numbers for an unchanged request.
+#:
+#: 2: net-of-fees window accounting, calendar-consistent daily returns on both
+#:    daily-equity paths, ratios undefined on an unreadable clock (#107/#113).
+#: Unversioned (pre-#113) artifacts carry no value and therefore never match.
+ACCOUNTING_VERSION = 2
+
 #: Where the identity lives inside a persisted ``BacktestResult``.
 GRID_IDENTITY_KEY = "grid_identity"
 
 __all__ = [
+    "ACCOUNTING_VERSION",
     "GRID_IDENTITY_KEY",
     "GRID_IDENTITY_VERSION",
     "cell_identity",
@@ -162,6 +174,7 @@ def cell_identity(
     "whatever dates were detected" and quietly change between two runs.
     """
     config = {
+        "accounting_version": ACCOUNTING_VERSION,
         "engine": str(engine or "").strip().lower(),
         "strategy_slug": Path(str(strategy)).stem,
         "strategy_sha256": strategy_source_sha256(strategy),
