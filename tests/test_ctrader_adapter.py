@@ -1041,9 +1041,10 @@ def test_a_fill_with_no_identity_at_all_is_refused_not_collided() -> None:
     (a unique key per event). The event is refused so it is retained for reconciliation, which
     reads deals that do carry ids.
     """
+    deal = SimpleNamespace(dealId=0)
     with pytest.raises(ValueError, match="no deal id, no cumulative order volume and no timestamp"):
         CTraderLiveAdapter._build_dedupe_key(
-            SimpleNamespace(dealId=0),
+            deal,
             order_id=123,
             timestamp_ms=0,
             filled_volume=500.0,

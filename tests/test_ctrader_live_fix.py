@@ -1219,10 +1219,12 @@ def test_the_base_adapter_does_not_claim_the_controls() -> None:
 
     assert adapter.supports_cancel_orders is False
     assert adapter.supports_flatten is False
+    cancel_call = adapter.cancel_open_orders()
     with pytest.raises(NotImplementedError):
-        _run(adapter.cancel_open_orders())
+        _run(cancel_call)
+    close_call = adapter.close_all_positions()
     with pytest.raises(NotImplementedError):
-        _run(adapter.close_all_positions())
+        _run(close_call)
 
 
 def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None:
@@ -1248,8 +1250,10 @@ def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None
     description = partial.describe()
     assert "nothing outstanding" not in description, description
     assert "1 completed" in description, description
-    assert "1 unidentifiable" in description and "order:None" in description, description
-    assert "1 refused" in description and "7" in description, description
+    assert "1 unidentifiable" in description, description
+    assert "order:None" in description, description
+    assert "1 refused" in description, description
+    assert "7" in description, description
 
     unidentified_only = ControlOutcome(completed=0, unidentified=("position:None:volume",))
     assert unidentified_only.complete is False
