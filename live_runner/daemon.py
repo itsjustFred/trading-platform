@@ -2839,7 +2839,14 @@ def _account_ids_needing_stopped_enforcement(
         deployment.account_id
         for deployment in deployments
         if _normalize_deployment_status(deployment.status) == "STOPPED"
-        and str(deployment.id) not in already_enforced
+        # The persisted stamp is authoritative: a deployment resumed and re-stopped
+        # between ticks has no stamp (the resume cleared it) while this process's
+        # ledger can still list it, and trusting the ledger alone would leave its
+        # account without an adapter, so the stop would never be enforced.
+        and (
+            deployment.stopped_enforced_at is None
+            or str(deployment.id) not in already_enforced
+        )
     }
 
 
