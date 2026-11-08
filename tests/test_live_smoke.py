@@ -6,6 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.live_smoke import (
     SmokeCheck,
     SmokeReport,
@@ -181,3 +183,44 @@ def test_discord_replay_smoke_routes_to_fake_order() -> None:
     assert report.checks[0].name == "discord-replay-routing"
     assert report.checks[0].details["symbol"] == "AAPL"
     assert report.checks[0].details["broker_order_id"] == "discord-smoke-order"
+
+
+def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(monkeypatch) -> None:
+    """The smoke deployment is validated against the account it really trades.
+
+    Passing the number the route *expects* makes the check compare a value to
+    itself, so a mis-resolved credential would still pass. The broker login the
+    smoke run actually resolved is the only meaningful comparison.
+    """
+    import live_runner.credential_env as credential_env
+    from scripts.live_smoke import _stockkit_deployment_and_signal
+
+    monkeypatch.setattr(
+        credential_env, "load_accounts_env_values", lambda *_args, **_kwargs: {}
+    )
+
+    trade_signal, deployment, _live_signal = _stockkit_deployment_and_signal(
+        {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+        route="ramjet",
+        account_id="acc-1",
+        broker_login="PA3T0MQAGQ51",
+        symbol="AAPL",
+        message_price=200.0,
+        stock_prices={"reference": 200.0, "buy_limit": 201.0},
+        extended_hours=False,
+    )
+
+    assert trade_signal.symbol == "AAPL"
+    assert deployment.account_id == "acc-1"
+
+    with pytest.raises(ValueError, match="must route to Alpaca account"):
+        _stockkit_deployment_and_signal(
+            {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+            route="ramjet",
+            account_id="acc-1",
+            broker_login="PA-SOMEONE-ELSE",
+            symbol="AAPL",
+            message_price=200.0,
+            stock_prices={"reference": 200.0, "buy_limit": 201.0},
+            extended_hours=False,
+        )

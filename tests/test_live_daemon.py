@@ -815,13 +815,24 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
         signal_config={"signal_processor": "ramjet"},
     )
 
+    # The broker-reported account number is what routing compares against; the
+    # local account id is a different identifier space and must not be used.
+    # Passing it here is what the daemon now does at dispatch time.
     assert daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "RAMJET"},
+        account_broker_login="PA3T0MQAGQ51",
     )
     assert not daemon._deployment_matches_stockkit_route(
         deployment,
         {"discord_bot_name": "NITRO"},
+        account_broker_login="PA3T0MQAGQ51",
+    )
+    # Without a broker identity the check fails closed rather than comparing the
+    # local id, which could never match a broker account number.
+    assert not daemon._deployment_matches_stockkit_route(
+        deployment,
+        {"discord_bot_name": "RAMJET"},
     )
 
 
@@ -856,7 +867,8 @@ def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
         status=status,
         signal_source="discord",
         signal_source_type="discord",
-        signal_config={"channel_id": "channel-1"},
+        # A deployment without its own allowlist trusts nobody and never trades.
+        signal_config={"channel_id": "channel-1", "trusted_author_ids": ["bot-1"]},
     )
 
 

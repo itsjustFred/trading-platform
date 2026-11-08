@@ -2969,12 +2969,35 @@ def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
 
-    validate_stockkit_deployment_route(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
         if account is None:
             raise ValueError(f"Unknown live account '{deployment.account_id}'")
+        # Validate routing against the account's broker-reported identity, not
+        # the local account id, which is a different identifier space. The
+        # accounts-env is supplied so route resolution follows the configured
+        # account labels rather than a hardcoded table.
+        try:
+            from live_runner.credential_env import load_accounts_env_values
+            from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
+
+            route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+        except Exception as exc:
+            # Routing validation still runs (and fails closed for a route it can no longer
+            # resolve), but an unreadable accounts env must not be silent: it changes which
+            # account number a route resolves to.
+            logger.warning(
+                "Could not load the accounts env for StockKit route validation; "
+                "falling back to the static route table: %s",
+                exc,
+            )
+            route_env = {}
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account.broker_login or account.ctid or "",
+            accounts_env_values=route_env,
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")

@@ -1,4 +1,5 @@
 """Tests for database migrations and model persistence."""
+
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, text
+from sqlmodel import select
 
 from shared.database import (
     BacktestRecord,
@@ -27,8 +29,6 @@ from shared.models import (
     Trade,
     TradeExit,
 )
-from sqlmodel import select
-
 from tests.conftest import seed_live_deployments
 
 
@@ -37,7 +37,10 @@ def test_backtest_record_equity_curve_persistence(isolated_db) -> None:
     database_module, _engine, _data_dir, _backtests_dir = isolated_db
     database_module.init_db()
 
-    record_id = f"test_equity_curve_record_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+    record_id = (
+        "test_equity_curve_record_"
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+    )
 
     with get_session() as session:
         # Create a test record
@@ -54,7 +57,9 @@ def test_backtest_record_equity_curve_persistence(isolated_db) -> None:
         session.commit()
 
         # Retrieve and verify
-        retrieved = session.exec(select(BacktestRecord).where(BacktestRecord.id == record_id)).first()
+        retrieved = session.exec(
+            select(BacktestRecord).where(BacktestRecord.id == record_id)
+        ).first()
 
         assert retrieved is not None
         assert retrieved.equity_curve[0]["time"] == 1700000000
@@ -111,12 +116,18 @@ def test_migrate_json_to_sqlite_is_idempotent(isolated_db) -> None:
     assert second == {"migrated": 0, "skipped": 1, "failed": 0, "total": 1}
 
     with get_session() as session:
-        records = session.exec(select(BacktestRecord).where(BacktestRecord.id == "legacy_json_backtest")).all()
+        records = session.exec(
+            select(BacktestRecord).where(BacktestRecord.id == "legacy_json_backtest")
+        ).all()
         trade_count = session.exec(
-            select(func.count(TradeRecord.id)).where(TradeRecord.backtest_id == "legacy_json_backtest")
+            select(func.count(TradeRecord.id)).where(
+                TradeRecord.backtest_id == "legacy_json_backtest"
+            )
         ).one()
         equity_count = session.exec(
-            select(func.count(EquityPoint.id)).where(EquityPoint.backtest_id == "legacy_json_backtest")
+            select(func.count(EquityPoint.id)).where(
+                EquityPoint.backtest_id == "legacy_json_backtest"
+            )
         ).one()
 
     assert len(records) == 1
@@ -377,7 +388,10 @@ def test_migration_backfills_discord_id_from_metadata(legacy_db) -> None:
     database, engine, _data_dir = legacy_db
     _legacy_signals_db(engine)
     _insert_legacy_signal(
-        engine, row_id="s1", timestamp="2024-01-01T00:00:00", metadata={"discord_message_id": "D-1"}
+        engine,
+        row_id="s1",
+        timestamp="2024-01-01T00:00:00",
+        metadata={"discord_message_id": "D-1"},
     )
     _insert_legacy_signal(
         engine, row_id="s2", timestamp="2024-01-01T00:01:00", metadata={"other": "x"}
@@ -386,7 +400,9 @@ def test_migration_backfills_discord_id_from_metadata(legacy_db) -> None:
     database.init_db()
 
     with engine.connect() as conn:
-        rows = dict(conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall())
+        rows = dict(
+            conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall()
+        )
     assert rows["s1"] == "D-1"
     assert rows["s2"] is None  # no metadata id => stays NULL
 
@@ -395,10 +411,16 @@ def test_migration_fails_closed_for_duplicate_discord_ids_within_deployment(lega
     database, engine, _data_dir = legacy_db
     _legacy_signals_db(engine)
     _insert_legacy_signal(
-        engine, row_id="dup_b", timestamp="2024-01-02T00:00:00", metadata={"discord_message_id": "DUP"}
+        engine,
+        row_id="dup_b",
+        timestamp="2024-01-02T00:00:00",
+        metadata={"discord_message_id": "DUP"},
     )
     _insert_legacy_signal(
-        engine, row_id="dup_a", timestamp="2024-01-01T00:00:00", metadata={"discord_message_id": "DUP"}
+        engine,
+        row_id="dup_a",
+        timestamp="2024-01-01T00:00:00",
+        metadata={"discord_message_id": "DUP"},
     )
 
     with pytest.raises(RuntimeError, match="No rows were deleted"):
@@ -406,9 +428,12 @@ def test_migration_fails_closed_for_duplicate_discord_ids_within_deployment(lega
 
     with engine.connect() as conn:
         columns = {
-            str(row[1]) for row in conn.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+            str(row[1])
+            for row in conn.execute(text("PRAGMA table_info('live_signals')")).fetchall()
         }
-        rows = dict(conn.execute(text("SELECT id, metadata FROM live_signals")).fetchall())
+        rows = dict(
+            conn.execute(text("SELECT id, metadata FROM live_signals")).fetchall()
+        )
         idx = conn.execute(
             text(
                 "SELECT name FROM sqlite_master WHERE type='index' "
@@ -424,28 +449,36 @@ def test_migration_fails_closed_for_duplicate_discord_ids_within_deployment(lega
     assert idx is None
     assert legacy_table is None
     assert "discord_message_id" not in columns
-    assert {row_id: json.loads(metadata)["discord_message_id"] for row_id, metadata in rows.items()} == {
-        "dup_a": "DUP",
-        "dup_b": "DUP",
+    recovered = {
+        row_id: json.loads(metadata)["discord_message_id"]
+        for row_id, metadata in rows.items()
     }
+    assert recovered == {"dup_a": "DUP", "dup_b": "DUP"}
 
 
 def test_migration_discord_backfill_is_idempotent(legacy_db) -> None:
     database, engine, _data_dir = legacy_db
     _legacy_signals_db(engine)
     _insert_legacy_signal(
-        engine, row_id="s1", timestamp="2024-01-01T00:00:00", metadata={"discord_message_id": "D-1"}
+        engine,
+        row_id="s1",
+        timestamp="2024-01-01T00:00:00",
+        metadata={"discord_message_id": "D-1"},
     )
 
     database.init_db()
     with engine.connect() as conn:
-        before = dict(conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall())
+        before = dict(
+            conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall()
+        )
 
     # Force a second migration pass.
     database._DB_INITIALIZED = False
     database._migrate_schema()
     with engine.connect() as conn:
-        after = dict(conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall())
+        after = dict(
+            conn.execute(text("SELECT id, discord_message_id FROM live_signals")).fetchall()
+        )
     assert before == after == {"s1": "D-1"}
 
 

@@ -1138,7 +1138,9 @@ async def _wait_for_alpaca_position_qty(
     return latest_qty
 
 
-def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, tuple[str, str, bool]]:
+def _stockkit_route_with_credentials(
+    env: Mapping[str, str],
+) -> tuple[str, str, str, tuple[str, str, bool]]:
     from live_runner.alpaca_adapter import resolve_alpaca_credentials
     from live_runner.stockkit_routing import STOCKKIT_ACCOUNT_ROUTES
     from live_runner.stockkit_routing import expected_account_for_stockkit_route
@@ -1151,7 +1153,7 @@ def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, 
             env=env,
         )
         if credentials is not None:
-            return route, expected_account, credentials
+            return route, expected_account, expected_account, credentials
         for index in (1, 2, 3):
             configured_name = str(env.get(f"ALPACA_ACCOUNT_NAME_ACC{index}", "")).strip()
             if configured_name.replace(" ", "").replace("_", "").lower() != route:
@@ -1162,7 +1164,10 @@ def _stockkit_route_with_credentials(env: Mapping[str, str]) -> tuple[str, str, 
                 env=env,
             )
             if credentials is not None:
-                return route, expected_account, credentials
+                # The broker-reported number actually used, not the static table
+                # entry: routing must be validated against the account the smoke
+                # run really trades, or the check compares a value to itself.
+                return route, expected_account, broker_login, credentials
     raise RuntimeError("No Alpaca credentials matched a configured StockKit route.")
 
 
@@ -1174,9 +1179,16 @@ async def _stockkit_market_context(
 ) -> tuple[str, str, tuple[str, str, bool], bool] | None:
     from alpaca.trading.client import TradingClient
 
-    route, account_id, credentials = _stockkit_route_with_credentials(env)
+    route, account_id, broker_login, credentials = _stockkit_route_with_credentials(env)
     api_key, secret_key, paper = credentials
-    details.update({"stockkit_route": route, "account_id": account_id, "paper": paper})
+    details.update(
+        {
+            "stockkit_route": route,
+            "account_id": account_id,
+            "broker_login": broker_login,
+            "paper": paper,
+        }
+    )
     if not paper:
         raise RuntimeError("Refusing non-paper Alpaca account for live-stockkit-e2e.")
 
@@ -1199,7 +1211,7 @@ async def _stockkit_market_context(
         details["market_closed_skipped"] = True
         details["remaining_qty"] = 0.0
         return None
-    return route, account_id, credentials, extended_hours
+    return route, account_id, broker_login, credentials, extended_hours
 
 
 def _stockkit_deployment_and_signal(
@@ -1207,6 +1219,7 @@ def _stockkit_deployment_and_signal(
     *,
     route: str,
     account_id: str,
+    broker_login: str,
     symbol: str,
     message_price: float,
     stock_prices: dict[str, float],
@@ -1217,12 +1230,14 @@ def _stockkit_deployment_and_signal(
     from live_runner.daemon import _trade_signal_to_live_signal
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
+    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from shared.models import LiveDeploymentConfig, LiveSignal
 
     message = SimpleNamespace(
         content=f"**$AAPL** is now oversold - buy signal\nPrice: ${message_price:.2f}",
         id=f"stockkit-e2e-{uuid4().hex}",
-        channel=SimpleNamespace(id=str(env.get(f"DISCORD_BOT_{route.upper()}_CHANNEL_ID", ""))),
+        channel=SimpleNamespace(id=str(env.get(discord_bot_env_key(route, "CHANNEL_ID"), ""))),
         author=SimpleNamespace(id=f"stockkit-{route}", bot=True),
         created_at=datetime.now(timezone.utc),
     )
@@ -1246,7 +1261,15 @@ def _stockkit_deployment_and_signal(
             "max_positions": 20,
         },
     )
-    validate_stockkit_deployment_route(deployment)
+    # Validate routing against the broker account number the smoke run actually
+    # resolved credentials for, not the number the route expects - otherwise the
+    # check compares a value to itself and can never fail.
+    smoke_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    validate_stockkit_deployment_route(
+        deployment,
+        account_broker_login=broker_login,
+        accounts_env_values=smoke_env,
+    )
     live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
     live_signal.metadata.update({"entry_price": float(trade_signal.entry_price)})
     if extended_hours:
@@ -1383,7 +1406,7 @@ async def _alpaca_stockkit_e2e(
         context = await _stockkit_market_context(env, symbol=symbol, details=details)
         if context is None:
             return SmokeCheck("alpaca-stockkit-e2e", True, details)
-        route, account_id, credentials, extended_hours = context
+        route, account_id, broker_login, credentials, extended_hours = context
         api_key, secret_key, _ = credentials
 
         stock_prices = await asyncio.to_thread(_alpaca_stock_prices, api_key, secret_key, symbol)
@@ -1392,6 +1415,7 @@ async def _alpaca_stockkit_e2e(
             env,
             route=route,
             account_id=account_id,
+            broker_login=broker_login,
             symbol=symbol,
             message_price=stock_prices["reference"],
             stock_prices=stock_prices,

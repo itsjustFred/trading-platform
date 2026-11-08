@@ -28,6 +28,8 @@ from live_runner.base_adapter import (
 )
 from live_runner.credential_env import (
     accounts_env_mtime,
+    discord_bot_env_canonical_name,
+    discord_bot_env_key,
     load_accounts_env_values,
     resolve_env_value,
 )
@@ -46,11 +48,13 @@ from live_runner.stockkit_routing import (
 from risk import RiskConfig, RiskEngine, TradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
+from shared.constants import normalize_timeframe
 from shared.database import (
     LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    get_live_account,
     get_live_deployment,
     get_service,
     list_live_accounts,
@@ -537,9 +541,39 @@ def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
     ).strip().lower()
 
 
+def _live_account_broker_login(account_id: str) -> str:
+    """Return the broker-reported account number for a local account id.
+
+    Alpaca reports an account number (e.g. ``PA35HB6T7815``) and cTrader a
+    ctid; both live in ``broker_login``/``ctid``. Routing checks compare against
+    that broker identity because the local id is a different identifier space.
+    Returns an empty string when the account is unknown, which makes routing
+    validation fail closed.
+    """
+    try:
+        account = get_live_account(str(account_id))
+    except Exception as exc:
+        # `exception()` and not `error()`: this is an unexpected failure on the
+        # routing path, and the traceback is the only thing that says whether the
+        # account lookup itself blew up or something below it did. The empty
+        # string returned here makes routing fail closed, so without the
+        # traceback the operator sees a refusal with no cause.
+        logger.exception(
+            "Could not resolve broker identity for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return ""
+    if account is None:
+        return ""
+    return str(getattr(account, "broker_login", "") or getattr(account, "ctid", "") or "")
+
+
 def _deployment_matches_stockkit_route(
     deployment: LiveDeploymentConfig,
     signal_metadata: Mapping[str, object],
+    *,
+    account_broker_login: str | None = None,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     route = infer_stockkit_route(
         signal_source_id=deployment.signal_source_id,
@@ -550,7 +584,11 @@ def _deployment_matches_stockkit_route(
     if not route:
         return True
     try:
-        validate_stockkit_deployment_route(deployment)
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        )
     except ValueError as exc:
         logger.warning(
             "Blocking misrouted StockKit deployment",
@@ -565,6 +603,85 @@ def _deployment_matches_stockkit_route(
         return False
     signal_route = infer_stockkit_route(metadata=signal_metadata)
     return not signal_route or signal_route == route
+
+
+def _timeframe_age_budget_seconds(timeframe: str) -> float:
+    # Through `normalize_timeframe`, not a bare `.lower()`. It used to lower-case only, so `M1`/`m1`
+    # missed the `1m` entry and fell through to the 300.0 default: the same 1-minute candle got a
+    # 600s effective staleness budget under `M1` and 300s under `1m`, because the daemon's caller
+    # computes `max(300.0, 2.0 * budget)`. `normalize_timeframe` is what every other consumer uses -
+    # `execution_timing._timeframe_seconds` routes through it - so the two halves of the same signal
+    # path disagreed on what `M1` means. Two spellings of one timeframe must not buy two policies.
+    normalized = normalize_timeframe(timeframe)
+    seconds_by_timeframe = {
+        "1m": 60.0,
+        "5m": 300.0,
+        "15m": 900.0,
+        "30m": 1800.0,
+        "1h": 3600.0,
+        "4h": 14400.0,
+        "1d": 86400.0,
+        "1w": 604800.0,
+    }
+    return seconds_by_timeframe.get(normalized, 300.0)
+
+
+def _validate_signal_age_before_wait(
+    signal: TradeSignal,
+    deployment: LiveDeploymentConfig,
+    *,
+    timeframe: str,
+    require_producer_timestamp: bool,
+) -> None:
+    """Fail closed on a signal that is already too old to trade.
+
+    The candle-close wait can span minutes, so a signal that arrives stale (or
+    with no producer timestamp at all) would otherwise be executed at the
+    candle-close price on information that is no longer valid. The budget scales
+    with the deployment's signal timeframe unless the operator pinned
+    ``max_signal_age_seconds``.
+
+    ``require_producer_timestamp`` is a required keyword, not a default, so a
+    new caller has to state its policy instead of inheriting one. It is passed
+    by :func:`_submit_normalized_discord_signal`, which is already *the*
+    Discord path -- the source is known at the call site, so the gate must not
+    re-derive it from ``metadata["source"]``. It used to: the Discord producer
+    writes ``"discord"`` at parse time and then overwrites it with
+    ``f"discord_{bot_name.lower()}"`` (``discord_nitro``), so an exact
+    comparison against ``"discord"`` never matched production and the
+    fail-closed branch was dead code. A signal whose age cannot be established
+    was then passed on to the processor and to ``submit_order`` unvalidated for
+    every timeframe :func:`signal_is_fresh` cannot parse (``tick``, ``daily``,
+    ``m5``), because that gate returns "fresh" when it has no budget at all.
+    """
+    metadata = signal.metadata or {}
+    received_raw = str(metadata.get("received_at") or "").strip()
+    if not received_raw:
+        if require_producer_timestamp:
+            raise ValueError("Discord signal is missing received_at")
+        return
+    try:
+        received_at = datetime.fromisoformat(received_raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Discord signal has an invalid received_at timestamp") from exc
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    configured = (deployment.signal_config or {}).get("max_signal_age_seconds")
+    if configured is None:
+        max_age = max(300.0, 2.0 * _timeframe_age_budget_seconds(timeframe))
+    else:
+        # Through the shared coercer: a boolean or a non-finite value is a config
+        # error, not a budget. `float(True)` silently means one second.
+        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
+    if max_age <= 0:
+        raise ValueError("max_signal_age_seconds must be positive")
+    age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
+    if age_seconds < -300:
+        raise ValueError("Discord signal timestamp is more than 5 minutes in the future")
+    if age_seconds > max_age:
+        raise ValueError(
+            f"Discord signal is stale: age={age_seconds:.1f}s exceeds {max_age:.1f}s"
+        )
 
 
 def _build_processor_market_data(
@@ -1222,20 +1339,63 @@ def _deployment_service_name(deployment: LiveDeploymentConfig) -> str:
 def _resolve_account_discord_token(
     accounts_env_values: Mapping[str, str],
     deployment: LiveDeploymentConfig,
-) -> str:
+) -> tuple[str, str]:
+    """Return the deployment's Discord token and the key it came from.
+
+    The source key matters as much as the token: a token found under a per-bot
+    key is configured with that bot's auth scheme, while one falling back to the
+    global ``DISCORD_BOT_TOKEN`` is configured with the global scheme. Sending a
+    per-bot scheme with a global token is a 401.
+    """
     service_name = _deployment_service_name(deployment)
     token_env_key = ""
     if service_name:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
-    discord_token = ""
+        canonical_name = discord_bot_env_canonical_name(service_name)
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     if token_env_key:
-        _resolved = resolve_env_value(accounts_env_values, token_env_key)
-        if _resolved:
-            discord_token = _resolved
-    if not discord_token:
-        discord_token = resolve_env_value(accounts_env_values, "DISCORD_BOT_TOKEN")
-    return discord_token
+        per_bot_token = resolve_env_value(accounts_env_values, token_env_key)
+        if per_bot_token:
+            return per_bot_token, token_env_key
+    global_token = resolve_env_value(accounts_env_values, "DISCORD_BOT_TOKEN")
+    if global_token:
+        return global_token, "DISCORD_BOT_TOKEN"
+    return "", ""
+
+
+def _resolve_account_discord_credentials(
+    accounts_env_values: Mapping[str, str],
+    deployment: LiveDeploymentConfig,
+) -> tuple[str, str]:
+    """Resolve a deployment's Discord token and auth scheme together.
+
+    Both must be keyed by the same service name. Resolving them separately let
+    the token fall back to `signal_config["service_name"]` while the scheme read
+    `signal_source_id` alone, so an id-less deployment found its token but sent a
+    `Bot` header for an account token and got a 401. Returning both from one
+    place makes that split unrepresentable.
+    """
+    token, token_source_key = _resolve_account_discord_token(
+        accounts_env_values, deployment
+    )
+    # An operator who pinned the scheme on the deployment has said so out loud;
+    # that beats any inferred scope. Otherwise the credential decides.
+    override = _deployment_discord_auth_scheme(deployment)
+    if override:
+        return token, override
+    if not token:
+        return "", _resolve_discord_auth_scheme(
+            _deployment_service_name(deployment), accounts_env_values
+        )
+    # The scheme is a property of the credential, not of the deployment, so it
+    # must be read from the scope the token actually came from. Only the global
+    # fallback needs special handling: a per-bot token was found under a key
+    # derived from this deployment's service name, which is exactly the scope
+    # `_resolve_discord_auth_scheme` already reads.
+    if token_source_key == "DISCORD_BOT_TOKEN":
+        return token, _resolve_discord_auth_scheme("", accounts_env_values)
+    return token, _resolve_discord_auth_scheme(
+        _deployment_service_name(deployment), accounts_env_values
+    )
 
 
 def _deployment_covers_discord_symbol(
@@ -1244,6 +1404,13 @@ def _deployment_covers_discord_symbol(
 ) -> bool:
     deployment_symbols = {item.upper() for item in deployment.symbols}
     return not deployment_symbols or symbol.upper() in deployment_symbols
+
+
+def _split_env_id_list(raw: object) -> set[str]:
+    """Split a comma/whitespace-separated env ID list into an ID set."""
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
 
 
 def _resolve_discord_service_trusted_author_ids(
@@ -1259,15 +1426,38 @@ def _resolve_discord_service_trusted_author_ids(
     )
     if direct:
         return direct
-    env_key = _service_config_string(config, "trusted_author_ids_env_key") or (
-        "DISCORD_TRUSTED_AUTHOR_IDS"
-    )
-    raw_env = resolve_env_value(accounts_env_values, env_key)
+    env_key = _service_config_string(config, "trusted_author_ids_env_key")
+    if not env_key:
+        # Per-bot first, matching DISCORD_BOT_<NAME>_TOKEN / _CHANNEL_ID. Without
+        # it every bot falls back to the single shared DISCORD_TRUSTED_AUTHOR_IDS,
+        # so each one trusts the *other* bots' authors: RocketFuel's bot posting
+        # in Nitro's channel would be accepted and could trade Nitro. The shared
+        # var stays as the fallback for single-bot setups.
+        # Through the canonicalisation helper, as `discord_bot_env_canonical_name`
+        # requires of every per-bot key. Building it by hand meant a service named
+        # `NITRO-BOT` looked for a variable the operator could never have set, found
+        # nothing, and silently fell back to the shared list - i.e. it fell open to
+        # exactly the cross-bot trust the per-bot var exists to prevent, with no
+        # log line. The deployment path already did this, so one variable resolved
+        # two different ways in the same file.
+        env_key = discord_bot_env_key(service.name, "TRUSTED_AUTHOR_IDS")
+    # Presence is tested against the mapping directly, not via
+    # `resolve_env_value`, which returns "" for both an absent key and a
+    # present-but-blank one - so a truthiness test cannot tell "this bot trusts
+    # nobody" from "not configured", and the empty case used to fall through to
+    # the shared list. That widened Nitro to all three bots' authors, and
+    # inconsistently: `...,` was truthy and failed closed while `` was falsy and
+    # opened up, so the safe configuration was unreachable.
+    #
+    # Deliberately does not consult os.environ. This is an allowlist, and an
+    # inherited process variable must not silently become one.
+    if accounts_env_values is not None and env_key in accounts_env_values:
+        per_bot = str(accounts_env_values.get(env_key) or "").strip()
+        return _trusted_author_ids_from_config(_split_env_id_list(per_bot))
+    raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
     if not raw_env:
         return set()
-    return _trusted_author_ids_from_config(
-        item.strip() for item in raw_env.split(",") if item.strip()
-    )
+    return _trusted_author_ids_from_config(_split_env_id_list(raw_env))
 
 
 async def _renew_submission_claim_until_cancelled(token: str) -> None:
@@ -1303,15 +1493,22 @@ async def _renew_submission_claim_until_cancelled(token: str) -> None:
             return
 
 
-async def _submit_normalized_discord_signal(
+async def _prepare_discord_signal_for_submission(
     account_id: str,
-    adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     trade_signal: TradeSignal,
     *,
     signal_timeframe: str,
     wait_enabled: bool,
-) -> None:
+) -> TradeSignal | None:
+    """Apply the pre-wait gates and, when enabled, the candle-close wait.
+
+    Returns the normalised signal to submit, or ``None`` when a gate refused it.
+    Every refusal is logged with the account/deployment/symbol it applies to and
+    returns ``None`` rather than raising: these signals are dispatched in a
+    fan-out loop, and letting one deployment's bad config propagate would tear
+    down the account's whole listener and lose the rest of the poll batch.
+    """
     # B2 (owner decision): stale signals trade immediately on outdated
     # information — discard anything older than one deployment-timeframe
     # candle instead.
@@ -1327,7 +1524,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     normalized_signal = TradeSignal(
         action=trade_signal.action,
         symbol=trade_signal.symbol,
@@ -1338,6 +1535,18 @@ async def _submit_normalized_discord_signal(
         metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
     )
     try:
+        # Fail closed on an already-stale signal BEFORE the candle-close wait:
+        # the wait can span minutes, so a signal older than the timeframe-aware
+        # budget would otherwise be executed at the candle-close price on
+        # information that has already expired.
+        _validate_signal_age_before_wait(
+            normalized_signal,
+            deployment,
+            timeframe=signal_timeframe,
+            # This function is the Discord dispatch path; the source is known
+            # here, so the gate is told rather than made to sniff metadata.
+            require_producer_timestamp=True,
+        )
         normalized_signal = _apply_signal_processor(normalized_signal, deployment)
     except ValueError as exc:
         logger.warning(
@@ -1351,12 +1560,32 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if wait_enabled:
-        await wait_for_candle_close(
-            normalized_signal,
-            normalized_signal.timeframe or signal_timeframe,
-        )
+        try:
+            await wait_for_candle_close(
+                normalized_signal,
+                normalized_signal.timeframe or signal_timeframe,
+            )
+        except ValueError as exc:
+            # An unrecognised timeframe is a configuration error, not a reason to
+            # trade immediately: `wait_for_candle_close` refuses rather than
+            # silently skipping the wait. Skip this deployment's signal and keep
+            # the listener alive - letting it propagate would tear down the whole
+            # account's source and lose the rest of the poll batch.
+            logger.warning(
+                "Skipping discord signal: candle-close wait refused the timeframe",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                        "signal_timeframe": signal_timeframe,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return None
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
@@ -1374,7 +1603,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
         logger.info(
             "Skipping discord signal: aged out during candle-close wait",
@@ -1386,7 +1615,29 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
+        return None
+    return normalized_signal
+
+
+async def _submit_normalized_discord_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+    *,
+    signal_timeframe: str,
+    wait_enabled: bool,
+) -> None:
+    prepared = await _prepare_discord_signal_for_submission(
+        account_id,
+        deployment,
+        trade_signal,
+        signal_timeframe=signal_timeframe,
+        wait_enabled=wait_enabled,
+    )
+    if prepared is None:
         return
+    normalized_signal = prepared
 
     try:
         live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
@@ -1541,6 +1792,8 @@ async def _submit_normalized_discord_signal(
 def _deployment_accepts_signal_author(
     deployment: LiveDeploymentConfig,
     signal_author_id: str,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     """Per-deployment author gate applied at dispatch time.
 
@@ -1549,13 +1802,31 @@ def _deployment_accepts_signal_author(
     is submitted, the signal must also satisfy the target deployment's own
     allowlist so a deployment cannot trade on an author another deployment
     trusted.
+
+    `accounts_env_values` must be threaded in. The call used to omit it, so the
+    resolver fell back to `os.environ` - and `.accounts.env` is never installed
+    there, only read into a mapping. The allowlist therefore resolved empty, the
+    empty case was treated as "no restriction", and this gate was **inert**: it
+    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
+    was not running, silently, in the documented production config.
     """
-    allowlist = _deployment_trusted_author_ids(deployment)
+    allowlist = _deployment_trusted_author_ids(
+        deployment, accounts_env_values=accounts_env_values
+    )
     if not allowlist:
-        # The listener refuses to start without any allowlist, so a deployment
-        # without its own one inherits the channel-merged set; refusing here
-        # would dead-lock signals for deployments relying on that merge.
-        return True
+        # Fail closed. An empty allowlist means "this deployment trusts nobody": either
+        # the operator set a blank `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS` (documented as
+        # trust-nobody) or nothing resolved at all. It must NOT mean "accept anyone": the
+        # listener's channel-merged set contains every deployment's authors, so letting an
+        # allowlist-less deployment inherit it would let bot Y's author trade on bot X's
+        # deployment - exactly what the per-bot allowlist exists to prevent. A deployment
+        # that should trade must carry its own allowlist.
+        logger.warning(
+            "Skipping discord signal: deployment has no trusted author allowlist "
+            "(unset or blank means it trusts nobody)",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return False
     if not signal_author_id:
         # No author metadata (e.g. internal replay): the ingestion gate already
         # decided authorship for live Discord signals; do not re-block here.
@@ -1606,43 +1877,109 @@ def _deployment_trusted_author_ids(
     )
     if direct:
         return direct
-    if accounts_env_values is not None:
-        env_source: Mapping[str, str] = accounts_env_values
-    else:
-        env_source = os.environ
+    # No fallback to os.environ, deliberately.
+    #
+    # `.accounts.env` is read into a mapping and never installed into the process
+    # environment, so an `os.environ` fallback resolves nothing here: the
+    # allowlist comes back empty, and `_deployment_accepts_signal_author` treats
+    # empty as "no restriction" and returns True. That is the exact shape of the
+    # inert-gate bug fixed in 8d8a3c3, one layer up - a gate that resolves
+    # nothing and reports success. The service path refuses os.environ for the
+    # same reason; this one now does too.
+    #
+    # All three production call sites pass the mapping, so this branch is
+    # unreachable today. It is here to be loud if a future caller forgets, rather
+    # than quietly permissive.
+    if accounts_env_values is None:
+        logger.error(
+            "Discord author allowlist requested without the accounts env; "
+            "refusing to fall back to the process environment, which never "
+            "contains it",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return set()
+    env_source: Mapping[str, str] = accounts_env_values
     service_name = _deployment_service_name(deployment)
     if service_name:
-        canonical = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
-        per_service_key = f"DISCORD_BOT_{canonical}_TRUSTED_AUTHOR_IDS"
-        per_service = _trusted_author_ids_from_config(
-            _split_env_id_list(env_source.get(per_service_key, ""))
-        )
-        if per_service:
-            return per_service
+        # Through the canonicalisation helper, as its own docstring requires of
+        # every per-bot key. This one was built by hand, so a name that kept its
+        # punctuation would look for a variable no operator could set and fall
+        # through to the shared list.
+        per_service_key = discord_bot_env_key(service_name, "TRUSTED_AUTHOR_IDS")
+        # Presence, not truthiness. A blank per-bot var means "this bot trusts
+        # nobody", and it must NOT fall through to the shared list: that widened
+        # Nitro to all three bots' authors, so the fail-closed configuration was
+        # unreachable from here - while the *service* path, fixed in 626e485,
+        # correctly returned empty for the same input. Same allowlist, two
+        # answers, on the path all three live deployments use.
+        if per_service_key in env_source:
+            return _trusted_author_ids_from_config(
+                _split_env_id_list(env_source.get(per_service_key, ""))
+            )
     return _trusted_author_ids_from_config(
         _split_env_id_list(env_source.get("DISCORD_TRUSTED_AUTHOR_IDS", ""))
     )
 
 
-def _split_env_id_list(raw: object) -> set[str]:
-    """Split a comma/whitespace-separated env ID list into an ID set."""
-    if not isinstance(raw, str) or not raw.strip():
-        return set()
-    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+DEFAULT_DISCORD_AUTH_SCHEME = "raw"
+_DISCORD_AUTH_SCHEME_VOCABULARY = ("raw", "account", "bot")
+
+
+def _resolve_discord_auth_scheme(
+    bot_name: str,
+    accounts_env_values: Mapping[str, str],
+) -> str:
+    """Resolve the Discord credential type for a bot service.
+
+    File-first like every other credential: ``DISCORD_BOT_<NAME>_AUTH_SCHEME``
+    then the global ``DISCORD_AUTH_SCHEME``, each falling back to the process
+    environment, defaulting to ``raw`` (the recorded operator default — the
+    unconfigured case is an account/user credential, not a bot one). ``raw`` and
+    ``account`` name the same credential kind, so both are accepted. Bot and
+    account tokens are not interchangeable, so an unknown value must never be
+    guessed: it raises. The per-bot key is built with the same canonicalisation
+    as the token key, otherwise a punctuated service name would read a key
+    nobody can configure.
+    """
+    canonical_name = discord_bot_env_canonical_name(bot_name)
+    per_bot_keys = (
+        (discord_bot_env_key(canonical_name, "AUTH_SCHEME"),) if canonical_name else ()
+    )
+    for key in (*per_bot_keys, "DISCORD_AUTH_SCHEME"):
+        resolved = resolve_env_value(accounts_env_values, key).strip().lower()
+        if not resolved:
+            continue
+        if resolved not in _DISCORD_AUTH_SCHEME_VOCABULARY:
+            raise ValueError(
+                f"Unsupported Discord auth_scheme {resolved!r} for {bot_name or 'global'}; "
+                f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
+            )
+        return resolved
+    return DEFAULT_DISCORD_AUTH_SCHEME
 
 
 def _deployment_discord_auth_scheme(deployment: LiveDeploymentConfig) -> str:
-    """Return this deployment's discord auth scheme (#81: raw|bot, default raw)."""
+    """Return this deployment's explicit auth-scheme override, if any.
+
+    The scheme is fundamentally a property of the *credential*, not of the
+    deployment, so an unconfigured deployment returns ``""`` and the caller
+    falls through to the credential-scoped resolution in
+    :func:`_resolve_discord_auth_scheme`. Only an operator who pinned
+    ``discord_auth_scheme`` on the deployment or its settings overrides that.
+    """
     configured = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
     settings = deployment.settings if isinstance(deployment.settings, dict) else {}
     raw = str(
         configured.get("discord_auth_scheme")
         or settings.get("discord_auth_scheme")
-        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
+        or ""
     ).strip().lower()
-    if raw not in ("raw", "bot"):
+    if not raw:
+        return ""
+    if raw not in _DISCORD_AUTH_SCHEME_VOCABULARY:
         raise ValueError(
-            f"Unknown discord_auth_scheme {raw!r}; expected 'raw' or 'bot'."
+            f"Unknown discord_auth_scheme {raw!r}; expected one of "
+            f"{', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
         )
     return raw
 
@@ -1660,14 +1997,24 @@ async def _dispatch_discord_trade_signal(
     # channel/symbol — the one that traded was picked by DB row order.
     signal_author_id = str(trade_signal.metadata.get("discord_author_id", "")).strip().lower()
     dispatched_to_any = False
+    # Resolve the broker-reported account number once: routing must be validated
+    # against broker identity, not the local account id.
+    account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
         if not _deployment_is_currently_active(deployment):
             continue
-        if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+        if not _deployment_matches_stockkit_route(
+            deployment,
+            trade_signal.metadata,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        ):
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue
-        if not _deployment_accepts_signal_author(deployment, signal_author_id):
+        if not _deployment_accepts_signal_author(
+            deployment, signal_author_id, accounts_env_values=accounts_env_values
+        ):
             logger.debug(
                 "Skipping discord signal: author not in deployment allowlist",
                 extra={
@@ -1717,6 +2064,31 @@ async def _dispatch_discord_trade_signal(
                 }
             },
         )
+
+
+def _service_id_for_discord_deployment(deployment: LiveDeploymentConfig) -> str | None:
+    """The service row a deployment's Discord listener should report through.
+
+    Joins on the deployment's service name, canonicalised the same way service
+    discovery names the rows it creates, so both sides derive the key from one
+    rule instead of two that can drift.
+
+    Returns None when there is no unique match. It deliberately does not create a
+    row, and does not fall back to "the first discord service": two services for
+    one bot, or none, must not silently attach this listener to the wrong bot's
+    status. No observability is recoverable; a wrong status is not.
+    """
+    name = discord_bot_env_canonical_name(_deployment_service_name(deployment))
+    if not name:
+        return None
+    matches = [
+        service
+        for service in list_services(service_type=ServiceType.DISCORD_BOT)
+        if discord_bot_env_canonical_name(service.name) == name
+    ]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].id)
 
 
 async def _run_discord_signal_listener_for_account(
@@ -1772,15 +2144,25 @@ async def _run_discord_signal_listener_for_account(
             },
         )
         return
+    # Token and auth scheme must come from the same credential scope, so they
+    # are resolved together (see `_resolve_account_discord_credentials`).
+    discord_token, discord_auth_scheme = _resolve_account_discord_credentials(
+        accounts_env_values,
+        primary_deployment,
+    )
     source = DiscordSignalSource(
-        token=_resolve_account_discord_token(
-            accounts_env_values,
-            primary_deployment,
-        ),
+        token=discord_token,
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
-        auth_scheme=_deployment_discord_auth_scheme(primary_deployment),
+        auth_scheme=discord_auth_scheme,
+        # Without this the deployment path could not report a mis-set allowlist
+        # at all: `_set_service_status` returns immediately when service_id is
+        # empty, so a5a76ad's streak alert had nowhere to write and the wrong
+        # allowlist stayed invisible on the path that all three live deployments
+        # actually use. Resolved, never created - a deployment with no matching
+        # service row simply gets no observability, which is the safe direction.
+        service_id=_service_id_for_discord_deployment(primary_deployment),
     )
     await source.connect()
     try:
@@ -1999,8 +2381,8 @@ def _resolve_discord_bot_runtime(
     config = service.config if isinstance(service.config, dict) else {}
     token_env_key = _service_config_string(config, "token_env_key")
     if not token_env_key:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", str(service.name or "").upper())
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+        canonical_name = discord_bot_env_canonical_name(service.name)
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     token = resolve_env_value(accounts_env_values, token_env_key)
     channel_id = _service_config_string(config, "channel_id")
     return token_env_key, token, channel_id
@@ -2335,14 +2717,33 @@ async def _sync_running_discord_bot(
         )
         return
     service_config = service.config if isinstance(service.config, dict) else {}
-    auth_scheme = str(
-        service_config.get("discord_auth_scheme")
-        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
-    ).strip().lower()
-    if auth_scheme not in ("raw", "bot"):
+    # The scheme belongs to the credential, so it is resolved from the same
+    # per-bot scope the token key uses; an explicit per-service override still
+    # wins. `_resolve_discord_auth_scheme` validates the vocabulary and raises on
+    # an unknown value rather than guessing between account and bot tokens.
+    try:
+        override = str(service_config.get("discord_auth_scheme") or "").strip().lower()
+        if override and override not in _DISCORD_AUTH_SCHEME_VOCABULARY:
+            # An explicit override is not exempt from the vocabulary: a typo must
+            # fail the service, not reach the source and be rejected there with a
+            # different error (or, worse, be guessed).
+            raise ValueError(
+                f"Unsupported Discord auth_scheme {override!r} for {service.name!r}; "
+                f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
+            )
+        auth_scheme = override or _resolve_discord_auth_scheme(
+            service.name, accounts_env_values
+        )
+    except ValueError as exc:
         logger.warning(
             "Discord service has unknown discord_auth_scheme",
-            extra={"data": {"service_id": service_id, "auth_scheme": auth_scheme}},
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "error": str(exc),
+                }
+            },
         )
         await asyncio.to_thread(
             update_service_status,
