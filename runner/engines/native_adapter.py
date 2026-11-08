@@ -10,6 +10,7 @@ import pandas as pd
 from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
+from runner.engines._drawings import _normalize_drawings
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -166,10 +167,14 @@ class NativeAdapter(EngineAdapter):
             symbol_result = engine.run(data, strategy_module.generate_signals)
 
             all_trades.extend(symbol_result.trades)
-            for drawing in symbol_result.drawings:
-                payload = dict(drawing)
-                payload.setdefault("symbol", symbol)
-                all_drawings.append(payload)
+            # Normalize exactly as the vectorbt adapter does. The native engine
+            # stores the strategy's drawings verbatim, so a strategy that puts a
+            # pandas Timestamp in `time` (the obvious thing to write) produced a
+            # payload that raised "Object of type Timestamp is not JSON
+            # serializable" the moment the result was persisted.
+            all_drawings.extend(
+                _normalize_drawings(symbol_result.drawings, symbol=symbol)
+            )
 
         all_trades.sort(key=lambda trade: (trade.entry_time, trade.id))
         for index, trade in enumerate(all_trades, start=1):

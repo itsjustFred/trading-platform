@@ -875,6 +875,77 @@ class TradeEngine:
             return None, None
         return resolve_ask_high_low(row, self._bar_spread(row))
 
+    def _record_bar_excursion(
+        self,
+        position: Position,
+        row: pd.Series,
+        *,
+        favorable_cap: float | None = None,
+        adverse_cap: float | None = None,
+    ) -> None:
+        """Record this bar's maximum favourable and adverse excursion.
+
+        `favorable_cap` and `adverse_cap` bound one side each. They are supplied
+        only for stop and take-profit exits, because those fills are levels
+        *inside* the bar: movement past the level never belonged to the position, and
+        crediting it overstates MFE on a take-profit and MAE on a stop - on exactly
+        the trades where the exit determined the outcome.
+
+        **Capping both sides at once is worse than not capping at all**, and the
+        first version of this fix did exactly that by clamping the bar symmetrically
+        to the fill. Measured on a LONG whose bar ran 90 to 115 with entry near 100:
+
+            take-profit at 110: MFE correctly capped at +5000, but MAE reported
+                -500 when the bar's low alone is -5000
+            stop at 95:         MAE correctly capped at -1000, but MFE reported
+                +200 when the bar's high alone is +3000
+
+        Every stop-out then reports a near-zero MFE and every take-profit a near-zero
+        MAE, so each trade looks like a monotone excursion and the two metrics stop
+        carrying independent information - the bias traded places instead of going
+        away. The bar's other side is real: under the engine's own intrabar model
+        the position traded there before the exit level was reached, and discarding
+        that is the same error pointed the other way.
+
+        Two caps can be in force at once, and both are correct: a bar can fill
+        several take-profit levels and then stop out the remainder. The caller
+        passes the *furthest level it actually reached* as the favourable cap and
+        the stop as the adverse cap; anything past either never belonged to the
+        position.
+
+        A signal or time exit is deliberately not clamped at all. It fills at the
+        bar's close under Fill-zum-Trigger-Close, so the position existed for the
+        whole bar and the bar's range genuinely is its excursion;
+        `test_trade_engine_mae_includes_signal_exit_bar_excursion` pins that, and it
+        is a decision rather than an oversight. The cap follows the engine's own exit
+        model: the price passed in is the same fill the close uses, spread
+        convention included, so excursion and exit cannot disagree.
+        """
+        qty = float(position.remaining_qty)
+        if qty <= 0:
+            return
+        if position.direction == "LONG":
+            high = float(row["high"])
+            low = float(row["low"])
+            if favorable_cap is not None:
+                high = min(high, favorable_cap)
+            if adverse_cap is not None:
+                low = max(low, adverse_cap)
+            favorable = (high - position.entry_price) * qty
+            adverse = (low - position.entry_price) * qty
+        else:
+            ask_high, ask_low = self._ask_bar(row)
+            ref_high = ask_high if ask_high is not None else float(row["high"])
+            ref_low = ask_low if ask_low is not None else float(row["low"])
+            if favorable_cap is not None:
+                ref_low = max(ref_low, favorable_cap)
+            if adverse_cap is not None:
+                ref_high = min(ref_high, adverse_cap)
+            favorable = (position.entry_price - ref_low) * qty
+            adverse = (position.entry_price - ref_high) * qty
+        position.mfe = max(position.mfe, favorable)
+        position.mae = min(position.mae, adverse)
+
     def _check_stops(
         self,
         row: pd.Series,
@@ -940,6 +1011,57 @@ class TradeEngine:
                 first_event = "stop"
             elif tp_hit:
                 first_event = "tp"
+
+            # The excursion for this bar is recorded once the exit event is known, so
+            # a stop or take-profit exit is credited only as far as it actually got.
+            # A position that stays open (first_event is None) keeps full-bar
+            # recording.
+            #
+            # One cap per side, because a bar can do both: fill several take-profit
+            # levels and then stop out whatever is left. The favourable cap is the
+            # *furthest level actually reached*, not the first pending one - a
+            # two-level ladder at 105 and 115 that fills both is credited with 115,
+            # and using the first level understated MFE five-fold on exactly the
+            # trades the cap exists to describe correctly. The adverse cap is the
+            # stop, but only when a stop actually fires for the remainder.
+            excursion_favorable_cap: float | None = None
+            excursion_adverse_cap: float | None = None
+            if first_event == "stop" and position.stop_loss is not None:
+                excursion_adverse_cap = float(position.stop_loss)
+                if position.direction != "LONG":
+                    excursion_adverse_cap += self._bar_spread(row)
+            elif first_event == "tp":
+                spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
+                reached = [
+                    float(level["price"])
+                    for level in pending_tp
+                    if (
+                        bar_high >= float(level["price"])
+                        if position.direction == "LONG"
+                        else bar_low <= float(level["price"])
+                    )
+                ]
+                if reached:
+                    furthest = (
+                        max(reached) if position.direction == "LONG" else min(reached)
+                    )
+                    excursion_favorable_cap = furthest + spread
+                # A ladder that does not close the whole position leaves a
+                # remainder, and the loop below stops it out. That part of the
+                # position exited at the stop, so the adverse side is capped too.
+                # Gated on a stop actually existing, unlike the favourable cap -
+                # gating the whole block on one made a take-profit with no stop
+                # configured record the full bar.
+                if stop_hit and position.stop_loss is not None:
+                    excursion_adverse_cap = float(position.stop_loss)
+                    if position.direction != "LONG":
+                        excursion_adverse_cap += self._bar_spread(row)
+            self._record_bar_excursion(
+                position,
+                row,
+                favorable_cap=excursion_favorable_cap,
+                adverse_cap=excursion_adverse_cap,
+            )
 
             if first_event == "stop" and position.stop_loss is not None:
                 # D4 (Phase 3, A-M1 exit convention): the unified convention

@@ -99,9 +99,31 @@ by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
 
-**Pinned by:** `tests/test_stats.py` (existing suite, green on both paths) —
-the QS and fallback formulas now provably share the total_return/Calmar
-computation.
+**Daily series includes the first trading day.** The daily equity build writes
+an inception point at the window start (00:00) and a close at
+`23:59:59.999999` of every day. Resampling to the *last* observation of each
+calendar day therefore dropped the inception point whenever its day also
+carried a close, so the first day's return never reached the series: three
+trading days produced two daily returns, a first-day loss vanished, and
+Sharpe/Sortino/PSR came out too high by an amount that depended on whether day
+one happened to be a loss. The curve's first observation is that day's opening
+equity and is now the base of its return; a day carrying a single observation
+still yields no return rather than a synthetic flat one.
+
+`daily_returns[*].equity` and the matching `EquityPoint.equity` are both
+cent-quantised, so the two published views describe the same number at the same
+instant instead of differing by up to half a cent per row. The running balance
+itself stays exact — only the reported values are rounded — so a long window
+does not accumulate a quantisation drift that would push its endpoint outside
+the reconciliation gate, and each `return` is computed from the exact balance
+before it is published beside the rounded equity.
+
+**Pinned by:** `tests/test_stats.py` (existing suite, green on both paths — the
+QS and fallback formulas provably share the total_return/Calmar computation),
+plus `TestFirstTradingDayReturn` (3 trading days ⇒ 3 returns with the first-day
+loss included; Sharpe and Sortino strictly lower than the collapsed series) and
+`TestComputeStats::test_intraday_sharpe_uses_daily_returns_not_bar_density` (one
+return per trading day, including the first).
 
 ## D6 — Risk-parity covariance uses asset prices first (F30)
 
@@ -278,6 +300,51 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on daily
+  returns, on both code paths. When the equity curve's timestamps cannot be
+  parsed the observation spacing is unknown, so the annualisation factor is
+  unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
+  published as `0.0`, the repo's convention for an undefined metric) and
+  `extras.equity_return_frequency` carries the reason
+  (`unknown:unparseable_equity_timestamps`). The p-value is a t-test on the raw
+  observation returns, independent of the period, and stays defined.
+  History: that path first passed `annualization_factor=1.0`, publishing a
+  per-observation ratio under the name "Sharpe" (a daily 3.2 reported as 0.20);
+  an intermediate fix annualised the raw bars with `sqrt(252)` on the unstated
+  assumption that they were daily, which overstates hourly bars and understates
+  weekly ones with nothing in the payload to say so. Declaring the ratios
+  undefined is the only answer that does not publish a guessed number.
+- A *reconciling* engine curve is compacted to one point per **calendar** day,
+  not per observed day. A curve that observed only 01-05, 01-08 and 01-09
+  produced three returns for an eight-day window, so a multi-day move was
+  annualised as if it had happened in one day (~2x here, and the factor grew
+  with the gap). `daily_equity_curve` and `daily_return_count` now describe the
+  same window as the calendar fill, with an explicit flat point for every day
+  the engine did not observe. Artifacts that compare `daily_return_count`
+  across code generations are not comparable.
+  The first day of the window is a day like any other: a ten-day window
+  publishes ten returns on either path (an earlier engine-path build anchored
+  its gap fill on the opening midnight and published nine, which moved Sharpe,
+  Sortino and PSR with whichever path adopted the curve). The opening point and
+  the first day's close are distinct instants (the close is stamped one
+  microsecond after the opening point when the engine stamps it at the same
+  midnight), so no timestamp is published twice, and
+  `daily_returns[i]["equity"]` is the cent-quantised value of the matching
+  curve point on both paths.
+- The reconciliation gate grows with the trade count, so an adopted engine
+  curve can legitimately sit a few dollars from the ledger on a long run. The
+  accepted drift is published as `meta.data["engine_curve_reconciliation"]`
+  (`expected_final_equity`, `engine_final_equity`, signed `drift`, `tolerance`,
+  `trade_count`) instead of being absorbed silently.
+- The engine-curve-vs-trades reconciliation gate is no longer a flat `$0.05`.
+  It is `max(n·one cent, 8·n·2⁻⁵²·|expected|)` — derived from the cent
+  quantisation the equity arithmetic actually performs, plus the float64
+  accumulation term that grows with the account. Curves that were off by cents
+  of accumulated per-trade rounding are now preserved instead of silently
+  discarded; the endpoint-only rejection is unchanged. The two terms are
+  combined with `max`, not addition, so a single-trade run keeps the absolute
+  one-cent cliff: the per-trade cent already contains that trade's own
+  endpoint quantisation.
 
 If a fresh run's metrics disagree with a persisted pre-16-D1 artifact, this
 is the expected cause — re-run comparisons within one code generation.

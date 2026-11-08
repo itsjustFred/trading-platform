@@ -588,6 +588,18 @@ def _row_group_edge_timestamp(
     return None if pd.isna(parsed) else pd.Timestamp(parsed)
 
 
+def ohlcv_timestamp_bounds(path: Path | str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Public entry point for :func:`_parquet_timestamp_bounds`.
+
+    Returns ``(first_timestamp, last_timestamp)`` of a stored OHLCV parquet, or
+    None when the bounds cannot be established (unreadable file, no timestamp
+    column, no rows). Callers that need to know *when* a symbol's data exists —
+    e.g. the universe provenance / survivorship diagnostic — read the bounds
+    through this name; None means "unknown", never "no data".
+    """
+    return _parquet_timestamp_bounds(Path(path))
+
+
 def _parquet_timestamp_bounds(path: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     """Read the min/max timestamp of a parquet without materializing the column.
 
