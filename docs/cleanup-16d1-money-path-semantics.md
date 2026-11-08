@@ -323,6 +323,20 @@ this code (older persisted artifacts keep their original numbers):
   same window as the calendar fill, with an explicit flat point for every day
   the engine did not observe. Artifacts that compare `daily_return_count`
   across code generations are not comparable.
+  The first day of the window is a day like any other: a ten-day window
+  publishes ten returns on either path (an earlier engine-path build anchored
+  its gap fill on the opening midnight and published nine, which moved Sharpe,
+  Sortino and PSR with whichever path adopted the curve). The opening point and
+  the first day's close are distinct instants (the close is stamped one
+  microsecond after the opening point when the engine stamps it at the same
+  midnight), so no timestamp is published twice, and
+  `daily_returns[i]["equity"]` is the cent-quantised value of the matching
+  curve point on both paths.
+- The reconciliation gate grows with the trade count, so an adopted engine
+  curve can legitimately sit a few dollars from the ledger on a long run. The
+  accepted drift is published as `meta.data["engine_curve_reconciliation"]`
+  (`expected_final_equity`, `engine_final_equity`, signed `drift`, `tolerance`,
+  `trade_count`) instead of being absorbed silently.
 - The engine-curve-vs-trades reconciliation gate is no longer a flat `$0.05`.
   It is `max(n·one cent, 8·n·2⁻⁵²·|expected|)` — derived from the cent
   quantisation the equity arithmetic actually performs, plus the float64
