@@ -347,6 +347,23 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
+def _deal_commission(deal: Any | None) -> float:
+    """A deal's commission in account currency.
+
+    ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
+    ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
+    integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
+    commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
+    only a real charge can trigger the "digits missing" fallback warning.
+    """
+    if deal is None:
+        return 0.0
+    raw = _to_float(getattr(deal, "commission", 0))
+    if raw == 0.0 or not math.isfinite(raw):
+        return 0.0
+    return raw / money_scale(money_digits_from_trader(deal))
+
+
 _NOT_AUTHORIZED_MARKER = "not authorized"
 
 #: `str()` of the exception cTrader's client raises on a response timeout:
@@ -1821,6 +1838,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
         return details_res
 
+    def _reconciled_deal_symbol(
+        self, deal: Any, *, broker_order_id: str, order: Any | None
+    ) -> str | None:
+        """The symbol a reconciled deal trades, or ``None`` when it cannot be determined."""
+        deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
+        if not deal_symbol_id and order is not None:
+            deal_symbol_id = int(getattr(order, "symbolId", 0) or 0)
+        deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
+        if deal_symbol is None:
+            try:
+                deal_symbol = self._order_id_to_symbol.get(int(broker_order_id))
+            except (TypeError, ValueError):
+                deal_symbol = None
+        return deal_symbol
+
     def _build_reconciled_execution(
         self,
         deal: Any,
@@ -1844,15 +1876,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # Unit contract: persist filled_qty in qty units (broker volume per
         # the symbol scale, #80), the same unit the risk engine sized and
         # the viewer consumes.
-        deal_symbol_id = int(getattr(deal, "symbolId", 0) or 0)
-        if not deal_symbol_id and order is not None:
-            deal_symbol_id = int(getattr(order, "symbolId", 0) or 0)
-        deal_symbol = self._symbol_name_for_id(deal_symbol_id) if deal_symbol_id else None
-        if deal_symbol is None:
-            try:
-                deal_symbol = self._order_id_to_symbol.get(int(broker_order_id))
-            except (TypeError, ValueError):
-                deal_symbol = None
+        deal_symbol = self._reconciled_deal_symbol(
+            deal, broker_order_id=broker_order_id, order=order
+        )
         if deal_symbol is None:
             raise ValueError(
                 "cTrader deal carries no symbolId; refusing to scale its "
@@ -1876,7 +1902,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_to_float(getattr(deal, "commission", 0)),
+            commission=_deal_commission(deal),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -1906,7 +1932,32 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if execution is None:
                 continue
-            if await asyncio.to_thread(save_live_execution, execution):
+            # Same semantics as the stream path: when the order states its cumulative executed
+            # volume, persist only what that cumulative still lacks. Plain `save_live_execution`
+            # treats a repeated dedupe key as a duplicate, so a deal that was first stored with a
+            # smaller volume and has since been amended upward would never grow here - and a deal
+            # skipped by the stream's cumulative cap (out-of-order delivery) is healed here
+            # because the order's *final* cumulative leaves room for it.
+            cumulative_qty = 0.0
+            cumulative_volume = self._resolve_order_cumulative_volume(details_order)
+            if cumulative_volume > 0:
+                deal_symbol = self._reconciled_deal_symbol(
+                    deal, broker_order_id=broker_order_id, order=details_order
+                )
+                if deal_symbol is not None:
+                    cumulative_qty = _broker_volume_to_qty(
+                        cumulative_volume, self._scale_for(deal_symbol).volume_per_qty
+                    )
+            if cumulative_qty > 0:
+                persisted = (
+                    await asyncio.to_thread(
+                        save_live_execution_up_to_cumulative, execution, cumulative_qty
+                    )
+                    > 0.0
+                )
+            else:
+                persisted = await asyncio.to_thread(save_live_execution, execution)
+            if persisted:
                 recovered += 1
                 logger.info(
                     "Reconciled missed cTrader fill",
@@ -2519,13 +2570,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
         return parsed if parsed > 0 else None
 
+    def _raise_if_order_error_event(self, response: Any) -> None:
+        """Turn a trading refusal into a `CTraderApiError`.
+
+        `_send_request` only raises for `ProtoOAErrorRes`. cTrader reports trading refusals
+        (``MARKET_CLOSED``, ``POSITION_NOT_FOUND``, ``TRADING_BAD_VOLUME``, ...) as a
+        `ProtoOAOrderErrorEvent`, which arrives as an ordinary *successful* response. A control
+        sweep that only watches for `CTraderApiError` would count a refused close or cancel as
+        completed, and the daemon would then stamp the deployment as enforced while the position
+        is still open. The submit path performs the same check in `_submit_new_order_request`.
+        """
+        event_type = self._ProtoOAOrderErrorEvent
+        if event_type is not None and isinstance(response, event_type):
+            raise CTraderApiError(
+                error_code=str(getattr(response, "errorCode", "")),
+                description=str(getattr(response, "description", "")) or "no description",
+            )
+
     async def _cancel_order_id(self, order_id: int) -> None:
-        """Send one cancel for a validated positive order id."""
+        """Send one cancel for a validated positive order id.
+
+        Raises `CTraderApiError` for both an API error response and a trading refusal.
+        """
         cancel_req = self._ProtoOACancelOrderReq()
         cancel_req.ctidTraderAccountId = self.ctid_trader_account_id
         cancel_req.orderId = order_id
         try:
-            await self._send_request_with_refresh_retry(cancel_req, timeout_seconds=10)
+            response = await self._send_request_with_refresh_retry(cancel_req, timeout_seconds=10)
+            self._raise_if_order_error_event(response)
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
@@ -2676,7 +2748,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             close_req.positionId = position_id
             close_req.volume = volume
             try:
-                await self._send_request_with_refresh_retry(close_req, timeout_seconds=15)
+                response = await self._send_request_with_refresh_retry(
+                    close_req, timeout_seconds=15
+                )
+                self._raise_if_order_error_event(response)
             except CTraderApiError as exc:
                 self._raise_terminal_auth_from_api_error(exc)
                 failed.append(str(position_id))
@@ -2821,7 +2896,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_to_float(getattr(deal, "commission", 0.0)) if deal is not None else 0.0,
+            commission=_deal_commission(deal),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
@@ -2851,8 +2926,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         else:
             persisted = await asyncio.to_thread(save_live_execution, execution)
         if not persisted:
+            # Either a redelivery of a fill already stored, or - when deals arrive out of order -
+            # a fill the broker's cumulative cap has no room for yet (a later deal with a larger
+            # cumulative was stored first). Nothing is lost in the second case: reconciliation
+            # re-reads the order with its final cumulative and stores the missing slice.
             logger.info(
-                "Skipped duplicate cTrader execution fill",
+                "Skipped cTrader execution fill (duplicate, or beyond the broker cumulative so "
+                "far; reconciliation recovers the latter)",
                 extra={
                     "data": {
                         "signal_id": str(execution.signal_id),

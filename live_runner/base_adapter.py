@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+from shared.logging import get_logger
 from shared.models import LiveSignal
 
 #: Marker in signal metadata (`risk_sizing_mode`) for exit-only flatten
@@ -26,12 +27,24 @@ def is_unbounded_tp(metadata: object) -> bool:
     return str(metadata.get("take_profit_policy") or "") == UNBOUNDED_TP_POLICY
 
 
+logger = get_logger("live-runner")
+
 #: Decimal places assumed when the broker sends no `moneyDigits` at all.
 DEFAULT_MONEY_DIGITS = 2
 
 #: Widest `moneyDigits` this codebase will scale by. Beyond it the field is treated as
 #: unreadable rather than trusted, because `10**digits` stops being a sane divisor.
 MAX_MONEY_DIGITS = 12
+
+
+def _money_digits_fallback(reason: str, raw: Any) -> int:
+    logger.warning(
+        "%s (value=%r); assuming %d decimal places",
+        reason,
+        raw if isinstance(raw, (int, float, str, bool, type(None))) else type(raw).__name__,
+        DEFAULT_MONEY_DIGITS,
+    )
+    return DEFAULT_MONEY_DIGITS
 
 
 def money_digits_from_trader(trader: Any) -> int:
@@ -56,12 +69,13 @@ def money_digits_from_trader(trader: Any) -> int:
     **Out-of-range values.** Anything outside ``0..MAX_MONEY_DIGITS`` is not a decimal count
     this code can scale by, so it falls back to the default rather than raising: the balance
     path is used by monitoring and refusing to report one is worse than reporting it at the
-    conventional scale, and the caller logs the fallback.
+    conventional scale. Every fallback is logged here at WARNING, so a broker that stops sending
+    ``moneyDigits`` (or sends nonsense) is visible rather than silently mis-scaled.
     """
     sentinel = object()
     raw = getattr(trader, "moneyDigits", sentinel)
     if raw is sentinel or raw is None:
-        return DEFAULT_MONEY_DIGITS
+        return _money_digits_fallback("moneyDigits is not present", raw)
 
     has_field = getattr(trader, "HasField", None)
     if has_field is not None:
@@ -69,7 +83,7 @@ def money_digits_from_trader(trader: Any) -> int:
             if not bool(has_field("moneyDigits")):
                 # The field is not on the wire at all: this is the "not sent" case, and no
                 # value read from the attribute is meaningful.
-                return DEFAULT_MONEY_DIGITS
+                return _money_digits_fallback("moneyDigits was not sent", raw)
         except (TypeError, ValueError):
             # A payload that cannot answer HasField is treated like one without presence.
             pass
@@ -77,9 +91,9 @@ def money_digits_from_trader(trader: Any) -> int:
     try:
         digits = int(raw)
     except (TypeError, ValueError, OverflowError):
-        return DEFAULT_MONEY_DIGITS
+        return _money_digits_fallback("moneyDigits is not an integer", raw)
     if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
-        return DEFAULT_MONEY_DIGITS
+        return _money_digits_fallback("moneyDigits is out of range", raw)
     return digits
 
 
