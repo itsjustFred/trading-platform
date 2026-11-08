@@ -326,7 +326,12 @@ class TestEveryBarsTimestampIsItsIntervalStart:
             "volume": 1.0,
         })
 
-    def test_a_weekly_bar_is_stamped_monday_and_covers_monday_to_sunday(self) -> None:
+    def test_a_weekly_bar_is_stamped_monday_and_covers_sunday_to_saturday(self) -> None:
+        """A week is [Sunday 00:00, next Sunday 00:00) UTC, stamped with its Monday.
+
+        The Sunday start is what lets the FX week open (Sunday ~22:00 UTC) belong to the week it
+        opens; a Sunday-midnight *daily* row therefore joins the following Monday's bar.
+        """
         import pandas as pd
 
         from data_tools.resample import resample_ohlcv
@@ -346,13 +351,13 @@ class TestEveryBarsTimestampIsItsIntervalStart:
             monday = stamp
             days_in_bucket = int(
                 (
-                    (self._daily_source()["timestamp"] >= monday)
-                    & (self._daily_source()["timestamp"] < monday + pd.Timedelta(days=7))
+                    (self._daily_source()["timestamp"] >= monday - pd.Timedelta(days=1))
+                    & (self._daily_source()["timestamp"] < monday + pd.Timedelta(days=6))
                 ).sum()
             )
             assert int(volume) == days_in_bucket, (
                 f"the bar stamped {monday:%Y-%m-%d} holds {int(volume)} rows but its Mon-Sun "
-                f"window contains {days_in_bucket}"
+                f"Sun-Sat window contains {days_in_bucket}"
             )
 
     def test_the_first_bar_starts_on_the_monday_its_data_begins_within(self) -> None:
@@ -432,10 +437,12 @@ class TestEveryBarsTimestampIsItsIntervalStart:
         )
         assert result["high"].max() == pytest.approx(source["high"].max())
         assert result["low"].min() == pytest.approx(source["low"].min())
-        # Independent reference: floor each row to the Monday of its week, then group. Note the
+        # Independent reference: floor each row to the Monday of its week, then group. Sunday
+        # belongs to the week that follows it, so it is moved forward a day first. Note the
         # floor has to be `timestamp - weekday days`; `pd.offsets.Week(weekday=0)` rolls *forward*
         # to the next Monday, which silently produced a third grouping and a wrong bar count.
-        monday_of = source["timestamp"] - pd.to_timedelta(source["timestamp"].dt.weekday, unit="D")
+        moved = source["timestamp"] + pd.Timedelta(days=1)
+        monday_of = moved - pd.to_timedelta(moved.dt.weekday, unit="D")
         expected = source.assign(monday=monday_of).groupby("monday").size()
         assert len(result) == len(expected), (
             f"{len(result)} weekly bars from resample_ohlcv but {len(expected)} from an "
@@ -639,3 +646,151 @@ def test_unsorted_input_is_sorted_before_bucketing():
     assert out["close"].iloc[0] == 4.0, "the 09:04 bar must close the bucket"
     assert out["high"].iloc[0] == 4.0
     assert out["volume"].iloc[0] == 5.0
+
+
+class TestWeeklyBucketsFollowTheVenueWeek:
+    """Weekly bars: Sunday-evening FX/CFD opens belong to the week they open, equities unchanged."""
+
+    @staticmethod
+    def _hourly(start: str, end: str, tz="UTC"):
+        stamps = pd.date_range(start, end, freq="1h", tz=tz)
+        return pd.DataFrame({
+            "timestamp": stamps,
+            "open": range(len(stamps)),
+            "high": [float(i) + 1 for i in range(len(stamps))],
+            "low": [float(i) - 1 for i in range(len(stamps))],
+            "close": [float(i) + 0.5 for i in range(len(stamps))],
+            "volume": 1.0,
+        })
+
+    def test_fx_sunday_open_is_in_the_week_it_opens(self) -> None:
+        # Sun 2024-01-07 22:00 UTC is the first bar of the week of Mon 2024-01-08.
+        source = self._hourly("2024-01-05 20:00", "2024-01-12 21:00")
+        # Drop the weekend closure like a real FX feed: Fri 22:00 -> Sun 22:00.
+        stamps = source["timestamp"]
+        closed = (stamps >= "2024-01-05 22:00+00:00") & (stamps < "2024-01-07 22:00+00:00")
+        source = source[~closed].reset_index(drop=True)
+
+        weekly = resample_ohlcv(source, "1w")
+
+        assert [str(t.date()) for t in weekly["timestamp"]] == ["2024-01-01", "2024-01-08"]
+        new_week = weekly.iloc[1]
+        sunday_open = source[source["timestamp"] == pd.Timestamp("2024-01-07 22:00", tz="UTC")]
+        assert new_week["open"] == sunday_open["open"].iloc[0]
+        first_week = weekly.iloc[0]
+        assert first_week["volume"] == (source["timestamp"] < "2024-01-07 22:00+00:00").sum()
+        assert new_week["volume"] == (source["timestamp"] >= "2024-01-07 22:00+00:00").sum()
+        assert weekly["volume"].sum() == len(source)
+
+    def test_friday_post_close_bar_on_saturday_utc_stays_in_its_week(self) -> None:
+        source = self._hourly("2024-01-08 00:00", "2024-01-13 00:00")  # Mon .. Sat 00:00
+        weekly = resample_ohlcv(source, "1w")
+        assert len(weekly) == 1
+        assert pd.Timestamp(weekly["timestamp"].iloc[0]) == pd.Timestamp("2024-01-08", tz="UTC")
+        assert weekly["volume"].iloc[0] == len(source)
+
+    def test_us_equity_monday_to_friday_weeks_are_unchanged(self) -> None:
+        days = pd.bdate_range("2024-01-01", "2024-01-19", tz="UTC")
+        source = pd.DataFrame({
+            "timestamp": days + pd.Timedelta(hours=14, minutes=30),
+            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+        weekly = resample_ohlcv(source, "1w")
+        assert [str(t.date()) for t in weekly["timestamp"]] == [
+            "2024-01-01", "2024-01-08", "2024-01-15",
+        ]
+        assert weekly["volume"].tolist() == [5.0, 5.0, 5.0]
+
+    def test_holiday_shortened_week_keeps_its_own_bar(self) -> None:
+        # MLK Monday 2024-01-15 is closed: four sessions, still one Monday-stamped bar.
+        days = pd.bdate_range("2024-01-08", "2024-01-26", tz="UTC")
+        days = days[days != pd.Timestamp("2024-01-15", tz="UTC")]
+        source = pd.DataFrame({
+            "timestamp": days + pd.Timedelta(hours=14, minutes=30),
+            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+        weekly = resample_ohlcv(source, "1w")
+        assert [str(t.date()) for t in weekly["timestamp"]] == [
+            "2024-01-08", "2024-01-15", "2024-01-22",
+        ]
+        assert weekly["volume"].tolist() == [5.0, 4.0, 5.0]
+
+    def test_a_whole_empty_week_is_dropped_not_invented(self) -> None:
+        days = pd.to_datetime(["2024-01-02", "2024-01-23"], utc=True)
+        source = pd.DataFrame({
+            "timestamp": days, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+        weekly = resample_ohlcv(source, "1w")
+        assert [str(t.date()) for t in weekly["timestamp"]] == ["2024-01-01", "2024-01-22"]
+
+    def test_monday_label_trails_the_sunday_open_by_only_the_open_offset(self) -> None:
+        source = self._hourly("2024-01-07 22:00", "2024-01-12 21:00")
+        weekly = resample_ohlcv(source, "1w")
+        label = pd.Timestamp(weekly["timestamp"].iloc[0])
+        first_bar = source["timestamp"].min()
+        assert label.weekday() == 0
+        assert label - first_bar == pd.Timedelta(hours=2)
+        assert label <= source["timestamp"].max()
+
+
+class TestMergeRefusesLegacyWeeklyLabels:
+    @staticmethod
+    def _bars(stamps):
+        return pd.DataFrame({
+            "timestamp": pd.to_datetime(stamps, utc=True),
+            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+        })
+
+    def test_old_sunday_labelled_file_is_not_merged_into(self, tmp_path) -> None:
+        from data_tools.resample import LegacyWeeklyLabelError, merge_resampled_history
+
+        stored = tmp_path / "1w.parquet"
+        self._bars(["2024-01-07", "2024-01-14"]).to_parquet(stored, index=False)  # Sundays
+        fresh = self._bars(["2024-01-08", "2024-01-15"])  # the same weeks, Monday-stamped
+
+        with pytest.raises(LegacyWeeklyLabelError, match="Monday 00:00 UTC"):
+            merge_resampled_history(stored, fresh, "1w")
+
+    def test_resample_file_fails_closed_and_keeps_stored_file(self, tmp_path) -> None:
+        from data_tools.resample import LegacyWeeklyLabelError
+
+        source = tmp_path / "1d.parquet"
+        days = pd.bdate_range("2024-01-01", "2024-01-12", tz="UTC")
+        pd.DataFrame({
+            "timestamp": days, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0,
+        }).to_parquet(source, index=False)
+        stored = tmp_path / "1w.parquet"
+        self._bars(["2024-01-07"]).to_parquet(stored, index=False)
+        before = stored.read_bytes()
+
+        with pytest.raises(LegacyWeeklyLabelError):
+            resample_file(source, ["1w"])
+
+        assert stored.read_bytes() == before
+
+    def test_monday_labelled_file_merges_without_duplicate_weeks(self, tmp_path) -> None:
+        from data_tools.resample import merge_resampled_history
+
+        stored = tmp_path / "1w.parquet"
+        self._bars(["2024-01-01", "2024-01-08"]).to_parquet(stored, index=False)
+        merged = merge_resampled_history(stored, self._bars(["2024-01-08", "2024-01-15"]), "1w")
+        assert [str(t.date()) for t in merged["timestamp"]] == [
+            "2024-01-01", "2024-01-08", "2024-01-15",
+        ]
+
+    def test_non_weekly_merge_is_not_affected(self, tmp_path) -> None:
+        from data_tools.resample import merge_resampled_history
+
+        stored = tmp_path / "1d.parquet"
+        self._bars(["2024-01-07"]).to_parquet(stored, index=False)
+        merged = merge_resampled_history(stored, self._bars(["2024-01-08"]), "1d")
+        assert len(merged) == 2
+
+    def test_midweek_monday_time_of_day_is_also_legacy(self, tmp_path) -> None:
+        from data_tools.resample import LegacyWeeklyLabelError, assert_stored_weekly_file_current
+
+        stored = tmp_path / "1w.parquet"
+        self._bars(["2024-01-08 22:00"]).to_parquet(stored, index=False)
+        with pytest.raises(LegacyWeeklyLabelError):
+            assert_stored_weekly_file_current(stored)
+        assert_stored_weekly_file_current(tmp_path / "missing.parquet")  # no file, no error

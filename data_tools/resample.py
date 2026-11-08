@@ -47,12 +47,24 @@ TIMEFRAME_MAP = {
     # `live_runner/signal_sources/execution_timing.py::_next_candle_close` anchors weeks on
     # Monday for the same reason. `1W` was the single outlier on all three counts.
     #
-    # Migration note: weekly files written before this change still carry Sunday labels, and
-    # `merge_resampled_history` unions on timestamp, so re-downloading a stored 1w series keeps
-    # both the old Sunday bar and the new Monday bar for the same week. Re-label or drop existing
-    # 1w.parquet files before the next weekly re-download.
+    # A plain left/left W-MON bucket is [Monday 00:00, next Monday 00:00), which puts the FX/CFD
+    # week open (Sunday ~21:00-22:00 UTC) in the *previous* week. `resample_with_origin` therefore
+    # shifts weekly input by `WEEKLY_SHIFT` first - see there.
+    #
+    # Migration: weekly files written before this change carry Sunday labels. They cannot be
+    # merged with new Monday-labelled bars (that would store the same week twice), so
+    # `merge_resampled_history` refuses them - see `assert_no_legacy_weekly_labels`.
     "1w": "W-MON",
 }
+
+#: Weekly bars are bucketed on a week that starts at **Sunday 00:00 UTC** and is stamped with the
+#: following Monday. The FX/CFD week opens on Sunday evening (~21:00-22:00 UTC) and belongs to the
+#: week it opens, not the one that just closed; US equities trade Monday-Friday and are unaffected.
+#: Implemented as a one-day shift of the input before a Monday-anchored left/left bucket, which
+#: leaves the label numerically equal to the Monday that follows the bucket's Sunday start.
+#: Post-market bars that cross midnight UTC on Friday land on Saturday and stay in their own week.
+WEEKLY_RULE = TIMEFRAME_MAP["1w"]
+WEEKLY_SHIFT = pd.Timedelta(days=1)
 
 # Ordering for validation (lower index = smaller timeframe)
 TIMEFRAME_ORDER = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -165,6 +177,10 @@ def resample_with_origin(
     frame = df.copy()
     frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True)
     frame = frame.set_index(timestamp_col).sort_index()
+    if rule == WEEKLY_RULE:
+        # See WEEKLY_SHIFT: Sunday-evening bars join the week that follows them. The labels that
+        # come out are the Mondays of the *shifted* index, which are the Mondays of the real week.
+        frame.index = frame.index + WEEKLY_SHIFT
     had_zero_volume_flag = "zero_volume_bar" in frame.columns
     # `label`/`closed` are pinned rather than left to pandas, because the defaults are *per
     # frequency*: intraday and daily offsets default to left/left, while weekly, monthly, quarterly
@@ -221,7 +237,55 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
     return resample_with_origin(df, TIMEFRAME_MAP[target_tf])
 
 
-def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.DataFrame:
+class LegacyWeeklyLabelError(ValueError):
+    """A stored weekly file uses a different week labelling from the current resampler."""
+
+
+def assert_no_legacy_weekly_labels(existing: pd.DataFrame, source: Path | str) -> None:
+    """Refuse to merge into a weekly series whose bars are not Monday 00:00 UTC.
+
+    Weekly bars used to be stamped with the Sunday their week *ended* on (pandas' right-closed
+    ``1W``). Merging recomputed Monday-stamped bars into such a file keeps both labels, so every
+    overlapping week is stored twice - once from each convention, with different open and volume.
+    That cannot be repaired by merging: the old bars are aggregates, and their week cannot be
+    recomputed from the partial source in hand, while relabelling them would guess which Sunday
+    session belonged to which week. Dropping them would silently discard history.
+
+    So this fails closed. Regenerate the file from daily or intraday source data (delete the old
+    ``1w.parquet`` and resample again), then merge as normal.
+    """
+    if existing.empty or "timestamp" not in existing.columns:
+        return
+    stamps = pd.to_datetime(existing["timestamp"], utc=True, errors="coerce").dropna()
+    off_monday = stamps[(stamps.dt.weekday != 0) | (stamps != stamps.dt.normalize())]
+    if off_monday.empty:
+        return
+    raise LegacyWeeklyLabelError(
+        f"{source} holds {len(off_monday)} weekly bar(s) not stamped Monday 00:00 UTC "
+        f"(first: {off_monday.iloc[0].isoformat()}); it predates the Monday-start weekly "
+        "convention. Merging would store the same weeks twice. Delete the file and re-resample "
+        "it from the daily/intraday source."
+    )
+
+
+def assert_stored_weekly_file_current(path: Path) -> None:
+    """Apply :func:`assert_no_legacy_weekly_labels` to a stored ``1w`` parquet, if one exists.
+
+    For writers that merge resampled weekly bars through their own path. Only the timestamp
+    column is read. A file that cannot be read is left for the writer's own error handling.
+    """
+    if not path.exists():
+        return
+    try:
+        stored = pd.read_parquet(path, columns=["timestamp"])
+    except (OSError, ValueError, KeyError):
+        return
+    assert_no_legacy_weekly_labels(stored, path)
+
+
+def merge_resampled_history(
+    existing_path: Path, resampled: pd.DataFrame, timeframe: str | None = None
+) -> pd.DataFrame:
     """Merge freshly resampled bars with the stored higher-timeframe history.
 
     Resampling only sees the rows of the source file it was given, so writing
@@ -229,6 +293,9 @@ def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.
     older history that is no longer present in the source. Merging keeps the
     union of both, with the newer resampled values winning on duplicate
     timestamps (DV-B23).
+
+    For ``timeframe="1w"`` the stored file must already follow the Monday-start convention or
+    :class:`LegacyWeeklyLabelError` is raised; see :func:`assert_no_legacy_weekly_labels`.
     """
     try:
         existing = pd.read_parquet(existing_path)
@@ -246,6 +313,8 @@ def merge_resampled_history(existing_path: Path, resampled: pd.DataFrame) -> pd.
 
     existing["timestamp"] = pd.to_datetime(existing["timestamp"], utc=True, errors="coerce")
     existing = existing.dropna(subset=["timestamp"])
+    if timeframe == "1w":
+        assert_no_legacy_weekly_labels(existing, existing_path)
 
     combined = (
         pd.concat([existing, resampled], ignore_index=True, sort=False)
@@ -285,7 +354,7 @@ def resample_file(
         out_path = build_dataset_path(out_dir, f"{tf}.parquet")
         resampled = resample_ohlcv(df, tf)
         if out_path.exists():
-            resampled = merge_resampled_history(out_path, resampled)
+            resampled = merge_resampled_history(out_path, resampled, tf)
         write_parquet_atomically(out_path, resampled)
         logger.info("  %s: %d → %d rows → %s", tf, len(df), len(resampled), out_path)
         results.append(out_path)
