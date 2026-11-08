@@ -583,23 +583,21 @@ class TestCalmarAndQsFallback:
             "definition, shared by both code paths)"
         )
 
-    def test_qs_installed_but_unparseable_times_still_yields_sharpe(self):
-        """Unparseable timestamps must not change the Sharpe that is published.
+    def test_qs_installed_but_unparseable_times_declare_the_ratios_undefined(self):
+        """Unparseable timestamps must not publish an annualised ratio.
 
-        **Why this test was rewritten.** The original asserted only
-        ``stats["sharpe_ratio"] != 0.0``. That cannot distinguish an annualized
-        Sharpe from a per-observation ratio — the defect published a per-period
-        ratio of 0.20 for a daily Sharpe of 3.2, which is very much "not
-        0.0" — so the assertion locked the defect in. The premise behind it,
-        that the fall-through exists to keep the number non-zero, was wrong:
-        under ADR D5 the two code paths must publish the SAME Sharpe for the
-        same returns, so the contract to pin is parity with the `"daily"`
-        branch, not the absence of a zero.
+        **Why this test was rewritten (it pinned wrong behaviour).** The earlier
+        version asserted that the unparseable curve published the SAME
+        sqrt(252)-annualised Sharpe as the daily one (ADR D5 parity). That
+        parity is only true if the bars happen to be daily, which is exactly
+        what an unreadable clock makes unknowable: hourly bars annualised with
+        252 periods per year overstate Sharpe by ~sqrt(6.5), weekly bars
+        understate it. A number that looks measured but rests on a guessed
+        period is worse than no number, so the ratios are now declared
+        undefined (and not silently published as 0.0 without the flag).
 
-        The fixture below builds two curves with identical equity values: one
-        with daily timestamps (the `daily` branch, quantstats) and one with
-        timestamps nothing can parse (the fall-through). Same returns in, same
-        Sharpe out.
+        The p-value is a t-test on the raw observation returns and does not
+        depend on the period, so it stays defined and equal to the daily one.
         """
         returns = [
             0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
@@ -632,19 +630,13 @@ class TestCalmarAndQsFallback:
         assert daily_stats["sharpe_ratio"] == pytest.approx(
             _sharpe_manual(returns, 0.04), abs=1e-4
         )
-        assert unknown["sharpe_ratio"] == pytest.approx(
-            daily_stats["sharpe_ratio"], abs=1e-4
-        ), (
-            "a per-observation ratio was published as a Sharpe: "
-            f"{unknown['sharpe_ratio']} instead of {daily_stats['sharpe_ratio']}"
-        )
-        assert unknown["sortino_ratio"] == pytest.approx(
-            daily_stats["sortino_ratio"], abs=1e-4
-        )
-        # Not merely "non-zero": the annualized value, ~13.75x the per-period
-        # ratio the defect produced for these returns.
-        assert unknown["sharpe_ratio"] > 1.0
-        assert "sharpe_ratio" not in unknown["undefined_metrics"]
+        assert "sharpe_ratio" not in daily_stats["undefined_metrics"]
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
+            assert metric in unknown["undefined_metrics"], metric
+        assert unknown["sharpe_ratio"] == 0.0
+        assert unknown["sortino_ratio"] == 0.0
+        assert "p_value" not in unknown["undefined_metrics"]
+        assert unknown["p_value"] == pytest.approx(daily_stats["p_value"], abs=1e-6)
 
     def test_unknown_frequency_states_why_the_period_assumption_is_unverified(self):
         """`equity_return_frequency` must name the reason, not just "unknown"."""
@@ -752,12 +744,15 @@ class TestWithoutQuantStats:
         )
         assert "sharpe_ratio" not in stats["undefined_metrics"]
 
-    def test_fallback_uses_the_raw_returns_when_the_clock_is_unparseable(self, monkeypatch):
-        """The unknown-frequency fall-through must compute, not declare undefined.
+    def test_fallback_declares_the_ratios_undefined_when_the_clock_is_unparseable(
+        self, monkeypatch
+    ):
+        """The no-quantstats path must agree with the quantstats path.
 
-        This is the same contract as the quantstats-installed test above, but on
-        the branch a bare install actually executes: a per-observation ratio, or
-        a silently-skipped computation, must both fail here.
+        Same contract as the quantstats-installed test above, on the branch a
+        bare install executes: no period can be read, so no annualised ratio is
+        published (it used to be sqrt(252)-annualised on the raw bars, wrong for
+        any non-daily spacing).
         """
         returns = [
             0.012, -0.008, 0.004, -0.011, 0.006, 0.002,
@@ -778,10 +773,11 @@ class TestWithoutQuantStats:
         assert stats["equity_return_frequency"] == (
             "unknown:unparseable_equity_timestamps"
         )
-        assert stats["sharpe_ratio"] == pytest.approx(
-            _sharpe_manual(returns, 0.04), abs=1e-4
-        )
-        assert "sharpe_ratio" not in stats["undefined_metrics"]
+        for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
+            assert metric in stats["undefined_metrics"], metric
+        assert stats["sharpe_ratio"] == 0.0
+        assert stats["sortino_ratio"] == 0.0
+        assert "p_value" not in stats["undefined_metrics"]
 
     def test_fallback_declares_metrics_undefined_for_a_one_point_curve(self, monkeypatch):
         """One observation cannot produce a ratio; the payload must say so.

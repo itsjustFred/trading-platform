@@ -300,21 +300,20 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
-- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on **every**
-  path, including the one taken when the equity curve's timestamps cannot be
-  parsed. That path used to pass `annualization_factor=1.0` into
-  `_sharpe_manual`/`_sortino_manual`, which published a per-observation ratio
-  under the name "Sharpe": a daily Sharpe of 3.2 was reported as 0.20, with
-  `undefined_metrics` untouched so the payload looked complete. The knob is
-  gone (it only ever had one correct value) and
-  `extras.equity_return_frequency` now carries the reason
-  (`unknown:unparseable_equity_timestamps`) instead of a bare `unknown`, so a
-  consumer can see that the period assumption could not be verified from the
-  data. An equity curve whose timestamps do not parse produces exactly the
-  same Sharpe as one whose timestamps do — that is the D5 contract. Note that
-  the `unknown` path also stopped listing these four metrics in
-  `undefined_metrics` while still publishing a number for them; the payload no
-  longer contradicts itself.
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on daily
+  returns, on both code paths. When the equity curve's timestamps cannot be
+  parsed the observation spacing is unknown, so the annualisation factor is
+  unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
+  published as `0.0`, the repo's convention for an undefined metric) and
+  `extras.equity_return_frequency` carries the reason
+  (`unknown:unparseable_equity_timestamps`). The p-value is a t-test on the raw
+  observation returns, independent of the period, and stays defined.
+  History: that path first passed `annualization_factor=1.0`, publishing a
+  per-observation ratio under the name "Sharpe" (a daily 3.2 reported as 0.20);
+  an intermediate fix annualised the raw bars with `sqrt(252)` on the unstated
+  assumption that they were daily, which overstates hourly bars and understates
+  weekly ones with nothing in the payload to say so. Declaring the ratios
+  undefined is the only answer that does not publish a guessed number.
 - A *reconciling* engine curve is compacted to one point per **calendar** day,
   not per observed day. A curve that observed only 01-05, 01-08 and 01-09
   produced three returns for an eight-day window, so a multi-day move was
