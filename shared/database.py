@@ -16,7 +16,9 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
+    Float,
     String,
     TextClause,
     UniqueConstraint,
@@ -49,6 +51,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    resolve_defined_stat,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -299,13 +302,51 @@ class BacktestRecord(SQLModel, table=True):
     parameters: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     tags_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("tags", JSON, nullable=False),
+        sa_column=Column("tags", JSON, nullable=False, server_default=text("'[]'")),
     )
     stats: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     notes: str = Field(default="")
     created_at: str = Field(default="", index=True)
     equity_curve: list[dict[str, Any]] = Field(
-        default_factory=list, sa_column=Column("equity_curve", JSON, nullable=False)
+        default_factory=list,
+        # Production has this column NULLABLE with DEFAULT '[]'; the model says NOT NULL. The
+        # nullability difference is left alone on purpose - narrowing it is a separate decision, and
+        # a model that claimed NOT NULL where production allows NULL is a much smaller problem than
+        # one that writes where it cannot.
+        sa_column=Column("equity_curve", JSON, nullable=False, server_default=text("'[]'")),
+    )
+    # These four columns have existed in the physical table for some time - NOT NULL, with defaults
+    # 0.0/0.0/0.0/1.0 - but the model never mapped them. Two consequences, both live:
+    #
+    #   * every INSERT took `DEFAULT 0.0`, so the fabricated 0.0 a corpus audit kept finding
+    #     was **manufactured by the schema**, not by a legacy backward-compatibility path;
+    #   * `session.merge()` issues an UPDATE over *mapped* columns only, so re-saving a backtest
+    #     with freshly computed stats left the scalar column at its old value forever - so the JSON
+    #     `stats` blob and the scalar column could disagree permanently, by construction.
+    #
+    # Mapped here so the columns can hold what the code computed. The defaults match the physical
+    # definitions exactly, so a row that says nothing still stores what it stored before.
+    # `Field(default=...)` is a *Python-side* default only, so `create_all` would produce NOT NULL
+    # columns with **no database default** - a schema that diverges from production's, where these
+    # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
+    # and a fresh install would not match the database it is supposed to replace. So the defaults
+    # are declared at the schema level too, matching production exactly - verified read-only
+    # against the production database.
+    sharpe_ratio: float = Field(
+        default=0.0,
+        sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
+    )
+    psr: float = Field(
+        default=0.0,
+        sa_column=Column("psr", Float, nullable=False, server_default="0.0"),
+    )
+    cagr: float = Field(
+        default=0.0,
+        sa_column=Column("cagr", Float, nullable=False, server_default="0.0"),
+    )
+    p_value: float = Field(
+        default=1.0,
+        sa_column=Column("p_value", Float, nullable=False, server_default="1.0"),
     )
 
 
@@ -509,13 +550,29 @@ class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
     id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
-    deployment_id: str = Field(index=True)
+    # Declared here, not only by `_migrate_schema`. A schema built by `create_all` used to have no
+    # foreign key on this column at all, so whether an orphan signal was even possible depended on
+    # which path created the database - and two test fixtures were relying on the difference. The
+    # migration still exists because SQLite cannot add a foreign key to an existing table; it now
+    # only has work to do on databases that predate this declaration.
+    deployment_id: str = Field(foreign_key="live_deployments.id", index=True)
     symbol: str = Field(index=True)
     action: str = Field(index=True)
     theoretical_price: float = Field(default=0.0)
     timestamp: datetime = Field(index=True)
-    source: str = Field(default="internal", index=True)
-    broker_order_id: str = Field(default="", index=True)
+    # Production stores DEFAULT 'internal' on this column; the model declared only the Python-side
+    # default, so a fresh install produced a NOT NULL column with no database default. `index` moves
+    # onto the Column because SQLAlchemy rejects it on Field when `sa_column` is given.
+    source: str = Field(
+        default="internal",
+        sa_column=Column("source", String, nullable=False, index=True,
+                         server_default=text("'internal'")),
+    )
+    broker_order_id: str = Field(
+        default="",
+        sa_column=Column("broker_order_id", String, nullable=False, index=True,
+                         server_default=text("''")),
+    )
     discord_message_id: str | None = Field(
         default=None,
         sa_column=Column("discord_message_id", String, nullable=True, index=True),
@@ -590,6 +647,10 @@ class LiveExecutionModel(SQLModel, table=True):
         default=None,
         sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
     )
+    # The broker's own per-fill id. Nullable and unindexed on purpose: it is *evidence*, not a
+    # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
+    # invite reading it as one. Adapters with no such id leave it NULL.
+    broker_fill_id: int | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -604,6 +665,7 @@ class LiveExecutionModel(SQLModel, table=True):
             dedupe_key=(str(execution.dedupe_key).strip() or None)
             if execution.dedupe_key is not None
             else None,
+            broker_fill_id=execution.broker_fill_id,
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -616,6 +678,7 @@ class LiveExecutionModel(SQLModel, table=True):
             timestamp=self.timestamp,
             broker_order_id=self.broker_order_id,
             dedupe_key=self.dedupe_key,
+            broker_fill_id=self.broker_fill_id,
         )
 
 
@@ -656,6 +719,10 @@ class LiveAccountModel(SQLModel, table=True):
     name: str = Field(default="", index=True)
     ctid: str | None = Field(default=None, index=True)
     broker_login: str | None = Field(default=None, index=True)
+    is_demo: bool = Field(
+        default=False,
+        sa_column=Column("is_demo", Boolean, nullable=False, index=True, server_default=text("0")),
+    )
 
     @classmethod
     def from_live_account(cls, account: LiveAccountConfig) -> "LiveAccountModel":
@@ -745,20 +812,39 @@ class LiveDeploymentModel(SQLModel, table=True):
     )
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
-    signal_source: str = Field(default="internal", index=True)
-    signal_source_type: str = Field(default="internal", index=True)
-    signal_source_id: str = Field(default="", index=True)
+    signal_source: str = Field(
+        default="internal",
+        sa_column=Column(
+            "signal_source", String, nullable=False, index=True, server_default=text("'internal'")
+        ),
+    )
+    signal_source_type: str = Field(
+        default="internal",
+        sa_column=Column(
+            "signal_source_type",
+            String,
+            nullable=False,
+            index=True,
+            server_default=text("'internal'"),
+        ),
+    )
+    signal_source_id: str = Field(
+        default="",
+        sa_column=Column(
+            "signal_source_id", String, nullable=False, index=True, server_default=text("''")
+        ),
+    )
     symbol_filter_json: list[str] = Field(
         default_factory=list,
-        sa_column=Column("symbol_filter", JSON, nullable=False),
+        sa_column=Column("symbol_filter", JSON, nullable=False, server_default=text("'[]'")),
     )
     signal_config_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("signal_config", JSON, nullable=False),
+        sa_column=Column("signal_config", JSON, nullable=False, server_default=text("'{}'")),
     )
     settings_json: dict[str, Any] = Field(
         default_factory=dict,
-        sa_column=Column("settings", JSON, nullable=False),
+        sa_column=Column("settings", JSON, nullable=False, server_default=text("'{}'")),
     )
     created_at: datetime = Field(default_factory=_utcnow_naive, index=True)
     updated_at: datetime = Field(default_factory=_utcnow_naive, index=True)
@@ -1234,6 +1320,51 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     _create_live_signal_discord_indexes(connection)
 
 
+_FK_VIOLATION_REPORT_LIMIT = 10
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _describe_foreign_key_violations(connection: Connection, violations: list) -> str:
+    """Build the fail-closed error for a failed ``PRAGMA foreign_key_check``.
+
+    Names the blocking rows (table, rowid, the dangling value and the parent it points at, capped)
+    and says how to fix them, so an operator can act instead of guessing. Never raises: a problem
+    while describing must not mask the violation itself.
+    """
+    lines: list[str] = []
+    for violation in violations[:_FK_VIOLATION_REPORT_LIMIT]:
+        table, rowid, parent, fkid = violation[0], violation[1], violation[2], violation[3]
+        detail = ""
+        try:
+            fk_rows = connection.exec_driver_sql(
+                f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+            ).fetchall()
+            column = next((row[3] for row in fk_rows if row[0] == fkid), None)
+            if column is not None and rowid is not None:
+                value = connection.exec_driver_sql(
+                    f"SELECT {_quote_identifier(column)} FROM {_quote_identifier(table)} "
+                    "WHERE rowid = ?",
+                    (rowid,),
+                ).scalar()
+                detail = f", {column}={value!r}"
+        except Exception:  # pragma: no cover - best-effort description only
+            logger.debug("Could not describe foreign key violation %r", violation, exc_info=True)
+        lines.append(f"  {table} rowid={rowid}{detail} -> missing row in {parent}")
+    extra = len(violations) - len(lines)
+    if extra > 0:
+        lines.append(f"  ... and {extra} more")
+    return (
+        f"Cannot safely migrate schema: foreign key violations remain "
+        f"({len(violations)} row(s); nothing was changed):\n"
+        + "\n".join(lines)
+        + "\nFix: re-point each row at an existing parent row, restore the missing parent, or "
+        "delete the orphan row after backing up the database, then restart."
+    )
+
+
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
@@ -1254,9 +1385,7 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 yield connection
                 violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
                 if violations:
-                    raise RuntimeError(
-                        "Cannot safely migrate schema: foreign key violations remain"
-                    )
+                    raise RuntimeError(_describe_foreign_key_violations(connection, violations))
             except BaseException:
                 connection.rollback()
                 raise
@@ -1268,34 +1397,6 @@ def _schema_migration_connection() -> Iterator[Connection]:
             if foreign_keys_enabled:
                 connection.execute(text("PRAGMA foreign_keys = ON"))
                 connection.commit()
-
-
-def _backfill_curve_for_id(connection: Connection, bt_id: str) -> list[dict[str, Any]]:
-    """Build a missing equity_curve from equity_points, else the JSON file."""
-    if _table_column_names(connection, "equity_points"):
-        points = connection.execute(
-            text(
-                "SELECT time, equity FROM equity_points "
-                "WHERE backtest_id = :id ORDER BY id"
-            ),
-            {"id": bt_id},
-        ).fetchall()
-        if points:
-            return [
-                {"time": str(time), "equity": float(equity)}
-                for time, equity in points
-            ]
-
-    json_path = DATA_DIR / "backtests" / f"{bt_id}.trades.json"
-    if json_path.exists():
-        try:
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        curve = payload.get("equity_curve")
-        if isinstance(curve, list) and curve:
-            return [dict(point) for point in curve if isinstance(point, dict)]
-    return []
 
 
 def _add_live_deployment_columns(connection: Connection, column_names: set[str]) -> None:
@@ -1351,6 +1452,51 @@ def _add_live_deployment_columns(connection: Connection, column_names: set[str])
         )
 
 
+def _add_backtests_stat_columns(connection: Connection) -> None:
+    """Add the scalar stat columns to `backtests`, which were never migrated.
+
+    `sharpe_ratio`, `psr`, `cagr` and `p_value` exist in the production table and have done for some
+    time, but **no migration creates them**. They are absent from this model, so `create_all` never
+    made them, and there is no `_add_*_column` step for them either. Every database in existence
+    therefore splits two ways: production, where somebody added the columns by hand, and every other
+    database - a fresh install, a developer's sandbox, a test fixture - built from the model, where
+    they simply do not exist.
+
+    That is why the columns read `0.0` on 2,600 rows rather than being absent: on those rows the
+    *schema default* was taken, because nothing could write anything else.
+
+    It stayed invisible while the model ignored the columns, since nothing ever named them. It stops
+    being invisible the moment the model maps them, because then every `SELECT backtests.*` names
+    them and a database without them fails outright - which is exactly how this surfaced.
+
+    So the columns need the migration they should always have had. Definitions match production
+    exactly, verified read-only against the production database:
+
+        sharpe_ratio REAL NOT NULL DEFAULT 0.0
+        psr         REAL NOT NULL DEFAULT 0.0
+        cagr        REAL NOT NULL DEFAULT 0.0
+        p_value     REAL NOT NULL DEFAULT 1.0
+
+    `p_value` defaults to 1.0, not 0.0, because "no evidence against the null hypothesis" is the
+    correct value for a p-value that was never computed; 0.0 would assert the opposite.
+
+    No-ops when the columns are already present, so this is safe on production and on repeat runs.
+    """
+    column_names = _table_column_names(connection, "backtests")
+    if not column_names:
+        return
+    for column, ddl in (
+        ("sharpe_ratio", "REAL NOT NULL DEFAULT 0.0"),
+        ("psr", "REAL NOT NULL DEFAULT 0.0"),
+        ("cagr", "REAL NOT NULL DEFAULT 0.0"),
+        ("p_value", "REAL NOT NULL DEFAULT 1.0"),
+    ):
+        if column not in column_names:
+            connection.execute(
+                text(f"ALTER TABLE backtests ADD COLUMN {column} {ddl}")
+            )
+
+
 def _add_backtests_tags_column(connection: Connection) -> None:
     """Add the tags column to legacy backtests tables."""
     column_names = _table_column_names(connection, "backtests")
@@ -1370,6 +1516,20 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN ctid TEXT"))
     if "broker_login" not in column_names:
         connection.execute(text("ALTER TABLE live_accounts ADD COLUMN broker_login TEXT"))
+    # The model maps this now, so every `SELECT live_accounts.*` names it. A database built before
+    # that mapping existed does not have the column, and production's definition is NOT NULL
+    # DEFAULT 0 - matched here so a migrated database and a fresh one are the same shape.
+    if "is_demo" not in column_names:
+        connection.execute(
+            text("ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
+        )
+    # The model declares `index=True`, which `create_all` turns into this index. `ADD COLUMN`
+    # cannot, so a migrated database would otherwise differ from a fresh one by exactly the index.
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_accounts_is_demo ON live_accounts (is_demo)"
+        )
+    )
 
 
 def _add_background_task_columns(connection: Connection) -> None:
@@ -1482,6 +1642,25 @@ def _migrate_backtests_equity_curve(connection: Connection) -> None:
         _backfill_backtest_equity_curves(connection)
 
 
+def _add_live_executions_broker_fill_id(connection: Connection) -> None:
+    """Add `live_executions.broker_fill_id`, the broker's per-fill identifier.
+
+    The dedupe key is a string this codebase assembled, so "were these two rows the same broker
+    fill?" is not answerable from the table afterwards. When two equal-sized fills on one order
+    collide - the case backlog item 1 is about - taking the key apart is the only evidence there is,
+    and it is ambiguous by construction.
+
+    Nullable with no default and no index: recorded evidence, not a constraint. Uniqueness stays
+    with `dedupe_key` and its partial unique index, and adapters with no such id leave this NULL.
+    No-ops when the column already exists.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "broker_fill_id" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN broker_fill_id INTEGER"))
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -1496,21 +1675,302 @@ def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
         )
 
 
+_SMOKE_DEPLOYMENT_PREFIX = "ctrader-demo-smoke-"
+
+
+def _backfill_smoke_deployments(connection: Connection) -> int:
+    """Give smoke-sourced orphan signals the parent deployment row they were always meant to have.
+
+    ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
+    no deployment row, so those signals were invisible to every deployment-scoped query. This
+    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs. Where it has to
+    create one it names every symbol the orphaned signals traded, because the backfill sees all of
+    them at once while a single run only knows its own; an adopted row keeps the symbols it already
+    carries, since rewriting a JSON column inside the migration would turn one malformed value into
+    a startup failure.
+
+    Three deliberate restrictions, each a guard against fabricating a trading record:
+
+    * only ids carrying the smoke prefix are touched - anything else is somebody's real deployment;
+    * the account must already exist in ``live_accounts``, because ``live_deployments.account_id``
+      carries a foreign key and an invented account would be worse than an orphan;
+    * the row is ``PAUSED`` with the smoke label as ``strategy_name``, following the existing
+      ``discord::`` convention for synthetic deployments, so no runner trades it.
+
+    **Adoption, not just creation.** ``live_deployments.id`` is typed ``uuid.UUID`` on
+    ``LiveDeploymentConfig``, so the readable label lives in ``strategy_name`` and the key is a
+    UUID. That means a parent can already exist under the same label with a different key - the
+    shape left by a run that predates this backfill - and the signals naming the label are still
+    orphans.
+    An earlier version skipped that case, which left the signals orphaned *and* the parent present:
+    the migration then failed its ``foreign_key_check`` and ``init_db()`` raised. So an existing
+    parent is adopted and the signals are repointed at it, exactly as a newly created one is.
+
+    Never deletes. Non-smoke orphans are left untouched and reported.
+
+    Returns the number of smoke deployment rows created *or* adopted.
+    """
+    column_names = _table_column_names(connection, "live_deployments")
+    signal_columns = _table_column_names(connection, "live_signals")
+    if "account_id" not in column_names or "deployment_id" not in signal_columns:
+        return 0
+
+    orphans = connection.execute(
+        text(
+            "SELECT s.deployment_id, s.symbol "
+            "FROM live_signals s "
+            "WHERE s.deployment_id LIKE :prefix "
+            "AND s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+        ),
+        {"prefix": _SMOKE_DEPLOYMENT_PREFIX + "%"},
+    ).fetchall()
+    if not orphans:
+        return 0
+
+    # One row per deployment, not per signal: the same smoke label covers every signal of that
+    # account, so iterating the pairs would count a deployment twice and give its `symbols` column
+    # whichever symbol happened to come back first.
+    symbols_by_deployment: dict[str, set[str]] = {}
+    for deployment_id, symbol in orphans:
+        symbols = symbols_by_deployment.setdefault(str(deployment_id), set())
+        if symbol:
+            symbols.add(str(symbol).upper())
+
+    resolved = 0
+    for deployment_id, symbols in symbols_by_deployment.items():
+        account_id = str(deployment_id)[len(_SMOKE_DEPLOYMENT_PREFIX):].strip()
+        if not account_id:
+            continue
+        known = connection.execute(
+            text("SELECT 1 FROM live_accounts WHERE id = :id"), {"id": account_id}
+        ).first()
+        if known is None:
+            # Refuse to invent an account. Leave the orphan and let the FK stay blocked.
+            logger.warning(
+                "Leaving smoke orphan %s: account %s is not in live_accounts",
+                deployment_id,
+                account_id,
+            )
+            continue
+        # A readable lookup keys on `strategy_name`, because the id is a UUID.
+        # `strategy_name` is not unique, so adoption must be unambiguous: more than one candidate,
+        # or a candidate that belongs to a different account, would make "the" parent a guess.
+        # Re-parenting signals onto the wrong deployment is worse than refusing to start.
+        candidates = connection.execute(
+            text(
+                "SELECT id, account_id FROM live_deployments "
+                "WHERE strategy_name = :name ORDER BY id"
+            ),
+            {"name": deployment_id},
+        ).fetchall()
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"Cannot safely adopt a parent for smoke signals labelled {deployment_id!r}: "
+                f"{len(candidates)} live_deployments rows share that strategy_name "
+                f"(ids: {', '.join(str(c[0]) for c in candidates[:10])}). Remove or rename the "
+                "extra rows so exactly one remains, then restart."
+            )
+        if candidates and str(candidates[0][1]) != account_id:
+            raise RuntimeError(
+                f"Cannot safely adopt live_deployments row {candidates[0][0]} for smoke signals "
+                f"labelled {deployment_id!r}: it belongs to account {candidates[0][1]!r}, the "
+                f"label names account {account_id!r}. Fix the row's account_id or rename it, "
+                "then restart."
+            )
+        existing = candidates[0] if candidates else None
+        if existing is not None:
+            new_id = str(existing[0])
+        else:
+            new_id = str(uuid4())
+            # Naive UTC, like every other timestamp in this schema: an aware ISO string carries a
+            # `+00:00` suffix that sorts and parses differently from the rows around it.
+            now = _utcnow_naive().isoformat(sep=" ")
+            connection.execute(
+                text(
+                    "INSERT INTO live_deployments "
+                    "(id, strategy_name, account_id, symbols, timeframe, status, "
+                    " signal_source, signal_source_type, signal_source_id, symbol_filter, "
+                    " signal_config, settings, created_at, updated_at) "
+                    "VALUES (:new_id, :name, :account_id, :symbols, '1m', 'PAUSED', "
+                    " 'smoke', 'internal', '', '[]', '{}', '{}', :now, :now)"
+                ),
+                {
+                    "new_id": new_id,
+                    "name": deployment_id,
+                    "account_id": account_id,
+                    "symbols": json.dumps(sorted(symbols)),
+                    "now": now,
+                },
+            )
+        # The signals still name the descriptive label, which is `strategy_name` rather than `id`.
+        # Repoint them, or the parent exists and every signal is still orphaned - the state this
+        # function exists to leave behind.
+        connection.execute(
+            text("UPDATE live_signals SET deployment_id = :new WHERE deployment_id = :old"),
+            {"new": new_id, "old": deployment_id},
+        )
+        resolved += 1
+    if resolved:
+        logger.info("Backfilled %d smoke deployment row(s) for orphaned signals", resolved)
+    return resolved
+
+
+def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
+    """Add the ``live_signals.deployment_id -> live_deployments.id`` foreign key.
+
+    SQLite cannot add a foreign key to an existing table, so the table is rebuilt: capture index DDL
+    *before* dropping, create the new table, copy, drop, rename, restore indexes.
+
+    Three traps this step exists to avoid:
+
+    * reading index DDL after ``DROP TABLE`` silently loses every index, because the drop removes
+      them. ``PRAGMA foreign_key_check`` validates referential integrity only and never notices.
+    * copying rows that violate the new constraint. That is not caught here either - the surrounding
+      ``_schema_migration_connection`` runs ``foreign_key_check`` and raises, rolling the whole
+      migration back. So this is safe to attempt while orphans remain: it either lands or changes
+      nothing.
+    * ``live_executions.signal_id`` already references ``live_signals(id)`` - a foreign key this
+      migration does not own and must not drop. With enforcement on, ``DROP TABLE live_signals`` is
+      refused *even when every dependent row has been removed*, because the surviving executions
+      point at rows inside the table being dropped. Measured on a production clone: the migration
+      failed at exactly that statement with no orphan rows left. So enforcement is off for the whole
+      swap; ``_schema_migration_connection`` turns it back on after the commit, and this function
+      restores both pragmas best-effort in a ``finally``. That restore is only real for
+      ``legacy_alter_table``: SQLite ignores a ``foreign_keys`` change made inside a transaction,
+      so for a direct caller inside one the outer context manager is what re-enables it.
+
+    Called from ``_migrate_schema``, after ``_backfill_smoke_deployments`` has parented what it can.
+    On a database that still carries a non-smoke orphan the rebuild lands, the surrounding
+    ``foreign_key_check`` reports the violation and the whole migration rolls back - so this is
+    fail-closed, not silent.
+
+    Returns True when the rebuild ran.
+    """
+    if any(
+        row[3] == "deployment_id"
+        for row in connection.execute(text("PRAGMA foreign_key_list(live_signals)")).fetchall()
+    ):
+        return False
+
+    # Capture index DDL before anything is dropped: DROP TABLE removes the indexes with it, and
+    # foreign_key_check validates referential integrity only, so lost indexes go unnoticed.
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_signals' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_signals'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        return False
+
+    # Reuse the real CREATE TABLE text and splice the constraint in just before the closing paren.
+    # Rebuilding from a column-name list silently drops PRIMARY KEY, which makes live_signals.id no
+    # longer unique - and live_executions has an FK to it, so every later pragma raises
+    # "foreign key mismatch" and the database is left unusable. The column-list approach was tried
+    # and failed exactly that way.
+    closing = create_sql.rstrip().rfind(")")
+    if closing == -1:
+        return False
+    body = create_sql.rstrip()[:closing].rstrip()
+    if body.endswith(","):
+        body = body[:-1]
+    new_create_sql = (
+        f"{body},\n\tFOREIGN KEY (deployment_id) REFERENCES live_deployments (id)\n)"
+    )
+
+    # The table name is rewritten through a pattern rather than `str.replace`, because SQLite may
+    # store it quoted: a rebuild that succeeds leaves `CREATE TABLE "live_signals" (...)` behind,
+    # and a plain replace of the unquoted spelling would then match nothing - so a second run (after
+    # the FK was lost some other way) would recreate `live_signals` while it still existed.
+    new_create_sql, replacements = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_signals\"|`live_signals`|\[live_signals\]|live_signals)",
+        "CREATE TABLE live_signals__fk_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if replacements != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_signals: could not address the table in its own CREATE statement"
+        )
+
+    columns = [
+        str(row[1])
+        for row in connection.execute(text("PRAGMA table_info('live_signals')")).fetchall()
+    ]
+    if not columns:
+        return False
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(column) for column in columns
+    )
+
+    # `foreign_keys` must be OFF for the whole swap, not just around the DROP. SQLite ignores the
+    # pragma while a transaction is open, so setting it mid-transaction leaves enforcement ON and
+    # the DROP is still refused. `_schema_migration_connection` already disables it before BEGIN and
+    # re-enables it after the commit; the pair below is for callers that do not, and only the
+    # `legacy_alter_table` half takes effect inside a transaction.
+    #
+    # legacy_alter_table keeps RENAME from rewriting the live_executions -> live_signals reference.
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_signals__fk_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_signals__fk_new ({column_list}) "
+                f"SELECT {column_list} FROM live_signals"
+            )
+        )
+        connection.execute(text("DROP TABLE live_signals"))
+        connection.execute(text("ALTER TABLE live_signals__fk_new RENAME TO live_signals"))
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+    logger.info("Rebuilt live_signals with the deployment_id foreign key")
+    return True
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
+        # The column migrations must stay ahead of the backfill: `_backfill_smoke_deployments`
+        # inserts a `live_deployments` row naming `signal_source`, `settings` and friends, which do
+        # not exist on a legacy table until `_add_live_deployment_columns` has run.
         _add_live_deployment_columns(
             connection, _table_column_names(connection, "live_deployments")
         )
         _add_backtests_tags_column(connection)
+        _add_backtests_stat_columns(connection)
         _add_live_account_columns(connection)
         _add_background_task_columns(connection)
         _add_trade_columns(connection)
+
+        # Parent the smoke-sourced orphans before the FK is added, so the rebuild never copies a
+        # row that violates the constraint it is introducing. On a database whose only orphans are
+        # smoke-shaped this makes the FK land; anything left over keeps the migration fail-closed
+        # via `foreign_key_check` at the end of `_schema_migration_connection`.
+        _backfill_smoke_deployments(connection)
+        _migrate_live_signal_deployment_fk(connection)
 
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
+        _add_live_executions_broker_fill_id(connection)
 
 
 def _find_existing_live_signal(
@@ -1719,10 +2179,6 @@ def save_live_execution_up_to_cumulative(
                 .where(LiveExecutionModel.dedupe_key == record.dedupe_key)
                 .limit(1)
             ).first()
-            if existing is not None:
-                session.rollback()
-                return 0.0
-
             local_filled_qty = float(
                 session.exec(
                     select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
@@ -1731,6 +2187,56 @@ def save_live_execution_up_to_cumulative(
                 ).one()
                 or 0.0
             )
+            if existing is not None:
+                # Same dedupe key. Two very different situations share this branch, and conflating
+                # them loses fills:
+                #
+                #   redelivery   the broker sent the same deal again, unchanged. Dropping it is
+                #                right - this is the duplicate the key exists to catch.
+                #   amendment    the broker sent the same dealId with a LARGER quantity, because
+                #                `ProtoOADeal` carries `filledVolume` and the deal grew. Dropping it
+                #                freezes the stored quantity at its first-seen value and the rest of
+                #                the fill is never recorded.
+                #
+                # cTrader exposes no fill-level identifier - a deal entry has dealId, orderId,
+                # positionId and symbolId and nothing finer - so an order split into several fills
+                # arrives as several deals with distinct dealIds, each stored. That case is already
+                # correct. The remaining risk is amendment, and it is handled here: only an increase
+                # amends, and a decrease is treated as redelivery rather than shrinking a fill that
+                # already happened.
+                #
+                # The increase is capped by what the broker still says is missing for the whole
+                # signal, exactly as the insert path below is. Without the cap a redelivery of a
+                # deal whose first insert was itself capped - because the broker's cumulative was
+                # lower than the deal claimed - would grow the stored total past the broker's own
+                # number, which is the same over-count the dedupe key exists to prevent.
+                prior_qty = float(existing.filled_qty or 0.0)
+                delta = min(requested_qty - prior_qty, cumulative_qty - local_filled_qty)
+                if delta <= 0.0:
+                    session.rollback()
+                    return 0.0
+                existing.filled_qty = prior_qty + delta
+                if record.commission:
+                    # Commission was recorded against the first-seen quantity, so only the
+                    # incremental slice needs adding. A deal that reports commission per unit is
+                    # handled by the caller scaling it, same as the partial-persist path below.
+                    existing.commission = float(existing.commission or 0.0) + float(
+                        record.commission
+                    ) * (delta / requested_qty)
+                if record.actual_price and not existing.actual_price:
+                    existing.actual_price = float(record.actual_price)
+                session.add(existing)
+                session.commit()
+                logger.info(
+                    "Amended live execution %s: dedupe key %s repeated with a larger quantity, "
+                    "filled_qty %s -> %s",
+                    existing.id,
+                    existing.dedupe_key,
+                    prior_qty,
+                    existing.filled_qty,
+                )
+                return delta
+
             persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
@@ -2283,14 +2789,96 @@ def update_live_deployment_status(
     return record.to_live_deployment()
 
 
+class LiveDeploymentInUseError(RuntimeError):
+    """Raised when a deployment cannot be deleted because records still reference it.
+
+    A typed error instead of the driver's ``IntegrityError`` escaping through the ORM: the caller
+    has to make a decision - refuse, archive, or delete the history deliberately first - and a
+    ``sqlite3.IntegrityError`` cannot carry that. Nothing is deleted when this is raised, and the
+    check happens before the delete rather than relying on the foreign key, so the behaviour is the
+    same on a database whose ``live_signals.deployment_id`` key was never migrated in.
+    """
+
+    def __init__(
+        self,
+        deployment_id: str,
+        *,
+        signal_count: int | None = None,
+        execution_count: int | None = None,
+    ) -> None:
+        detail = ""
+        if signal_count is not None and execution_count is not None:
+            detail = f" ({signal_count} signal(s), {execution_count} execution(s))"
+        super().__init__(
+            f"Deployment {deployment_id} still has records referencing it{detail}; nothing was "
+            f"deleted. Resolve or remove those records explicitly if the history is expendable."
+        )
+        self.deployment_id = deployment_id
+        self.signal_count = signal_count
+        self.execution_count = execution_count
+
+
 def delete_live_deployment(deployment_id: str) -> bool:
+    """Delete a deployment, refusing while signals or executions still reference it.
+
+    It used to attempt the delete unconditionally, so any deployment with history raised a raw
+    ``sqlite3.IntegrityError`` out of the ORM - the viewer turned that into a 500 after having
+    already set the deployment PAUSED, leaving it stuck there. Deleting the signals as a cascade
+    would have "worked", but it silently destroys the execution record of real trades, which is the
+    one thing this database exists to keep.
+
+    So the refusal is explicit and typed, the counts come with it, and the caller decides. Returns
+    True when the row was deleted and False when it was already absent.
+    """
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return False
     init_db()
     with get_session() as session:
-        record = session.get(LiveDeploymentModel, deployment_id)
-        if record is None:
-            return False
-        session.delete(record)
-        session.commit()
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveDeploymentModel, normalized_id)
+            if record is None:
+                session.rollback()
+                return False
+            signal_count = int(
+                session.exec(
+                    select(func.count(LiveSignalModel.id)).where(
+                        LiveSignalModel.deployment_id == normalized_id
+                    )
+                ).one()
+                or 0
+            )
+            execution_count = int(
+                session.exec(
+                    select(func.count(LiveExecutionModel.id))
+                    .join(
+                        LiveSignalModel,
+                        LiveExecutionModel.signal_id == LiveSignalModel.id,
+                    )
+                    .where(LiveSignalModel.deployment_id == normalized_id)
+                ).one()
+                or 0
+            )
+            if signal_count or execution_count:
+                session.rollback()
+                raise LiveDeploymentInUseError(
+                    normalized_id,
+                    signal_count=signal_count,
+                    execution_count=execution_count,
+                )
+            session.delete(record)
+            session.commit()
+        except LiveDeploymentInUseError:
+            raise
+        except IntegrityError as exc:
+            # A signal inserted between the count and the delete. The foreign key caught it, and the
+            # caller gets the same typed refusal rather than a driver exception.
+            session.rollback()
+            raise LiveDeploymentInUseError(normalized_id) from exc
+        except Exception:
+            session.rollback()
+            raise
     return True
 
 
@@ -2588,6 +3176,73 @@ def list_live_signals_for_replay(
     return _replay_signal_payload(rows)
 
 
+# The scalar stat columns, with the default each physically carries. `p_value` defaults to 1.0
+# because "no evidence against the null hypothesis" is the right value for a p-value that was never
+# computed - which is exactly why it must never be silently replaced by 0.0.
+_SCALAR_STAT_COLUMNS: tuple[tuple[str, float], ...] = (
+    ("sharpe_ratio", 0.0),
+    ("psr", 0.0),
+    ("cagr", 0.0),
+    ("p_value", 1.0),
+)
+
+
+def _scalar_stats_for_save(
+    session: Session, backtest_id: str, stats: dict[str, Any]
+) -> dict[str, float]:
+    """The values the four scalar stat columns should hold after this save.
+
+    A metric the stats **define** is written. A metric they do not - because the producer listed it
+    in `undefined_metrics`, or because the artifact predates the convention and never named it -
+    **carries its current column value forward**.
+
+    That second half is the whole point. These columns are NOT NULL, so "undefined" cannot be
+    stored. Letting the model's default land instead would mean a re-save of a backtest whose
+    Sharpe is no longer computable overwrites a real stored value with 0.0 - destroying data to
+    express absence, which is the failure the corpus audit found in the first place, reintroduced
+    by the fix for it. So absence leaves the column alone and only a finite number moves it - a
+    malformed or non-finite value is not a number the column can hold honestly, so it counts as
+    absence and is logged.
+    """
+    current: dict[str, float] = {name: default for name, default in _SCALAR_STAT_COLUMNS}
+    # Built from the same tuple that names the columns, not spelled out: the zip below pairs by
+    # position, so a fifth entry added to `_SCALAR_STAT_COLUMNS` alone would silently shift every
+    # value into the wrong column instead of failing.
+    row = session.exec(
+        select(
+            *(getattr(BacktestRecord, name) for name, _default in _SCALAR_STAT_COLUMNS)
+        ).where(BacktestRecord.id == backtest_id)
+    ).first()
+    if row is not None:
+        current.update(zip((name for name, _ in _SCALAR_STAT_COLUMNS), row))
+    resolved: dict[str, float] = {}
+    for name, _default in _SCALAR_STAT_COLUMNS:
+        # `default=None` makes "the producer did not name it" and "the producer declared it
+        # undefined" both resolve to None, which is precisely the do-not-write case.
+        value = resolve_defined_stat(stats, name, None)
+        resolved[name] = current[name]
+        if value is None:
+            continue
+        # A value that is not a finite number cannot be stored honestly: the columns are NOT NULL
+        # REAL, and a stored NaN or infinity poisons every later comparison and any JSON read of
+        # the row. Carrying the stored value forward is the same rule as for an absent metric, and
+        # it is logged because a malformed number is a producer bug, not an absence.
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = math.nan
+        if math.isfinite(number):
+            resolved[name] = number
+        else:
+            logger.warning(
+                "Ignoring unusable %s value %r for backtest %s: not a finite number",
+                name,
+                value,
+                backtest_id,
+            )
+    return resolved
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -2681,8 +3336,11 @@ def save_result_to_sqlite(result: BacktestResult) -> None:
             "reject_missing_stop": result.meta.reject_missing_stop,
             "require_explicit_column_roles": result.meta.require_explicit_column_roles,
         }
+        scalar_stats = _scalar_stats_for_save(session, backtest_id, result.stats or {})
+
         backtest_record = BacktestRecord(
             id=backtest_id,
+            **scalar_stats,
             strategies=result.meta.strategies,
             engine=result.meta.engine,
             backtest_start=result.meta.backtest_start,

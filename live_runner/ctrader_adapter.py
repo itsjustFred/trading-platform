@@ -310,6 +310,19 @@ def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCAL
     return _to_float(volume, default=0.0) / float(volume_per_qty)
 
 
+def _deal_id_or_none(deal: Any | None) -> int | None:
+    """The broker's per-fill id, or ``None`` when it did not send one.
+
+    ``0`` is both the protobuf default for an unset ``dealId`` and the sentinel this adapter
+    rejects, so it must never be stored as a real id: a fabricated ``0`` would make "the broker
+    told us nothing" indistinguishable from "the broker said zero".
+    """
+    if deal is None:
+        return None
+    deal_id = int(getattr(deal, "dealId", 0) or 0)
+    return deal_id if deal_id > 0 else None
+
+
 _NOT_AUTHORIZED_MARKER = "not authorized"
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
@@ -1729,6 +1742,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
+            # The deal id is positive here - this path returns early when `deal_id <= 0` - so the
+            # stored value is the broker's real id, not a sentinel.
+            broker_fill_id=_deal_id_or_none(deal),
         )
 
     async def _persist_recovered_deals(
@@ -2332,6 +2348,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 deal, order_id=order_id, timestamp_ms=timestamp_ms,
                 filled_volume=filled_volume,
             ),
+            # Recorded so a later collision between two equal-sized fills is decidable from the
+            # table, rather than by taking the dedupe key apart again. `None` when the broker sent
+            # no deal - the case the key builder already handles by deriving a key instead.
+            broker_fill_id=_deal_id_or_none(deal),
         )
         persisted = await asyncio.to_thread(save_live_execution, execution)
         if not persisted:

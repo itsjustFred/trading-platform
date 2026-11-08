@@ -1,0 +1,239 @@
+"""A database built from the model must match the schema production actually has.
+
+`Field(default=...)` is a **Python-side** default. It never reaches the DDL. So a model declaring
+only Python-side defaults produces `NOT NULL` columns with **no database-level default** - and where
+production has carried those defaults for some time, the two schemas diverge.
+
+That divergence is not cosmetic. Measured on both schemas, one column at a time, with every
+*other* required column supplied and only the target omitted:
+
+| | model-built database | production |
+|---|---|---|
+| `INSERT` omitting the column | `IntegrityError` | succeeds |
+
+Same statement, same schema intent, different outcome - decided purely by which database you are
+pointed at. ORM inserts are unaffected, because the ORM always supplies the Python-side value. **Raw
+SQL is not**, and raw SQL is what migrations, backfills and ad-hoc repair scripts are.
+
+This is the same defect as the four scalar stat columns fixed in `476d6d6`, and that commit left it
+behind in eleven more places. So the defaults are now declared at the schema level too.
+
+The expectations below are **read from production**, not copied from the model - that is the whole
+point. If somebody edits the model and production together the test still holds; if they edit one
+alone, it fails, which is the case worth catching.
+
+SQLite reports `server_default` through `PRAGMA table_info` **quoted** - `'[]'` rather than `[]` -
+so the comparison strips the quotes rather than guessing. Getting this wrong cost one run.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+from sqlmodel import SQLModel, create_engine
+
+# The live production database is not part of this repository and must never be opened by a test
+# run. The pinned expectations below are what makes the parity check hermetic; pointing
+# `TRADING_PRODUCTION_DB` at a *copy* additionally re-verifies that production has not drifted
+# away from them. Deliberately not a hard-coded absolute path: this has to run on Windows and
+# macOS too.
+_PRODUCTION_DB_ENV = "TRADING_PRODUCTION_DB"
+PRODUCTION_DB: Path | None = (
+    Path(os.environ[_PRODUCTION_DB_ENV]) if os.environ.get(_PRODUCTION_DB_ENV) else None
+)
+
+
+def _production_db_available() -> bool:
+    return PRODUCTION_DB is not None and PRODUCTION_DB.is_file()
+
+# Production's actual defaults, read-only, verified 2026-10-04, and **unquoted** - SQLite reports
+# them through PRAGMA as the text `'[]'`, which `_unquote` strips. Any change here is a real
+# schema change made to production by hand, and should be reconciled rather than edited to suit.
+PRODUCTION_DEFAULTS = {
+    ("backtests", "tags"): "[]",
+    ("backtests", "equity_curve"): "[]",
+    ("live_accounts", "is_demo"): "0",
+    ("live_deployments", "settings"): "{}",
+    ("live_deployments", "signal_config"): "{}",
+    ("live_deployments", "symbol_filter"): "[]",
+    ("live_deployments", "signal_source"): "internal",
+    ("live_deployments", "signal_source_type"): "internal",
+    ("live_deployments", "signal_source_id"): "",
+    ("live_signals", "source"): "internal",
+    ("live_signals", "broker_order_id"): "",
+}
+
+# And one that must NOT gain a default: `portfolio_components.settings` has none in production,
+# and a well-meaning "fix" once added one. Pinned because I made that mistake here.
+MUST_NOT_HAVE_A_DEFAULT = {("portfolio_components", "settings")}
+
+
+def _unquote(value: object) -> str | None:
+    """SQLite reports a server_default quoted, as the text `'[]'`. Normalise to `[]`."""
+    if value is None:
+        return None
+    return str(value).strip("'")
+
+
+def _defaults_from(db_path: Path, tables: set[str]) -> dict[tuple[str, str], str | None]:
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        out: dict[tuple[str, str], str | None] = {}
+        for table in tables:
+            for row in conn.execute("PRAGMA table_info(%s)" % table):
+                out[(table, str(row[1]))] = _unquote(row[4])
+        return out
+    finally:
+        conn.close()
+
+
+@pytest.fixture(scope="module")
+def model_built_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A database whose schema comes from the model alone - `create_all`, no migrations.
+
+    Built from `SQLModel.metadata` in a throwaway file. Production is never opened for writing, and
+    the fixture asserts the file it created is the one it inspects.
+    """
+    from shared.database import SQLModel as _SM  # noqa: F401  (ensures metadata is populated)
+
+    db_file = tmp_path_factory.mktemp("model-built") / "schema.db"
+    engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+    try:
+        SQLModel.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+    assert db_file.is_file(), "create_all did not produce the file under test"
+    return db_file
+
+
+def test_the_model_declares_every_default_production_has(model_built_db: Path) -> None:
+    """The parity check itself, against the pinned expectations.
+
+    Hermetic on purpose: `PRODUCTION_DEFAULTS` was read from production on 2026-10-04, and a test
+    that opened the live database to confirm its own fixture would be testing production rather
+    than the model. Re-verifying production itself is the separate, opt-in check below.
+    """
+    # Both sets, not just the first. Collecting only `PRODUCTION_DEFAULTS` left
+    # `MUST_NOT_HAVE_A_DEFAULT` looking at a table that was never read, so `.get()` returned None
+    # and the negative guard could not fire - a check that cannot fail, found by mutation.
+    tables = {table for table, _ in PRODUCTION_DEFAULTS}
+    tables |= {table for table, _ in MUST_NOT_HAVE_A_DEFAULT}
+    mine = _defaults_from(model_built_db, tables)
+
+    model_lacks, model_added = [], []
+    for key, expected in PRODUCTION_DEFAULTS.items():
+        if mine.get(key) != expected:
+            model_lacks.append(
+                f"{key[0]}.{key[1]}: model={mine.get(key)!r} production={expected!r}"
+            )
+
+    for key in MUST_NOT_HAVE_A_DEFAULT:
+        if mine.get(key) is not None:
+            model_added.append(
+                f"{key[0]}.{key[1]}: model now has default {mine.get(key)!r}, production has none"
+            )
+    assert not model_added, (
+        "these columns gained a database default the model invented, so a fresh install now "
+        f"diverges from production in the opposite direction: {model_added}"
+    )
+    assert not model_lacks, (
+        "the model is missing database-level defaults that production has, so an INSERT that "
+        "omits these columns raises IntegrityError on a fresh install and succeeds on production: "
+        f"{model_lacks}"
+    )
+
+
+@pytest.mark.skipif(
+    not _production_db_available(),
+    reason=f"set {_PRODUCTION_DB_ENV} to a copy of production to re-verify its defaults",
+)
+def test_production_still_carries_the_defaults_this_test_pins() -> None:
+    """Opt-in drift check: is the *live* schema still what `PRODUCTION_DEFAULTS` claims?
+
+    Kept separate from the parity assertion because the two failures need opposite responses -
+    "someone changed the model" versus "someone changed production by hand" - and because this one
+    needs a database that is not in the repository. Opened read-only; never written.
+    """
+    assert PRODUCTION_DB is not None  # narrowed by the skipif above
+    tables = {table for table, _ in PRODUCTION_DEFAULTS}
+    theirs = _defaults_from(PRODUCTION_DB, tables)
+    drifted = [
+        f"{key[0]}.{key[1]}: production={theirs.get(key)!r} pinned={expected!r}"
+        for key, expected in PRODUCTION_DEFAULTS.items()
+        if theirs.get(key) != expected
+    ]
+    assert not drifted, (
+        "production's defaults no longer match what this test pins, so the model and the database "
+        f"have diverged - reconcile them rather than editing either to suit: {drifted}"
+    )
+
+
+def test_a_raw_insert_lands_on_a_model_built_database(model_built_db: Path) -> None:
+    """The consequence, demonstrated rather than asserted.
+
+    Supplies every other required column of `live_deployments` and omits only the one whose
+    default is declared at schema level. If the default were missing, this raises - which is the
+    whole failure mode, shown rather than described.
+    """
+    conn = sqlite3.connect(model_built_db)
+    try:
+        conn.execute(
+            "INSERT INTO live_deployments "
+            "(id, strategy_name, account_id, symbols, timeframe, status, created_at, updated_at, "
+            " signal_source, signal_source_type, signal_source_id, symbol_filter) "
+            "VALUES ('probe', 's', 'acct', '[]', '1m', 'PAUSED', '', '', 'internal', "
+            "'internal', '', '[]')"
+        )
+        conn.commit()
+        stored = conn.execute(
+            "SELECT settings FROM live_deployments WHERE id = 'probe'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == "{}", f"the schema default did not apply, got {stored!r}"
+
+
+def test_the_scalar_stat_defaults_are_still_declared(model_built_db: Path) -> None:
+    """The four from `476d6d6`, kept honest by the same mechanism.
+
+    Separate from the parity test above because they were the original case: they are the columns
+    whose absence made ~2,600 rows read a fabricated `0.0`, so a regression here is silent and
+    expensive.
+    """
+    defaults = _defaults_from(model_built_db, {"backtests"})
+    for column, expected in (
+        ("sharpe_ratio", "0.0"),
+        ("psr", "0.0"),
+        ("cagr", "0.0"),
+        ("p_value", "1.0"),
+    ):
+        assert defaults.get(("backtests", column)) == expected, (
+            f"backtests.{column} has model default {defaults.get(('backtests', column))!r}, "
+            f"expected {expected!r}"
+        )
+
+
+def test_the_model_declares_the_signal_to_deployment_foreign_key(model_built_db: Path) -> None:
+    """A schema built by `create_all` must have the constraint, not only a migrated one.
+
+    Without the declaration, whether a signal could even be orphaned depended on *which* path built
+    the database: a fresh install had no key, production gained it by migration. That split is what
+    let two test fixtures rely on being able to write an orphan - so the declaration is the thing
+    that makes the invariant independent of the build path. The migration still exists, because
+    SQLite cannot add a foreign key to an existing table; it just has nothing to do here.
+    """
+    conn = sqlite3.connect(f"file:{model_built_db}?mode=ro", uri=True)
+    try:
+        refs = conn.execute("PRAGMA foreign_key_list(live_signals)").fetchall()
+    finally:
+        conn.close()
+    assert any(
+        (row[2], row[3], row[4]) == ("live_deployments", "deployment_id", "id") for row in refs
+    ), (
+        "a model-built database has no live_signals.deployment_id -> "
+        "live_deployments.id key, so an orphan is possible on a fresh install but not on "
+        f"production: {refs}"
+    )

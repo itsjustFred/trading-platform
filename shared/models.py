@@ -239,6 +239,19 @@ class LiveExecution(BaseModel):
     broker_order_id: str
     dedupe_key: str | None = None
 
+    # The broker's own per-fill identifier, where it has one. cTrader calls it `dealId`; Alpaca's
+    # equivalent is not populated yet.
+    #
+    # Stored because the dedupe key alone cannot answer the question it was built to answer. The key
+    # is a string our own code assembled, so "were these two rows the same broker fill?" cannot be
+    # answered afterwards without parsing it back out of that string - and when two equal-sized
+    # fills on one order collide, that parse is the only evidence there is. Measured: one stored
+    # signal produced two execution rows 2 ms apart at an identical price, and `live_executions`
+    # carried nothing that could distinguish two real partial fills from one fill counted twice.
+    #
+    # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
+    broker_fill_id: int | None = None
+
 
 class LiveBalanceRecord(BaseModel):
     """Periodic balance/equity snapshot for a live broker account."""
@@ -665,6 +678,34 @@ class BacktestStats:
         payload = {key: value for key, value in d.items() if key in field_names}
         payload["extras"] = {key: value for key, value in d.items() if key not in field_names}
         return cls(**payload)
+
+
+def resolve_defined_stat(
+    stats: dict[str, Any] | None,
+    key: str,
+    default: float | None = None,
+) -> float | None:
+    """Resolve a stat, honouring the producer's ``undefined_metrics`` list.
+
+    The convention is that a quantity which could not be computed is *named* in
+    ``undefined_metrics`` and its value omitted, so an absent number is never
+    readable as a real one. ``dict.get(key, 0)`` silently undoes that: it cannot
+    tell "computed as zero" from "never computed" and returns 0 for the omitted
+    key.
+
+    It lives here rather than in the database or viewer layer because the
+    convention belongs to the data model and every consumer has to apply it the
+    same way. It has already bitten twice - once for PSR, where the default was
+    the *worst* attainable value, and once for the portfolio combined stats -
+    each time because the default was applied somewhere new.
+    """
+    if not isinstance(stats, dict):
+        return default
+    undefined = stats.get("undefined_metrics")
+    if isinstance(undefined, (list, tuple, set)) and key in undefined:
+        return None
+    value = stats.get(key, default)
+    return default if value is None else value
 
 
 @dataclass
