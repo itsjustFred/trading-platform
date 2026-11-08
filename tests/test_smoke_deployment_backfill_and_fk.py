@@ -449,3 +449,32 @@ def test_the_backfill_adopts_a_parent_that_already_carries_the_label(conn):
     # And with the orphan resolved, the rebuild has nothing to object to.
     assert _migrate_live_signal_deployment_fk(conn) is True
     assert conn.execute(text("pragma foreign_key_check")).fetchall() == []
+
+
+def test_backfill_refuses_when_several_parents_share_the_smoke_label(conn):
+    """`strategy_name` is not unique: with two candidates there is no safe parent to adopt.
+
+    The refusal must be the explicit error, and nothing may be repointed or invented
+    before it fires.
+    """
+    label = "ctrader-demo-smoke-44695443"
+    _add_account(conn, "44695443")
+    for deployment_id in ("dep-a", "dep-b"):
+        conn.execute(
+            text(
+                "insert into live_deployments (id, strategy_name, account_id, symbols, timeframe, "
+                "status, created_at, updated_at) "
+                "values (:id, :name, '44695443', '[]', '1m', 'PAUSED', '', '')"
+            ),
+            {"id": deployment_id, "name": label},
+        )
+    _add_signal(conn, "s1", label)
+
+    with pytest.raises(RuntimeError, match="share that strategy_name") as excinfo:
+        _backfill_smoke_deployments(conn)
+
+    assert "dep-a" in str(excinfo.value) and "dep-b" in str(excinfo.value)
+    assert conn.execute(
+        text("select deployment_id from live_signals where id = 's1'")
+    ).scalar_one() == label, "a signal was repointed despite the ambiguous parents"
+    assert conn.execute(text("select count(*) from live_deployments")).scalar_one() == 2
