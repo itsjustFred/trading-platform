@@ -22,6 +22,7 @@ from shared.models import (
     BacktestMeta,
     BacktestResult,
     EquityPoint as EquityPointModel,
+    LiveAccountConfig,
     LiveSignal,
     Trade,
     TradeExit,
@@ -624,6 +625,36 @@ def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> N
     assert summary2["skipped"] == 1
 
 
+def test_upserting_an_existing_account_preserves_is_demo(isolated_db) -> None:
+    """Re-saving an account must not reset the flag it is not carrying.
+
+    `LiveAccountConfig` has no `is_demo`, so `from_live_account` always builds a model with the
+    Python default `False`. That is correct for a *new* account and would silently un-flag a demo
+    account if the update path merged a config-built model. It does not - the update path sets
+    fields explicitly - and this pins that, because the failure would be invisible: the account
+    keeps working, it just stops being reported as demo.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    database.init_db()
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="acct-demo", broker="ctrader", name="demo", is_demo=True
+            )
+        )
+        session.commit()
+
+    database.upsert_live_accounts(
+        [LiveAccountConfig(id="acct-demo", broker="ctrader", name="renamed")]
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acct-demo")
+    assert row is not None
+    assert row.is_demo is True, "re-saving the account reset a stored is_demo flag"
+    assert row.name == "renamed", "the update path stopped applying the fields it does carry"
+
+
 def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db) -> None:
     """A database built before `is_demo` was mapped must gain the column.
 
@@ -654,6 +685,16 @@ def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db
     assert not_null == 1, "is_demo must be NOT NULL, matching production"
     assert default is not None and str(default).strip("'") == "0", (
         f"is_demo must default to 0, matching production; got {default!r}"
+    )
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(live_accounts)")}
+    finally:
+        conn.close()
+    assert "ix_live_accounts_is_demo" in indexes, (
+        f"the model declares is_demo with index=True, so a fresh database has "
+        f"ix_live_accounts_is_demo and a migrated one must too; got {sorted(indexes)}"
     )
 
 

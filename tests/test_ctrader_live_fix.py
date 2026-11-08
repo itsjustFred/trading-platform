@@ -831,6 +831,7 @@ def _control_adapter(*, orders=(), positions=()):
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOACancelOrderReq,
         ProtoOAClosePositionReq,
+        ProtoOAOrderErrorEvent,
         ProtoOAReconcileRes,
     )
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
@@ -851,8 +852,12 @@ def _control_adapter(*, orders=(), positions=()):
     adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
     adapter._ProtoOAPositionStatus = ProtoOAPositionStatus
     adapter._ProtoOAReconcileRes = ProtoOAReconcileRes
+    adapter._ProtoOAOrderErrorEvent = ProtoOAOrderErrorEvent
     adapter.sent: list[Any] = []
     adapter.refuse: set[int] = set()
+    # Targets answered with a real `ProtoOAOrderErrorEvent` (how cTrader reports a trading
+    # refusal: a *successful* response, not a `ProtoOAErrorRes`).
+    adapter.refuse_event: dict[int, str] = {}
 
     snapshot = ProtoOAReconcileRes()
     for order in orders:
@@ -868,6 +873,12 @@ def _control_adapter(*, orders=(), positions=()):
         target = int(getattr(request, "orderId", 0) or getattr(request, "positionId", 0) or 0)
         if target in adapter.refuse:
             raise CTraderApiError("ORDER_REJECTED", f"refused {target}")
+        if target in adapter.refuse_event:
+            return ProtoOAOrderErrorEvent(
+                ctidTraderAccountId=46736452,
+                errorCode=adapter.refuse_event[target],
+                description=f"refused {target}",
+            )
         return request
 
     adapter._reconcile_state = _reconcile_state
@@ -1077,6 +1088,57 @@ def test_one_refused_close_does_not_stop_the_others() -> None:
     assert outcome.failed == ("911",)
     assert outcome.complete is False
     assert sorted(int(request.positionId) for request in adapter.sent) == [911, 912]
+
+
+def test_a_close_refused_with_an_order_error_event_is_a_failure() -> None:
+    """The blocker: cTrader answers a refused close with `ProtoOAOrderErrorEvent`.
+
+    That is a successful response as far as the transport is concerned, so only an explicit check
+    keeps `MARKET_CLOSED` from being counted as a completed close and the position from being
+    reported as flat.
+    """
+    adapter = _control_adapter(positions=[_position(921, 1000), _position(922, 1000)])
+    adapter.refuse_event = {921: "MARKET_CLOSED"}
+
+    outcome = _run(adapter.close_all_positions())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("921",)
+    assert outcome.complete is False
+    assert sorted(int(r.positionId) for r in adapter.sent) == [921, 922]
+
+
+def test_a_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[
+            _order(601, ProtoOAOrderType.LIMIT),
+            _order(602, ProtoOAOrderType.LIMIT),
+        ]
+    )
+    adapter.refuse_event = {601: "ORDER_NOT_FOUND"}
+
+    outcome = _run(adapter.cancel_open_orders())
+
+    assert outcome.completed == 1
+    assert outcome.failed == ("601",)
+    assert outcome.complete is False
+
+
+def test_orphaned_protection_cancel_refused_with_an_order_error_event_is_a_failure() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter(
+        orders=[_order(701, ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT, position_id=999)],
+    )
+    adapter.refuse_event = {701: "ORDER_NOT_FOUND"}
+
+    outcome = _run(adapter.cancel_orphaned_protections())
+
+    assert outcome.completed == 0
+    assert outcome.failed == ("701",)
+    assert outcome.complete is False
 
 
 def test_an_empty_sweep_is_complete() -> None:

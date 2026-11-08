@@ -333,7 +333,7 @@ class BacktestRecord(SQLModel, table=True):
     # carry DEFAULT 0.0/0.0/0.0/1.0. Any INSERT not going through the ORM would then fail outright,
     # and a fresh install would not match the database it is supposed to replace. So the defaults
     # are declared at the schema level too, matching production exactly - verified read-only
-    # against `/home/ubuntu/data/backtests.db`.
+    # against the production database.
     sharpe_ratio: float = Field(
         default=0.0,
         sa_column=Column("sharpe_ratio", Float, nullable=False, server_default="0.0"),
@@ -1361,6 +1361,51 @@ def _migrate_live_signal_discord_identity(connection: Connection) -> None:
     _create_live_signal_discord_indexes(connection)
 
 
+_FK_VIOLATION_REPORT_LIMIT = 10
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _describe_foreign_key_violations(connection: Connection, violations: list) -> str:
+    """Build the fail-closed error for a failed ``PRAGMA foreign_key_check``.
+
+    Names the blocking rows (table, rowid, the dangling value and the parent it points at, capped)
+    and says how to fix them, so an operator can act instead of guessing. Never raises: a problem
+    while describing must not mask the violation itself.
+    """
+    lines: list[str] = []
+    for violation in violations[:_FK_VIOLATION_REPORT_LIMIT]:
+        table, rowid, parent, fkid = violation[0], violation[1], violation[2], violation[3]
+        detail = ""
+        try:
+            fk_rows = connection.exec_driver_sql(
+                f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+            ).fetchall()
+            column = next((row[3] for row in fk_rows if row[0] == fkid), None)
+            if column is not None and rowid is not None:
+                value = connection.exec_driver_sql(
+                    f"SELECT {_quote_identifier(column)} FROM {_quote_identifier(table)} "
+                    "WHERE rowid = ?",
+                    (rowid,),
+                ).scalar()
+                detail = f", {column}={value!r}"
+        except Exception:  # pragma: no cover - best-effort description only
+            logger.debug("Could not describe foreign key violation %r", violation, exc_info=True)
+        lines.append(f"  {table} rowid={rowid}{detail} -> missing row in {parent}")
+    extra = len(violations) - len(lines)
+    if extra > 0:
+        lines.append(f"  ... and {extra} more")
+    return (
+        f"Cannot safely migrate schema: foreign key violations remain "
+        f"({len(violations)} row(s); nothing was changed):\n"
+        + "\n".join(lines)
+        + "\nFix: re-point each row at an existing parent row, restore the missing parent, or "
+        "delete the orphan row after backing up the database, then restart."
+    )
+
+
 @contextmanager
 def _schema_migration_connection() -> Iterator[Connection]:
     """Run SQLite schema changes with FK DDL disabled, then validate before commit."""
@@ -1381,9 +1426,7 @@ def _schema_migration_connection() -> Iterator[Connection]:
                 yield connection
                 violations = connection.execute(text("PRAGMA foreign_key_check")).fetchall()
                 if violations:
-                    raise RuntimeError(
-                        "Cannot safely migrate schema: foreign key violations remain"
-                    )
+                    raise RuntimeError(_describe_foreign_key_violations(connection, violations))
             except BaseException:
                 connection.rollback()
                 raise
@@ -1478,7 +1521,7 @@ def _add_backtests_stat_columns(connection: Connection) -> None:
     them and a database without them fails outright - which is exactly how this surfaced.
 
     So the columns need the migration they should always have had. Definitions match production
-    exactly, verified read-only against `/home/ubuntu/data/backtests.db`:
+    exactly, verified read-only against the production database:
 
         sharpe_ratio REAL NOT NULL DEFAULT 0.0
         psr         REAL NOT NULL DEFAULT 0.0
@@ -1531,6 +1574,13 @@ def _add_live_account_columns(connection: Connection) -> None:
         connection.execute(
             text("ALTER TABLE live_accounts ADD COLUMN is_demo BOOLEAN NOT NULL DEFAULT 0")
         )
+    # The model declares `index=True`, which `create_all` turns into this index. `ADD COLUMN`
+    # cannot, so a migrated database would otherwise differ from a fresh one by exactly the index.
+    connection.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_live_accounts_is_demo ON live_accounts (is_demo)"
+        )
+    )
 
 
 def _add_background_task_columns(connection: Connection) -> None:
@@ -1707,9 +1757,11 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
 
     ``live_smoke`` writes ``deployment_id = ctrader-demo-smoke-<account>`` but historically created
     no deployment row, so those signals were invisible to every deployment-scoped query. This
-    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs, with one difference:
-    the ``symbols`` column names every symbol the orphaned signals traded, because the backfill sees
-    all of them at once while a single run only knows its own.
+    recreates the row ``_ensure_ctrader_smoke_deployment`` writes on new runs. Where it has to
+    create one it names every symbol the orphaned signals traded, because the backfill sees all of
+    them at once while a single run only knows its own; an adopted row keeps the symbols it already
+    carries, since rewriting a JSON column inside the migration would turn one malformed value into
+    a startup failure.
 
     Three deliberate restrictions, each a guard against fabricating a trading record:
 
@@ -1775,15 +1827,38 @@ def _backfill_smoke_deployments(connection: Connection) -> int:
             )
             continue
         # A readable lookup keys on `strategy_name`, because the id is a UUID.
-        existing = connection.execute(
-            text("SELECT id FROM live_deployments WHERE strategy_name = :name"),
+        # `strategy_name` is not unique, so adoption must be unambiguous: more than one candidate,
+        # or a candidate that belongs to a different account, would make "the" parent a guess.
+        # Re-parenting signals onto the wrong deployment is worse than refusing to start.
+        candidates = connection.execute(
+            text(
+                "SELECT id, account_id FROM live_deployments "
+                "WHERE strategy_name = :name ORDER BY id"
+            ),
             {"name": deployment_id},
-        ).first()
+        ).fetchall()
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"Cannot safely adopt a parent for smoke signals labelled {deployment_id!r}: "
+                f"{len(candidates)} live_deployments rows share that strategy_name "
+                f"(ids: {', '.join(str(c[0]) for c in candidates[:10])}). Remove or rename the "
+                "extra rows so exactly one remains, then restart."
+            )
+        if candidates and str(candidates[0][1]) != account_id:
+            raise RuntimeError(
+                f"Cannot safely adopt live_deployments row {candidates[0][0]} for smoke signals "
+                f"labelled {deployment_id!r}: it belongs to account {candidates[0][1]!r}, the "
+                f"label names account {account_id!r}. Fix the row's account_id or rename it, "
+                "then restart."
+            )
+        existing = candidates[0] if candidates else None
         if existing is not None:
             new_id = str(existing[0])
         else:
             new_id = str(uuid4())
-            now = datetime.now(timezone.utc).isoformat(sep=" ")
+            # Naive UTC, like every other timestamp in this schema: an aware ISO string carries a
+            # `+00:00` suffix that sorts and parses differently from the rows around it.
+            now = _utcnow_naive().isoformat(sep=" ")
             connection.execute(
                 text(
                     "INSERT INTO live_deployments "
