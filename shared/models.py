@@ -849,11 +849,37 @@ class BacktestResult:
     drawings: list[dict[str, Any]] = field(default_factory=list)
     equity_evidence_status: Literal["unknown", "available", "missing"] = "unknown"
 
-    def __post_init__(self) -> None:
+    def _derived_equity_evidence_status(self) -> Literal["unknown", "available", "missing"]:
+        """Equity evidence status derived from the curve currently attached.
+
+        The status is derived in ``__post_init__``, but the curve can be attached
+        afterwards (the daily-equity builder does exactly that).  Reading the raw
+        attribute at serialization time then produced artifacts that contradicted
+        their own curve, and reloading such a file reported ``available`` while the
+        writer had written nothing at all.
+        """
         if self.equity_curve and self.equity_evidence_status == "unknown":
-            self.equity_evidence_status = "available"
+            return "available"
+        if not self.equity_curve and self.equity_evidence_status == "available":
+            # The curve that made the status "available" was detached again
+            # (an empty fallback curve): the claim no longer has evidence.
+            return "unknown"
+        return self.equity_evidence_status
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "equity_curve":
+            # Keep the in-memory attribute in step with what ``to_dict`` will
+            # write. The daily-equity builder attaches the curve after
+            # construction, and readers of the attribute (the validation
+            # reports) used to see "unknown" next to a result that serialized as
+            # "available".
+            super().__setattr__("equity_evidence_status", self._derived_equity_evidence_status())
+
+    def __post_init__(self) -> None:
         if self.equity_evidence_status == "available" and not self.equity_curve:
             raise ValueError("equity_evidence_status=available requires an equity curve")
+        self.equity_evidence_status = self._derived_equity_evidence_status()
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -868,8 +894,12 @@ class BacktestResult:
             d["indicators"] = [i.to_dict() for i in self.indicators]
         if self.drawings:
             d["drawings"] = self.drawings
-        if self.equity_evidence_status != "unknown":
-            d["equity_evidence_status"] = self.equity_evidence_status
+        # In-place edits of the curve (append/clear) bypass ``__setattr__``, so
+        # the attribute is re-synchronised with the value written here.
+        evidence_status = self._derived_equity_evidence_status()
+        self.equity_evidence_status = evidence_status
+        if evidence_status != "unknown":
+            d["equity_evidence_status"] = evidence_status
         return d
 
     @classmethod

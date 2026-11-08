@@ -5,9 +5,9 @@ from __future__ import annotations
 from validation.comparison.comparison import (
     FieldComparisonResult,
     MatchedTrade,
+    TradeComparator,
     TradeComparisonConfig,
     TradeComparisonResult,
-    TradeComparator,
 )
 from validation.comparison.delta_report import (
     DeltaReportBuilder,

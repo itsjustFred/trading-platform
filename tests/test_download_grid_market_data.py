@@ -63,11 +63,17 @@ def test_parse_csv_list():
 
 
 def test_valid_timeframes():
-    """Test VALID_TIMEFRAMES set."""
-    from data_tools.download_grid_market_data import VALID_TIMEFRAMES
+    """Test the timeframe set this tool actually serves.
+
+    The name moved. `VALID_TIMEFRAMES` is now the canonical set imported from
+    `shared.constants`, and what this downloader can serve is that set minus the
+    timeframes it cannot produce - see `UNSUPPORTED_TIMEFRAMES` in the module. The
+    assertion is unchanged in strength: still the exact seven.
+    """
+    from data_tools.download_grid_market_data import SUPPORTED_TIMEFRAMES
 
     expected = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
-    assert VALID_TIMEFRAMES == expected
+    assert SUPPORTED_TIMEFRAMES == expected
 
 
 def test_symbol_asset_class():

@@ -40,7 +40,7 @@ import pandas as pd
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG, _resolve_symbol_and_instrument
 from data_tools.path_safety import build_dataset_path
-from data_tools.resample import resample_ohlcv
+from data_tools.resample import assert_stored_weekly_file_current, resample_ohlcv
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -1482,6 +1482,11 @@ class JForexDownloader(Downloader):
                 bid_result_df = _resample_offer_prefixed(bid_df, target_tf, "bid")
                 ask_result_df = _resample_offer_prefixed(ask_df, target_tf, "ask")
 
+            if target_tf == "1w":
+                # Weekly bars are resampled here, so a pre-Monday-convention file would be
+                # merged into rather than replaced; fail before either side is written.
+                assert_stored_weekly_file_current(bid_out_path)
+                assert_stored_weekly_file_current(ask_out_path)
             self._merge_and_store_single_file(bid_out_path, bid_result_df)
             self._merge_and_store_single_file(ask_out_path, ask_result_df)
             result_df = bid_result_df.merge(ask_result_df, on="timestamp", how="inner")
@@ -1529,6 +1534,8 @@ class JForexDownloader(Downloader):
             # the symbol directory; fails closed when the file is missing.
             output_path = merged_result_path(bid_out_path)
         else:
+            if target_tf == "1w" and base_tf != target_tf:
+                assert_stored_weekly_file_current(out_path)
             combined = self._merge_and_store_single_file(out_path, result_df)
             size_bytes = out_path.stat().st_size
             output_path = out_path

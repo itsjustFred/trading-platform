@@ -520,7 +520,7 @@ class MT5XLSXImporter(BaseImporter):
     def _extract_first_percent(val: Any) -> float | None:
         if val is None:
             return None
-        m = re.search(r"([0-9]+[.,]?[0-9]*)\s*%", str(val))
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", str(val))
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -549,7 +549,7 @@ class MT5XLSXImporter(BaseImporter):
             return val
         text = str(val).strip()
         # Percentage wrapped in text, e.g. "1.0004 (0.04%)"
-        m = re.match(r"([0-9]+[.,]?[0-9]*)\s*\(([^)]+)\)", text)
+        m = re.match(r"(\d+(?:[.,]\d+)?)\s*\(([^)]+)\)", text)
         if m:
             try:
                 return float(m.group(1).replace(",", "."))
@@ -652,6 +652,16 @@ class MT5XLSXImporter(BaseImporter):
                 "Trades table is missing required columns "
                 "(Zeit / Typ / Richtung / Symbol / Volumen / Preis / Gewinn): "
                 + ", ".join(missing_columns)
+            )
+
+        # The Trade column drives position reconstruction. Without it every deal
+        # id resolves to "", so every row looks like a deal of the same position
+        # and the whole report is imported as one giant position. Refuse rather
+        # than silently produce that.
+        if col_trade_id is None:
+            raise ValueError(
+                "Trades table is missing required column (Trade): position "
+                "reconstruction would collapse every trade into one position."
             )
 
         # DV-B43: reconstruct one Trade per position with one TradeExit per
@@ -787,7 +797,8 @@ class MT5XLSXImporter(BaseImporter):
                 quantity=entry_volume,
                 exits=exits,
                 pnl=pnl,
-                fees=fees if fees != 0.0 else None,
+                # Exact zero, not a tolerance: MT5 reports "no fees" as 0.0.
+                fees=fees if abs(fees) > 0.0 else None,
                 net_pnl=pnl - fees,
                 stop_loss=sl,
                 take_profit=tp,
@@ -798,8 +809,9 @@ class MT5XLSXImporter(BaseImporter):
                     "order_id": order_id,
                     "stop_loss": sl,
                     "take_profit": tp,
-                    "swap": swap if swap != 0.0 else None,
-                    "commission": commission if commission != 0.0 else None,
+                    # Exact zero, not a tolerance: MT5 reports "no swap" as 0.0.
+                    "swap": swap if abs(swap) > 0.0 else None,
+                    "commission": commission if abs(commission) > 0.0 else None,
                 },
             )
             trades.append(trade)

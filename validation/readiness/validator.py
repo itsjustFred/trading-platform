@@ -29,8 +29,10 @@ def _abs_pct_diff(expected: float, actual: float) -> float:
     actual is also zero.
     """
     denom = abs(expected)
-    if denom == 0.0:
-        return 0.0 if actual == 0.0 else 1.0
+    if denom <= 0.0:
+        # Exact zero, not a tolerance: with no expected value there is no
+        # proportion to compute, so any non-zero actual is total drift.
+        return 0.0 if abs(actual) <= 0.0 else 1.0
     return abs(expected - actual) / denom
 
 
@@ -128,9 +130,14 @@ class ReadinessValidator:
                     )
                 )
 
-        errors = sum(1 for c in checks if not c.passed and c.severity == "error")
+        # `applicable` is excluded from both counts: a check with no answer must not be counted
+        # as a failure, and must not be counted as a pass either. Default True, so this is a
+        # no-op until something opts in.
+        errors = sum(
+            1 for c in checks if c.applicable and not c.passed and c.severity == "error"
+        )
         warnings = sum(
-            1 for c in checks if c.severity == "warning" and not c.passed
+            1 for c in checks if c.applicable and c.severity == "warning" and not c.passed
         )
 
         if errors > 0:
@@ -711,7 +718,9 @@ class ReadinessValidator:
             float(getattr(expected_stats, "risk_free_rate", 0.0)),
             float(getattr(actual_stats, "risk_free_rate", 0.0)),
         )
-        canonical_rf = all(math.isfinite(rate) and rate == 0.0 for rate in risk_free_rates)
+        # Exact zero, not a tolerance: "canonical" means the runner recomputed with
+        # rf=0.0, so any epsilon would accept a rate that is not the canonical one.
+        canonical_rf = all(math.isfinite(rate) and abs(rate) <= 0.0 for rate in risk_free_rates)
         checks.append(
             ReadinessCheck(
                 name="stats_risk_free_rate",
@@ -782,7 +791,10 @@ class ReadinessValidator:
             )
 
         # #83: Sharpe gate (canonical rf=0 on both sides). Pass when the
-        # absolute drift fits max(10% relative, 0.1 absolute).
+        # absolute drift fits max(10% relative, 0.05 absolute). The 0.1 in an older comment here
+        # was stale: models.py has defaulted the absolute floor to 0.05, so the comment described
+        # a tolerance the validator did not apply. The defaults are named rather than restated
+        # below so the comment cannot drift away from cfg a second time.
         expected_sharpe = float(expected_stats.sharpe_ratio)
         actual_sharpe = float(actual_stats.sharpe_ratio)
         sharpe_abs_diff = abs(expected_sharpe - actual_sharpe)
@@ -791,25 +803,49 @@ class ReadinessValidator:
             cfg.stats_sharpe_tolerance_abs,
         )
         sharpe_passed = sharpe_abs_diff <= sharpe_threshold
+        # At an expected Sharpe of exactly zero the relative term vanishes and only the absolute
+        # floor applies, so a "proportionate" comparison has no scale to work with. Whether that
+        # should be a pass/fail or an explicit "not comparable" is the open policy question; the
+        # config decides, and the default preserves today's behaviour.
+        sharpe_not_comparable = (
+            abs(expected_sharpe) <= 0.0
+            and cfg.stats_sharpe_zero_expectation_is_not_comparable
+        )
         checks.append(
             ReadinessCheck(
                 name="stats_sharpe",
                 description="Sharpe ratio is within tolerance between reference and platform",
                 passed=sharpe_passed,
-                severity="error" if not sharpe_passed else "info",
                 message=(
-                    f"Sharpe abs diff {sharpe_abs_diff:.4f} "
-                    f"(threshold {sharpe_threshold:.4f})"
+                    "Not comparable: reference Sharpe is exactly 0.0"
+                    if sharpe_not_comparable
+                    else (
+                        f"Sharpe abs diff {sharpe_abs_diff:.4f} "
+                        f"(threshold {sharpe_threshold:.4f})"
+                    )
                 ),
                 details={
                     "expected": expected_sharpe,
                     "actual": actual_sharpe,
                     "abs_diff": sharpe_abs_diff,
                     "threshold": sharpe_threshold,
+                    "applicable": not sharpe_not_comparable,
                 },
+                applicable=not sharpe_not_comparable,
+                severity=(
+                    "info"
+                    if (sharpe_passed or sharpe_not_comparable)
+                    else "error"
+                ),
             )
         )
-        if not sharpe_passed:
+        if sharpe_not_comparable:
+            recommendations.append(
+                "Sharpe was not compared: the reference Sharpe is exactly 0.0, so there is no "
+                "scale for a proportionate tolerance. Reported as not comparable rather than "
+                "passed or failed."
+            )
+        elif not sharpe_passed:
             recommendations.append(
                 f"Sharpe deviation exceeds threshold ({sharpe_abs_diff:.4f} > "
                 f"{sharpe_threshold:.4f})."

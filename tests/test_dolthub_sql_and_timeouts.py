@@ -50,6 +50,17 @@ class TestSqlBuilders:
         sql = build_symbol_select("we`ird")
         assert sql == "SELECT DISTINCT act_symbol FROM `we``ird`"
 
+    def test_build_symbol_select_filters_when_a_symbol_is_given(self) -> None:
+        """Omitting the symbol is the every-symbol listing; passing one filters
+        and quotes the literal rather than interpolating it raw (DV-B27)."""
+        assert build_symbol_select("ohlcv", "AAPL") == (
+            "SELECT DISTINCT act_symbol FROM `ohlcv` WHERE act_symbol = 'AAPL'"
+        )
+
+    def test_build_symbol_select_rejects_an_unsafe_symbol(self) -> None:
+        with pytest.raises(ValueError):
+            build_symbol_select("ohlcv", "AAPL' OR 1=1 --")
+
     def test_build_ohlcv_select_shape(self) -> None:
         sql = build_ohlcv_select("ohlcv", "AAPL")
         assert sql == (
