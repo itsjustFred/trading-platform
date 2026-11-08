@@ -24,6 +24,7 @@ from shared.models import (
     BacktestMeta,
     BacktestResult,
     EquityPoint as EquityPointModel,
+    LiveAccountConfig,
     LiveSignal,
     Trade,
     TradeExit,
@@ -657,6 +658,36 @@ def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> N
     assert summary2["skipped"] == 1
 
 
+def test_upserting_an_existing_account_preserves_is_demo(isolated_db) -> None:
+    """Re-saving an account must not reset the flag it is not carrying.
+
+    `LiveAccountConfig` has no `is_demo`, so `from_live_account` always builds a model with the
+    Python default `False`. That is correct for a *new* account and would silently un-flag a demo
+    account if the update path merged a config-built model. It does not - the update path sets
+    fields explicitly - and this pins that, because the failure would be invisible: the account
+    keeps working, it just stops being reported as demo.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    database.init_db()
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="acct-demo", broker="ctrader", name="demo", is_demo=True
+            )
+        )
+        session.commit()
+
+    database.upsert_live_accounts(
+        [LiveAccountConfig(id="acct-demo", broker="ctrader", name="renamed")]
+    )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "acct-demo")
+    assert row is not None
+    assert row.is_demo is True, "re-saving the account reset a stored is_demo flag"
+    assert row.name == "renamed", "the update path stopped applying the fields it does carry"
+
+
 def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db) -> None:
     """A database built before `is_demo` was mapped must gain the column.
 
@@ -688,3 +719,59 @@ def test_migrate_schema_adds_is_demo_to_a_legacy_live_accounts_table(isolated_db
     assert default is not None and str(default).strip("'") == "0", (
         f"is_demo must default to 0, matching production; got {default!r}"
     )
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(live_accounts)")}
+    finally:
+        conn.close()
+    assert "ix_live_accounts_is_demo" in indexes, (
+        f"the model declares is_demo with index=True, so a fresh database has "
+        f"ix_live_accounts_is_demo and a migrated one must too; got {sorted(indexes)}"
+    )
+
+
+def test_migrate_schema_parents_smoke_orphans_and_lands_the_foreign_key(legacy_db) -> None:
+    """The whole slice, end to end, on a database shaped like production.
+
+    A legacy `live_signals` with no foreign key and a smoke-prefixed orphan whose account exists:
+    `init_db()` must (a) create the parent deployment, (b) repoint the signal at it, and (c) finish
+    with the `deployment_id` foreign key present and no orphans left. This is the one path that ties
+    the two halves together - the unit tests each exercise a piece, and neither would fail if
+    `_migrate_schema` forgot to call them in that order.
+    """
+    database, engine, _data_dir = legacy_db
+    _legacy_signals_db(engine)
+    with engine.begin() as conn:
+        # A smoke orphan rather than the fixture's default 'dep'-parented row: this is the shape the
+        # backfill exists to resolve.
+        conn.execute(
+            text(
+                "INSERT INTO live_signals (id, deployment_id, symbol, action, theoretical_price, "
+                "timestamp, source, broker_order_id, metadata) "
+                "VALUES ('smoke-1', 'ctrader-demo-smoke-acct-legacy', 'EURUSD', 'buy', 1.0, "
+                "'2024-01-01T00:00:00', 'internal', '', '{}')"
+            )
+        )
+
+    database.init_db()
+
+    with engine.connect() as conn:
+        fks = conn.execute(text("PRAGMA foreign_key_list(live_signals)")).fetchall()
+        orphans = conn.execute(
+            text(
+                "SELECT count(*) FROM live_signals s "
+                "WHERE s.deployment_id NOT IN (SELECT id FROM live_deployments)"
+            )
+        ).scalar_one()
+        parents = conn.execute(
+            text(
+                "SELECT count(*) FROM live_deployments "
+                "WHERE strategy_name = 'ctrader-demo-smoke-acct-legacy'"
+            )
+        ).scalar_one()
+    assert any(
+        (row[2], row[3], row[4]) == ("live_deployments", "deployment_id", "id") for row in fks
+    ), "init_db() did not land the deployment_id foreign key on a smoke-only database"
+    assert parents == 1, "the smoke orphan's parent was not created"
+    assert orphans == 0, "a smoke orphan survived the migration, so the FK was left blocked"

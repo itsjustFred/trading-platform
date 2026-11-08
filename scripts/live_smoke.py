@@ -412,8 +412,11 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
     """
     from sqlmodel import select
 
-    from shared.database import LiveDeploymentModel, get_session
+    from shared.database import LiveDeploymentModel, get_session, init_db
 
+    # The worker mode reaches this before anything else touches the database, so on a fresh data
+    # dir the tables do not exist yet and the select below would raise "no such table".
+    init_db()
     strategy_name = f"ctrader-demo-smoke-{account_id}"
     with get_session() as session:
         existing = session.exec(
@@ -422,6 +425,14 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
             )
         ).first()
         if existing is not None:
+            # A later run may trade a different symbol. The row describes the account, so the new
+            # symbol joins the list instead of being dropped - otherwise `symbols` disagrees with
+            # the signals the deployment parents.
+            symbols = list(existing.symbols_json or [])
+            if symbol.upper() not in symbols:
+                existing.symbols_json = [*symbols, symbol.upper()]
+                session.add(existing)
+                session.commit()
             return str(existing.id)
         deployment_id = str(uuid4())
         session.add(

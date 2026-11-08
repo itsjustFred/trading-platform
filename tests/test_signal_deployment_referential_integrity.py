@@ -16,8 +16,10 @@ Measured facts held in place here, because together they are the whole argument 
    signal naming `ctrader-demo-smoke-<account>` and insert no `live_deployments` row at all. It now
    creates the parent first, and keys it on `strategy_name` with a UUID id.
 
-4. **Nothing in the app deletes a deployment**, so the seventh orphan - `4e9bbdab`, a real
-   deployment that is simply gone - was not made by application code removing a row.
+4. **The app cannot orphan a deployment.** It has exactly one deletion path,
+   `delete_live_deployment`, and that refuses while any signal or execution still points at the
+   row. So the seventh orphan - `4e9bbdab`, a real deployment that is simply gone - was not made
+   by application code removing a row.
 
 **So adding the FK has a cost**: every writer of a signal must first write its parent. That is not
 an argument against the constraint - a signal naming a nonexistent deployment is a defect, and
@@ -46,32 +48,40 @@ SMOKE_LABEL = "ctrader-demo-smoke-{account_id}"
 DELETED_REAL_DEPLOYMENT = "4e9bbdab-0d15-4232-91e1-cc459166b764"
 
 
-def test_foreign_keys_are_enabled_for_every_app_connection() -> None:
-    """The premise: the declared FKs are real, so a missing one is a gap and not a convention."""
-    text = DATABASE.read_text(encoding="utf-8")
-    assert "PRAGMA foreign_keys=ON" in text, (
-        "the connect-listener no longer enables foreign keys, so every declared FK is decorative"
+def test_foreign_keys_are_enabled_for_every_app_connection(isolated_db_sandbox) -> None:
+    """The premise: the declared FKs are real, so a missing one is a gap and not a convention.
+
+    Asserted by asking a connection from the app's own engine, not by grepping for the pragma:
+    a source match cannot tell "the pragma is set" from "the pragma is set on a path nothing
+    takes".
+    """
+    database, _engine, _data_dir = isolated_db_sandbox
+    database.init_db()
+    with database.get_engine().connect() as connection:
+        enabled = connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+    assert enabled == 1, (
+        "an app connection has foreign keys off, so every declared FK is decorative"
     )
 
 
 def test_live_signals_declares_the_deployment_foreign_key() -> None:
-    """The gap, closed.
+    """The gap, closed, asserted on the mapped table rather than on the source text.
 
     This file previously asserted the opposite, deliberately: adding the FK had a measured cost in
     the smoke tooling, and the tripwire was there so nobody could add the constraint without seeing
     it. The cost is now paid - `live_smoke._ensure_ctrader_smoke_deployment` writes the parent row
     before the signal - so the assertion is inverted rather than deleted.
     """
-    match = re.search(
-        r"class LiveSignalModel\(SQLModel, table=True\):(.*?)\n\s*@classmethod",
-        DATABASE.read_text(),
-        re.S,
-    )
-    block = match.group(1) if match else ""
-    assert block, "could not locate LiveSignalModel in shared/database.py"
-    assert 'foreign_key="live_deployments.id"' in block, (
-        "live_signals no longer declares a foreign key on deployment_id, so a schema built by "
-        "create_all accepts a signal naming a deployment that does not exist"
+    from shared.database import LiveSignalModel
+
+    targets = {
+        (foreign_key.column.table.name, foreign_key.parent.name)
+        for foreign_key in LiveSignalModel.__table__.foreign_keys
+    }
+    assert ("live_deployments", "deployment_id") in targets, (
+        f"live_signals declares no foreign key from deployment_id to live_deployments, so a "
+        f"schema built by create_all accepts a signal naming a deployment that does not exist: "
+        f"{sorted(targets)}"
     )
 
 
@@ -143,25 +153,102 @@ def test_the_smoke_helper_creates_one_paused_parent_per_account(isolated_db_sand
     assert row.symbols_json == ["XAUUSD"], row.symbols_json
     assert str(UUID(str(row.id))) == str(row.id), "the id is not a UUID"
 
+    # A later run on another symbol must extend the row, not leave `symbols` disagreeing with the
+    # signals the deployment parents.
+    third = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="eurusd")
+    assert third == first
+    with database.get_session() as session:
+        row = session.exec(select(database.LiveDeploymentModel)).one()
+    assert row.symbols_json == ["XAUUSD", "EURUSD"], row.symbols_json
 
-def test_no_code_path_deletes_a_deployment() -> None:
-    """Why the seventh orphan is a different story from the other six."""
-    for path in (REPO / "shared").rglob("*.py"):
-        if "tests" in path.parts:
-            continue
-        body = path.read_text(errors="replace")
-        assert "delete(LiveDeploymentModel)" not in body, (
-            f"{path} can now delete a deployment row, so the orphans have a second cause and this "
-            f"file's account of them is incomplete"
+
+def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_no_schema) -> None:
+    """The worker mode reaches the helper before anything else touches the database.
+
+    On a fresh data dir the tables do not exist yet, so without `init_db()` the first SELECT raises
+    "no such table" - a failure that names the wrong problem. The call still fails, by design: the
+    account row is absent and `live_deployments.account_id` carries a foreign key, so writing the
+    deployment would create a second orphan.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    database, engine, _data_dir = isolated_db_no_schema
+    from scripts.live_smoke import _ensure_ctrader_smoke_deployment
+
+    with pytest.raises(IntegrityError):
+        _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+
+    with engine.connect() as connection:
+        tables = {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert {"live_deployments", "live_accounts"} <= tables, (
+        f"the helper queried a database whose schema was never created: {sorted(tables)}"
+    )
+
+
+def test_the_app_cannot_delete_a_deployment_that_still_has_signals(isolated_db_sandbox) -> None:
+    """Why the seventh orphan is a different story from the other six.
+
+    The app does have one deletion path - `delete_live_deployment`, added for Blocker 5 - but it
+    refuses while any signal or execution still points at the row, so application code cannot
+    produce an orphan. That is what makes the hand-removed `4e9bbdab` a different cause from the
+    smoke tooling, and why this file's account of the two stories still holds.
+
+    This previously asserted that *no* code path deletes a deployment, by grepping for
+    `delete(LiveDeploymentModel)`. That grep cannot see `session.delete(record)`, so it kept passing
+    while the app gained a deletion path - the assertion was about the spelling, not the behaviour.
+    """
+    from datetime import datetime, timezone
+
+    database, engine, _data_dir = isolated_db_sandbox
+    database.init_db()
+    with database.get_session() as session:
+        session.add(database.LiveAccountModel(id="acct-keep", broker="fixture", name="acct-keep"))
+        session.add(
+            database.LiveDeploymentModel(
+                id="dep-keep",
+                strategy_name="keep-me",
+                account_id="acct-keep",
+                symbols_json=[],
+                timeframe="1m",
+            )
         )
+        session.commit()
+    with database.get_session() as session:
+        session.add(
+            database.LiveSignalModel(
+                id="sig-keep",
+                deployment_id="dep-keep",
+                symbol="AAPL",
+                action="buy",
+                theoretical_price=1.0,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    with pytest.raises(database.LiveDeploymentInUseError):
+        database.delete_live_deployment("dep-keep")
+
+    with engine.connect() as connection:
+        survivors = connection.exec_driver_sql(
+            "SELECT count(*) FROM live_deployments"
+        ).scalar_one()
+    assert survivors == 1, "the app deleted a deployment that still had history"
 
 
 def test_the_two_orphan_stories_are_recorded_separately() -> None:
     """Six from the smoke tooling, one removed by hand. Collapsing them loses the cause."""
-    assert SMOKE_LABEL.count("smoke") == 1
     assert DELETED_REAL_DEPLOYMENT.startswith("4e9bbdab"), (
         "the deleted real deployment id must stay recorded; it is the only orphan whose cause is "
         "not the smoke tooling"
+    )
+    assert not DELETED_REAL_DEPLOYMENT.startswith("ctrader-demo-smoke-"), (
+        "the hand-removed deployment is being confused with a smoke label"
     )
 
 
@@ -360,8 +447,16 @@ def test_init_db_still_refuses_while_a_non_smoke_orphan_remains(isolated_db_sand
         )
         connection.commit()
 
-    with pytest.raises(RuntimeError, match="foreign key violations remain"):
+    with pytest.raises(RuntimeError, match="foreign key violations remain") as excinfo:
         database.init_db()
+    # The operator must be able to act on the error: it names the table, the rowid, the dangling
+    # deployment_id and the remedy.
+    message = str(excinfo.value)
+    assert "live_signals" in message
+    assert DELETED_REAL_DEPLOYMENT in message
+    assert "rowid=" in message
+    assert "Fix:" in message
+    assert "1 row(s)" in message
 
     # Nothing half-applied: the key did not land and the rows survived.
     with engine.connect() as connection:
@@ -566,3 +661,72 @@ class TestTheRebuildSwapsCorrectlyDespiteTheChildForeignKey:
             assert check.execute("PRAGMA foreign_key_check").fetchall() == []
         finally:
             check.close()
+
+
+def test_foreign_key_violation_report_is_capped(isolated_db_sandbox) -> None:
+    """Many orphans must not produce an unbounded error message."""
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        for index in range(15):
+            connection.exec_driver_sql(
+                "INSERT INTO live_signals "
+                "(id, deployment_id, symbol, action, theoretical_price, timestamp, metadata) "
+                f"VALUES ('sig-o{index}', 'ghost-{index}', 'AAPL', 'buy', 1.0, "
+                "'2026-04-10 15:16:17', '{}')"
+            )
+        connection.commit()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        database.init_db()
+
+    message = str(excinfo.value)
+    assert "15 row(s)" in message
+    assert "... and 5 more" in message
+    assert message.count("live_signals rowid=") == 10
+
+
+def test_init_db_refuses_to_adopt_when_several_parents_share_the_smoke_label(
+    isolated_db_sandbox,
+) -> None:
+    """`strategy_name` is not unique: adoption must not silently pick one of several."""
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    first, second = str(uuid4()), str(uuid4())
+    _seed_smoke_parent(engine, account_id="acct-5", parent_id=first)
+    label = SMOKE_LABEL.format(account_id="acct-5")
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO live_deployments "
+            "(id, strategy_name, account_id, symbols, timeframe, status, created_at, updated_at)"
+            f" VALUES ('{second}', '{label}', 'acct-5', '[]', '1m', 'PAUSED', '', '')"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="share that strategy_name") as excinfo:
+        database.init_db()
+    assert first in str(excinfo.value) and second in str(excinfo.value)
+
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT deployment_id FROM live_signals WHERE id = 'sig-1'"
+        ).scalar_one() == label, "the signal was re-pointed despite the ambiguity"
+
+
+def test_init_db_refuses_to_adopt_a_parent_of_a_different_account(isolated_db_sandbox) -> None:
+    database, engine, _data_dir = isolated_db_sandbox
+    _strip_deployment_fk(engine)
+    parent_id = str(uuid4())
+    _seed_smoke_parent(engine, account_id="acct-6", parent_id=parent_id)
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO live_accounts (id, broker, name) VALUES ('other', 'ctrader', 'other')"
+        )
+        connection.exec_driver_sql(
+            f"UPDATE live_deployments SET account_id = 'other' WHERE id = '{parent_id}'"
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="belongs to account"):
+        database.init_db()

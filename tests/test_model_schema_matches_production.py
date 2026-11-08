@@ -214,3 +214,26 @@ def test_the_scalar_stat_defaults_are_still_declared(model_built_db: Path) -> No
             f"backtests.{column} has model default {defaults.get(('backtests', column))!r}, "
             f"expected {expected!r}"
         )
+
+
+def test_the_model_declares_the_signal_to_deployment_foreign_key(model_built_db: Path) -> None:
+    """A schema built by `create_all` must have the constraint, not only a migrated one.
+
+    Without the declaration, whether a signal could even be orphaned depended on *which* path built
+    the database: a fresh install had no key, production gained it by migration. That split is what
+    let two test fixtures rely on being able to write an orphan - so the declaration is the thing
+    that makes the invariant independent of the build path. The migration still exists, because
+    SQLite cannot add a foreign key to an existing table; it just has nothing to do here.
+    """
+    conn = sqlite3.connect(f"file:{model_built_db}?mode=ro", uri=True)
+    try:
+        refs = conn.execute("PRAGMA foreign_key_list(live_signals)").fetchall()
+    finally:
+        conn.close()
+    assert any(
+        (row[2], row[3], row[4]) == ("live_deployments", "deployment_id", "id") for row in refs
+    ), (
+        "a model-built database has no live_signals.deployment_id -> "
+        "live_deployments.id key, so an orphan is possible on a fresh install but not on "
+        f"production: {refs}"
+    )

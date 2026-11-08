@@ -91,6 +91,13 @@ def _order_symbol(order: Any) -> str:
     return str(_order_attr(order, "symbol", "") or "").strip().upper()
 
 
+def _order_side(order: Any) -> str:
+    """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
+    raw = _order_attr(order, "side", "")
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
 def _alpaca_timeframe(value: str):
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -1072,10 +1079,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         newest = pd.Timestamp(frame["timestamp"].iloc[-1])
         now = pd.Timestamp.now(tz="UTC")
+        # Intraday bars can legitimately be days old across a market closure: a
+        # Friday close to a Tuesday open is ~89 hours once a holiday Monday is
+        # included, and IEX has no pre/post session to shorten the gap. 72 hours
+        # rejected that valid data; a week still catches a feed that has stopped.
         max_age = (
             timedelta(days=7)
             if str(timeframe).strip().lower() == "1d"
-            else timedelta(hours=72)
+            else timedelta(days=5)
         )
         if newest < now - max_age:
             raise ValueError(
@@ -1300,6 +1311,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ) from exc
         return OrderSide, TimeInForce, StopOrderRequest
 
+    @staticmethod
+    def _has_working_stop(orders: list[Any], symbol: str, side: str) -> bool:
+        """Whether a stop that actually protects this position is still working.
+
+        The side matters. A buy stop on a long is an entry for a different intent,
+        not a protection: treating it as one after the position's own sell stop was
+        cancelled reports the position as protected while it is naked. Only a stop
+        on the reducing side counts, and a bracket's leg counts only if that leg
+        itself is on the reducing side.
+        """
+        wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
+        for order in orders:
+            if _order_symbol(order) != symbol:
+                continue
+            for candidate in (order, *_order_legs(order)):
+                candidate_symbol = _order_symbol(candidate)
+                if candidate_symbol not in {"", symbol}:
+                    continue
+                order_type = str(_order_attr(candidate, "order_type", "") or "").lower()
+                if "stop" not in order_type:
+                    continue
+                if _order_side(candidate) == wanted:
+                    return True
+        return False
+
     async def _restore_stop(
         self,
         client: Any,
@@ -1314,7 +1350,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         otherwise leave the position naked. Restoring the stop the strategy had
         is the only acceptable outcome short of a fill; failing to do so is
         logged at CRITICAL because it means live unprotected exposure.
+
+        Returns whether the position is protected afterwards, which is also true
+        when a stop still works at the broker. Re-submitting in that case would
+        leave two stops on one position, and the second becomes an orphan the
+        moment the first fills - an orphaned sell-stop opens a short.
         """
+        try:
+            working = await self._list_open_orders(client)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not re-read orders before restoring a stop; restoring anyway",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            working = None
+        if working is not None and self._has_working_stop(working, symbol, side):
+            logger.warning(
+                "Not restoring a stop: one still works at the broker",
+                extra={"data": {"symbol": symbol}},
+            )
+            return True
         if stop_price is None:
             logger.critical(
                 "Cannot restore a stop: the cancelled orders carried no stop price, "
