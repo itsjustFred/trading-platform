@@ -57,6 +57,12 @@ STRATEGY_META = {
     },
 }
 
+# NOTE: "1W" is deliberately left as pandas' default weekly bucket here. This map feeds an
+# in-strategy `resample(...).last().shift(1)` confirmation price, not stored bars, and the
+# default (Sunday-labelled, right-closed) bucket makes that signal lag one week more than a
+# Monday-start bucket would - conservative, no look-ahead. Moving it to the stored-data
+# convention in `data_tools.resample` (Sunday-start, Monday-labelled) would change signal
+# timing and therefore backtest results, so it is a separate, explicit decision.
 _TF_FREQ_MAP = {
     "1m": "1min",
     "5m": "5min",

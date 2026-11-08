@@ -13,17 +13,23 @@ from validation.importers._pairing import group_position_fills
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import ValidationReference
 
+_REPORTS = (
+    Path(__file__).resolve().parents[2]
+    / "strategy-comparisons"
+    / "intraday_volatility_breakout"
+)
+
 
 def _eurusd_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/EURUSD_H1.xlsx")
+    return _REPORTS / "EURUSD_H1.xlsx"
 
 
 def _nas100_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/NAS100_M15.xlsx")
+    return _REPORTS / "NAS100_M15.xlsx"
 
 
 def _sp500_path() -> Path:
-    return Path("strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx")
+    return _REPORTS / "SP500_M1.xlsx"
 
 
 @pytest.fixture
@@ -564,3 +570,122 @@ def test_build_trades_empty_frame_returns_tuple_shape() -> None:
     trades, summary = MT5XLSXImporter._build_trades(pd.DataFrame(), {})
     assert trades == []
     assert summary["open_position_count"] == 0
+
+
+class TestTradeColumnRequired:
+    """The Trade column drives position reconstruction and cannot be optional.
+
+    Without it every deal id resolves to "", so every row looks like a deal of
+    the same position and the whole report imports as one giant position.
+    """
+
+    def _write_report(self, tmp_path: Path, include_trade: bool) -> Path:
+        # Merge resolution: the fixture gained the ``Gewinn`` column. The
+        # importer has required it since DV-B42 (``direction``/``Gewinn`` are
+        # derived inputs, not optional), and without it both tests below failed
+        # at that earlier gate instead of at the Trade-column gate they target.
+        header = ["Zeit"] + (["Trade"] if include_trade else []) + [
+            "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Gewinn", "Kommentar",
+        ]
+
+        def _row(
+            time_value: str,
+            deal: int,
+            typ: str,
+            direction: str,
+            price: float,
+            profit: float = 0.0,
+        ):
+            return [time_value] + ([deal] if include_trade else []) + [
+                "EURUSD", typ, direction, "0.10", price, profit, "",
+            ]
+
+        rows = [
+            ["Trades"] + [None] * (len(header) - 1),
+            header,
+            _row("2024.01.03 08:00:00", 2, "buy", "in", 1.085),
+            _row("2024.01.03 16:00:00", 3, "sell", "out", 1.09, profit=0.0005),
+        ]
+        trades = pd.DataFrame(rows)
+        # All-string Orders table; a mixed-type cell becomes NaN and breaks the
+        # importer's frame handling before the Trades table is even read.
+        orders = pd.DataFrame([["Orders", None], [None, None]])
+
+        path = tmp_path / f"report_{'with' if include_trade else 'no'}_trade.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            trades.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    def test_missing_trade_column_raises(self, tmp_path: Path):
+        path = self._write_report(tmp_path, include_trade=False)
+        importer = MT5XLSXImporter()
+        with pytest.raises(ValueError) as excinfo:
+            importer.load(path)
+        # Merge resolution: assert the Trade-column gate specifically. The
+        # substring "Trade" also occurs in the generic "Trades table is missing
+        # required columns ..." prefix, so the original assertion could pass on
+        # an unrelated missing column and never reach the gate under test.
+        assert "missing required column (Trade)" in str(excinfo.value)
+
+    def test_present_trade_column_still_imports(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(self._write_report(tmp_path, include_trade=True))
+        assert len(ref.trades) == 1, "one in/out pair must reconstruct one position"
+
+
+class TestZeroFeesBecomeNone:
+    """MT5 reports "no fees" as ``0.0``; the importer stores that as ``None``.
+
+    A mutant flipping ``abs(fees) > 0.0`` to ``>= 0.0`` would store ``0.0`` and
+    still pass every other test, because the fee columns are only exercised with
+    non-zero values. Pin the exact-zero mapping and the net-pnl arithmetic.
+    """
+
+    def _write_report(
+        self, tmp_path: Path, *, commission: float, swap: float, profit: float = 100.0
+    ) -> Path:
+        header = [
+            "Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis",
+            "Kommission", "Swap", "Gewinn", "Kommentar",
+        ]
+        rows = [
+            ["Trades"] + [None] * (len(header) - 1),
+            header,
+            ["2024.01.03 08:00:00", 2, "EURUSD", "buy", "in", "0.10", 1.085,
+             commission, swap, 0.0, ""],
+            ["2024.01.03 16:00:00", 3, "EURUSD", "sell", "out", "0.10", 1.090,
+             0.0, 0.0, profit, ""],
+        ]
+        trades = pd.DataFrame(rows)
+        orders = pd.DataFrame([["Orders", None], [None, None]])
+
+        path = tmp_path / f"report_{commission}_{swap}.xlsx"
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            orders.to_excel(writer, index=False, header=False, startrow=0)
+            trades.to_excel(writer, index=False, header=False, startrow=20)
+        return path
+
+    def test_zero_commission_and_swap_are_stored_as_none(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=0.0, swap=0.0)
+        )
+        trade = ref.trades[0]
+        assert trade.fees is None
+        assert trade.meta["commission"] is None
+        assert trade.meta["swap"] is None
+
+    def test_nonzero_fees_are_stored_as_the_summed_value(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=2.5, swap=1.5)
+        )
+        trade = ref.trades[0]
+        assert trade.fees == pytest.approx(4.0)
+        assert trade.meta["commission"] == pytest.approx(2.5)
+        assert trade.meta["swap"] == pytest.approx(1.5)
+
+    def test_net_pnl_subtracts_fees_from_gross(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=2.5, swap=1.5, profit=100.0)
+        )
+        trade = ref.trades[0]
+        assert trade.net_pnl == pytest.approx(trade.pnl - 4.0)

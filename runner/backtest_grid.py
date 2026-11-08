@@ -40,7 +40,7 @@ from runner.grid_identity import (
     identity_matches,
 )
 from runner.stats import merge_canonical_stats
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import DATA_DIR, GRID_TIMEFRAME_ALIASES, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
 from shared.models import BacktestResult, StrategyType
@@ -51,21 +51,9 @@ GRID_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
 GRID_START = "2020-01-01"
 DEFAULT_OUTPUT_DIR = DATA_DIR / "backtests" / "grid_runner"
 logger = get_logger("runner.grid")
-TIMEFRAME_ALIASES = {
-    "m1": "1m",
-    "1min": "1m",
-    "min1": "1m",
-    "m5": "5m",
-    "m15": "15m",
-    "m30": "30m",
-    "h1": "1h",
-    "hour1": "1h",
-    "h4": "4h",
-    "hour4": "4h",
-    "d1": "1d",
-    "daily": "1d",
-    "day": "1d",
-}
+# One definition, in shared.constants. Kept as a module-level name because the
+# grid CLI and its tests read it from here.
+TIMEFRAME_ALIASES = GRID_TIMEFRAME_ALIASES
 
 
 def parse_csv_list(raw: str | Iterable[str]) -> list[str]:
