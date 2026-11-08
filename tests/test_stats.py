@@ -354,6 +354,40 @@ class TestComputeStats:
         assert stats["total_pnl"] == 38.0
         assert stats["profit_factor"] == pytest.approx(95.0 / 57.0, abs=1e-3)
 
+    def test_trade_stats_subtract_stored_fees_when_net_pnl_is_absent(self):
+        """The gross-minus-fees fallback must subtract, not add, the fee.
+
+        The stored-net path above cannot catch an inverted operator: these
+        trades deliberately carry ``net_pnl=None`` so the ledger arithmetic is
+        the only thing that decides the winner/loser split.  With a fee of 5 a
+        gross -3 trade is a -8 loser; adding the fee would make it a +2 winner
+        and flip both the win rate and the total.
+        """
+        gross_winner = _trade(30.0)
+        gross_winner.fees = 10.0
+        gross_winner.net_pnl = None
+        gross_winner.id = 1
+        gross_loser = _trade(-3.0)
+        gross_loser.fees = 5.0
+        gross_loser.net_pnl = None
+        gross_loser.id = 2
+
+        stats = compute_stats([gross_winner, gross_loser])
+
+        # Net: +20, -8 → one winner, one loser, total +12.  With the fee added
+        # instead of subtracted the figures would be +40 / +2 (two winners,
+        # total +42, profit_factor infinite).
+        assert stats["winners"] == 1
+        assert stats["losers"] == 1
+        assert stats["total_trades"] == 2
+        assert stats["total_pnl"] == 12.0
+        assert stats["win_rate"] == pytest.approx(0.5)
+        assert stats["avg_winner"] == pytest.approx(20.0)
+        assert stats["avg_loser"] == pytest.approx(-8.0)
+        assert stats["profit_factor"] == pytest.approx(2.5)
+        assert stats["max_consecutive_wins"] == 1
+        assert stats["max_consecutive_losses"] == 1
+
     def test_calmar_ratio_zeroed_for_tiny_drawdown(self):
         equity = _equity_curve_from_returns([0.0200, -0.0005, 0.0150, 0.0100])
 

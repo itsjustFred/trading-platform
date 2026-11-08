@@ -1,0 +1,325 @@
+{
+  "equity_curve": [
+    {
+      "equity": 100000.0,
+      "time": "2024-01-01T00:00:00+00:00"
+    },
+    {
+      "equity": 99849.0,
+      "time": "2024-01-01T07:00:00+00:00"
+    },
+    {
+      "equity": 99721.47,
+      "time": "2024-01-02T07:00:00+00:00"
+    },
+    {
+      "equity": 100497.05,
+      "time": "2024-01-03T07:00:00+00:00"
+    }
+  ],
+  "equity_evidence_status": "available",
+  "meta": {
+    "backtest_end": "2024-01-03",
+    "backtest_start": "2024-01-01",
+    "created_at": "<dynamic>",
+    "data": {
+      "daily_equity_curve": [
+        {
+          "equity": 100000.0,
+          "time": "2024-01-01T00:00:00+00:00"
+        },
+        {
+          "equity": 99849.0,
+          "time": "2024-01-01T23:59:59.999999+00:00"
+        },
+        {
+          "equity": 99721.47,
+          "time": "2024-01-02T23:59:59.999999+00:00"
+        },
+        {
+          "equity": 100497.05,
+          "time": "2024-01-03T23:59:59.999999+00:00"
+        }
+      ],
+      "daily_return_count": 3,
+      "equity_frequency": "daily",
+      "execution_context": {
+        "data_dir": "<dynamic-path>",
+        "data_source": "",
+        "engine": "native",
+        "initial_capital": 100000.0,
+        "risk_config": {
+          "max_leverage": 1.0,
+          "max_position_exposure_pct": 1.0,
+          "max_position_exposure_semantics": "aggregate_open_risk",
+          "modeling_resolution": "main_timeframe",
+          "risk_per_trade_pct": 0.01,
+          "signal_exit_fill": "close",
+          "warmup_start": ""
+        },
+        "symbols": [
+          "PARITY"
+        ],
+        "timeframe": "1h"
+      },
+      "pnl_basis": {
+        "net_pnl": "net_after_fees",
+        "pnl": "gross"
+      },
+      "risk_config": {
+        "max_leverage": 1.0,
+        "max_position_exposure_pct": 1.0,
+        "max_position_exposure_semantics": "aggregate_open_risk",
+        "modeling_resolution": "main_timeframe",
+        "risk_per_trade_pct": 0.01,
+        "signal_exit_fill": "close",
+        "warmup_start": ""
+      },
+      "shared_equity": {},
+      "source": "ohlcv",
+      "symbols": [
+        "PARITY"
+      ],
+      "timeframes": [
+        "1h"
+      ],
+      "universe": "",
+      "universe_provenance": {
+        "as_of": null,
+        "as_of_declared": false,
+        "disclosure": "The symbol list was resolved from cli:--symbols at <dynamic> and the run makes no statement about when its membership was determined. This platform ships no historical (point-in-time) index-membership source. If the list came from a current constituents snapshot, every name removed from or delisted before <dynamic> is missing from the whole window and the result is biased upward; if it is a hand-picked list, membership was constant and the point-in-time concern does not apply. Which of the two is true is unknown, and is recorded as unknown rather than assumed.",
+        "is_point_in_time": null,
+        "membership_basis": "undeclared",
+        "platform_membership_sources": [],
+        "point_in_time_source": "",
+        "provider": "cli:--symbols",
+        "resolved_at": "<dynamic>",
+        "symbol_count": 1,
+        "symbols": [
+          "PARITY"
+        ],
+        "symbols_sha256": "114646257f81c63b78d0d9554ed3c3d1332ba237049dde829b4938a3b21317ac",
+        "undefined_metrics": [
+          "as_of",
+          "membership_basis"
+        ],
+        "version": 1,
+        "window": {
+          "end": "2024-01-03T00:00:00+00:00",
+          "start": "2024-01-01T00:00:00+00:00"
+        }
+      },
+      "window_start_basis": "ledger_only"
+    },
+    "duration_days": 2,
+    "engine": "native",
+    "id": "backtest-golden-native-v1",
+    "initial_capital": 100000.0,
+    "max_leverage": 1.0,
+    "max_position_exposure_pct": 1.0,
+    "parameters": {
+      "fee_flat_per_trade": 1.0,
+      "fee_rate": 0.0005
+    },
+    "risk_per_trade_pct": 0.01,
+    "strategies": [
+      "backtest_golden"
+    ],
+    "total_bars": 72
+  },
+  "stats": {
+    "avg_holding_bars": 4.0,
+    "avg_loser": -139.26,
+    "avg_winner": 775.58,
+    "cagr": 0.828799,
+    "calmar_ratio": 297.5618,
+    "daily_return_count": 3,
+    "daily_returns": [
+      {
+        "date": "2024-01-01",
+        "equity": 99849.0,
+        "return": -0.00151
+      },
+      {
+        "date": "2024-01-02",
+        "equity": 99721.47,
+        "return": -0.0012772026228354651
+      },
+      {
+        "date": "2024-01-03",
+        "equity": 100497.05,
+        "return": 0.007777437822890051
+      }
+    ],
+    "duplicate_equity_timestamps": 0,
+    "equity_return_frequency": "daily",
+    "losers": 2,
+    "max_consecutive_losses": 2,
+    "max_consecutive_wins": 1,
+    "max_drawdown_duration": 2,
+    "max_drawdown_pct": -0.002785,
+    "p_value": 0.320491,
+    "profit_factor": 2.7846,
+    "risk_free_rate": 0.0,
+    "sharpe_ratio": 4.9858,
+    "sortino_ratio": 23.1256,
+    "total_pnl": 497.05,
+    "total_return": 0.00497,
+    "total_trades": 3,
+    "undefined_metrics": [],
+    "win_rate": 0.3333,
+    "winners": 1
+  },
+  "trades": [
+    {
+      "direction": "LONG",
+      "entry_price": 104.0,
+      "entry_time": "2024-01-01T03:00:00+00:00",
+      "exits": [
+        {
+          "pnl": -148.14814814814815,
+          "price": 96.0,
+          "quantity": 18.51851851851852,
+          "reason": "signal",
+          "time": "2024-01-01T07:00:00+00:00"
+        }
+      ],
+      "fees": 2.851851851851852,
+      "holding_bars": 4,
+      "id": 1,
+      "mae": -166.66666666666669,
+      "meta": {
+        "entry_fill": {
+          "order_type": "market",
+          "price": 104.0,
+          "price_side": "open",
+          "timestamp": "2024-01-01T03:00:00+00:00"
+        },
+        "equity_at_entry": 100000.0,
+        "equity_proportional_sizing": true,
+        "execution_model": {
+          "entry_price_side": "open",
+          "intrabar_resolution": null,
+          "lower_timeframe_replay": false,
+          "market_order_timing": "next_bar_open",
+          "same_bar_order": "stop_first",
+          "stop_trigger_side": "bar_low_high",
+          "take_profit_trigger_side": "bar_high_low"
+        },
+        "exit_reason": "signal",
+        "sizing_stop_loss": 50.0
+      },
+      "mfe": 18.51851851851852,
+      "net_pnl": -151.0,
+      "pnl": -148.14814814814815,
+      "pnl_pct": -7.840384615384615,
+      "quantity": 18.51851851851852,
+      "r_multiple": -0.151,
+      "stop_loss": 50.0,
+      "symbol": "PARITY",
+      "tags": [
+        "native"
+      ]
+    },
+    {
+      "direction": "LONG",
+      "entry_price": 114.0,
+      "entry_time": "2024-01-02T03:00:00+00:00",
+      "exits": [
+        {
+          "pnl": -124.81125,
+          "price": 106.0,
+          "quantity": 15.60140625,
+          "reason": "signal",
+          "time": "2024-01-02T07:00:00+00:00"
+        }
+      ],
+      "fees": 2.7161546875,
+      "holding_bars": 4,
+      "id": 2,
+      "mae": -140.41265625,
+      "meta": {
+        "entry_fill": {
+          "order_type": "market",
+          "price": 114.0,
+          "price_side": "open",
+          "timestamp": "2024-01-02T03:00:00+00:00"
+        },
+        "equity_at_entry": 99849.0,
+        "equity_proportional_sizing": true,
+        "execution_model": {
+          "entry_price_side": "open",
+          "intrabar_resolution": null,
+          "lower_timeframe_replay": false,
+          "market_order_timing": "next_bar_open",
+          "same_bar_order": "stop_first",
+          "stop_trigger_side": "bar_low_high",
+          "take_profit_trigger_side": "bar_high_low"
+        },
+        "exit_reason": "signal",
+        "sizing_stop_loss": 50.0
+      },
+      "mfe": 15.60140625,
+      "net_pnl": -127.5274046875,
+      "pnl": -124.81125,
+      "pnl_pct": -7.170260338725511,
+      "quantity": 15.60140625,
+      "r_multiple": -0.12772026228354816,
+      "stop_loss": 50.0,
+      "symbol": "PARITY",
+      "tags": [
+        "native"
+      ]
+    },
+    {
+      "direction": "LONG",
+      "entry_price": 123.0,
+      "entry_time": "2024-01-03T03:00:00+00:00",
+      "exits": [
+        {
+          "pnl": 778.6471147853168,
+          "price": 180.0,
+          "quantity": 13.660475697988014,
+          "reason": "signal",
+          "time": "2024-01-03T07:00:00+00:00"
+        }
+      ],
+      "fees": 3.069562068245184,
+      "holding_bars": 4,
+      "id": 3,
+      "mae": -13.660475697988014,
+      "meta": {
+        "entry_fill": {
+          "order_type": "market",
+          "price": 123.0,
+          "price_side": "open",
+          "timestamp": "2024-01-03T03:00:00+00:00"
+        },
+        "equity_at_entry": 99721.47,
+        "equity_proportional_sizing": true,
+        "execution_model": {
+          "entry_price_side": "open",
+          "intrabar_resolution": null,
+          "lower_timeframe_replay": false,
+          "market_order_timing": "next_bar_open",
+          "same_bar_order": "stop_first",
+          "stop_trigger_side": "bar_low_high",
+          "take_profit_trigger_side": "bar_high_low"
+        },
+        "exit_reason": "signal",
+        "sizing_stop_loss": 50.0
+      },
+      "mfe": 792.3075904833048,
+      "net_pnl": 775.5775527170716,
+      "pnl": 778.6471147853168,
+      "pnl_pct": 46.158777322843065,
+      "quantity": 13.660475697988014,
+      "r_multiple": 0.7777437822889995,
+      "stop_loss": 50.0,
+      "symbol": "PARITY",
+      "tags": [
+        "native"
+      ]
+    }
+  ]
+}

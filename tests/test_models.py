@@ -240,6 +240,90 @@ class TestBacktestResult:
             assert r2.meta.id == r.meta.id
             assert len(r2.trades) == 2
 
+    def test_available_status_without_a_curve_is_rejected(self):
+        """A payload may not claim equity evidence it does not carry.
+
+        ``equity_evidence_status`` drives the validation reports, so a file that
+        says ``available`` while shipping no curve must fail loudly instead of
+        being read as evidence.
+        """
+        payload = _make_result().to_dict()
+        payload["equity_curve"] = []
+        payload["equity_evidence_status"] = "available"
+
+        with pytest.raises(ValueError, match="requires an equity curve"):
+            BacktestResult.from_dict(payload)
+
+    def test_curve_attached_after_construction_serializes_evidence_status(self, tmp_path):
+        """A curve attached after construction must not leave a stale status.
+
+        The daily-equity builder attaches the curve to an already constructed
+        result, so the status derived in ``__post_init__`` goes stale.  The
+        artifact then omitted the field while reloading it inferred
+        ``available``: writer and reader disagreed about the same file.
+        """
+        result = BacktestResult(meta=_make_result().meta, trades=[_make_simple_trade()])
+        assert result.equity_evidence_status == "unknown"
+        assert "equity_evidence_status" not in result.to_dict()
+
+        result.equity_curve = [EquityPoint(time="2021-01-01", equity=100_000.0)]
+        assert result.to_dict()["equity_evidence_status"] == "available"
+
+        path = tmp_path / "result.json"
+        result.save(path)
+        reloaded = BacktestResult.load(path)
+        assert reloaded.equity_evidence_status == "available"
+        assert reloaded.to_dict()["equity_evidence_status"] == "available"
+
+    def test_in_memory_status_agrees_with_the_serialized_status(self):
+        """The attribute readers see must equal what ``to_dict`` writes."""
+        result = BacktestResult(meta=_make_result().meta, trades=[_make_simple_trade()])
+        assert result.equity_evidence_status == "unknown"
+
+        result.equity_curve = [EquityPoint(time="2021-01-01", equity=100_000.0)]
+        assert result.equity_evidence_status == "available"
+        assert result.to_dict()["equity_evidence_status"] == result.equity_evidence_status
+
+        # Detaching the curve again withdraws the claim instead of leaving a
+        # serialized "available" that cannot be reloaded.
+        result.equity_curve = []
+        assert result.equity_evidence_status == "unknown"
+        assert "equity_evidence_status" not in result.to_dict()
+        BacktestResult.from_dict(result.to_dict())
+
+    def test_in_place_curve_edits_are_resynchronised_on_serialization(self):
+        result = BacktestResult(meta=_make_result().meta, trades=[_make_simple_trade()])
+        result.equity_curve.append(EquityPoint(time="2021-01-01", equity=100_000.0))
+        assert result.equity_evidence_status == "unknown"
+
+        written = result.to_dict()
+
+        assert written["equity_evidence_status"] == "available"
+        assert result.equity_evidence_status == "available"
+
+    def test_an_explicit_missing_status_is_never_overridden(self):
+        result = BacktestResult(
+            meta=_make_result().meta,
+            trades=[_make_simple_trade()],
+            equity_evidence_status="missing",
+        )
+        result.equity_curve = [EquityPoint(time="2021-01-01", equity=100_000.0)]
+        assert result.equity_evidence_status == "missing"
+        assert result.to_dict()["equity_evidence_status"] == "missing"
+
+    def test_attach_daily_equity_leaves_the_attribute_in_step(self):
+        from runner.daily_equity import attach_daily_equity
+
+        result = _make_result()
+        result.equity_curve = []
+        result.equity_evidence_status = "unknown"
+
+        attach_daily_equity(result)
+
+        assert result.equity_curve, "the daily builder must attach a curve"
+        assert result.equity_evidence_status == "available"
+        assert result.to_dict()["equity_evidence_status"] == "available"
+
     def test_save_preserves_existing_file_when_serialization_fails(self, tmp_path, monkeypatch):
         result = _make_result()
         path = tmp_path / "result.json"
