@@ -234,3 +234,90 @@ def test_non_discord_deployment_ignores_channel_config() -> None:
     validate_discord_deployment_signal_config(
         _deployment(route="nitro", channel_id="123", signal_source="internal")
     )
+
+
+def test_duplicate_labels_naming_different_accounts_are_ambiguous() -> None:
+    """File order must never pick the account real orders go to."""
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-ONE",
+        "ALPACA_ACCOUNT_NAME_ACC2": "nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC2": "PA-TWO",
+    }
+    with pytest.raises(ValueError, match="Ambiguous Nitro route"):
+        expected_account_number_for_route("nitro", env)
+
+
+def test_ambiguous_label_does_not_fall_back_to_the_static_table() -> None:
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-ONE",
+        "ALPACA_ACCOUNT_NAME_ACC2": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC2": "PA-TWO",
+    }
+    with pytest.raises(ValueError):
+        expected_account_number_for_route("nitro", env)
+
+
+def test_explicit_override_still_resolves_an_ambiguous_label() -> None:
+    env = {
+        "STOCKKIT_ACCOUNT_NUMBER_NITRO": "PA-EXPLICIT",
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-ONE",
+        "ALPACA_ACCOUNT_NAME_ACC2": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC2": "PA-TWO",
+    }
+    assert expected_account_number_for_route("nitro", env) == "PA-EXPLICIT"
+
+
+def test_duplicate_labels_naming_the_same_account_are_not_ambiguous() -> None:
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-SAME",
+        "ALPACA_ACCOUNT_NAME_ACC2": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC2": "PA-SAME",
+    }
+    assert expected_account_number_for_route("nitro", env) == "PA-SAME"
+
+
+def test_an_unlabelled_duplicate_without_a_number_is_ignored() -> None:
+    env = {
+        "ALPACA_ACCOUNT_NAME_ACC1": "Nitro",
+        "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-ONE",
+        "ALPACA_ACCOUNT_NAME_ACC2": "Nitro",
+    }
+    assert expected_account_number_for_route("nitro", env) == "PA-ONE"
+
+
+def test_an_unreadable_accounts_env_is_logged_not_swallowed(isolated_db, monkeypatch, caplog):
+    """Route validation falls back to the static table, but never silently."""
+    import logging
+    from uuid import uuid4
+
+    import live_runner.credential_env as credential_env
+    from shared.models import LiveDeploymentConfig
+
+    database = isolated_db[0]
+    database.ensure_live_account("acc-1", "alpaca")
+
+    def _boom(_path):
+        raise OSError("accounts env unreadable")
+
+    monkeypatch.setattr(credential_env, "load_accounts_env_values", _boom)
+    deployment = LiveDeploymentConfig(
+        id=uuid4(),
+        strategy_name="plain",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+        signal_source="internal",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        database.create_live_deployment(deployment)
+
+    assert any(
+        "accounts env" in record.getMessage() and "unreadable" in record.getMessage()
+        for record in caplog.records
+    )

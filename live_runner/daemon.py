@@ -1806,18 +1806,27 @@ def _deployment_accepts_signal_author(
     `accounts_env_values` must be threaded in. The call used to omit it, so the
     resolver fell back to `os.environ` - and `.accounts.env` is never installed
     there, only read into a mapping. The allowlist therefore resolved empty, the
-    empty case below returned True, and this gate was **inert**: it accepted every
-    author. The one defence against a deployment trading on another bot's author
+    empty case was treated as "no restriction", and this gate was **inert**: it
+    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
     was not running, silently, in the documented production config.
     """
     allowlist = _deployment_trusted_author_ids(
         deployment, accounts_env_values=accounts_env_values
     )
     if not allowlist:
-        # The listener refuses to start without any allowlist, so a deployment
-        # without its own one inherits the channel-merged set; refusing here
-        # would dead-lock signals for deployments relying on that merge.
-        return True
+        # Fail closed. An empty allowlist means "this deployment trusts nobody": either
+        # the operator set a blank `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS` (documented as
+        # trust-nobody) or nothing resolved at all. It must NOT mean "accept anyone": the
+        # listener's channel-merged set contains every deployment's authors, so letting an
+        # allowlist-less deployment inherit it would let bot Y's author trade on bot X's
+        # deployment - exactly what the per-bot allowlist exists to prevent. A deployment
+        # that should trade must carry its own allowlist.
+        logger.warning(
+            "Skipping discord signal: deployment has no trusted author allowlist "
+            "(unset or blank means it trusts nobody)",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return False
     if not signal_author_id:
         # No author metadata (e.g. internal replay): the ingestion gate already
         # decided authorship for live Discord signals; do not re-block here.

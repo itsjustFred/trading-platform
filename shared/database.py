@@ -2983,7 +2983,15 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
 
             route_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
-        except Exception:
+        except Exception as exc:
+            # Routing validation still runs (and fails closed for a route it can no longer
+            # resolve), but an unreadable accounts env must not be silent: it changes which
+            # account number a route resolves to.
+            logger.warning(
+                "Could not load the accounts env for StockKit route validation; "
+                "falling back to the static route table: %s",
+                exc,
+            )
             route_env = {}
         validate_stockkit_deployment_route(
             deployment,

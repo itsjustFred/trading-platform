@@ -576,6 +576,18 @@ def _parse_timestamp(raw_timestamp: str | None) -> datetime | None:
 # Low enough that a single impersonation attempt cannot fail a healthy bot, high
 # enough that a systematically wrong allowlist is caught on the first burst of
 # real messages rather than days later.
+#: Statuses only an operator sets. This source reports status on a best-effort basis and must
+#: never move a service out of one of them (connect() used to write RUNNING over STOPPED).
+_OPERATOR_SERVICE_STATUSES = frozenset({ServiceStatus.PAUSED, ServiceStatus.STOPPED})
+_OPERATOR_SERVICE_STATUS_VALUES = frozenset(
+    status.value for status in _OPERATOR_SERVICE_STATUSES
+)
+
+
+def _service_status_value(status: ServiceStatus | str) -> str:
+    return str(status.value if isinstance(status, ServiceStatus) else status).strip().lower()
+
+
 AUTHOR_REJECTION_STREAK_THRESHOLD = 3
 
 # A coroutine produced by a sync caller. The running loop is the daemon's, so the
@@ -928,17 +940,16 @@ class DiscordSignalSource(BaseSignalSource):
         rejected_count: int,
         rejected_author_ids: list[str],
     ) -> None:
-        """Clear the failure the wrong-allowlist alert raised.
+        """Log that a trusted author was accepted after a rejection alert.
 
-        Deliberately RUNNING, not just a cleared latch: the service is FAILED in
-        the database and nothing else will change that, so a corrected allowlist
-        would otherwise look broken for another restart cycle. The rejected
-        authors go in the log because they are what the operator needs to check
-        the allowlist against.
+        Log only: the alert never changes the service status (see
+        `_flag_author_rejection_streak`), so there is nothing to clear. The rejected
+        authors go in the log because they are what the operator needs to check the
+        allowlist against.
         """
         logger.info(
             "Discord bot accepted a message from a trusted author; the author "
-            "allowlist is working and the previous failure is cleared",
+            "allowlist is working again after a run of rejections",
             extra={
                 "data": {
                     "service_id": str(self.service_id or ""),
@@ -948,7 +959,6 @@ class DiscordSignalSource(BaseSignalSource):
                 }
             },
         )
-        await self._set_service_status(ServiceStatus.RUNNING)
 
     async def _flag_author_rejection_streak(self, *, consecutive_rejections: int) -> None:
         """Note that a message was dropped because its author is not trusted.
@@ -957,13 +967,12 @@ class DiscordSignalSource(BaseSignalSource):
         every one, and a busy channel would drown the log. This exists so the
         *pattern* - every message rejected - is visible.
 
-        Once a run of consecutive rejections clears the threshold the service is
-        marked FAILED. A bot refusing every message it receives is not healthy,
-        and leaving it reporting RUNNING is what makes a wrong allowlist look
-        like a strategy that simply stopped firing. Failing the *service* rather
-        than refusing to ingest is the right lever: the operator sees it on the
-        dashboard with the rejected author ids attached, and nothing about the
-        safety gates changes.
+        Once a run of consecutive rejections clears the threshold an ERROR alert is
+        logged (once per streak) with the rejected author ids attached, so a wrong
+        allowlist does not look like a strategy that simply stopped firing. The
+        service status is NOT changed: the rejected authors are untrusted by
+        definition, and letting them flip the status would let any channel member
+        take the bot out of service.
 
         `consecutive_rejections` is passed in rather than read from self, because
         by the time this runs the loop may have already accepted a message and
@@ -983,7 +992,12 @@ class DiscordSignalSource(BaseSignalSource):
                 }
             },
         )
-        await self._set_service_status(ServiceStatus.FAILED)
+        # Deliberately NOT marking the service FAILED. The rejected messages come from
+        # authors the allowlist does not trust - by definition untrusted channel members -
+        # so letting three of them flip the service status would hand any member of the
+        # channel the ability to take the bot out of service (the daemon stops
+        # every discord service that is not RUNNING). The refusal itself is already correct; this alert is the signal for
+        # the operator, who checks the logged `rejected_author_ids` against the allowlist.
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.
@@ -1014,7 +1028,7 @@ class DiscordSignalSource(BaseSignalSource):
     ) -> None:
         if not self.service_id:
             return
-        # Never overwrite PAUSED at all. That is operator intent, and it has to
+        # Never overwrite PAUSED or STOPPED. Those are operator intent, and it has to
         # survive whatever the process last observed - a message arriving after the
         # pause, a connector failing, an author allowlist turning out to be wrong.
         #
@@ -1032,13 +1046,20 @@ class DiscordSignalSource(BaseSignalSource):
             # so an unreachable database would stop the bot rather than just
             # leaving a status unwritten. Found by the CodeRabbit review.
             current = await asyncio.to_thread(get_service, self.service_id)
-            if current is not None and current.status == ServiceStatus.PAUSED:
+            if (
+                current is not None
+                and current.status in _OPERATOR_SERVICE_STATUSES
+                and _service_status_value(status) not in _OPERATOR_SERVICE_STATUS_VALUES
+            ):
                 return
+            # `respect_operator_intent` repeats the check inside the write itself, so a
+            # PAUSE/STOP that commits between the read above and this write still wins.
             await asyncio.to_thread(
                 update_service_status,
                 self.service_id,
                 status,
                 last_activity=last_activity,
+                respect_operator_intent=True,
             )
         except Exception as exc:
             logger.warning(
@@ -1541,7 +1562,14 @@ class DiscordSignalSource(BaseSignalSource):
             name=f"discord-source-poll-{self.bot_name.lower()}",
         )
 
-    async def disconnect(self, *, failed: bool = True) -> None:
+    async def disconnect(self, *, failed: bool = False) -> None:
+        """Tear the source down.
+
+        ``failed`` defaults to ``False``: an ordinary teardown (the daemon's ``finally``, a
+        cancellation, a reconnect) says nothing about the service's health and must not mark
+        it FAILED. Callers that *know* the teardown is a failure (an authentication error)
+        pass ``failed=True``; runtime failures in ``listen_signals`` write FAILED themselves.
+        """
         self._connected = False
         self._ready.clear()
         if self._run_task is not None:
