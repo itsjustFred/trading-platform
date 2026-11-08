@@ -23,10 +23,13 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     coerce_positive_live_qty,
+    is_order_not_submitted,
     is_unbounded_tp,
 )
 from live_runner.credential_env import (
     accounts_env_mtime,
+    discord_bot_env_canonical_name,
+    discord_bot_env_key,
     load_accounts_env_values,
     resolve_env_value,
 )
@@ -45,12 +48,22 @@ from live_runner.stockkit_routing import (
 from risk import RiskConfig, RiskEngine, TradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
+from shared.constants import normalize_timeframe
 from shared.database import (
+    LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    claim_live_deployment_submission,
+    clear_live_deployment_stopped_enforced,
     create_service,
+    get_live_account,
     get_live_deployment,
+    get_service,
     list_live_accounts,
     list_live_deployments,
     list_services,
+    list_stopped_enforced_deployment_ids,
+    mark_live_deployment_stopped_enforced,
+    release_live_deployment_submission,
+    renew_live_deployment_submission,
     save_live_balance,
     update_service_status,
 )
@@ -152,6 +165,31 @@ def _adapter_is_ready(adapter: BaseLiveAdapter) -> bool:
     return True
 
 
+def _adapter_is_demo(adapter: BaseLiveAdapter) -> bool:
+    """Whether this adapter provably routes to a demo/paper account.
+
+    Fail closed on every uncertainty: an unknown adapter type, a missing flag,
+    or a flag that is not literally ``True`` is not demo. cTrader calls it
+    ``demo`` and Alpaca ``paper``.
+
+    Deliberately reads the adapter and not ``LiveAccountConfig.is_demo``: the
+    account row's flag is not populated by ``ensure_live_account``, so gating on
+    it would reject every account. The adapter is also the object that actually
+    sends orders, so its own flag is the closer one to the risk.
+    """
+    if isinstance(adapter, AlpacaLiveAdapter):
+        return getattr(adapter, "paper", None) is True
+    if isinstance(adapter, CTraderLiveAdapter):
+        return getattr(adapter, "demo", None) is True
+    # Unknown adapter types still have to prove it, so a double or a future
+    # adapter cannot slip through by being unrecognised. Only a literal True on
+    # either documented flag counts.
+    return (
+        getattr(adapter, "demo", None) is True
+        or getattr(adapter, "paper", None) is True
+    )
+
+
 def _parse_bool_env(value: str | None, *, default: bool = True) -> bool:
     if value is None:
         return default
@@ -249,7 +287,20 @@ def _recover_failed_services() -> list[Service]:
     for service in services:
         if service.status != ServiceStatus.FAILED:
             continue
-        update_service_status(str(service.id), ServiceStatus.RUNNING)
+        # The write is conditional on the row still not being PAUSED, so a
+        # pause that landed after the list read wins. Only arm the reconnect
+        # floor when the service actually moved to RUNNING.
+        recovered = update_service_status(
+            str(service.id),
+            ServiceStatus.RUNNING,
+            respect_operator_intent=True,
+        )
+        if recovered is None or recovered.status != ServiceStatus.RUNNING:
+            logger.info(
+                "Not recovering a service whose operator paused it",
+                extra={"data": {"service_id": str(service.id)}},
+            )
+            continue
         _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE[str(service.id)] = (
             datetime.now(timezone.utc)
             + timedelta(seconds=DISCORD_RECONNECT_RETRY_FLOOR_SECONDS)
@@ -490,9 +541,39 @@ def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
     ).strip().lower()
 
 
+def _live_account_broker_login(account_id: str) -> str:
+    """Return the broker-reported account number for a local account id.
+
+    Alpaca reports an account number (e.g. ``PA35HB6T7815``) and cTrader a
+    ctid; both live in ``broker_login``/``ctid``. Routing checks compare against
+    that broker identity because the local id is a different identifier space.
+    Returns an empty string when the account is unknown, which makes routing
+    validation fail closed.
+    """
+    try:
+        account = get_live_account(str(account_id))
+    except Exception as exc:
+        # `exception()` and not `error()`: this is an unexpected failure on the
+        # routing path, and the traceback is the only thing that says whether the
+        # account lookup itself blew up or something below it did. The empty
+        # string returned here makes routing fail closed, so without the
+        # traceback the operator sees a refusal with no cause.
+        logger.exception(
+            "Could not resolve broker identity for account",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return ""
+    if account is None:
+        return ""
+    return str(getattr(account, "broker_login", "") or getattr(account, "ctid", "") or "")
+
+
 def _deployment_matches_stockkit_route(
     deployment: LiveDeploymentConfig,
     signal_metadata: Mapping[str, object],
+    *,
+    account_broker_login: str | None = None,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     route = infer_stockkit_route(
         signal_source_id=deployment.signal_source_id,
@@ -503,7 +584,11 @@ def _deployment_matches_stockkit_route(
     if not route:
         return True
     try:
-        validate_stockkit_deployment_route(deployment)
+        validate_stockkit_deployment_route(
+            deployment,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        )
     except ValueError as exc:
         logger.warning(
             "Blocking misrouted StockKit deployment",
@@ -518,6 +603,85 @@ def _deployment_matches_stockkit_route(
         return False
     signal_route = infer_stockkit_route(metadata=signal_metadata)
     return not signal_route or signal_route == route
+
+
+def _timeframe_age_budget_seconds(timeframe: str) -> float:
+    # Through `normalize_timeframe`, not a bare `.lower()`. It used to lower-case only, so `M1`/`m1`
+    # missed the `1m` entry and fell through to the 300.0 default: the same 1-minute candle got a
+    # 600s effective staleness budget under `M1` and 300s under `1m`, because the daemon's caller
+    # computes `max(300.0, 2.0 * budget)`. `normalize_timeframe` is what every other consumer uses -
+    # `execution_timing._timeframe_seconds` routes through it - so the two halves of the same signal
+    # path disagreed on what `M1` means. Two spellings of one timeframe must not buy two policies.
+    normalized = normalize_timeframe(timeframe)
+    seconds_by_timeframe = {
+        "1m": 60.0,
+        "5m": 300.0,
+        "15m": 900.0,
+        "30m": 1800.0,
+        "1h": 3600.0,
+        "4h": 14400.0,
+        "1d": 86400.0,
+        "1w": 604800.0,
+    }
+    return seconds_by_timeframe.get(normalized, 300.0)
+
+
+def _validate_signal_age_before_wait(
+    signal: TradeSignal,
+    deployment: LiveDeploymentConfig,
+    *,
+    timeframe: str,
+    require_producer_timestamp: bool,
+) -> None:
+    """Fail closed on a signal that is already too old to trade.
+
+    The candle-close wait can span minutes, so a signal that arrives stale (or
+    with no producer timestamp at all) would otherwise be executed at the
+    candle-close price on information that is no longer valid. The budget scales
+    with the deployment's signal timeframe unless the operator pinned
+    ``max_signal_age_seconds``.
+
+    ``require_producer_timestamp`` is a required keyword, not a default, so a
+    new caller has to state its policy instead of inheriting one. It is passed
+    by :func:`_submit_normalized_discord_signal`, which is already *the*
+    Discord path -- the source is known at the call site, so the gate must not
+    re-derive it from ``metadata["source"]``. It used to: the Discord producer
+    writes ``"discord"`` at parse time and then overwrites it with
+    ``f"discord_{bot_name.lower()}"`` (``discord_nitro``), so an exact
+    comparison against ``"discord"`` never matched production and the
+    fail-closed branch was dead code. A signal whose age cannot be established
+    was then passed on to the processor and to ``submit_order`` unvalidated for
+    every timeframe :func:`signal_is_fresh` cannot parse (``tick``, ``daily``,
+    ``m5``), because that gate returns "fresh" when it has no budget at all.
+    """
+    metadata = signal.metadata or {}
+    received_raw = str(metadata.get("received_at") or "").strip()
+    if not received_raw:
+        if require_producer_timestamp:
+            raise ValueError("Discord signal is missing received_at")
+        return
+    try:
+        received_at = datetime.fromisoformat(received_raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Discord signal has an invalid received_at timestamp") from exc
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    configured = (deployment.signal_config or {}).get("max_signal_age_seconds")
+    if configured is None:
+        max_age = max(300.0, 2.0 * _timeframe_age_budget_seconds(timeframe))
+    else:
+        # Through the shared coercer: a boolean or a non-finite value is a config
+        # error, not a budget. `float(True)` silently means one second.
+        max_age = _coerce_live_float(configured, field_name="max_signal_age_seconds")
+    if max_age <= 0:
+        raise ValueError("max_signal_age_seconds must be positive")
+    age_seconds = (datetime.now(timezone.utc) - received_at).total_seconds()
+    if age_seconds < -300:
+        raise ValueError("Discord signal timestamp is more than 5 minutes in the future")
+    if age_seconds > max_age:
+        raise ValueError(
+            f"Discord signal is stale: age={age_seconds:.1f}s exceeds {max_age:.1f}s"
+        )
 
 
 def _build_processor_market_data(
@@ -818,7 +982,7 @@ async def _resolve_account_balance(
     return account_balance
 
 
-async def submit_order_with_risk(
+async def prepare_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     signal: LiveSignal,
@@ -826,7 +990,19 @@ async def submit_order_with_risk(
     current_exposure: float = 0.0,
     account_balance: float | None = None,
     pip_value: float | None = None,
-) -> str:
+) -> tuple[LiveSignal, float]:
+    """Size and validate an order, returning exactly what to submit.
+
+    Split out from :func:`submit_order_with_risk` so a caller can separate the
+    two phases that matter for a submission lease: everything here happens
+    before the broker can see an order, so a failure is safe to retry; the
+    adapter call the caller makes next is not. The submission path claims its
+    lease *after* this returns, so a plain validation or sizing refusal cannot
+    lock the deployment out for the lease TTL.
+
+    Nothing in here places an order. It does read broker state (positions,
+    balance) because sizing has to see broker truth.
+    """
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
         # Exit-only orders close an existing position at the broker-observed
@@ -841,10 +1017,7 @@ async def submit_order_with_risk(
             update["action"] = close_action
         # C1/B2: the broker-resolved flatten qty is binding — pass it
         # explicitly so the adapter never re-sizes.
-        return await adapter.submit_order(
-            signal.model_copy(update=update),
-            qty=float(metadata["explicit_qty"]),
-        )
+        return signal.model_copy(update=update), float(metadata["explicit_qty"])
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -951,9 +1124,28 @@ async def submit_order_with_risk(
     sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
     # C1/B2: the risk-sized qty is binding — pass it explicitly so the
     # adapter sizes exactly zero times (never with default config).
-    return await adapter.submit_order(
-        sized_signal, qty=float(sized_signal.metadata["qty"])
+    return sized_signal, float(sized_signal.metadata["qty"])
+
+
+async def submit_order_with_risk(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+    *,
+    current_exposure: float = 0.0,
+    account_balance: float | None = None,
+    pip_value: float | None = None,
+) -> str:
+    """Prepare an order and submit it, for callers with no lease to protect."""
+    prepared_signal, prepared_qty = await prepare_order_with_risk(
+        adapter,
+        deployment,
+        signal,
+        current_exposure=current_exposure,
+        account_balance=account_balance,
+        pip_value=pip_value,
     )
+    return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -1147,20 +1339,63 @@ def _deployment_service_name(deployment: LiveDeploymentConfig) -> str:
 def _resolve_account_discord_token(
     accounts_env_values: Mapping[str, str],
     deployment: LiveDeploymentConfig,
-) -> str:
+) -> tuple[str, str]:
+    """Return the deployment's Discord token and the key it came from.
+
+    The source key matters as much as the token: a token found under a per-bot
+    key is configured with that bot's auth scheme, while one falling back to the
+    global ``DISCORD_BOT_TOKEN`` is configured with the global scheme. Sending a
+    per-bot scheme with a global token is a 401.
+    """
     service_name = _deployment_service_name(deployment)
     token_env_key = ""
     if service_name:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
-    discord_token = ""
+        canonical_name = discord_bot_env_canonical_name(service_name)
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     if token_env_key:
-        _resolved = resolve_env_value(accounts_env_values, token_env_key)
-        if _resolved:
-            discord_token = _resolved
-    if not discord_token:
-        discord_token = resolve_env_value(accounts_env_values, "DISCORD_BOT_TOKEN")
-    return discord_token
+        per_bot_token = resolve_env_value(accounts_env_values, token_env_key)
+        if per_bot_token:
+            return per_bot_token, token_env_key
+    global_token = resolve_env_value(accounts_env_values, "DISCORD_BOT_TOKEN")
+    if global_token:
+        return global_token, "DISCORD_BOT_TOKEN"
+    return "", ""
+
+
+def _resolve_account_discord_credentials(
+    accounts_env_values: Mapping[str, str],
+    deployment: LiveDeploymentConfig,
+) -> tuple[str, str]:
+    """Resolve a deployment's Discord token and auth scheme together.
+
+    Both must be keyed by the same service name. Resolving them separately let
+    the token fall back to `signal_config["service_name"]` while the scheme read
+    `signal_source_id` alone, so an id-less deployment found its token but sent a
+    `Bot` header for an account token and got a 401. Returning both from one
+    place makes that split unrepresentable.
+    """
+    token, token_source_key = _resolve_account_discord_token(
+        accounts_env_values, deployment
+    )
+    # An operator who pinned the scheme on the deployment has said so out loud;
+    # that beats any inferred scope. Otherwise the credential decides.
+    override = _deployment_discord_auth_scheme(deployment)
+    if override:
+        return token, override
+    if not token:
+        return "", _resolve_discord_auth_scheme(
+            _deployment_service_name(deployment), accounts_env_values
+        )
+    # The scheme is a property of the credential, not of the deployment, so it
+    # must be read from the scope the token actually came from. Only the global
+    # fallback needs special handling: a per-bot token was found under a key
+    # derived from this deployment's service name, which is exactly the scope
+    # `_resolve_discord_auth_scheme` already reads.
+    if token_source_key == "DISCORD_BOT_TOKEN":
+        return token, _resolve_discord_auth_scheme("", accounts_env_values)
+    return token, _resolve_discord_auth_scheme(
+        _deployment_service_name(deployment), accounts_env_values
+    )
 
 
 def _deployment_covers_discord_symbol(
@@ -1169,6 +1404,13 @@ def _deployment_covers_discord_symbol(
 ) -> bool:
     deployment_symbols = {item.upper() for item in deployment.symbols}
     return not deployment_symbols or symbol.upper() in deployment_symbols
+
+
+def _split_env_id_list(raw: object) -> set[str]:
+    """Split a comma/whitespace-separated env ID list into an ID set."""
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
 
 
 def _resolve_discord_service_trusted_author_ids(
@@ -1184,26 +1426,89 @@ def _resolve_discord_service_trusted_author_ids(
     )
     if direct:
         return direct
-    env_key = _service_config_string(config, "trusted_author_ids_env_key") or (
-        "DISCORD_TRUSTED_AUTHOR_IDS"
-    )
-    raw_env = resolve_env_value(accounts_env_values, env_key)
+    env_key = _service_config_string(config, "trusted_author_ids_env_key")
+    if not env_key:
+        # Per-bot first, matching DISCORD_BOT_<NAME>_TOKEN / _CHANNEL_ID. Without
+        # it every bot falls back to the single shared DISCORD_TRUSTED_AUTHOR_IDS,
+        # so each one trusts the *other* bots' authors: RocketFuel's bot posting
+        # in Nitro's channel would be accepted and could trade Nitro. The shared
+        # var stays as the fallback for single-bot setups.
+        # Through the canonicalisation helper, as `discord_bot_env_canonical_name`
+        # requires of every per-bot key. Building it by hand meant a service named
+        # `NITRO-BOT` looked for a variable the operator could never have set, found
+        # nothing, and silently fell back to the shared list - i.e. it fell open to
+        # exactly the cross-bot trust the per-bot var exists to prevent, with no
+        # log line. The deployment path already did this, so one variable resolved
+        # two different ways in the same file.
+        env_key = discord_bot_env_key(service.name, "TRUSTED_AUTHOR_IDS")
+    # Presence is tested against the mapping directly, not via
+    # `resolve_env_value`, which returns "" for both an absent key and a
+    # present-but-blank one - so a truthiness test cannot tell "this bot trusts
+    # nobody" from "not configured", and the empty case used to fall through to
+    # the shared list. That widened Nitro to all three bots' authors, and
+    # inconsistently: `...,` was truthy and failed closed while `` was falsy and
+    # opened up, so the safe configuration was unreachable.
+    #
+    # Deliberately does not consult os.environ. This is an allowlist, and an
+    # inherited process variable must not silently become one.
+    if accounts_env_values is not None and env_key in accounts_env_values:
+        per_bot = str(accounts_env_values.get(env_key) or "").strip()
+        return _trusted_author_ids_from_config(_split_env_id_list(per_bot))
+    raw_env = resolve_env_value(accounts_env_values, "DISCORD_TRUSTED_AUTHOR_IDS")
     if not raw_env:
         return set()
-    return _trusted_author_ids_from_config(
-        item.strip() for item in raw_env.split(",") if item.strip()
-    )
+    return _trusted_author_ids_from_config(_split_env_id_list(raw_env))
 
 
-async def _submit_normalized_discord_signal(
+async def _renew_submission_claim_until_cancelled(token: str) -> None:
+    """Keep a submission lease alive while the broker call is in flight.
+
+    A fixed 30 s lease used to expire under a slow submit, and a second
+    dispatcher could then take it and submit a duplicate. Renewal runs at a
+    third of the TTL, so a single missed beat is harmless. Losing the lease is
+    logged loudly but does not cancel the in-flight call: the order may already
+    be at the broker, and killing the coroutine would not recall it.
+    """
+    interval = max(LIVE_SUBMISSION_CLAIM_TTL_SECONDS / 3.0, 0.05)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            renewed = await asyncio.to_thread(
+                renew_live_deployment_submission, token
+            )
+        except Exception as exc:
+            # Keep trying: a transient DB error must not be what lets the lease
+            # expire under an in-flight order.
+            logger.error(
+                "Could not renew the live submission lease; retrying next interval",
+                extra={"data": {"token": token, "error": repr(exc)}},
+            )
+            continue
+        if not renewed:
+            logger.error(
+                "Live submission lease was lost while the order was in flight; "
+                "the outcome must be reconciled before the next submission",
+                extra={"data": {"token": token}},
+            )
+            return
+
+
+async def _prepare_discord_signal_for_submission(
     account_id: str,
-    adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     trade_signal: TradeSignal,
     *,
     signal_timeframe: str,
     wait_enabled: bool,
-) -> None:
+) -> TradeSignal | None:
+    """Apply the pre-wait gates and, when enabled, the candle-close wait.
+
+    Returns the normalised signal to submit, or ``None`` when a gate refused it.
+    Every refusal is logged with the account/deployment/symbol it applies to and
+    returns ``None`` rather than raising: these signals are dispatched in a
+    fan-out loop, and letting one deployment's bad config propagate would tear
+    down the account's whole listener and lose the rest of the poll batch.
+    """
     # B2 (owner decision): stale signals trade immediately on outdated
     # information — discard anything older than one deployment-timeframe
     # candle instead.
@@ -1219,7 +1524,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     normalized_signal = TradeSignal(
         action=trade_signal.action,
         symbol=trade_signal.symbol,
@@ -1230,6 +1535,18 @@ async def _submit_normalized_discord_signal(
         metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
     )
     try:
+        # Fail closed on an already-stale signal BEFORE the candle-close wait:
+        # the wait can span minutes, so a signal older than the timeframe-aware
+        # budget would otherwise be executed at the candle-close price on
+        # information that has already expired.
+        _validate_signal_age_before_wait(
+            normalized_signal,
+            deployment,
+            timeframe=signal_timeframe,
+            # This function is the Discord dispatch path; the source is known
+            # here, so the gate is told rather than made to sniff metadata.
+            require_producer_timestamp=True,
+        )
         normalized_signal = _apply_signal_processor(normalized_signal, deployment)
     except ValueError as exc:
         logger.warning(
@@ -1243,12 +1560,32 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if wait_enabled:
-        await wait_for_candle_close(
-            normalized_signal,
-            normalized_signal.timeframe or signal_timeframe,
-        )
+        try:
+            await wait_for_candle_close(
+                normalized_signal,
+                normalized_signal.timeframe or signal_timeframe,
+            )
+        except ValueError as exc:
+            # An unrecognised timeframe is a configuration error, not a reason to
+            # trade immediately: `wait_for_candle_close` refuses rather than
+            # silently skipping the wait. Skip this deployment's signal and keep
+            # the listener alive - letting it propagate would tear down the whole
+            # account's source and lose the rest of the poll batch.
+            logger.warning(
+                "Skipping discord signal: candle-close wait refused the timeframe",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                        "signal_timeframe": signal_timeframe,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return None
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
     # pre-dispatch snapshot was taken before it. A deployment paused during the
@@ -1266,7 +1603,7 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
-        return
+        return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
         logger.info(
             "Skipping discord signal: aged out during candle-close wait",
@@ -1278,7 +1615,29 @@ async def _submit_normalized_discord_signal(
                 }
             },
         )
+        return None
+    return normalized_signal
+
+
+async def _submit_normalized_discord_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+    *,
+    signal_timeframe: str,
+    wait_enabled: bool,
+) -> None:
+    prepared = await _prepare_discord_signal_for_submission(
+        account_id,
+        deployment,
+        trade_signal,
+        signal_timeframe=signal_timeframe,
+        wait_enabled=wait_enabled,
+    )
+    if prepared is None:
         return
+    normalized_signal = prepared
 
     try:
         live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
@@ -1296,11 +1655,18 @@ async def _submit_normalized_discord_signal(
             },
         )
         return
+
+    # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
+    # here, and every failure in them happens before an order can reach the
+    # broker. Claiming first (as this used to) held the lease for the whole TTL
+    # on a plain validation refusal, locking the deployment out for no reason.
     try:
-        broker_order_id = await submit_order_with_risk(adapter, deployment, live_signal)
+        prepared_signal, prepared_qty = await prepare_order_with_risk(
+            adapter, deployment, live_signal
+        )
     except Exception as exc:
         logger.warning(
-            "Discord signal submission failed",
+            "Discord signal refused before submission; nothing was sent to the broker",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -1312,6 +1678,102 @@ async def _submit_normalized_discord_signal(
         )
         return
 
+    # Atomic submission claim. The status re-checks above ran against a
+    # snapshot; between them and the broker call an operator can pause the
+    # deployment. The claim turns "still ACTIVE" into a single atomic database
+    # fact taken immediately before submission, so a PAUSE either wins the race
+    # (the claim fails and nothing is sent) or is already in effect while this
+    # dispatcher finishes the order it had already claimed.
+    claim_token = uuid.uuid4().hex
+    claimed = await asyncio.to_thread(
+        claim_live_deployment_submission,
+        str(deployment.id),
+        claim_token,
+    )
+    if not claimed:
+        logger.info(
+            "Skipping discord signal: deployment no longer ACTIVE at submission claim",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": normalized_signal.symbol,
+                    "snapshot_status": deployment.status,
+                }
+            },
+        )
+        return
+
+    renew_task = asyncio.create_task(
+        _renew_submission_claim_until_cancelled(claim_token),
+        name=f"submission-claim-renewal-{deployment.id}",
+    )
+    try:
+        try:
+            broker_order_id = await adapter.submit_order(
+                prepared_signal, qty=prepared_qty
+            )
+        except Exception as exc:
+            if is_order_not_submitted(exc):
+                # The adapter marked the failure as provably pre-request: the
+                # order never left the process, so the lease can be released
+                # and the next signal is not locked out for the TTL.
+                try:
+                    await asyncio.to_thread(
+                        release_live_deployment_submission, claim_token
+                    )
+                except Exception:
+                    # The lease expires on its own. Never let the cleanup turn a
+                    # handled refusal into an exception that aborts the fan-out
+                    # to the remaining deployments.
+                    logger.exception("Could not release the submission lease")
+                logger.warning(
+                    "Discord signal was refused before the broker request; "
+                    "released the submission lease",
+                    extra={
+                        "data": {
+                            "account_id": account_id,
+                            "deployment_id": str(deployment.id),
+                            "symbol": prepared_signal.symbol,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                return
+            # **Do not release the lease.** The broker may have accepted the
+            # order and only the response was lost; releasing would let the next
+            # signal submit a duplicate before anyone reconciled. The lease is
+            # left to expire, which the drain reports as INDETERMINATE rather
+            # than DRAINED.
+            logger.error(
+                "Discord signal submission failed with an unknown outcome; "
+                "holding the submission lease until it expires and requiring "
+                "reconciliation before the next submit",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": prepared_signal.symbol,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
+    finally:
+        renew_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renew_task
+
+    try:
+        await asyncio.to_thread(release_live_deployment_submission, claim_token)
+    except Exception:
+        # The order is already at the broker, so the lease expiring on its own
+        # is harmless. A cleanup failure must not abort the fan-out or skip the
+        # "submitted" log line below.
+        logger.exception(
+            "Could not release the submission lease; it expires on its own",
+            extra={"data": {"deployment_id": str(deployment.id)}},
+        )
     logger.info(
         "Discord signal submitted",
         extra={
@@ -1330,6 +1792,8 @@ async def _submit_normalized_discord_signal(
 def _deployment_accepts_signal_author(
     deployment: LiveDeploymentConfig,
     signal_author_id: str,
+    *,
+    accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
     """Per-deployment author gate applied at dispatch time.
 
@@ -1338,13 +1802,31 @@ def _deployment_accepts_signal_author(
     is submitted, the signal must also satisfy the target deployment's own
     allowlist so a deployment cannot trade on an author another deployment
     trusted.
+
+    `accounts_env_values` must be threaded in. The call used to omit it, so the
+    resolver fell back to `os.environ` - and `.accounts.env` is never installed
+    there, only read into a mapping. The allowlist therefore resolved empty, the
+    empty case was treated as "no restriction", and this gate was **inert**: it
+    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
+    was not running, silently, in the documented production config.
     """
-    allowlist = _deployment_trusted_author_ids(deployment)
+    allowlist = _deployment_trusted_author_ids(
+        deployment, accounts_env_values=accounts_env_values
+    )
     if not allowlist:
-        # The listener refuses to start without any allowlist, so a deployment
-        # without its own one inherits the channel-merged set; refusing here
-        # would dead-lock signals for deployments relying on that merge.
-        return True
+        # Fail closed. An empty allowlist means "this deployment trusts nobody": either
+        # the operator set a blank `DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS` (documented as
+        # trust-nobody) or nothing resolved at all. It must NOT mean "accept anyone": the
+        # listener's channel-merged set contains every deployment's authors, so letting an
+        # allowlist-less deployment inherit it would let bot Y's author trade on bot X's
+        # deployment - exactly what the per-bot allowlist exists to prevent. A deployment
+        # that should trade must carry its own allowlist.
+        logger.warning(
+            "Skipping discord signal: deployment has no trusted author allowlist "
+            "(unset or blank means it trusts nobody)",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return False
     if not signal_author_id:
         # No author metadata (e.g. internal replay): the ingestion gate already
         # decided authorship for live Discord signals; do not re-block here.
@@ -1395,43 +1877,109 @@ def _deployment_trusted_author_ids(
     )
     if direct:
         return direct
-    if accounts_env_values is not None:
-        env_source: Mapping[str, str] = accounts_env_values
-    else:
-        env_source = os.environ
+    # No fallback to os.environ, deliberately.
+    #
+    # `.accounts.env` is read into a mapping and never installed into the process
+    # environment, so an `os.environ` fallback resolves nothing here: the
+    # allowlist comes back empty, and `_deployment_accepts_signal_author` treats
+    # empty as "no restriction" and returns True. That is the exact shape of the
+    # inert-gate bug fixed in 8d8a3c3, one layer up - a gate that resolves
+    # nothing and reports success. The service path refuses os.environ for the
+    # same reason; this one now does too.
+    #
+    # All three production call sites pass the mapping, so this branch is
+    # unreachable today. It is here to be loud if a future caller forgets, rather
+    # than quietly permissive.
+    if accounts_env_values is None:
+        logger.error(
+            "Discord author allowlist requested without the accounts env; "
+            "refusing to fall back to the process environment, which never "
+            "contains it",
+            extra={"data": {"deployment_id": str(deployment.id or "")}},
+        )
+        return set()
+    env_source: Mapping[str, str] = accounts_env_values
     service_name = _deployment_service_name(deployment)
     if service_name:
-        canonical = re.sub(r"[^A-Z0-9_]+", "_", service_name.upper())
-        per_service_key = f"DISCORD_BOT_{canonical}_TRUSTED_AUTHOR_IDS"
-        per_service = _trusted_author_ids_from_config(
-            _split_env_id_list(env_source.get(per_service_key, ""))
-        )
-        if per_service:
-            return per_service
+        # Through the canonicalisation helper, as its own docstring requires of
+        # every per-bot key. This one was built by hand, so a name that kept its
+        # punctuation would look for a variable no operator could set and fall
+        # through to the shared list.
+        per_service_key = discord_bot_env_key(service_name, "TRUSTED_AUTHOR_IDS")
+        # Presence, not truthiness. A blank per-bot var means "this bot trusts
+        # nobody", and it must NOT fall through to the shared list: that widened
+        # Nitro to all three bots' authors, so the fail-closed configuration was
+        # unreachable from here - while the *service* path, fixed in 626e485,
+        # correctly returned empty for the same input. Same allowlist, two
+        # answers, on the path all three live deployments use.
+        if per_service_key in env_source:
+            return _trusted_author_ids_from_config(
+                _split_env_id_list(env_source.get(per_service_key, ""))
+            )
     return _trusted_author_ids_from_config(
         _split_env_id_list(env_source.get("DISCORD_TRUSTED_AUTHOR_IDS", ""))
     )
 
 
-def _split_env_id_list(raw: object) -> set[str]:
-    """Split a comma/whitespace-separated env ID list into an ID set."""
-    if not isinstance(raw, str) or not raw.strip():
-        return set()
-    return {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+DEFAULT_DISCORD_AUTH_SCHEME = "raw"
+_DISCORD_AUTH_SCHEME_VOCABULARY = ("raw", "account", "bot")
+
+
+def _resolve_discord_auth_scheme(
+    bot_name: str,
+    accounts_env_values: Mapping[str, str],
+) -> str:
+    """Resolve the Discord credential type for a bot service.
+
+    File-first like every other credential: ``DISCORD_BOT_<NAME>_AUTH_SCHEME``
+    then the global ``DISCORD_AUTH_SCHEME``, each falling back to the process
+    environment, defaulting to ``raw`` (the recorded operator default — the
+    unconfigured case is an account/user credential, not a bot one). ``raw`` and
+    ``account`` name the same credential kind, so both are accepted. Bot and
+    account tokens are not interchangeable, so an unknown value must never be
+    guessed: it raises. The per-bot key is built with the same canonicalisation
+    as the token key, otherwise a punctuated service name would read a key
+    nobody can configure.
+    """
+    canonical_name = discord_bot_env_canonical_name(bot_name)
+    per_bot_keys = (
+        (discord_bot_env_key(canonical_name, "AUTH_SCHEME"),) if canonical_name else ()
+    )
+    for key in (*per_bot_keys, "DISCORD_AUTH_SCHEME"):
+        resolved = resolve_env_value(accounts_env_values, key).strip().lower()
+        if not resolved:
+            continue
+        if resolved not in _DISCORD_AUTH_SCHEME_VOCABULARY:
+            raise ValueError(
+                f"Unsupported Discord auth_scheme {resolved!r} for {bot_name or 'global'}; "
+                f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
+            )
+        return resolved
+    return DEFAULT_DISCORD_AUTH_SCHEME
 
 
 def _deployment_discord_auth_scheme(deployment: LiveDeploymentConfig) -> str:
-    """Return this deployment's discord auth scheme (#81: raw|bot, default raw)."""
+    """Return this deployment's explicit auth-scheme override, if any.
+
+    The scheme is fundamentally a property of the *credential*, not of the
+    deployment, so an unconfigured deployment returns ``""`` and the caller
+    falls through to the credential-scoped resolution in
+    :func:`_resolve_discord_auth_scheme`. Only an operator who pinned
+    ``discord_auth_scheme`` on the deployment or its settings overrides that.
+    """
     configured = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
     settings = deployment.settings if isinstance(deployment.settings, dict) else {}
     raw = str(
         configured.get("discord_auth_scheme")
         or settings.get("discord_auth_scheme")
-        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
+        or ""
     ).strip().lower()
-    if raw not in ("raw", "bot"):
+    if not raw:
+        return ""
+    if raw not in _DISCORD_AUTH_SCHEME_VOCABULARY:
         raise ValueError(
-            f"Unknown discord_auth_scheme {raw!r}; expected 'raw' or 'bot'."
+            f"Unknown discord_auth_scheme {raw!r}; expected one of "
+            f"{', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
         )
     return raw
 
@@ -1449,14 +1997,24 @@ async def _dispatch_discord_trade_signal(
     # channel/symbol — the one that traded was picked by DB row order.
     signal_author_id = str(trade_signal.metadata.get("discord_author_id", "")).strip().lower()
     dispatched_to_any = False
+    # Resolve the broker-reported account number once: routing must be validated
+    # against broker identity, not the local account id.
+    account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
         if not _deployment_is_currently_active(deployment):
             continue
-        if not _deployment_matches_stockkit_route(deployment, trade_signal.metadata):
+        if not _deployment_matches_stockkit_route(
+            deployment,
+            trade_signal.metadata,
+            account_broker_login=account_broker_login,
+            accounts_env_values=accounts_env_values,
+        ):
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
             continue
-        if not _deployment_accepts_signal_author(deployment, signal_author_id):
+        if not _deployment_accepts_signal_author(
+            deployment, signal_author_id, accounts_env_values=accounts_env_values
+        ):
             logger.debug(
                 "Skipping discord signal: author not in deployment allowlist",
                 extra={
@@ -1506,6 +2064,31 @@ async def _dispatch_discord_trade_signal(
                 }
             },
         )
+
+
+def _service_id_for_discord_deployment(deployment: LiveDeploymentConfig) -> str | None:
+    """The service row a deployment's Discord listener should report through.
+
+    Joins on the deployment's service name, canonicalised the same way service
+    discovery names the rows it creates, so both sides derive the key from one
+    rule instead of two that can drift.
+
+    Returns None when there is no unique match. It deliberately does not create a
+    row, and does not fall back to "the first discord service": two services for
+    one bot, or none, must not silently attach this listener to the wrong bot's
+    status. No observability is recoverable; a wrong status is not.
+    """
+    name = discord_bot_env_canonical_name(_deployment_service_name(deployment))
+    if not name:
+        return None
+    matches = [
+        service
+        for service in list_services(service_type=ServiceType.DISCORD_BOT)
+        if discord_bot_env_canonical_name(service.name) == name
+    ]
+    if len(matches) != 1:
+        return None
+    return str(matches[0].id)
 
 
 async def _run_discord_signal_listener_for_account(
@@ -1561,15 +2144,25 @@ async def _run_discord_signal_listener_for_account(
             },
         )
         return
+    # Token and auth scheme must come from the same credential scope, so they
+    # are resolved together (see `_resolve_account_discord_credentials`).
+    discord_token, discord_auth_scheme = _resolve_account_discord_credentials(
+        accounts_env_values,
+        primary_deployment,
+    )
     source = DiscordSignalSource(
-        token=_resolve_account_discord_token(
-            accounts_env_values,
-            primary_deployment,
-        ),
+        token=discord_token,
         channel_ids=set(channel_to_deployments.keys()),
         timeframe=_deployment_signal_timeframe(primary_deployment),
         trusted_author_ids=merged_trusted_author_ids,
-        auth_scheme=_deployment_discord_auth_scheme(primary_deployment),
+        auth_scheme=discord_auth_scheme,
+        # Without this the deployment path could not report a mis-set allowlist
+        # at all: `_set_service_status` returns immediately when service_id is
+        # empty, so a5a76ad's streak alert had nowhere to write and the wrong
+        # allowlist stayed invisible on the path that all three live deployments
+        # actually use. Resolved, never created - a deployment with no matching
+        # service row simply gets no observability, which is the safe direction.
+        service_id=_service_id_for_discord_deployment(primary_deployment),
     )
     await source.connect()
     try:
@@ -1788,8 +2381,8 @@ def _resolve_discord_bot_runtime(
     config = service.config if isinstance(service.config, dict) else {}
     token_env_key = _service_config_string(config, "token_env_key")
     if not token_env_key:
-        canonical_name = re.sub(r"[^A-Z0-9_]+", "_", str(service.name or "").upper())
-        token_env_key = f"DISCORD_BOT_{canonical_name}_TOKEN"
+        canonical_name = discord_bot_env_canonical_name(service.name)
+        token_env_key = discord_bot_env_key(canonical_name, "TOKEN")
     token = resolve_env_value(accounts_env_values, token_env_key)
     channel_id = _service_config_string(config, "channel_id")
     return token_env_key, token, channel_id
@@ -1824,6 +2417,7 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
                     update_service_status,
                     service_id,
                     ServiceStatus.FAILED,
+                    respect_operator_intent=True,
                 )
                 return
             logger.warning(
@@ -1956,6 +2550,7 @@ async def _reconnect_discord_bot_source(
             service_id,
             ServiceStatus.RUNNING,
             last_activity=datetime.now(timezone.utc),
+            respect_operator_intent=True,
         )
         _DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE.pop(service_id, None)
         logger.info(
@@ -1975,7 +2570,12 @@ async def _reconnect_discord_bot_source(
                     }
                 },
             )
-            await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+            await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
             return
         # Transient failure: keep the service recoverable. The next sync tick
         # retries after the backoff floor instead of the old behavior of
@@ -2066,6 +2666,16 @@ async def _sync_running_discord_bot(
     accounts_env_values: Mapping[str, str],
 ) -> None:
     service_id = str(service.id)
+    # The caller's list is a snapshot taken before this tick's work. Re-read the
+    # row so a bot paused in the meantime is not started and then stopped a tick
+    # later; PAUSED is operator intent, not a transient state.
+    current = await asyncio.to_thread(get_service, service_id)
+    if current is None or current.status != ServiceStatus.RUNNING:
+        logger.info(
+            "Discord service is no longer RUNNING; refusing to start it",
+            extra={"data": {"service_id": service_id}},
+        )
+        return
     token_env_key, token, channel_id = _resolve_discord_bot_runtime(
         service,
         accounts_env_values=accounts_env_values,
@@ -2083,7 +2693,12 @@ async def _sync_running_discord_bot(
                 }
             },
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
 
     trusted_author_ids = _resolve_discord_service_trusted_author_ids(
@@ -2094,19 +2709,48 @@ async def _sync_running_discord_bot(
             "Discord service missing trusted_author_ids; refusing open gate",
             extra={"data": {"service_id": service_id, "service_name": service.name}},
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
     service_config = service.config if isinstance(service.config, dict) else {}
-    auth_scheme = str(
-        service_config.get("discord_auth_scheme")
-        or os.environ.get("DISCORD_AUTH_SCHEME", "raw")
-    ).strip().lower()
-    if auth_scheme not in ("raw", "bot"):
+    # The scheme belongs to the credential, so it is resolved from the same
+    # per-bot scope the token key uses; an explicit per-service override still
+    # wins. `_resolve_discord_auth_scheme` validates the vocabulary and raises on
+    # an unknown value rather than guessing between account and bot tokens.
+    try:
+        override = str(service_config.get("discord_auth_scheme") or "").strip().lower()
+        if override and override not in _DISCORD_AUTH_SCHEME_VOCABULARY:
+            # An explicit override is not exempt from the vocabulary: a typo must
+            # fail the service, not reach the source and be rejected there with a
+            # different error (or, worse, be guessed).
+            raise ValueError(
+                f"Unsupported Discord auth_scheme {override!r} for {service.name!r}; "
+                f"expected one of {', '.join(_DISCORD_AUTH_SCHEME_VOCABULARY)}."
+            )
+        auth_scheme = override or _resolve_discord_auth_scheme(
+            service.name, accounts_env_values
+        )
+    except ValueError as exc:
         logger.warning(
             "Discord service has unknown discord_auth_scheme",
-            extra={"data": {"service_id": service_id, "auth_scheme": auth_scheme}},
+            extra={
+                "data": {
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "error": str(exc),
+                }
+            },
         )
-        await asyncio.to_thread(update_service_status, service_id, ServiceStatus.FAILED)
+        await asyncio.to_thread(
+            update_service_status,
+            service_id,
+            ServiceStatus.FAILED,
+            respect_operator_intent=True,
+        )
         return
 
     await _ensure_discord_bot_source(
@@ -2577,6 +3221,396 @@ def _log_deployment_status_observations(
         )
 
 
+def _account_ids_needing_stopped_enforcement(
+    deployments: list[LiveDeploymentConfig],
+    already_enforced: set[str],
+) -> set[str]:
+    """Accounts holding a STOPPED deployment whose cancel/flatten is still due.
+
+    These accounts need a connected adapter because the adapter is what performs
+    the sweep. Connecting only runnable accounts meant an account whose
+    deployments were all STOPPED never got one, so the stop was retried forever
+    and never actually enforced.
+
+    Returns account ids only; whether they may *trade* is decided separately
+    from the runnable set, so connecting for enforcement never grants trading
+    permission.
+    """
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "STOPPED"
+        # The persisted stamp is authoritative: a deployment resumed and re-stopped
+        # between ticks has no stamp (the resume cleared it) while this process's
+        # ledger can still list it, and trusting the ledger alone would leave its
+        # account without an adapter, so the stop would never be enforced.
+        and (
+            deployment.stopped_enforced_at is None
+            or str(deployment.id) not in already_enforced
+        )
+    }
+
+
+def _stopped_enforcement_refusal(
+    account_lookup: Mapping[str, LiveAccountConfig] | None,
+    account_id: str,
+) -> str | None:
+    """Why this account can never get an adapter, or None when it can."""
+    if account_lookup is None:
+        return None
+    account = account_lookup.get(account_id)
+    if account is None:
+        return "account is not in the database"
+    return None
+
+
+async def _enforce_stopped_deployments(
+    deployments: list[LiveDeploymentConfig],
+    active_adapters: dict[str, BaseLiveAdapter],
+    *,
+    already_enforced: set[str],
+    account_lookup: Mapping[str, LiveAccountConfig] | None = None,
+) -> None:
+    """Make STOPPED mean what an operator expects: nothing open, nothing resting.
+
+    For each STOPPED deployment: cancel working orders (leaving attached SL/TP
+    alone), flatten positions, then sweep protections orphaned by the flatten.
+    Enforced once per transition, not every tick, so a persistently stopped
+    deployment does not spam the broker.
+
+    A deployment is recorded as enforced **only when every sweep reports
+    ``ControlOutcome.complete``**. `completed > 0` is not success: it is equally
+    true of a sweep that closed one of three positions, and recording that as
+    stopped is how open exposure survives behind a dashboard that says
+    "stopped". A partial sweep is logged with its outstanding items and retried
+    on the next tick. The orphaned-protection sweep counts too: a stop that
+    outlived its position can still trigger and open a new one.
+
+    The cancel is the one sweep that does not gate the next step: a surviving
+    order - or a cancel call that failed outright - still lets the flatten run,
+    because leaving positions open is worse than leaving an order resting. It
+    does gate the stamp.
+    """
+    stopped = [
+        deployment
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) == "STOPPED"
+    ]
+    stopped_ids = {str(deployment.id) for deployment in stopped}
+    # Forget deployments that are no longer stopped, so a later STOPPED
+    # transition enforces again instead of being skipped as "already done".
+    left_stopped = {
+        deployment_id
+        for deployment_id in already_enforced
+        if deployment_id not in stopped_ids
+    }
+    already_enforced.difference_update(left_stopped)
+    # The persisted stamp is authoritative, not this process's ledger: a deployment
+    # that was resumed and stopped again between two ticks was never observed
+    # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the
+    # resume, transactionally) is gone and its positions are open again.
+    already_enforced.difference_update(
+        {
+            str(deployment.id)
+            for deployment in stopped
+            if deployment.stopped_enforced_at is None
+        }
+    )
+    for deployment_id in sorted(left_stopped):
+        try:
+            await asyncio.to_thread(
+                clear_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not clear a stale STOPPED enforcement stamp",
+                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+            )
+
+    # cancel/flatten act on the whole broker account, not on one deployment's
+    # positions. If another deployment on the same account is ACTIVE or PAUSED,
+    # flattening would close positions that deployment still owns.
+    position_owning_accounts = {
+        deployment.account_id
+        for deployment in deployments
+        if _normalize_deployment_status(deployment.status) in {"ACTIVE", "PAUSED"}
+    }
+
+    for deployment in stopped:
+        deployment_id = str(deployment.id)
+        if deployment.stopped_enforced_at is not None:
+            already_enforced.add(deployment_id)
+            continue
+
+        if deployment.account_id in position_owning_accounts:
+            logger.error(
+                "Refusing to flatten a shared account: another deployment on it is "
+                "still ACTIVE or PAUSED and its positions would be closed too",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        adapter = active_adapters.get(deployment.account_id)
+        if adapter is None:
+            block_reason = _stopped_enforcement_refusal(
+                account_lookup, deployment.account_id
+            )
+            if block_reason is not None:
+                logger.error(
+                    "Stopped deployment's account can never get an adapter, so the "
+                    "cancel/flatten can never run; flatten it at the broker by hand. "
+                    "Reason: %s",
+                    block_reason,
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+            else:
+                logger.info(
+                    "Stopped deployment has no active adapter yet; will retry cancel/flatten",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+            continue
+
+        cancel_error: Exception | None = None
+        try:
+            cancelled = (
+                await adapter.cancel_open_orders()
+                if adapter.supports_cancel_orders
+                else None
+            )
+        except NotImplementedError:
+            cancelled = None
+        except Exception as exc:
+            # Still flatten. The cancel failing says nothing about whether the
+            # positions can be closed - the Alpaca flatten cancels its own
+            # per-symbol orders - and leaving exposure open to protect a
+            # cosmetic ordering rule is the wrong trade.
+            cancelled = None
+            cancel_error = exc
+            logger.error(
+                "Failed to cancel open orders for stopped deployment; flattening "
+                "anyway",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+
+        # A partial cancel must not stop the flatten: closing the positions is
+        # the money-safety action, and the remaining order is retried on the
+        # next tick. It does, however, prevent the enforced stamp - the account
+        # may still have something resting.
+        cancel_ok = cancelled is not None and cancelled.complete
+        if cancel_error is not None:
+            pass  # already logged above
+        elif cancelled is None:
+            logger.error(
+                "Adapter cannot cancel orders; flattening anyway and keeping the "
+                "deployment unenforced",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+        elif not cancel_ok:
+            logger.error(
+                "Order cancel was incomplete for stopped deployment; flattening "
+                "anyway and retrying the cancel: %s",
+                cancelled.describe(),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+
+        try:
+            flattened = (
+                await adapter.close_all_positions() if adapter.supports_flatten else None
+            )
+        except NotImplementedError:
+            flattened = None
+        except Exception as exc:
+            logger.error(
+                "Failed to flatten positions for stopped deployment",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            continue
+
+        if flattened is None:
+            logger.error(
+                "Adapter cannot flatten positions; stopped deployment is NOT flat",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+            continue
+        if not flattened.complete:
+            logger.error(
+                "Flatten was incomplete for stopped deployment; keeping it "
+                "unenforced and retrying: %s",
+                flattened.describe(),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        # The account is flat. Sweep the protections the flatten detached.
+        # This is not merely cosmetic: a stop that outlived its position can
+        # still trigger, and a triggered sell-stop with nothing to sell opens a
+        # short. So a sweep that *failed* keeps the deployment unenforced and
+        # retries; only an adapter that has no such concept may stamp without
+        # one.
+        orphan_sweep_unsupported = False
+        try:
+            orphaned = await adapter.cancel_orphaned_protections()
+        except NotImplementedError:
+            orphaned = None
+            orphan_sweep_unsupported = True
+        except Exception as exc:
+            logger.error(
+                "Failed to sweep protections orphaned by the flatten; the account "
+                "is flat but a resting protection could still trigger",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            orphaned = None
+        if orphan_sweep_unsupported:
+            logger.warning(
+                "Adapter cannot identify orphaned protections; the account is flat "
+                "but protection orders may still be listed by the broker",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
+        elif orphaned is not None and not orphaned.complete:
+            logger.error(
+                "Orphaned-protection sweep was incomplete; the account is flat but "
+                "protections may still be resting: %s",
+                orphaned.describe(),
+                extra={"data": {"deployment_id": deployment_id}},
+            )
+
+        # Every sweep must be complete before the deployment counts as
+        # enforced. The account is flat either way - the money-safety part is
+        # done - but a surviving order means the next tick must try again.
+        if not cancel_ok:
+            logger.error(
+                "Not recording STOPPED enforcement: the order cancel did not "
+                "complete, so orders may still be resting. Retrying next tick: %s",
+                (
+                    cancelled.describe()
+                    if cancelled is not None
+                    else (
+                        f"cancel failed: {cancel_error!r}"
+                        if cancel_error is not None
+                        else "adapter cannot cancel open orders"
+                    )
+                ),
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+        if not orphan_sweep_unsupported and (
+            orphaned is None or not orphaned.complete
+        ):
+            logger.error(
+                "Not recording STOPPED enforcement: the orphaned-protection sweep "
+                "did not complete. Retrying next tick",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+
+        try:
+            stamped = await asyncio.to_thread(
+                mark_live_deployment_stopped_enforced, deployment_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not record STOPPED enforcement for a deployment; retrying next tick",
+                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+            )
+            continue
+        if not stamped:
+            # Refused by the database: the deployment left STOPPED, or a submission
+            # lease (live or expired-but-unreleased) says an order may still fill.
+            # Either way the sweep does not count yet; the next tick runs it again.
+            logger.warning(
+                "Not recording STOPPED enforcement: the deployment is no longer STOPPED "
+                "or a submission lease is outstanding, so an in-flight order could still "
+                "fill. Retrying next tick",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                    }
+                },
+            )
+            continue
+        already_enforced.add(deployment_id)
+        logger.warning(
+            "Enforced STOPPED deployment: orders cancelled and positions flattened",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "cancelled": cancelled.describe(),
+                    "flattened": flattened.describe(),
+                }
+            },
+        )
+
+
 async def _load_db_accounts_and_deployments(
 ) -> tuple[list[LiveAccountConfig], list[LiveDeploymentConfig]]:
     accounts_task = asyncio.to_thread(list_live_accounts)
@@ -2595,18 +3629,42 @@ async def _ensure_adapter_for_active_account(
 ) -> None:
     if account_id in _CTRADER_AUTH_BLOCKED_ACCOUNTS:
         return
+    account = account_lookup.get(account_id)
+    if account is None:
+        logger.error(
+            "Refusing to construct an adapter for an unknown account",
+            extra={"data": {"account_id": account_id}},
+        )
+        stale = active_adapters.pop(account_id, None)
+        if stale is not None:
+            await _disconnect_adapter(
+                stale,
+                account_id=account_id,
+                reason="unknown_account",
+            )
+        return
     adapter = active_adapters.get(account_id)
+    if adapter is not None and not _adapter_is_demo(adapter):
+        logger.error(
+            "Existing adapter is not in demo/paper mode; refusing continued use",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+        active_adapters.pop(account_id, None)
+        await _disconnect_adapter(
+            adapter,
+            account_id=account_id,
+            reason="non_demo_adapter",
+        )
+        return
     if adapter is not None:
         if _adapter_is_ready(adapter):
             return
     else:
-        account = account_lookup.get(account_id)
-        if account is None:
-            logger.warning(
-                "Active deployment references unknown account",
-                extra={"data": {"account_id": account_id}},
-            )
-            return
         try:
             adapter = _create_adapter_for_account(
                 account,
@@ -2623,6 +3681,17 @@ async def _ensure_adapter_for_active_account(
             )
             return
         if adapter is None:
+            return
+        if not _adapter_is_demo(adapter):
+            logger.error(
+                "Refusing a newly created adapter that is not in demo/paper mode",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                    }
+                },
+            )
             return
         active_adapters[account_id] = adapter
 
@@ -2798,6 +3867,23 @@ async def sync_deployments_loop(
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
+    # Seeded from the database, not empty. Every restart used to re-run cancel
+    # and flatten for deployments that were already stopped, because this set
+    # was process-local while the stamp it mirrors is persisted.
+    try:
+        enforced_stopped_deployments = await asyncio.to_thread(
+            list_stopped_enforced_deployment_ids
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        # Fail toward re-enforcing rather than toward skipping it: an empty
+        # ledger repeats work, a wrong one would leave a stopped deployment with
+        # open positions.
+        enforced_stopped_deployments = set()
+        logger.warning(
+            "Could not read the persisted STOPPED enforcement ledger; "
+            "enforcement will be re-run for every stopped deployment this tick",
+            extra={"data": {"error": repr(exc)}},
+        )
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
@@ -2842,15 +3928,25 @@ async def sync_deployments_loop(
             )
             runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            # B2: disconnect against runnable (blocked-excluded) ids — a
-            # blocked account must never keep a live adapter via the
-            # active-id set.
-            await _disconnect_inactive_adapters(active_adapters, runnable_account_ids)
+            # A STOPPED deployment can only be flattened by an adapter, so an
+            # account whose deployments are all STOPPED still needs one. The
+            # retained set is the union of runnable and enforcement accounts;
+            # only the runnable set may trade, and the task sets below use it
+            # alone, so connecting for enforcement never grants permission.
+            enforcement_account_ids = _account_ids_needing_stopped_enforcement(
+                deployments,
+                enforced_stopped_deployments,
+            ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            retained_account_ids = runnable_account_ids | enforcement_account_ids
+
+            # B2: disconnect against retained (blocked-excluded) ids — a
+            # blocked account must never keep a live adapter via either path.
+            await _disconnect_inactive_adapters(active_adapters, retained_account_ids)
 
             active_discord_account_ids = _discord_active_account_ids(deployments)
 
             await _connect_active_accounts(
-                runnable_account_ids,
+                retained_account_ids,
                 account_lookup,
                 active_adapters,
                 accounts_env_values=accounts_env_values,
@@ -2859,6 +3955,18 @@ async def sync_deployments_loop(
 
             _cancel_inactive_tasks(active_tasks, runnable_account_ids)
             _start_missing_tasks(active_adapters, active_tasks, runnable_account_ids)
+
+            # STOPPED means "cancel entries, flatten, sweep orphaned
+            # protections", enforced here rather than only in the status
+            # endpoint so it also holds when another operator changed the status
+            # or the daemon restarted. It runs after the connect because the
+            # adapter is what performs the sweep.
+            await _enforce_stopped_deployments(
+                deployments,
+                active_adapters,
+                already_enforced=enforced_stopped_deployments,
+                account_lookup=account_lookup,
+            )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,

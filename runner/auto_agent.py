@@ -552,7 +552,7 @@ def _timeout(proc: subprocess.Popen, cmd: list[str]) -> None:
     proc.wait(timeout=30)
     raise RuntimeError(
         f"Generated-strategy backtest timed out after "
-        f"{_backtest_timeout()} seconds: {' '.join(cmd)}"
+        f"{BACKTEST_TIMEOUT_SECONDS} seconds: {' '.join(cmd)}"
     ) from None
 
 

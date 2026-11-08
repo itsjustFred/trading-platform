@@ -106,7 +106,12 @@ def _warn_once(
 
 
 IndicatorMap = dict[str, tuple[pd.Series, str]]
-TIMEFRAME_ORDER = ["tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+# Conformance (Cleanup 16-A, F8): the granularity order is owned by the contract
+# module. This used to be a private literal copy, so a timeframe added to
+# VALID_TIMEFRAMES would reach the native engine and silently not reach this one
+# -- the exact divergence the contract docstring warns about. Same object as
+# native, so the two can never disagree.
+TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
 TIMEFRAME_TO_DURATION = {
     "s1": pd.Timedelta(seconds=1),
     "1m": pd.Timedelta(minutes=1),

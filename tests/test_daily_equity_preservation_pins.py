@@ -26,7 +26,7 @@ def test_a_single_point_curve_is_not_preserved_for_a_one_day_window() -> None:
     preserved = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
     daily = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
 
-    assert not _preserves_engine_curve(preserved, daily)
+    assert not _preserves_engine_curve(preserved, daily, [])
 
 
 def test_a_single_point_curve_is_not_preserved_even_with_matching_endpoints() -> None:
@@ -38,4 +38,4 @@ def test_a_single_point_curve_is_not_preserved_even_with_matching_endpoints() ->
     preserved = [EquityPoint(time="2024-01-01T12:00:00+00:00", equity=100_000.0)]
     daily = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
 
-    assert not _preserves_engine_curve(preserved, daily)
+    assert not _preserves_engine_curve(preserved, daily, [])

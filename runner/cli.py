@@ -30,6 +30,14 @@ from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.stats import merge_canonical_stats
+from runner.universe_provenance import (
+    DEFAULT_UNIVERSE_PROVIDER,
+    MEMBERSHIP_CURRENT,
+    MEMBERSHIP_POINT_IN_TIME,
+    MEMBERSHIP_UNDECLARED,
+    UNIVERSE_PROVENANCE_KEY,
+    universe_provenance,
+)
 from runner.walkforward import run_walkforward
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -165,6 +173,21 @@ def _detect_date_range(symbols: list[str], timeframe: str, data_dir: str = "") -
     return detected_start, detected_end
 
 
+def _declared_membership_basis(args) -> str:
+    """The membership basis the operator declared for this run's symbol list.
+
+    The default is deliberately ``undeclared``: a symbol list resolved at run
+    time says nothing about when its membership was determined, and recording
+    that as ``point_in_time`` (or as ``current``) would assert a fact nobody
+    made. Declaring either basis is an operator statement, and the flags make
+    it explicit.
+    """
+    declared = str(getattr(args, "universe_membership", "") or "").strip().lower()
+    if declared:
+        return declared
+    return MEMBERSHIP_UNDECLARED
+
+
 def cmd_run(args):
     """Run a backtest."""
     strategy_type = _resolve_strategy_type(args.strategy)
@@ -247,6 +270,32 @@ def cmd_run(args):
             logger.error("Config error: %s", e)
         sys.exit(1)
 
+    # Universe provenance (#70): who decided the symbol list, and when. The
+    # artifact records the membership fact even when nobody declared one, so a
+    # reader can tell "current list" from "point-in-time list" from "unknown"
+    # instead of having to assume the best case. The disclosure is logged too —
+    # a run that cannot rule out survivorship bias should say so out loud.
+    #
+    # Resolved here, next to the other fail-fast validation, rather than after
+    # the run. Every value it needs is known before a bar is processed, and it
+    # rejects contradictory input — an unknown membership basis, an unreadable
+    # date, or point-in-time without an as-of. Paying for a full backtest to
+    # learn that the flags were contradictory is the worst version of this bug:
+    # hours of compute, then an error, and a saved run whose provenance is
+    # unrecorded.
+    provenance = universe_provenance(
+        symbols=list(config.symbols),
+        provider=str(getattr(args, "universe_source", "") or "").strip()
+        or DEFAULT_UNIVERSE_PROVIDER,
+        as_of=str(getattr(args, "universe_as_of", "") or "").strip() or None,
+        membership=_declared_membership_basis(args),
+        point_in_time_source=str(getattr(args, "universe_source_name", "") or "").strip(),
+        resolved_at=datetime.now(timezone.utc),
+        window_start=start,
+        window_end=end,
+    )
+    logger.info("Universe provenance: %s", provenance["disclosure"])
+
     logger.info(
         "Running backtest: engine=%s, strategy=%s, symbols=%s",
         engine.name,
@@ -263,6 +312,36 @@ def cmd_run(args):
     result_id = str(getattr(args, "result_id", "") or "").strip()
     if result_id:
         result.meta.id = result_id
+    # Persist the run's own money-path semantics next to the numbers, so a
+    # reader never has to guess whether `pnl` is gross or net (#84), and so
+    # the optimizer can reproduce this exact run (execution_context).
+    result.meta.data["pnl_basis"] = {
+        "pnl": "gross",
+        "net_pnl": "net_after_fees",
+    }
+    result.meta.data["risk_config"] = {
+        "risk_per_trade_pct": config.risk_per_trade_pct,
+        "max_position_exposure_pct": config.max_position_exposure_pct,
+        "max_leverage": config.max_leverage,
+        "modeling_resolution": config.modeling_resolution,
+        "signal_exit_fill": config.signal_exit_fill,
+        "warmup_start": config.warmup_start,
+        "max_position_exposure_semantics": (
+            "aggregate_open_risk"
+            if engine.name == "native"
+            else "per_position_notional"
+        ),
+    }
+    result.meta.data["execution_context"] = {
+        "engine": engine.name,
+        "data_dir": str(Path(config.data_dir) if config.data_dir else DATA_DIR),
+        "data_source": config.data_source,
+        "symbols": list(config.symbols),
+        "timeframe": config.timeframe,
+        "initial_capital": float(config.initial_capital),
+        "risk_config": dict(result.meta.data["risk_config"]),
+    }
+    result.meta.data[UNIVERSE_PROVENANCE_KEY] = provenance
     if engine.name != "native":
         _emit_progress(progress_callback, 90.0, "Calculating statistics...")
     attach_daily_equity(result, start=start, end=end)
@@ -546,6 +625,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("--params", help="Parameters JSON, e.g. '{\"fast\": 10, \"slow\": 30}'")
     run_p.add_argument("--data-dir", help=HELP_OVERRIDE_DATA_DIR)
+    # Universe provenance (#70). Nothing here changes what is traded; the flags
+    # exist so the artifact can state HOW the symbol list was determined and
+    # WHEN its membership was fixed, which is what a survivorship-bias claim
+    # rests on.
+    run_p.add_argument(
+        "--universe-source",
+        default="",
+        help=(
+            "Where the symbol list came from (e.g. 'sp500-constituents-2026-09'). "
+            "Recorded on the artifact as universe provenance; defaults to the "
+            f"run's own --symbols argument ({DEFAULT_UNIVERSE_PROVIDER!r})"
+        ),
+    )
+    run_p.add_argument(
+        "--universe-as-of",
+        default="",
+        help="Date the symbol list's membership was determined (YYYY-MM-DD)",
+    )
+    run_p.add_argument(
+        "--universe-membership",
+        default="",
+        choices=["", MEMBERSHIP_UNDECLARED, MEMBERSHIP_CURRENT, MEMBERSHIP_POINT_IN_TIME],
+        help=(
+            "Declare whether the symbol list is a current membership snapshot or "
+            "a point-in-time one. Undeclared is recorded as unknown, not as "
+            "point-in-time"
+        ),
+    )
+    run_p.add_argument(
+        "--universe-source-name",
+        default="",
+        help=(
+            "Name of the point-in-time membership source behind --symbols "
+            "(required to claim --universe-membership point_in_time)"
+        ),
+    )
     run_p.add_argument(
         "--keep-indicators",
         action="store_true",

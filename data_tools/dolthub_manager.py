@@ -87,14 +87,34 @@ def run_dolt(
         ) from exc
 
 
-def build_symbol_select(table_name: str) -> str:
-    """Build the distinct-symbol listing query without raw interpolation (DV-B27).
+def build_distinct_symbol_select(table_name: str) -> str:
+    """Build the every-symbol listing query without raw interpolation (DV-B27).
 
     The table name goes through :func:`shared.sql.quote_identifier`, which
-    escapes backticks and rejects empty names. The listing query must not
-    filter on ``act_symbol`` — every symbol is requested.
+    escapes backticks and raises ``ValueError`` on an empty or otherwise
+    unusable identifier. The listing query must not filter on ``act_symbol``
+    — every symbol is requested, so routing a wildcard through
+    :func:`shared.sql.quote_literal` would raise before the ``dolt`` call.
     """
     return f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}"
+
+
+def build_symbol_select(table_name: str, symbol: str | None = None) -> str:
+    """Build the distinct-symbol query without raw interpolation (DV-B27).
+
+    The table name goes through :func:`shared.sql.quote_identifier`, and a
+    given ``symbol`` through :func:`shared.sql.quote_literal`; both validate
+    their input and raise ``ValueError`` on anything unsafe. Omitting
+    ``symbol`` returns the every-symbol listing query, i.e. exactly what
+    :func:`build_distinct_symbol_select` returns; pass a symbol only when the
+    caller really wants that one symbol.
+    """
+    if symbol is None:
+        return build_distinct_symbol_select(table_name)
+    return (
+        "SELECT DISTINCT act_symbol FROM "
+        f"{quote_identifier(table_name)} WHERE act_symbol = {quote_literal(symbol)}"
+    )
 
 
 def build_ohlcv_select(table_name: str, symbol: str) -> str:
@@ -222,12 +242,21 @@ def _export_stocks() -> None:
 
 
 def _list_symbols(stocks_repo: Path, table_name: str) -> list[str]:
-    result = subprocess.run(
-        ["dolt", "sql", "-q", build_symbol_select(table_name), "-r", "csv"],
-        cwd=stocks_repo,
-        capture_output=True,
-        text=True,
-    )
+    """List every symbol in ``table_name`` (no symbol filter — see the builder).
+
+    Runs under the mandatory dolt timeout (DV-B28). A timeout, a dolt failure
+    or an unusable table name returns no symbols instead of aborting the whole
+    export, so one bad repo cannot block the others.
+    """
+    try:
+        result = run_dolt(
+            ["dolt", "sql", "-q", build_distinct_symbol_select(table_name), "-r", "csv"],
+            cwd=stocks_repo,
+            capture=True,
+        )
+    except (subprocess.CalledProcessError, DoltTimeoutError, ValueError) as exc:
+        logger.exception("Failed to list symbols in %s: %s", stocks_repo, exc)
+        return []
     lines = result.stdout.strip().split("\n")[1:]  # skip header
     return [line.strip() for line in lines if line.strip()]
 
@@ -251,7 +280,7 @@ def _export_symbol_csv(
 
         def _write_csv(target: Path) -> None:
             with target.open("w", encoding="utf-8", newline="") as handle:
-                subprocess.check_call(
+                run_dolt(
                     [
                         "dolt",
                         "sql",
@@ -329,21 +358,15 @@ def export_data():
         else:
             logger.info(f"Using table: {table_name}")
 
-            # Get symbols
-            result = run_dolt(
-                [
-                    "dolt",
-                    "sql",
-                    "-q",
-                    f"SELECT DISTINCT act_symbol FROM {quote_identifier(table_name)}",
-                    "-r",
-                    "csv",
-                ],
-                cwd=stocks_repo,
-                capture=True,
-            )
-            lines = result.stdout.strip().split("\n")[1:]  # skip header
-            symbols = [line.strip() for line in lines if line.strip()]
+            # Get symbols, through the helper that already carries the timeout and
+            # dolt-failure guard. This used to be inlined, and the inline copy had
+            # no `except`: a `DoltTimeoutError` from the symbol listing escaped
+            # `export_data` and took the earnings and rates exports with it, so one
+            # slow or broken `stocks` repo meant *no* fundamentals at all, with a
+            # traceback and no partial-success report. The guard was added to
+            # `_list_symbols` - which nothing in production called, since this
+            # re-implementation is what actually runs.
+            symbols = _list_symbols(stocks_repo, table_name)
             logger.info(f"Found {len(symbols)} symbols to export.")
 
             for i, symbol in enumerate(symbols):

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
 from shared.logging import get_logger
+from shared.models import VALID_TIMEFRAMES
 
 logger = get_logger("live-runner")
 
@@ -26,6 +27,27 @@ def _parse_signal_timestamp(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _require_recognised_timeframe(timeframe: str, caller: str) -> None:
+    """Refuse a timeframe label the repo does not define.
+
+    Separated from the budget lookup because "no budget" and "no such timeframe"
+    are different answers to different questions, and collapsing them is what let
+    a broker-style label (`M15`, `H1`, `D`) disable both the staleness gate and the
+    candle-close wait without a word. `tick` resolves to no budget and is fine;
+    `M15` resolves to nothing at all and is a configuration error.
+    """
+    normalized = normalize_timeframe(timeframe)
+    if normalized in VALID_TIMEFRAMES:
+        return
+    raise ValueError(
+        f"{caller}: unrecognised live timeframe {timeframe!r} "
+        f"(normalised {normalized!r}); expected one of "
+        f"{', '.join(VALID_TIMEFRAMES)}. An unknown label cannot be given a "
+        f"staleness budget or a candle close, so treating it as 'no limit' would "
+        f"silently trade on old information and skip the requested wait."
+    )
 
 
 def _timeframe_seconds(timeframe: str) -> int | None:
@@ -96,6 +118,19 @@ def signal_is_fresh(
     """
     max_age = max_signal_age_seconds(timeframe)
     if max_age is None:
+        # Deliberately permissive, and NOT changed here. This gate is secondary:
+        # `_validate_signal_age_before_wait` in the daemon is the primary one, it
+        # raises for a missing, invalid or stale stamp, and for a timeframe it
+        # cannot size it falls back to `max(300.0, 2 * timeframe_budget)`. That
+        # compensating gate is documented in `_validate_signal_age_before_wait`'s
+        # own docstring, which names this exact fail-open by name.
+        #
+        # An audit proposed refusing here too. It was rejected after reading that
+        # gate: it would add a second, weaker refusal in front of a stronger one,
+        # change a documented decision, and break a test that pins the behaviour on
+        # purpose. `wait_for_candle_close` below has no such compensating gate -
+        # skipping the wait silently changes what the strategy does - so that one is
+        # fixed and this one is left as designed.
         return True
     received_at = _parse_signal_timestamp(signal.metadata.get("received_at"))
     if received_at is None:
@@ -108,6 +143,11 @@ async def wait_for_candle_close(signal: TradeSignal, timeframe: str) -> None:
     """Wait until the next candle close for the given timeframe."""
     timeframe_seconds = _timeframe_seconds(timeframe)
     if timeframe_seconds is None:
+        # See `signal_is_fresh`. Returning here for an unrecognised label means
+        # "no wait", which turns the operator's requested candle-close entry into
+        # an immediate market order at a different price than the strategy was
+        # validated against - a silent change in what the strategy does.
+        _require_recognised_timeframe(timeframe, "wait_for_candle_close")
         return
 
     received_at = _parse_signal_timestamp(signal.metadata.get("received_at"))

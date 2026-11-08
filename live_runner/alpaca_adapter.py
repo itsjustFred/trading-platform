@@ -6,19 +6,22 @@ import math
 import os
 import re
 from collections.abc import Mapping
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
+import pandas as pd
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    ControlOutcome,
     coerce_positive_live_qty,
     is_unbounded_tp,
+    order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
 from shared.database import (
@@ -57,6 +60,107 @@ def _normalize_broker_order_id(value: Any) -> str | None:
     return str(uuid_value)
 
 
+def _control_order_id(value: Any) -> str | None:
+    """An order id usable for a control call, without assuming a UUID shape.
+
+    `_normalize_broker_order_id` is deliberately strict because it guards the
+    submission path against junk. Control calls only need to name an order the
+    broker just returned, and a fake client (or a broker that changes its id
+    format) must not be reported as "unidentifiable" for that reason.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() in {"none", "null", "false"}:
+        return None
+    return normalized
+
+
+def _order_attr(order: Any, name: str, default: Any = None) -> Any:
+    if isinstance(order, Mapping):
+        return order.get(name, default)
+    return getattr(order, name, default)
+
+
+def _order_legs(order: Any) -> list[Any]:
+    legs = _order_attr(order, "legs", None)
+    return list(legs) if isinstance(legs, (list, tuple)) else []
+
+
+def _order_symbol(order: Any) -> str:
+    return str(_order_attr(order, "symbol", "") or "").strip().upper()
+
+
+def _order_side(order: Any) -> str:
+    """The order's side as ``buy``/``sell``, whether it arrives as an enum or a string."""
+    raw = _order_attr(order, "side", "")
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
+def _alpaca_timeframe(value: str):
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    normalized = str(value or "").strip().lower()
+    units = {
+        "1m": (1, TimeFrameUnit.Minute),
+        "5m": (5, TimeFrameUnit.Minute),
+        "15m": (15, TimeFrameUnit.Minute),
+        "30m": (30, TimeFrameUnit.Minute),
+        "1h": (1, TimeFrameUnit.Hour),
+        "1d": (1, TimeFrameUnit.Day),
+    }
+    if normalized not in units:
+        raise ValueError(f"Unsupported Alpaca market-data timeframe: {value!r}")
+    amount, unit = units[normalized]
+    return TimeFrame(amount=amount, unit=unit), normalized
+
+
+# Markets are closed for most of the calendar. A US equity session is 6.5 hours
+# on five days a week, so one calendar day buys ~27% of a trading day and a week
+# buys ~5/7 of the sessions. Sizing an intraday lookback by the bare bar duration
+# therefore under-requests by ~5.2x: 200 30-minute bars need ~6000 trading
+# minutes, which is ~21 calendar days, not the 220 hours (9 days) a `*2.2`
+# multiplier buys. The old value returned a short history, and the `tail()` then
+# shipped it - silently changing every lookback-dependent indicator relative to
+# the backtest. 6.5 covers the session fraction, weekends and a holiday week;
+# the widening retry below covers sparse IEX data on top of it.
+_CALENDAR_TO_TRADING_SLACK = 6.5
+_DAILY_CALENDAR_TO_TRADING_SLACK = 1.6
+
+
+def _alpaca_market_data_start(
+    timeframe: str,
+    limit: int,
+    *,
+    slack_multiplier: float = 1.0,
+) -> datetime:
+    normalized = str(timeframe or "").strip().lower()
+    bars = max(int(limit), 1) * max(float(slack_multiplier), 1.0)
+    if normalized.endswith("m"):
+        # The bar duration is part of the request: `limit` bars of 30 minutes is
+        # 6000 trading minutes, not 200. Omitting it was the other half of the
+        # short-history bug, on top of the calendar/trading slack.
+        try:
+            bar_minutes = float(normalized[:-1])
+        except ValueError:
+            bar_minutes = 1.0
+        return datetime.now(timezone.utc) - timedelta(
+            minutes=bars * bar_minutes * _CALENDAR_TO_TRADING_SLACK
+        )
+    if normalized.endswith("h"):
+        try:
+            bar_hours = float(normalized[:-1])
+        except ValueError:
+            bar_hours = 1.0
+        return datetime.now(timezone.utc) - timedelta(
+            hours=bars * bar_hours * _CALENDAR_TO_TRADING_SLACK
+        )
+    return datetime.now(timezone.utc) - timedelta(
+        days=bars * _DAILY_CALENDAR_TO_TRADING_SLACK
+    )
+
+
 def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bool:
     """Strict boolean parsing shared with live_runner.credential_env.
 
@@ -74,6 +178,67 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_parseable_qty(value: Any) -> bool:
+    """Whether ``value`` yields a finite float quantity."""
+    try:
+        return math.isfinite(float(Decimal(str(value))))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _position_qty(position: Mapping[str, Any]) -> float:
+    """The broker position's signed quantity, refusing to guess on a bad value.
+
+    ``_to_float(..., default=0.0)`` maps an *unparseable* ``qty`` onto "flat",
+    which would let a position with a malformed quantity be silently skipped as
+    "no position" — the flatten would then report success and a STOPPED
+    deployment would be stamped enforced while real exposure stayed open.
+
+    :func:`get_positions` marks such a row with ``qty_unparseable`` (the
+    displayed ``qty`` is still the coerced ``0.0`` so ordinary consumers keep
+    working). This helper is the risk-path reader: it raises on that marker, and
+    on a non-finite quantity, rather than returning a misleading zero.
+    """
+    if position.get("qty_unparseable"):
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has an unparseable "
+            f"qty ({position.get('qty_raw')!r}); refusing to treat it as flat"
+        )
+    if "qty" not in position:
+        return 0.0
+    value = position.get("qty")
+    if value is None:
+        return 0.0
+    try:
+        qty = float(Decimal(str(value)))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has an unparseable "
+            f"qty ({value!r}); refusing to treat it as flat"
+        ) from exc
+    if not math.isfinite(qty):
+        raise ValueError(
+            f"broker position for {position.get('symbol')!r} has a non-finite "
+            f"qty ({value!r}); refusing to treat it as flat"
+        )
+    return qty
+
+
+def _is_flat(qty: float) -> bool:
+    """Whether a broker quantity means "no position".
+
+    Comparing a quantity to ``0.0`` with ``==`` is a float-equality bug (Sonar
+    S1244): a position left with a sub-unit residue would read as open forever,
+    and a quantity a hair above zero would never be treated as closed. The
+    tolerance is absolute and far below any tradable unit (brokers quote to at
+    most 1e-9), so a real position cannot be mistaken for flat.
+
+    Non-finite values are not flat - ``_position_qty`` already refuses them, and
+    a NaN that slipped through must not read as "nothing open".
+    """
+    return math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12)
 
 
 def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) -> float | None:
@@ -314,6 +479,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self.account_id = account_id
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
+        self._historical_data_client: Any | None = None
         # #78: subscribe exactly once per stream instance. Re-subscribing
         # the same (or a reconnected) stream duplicates callbacks. The
         # subscribed stream object itself is tracked (not its id(): CPython
@@ -330,6 +496,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def connect(self) -> None:
         """Initialize REST and websocket clients, and verify account access."""
         try:
+            from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.trading.client import TradingClient
             from alpaca.trading.stream import TradingStream
         except ModuleNotFoundError as exc:
@@ -338,6 +505,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ) from exc
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
+        self._historical_data_client = StockHistoricalDataClient(
+            self.api_key, self.secret_key
+        )
         try:
             self._trading_client.get_account()
         except Exception:
@@ -460,6 +630,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_stream = None
         self._subscribed_stream = None
         self._trading_client = None
+        self._historical_data_client = None
         self._connected = False
         if stream is None:
             return
@@ -670,54 +841,137 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
 
+    async def _require_exit_position(self, signal: LiveSignal, qty: float) -> float:
+        """Fail closed unless an exit-only order provably reduces a live position.
+
+        Alpaca closes a position with an ordinary opposing market order, so an
+        exit-only order whose position has already gone would silently OPEN one -
+        and because the exit-only path drops the mandatory SL/TP legs it would
+        open it unbounded. The same is true of an order larger than the position:
+        the excess becomes a new naked position on the other side.
+
+        Returns the quantity to submit, capped at the broker's current position.
+        Capping rather than refusing is deliberate: the order's intent is to
+        close what exists, and refusing would leave the exposure in place. The
+        cap is logged because a size mismatch means the daemon's book moved
+        under us.
+        """
+        if not (
+            str((signal.metadata or {}).get("risk_sizing_mode") or "")
+            == EXIT_ONLY_RISK_SIZING_MODE
+        ):
+            return qty
+        symbol = str(signal.symbol or "").strip().upper()
+        quantities = [
+            quantity
+            for position in await self.get_positions()
+            if str(position.get("symbol") or "").strip().upper() == symbol
+            and not _is_flat(quantity := _position_qty(position))
+        ]
+        if not quantities:
+            raise ValueError(
+                "Refusing Alpaca exit-only order for "
+                f"{symbol} (action={signal.action}, signal_id={signal.id}): "
+                "no live broker position to close. An exit-only order without a "
+                "position would OPEN one, and without its mandatory SL/TP."
+            )
+        if any(quantity > 0 for quantity in quantities) and any(
+            quantity < 0 for quantity in quantities
+        ):
+            raise ValueError(
+                f"Refusing Alpaca exit-only order for {symbol}: the broker book "
+                "holds mixed long and short positions, so no single close is "
+                "unambiguous."
+            )
+        close_action = "sell" if quantities[0] > 0 else "buy"
+        if signal.action != close_action:
+            position_side = "long" if close_action == "sell" else "short"
+            raise ValueError(
+                f"Refusing Alpaca exit-only order for {symbol}: a {signal.action} "
+                f"does not close a {position_side} position (its close side is "
+                f"{close_action!r}); it would open or extend exposure instead of "
+                "reducing it."
+            )
+        position_qty = abs(quantities[0])
+        if qty > position_qty:
+            logger.warning(
+                "Capping Alpaca exit-only order to the broker position; the "
+                "requested quantity exceeded it and the excess would open a new "
+                "naked position",
+                extra={
+                    "data": {
+                        "signal_id": str(signal.id),
+                        "symbol": symbol,
+                        "requested_qty": qty,
+                        "broker_position_qty": position_qty,
+                    }
+                },
+            )
+            return position_qty
+        return qty
+
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
-        if not self._connected or self._trading_client is None:
-            await self.connect()
-        trading_client = self._trading_client
-        if trading_client is None:
-            raise RuntimeError("Alpaca trading client is unavailable after connect.")
+        # Everything up to and including the request build is provably before
+        # the broker sees an order, so a failure here is marked and the caller
+        # can safely retry instead of treating the outcome as unknown. The
+        # `trading_client.submit_order` call below is deliberately outside.
+        with order_not_submitted():
+            if not self._connected or self._trading_client is None:
+                await self.connect()
+            trading_client = self._trading_client
+            if trading_client is None:
+                raise RuntimeError("Alpaca trading client is unavailable after connect.")
 
-        # B-8: validate the cheap in-memory facts BEFORE the first persistence.
-        # A signal row persisted without a broker order wedges every redelivery
-        # on the duplicate-persisted recovery path.
-        if signal.action not in {"buy", "sell"}:
-            raise ValueError(f"Unsupported action '{signal.action}'")
+            # B-8: validate the cheap in-memory facts BEFORE the first persistence.
+            # A signal row persisted without a broker order wedges every redelivery
+            # on the duplicate-persisted recovery path.
+            if signal.action not in {"buy", "sell"}:
+                raise ValueError(f"Unsupported action '{signal.action}'")
 
-        # C1/B2: size exactly once upstream (deployment RiskConfig); the
-        # incoming qty is binding. No default-config sizing here — sizing
-        # with defaults silently diverged from the deployment policy, and
-        # max(float(qty), 0.0) let NaN through to MarketOrderRequest.
-        if qty is None:
-            raise ValueError(
-                "Alpaca submit_order requires an explicit risk-sized qty; "
-                "size exactly once upstream and pass it as binding "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
+            # C1/B2: size exactly once upstream (deployment RiskConfig); the
+            # incoming qty is binding. No default-config sizing here — sizing
+            # with defaults silently diverged from the deployment policy, and
+            # max(float(qty), 0.0) let NaN through to MarketOrderRequest.
+            if qty is None:
+                raise ValueError(
+                    "Alpaca submit_order requires an explicit risk-sized qty; "
+                    "size exactly once upstream and pass it as binding "
+                    f"(signal_id={signal.id}, symbol={signal.symbol})."
+                )
+            try:
+                qty_value = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
+            except ValueError as exc:
+                raise ValueError(
+                    "Alpaca order qty must be finite and positive, "
+                    f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
+                ) from exc
+            qty = qty_value
+
+            # Must precede save_live_signal: an exit-only order with no position to
+            # close is refused before the signal row is persisted, and an oversized
+            # one is capped so it cannot open a new naked position.
+            qty = await self._require_exit_position(signal, qty)
+
+            order_side, time_in_force, market_request_cls = (
+                self._load_alpaca_order_types()
             )
-        try:
-            qty_value = coerce_positive_live_qty(qty, field_name="Alpaca order qty")
-        except ValueError as exc:
-            raise ValueError(
-                "Alpaca order qty must be finite and positive, "
-                f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
-            ) from exc
-        qty = qty_value
 
-        order_side, time_in_force, market_request_cls = self._load_alpaca_order_types()
-
-        canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
-        if not created:
-            return await self._recover_existing_signal_order(
-                trading_client, canonical_signal_id
+            canonical_signal_id, created = await asyncio.to_thread(
+                save_live_signal, signal
             )
+            if not created:
+                return await self._recover_existing_signal_order(
+                    trading_client, canonical_signal_id
+                )
 
-        request = self._build_order_request(
-            signal,
-            qty=qty,
-            order_side=order_side,
-            time_in_force=time_in_force,
-            market_request_cls=market_request_cls,
-            client_order_id=canonical_signal_id,
-        )
+            request = self._build_order_request(
+                signal,
+                qty=qty,
+                order_side=order_side,
+                time_in_force=time_in_force,
+                market_request_cls=market_request_cls,
+                client_order_id=canonical_signal_id,
+            )
         order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
@@ -748,6 +1002,606 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
 
+    async def get_market_data(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Recent bars, refusing to return a shorter history than requested.
+
+        A short history is not cosmetic: indicators would be computed over fewer
+        bars than the backtest used, so the live strategy would quietly behave
+        differently from the one that was validated.
+        """
+        from alpaca.common.enums import Sort
+        from alpaca.data.requests import StockBarsRequest
+
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required for Alpaca market data")
+        resolved_timeframe, _normalized = _alpaca_timeframe(timeframe)
+        bounded_limit = max(1, min(int(limit), 1000))
+        if not self._connected or self._historical_data_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting market data"
+            )
+
+        def _fetch(slack_multiplier: float) -> pd.DataFrame:
+            request = StockBarsRequest(
+                symbol_or_symbols=[normalized_symbol],
+                timeframe=resolved_timeframe,
+                start=_alpaca_market_data_start(
+                    timeframe, bounded_limit, slack_multiplier=slack_multiplier
+                ),
+                limit=1000,
+                adjustment="raw",
+                feed="iex",
+                # Newest first. The response is capped at `limit`, so an
+                # ascending request over a widened window would return the
+                # oldest bars in it. Sorted back to ascending below.
+                sort=Sort.DESC,
+            )
+            return self._historical_data_client.get_stock_bars(request).df
+
+        frame = await asyncio.to_thread(_fetch, 1.0)
+        if frame is not None and len(frame.index) < bounded_limit:
+            widened = await asyncio.to_thread(_fetch, 4.0)
+            if widened is not None and len(widened.index) > len(frame.index):
+                frame = widened
+        if frame is not None and 0 < len(frame.index) < bounded_limit:
+            raise ValueError(
+                f"Alpaca returned only {len(frame.index)} of {bounded_limit} requested "
+                f"{timeframe} bars for {normalized_symbol}; refusing to compute "
+                "indicators on a shorter history than requested"
+            )
+        if frame is None or frame.empty:
+            raise ValueError(
+                f"Alpaca returned no {timeframe} market data for {normalized_symbol}"
+            )
+        frame = frame.reset_index()
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        required = {"open", "high", "low", "close"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(
+                "Alpaca market data is missing columns: " + ", ".join(sorted(missing))
+            )
+        if "timestamp" not in frame.columns:
+            raise ValueError("Alpaca market data is missing timestamp")
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp")
+        frame = frame.tail(bounded_limit).reset_index(drop=True)
+        if frame.empty:
+            raise ValueError(
+                f"Alpaca returned no usable {timeframe} bars for {normalized_symbol}"
+            )
+        newest = pd.Timestamp(frame["timestamp"].iloc[-1])
+        now = pd.Timestamp.now(tz="UTC")
+        # Intraday bars can legitimately be days old across a market closure: a
+        # Friday close to a Tuesday open is ~89 hours once a holiday Monday is
+        # included, and IEX has no pre/post session to shorten the gap. 72 hours
+        # rejected that valid data; a week still catches a feed that has stopped.
+        max_age = (
+            timedelta(days=7)
+            if str(timeframe).strip().lower() == "1d"
+            else timedelta(days=5)
+        )
+        if newest < now - max_age:
+            raise ValueError(
+                f"Alpaca market data is stale for {normalized_symbol}: "
+                f"newest bar {newest.isoformat()} exceeds {max_age}"
+            )
+        return frame
+
+    # ── Operator safety controls ──────────────────────────────────────────────────────────────
+    #
+    # Ordering matters more than the calls themselves. `cancel_open_orders` must never cancel
+    # the SL/TP legs attached to a live position: the flatten runs after it, and if the
+    # flatten fails the position would survive with every risk control removed. Alpaca has no
+    # single "cancel detached orders" endpoint, so this classifies each working order by what
+    # it would do to the *current* book:
+    #
+    #   * an order on a flat symbol cannot protect anything - cancel it (it is either an
+    #     entry, or a protection orphaned by an earlier close);
+    #   * an order on an open position whose side reduces that position is a protection -
+    #     leave it;
+    #   * anything else would open or extend exposure - cancel it.
+    #
+    # The flatten cannot follow that rule to the letter: Alpaca reserves the quantity of a
+    # reducing-side order, so a working SL/TP makes `close_position` fail with "insufficient
+    # qty available". `close_all_positions` therefore cancels each symbol's protections itself,
+    # confirms the cancellation by re-read, closes, and restores a stop if the close is
+    # refused - see `_flatten_symbol`.
+    #
+    # After the flatten, every symbol is flat, so `cancel_orphaned_protections` removes the
+    # legs that outlived their position.
+
+    @property
+    def supports_cancel_orders(self) -> bool:
+        return True
+
+    @property
+    def supports_flatten(self) -> bool:
+        return True
+
+    async def _require_trading_client(self) -> Any:
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        client = self._trading_client
+        if client is None:
+            raise RuntimeError("Alpaca trading client is unavailable after connect.")
+        return client
+
+    async def _list_open_orders(self, client: Any) -> list[Any]:
+        """Every working order, or a hard failure - never a silent empty list."""
+        get_orders = getattr(client, "get_orders", None)
+        if not callable(get_orders):
+            raise RuntimeError(
+                "Alpaca client cannot list orders; refusing to report a clean sweep"
+            )
+        try:
+            from alpaca.trading.enums import QueryOrderStatus
+            from alpaca.trading.requests import GetOrdersRequest
+
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            result = await asyncio.to_thread(get_orders, filter=request)
+        except ModuleNotFoundError:
+            result = await asyncio.to_thread(get_orders)
+        except TypeError:
+            # A client double (or an older alpaca-py) without the `filter`
+            # keyword. Only retried here; an error raised *inside* get_orders is
+            # not a TypeError from the call shape and propagates.
+            result = await asyncio.to_thread(get_orders)
+        if result is None:
+            raise RuntimeError("Alpaca returned no order list; refusing to report a clean sweep")
+        if isinstance(result, (list, tuple)):
+            return list(result)
+        for key in ("orders", "order"):
+            value = _order_attr(result, key, None)
+            if isinstance(value, (list, tuple)):
+                return list(value)
+        raise RuntimeError(
+            f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+            "refusing to report a clean sweep"
+        )
+
+    @staticmethod
+    def _protection_order_ids(
+        orders: list[Any], protection_side_by_symbol: dict[str, str]
+    ) -> set[str]:
+        """Ids of orders that must survive the entry-cancel sweep.
+
+        Two shapes mean "protection": a leg nested under a working parent, and
+        an order whose side reduces an open position. The second covers the case
+        where the parent has already filled and only the legs are returned.
+        """
+        protected: set[str] = set()
+        for order in orders:
+            for leg in _order_legs(order):
+                leg_id = _control_order_id(_order_attr(leg, "id"))
+                if leg_id is not None:
+                    protected.add(leg_id)
+            symbol = _order_symbol(order)
+            expected_side = protection_side_by_symbol.get(symbol)
+            raw_side = _order_attr(order, "side", "")
+            side = str(getattr(raw_side, "value", raw_side) or "").strip().lower()
+            if expected_side and side == expected_side:
+                order_id = _control_order_id(_order_attr(order, "id"))
+                if order_id is not None:
+                    protected.add(order_id)
+        return protected
+
+    async def _protection_sides_by_symbol(self) -> dict[str, str]:
+        """The side that would *reduce* each open position."""
+        sides: dict[str, str] = {}
+        for position in await self.get_positions():
+            symbol = str(position.get("symbol") or "").strip().upper()
+            qty = _position_qty(position)
+            if not symbol or _is_flat(qty):
+                continue
+            sides[symbol] = "sell" if qty > 0 else "buy"
+        return sides
+
+    async def _cancel_one(self, client: Any, order_id: str) -> None:
+        cancel = getattr(client, "cancel_order_by_id", None)
+        if not callable(cancel):
+            cancel = getattr(client, "cancel_order", None)
+        if not callable(cancel):
+            raise RuntimeError("Alpaca client cannot cancel an order by id")
+        await asyncio.to_thread(cancel, order_id)
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel working orders that could open or extend exposure.
+
+        SL/TP legs on a live position are deliberately left alone: the flatten
+        that follows is the step that removes the position, and a failure there
+        must not leave it naked. A refused cancel does not stop the rest, and
+        every refusal/unreadable id is reported so a partial sweep cannot be
+        mistaken for a complete one.
+        """
+        client = await self._require_trading_client()
+        orders = await self._list_open_orders(client)
+        protected = self._protection_order_ids(
+            orders, await self._protection_sides_by_symbol()
+        )
+        completed = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for order in orders:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            if order_id is None:
+                unidentified.append(f"order:{_order_attr(order, 'id', None)!r}")
+                continue
+            if order_id in protected:
+                continue
+            try:
+                await self._cancel_one(client, order_id)
+            except Exception as exc:
+                failed.append(f"{order_id}:{exc}")
+                logger.warning(
+                    "Alpaca refused to cancel order %s: %s. Continuing the sweep.",
+                    order_id,
+                    exc,
+                )
+                continue
+            completed += 1
+
+        # A cancel the broker accepted must actually disappear from the working
+        # book. Re-reading also catches an order whose cancel was silently
+        # dropped, which a count alone would report as done.
+        try:
+            remaining = await self._list_open_orders(client)
+        except Exception as exc:
+            return ControlOutcome(
+                completed=completed,
+                unidentified=tuple(unidentified),
+                failed=tuple(failed) + (f"verify:{exc}",),
+            )
+        still_working = {
+            _control_order_id(_order_attr(order, "id"))
+            for order in remaining
+            if _control_order_id(_order_attr(order, "id")) not in protected
+        }
+        still_working.discard(None)
+        failed.extend(sorted(still_working))
+        return ControlOutcome(
+            completed=completed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
+    @staticmethod
+    def _best_stop_price(orders: list[Any], symbol: str) -> float | None:
+        """The stop price to restore if a close is refused.
+
+        Taken from the protection about to be cancelled, so the position is
+        restored to the stop the strategy chose rather than one invented from a
+        stale quote. A nested stop leg is checked too, because a bracket's stop
+        is sometimes only visible there.
+        """
+        for order in orders:
+            if _order_symbol(order) != symbol:
+                continue
+            for candidate in (order, *_order_legs(order)):
+                candidate_symbol = _order_symbol(candidate)
+                if candidate_symbol not in {"", symbol}:
+                    continue
+                price = _to_float(
+                    _order_attr(candidate, "stop_price", None), default=0.0
+                )
+                if price > 0:
+                    return price
+                nested = _order_attr(candidate, "stop_loss", None)
+                nested_price = _to_float(
+                    _order_attr(nested, "stop_price", None), default=0.0
+                )
+                if nested_price > 0:
+                    return nested_price
+        return None
+
+    def _load_stop_order_types(self) -> tuple[Any, Any, Any]:
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.trading.requests import StopOrderRequest
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
+            ) from exc
+        return OrderSide, TimeInForce, StopOrderRequest
+
+    @staticmethod
+    def _has_working_stop(orders: list[Any], symbol: str, side: str) -> bool:
+        """Whether a stop that actually protects this position is still working.
+
+        The side matters. A buy stop on a long is an entry for a different intent,
+        not a protection: treating it as one after the position's own sell stop was
+        cancelled reports the position as protected while it is naked. Only a stop
+        on the reducing side counts, and a bracket's leg counts only if that leg
+        itself is on the reducing side.
+        """
+        wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
+        for order in orders:
+            if _order_symbol(order) != symbol:
+                continue
+            for candidate in (order, *_order_legs(order)):
+                candidate_symbol = _order_symbol(candidate)
+                if candidate_symbol not in {"", symbol}:
+                    continue
+                order_type = str(_order_attr(candidate, "order_type", "") or "").lower()
+                if "stop" not in order_type:
+                    continue
+                if _order_side(candidate) == wanted:
+                    return True
+        return False
+
+    async def _restore_stop(
+        self,
+        client: Any,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float | None,
+    ) -> bool:
+        """Put a stop back on a position whose close was refused.
+
+        The protections were cancelled to unblock the close, so a refusal would
+        otherwise leave the position naked. Restoring the stop the strategy had
+        is the only acceptable outcome short of a fill; failing to do so is
+        logged at CRITICAL because it means live unprotected exposure.
+
+        Returns whether the position is protected afterwards, which is also true
+        when a stop still works at the broker. Re-submitting in that case would
+        leave two stops on one position, and the second becomes an orphan the
+        moment the first fills - an orphaned sell-stop opens a short.
+        """
+        try:
+            working = await self._list_open_orders(client)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not re-read orders before restoring a stop; restoring anyway",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            working = None
+        if working is not None and self._has_working_stop(working, symbol, side):
+            logger.warning(
+                "Not restoring a stop: one still works at the broker",
+                extra={"data": {"symbol": symbol}},
+            )
+            return True
+        if stop_price is None:
+            logger.critical(
+                "Cannot restore a stop: the cancelled orders carried no stop price, "
+                "so the position is unprotected until the next retry",
+                extra={"data": {"symbol": symbol, "qty": qty}},
+            )
+            return False
+        try:
+            order_side, time_in_force, stop_request_cls = self._load_stop_order_types()
+            request = stop_request_cls(
+                symbol=symbol,
+                qty=abs(qty),
+                side=order_side.SELL if side == "sell" else order_side.BUY,
+                time_in_force=time_in_force.DAY,
+                stop_price=stop_price,
+            )
+            await asyncio.to_thread(client.submit_order, order_data=request)
+        except Exception as exc:
+            logger.critical(
+                "Failed to restore a stop on a position whose close was refused; "
+                "the position is unprotected",
+                extra={
+                    "data": {
+                        "symbol": symbol,
+                        "qty": qty,
+                        "stop_price": stop_price,
+                        "error": repr(exc),
+                    }
+                },
+            )
+            return False
+        logger.warning(
+            "Restored a stop after the broker refused to close the position",
+            extra={
+                "data": {"symbol": symbol, "qty": qty, "stop_price": stop_price}
+            },
+        )
+        return True
+
+    async def _abandon_flatten(
+        self,
+        client: Any,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float | None,
+        reason: str,
+        *,
+        removed_protection: bool,
+    ) -> str:
+        """Report why a flatten stopped, restoring the stop if one was removed.
+
+        Once a protection has been cancelled the position is unprotected, so
+        every early exit after that point has to put a stop back before the
+        failure is reported.
+        """
+        if removed_protection:
+            if not await self._restore_stop(client, symbol, qty, side, stop_price):
+                return f"{reason};NO-STOP-RESTORED"
+        return reason
+
+    async def _flatten_symbol(self, client: Any, symbol: str, qty: float) -> str | None:
+        """Cancel this symbol's working orders, then close its position.
+
+        Returns ``None`` on success, or a short reason for the failure.
+
+        The cancel is not optional. Alpaca reserves the quantity of every
+        reducing-side order, so `close_position` is refused with "insufficient
+        qty available" while the SL/TP legs are still working. That is the one
+        place where "keep the protections until the flatten succeeds" cannot
+        hold - the protections are exactly what blocks the flatten - so the stop
+        is re-placed on every failure after a protection was removed.
+        """
+        side = "sell" if qty > 0 else "buy"
+        orders = await self._list_open_orders(client)
+        on_symbol = [order for order in orders if _order_symbol(order) == symbol]
+        stop_price = self._best_stop_price(on_symbol, symbol)
+
+        cancelled_any = False
+        for order in on_symbol:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            if order_id is None:
+                return await self._abandon_flatten(
+                    client,
+                    symbol,
+                    qty,
+                    side,
+                    stop_price,
+                    f"unreadable-order:{_order_attr(order, 'id', None)!r}",
+                    removed_protection=cancelled_any,
+                )
+            try:
+                await self._cancel_one(client, order_id)
+            except Exception as exc:
+                return await self._abandon_flatten(
+                    client,
+                    symbol,
+                    qty,
+                    side,
+                    stop_price,
+                    f"cancel:{order_id}:{exc}",
+                    removed_protection=cancelled_any,
+                )
+            cancelled_any = True
+
+        # A cancel the broker accepted but did not apply still reserves the
+        # quantity, and the close would then be refused. Confirm by re-read.
+        try:
+            remaining_orders = await self._list_open_orders(client)
+        except Exception as exc:
+            return await self._abandon_flatten(
+                client,
+                symbol,
+                qty,
+                side,
+                stop_price,
+                f"verify:{exc}",
+                removed_protection=cancelled_any,
+            )
+        still_working = [
+            _control_order_id(_order_attr(order, "id"))
+            for order in remaining_orders
+            if _order_symbol(order) == symbol
+        ]
+        if still_working:
+            return await self._abandon_flatten(
+                client,
+                symbol,
+                qty,
+                side,
+                stop_price,
+                "orders-still-working:"
+                + ",".join(str(order_id) for order_id in still_working),
+                removed_protection=cancelled_any,
+            )
+
+        try:
+            await asyncio.to_thread(client.close_position, symbol)
+        except Exception as exc:
+            return await self._abandon_flatten(
+                client,
+                symbol,
+                qty,
+                side,
+                stop_price,
+                f"close:{exc}",
+                removed_protection=cancelled_any,
+            )
+        return None
+
+    async def close_all_positions(self) -> ControlOutcome:
+        """Flatten every open position, one symbol at a time.
+
+        `close_all_positions(cancel_orders=False)` cannot do this job: it does
+        not cancel the reducing-side legs, Alpaca reserves their quantity, and
+        the close is refused - so a stopped deployment with a working SL/TP
+        would never actually flatten. Each symbol is therefore handled on its
+        own: cancel its working orders, confirm by re-read, close, and restore a
+        stop if the close is refused.
+        """
+        client = await self._require_trading_client()
+        positions = [
+            position
+            for position in await self.get_positions()
+            if not _is_flat(_position_qty(position))
+        ]
+        if not positions:
+            return ControlOutcome(completed=0)
+
+        failed: list[str] = []
+        for position in positions:
+            symbol = str(position.get("symbol") or "").strip().upper()
+            qty = _position_qty(position)
+            if not symbol or _is_flat(qty):
+                continue
+            problem = await self._flatten_symbol(client, symbol, qty)
+            if problem is not None:
+                failed.append(f"{symbol}:{problem}")
+
+        # The broker's acknowledgement is not proof the account is flat. A
+        # position that is still open must keep the deployment unenforced.
+        remaining = [
+            position
+            for position in await self.get_positions()
+            if not _is_flat(_position_qty(position))
+        ]
+        for position in remaining:
+            symbol = str(position.get("symbol") or "?")
+            if not any(item.startswith(f"{symbol}:") for item in failed):
+                failed.append(symbol)
+        return ControlOutcome(
+            completed=len(positions) - len(remaining),
+            failed=tuple(failed),
+        )
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel working orders left on symbols with no open position.
+
+        Called after a successful flatten, when every symbol is flat: what
+        remains are the SL/TP legs detached from the positions they protected.
+        An order on a symbol that still has a position is never touched, so this
+        cannot disarm a live position.
+        """
+        client = await self._require_trading_client()
+        orders = await self._list_open_orders(client)
+        open_symbols = {
+            str(position.get("symbol") or "").strip().upper()
+            for position in await self.get_positions()
+            if not _is_flat(_position_qty(position))
+        }
+        completed = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for order in orders:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            if order_id is None:
+                unidentified.append(f"order:{_order_attr(order, 'id', None)!r}")
+                continue
+            if _order_symbol(order) in open_symbols:
+                continue
+            try:
+                await self._cancel_one(client, order_id)
+            except Exception as exc:
+                failed.append(f"{order_id}:{exc}")
+                continue
+            completed += 1
+        return ControlOutcome(
+            completed=completed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
     async def get_positions(self) -> list[dict[str, Any]]:
         """Return open positions with pricing and unrealized PnL."""
         if not self._connected or self._trading_client is None:
@@ -755,15 +1609,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         rows = await asyncio.to_thread(self._trading_client.get_all_positions)
         payload: list[dict[str, Any]] = []
         for row in rows:
-            payload.append(
-                {
-                    "symbol": str(getattr(row, "symbol", "")).strip().upper(),
-                    "qty": _to_float(getattr(row, "qty", None), default=0.0),
-                    "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
-                    "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
-                    "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
-                }
-            )
+            raw_qty = getattr(row, "qty", None)
+            entry: dict[str, Any] = {
+                "symbol": str(getattr(row, "symbol", "")).strip().upper(),
+                "qty": _to_float(raw_qty, default=0.0),
+                "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
+                "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
+                "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
+            }
+            if raw_qty is not None and not _is_parseable_qty(raw_qty):
+                # Keep the coercion for display consumers, but remember that the
+                # broker's value could not be read: the risk paths that decide
+                # whether an account is flat must fail closed rather than treat
+                # it as a zero position.
+                entry["qty_unparseable"] = True
+                entry["qty_raw"] = raw_qty
+            payload.append(entry)
         return payload
 
     def _parse_trade_update_event(

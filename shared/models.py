@@ -186,6 +186,12 @@ class LiveDeploymentConfig(BaseModel):
     symbols: list[str]
     timeframe: str
     status: Literal["ACTIVE", "PAUSED", "STOPPED"] = "ACTIVE"
+    # When STOPPED enforcement (cancel entries, flatten, sweep orphaned
+    # protections) last completed for this deployment. The daemon seeds its
+    # in-memory ledger from this, so a restart does not repeat work that is
+    # already done - and it is cleared on every transition out of STOPPED, so a
+    # second stop enforces again instead of being skipped as "already done".
+    stopped_enforced_at: datetime | None = None
     signal_source_type: Literal["internal", "discord"] = "internal"
     signal_source_id: str | None = None
     symbol_filter: list[str] = Field(default_factory=list)
@@ -227,6 +233,16 @@ class LiveSignal(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+#: Verdicts for `LiveExecution.actual_price_observed`.
+#:
+#: `observed`  a finite, positive price was read from the broker payload.
+#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`    the broker stated no price at all on any field the resolver reads.
+PRICE_OBSERVED = "observed"
+PRICE_SENT_BAD = "sent_bad"
+PRICE_ABSENT = "absent"
+
+
 class LiveExecution(BaseModel):
     """Execution fill received from broker for a previously emitted signal."""
 
@@ -238,6 +254,34 @@ class LiveExecution(BaseModel):
     timestamp: datetime
     broker_order_id: str
     dedupe_key: str | None = None
+
+    # The broker's own per-fill identifier, where it has one. cTrader calls it `dealId`; Alpaca's
+    # equivalent is not populated yet.
+    #
+    # Stored because the dedupe key alone cannot answer the question it was built to answer. The key
+    # is a string our own code assembled, so "were these two rows the same broker fill?" cannot be
+    # answered afterwards without parsing it back out of that string - and when two equal-sized
+    # fills on one order collide, that parse is the only evidence there is. Measured: one stored
+    # signal produced two execution rows 2 ms apart at an identical price, and `live_executions`
+    # carried nothing that could distinguish two real partial fills from one fill counted twice.
+    #
+    # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
+    broker_fill_id: int | None = None
+
+    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
+    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    #
+    # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
+    # be read" produces the same stored value whether the broker omitted `executionPrice` or
+    # explicitly sent zero, and a reader of the row cannot tell either from a genuine price that
+    # happens to be zero. Any PnL derived from such a row is meaningless, and until this column
+    # existed nothing said which rows those were.
+    #
+    # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
+    # one is `absent`. Nullable because rows written before this column existed, and adapters that
+    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
+    # `observed`.
+    actual_price_observed: str | None = None
 
 
 class LiveBalanceRecord(BaseModel):
@@ -667,6 +711,34 @@ class BacktestStats:
         return cls(**payload)
 
 
+def resolve_defined_stat(
+    stats: dict[str, Any] | None,
+    key: str,
+    default: float | None = None,
+) -> float | None:
+    """Resolve a stat, honouring the producer's ``undefined_metrics`` list.
+
+    The convention is that a quantity which could not be computed is *named* in
+    ``undefined_metrics`` and its value omitted, so an absent number is never
+    readable as a real one. ``dict.get(key, 0)`` silently undoes that: it cannot
+    tell "computed as zero" from "never computed" and returns 0 for the omitted
+    key.
+
+    It lives here rather than in the database or viewer layer because the
+    convention belongs to the data model and every consumer has to apply it the
+    same way. It has already bitten twice - once for PSR, where the default was
+    the *worst* attainable value, and once for the portfolio combined stats -
+    each time because the default was applied somewhere new.
+    """
+    if not isinstance(stats, dict):
+        return default
+    undefined = stats.get("undefined_metrics")
+    if isinstance(undefined, (list, tuple, set)) and key in undefined:
+        return None
+    value = stats.get(key, default)
+    return default if value is None else value
+
+
 @dataclass
 class PortfolioStats:
     """Canonical portfolio statistics for persisted combined portfolio metrics."""
@@ -729,11 +801,37 @@ class BacktestResult:
     drawings: list[dict[str, Any]] = field(default_factory=list)
     equity_evidence_status: Literal["unknown", "available", "missing"] = "unknown"
 
-    def __post_init__(self) -> None:
+    def _derived_equity_evidence_status(self) -> Literal["unknown", "available", "missing"]:
+        """Equity evidence status derived from the curve currently attached.
+
+        The status is derived in ``__post_init__``, but the curve can be attached
+        afterwards (the daily-equity builder does exactly that).  Reading the raw
+        attribute at serialization time then produced artifacts that contradicted
+        their own curve, and reloading such a file reported ``available`` while the
+        writer had written nothing at all.
+        """
         if self.equity_curve and self.equity_evidence_status == "unknown":
-            self.equity_evidence_status = "available"
+            return "available"
+        if not self.equity_curve and self.equity_evidence_status == "available":
+            # The curve that made the status "available" was detached again
+            # (an empty fallback curve): the claim no longer has evidence.
+            return "unknown"
+        return self.equity_evidence_status
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "equity_curve":
+            # Keep the in-memory attribute in step with what ``to_dict`` will
+            # write. The daily-equity builder attaches the curve after
+            # construction, and readers of the attribute (the validation
+            # reports) used to see "unknown" next to a result that serialized as
+            # "available".
+            super().__setattr__("equity_evidence_status", self._derived_equity_evidence_status())
+
+    def __post_init__(self) -> None:
         if self.equity_evidence_status == "available" and not self.equity_curve:
             raise ValueError("equity_evidence_status=available requires an equity curve")
+        self.equity_evidence_status = self._derived_equity_evidence_status()
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -748,8 +846,12 @@ class BacktestResult:
             d["indicators"] = [i.to_dict() for i in self.indicators]
         if self.drawings:
             d["drawings"] = self.drawings
-        if self.equity_evidence_status != "unknown":
-            d["equity_evidence_status"] = self.equity_evidence_status
+        # In-place edits of the curve (append/clear) bypass ``__setattr__``, so
+        # the attribute is re-synchronised with the value written here.
+        evidence_status = self._derived_equity_evidence_status()
+        self.equity_evidence_status = evidence_status
+        if evidence_status != "unknown":
+            d["equity_evidence_status"] = evidence_status
         return d
 
     @classmethod

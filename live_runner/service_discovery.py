@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import (
+    discord_bot_env_key,
+    load_accounts_env_values,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
@@ -21,8 +24,12 @@ def discover_discord_bots_from_env() -> list[dict[str, str]]:
         if token_match is None:
             continue
         bot_name = token_match.group("name")
-        token_env_key = f"DISCORD_BOT_{bot_name}_TOKEN"
-        channel_key = f"DISCORD_BOT_{bot_name}_CHANNEL_ID"
+        # Through the helper even though `bot_name` is already canonical, because
+        # it came from a regex here rather than from the canonicaliser. Spelling the
+        # prefix out in two places is how the copies drift; this one is a
+        # round-trip today and a divergence the moment the pattern is widened.
+        token_env_key = discord_bot_env_key(bot_name, "TOKEN")
+        channel_key = discord_bot_env_key(bot_name, "CHANNEL_ID")
         channel_id = str(env_values.get(channel_key, "")).strip()
         if not channel_id:
             continue

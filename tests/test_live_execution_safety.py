@@ -21,11 +21,12 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import BaseLiveAdapter, is_order_not_submitted
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
+from tests.conftest import seed_live_deployments
 
 
 def _alpaca_order_id(label: str) -> str:
@@ -1177,11 +1178,17 @@ def test_ctrader_sparse_deal_uses_order_executed_volume(monkeypatch):
     adapter._order_id_to_symbol[45678] = "EURUSD"
     adapter._ProtoOAExecutionType = SimpleNamespace(ORDER_FILLED=1, ORDER_PARTIAL_FILL=2)
     saved: list[LiveExecution] = []
-    monkeypatch.setattr(
-        module,
-        "save_live_execution",
-        lambda execution: saved.append(execution) or True,
-    )
+    cumulative_caps: list[float] = []
+
+    def _capture(execution: LiveExecution, cumulative_qty: float) -> float:
+        # The order states a cumulative executed volume, so the fill is persisted through the
+        # capped path - that is what keeps a repeated order-level snapshot from being added
+        # twice. What this test pins is the *unit*, so the cap is recorded and returned as met.
+        saved.append(execution)
+        cumulative_caps.append(cumulative_qty)
+        return execution.filled_qty
+
+    monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
 
     event = SimpleNamespace(
         executionType=1,
@@ -1208,6 +1215,10 @@ def test_ctrader_sparse_deal_uses_order_executed_volume(monkeypatch):
     assert len(saved) == 1
     assert saved[0].filled_qty == pytest.approx(5000.0)
     assert saved[0].dedupe_key == "ctrader:deal:778"
+    assert cumulative_caps == [pytest.approx(5000.0)], (
+        "the broker's cumulative executed volume must reach the cap in qty units, or the cap "
+        "compares broker units against qty and stops capping anything"
+    )
 
 
 def test_ctrader_reconciled_deals_are_persisted_in_qty_units(monkeypatch):
@@ -1450,6 +1461,9 @@ def isolated_db(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(database, "ENGINE", engine)
     monkeypatch.setattr(database, "DATA_DIR", tmp_path)
     monkeypatch.setattr(database, "_DB_INITIALIZED", False)
+    # `live_signals.deployment_id` carries a foreign key, so the synthetic ids this module writes
+    # need parents like any other signal. The ids are the module's, not the code's.
+    seed_live_deployments(database, ["dep-1", "dep-2", "dep-naive", "dep-aware"])
     yield database
     engine.dispose()
 
@@ -1533,6 +1547,9 @@ def test_save_live_signal_scopes_discord_claim_by_deployment(isolated_db):
 def _legacy_live_signal_table(database: Any, *, table_unique: bool = False) -> None:
     unique_clause = ", UNIQUE(discord_message_id)" if table_unique else ""
     with database.ENGINE.begin() as connection:
+        # Replaces whatever the fixture's `init_db()` created: these tests stage the *legacy* shape,
+        # which by definition predates the deployment foreign key and the deployment-scoped indexes.
+        connection.execute(database.text("DROP TABLE IF EXISTS live_signals"))
         connection.execute(
             database.text(
                 "CREATE TABLE live_signals ("
@@ -1764,6 +1781,9 @@ def test_migration_rebuild_preserves_live_execution_foreign_key(isolated_db):
         discord_message_id="fk-message",
     )
     with database.ENGINE.begin() as connection:
+        # Replaces the fixture's table: the point is a minimal legacy one whose only feature is the
+        # child foreign key the rebuild must not rewrite.
+        connection.execute(database.text("DROP TABLE IF EXISTS live_executions"))
         connection.execute(
             database.text(
                 "CREATE TABLE live_executions ("
@@ -3248,20 +3268,23 @@ def test_recover_failed_services_respects_paused_and_stopped(monkeypatch):
         _service("failed-bot", ServiceStatus.FAILED),
         _service("running-bot", ServiceStatus.RUNNING),
     ]
-    updated: list[tuple[str, ServiceStatus]] = []
+    updated: list[tuple[str, ServiceStatus, dict]] = []
+
+    def _record(service_id, status, **kwargs):
+        updated.append((service_id, status, kwargs))
+        return services[2].model_copy(update={"status": status})
 
     monkeypatch.setattr(module, "list_services", lambda: services)
-    monkeypatch.setattr(
-        module,
-        "update_service_status",
-        lambda service_id, status: updated.append((service_id, status)),
-    )
+    monkeypatch.setattr(module, "update_service_status", _record)
 
     module._recover_failed_services()
 
     assert len(updated) == 1
     assert updated[0][0] == str(services[2].id)
     assert updated[0][1] == ServiceStatus.RUNNING
+    # The daemon is the automated caller: it must opt into the PAUSED floor
+    # explicitly, because the default belongs to the operator's own writes.
+    assert updated[0][2] == {"respect_operator_intent": True}
 
 
 # ── Cleanup 15-A: unknown signal actions must never become SELL ────────────────
@@ -4569,6 +4592,66 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
     assert volumes == [2000]
 
 
+def _ctrader_entry_signal() -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": 1.09, "take_profit": 1.12},
+    )
+
+
+def test_ctrader_pre_submit_refusal_is_marked_as_not_submitted(monkeypatch) -> None:
+    """A local refusal proves nothing reached the broker.
+
+    The submission lease may be released on this, because retrying cannot
+    duplicate an order that was never sent.
+    """
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
+    monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
+
+    with pytest.raises(ValueError, match="finite and positive") as raised:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=0.0))
+
+    assert is_order_not_submitted(raised.value) is True
+
+
+def test_ctrader_broker_write_failure_is_not_marked_as_not_submitted(
+    monkeypatch,
+) -> None:
+    """A failure of the send itself may still have reached the broker."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: None)
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(module, "save_live_signal", lambda _signal: ("sig-1", True))
+    monkeypatch.setattr(adapter, "_validate_pre_persistence", lambda _signal: None)
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
+    monkeypatch.setattr(
+        adapter, "_build_new_order_request", lambda signal, *, symbol_id: object()
+    )
+
+    async def _resolve_symbol_id(_symbol: str) -> int:
+        return 1
+
+    async def _send(_request):
+        raise RuntimeError("connection lost after send")
+
+    monkeypatch.setattr(adapter, "_resolve_symbol_id", _resolve_symbol_id)
+    monkeypatch.setattr(adapter, "_submit_new_order_request", _send)
+
+    with pytest.raises(RuntimeError, match="connection lost") as raised:
+        asyncio.run(adapter.submit_order(_ctrader_entry_signal(), qty=1.0))
+
+    assert is_order_not_submitted(raised.value) is False
+
+
 def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
     """B2: resuscitation is bounded — a flipped service backs off first."""
     from live_runner import daemon as module
@@ -4582,8 +4665,63 @@ def test_recover_failed_services_arms_reconnect_floor(monkeypatch) -> None:
         created_at=datetime.now(timezone.utc),
     )
     monkeypatch.setattr(module, "list_services", lambda: [service])
-    monkeypatch.setattr(module, "update_service_status", lambda *_args: None)
+    # The recovery path now only arms the floor when the conditional status
+    # write actually moved the row to RUNNING.
+    monkeypatch.setattr(
+        module,
+        "update_service_status",
+        lambda *_args, **_kwargs: service.model_copy(
+            update={"status": ServiceStatus.RUNNING}
+        ),
+    )
 
     module._recover_failed_services()
 
     assert str(service.id) in module._DISCORD_SERVICE_RECONNECT_RETRY_NOT_BEFORE
+
+
+def test_create_live_deployment_validates_against_the_broker_identity(
+    isolated_db, monkeypatch
+) -> None:
+    """A Discord deployment is validated against its account's broker number.
+
+    The check compares the account's *broker-reported* identity with the number
+    configured for the route. If the caller passes an empty identity, every
+    correctly routed deployment is rejected; if it skips the accounts-env, the
+    route resolves to the stale static table instead of the configured label.
+    """
+    database = isolated_db
+    monkeypatch.setattr(
+        "live_runner.credential_env.load_accounts_env_values",
+        lambda *_args, **_kwargs: {
+            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
+        },
+    )
+    deployment = LiveDeploymentConfig(
+        id=str(uuid4()),
+        strategy_name="discord::ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_source_type="discord",
+        signal_source_id="RAMJET",
+        signal_config={
+            "service_name": "ramjet",
+            "channel_id": "100000000000000002",
+        },
+        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+    )
+
+    database.ensure_live_account("acc-1", "alpaca", broker_login="PA-LABELLED-RAMJET")
+    created = database.create_live_deployment(deployment)
+    assert str(created.id) == str(deployment.id)
+
+    # An account on a different broker number must be refused, not stored.
+    database.ensure_live_account("acc-2", "alpaca", broker_login="PA-SOMEONE-ELSE")
+    with pytest.raises(ValueError, match="must route to Alpaca account"):
+        database.create_live_deployment(
+            deployment.model_copy(update={"id": str(uuid4()), "account_id": "acc-2"})
+        )

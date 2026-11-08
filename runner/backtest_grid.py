@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import pandas as pd
 from pydantic import ValidationError
@@ -32,8 +32,15 @@ from runner.engines.base import (
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
 )
+from runner.engines.contract import resolve_intrabar_timeframe
+from runner.grid_identity import (
+    GRID_IDENTITY_KEY,
+    cell_identity,
+    identity_from_result_meta,
+    identity_matches,
+)
 from runner.stats import merge_canonical_stats
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import DATA_DIR, GRID_TIMEFRAME_ALIASES, normalize_timeframe
 from shared.database import save_result_to_sqlite
 from shared.logging import get_logger
 from shared.models import BacktestResult, StrategyType
@@ -44,21 +51,9 @@ GRID_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
 GRID_START = "2020-01-01"
 DEFAULT_OUTPUT_DIR = DATA_DIR / "backtests" / "grid_runner"
 logger = get_logger("runner.grid")
-TIMEFRAME_ALIASES = {
-    "m1": "1m",
-    "1min": "1m",
-    "min1": "1m",
-    "m5": "5m",
-    "m15": "15m",
-    "m30": "30m",
-    "h1": "1h",
-    "hour1": "1h",
-    "h4": "4h",
-    "hour4": "4h",
-    "d1": "1d",
-    "daily": "1d",
-    "day": "1d",
-}
+# One definition, in shared.constants. Kept as a module-level name because the
+# grid CLI and its tests read it from here.
+TIMEFRAME_ALIASES = GRID_TIMEFRAME_ALIASES
 
 
 def parse_csv_list(raw: str | Iterable[str]) -> list[str]:
@@ -332,6 +327,63 @@ def _failed_cell(
     }
 
 
+def _cell_identity(
+    request: "CellRequest", resolved_start: str, resolved_end: str
+) -> dict[str, Any]:
+    """The identity of a cell: its request plus the data behind it.
+
+    One helper so the reuse decision (:func:`_init_cell_result`) and the
+    artifact's own stamp (:func:`_run_backtest_in_process_body`,
+    :func:`_stamp_cell_identity`) can never describe the same cell differently.
+    """
+    normalized_timeframe = normalize_timeframe_value(request.timeframe)
+    return cell_identity(
+        engine=request.engine,
+        strategy=request.strategy,
+        symbol=request.symbol,
+        timeframe=normalized_timeframe,
+        start=resolved_start,
+        end=resolved_end,
+        capital=request.capital,
+        risk_pct=request.risk_pct,
+        max_position_exposure_pct=request.max_position_exposure_pct,
+        max_leverage=request.max_leverage,
+        intrabar_resolution=request.intrabar_resolution or "open_close",
+        params=request.params or {},
+        data_dir=request.data_dir,
+        intrabar_timeframe=resolve_intrabar_timeframe(
+            normalized_timeframe, request.intrabar_resolution or "open_close"
+        )
+        or "",
+    )
+
+
+def _stamp_cell_identity(
+    path: Path, identity: Mapping[str, Any]
+) -> bool:
+    """Write a cell's identity into its persisted artifact.
+
+    Returns False when the artifact could not be stamped, which the caller must
+    treat as a failed cell: an unstamped artifact is one that the next
+    ``--resume`` is obliged to refuse, so shipping it as a finished cell only
+    buys a silent recompute later. Nothing here may raise: a save failure in
+    the serial fan-out would otherwise abort the whole grid over one cell.
+    """
+    try:
+        backtest_result = BacktestResult.load(path)
+        data = (
+            backtest_result.meta.data
+            if isinstance(backtest_result.meta.data, dict)
+            else {}
+        )
+        backtest_result.meta.data = {**data, GRID_IDENTITY_KEY: dict(identity)}
+        backtest_result.save(path)
+    except (ValidationError, OSError, ValueError) as exc:
+        logger.warning("Could not stamp the grid identity on %s: %s", path, exc)
+        return False
+    return True
+
+
 def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     """Build the shared cell record and honor the skip-existing shortcut.
 
@@ -350,6 +402,7 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
         )
     except (OSError, ValueError) as exc:
         return _failed_cell(request, error_class="no_data", error=str(exc))
+    identity = _cell_identity(request, resolved_start, resolved_end)
     result: dict[str, Any] = {
         "run_id": run_id,
         "symbol": request.symbol,
@@ -364,12 +417,14 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
     if request.skip_existing and path.exists():
         try:
             backtest_result = BacktestResult.load(path)
-            if not _existing_cell_matches_request(
-                backtest_result, request, resolved_start, resolved_end
-            ):
+            stale_reason = _stale_cell_reason(
+                backtest_result, request, resolved_start, resolved_end, identity
+            )
+            if stale_reason is not None:
                 logger.info(
-                    "Existing cell output is stale (engine/params/window/capital "
-                    "mismatch); recomputing instead of selling it as fresh.",
+                    "Existing cell output is stale (%s); recomputing instead of "
+                    "selling it as fresh.",
+                    stale_reason,
                     extra={"data": {"run_id": run_id}},
                 )
             else:
@@ -377,7 +432,13 @@ def _init_cell_result(request: CellRequest) -> dict[str, Any]:
                 merge_canonical_stats(backtest_result)
                 backtest_result.save(path)
                 result.update(read_backtest_stats(path))
-                result.update({"status": "skipped_existing", "finished_at": datetime.now(timezone.utc).isoformat()})
+                result.update(
+                    {
+                        "status": "skipped_existing",
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "grid_identity": identity["fingerprint"],
+                    }
+                )
                 return result
         except (ValidationError, OSError, ValueError) as exc:
             result.update({"status": "failed", "error": f"existing output is invalid: {exc}"})
@@ -409,12 +470,14 @@ def _existing_cell_matches_request(
     resolved_start: str,
     resolved_end: str,
 ) -> bool:
-    """Whether a persisted cell artifact matches the current request (C3).
+    """Whether a persisted cell artifact's own metadata matches the request (C3).
 
-    `skip_existing` must not sell stale cells as fresh: engine, strategy,
-    symbol, timeframe, resolved window, capital and strategy parameters must
-    all agree, otherwise the cell recomputes. (Risk sizing knobs live outside
-    the artifact schema and are NOT covered — residual gap, documented.)
+    This is the *artifact schema* half of the staleness decision: engine,
+    strategy, symbol, timeframe, resolved window, capital and strategy
+    parameters must all agree. The grid identity
+    (:func:`runner.grid_identity.cell_identity`) is the other half and covers
+    what the schema cannot: the strategy source bytes, the risk/modelling
+    knobs and the data the run actually read. Both must pass.
     """
     meta = backtest_result.meta
     try:
@@ -448,6 +511,34 @@ def _existing_cell_matches_request(
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _stale_cell_reason(
+    backtest_result: BacktestResult,
+    request: CellRequest,
+    resolved_start: str,
+    resolved_end: str,
+    identity: Mapping[str, Any],
+) -> str | None:
+    """Why a persisted cell may not be reused, or None when it may be.
+
+    Two independent gates, either of which refuses:
+
+    1. the artifact's own metadata vs. the request (C3), and
+    2. the recorded grid identity vs. the identity of the request as it stands
+       now -- which is what catches a re-downloaded frame or an edited strategy
+       file, neither of which changes a single artifact field.
+    """
+    if not _existing_cell_matches_request(
+        backtest_result, request, resolved_start, resolved_end
+    ):
+        return "engine/params/window/capital mismatch"
+    matched, reason = identity_matches(
+        identity_from_result_meta(backtest_result.meta), identity
+    )
+    if not matched:
+        return reason
+    return None
 
 
 @dataclass(frozen=True)
@@ -540,6 +631,15 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
     backtest_result.meta.id = build_run_id(strategy, symbol, timeframe)
     if not keep_indicators:
         backtest_result.indicators = []
+    # Stamp the identity AFTER the run (and after any auto-download above) so
+    # it describes the data this artifact was actually computed from.
+    identity = _cell_identity(request, start_date, end_date)
+    meta_data = (
+        backtest_result.meta.data
+        if isinstance(backtest_result.meta.data, dict)
+        else {}
+    )
+    backtest_result.meta.data = {**meta_data, GRID_IDENTITY_KEY: identity}
     # Use the resolved dates for daily equity attachment
     attach_daily_equity(backtest_result, start=start_date, end=end_date)
     merge_canonical_stats(backtest_result)
@@ -552,7 +652,10 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("Could not persist grid cell to SQLite: %s", exc)
 
-    return {"auto_downloaded_data": downloaded} if downloaded else {}
+    return {
+        "grid_identity": identity["fingerprint"],
+        **({"auto_downloaded_data": downloaded} if downloaded else {}),
+    }
 
 
 def run_one_backtest_in_process(request: CellRequest, cell: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -673,7 +776,19 @@ def run_one_backtest(
         result["finished_at"] = datetime.now(timezone.utc).isoformat()
 
         if proc.returncode == 0 and path.exists():
+            # `runner.cli` knows nothing about grid identity, so the parent
+            # stamps it here. An unstamped artifact is a cell the next
+            # --resume must refuse, so it is a failed cell, not a slow one.
+            identity = _cell_identity(request, resolved_start, resolved_end)
+            if not _stamp_cell_identity(path, identity):
+                result["status"] = "failed"
+                result["error"] = (
+                    f"grid identity could not be stamped on {path}; the cell is "
+                    "not resumable and is reported as failed"
+                )
+                return result
             result.update(read_backtest_stats(path))
+            result["grid_identity"] = identity["fingerprint"]
             result["status"] = "ok"
         else:
             result["status"] = "failed"
@@ -712,6 +827,7 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
         "max_drawdown_pct",
         "win_rate",
         "daily_return_count",
+        "grid_identity",
         "output",
         "error",
     ]

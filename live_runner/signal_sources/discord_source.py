@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import re
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
 import requests
 
+from live_runner.credential_env import discord_bot_env_key
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
-from shared.database import update_service_status
+from shared.database import get_service, update_service_status
 from shared.logging import get_logger
 from shared.models import ServiceStatus
 
@@ -51,6 +53,22 @@ class DiscordChannelForbiddenError(RuntimeError):
 #: POLL_LIMIT and 429-windows must not lose signals incl. exits).
 MAX_BACKFILL_PAGES = 5
 
+#: ``auth_scheme`` values that mean "a Developer Portal BOT token" — sent with
+#: the ``Bot `` prefix.
+DISCORD_BOT_AUTH_SCHEMES = frozenset({"bot"})
+#: ``auth_scheme`` values that mean "a USER/ACCOUNT (self-bot) token" — sent
+#: exactly as supplied. ``raw`` is the historical operator spelling (#81: tokens
+#: copied out of Discord devtools), ``account`` the explicit one; they are the
+#: same credential kind and are both accepted.
+DISCORD_ACCOUNT_AUTH_SCHEMES = frozenset({"raw", "account"})
+#: Every accepted ``auth_scheme``. Anything else raises instead of being guessed.
+DISCORD_AUTH_SCHEMES = DISCORD_BOT_AUTH_SCHEMES | DISCORD_ACCOUNT_AUTH_SCHEMES
+#: Last-resort scheme when nothing is configured anywhere. "raw" is the
+#: recorded owner decision for the existing operator deployment; a mismatch
+#: with the actual token is NOT silently corrected — Discord answers 401 and
+#: :class:`DiscordAuthenticationError` fails the source closed.
+DEFAULT_DISCORD_AUTH_SCHEME = "raw"
+
 
 class DiscordRateLimitError(RuntimeError):
     """Raised when Discord returns a 429 rate limit response."""
@@ -71,13 +89,120 @@ _PRICE_LABEL_RE = re.compile(
 )
 _DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
 _AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
-_ACTION_BUY_RE = re.compile(r"\bbuy\b|\blong\b", re.IGNORECASE)
-_ACTION_SELL_RE = re.compile(r"\bsell\b|\bshort\b|\bmomentum\s*reversal\b", re.IGNORECASE)
+# The mirror of _ACTION_SELL_RE, and the same hazard in the other direction: a
+# buy is the fallback, so an incidental "buy" opens a real position. Matched
+# bare, "could buy here" and - worse - "do not buy" both read as a BUY signal.
+#
+# An explicit buy directive is the action word next to "signal", or the action
+# word immediately followed by a ticker - which is the shape
+# _extract_action_symbol already recognises, and what the real RamJet channel
+# emits ("RAM JET BUY AAPL @ 100.0"). Anchoring to the start of the message
+# instead would have broken every real RamJet signal.
+#
+# CORRECTION. This comment used to add: "the ticker is required rather than a
+# position: 'do not buy' and 'could buy here' have no ticker after the word and
+# so resolve to nothing." **That was wrong, and wrong in the way that matters** -
+# it credited this regex with work it does not do. Measured:
+#
+#   text              this regex   captured ticker   normalizes to   price
+#   "could buy here"  matches      "here"           HERE            None
+#   "do not buy this" matches      "this"           THIS            None
+#
+# Neither "here" nor "this" is in _SKIP_WORDS, and both are 1-10 letters, so
+# both are perfectly good ticker candidates by this regex's own definition. What
+# actually rejects them is further down, in _reads_as_buy_directive: the
+# **negation veto** for "do not buy", and the **price requirement** for "could
+# buy here" ("a stop-word list cannot enumerate every English word that might
+# follow 'buy', but a price is unambiguous").
+#
+# Why it was worth correcting rather than deleting: a developer tightening this
+# regex to match the stated rationale - requiring a real ticker shape, or
+# anchoring harder - would have been reinforcing a protection that lives
+# elsewhere, while the two guards that do the work went unremarked. Mutation
+# testing agrees: deleting the price requirement is caught, and deleting the
+# negation veto is caught, while five other mutations of this function and its
+# neighbours survive precisely because those two are load-bearing.
+_ACTION_BUY_RE = re.compile(
+    r"\b(?:buy|long)\s+signal\b"
+    r"|\b(?:buy|long)\s+\**\$?[A-Za-z]{1,10}\b",
+    re.IGNORECASE,
+)
+# Captures the word after buy/long so it can be run through the same
+# _SKIP_WORDS filter the symbol extractors use. A regex cannot know that "here"
+# is not a ticker, but _normalize_symbol_candidate already knows.
+_ACTION_BUY_TICKER_RE = re.compile(
+    r"\b(?:buy|long)\s+\**\$?([A-Za-z]{1,10})\b",
+    re.IGNORECASE,
+)
+# An action word only decides direction when the message is actually a signal.
+# Matched bare, "sellers are short-term weak" inside an unambiguous buy message
+# flipped it to a sell - and a sell a bot accepts is a real short position.
+#
+# Two shapes count as an explicit sell signal: the action word next to the word
+# "signal" ("sell signal", "signal: SELL"), or a momentum-reversal phrase. A
+# bare trailing action word after a symbol and price is also a signal, but only
+# when the word is the *directive* ("SELL EURUSD"), not a noun phrase describing
+# the market ("sellers are weak", "short covering"). `_explicit_sell_action`
+# below keeps that distinction; requiring "signal" alone would have silently
+# dropped the plain "SELL EURUSD" form, which is a regression, not a tightening.
+# One definition of the explicit sell forms, and the only one. This rule used to
+# be spelled out twice - here and in _EXPLICIT_SELL_SIGNAL_RE - unguarded in both.
+# That duplication is what let "signal is short of resistance" through while the
+# explicit copy was being tightened: a second, unfixed copy of the same rule.
+#
+# Guards on the "signal is short" alternative, both load-bearing:
+#   `(?![-\w])`  `\bshort\b` matches the "short" inside "short-term", because a
+#     hyphen is a word boundary, so "oversold buy signal. Signal is short-term."
+#     was vetoed as a noun and then let straight back in as an instruction - a
+#     real short opened on a BUY message.
+#   _SELL_PROSE_TAIL  "short of resistance" and "short covering" are prose that
+#     continues past the word, not an instruction that stops at it.
+#
+# The "sell signal" alternative is deliberately unguarded: it is an instruction in
+# every phrasing seen, and guarding it dropped real signals.
+_SELL_PROSE_TAIL = (
+    r"(?!\s+(?:of|term|covering|sellers?|positions?|at|into|near|below|above))"
+)
+_EXPLICIT_SELL_SIGNAL_RE = re.compile(
+    r"\b(?:sell|short)\s+signal\b"
+    r"|\bsignal\s*(?:is|:)\s*\b(?:sell|short)(?![-\w])" + _SELL_PROSE_TAIL + r"\b",
+    re.IGNORECASE,
+)
+# A leading "sell"/"short" only counts when the message says what it acts on.
+# Without requiring a target, "short covering underway" is a directive aimed at a
+# ticker called COVERING, because any two-to-ten-letter noun passed as a symbol.
+_LEADING_SELL_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:sell|short)(?![-\w])\b\s*[:\-]?\s*\**\$?(?P<target>[A-Za-z]{2,10})\b",
+    re.IGNORECASE,
+)
+_ACTION_SELL_RE = re.compile(
+    _EXPLICIT_SELL_SIGNAL_RE.pattern + r"|\bmomentum\s*reversal\b",
+    re.IGNORECASE,
+)
+# Noun-phrase and participle forms that describe the market rather than issue an
+# instruction. Checked before _ACTION_SELL_RE so "sellers", "short-term" and
+# "short covering" cannot be read as a directive.
+_SELL_AS_NOUN_RE = re.compile(
+    r"\bsellers?\b"
+    r"|\bshorts\b"
+    r"|\bshort[-\s]term\b"
+    r"|\bshort\s+covering\b"
+    r"|\bcovering\b",
+    re.IGNORECASE,
+)
 _MOMENTUM_REVERSAL_RE = re.compile(r"momentum\s*reversal", re.IGNORECASE)
 _GOLDEN_CROSS_RE = re.compile(r"golden\s*cross", re.IGNORECASE)
 _DEATH_CROSS_RE = re.compile(r"death\s*cross", re.IGNORECASE)
 _OVERBOUGHT_RE = re.compile(r"overbought", re.IGNORECASE)
-_OVERSOLD_RE = re.compile(r"oversold|rsi\s*<?\s*30|rocket\s*fuel\s*buy\s*signal", re.IGNORECASE)
+_OVERSOLD_RE = re.compile(
+    r"oversold"
+    r"|rsi\s*<?\s*30"
+    r"|rsi\s+(?:has\s+)?crossed\s+(?:below|under)\s*30"
+    r"|\bis\s+down\s+significantly\b"
+    r"|rocket\s*fuel\s*buy\s*signal"
+    r"|nitro\s+watchlist\s*[\u2014\-]\s*buy\s+signal",
+    re.IGNORECASE,
+)
 _SKIP_WORDS = {
     "RSI",
     "DMA",
@@ -115,6 +240,11 @@ _SKIP_WORDS = {
     "OPEN",
     "CLOSE",
     "STOP",
+    "COVERING",
+    "SELLERS",
+    "TERM",
+    "UNDERWAY",
+    "STEPPING",
     "LOSS",
     "TAKE",
     "PROFIT",
@@ -164,6 +294,19 @@ def _normalize_symbol_candidate(candidate: str) -> str | None:
     return normalized
 
 
+def _has_leading_sell_directive(content: str) -> bool:
+    """True for "SELL EURUSD", false for "short covering underway".
+
+    The captured word goes through the same normalizer as every other symbol
+    candidate, which is why COVERING and friends are in _SKIP_WORDS. Position
+    alone cannot settle this: "short covering underway" also starts with "short".
+    """
+    match = _LEADING_SELL_DIRECTIVE_RE.match(content)
+    if match is None:
+        return False
+    return _normalize_symbol_candidate(match.group("target")) is not None
+
+
 def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
     for matched in matches:
         candidate = _normalize_symbol_candidate(matched)
@@ -173,7 +316,15 @@ def _first_normalized_symbol(matches: Iterable[str]) -> str | None:
 
 
 def _extract_bold_symbol(content: str) -> str | None:
-    return _first_normalized_symbol(re.findall(r"\*\* \$?([A-Za-z]{1,10})\*\*", content))
+    # Accept both "** $TICKER**" and "**TICKER**". The signal bots are not
+    # consistent about the space, and requiring one silently dropped every
+    # Nitro alert, which formats its ticker as "**BE** is down significantly".
+    # The capture is letters-only and immediately followed by "**", so a
+    # multi-word bold header such as "**NITRO WATCHLIST — BUY SIGNAL**" cannot
+    # match.
+    return _first_normalized_symbol(
+        re.findall(r"\*\*\s*\$?([A-Za-z]{1,10})\s*\*\*", content)
+    )
 
 
 def _extract_labeled_symbol(content: str) -> str | None:
@@ -263,12 +414,93 @@ def _is_well_formed_price_token(raw_price: str) -> bool:
     return all(len(part) == 3 and part.isdigit() for part in parts[1:])
 
 
+# A negation between here and the action word cancels the instruction.
+#
+# This is the buy-side mirror of _SELL_AS_NOUN_RE, and it was missing: the buy
+# predicate only ever checked that a ticker followed the action word, so "this
+# is not a buy signal", "I should not long here" and "Do not buy this yet" all
+# opened a long. The predicate's own docstring claimed "do not buy" did not read
+# as a signal, and it did.
+#
+# `[^.!?\n,;]` is load-bearing. A negation in one clause must not cancel an
+# instruction in the next: "do not sell, buy instead" is an instruction to buy,
+# and a window that crossed the comma turned it into no signal at all.
+_BUY_NEGATED_RE = re.compile(
+    r"\b(?:do\s*n[o']?t|don'?t|never|should\s*n[o']?t|shouldn'?t|wouldn'?t|"
+    r"would\s*n[o']?t|can'?t|cannot|won'?t|avoid|wait\s+on|not)\b"
+    r"[^.!?\n,;]{0,30}?\b(?:buy|long|enter|add)\b",
+    re.IGNORECASE,
+)
+
+
+def _reads_as_buy_directive(content: str) -> bool:
+    """True when the message issues a buy, rather than merely mentioning one.
+
+    Same hazard as the sell side, in the direction that opens a position: matched
+    bare, "could buy here" and "do not buy" both read as a BUY signal. A negated
+    instruction parsed as a trade is the clearest failure this parser can make.
+
+    The ticker requirement is what separates "BUY AAPL" (a signal, and what the
+    real RamJet channel emits) from "could buy here" (commentary). The captured
+    word goes through _normalize_symbol_candidate so it obeys the same _SKIP_WORDS
+    list as every other symbol extractor - duplicating that knowledge in a regex
+    would let the two drift.
+    """
+    if _ACTION_BUY_RE.search(content) is None:
+        return False
+    if _BUY_NEGATED_RE.search(content):
+        return False
+    explicit = re.search(
+        r"\b(?:buy|long)\s+signal\b", content, re.IGNORECASE
+    )
+    if explicit:
+        return True
+    match = _ACTION_BUY_TICKER_RE.search(content)
+    if match is None:
+        return False
+    if _normalize_symbol_candidate(match.group(1)) is None:
+        return False
+    # A real entry carries a price, and the parser needs one anyway - without it
+    # the message is discarded two lines later. Keying on that is what separates
+    # "BUY AAPL @ 100.0" from "could buy here": a stop-word list cannot enumerate
+    # every English word that might follow "buy", but a price is unambiguous.
+    # Deliberately structural rather than a longer word list, which would grow
+    # with every phrasing someone happens to use.
+    return _extract_price(content) is not None
+
+
+def _reads_as_sell_directive(content: str) -> bool:
+    """True when the message issues a sell, rather than merely mentioning one.
+
+    A noun phrase ("sellers are weak", "short covering") describes the market;
+    only a directive ("SELL EURUSD", "sell signal") is an instruction. Keeping
+    this in one place matters because the detector and the action resolver both
+    need the same verdict - when they disagreed, a buy message with "sellers" in
+    it was typed as a sell.
+    """
+    if _SELL_AS_NOUN_RE.search(content):
+        # The noun form only disqualifies an incidental match. An explicit
+        # "sell signal" alongside it is still an instruction.
+        if _EXPLICIT_SELL_SIGNAL_RE.search(content):
+            return True
+        # "SELL EURUSD, sellers stepping in" is a directive: the message opens
+        # with the action and the noun phrases only describe the market
+        # afterwards. Vetoing those dropped real exit signals, which costs as
+        # much as the false positives this guard exists to stop.
+        if _has_leading_sell_directive(content):
+            return True
+        return False
+    if _has_leading_sell_directive(content):
+        return True
+    return bool(_ACTION_SELL_RE.search(content))
+
+
 def _is_ramjet_signal(content: str) -> bool:
     return bool(_RAMJET_OVERSOLD_RE.search(content) and _BUY_SIGNAL_RE.search(content))
 
 
 def _detect_rocket_fuel_signal_type(content: str) -> str | None:
-    if _MOMENTUM_REVERSAL_RE.search(content) or _ACTION_SELL_RE.search(content):
+    if _MOMENTUM_REVERSAL_RE.search(content) or _reads_as_sell_directive(content):
         return "momentum_reversal"
     if _GOLDEN_CROSS_RE.search(content):
         return "golden_cross"
@@ -284,25 +516,168 @@ def _detect_rocket_fuel_signal_type(content: str) -> str | None:
 def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
     if signal_type in {"overbought_alert", "death_cross_warning"}:
         return None
+    # A buy-side negation vetoes the inferred BUY before it is applied.
+    #
+    # The signal_type branch used to return "buy" straight away, so the negation
+    # guard never ran for it: "**EURUSD** is now oversold / Do not buy this yet"
+    # resolved to a long, because "oversold" was enough on its own. An explicit
+    # instruction not to trade is stronger evidence than an inferred reading of
+    # the same message, and it is the direction that opens a position.
+    #
+    # Scoped to the BUY side on purpose. An earlier version delegated to
+    # `_reads_as_sell_directive` to preserve an exit, and that defeated the exit
+    # it was protecting: "momentum reversal ... do not buy, sellers in control"
+    # dropped to no signal at all, because the noun guard vetoes "sellers" before
+    # the momentum-reversal alternative is reached. A position that should be
+    # closed stayed open. Refusing to open is the safe direction; refusing to
+    # exit is not.
     if signal_type in {"momentum_reversal"}:
+        # Checked before the buy-side negation veto, and deliberately not gated by
+        # it. "momentum reversal ... do not buy" is an instruction to close, and a
+        # clause like "sellers in control" is commentary about it. Dropping those
+        # would leave a position open, which is the one outcome that is not the
+        # safe direction: refusing to open is conservative, refusing to exit is
+        # not.
         return "sell"
+    if _BUY_NEGATED_RE.search(content):
+        return None
     if signal_type in {"oversold_buy", "golden_cross"}:
         return "buy"
-    if _ACTION_SELL_RE.search(content):
+    if _reads_as_sell_directive(content):
         return "sell"
-    if _ACTION_BUY_RE.search(content):
+    if _reads_as_buy_directive(content):
         return "buy"
     return None
 
 
-def _parse_timestamp(raw_timestamp: str | None) -> datetime:
+def _parse_timestamp(raw_timestamp: str | None) -> datetime | None:
+    """Read a Discord timestamp, or ``None`` when it cannot be read.
+
+    Fail closed. This used to return ``datetime.now(timezone.utc)`` for both a
+    missing *and* an unparseable value, which silently stamped every signal as
+    "received just now": an unparseable timestamp therefore made a message
+    look brand new, defeating every age check downstream
+    (``signal_is_fresh`` and the daemon's pre-wait age gate both read
+    ``received_at``). An age that cannot be established is unknown, not zero,
+    so the caller must decide what to do -- and the callers omit
+    ``received_at`` entirely so the gate refuses visibly instead of trading on
+    an assumed age.
+    """
     if not raw_timestamp:
-        return datetime.now(timezone.utc)
+        return None
     try:
         parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
     except ValueError:
-        return datetime.now(timezone.utc)
+        return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+# Consecutive author-rejected messages before the service is called unhealthy.
+# Low enough that a single impersonation attempt cannot fail a healthy bot, high
+# enough that a systematically wrong allowlist is caught on the first burst of
+# real messages rather than days later.
+#: Statuses only an operator sets. This source reports status on a best-effort basis and must
+#: never move a service out of one of them (connect() used to write RUNNING over STOPPED).
+_OPERATOR_SERVICE_STATUSES = frozenset({ServiceStatus.PAUSED, ServiceStatus.STOPPED})
+_OPERATOR_SERVICE_STATUS_VALUES = frozenset(
+    status.value for status in _OPERATOR_SERVICE_STATUSES
+)
+
+
+def _service_status_value(status: ServiceStatus | str) -> str:
+    return str(status.value if isinstance(status, ServiceStatus) else status).strip().lower()
+
+
+AUTHOR_REJECTION_STREAK_THRESHOLD = 3
+
+# A coroutine produced by a sync caller. The running loop is the daemon's, so the
+# work still happens; with no loop (a synchronous test) it is discarded with a
+# clear message rather than raising "never awaited".
+_observed_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _schedule(coro: Any) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        coro.close()
+        logger.warning(
+            "Author-rejection observer produced work with no running loop; "
+            "discarded (synchronous caller)"
+        )
+        return
+    task = loop.create_task(coro)
+    _observed_tasks.add(task)
+    task.add_done_callback(_observed_tasks.discard)
+
+
+def _resolve_message_author_id(message: Any) -> str:
+    """The author id of a message, lowercased, or "" when it cannot be read."""
+    return str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
+
+
+def _resolve_message_channel_id(message: Any) -> str:
+    """The channel id of a message, or "" when it cannot be read."""
+    return str(getattr(getattr(message, "channel", None), "id", ""))
+
+
+def _reject_untrusted_author(
+    message: Any,
+    author_id: str,
+    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None,
+) -> None:
+    """Record and log one message refused by the author allowlist.
+
+    Extracted from the parser so the gate itself reads as one decision. The two
+    halves are deliberately ordered and both are load-bearing: a caller that can
+    only schedule (the parser is synchronous) must still have the rejection
+    counted before the message is dropped, or a burst of impersonation attempts
+    leaves no trace an operator can act on.
+    """
+    if on_author_rejection is not None:
+        result = on_author_rejection(author_id or "<missing>")
+        if inspect.isawaitable(result):
+            _schedule(result)
+    logger.warning(
+        "Discord message rejected: author is not a trusted signal source",
+        extra={
+            "data": {
+                "discord_author_id": author_id,
+                "discord_channel_id": _resolve_message_channel_id(message),
+            }
+        },
+    )
+
+
+def _build_signal_metadata(
+    message: Any,
+    content: str,
+    *,
+    signal_type: str | None,
+    default_timeframe: str,
+) -> dict[str, Any]:
+    """The provenance the daemon needs to age-check and audit one parsed signal."""
+    metadata: dict[str, Any] = {
+        "source": "discord",
+        "discord_signal_type": signal_type or "generic",
+        "discord_message_id": str(getattr(message, "id", "")),
+        "discord_channel_id": _resolve_message_channel_id(message),
+        "discord_author_id": str(getattr(getattr(message, "author", None), "id", "")),
+        "discord_content": content,
+        "timeframe": normalize_timeframe(default_timeframe) or default_timeframe,
+    }
+    created_at = getattr(message, "created_at", None)
+    raw_timestamp = created_at.isoformat() if isinstance(created_at, datetime) else None
+    timestamp = _parse_timestamp(raw_timestamp)
+    if timestamp is not None:
+        metadata["received_at"] = timestamp.isoformat()
+    else:
+        # No fabricated receipt time. The key is left absent so the daemon's
+        # pre-wait age gate -- which knows it is on the Discord path and so
+        # requires the key -- refuses with an operator-visible warning rather
+        # than trading a message whose age nobody can establish.
+        metadata["discord_received_at_unreadable"] = True
+    return metadata
 
 
 def _parse_trade_signal_from_message(
@@ -310,6 +685,8 @@ def _parse_trade_signal_from_message(
     *,
     default_timeframe: str,
     trusted_author_ids: Iterable[str] | None = None,
+    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None = None,
+    on_author_accepted: Callable[[], Any] | None = None,
 ) -> TradeSignal | None:
     """Parse a Discord message into a trade signal.
 
@@ -324,23 +701,23 @@ def _parse_trade_signal_from_message(
 
     trusted = _normalize_author_ids(trusted_author_ids)
     if trusted is not None:
-        author_id = str(getattr(getattr(message, "author", None), "id", "") or "").strip().lower()
+        author_id = _resolve_message_author_id(message)
         if not author_id or author_id not in trusted:
-            logger.warning(
-                "Discord message rejected: author is not a trusted signal source",
-                extra={
-                    "data": {
-                        "discord_author_id": author_id,
-                        "discord_channel_id": str(
-                            getattr(getattr(message, "channel", None), "id", "")
-                        ),
-                    }
-                },
-            )
+            _reject_untrusted_author(message, author_id, on_author_rejection)
             return None
+
+    if on_author_accepted is not None:
+        on_author_accepted()
 
     signal_type = None
     if _is_ramjet_signal(content):
+        # Still subject to the negation guard. This branch sets the action
+        # outright, so "oversold buy signal - do not buy this yet" was a long on
+        # the RamJet path while the RocketFuel path correctly refused it. Two bots
+        # reading the same message in opposite directions is exactly the
+        # inconsistency the one shared predicate exists to prevent.
+        if _BUY_NEGATED_RE.search(content):
+            return None
         action = "buy"
         signal_type = "ram_jet_oversold_buy"
     else:
@@ -354,19 +731,12 @@ def _parse_trade_signal_from_message(
     if not symbol or price is None or price <= 0:
         return None
 
-    created_at = getattr(message, "created_at", None)
-    raw_timestamp = created_at.isoformat() if isinstance(created_at, datetime) else None
-    timestamp = _parse_timestamp(raw_timestamp)
-    metadata = {
-        "source": "discord",
-        "discord_signal_type": signal_type or "generic",
-        "discord_message_id": str(getattr(message, "id", "")),
-        "discord_channel_id": str(getattr(getattr(message, "channel", None), "id", "")),
-        "discord_author_id": str(getattr(getattr(message, "author", None), "id", "")),
-        "discord_content": content,
-        "received_at": timestamp.isoformat(),
-        "timeframe": normalize_timeframe(default_timeframe) or default_timeframe,
-    }
+    metadata = _build_signal_metadata(
+        message,
+        content,
+        signal_type=signal_type,
+        default_timeframe=default_timeframe,
+    )
     return TradeSignal(
         action=action,
         symbol=symbol,
@@ -379,7 +749,12 @@ def _parse_trade_signal_from_message(
 
 
 class _DiscordMessageAdapter:
-    """Minimal adapter exposing the attributes the parser relies on."""
+    """Minimal adapter exposing the attributes the parser relies on.
+
+    ``created_at`` is ``None`` when the message carries no readable timestamp;
+    the parser turns that into a signal with no ``received_at`` rather than a
+    fabricated one.
+    """
 
     __slots__ = ("content", "id", "created_at", "channel", "author")
 
@@ -390,6 +765,42 @@ class _DiscordMessageAdapter:
         self.channel = SimpleNamespace(id=str(message.get("channel_id")))
         author = message.get("author") or {}
         self.author = SimpleNamespace(id=str(author.get("id")))
+
+
+def _resolve_auth_scheme(bot_name: str, auth_scheme: str | None) -> str:
+    """Resolve and validate the credential scheme for one Discord bot.
+
+    Returns the scheme name from ``DISCORD_AUTH_SCHEMES``; raises ``ValueError``
+    for anything else.
+
+    An unrecognised scheme must never fall through to "raw" or "bot" and poll with
+    the wrong credential, so this raises rather than defaulting. Kept out of
+    ``DiscordSignalSource.__init__`` because the precedence chain, the vocabulary
+    and the refusal are one decision, and reading them interleaved with attribute
+    assignment hid that.
+    """
+    per_bot_scheme_key = discord_bot_env_key(bot_name, "AUTH_SCHEME")
+    scheme = str(
+        auth_scheme
+        or os.environ.get(per_bot_scheme_key, "")
+        or os.environ.get("DISCORD_AUTH_SCHEME", "")
+        or DEFAULT_DISCORD_AUTH_SCHEME
+    ).strip().lower()
+    if scheme not in DISCORD_AUTH_SCHEMES:
+        raise ValueError(
+            f"Unsupported Discord auth_scheme '{scheme}': unknown "
+            f"discord_auth_scheme; expected one of "
+            f"{sorted(DISCORD_AUTH_SCHEMES)}"
+        )
+    if scheme in DISCORD_ACCOUNT_AUTH_SCHEMES:
+        logger.warning(
+            "Discord source configured with an ACCOUNT (user) token. That is a "
+            "self-bot: it violates Discord's Terms of Service and can get the "
+            "account terminated. Use a Developer Portal bot token for unattended "
+            "trading.",
+            extra={"data": {"bot_name": bot_name, "auth_scheme": scheme}},
+        )
+    return scheme
 
 
 class DiscordSignalSource(BaseSignalSource):
@@ -410,16 +821,20 @@ class DiscordSignalSource(BaseSignalSource):
         self.service_id = str(service_id or "").strip() or None
         self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
-        # #81: operator tokens are account/user tokens copied from Discord
-        # devtools — sent RAW (no "Bot " prefix) like the Stockkit reference
-        # (headers = {"authorization": token}, api v9). Real bot tokens stay
-        # possible via auth_scheme="bot". Default "raw" (owner decision).
-        scheme = str(auth_scheme or os.environ.get("DISCORD_AUTH_SCHEME", "raw")).strip().lower()
-        if scheme not in ("raw", "bot"):
-            raise ValueError(
-                f"Unknown discord_auth_scheme {auth_scheme!r}; expected 'raw' or 'bot'."
-            )
-        self.auth_scheme = scheme
+        # Discord accepts two different credentials and they are NOT
+        # interchangeable: an application/bot token needs the "Bot " prefix, while
+        # a user (account) token must be sent raw. Either mismatch is answered
+        # with HTTP 401, so the scheme is explicit and never guessed, and a
+        # wrong scheme fails the source closed rather than polling as anonymous.
+        #
+        # Vocabulary (union of both sides, same two credential kinds):
+        #   "bot"             -> Developer Portal bot token, sent "Bot <token>"
+        #   "raw" / "account" -> user (account/self-bot) token, sent verbatim.
+        # "raw" is the operator spelling from #81 (tokens copied out of Discord
+        # devtools), "account" the explicit one; both name the same credential.
+        # Precedence: explicit argument -> per-bot env -> global env -> default,
+        # so a per-bot scheme can never be shadowed by a global one.
+        self.auth_scheme = _resolve_auth_scheme(self.bot_name, auth_scheme)
         resolved_channel_ids: set[str] = set(channel_ids or set())
         fallback_channel_id = str(channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
         if fallback_channel_id:
@@ -448,6 +863,154 @@ class DiscordSignalSource(BaseSignalSource):
         self._run_task: asyncio.Task[None] | None = None
         self._seen_ids: dict[str, set[str]] = {}
         self._last_seen_message_ids: dict[str, str] = {}
+        # Author rejections, and the distinct authors that produced them.
+        #
+        # A mis-configured allowlist is otherwise silent: every message is
+        # rejected with a per-message WARNING, the service still reports
+        # connected, and the deployment still reports ACTIVE while never trading.
+        # That is indistinguishable from a strategy that stopped firing - the
+        # same signature as the market-calendar staleness budget and the stray
+        # `return` fixed elsewhere in this branch. Counting them gives an
+        # operator something to check, and lets the daemon log it once instead of
+        # once per message.
+        self._author_rejection_count = 0
+        self._rejected_author_ids: set[str] = set()
+        self._consecutive_author_rejections = 0
+        self._author_rejection_alerted = False
+
+    def _record_author_rejection(self, author_id: str) -> None:
+        """Count the rejection synchronously; only the status write is deferred.
+
+        The caller is a synchronous parser, so it can only *schedule* an
+        observer. Doing the counting inside the coroutine made the streak race
+        the loop: three rapid messages all read a streak of zero, because none of
+        the scheduled bodies had run yet. Counting here - in the caller's own
+        frame - makes the state immediately consistent, and only the DB write is
+        allowed to lag.
+        """
+        self._author_rejection_count += 1
+        self._consecutive_author_rejections += 1
+        self._rejected_author_ids.add(str(author_id))
+        if self._consecutive_author_rejections >= AUTHOR_REJECTION_STREAK_THRESHOLD:
+            # The decision is made HERE, in the caller's frame, and the streak is
+            # latched here too. The coroutine below runs on a later pass of the
+            # event loop, and by then `_record_author_accepted` may have reset the
+            # latch - so re-testing `_author_rejection_alerted` inside it flagged a
+            # service FAILED for a streak that no longer existed, stopping a bot
+            # that had just accepted a message from its real author. That is the
+            # allowlist proving itself correct and being failed for it.
+            if self._author_rejection_alerted:
+                return None
+            self._author_rejection_alerted = True
+            consecutive = self._consecutive_author_rejections
+            return self._flag_author_rejection_streak(consecutive_rejections=consecutive)
+        return None
+
+    def _record_author_accepted(self) -> None:
+        """An accepted message proves the allowlist is right for this bot.
+
+        It ends any rejection streak and un-latches the failure alert, so
+        scattered impersonation attempts across a day can never accumulate into a
+        false alarm.
+
+        When the alert had latched, the service was left FAILED and nothing ever
+        put it back: recovery only happens in `_recover_failed_services`, which
+        runs on daemon *start*. So an operator who fixed the allowlist saw the
+        service stay red on the dashboard until they restarted something, with
+        no record that it had healed. The status write is scheduled for the same
+        reason the rejection write is - the caller is a synchronous parser - and
+        the latch is cleared first, so this fires at most once per streak.
+        """
+        was_alerted = self._author_rejection_alerted
+        self._consecutive_author_rejections = 0
+        self._author_rejection_alerted = False
+        if was_alerted:
+            _schedule(
+                self._record_author_recovery(
+                    rejected_count=self._author_rejection_count,
+                    rejected_author_ids=sorted(self._rejected_author_ids),
+                )
+            )
+            self._author_rejection_count = 0
+            self._rejected_author_ids = set()
+
+    async def _record_author_recovery(
+        self,
+        *,
+        rejected_count: int,
+        rejected_author_ids: list[str],
+    ) -> None:
+        """Log that a trusted author was accepted after a rejection alert.
+
+        Log only: the alert never changes the service status (see
+        `_flag_author_rejection_streak`), so there is nothing to clear. The rejected
+        authors go in the log because they are what the operator needs to check the
+        allowlist against.
+        """
+        logger.info(
+            "Discord bot accepted a message from a trusted author; the author "
+            "allowlist is working again after a run of rejections",
+            extra={
+                "data": {
+                    "service_id": str(self.service_id or ""),
+                    "bot_name": str(self.bot_name or ""),
+                    "rejected_before_recovery": rejected_count,
+                    "rejected_author_ids": rejected_author_ids,
+                }
+            },
+        )
+
+    async def _flag_author_rejection_streak(self, *, consecutive_rejections: int) -> None:
+        """Note that a message was dropped because its author is not trusted.
+
+        Deliberately not logging each rejection here: the caller already logs
+        every one, and a busy channel would drown the log. This exists so the
+        *pattern* - every message rejected - is visible.
+
+        Once a run of consecutive rejections clears the threshold an ERROR alert is
+        logged (once per streak) with the rejected author ids attached, so a wrong
+        allowlist does not look like a strategy that simply stopped firing. The
+        service status is NOT changed: the rejected authors are untrusted by
+        definition, and letting them flip the status would let any channel member
+        take the bot out of service.
+
+        `consecutive_rejections` is passed in rather than read from self, because
+        by the time this runs the loop may have already accepted a message and
+        reset the streak. The count reported is the one that triggered the alert.
+        """
+        logger.error(
+            "Discord bot rejected every recent message for authorship; "
+            "the trusted_author_ids allowlist is probably wrong for this bot",
+            extra={
+                "data": {
+                    "service_id": str(self.service_id or ""),
+                    "bot_name": str(self.bot_name or ""),
+                    "rejected_count": self._author_rejection_count,
+                    "consecutive_rejections": consecutive_rejections,
+                    "rejected_author_ids": sorted(self._rejected_author_ids),
+                    "trusted_author_ids": sorted(self.trusted_author_ids),
+                }
+            },
+        )
+        # Deliberately NOT marking the service FAILED. The rejected messages come from
+        # authors the allowlist does not trust - by definition untrusted channel members -
+        # so letting three of them flip the service status would hand any member of the
+        # channel the ability to take the bot out of service (the daemon stops
+        # every discord service that is not RUNNING). The refusal itself is already correct; this alert is the signal for
+        # the operator, who checks the logged `rejected_author_ids` against the allowlist.
+
+    def author_rejection_summary(self) -> dict[str, Any]:
+        """How many messages were dropped for authorship, and by whom.
+
+        An operator who has just set ``DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS``
+        needs to know whether the value is right. A non-zero count with a single
+        distinct author usually means the allowlist is wrong for that bot, and
+        that bot is currently refusing every signal it receives.
+        """
+        return {
+            "rejected_count": int(self._author_rejection_count),
+            "rejected_author_ids": sorted(self._rejected_author_ids),
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -465,12 +1028,38 @@ class DiscordSignalSource(BaseSignalSource):
     ) -> None:
         if not self.service_id:
             return
+        # Never overwrite PAUSED or STOPPED. Those are operator intent, and it has to
+        # survive whatever the process last observed - a message arriving after the
+        # pause, a connector failing, an author allowlist turning out to be wrong.
+        #
+        # The guard originally covered only RUNNING, which left the nastier case
+        # open: within a sync tick of the operator pausing a service, a
+        # FAILED write landed on the PAUSED row. `_recover_failed_services` then
+        # found FAILED - not PAUSED - and reset it to RUNNING on the next daemon
+        # start, so the process had undone a decision the operator had just made.
+        # A status that an inbound message can flip is not a record of intent.
         try:
+            # The PAUSED read is inside the try, not merely next to it. A
+            # transient database error here would otherwise propagate out of a
+            # method whose whole job is to report status without failing, and
+            # take the caller's loop with it - this is called from the poll path,
+            # so an unreachable database would stop the bot rather than just
+            # leaving a status unwritten. Found by the CodeRabbit review.
+            current = await asyncio.to_thread(get_service, self.service_id)
+            if (
+                current is not None
+                and current.status in _OPERATOR_SERVICE_STATUSES
+                and _service_status_value(status) not in _OPERATOR_SERVICE_STATUS_VALUES
+            ):
+                return
+            # `respect_operator_intent` repeats the check inside the write itself, so a
+            # PAUSE/STOP that commits between the read above and this write still wins.
             await asyncio.to_thread(
                 update_service_status,
                 self.service_id,
                 status,
                 last_activity=last_activity,
+                respect_operator_intent=True,
             )
         except Exception as exc:
             logger.warning(
@@ -485,12 +1074,85 @@ class DiscordSignalSource(BaseSignalSource):
             )
 
     def _auth_header(self) -> str:
-        """Build the Authorization header per configured scheme (#81)."""
-        if self.auth_scheme == "bot":
-            if self.token.lower().startswith("bot "):
-                return self.token
-            return f"Bot {self.token}"
-        return self.token
+        """Build the Authorization header for the configured credential type.
+
+        A token that already carries a scheme prefix is left alone so operators
+        can paste a fully-formed header value. A credential/scheme mismatch is
+        NOT auto-corrected: Discord answers 401 and
+        :class:`DiscordAuthenticationError` stops the source.
+        """
+        token = str(self.token or "").strip()
+        if self.auth_scheme in DISCORD_BOT_AUTH_SCHEMES:
+            if token.lower().startswith("bot "):
+                return token
+            return f"Bot {token}"
+        # Account (self-bot) token, both spellings: sent exactly as supplied.
+        return token
+
+    #: Branch-side spelling of :meth:`_auth_header`; both names are kept so
+    #: either call site keeps working.
+    def _authorization_header(self) -> str:
+        """Alias of :meth:`_auth_header`."""
+        return self._auth_header()
+
+    async def observe_channel_authors(
+        self,
+        channel_id: str,
+        *,
+        pages: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Read recent messages and report who authored them.
+
+        Read-only, and deliberately outside the trading path: it builds no
+        signal, mutates no state, and submits nothing. It exists because
+        ``DISCORD_BOT_<NAME>_TRUSTED_AUTHOR_IDS`` is operator-set and the mapping
+        from author id to bot is not derivable from the repository - guessing it
+        wrong refuses that bot's real messages and silently stops it trading.
+
+        So the value can be *observed* rather than guessed. Note this is a
+        historical message list, not the configured allowlist: a human or an
+        unrelated bot posting in the same channel will appear here too, which is
+        exactly why the allowlist is an operator decision rather than something
+        this should infer and apply by itself.
+
+        Returns one row per distinct author, most active first. ``is_bot`` is
+        included because signal bots post as bots and a human interjection should
+        not be trusted even when it is the loudest voice in the channel.
+        """
+        counts: dict[str, dict[str, Any]] = {}
+        before: str | None = None
+        for _ in range(max(1, int(pages))):
+            messages = await self._fetch_messages(channel_id, before=before)
+            if not messages:
+                break
+            for message in messages:
+                # `_fetch_messages` returns the raw REST dicts; the ingest path
+                # wraps them in _DiscordMessageAdapter, this path does not need
+                # to. Reading them as dicts is what the source actually returned.
+                author = message.get("author") or {}
+                author_id = str(author.get("id") or "").strip().lower()
+                if not author_id:
+                    continue
+                row = counts.setdefault(
+                    author_id,
+                    {
+                        "author_id": author_id,
+                        "username": str(author.get("username", "") or ""),
+                        "is_bot": bool(author.get("bot", False)),
+                        "message_count": 0,
+                    },
+                )
+                row["message_count"] += 1
+            oldest = min(
+                (str(m.get("id", "")) for m in messages if m.get("id")),
+                default="",
+            )
+            before = oldest or None
+            if not before:
+                break
+        return sorted(
+            counts.values(), key=lambda row: (-row["message_count"], row["author_id"])
+        )
 
     async def _fetch_messages(
         self,
@@ -660,6 +1322,8 @@ class DiscordSignalSource(BaseSignalSource):
             wrapped,
             default_timeframe=self.timeframe,
             trusted_author_ids=self.trusted_author_ids,
+            on_author_rejection=self._record_author_rejection,
+            on_author_accepted=self._record_author_accepted,
         )
         if parsed is None:
             return
@@ -898,7 +1562,14 @@ class DiscordSignalSource(BaseSignalSource):
             name=f"discord-source-poll-{self.bot_name.lower()}",
         )
 
-    async def disconnect(self, *, failed: bool = True) -> None:
+    async def disconnect(self, *, failed: bool = False) -> None:
+        """Tear the source down.
+
+        ``failed`` defaults to ``False``: an ordinary teardown (the daemon's ``finally``, a
+        cancellation, a reconnect) says nothing about the service's health and must not mark
+        it FAILED. Callers that *know* the teardown is a failure (an authentication error)
+        pass ``failed=True``; runtime failures in ``listen_signals`` write FAILED themselves.
+        """
         self._connected = False
         self._ready.clear()
         if self._run_task is not None:

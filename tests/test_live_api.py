@@ -225,7 +225,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
         "signal_source_type": "discord",
         "signal_source_id": "RAMJET",
         "signal_source": "discord",
-        "signal_config": {"channel_id": "123", "wait_candle_close": True},
+        "signal_config": {"channel_id": "100000000000000009", "wait_candle_close": True},
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
@@ -250,6 +250,9 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "id": _account_id,
             "broker": "alpaca",
             "name": "Alpaca Paper",
+            # Routing compares the broker-reported account number for the
+            # RAMJET route, not the local account id.
+            "broker_login": "PA3T0MQAGQ51",
         },
     )
     monkeypatch.setattr(
@@ -302,7 +305,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
             "signal_source_id": "RAMJET",
             "symbol_filter": ["AAPL", "MSFT"],
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "wait_candle_close": True},
+            "signal_config": {"channel_id": "100000000000000009", "wait_candle_close": True},
             "settings": {"risk_per_trade_pct": 0.01},
         },
     )
@@ -314,7 +317,7 @@ def test_live_deployments_crud_endpoints(monkeypatch):
     assert created["signal_source_id"] == "RAMJET"
     assert created["symbol_filter"] == ["AAPL", "MSFT"]
     assert created["signal_source"] == "discord"
-    assert created["signal_config"]["channel_id"] == "123"
+    assert created["signal_config"]["channel_id"] == "100000000000000009"
     assert created["settings"]["risk_per_trade_pct"] == 0.01
 
     update_resp = client.put(
@@ -447,7 +450,12 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
     monkeypatch.setattr(
         viewer_main_module,
         "_ensure_live_account_for_deployment",
-        lambda _account_id: {"id": _account_id, "broker": "alpaca", "name": "Wrong"},
+        lambda _account_id: {
+            "id": _account_id,
+            "broker": "alpaca",
+            "name": "Wrong",
+            "broker_login": "PA-WRONG-ACCOUNT",
+        },
     )
 
     client = TestClient(viewer_main_module.app)
@@ -461,7 +469,7 @@ def test_discord_stockkit_deployment_rejects_wrong_account(monkeypatch):
             "signal_source_type": "discord",
             "signal_source_id": "RAMJET",
             "signal_source": "discord",
-            "signal_config": {"channel_id": "123", "signal_processor": "ramjet"},
+            "signal_config": {"channel_id": "100000000000000009", "signal_processor": "ramjet"},
         },
     )
 
@@ -1318,3 +1326,80 @@ def test_live_accounts_websocket_ping_pong(monkeypatch):
 
     assert pong["type"] == "pong"
     assert pong["topic"] == "live.accounts"
+
+
+def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatch):
+    """The viewer must resolve the route's account number from `.accounts.env`.
+
+    `.accounts.env` is never installed into the process environment, so a
+    resolver left to `os.environ` falls back to the static table. That table goes
+    stale whenever a paper account is re-created, and the endpoint then rejects
+    correctly routed deployments with a 400.
+    """
+    import live_runner.credential_env as credential_env
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_services",
+        lambda *args, **kwargs: [
+            Service(
+                id="88888888-8888-8888-8888-888888888888",
+                name="RAMJET",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+                config={
+                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+                    "channel_id": "100000000000000002",
+                },
+                created_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_ensure_live_account_for_deployment",
+        lambda account_id: {
+            "id": account_id,
+            "broker": "alpaca",
+            "name": "Labelled paper account",
+            "broker_login": "PA-LABELLED-RAMJET",
+        },
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "create_live_deployment",
+        lambda deployment: deployment,
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = {
+        "strategy_name": "discord::ramjet",
+        "account_id": "acc-1",
+        "symbols": ["AAPL"],
+        "timeframe": "1h",
+        "signal_source_type": "discord",
+        "signal_source_id": "RAMJET",
+        "signal_source": "discord",
+        "signal_config": {"channel_id": "100000000000000002"},
+    }
+
+    monkeypatch.setattr(
+        credential_env,
+        "load_accounts_env_values",
+        lambda *_args, **_kwargs: {
+            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
+        },
+    )
+    assert client.post("/api/live/deployments", json=payload).status_code == 201
+
+    # Without the accounts-env the configured label is invisible and the stale
+    # static table rejects the same deployment.
+    monkeypatch.setattr(
+        credential_env, "load_accounts_env_values", lambda *_args, **_kwargs: {}
+    )
+    response = client.post("/api/live/deployments", json=payload)
+    assert response.status_code == 400
+    assert "must route to Alpaca account" in response.json()["detail"]
