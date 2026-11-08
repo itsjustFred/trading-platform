@@ -483,14 +483,25 @@ def _assume_snapshot_deployments_currently_active(monkeypatch):
     return None and every dispatch would be skipped. Default the recheck to
     "the snapshot is still current"; tests that pin the recheck itself
     override `daemon.get_live_deployment` explicitly."""
-    import live_runner.daemon as daemon_module
-
     from types import SimpleNamespace as _NS
+
+    import live_runner.daemon as daemon_module
 
     def _current(deployment_id: str):
         return _NS(status="ACTIVE", id=deployment_id)
 
     monkeypatch.setattr(daemon_module, "get_live_deployment", _current)
+
+    # Same reason, for the submission lease: the claim is an INSERT..SELECT
+    # against `live_deployments`, which these in-memory deployments never
+    # reach, so the real claim would refuse every dispatch here. The lease
+    # itself is covered by tests/test_daemon_control_plane.py.
+    monkeypatch.setattr(
+        daemon_module, "claim_live_deployment_submission", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        daemon_module, "release_live_deployment_submission", lambda *_a, **_k: True
+    )
 
 
 def test_dispatch_fans_out_to_every_matching_deployment() -> None:

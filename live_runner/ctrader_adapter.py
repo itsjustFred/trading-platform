@@ -24,6 +24,7 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
+    order_not_submitted,
 )
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
@@ -2029,107 +2030,119 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
-        self._raise_if_terminal_auth_failed()
-        signal_id = str(signal.id)
-        existing_order_id = await asyncio.to_thread(
-            get_live_signal_broker_order_id, signal_id
-        )
-        if existing_order_id:
-            normalized_order_id = self._coerce_broker_order_id(existing_order_id)
-            if normalized_order_id is None:
-                raise RuntimeError(
-                    "Persisted cTrader broker order id is invalid; refusing duplicate submission."
+        # Everything up to and including the request build is provably before
+        # the broker sees an order, so a failure here is marked and the caller
+        # can safely retry instead of treating the outcome as unknown. The
+        # `_submit_new_order_request` call below is deliberately outside.
+        with order_not_submitted():
+            self._raise_if_terminal_auth_failed()
+            signal_id = str(signal.id)
+            existing_order_id = await asyncio.to_thread(
+                get_live_signal_broker_order_id, signal_id
+            )
+            if existing_order_id:
+                normalized_order_id = self._coerce_broker_order_id(existing_order_id)
+                if normalized_order_id is None:
+                    raise RuntimeError(
+                        "Persisted cTrader broker order id is invalid; "
+                        "refusing duplicate submission."
+                    )
+                self._order_id_to_signal_id[normalized_order_id] = signal_id
+                return str(normalized_order_id)
+
+            if not self._connected or not self._authenticated:
+                await self.connect()
+
+            self._validate_pre_persistence(signal)
+
+            # C1/B2: size exactly once upstream (deployment RiskConfig); the
+            # incoming qty is binding. No default-config sizing here.
+            if qty is None:
+                raise ValueError(
+                    "cTrader submit_order requires an explicit risk-sized qty; "
+                    "size exactly once upstream and pass it as binding "
+                    f"(signal_id={signal.id}, symbol={signal.symbol})."
                 )
-            self._order_id_to_signal_id[normalized_order_id] = signal_id
-            return str(normalized_order_id)
-
-        if not self._connected or not self._authenticated:
-            await self.connect()
-
-        self._validate_pre_persistence(signal)
-
-        # C1/B2: size exactly once upstream (deployment RiskConfig); the
-        # incoming qty is binding. No default-config sizing here.
-        if qty is None:
-            raise ValueError(
-                "cTrader submit_order requires an explicit risk-sized qty; "
-                "size exactly once upstream and pass it as binding "
-                f"(signal_id={signal.id}, symbol={signal.symbol})."
-            )
-        try:
-            qty_value = coerce_positive_live_qty(qty, field_name="cTrader order qty")
-        except ValueError as exc:
-            raise ValueError(
-                "cTrader order qty must be finite and positive, "
-                f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
-            ) from exc
-        signal = signal.model_copy(
-            update={
-                "metadata": {
-                    **(signal.metadata or {}),
-                    "qty": qty_value,
-                    "explicit_qty": qty_value,
-                }
-            }
-        )
-        exit_only = (
-            str((signal.metadata or {}).get("risk_sizing_mode") or "")
-            == EXIT_ONLY_RISK_SIZING_MODE
-        )
-        self._resolve_order_volume(signal)
-        signal = signal.model_copy(
-            update={
-                "metadata": {
-                    key: value
-                    for key, value in (signal.metadata or {}).items()
-                    if key not in {"ctrader_volume", "volume"}
-                }
-            }
-        )
-        persisted_timestamp = await asyncio.to_thread(
-            get_live_signal_timestamp, signal_id
-        )
-        if persisted_timestamp is not None:
-            return await self._recover_persisted_signal_order_id(
-                signal_id,
-                signal_timestamp=persisted_timestamp,
-                unrecovered_error=(
-                    "Persisted cTrader signal has no unique recoverable broker order; "
-                    "refusing possible duplicate submission."
-                ),
-                unpersisted_error=(
-                    "Recovered cTrader order but failed to persist broker order id."
-                ),
-            )
-
-        position_id: int | None = None
-        if exit_only:
-            requested_position_id = self._requested_exit_position_id(signal.metadata or {})
-            position_id = self._position_id_for_exit(signal.symbol, requested_position_id)
+            try:
+                qty_value = coerce_positive_live_qty(qty, field_name="cTrader order qty")
+            except ValueError as exc:
+                raise ValueError(
+                    "cTrader order qty must be finite and positive, "
+                    f"got {qty!r} (signal_id={signal.id}, symbol={signal.symbol})."
+                ) from exc
             signal = signal.model_copy(
                 update={
                     "metadata": {
                         **(signal.metadata or {}),
-                        "position_id": position_id,
+                        "qty": qty_value,
+                        "explicit_qty": qty_value,
                     }
                 }
             )
-            self._resolve_order_volume(signal)
-
-        canonical_signal_id, created = await asyncio.to_thread(save_live_signal, signal)
-        if not created:
-            return await self._recover_duplicate_signal_order_id(canonical_signal_id)
-
-        symbol_id = await self._resolve_symbol_id(signal.symbol)
-        if exit_only:
-            if position_id is None:
-                raise RuntimeError("cTrader exit-only position id was not resolved.")
-            request = self._build_close_position_request(
-                position_id=position_id,
-                volume=self._resolve_order_volume(signal),
+            exit_only = (
+                str((signal.metadata or {}).get("risk_sizing_mode") or "")
+                == EXIT_ONLY_RISK_SIZING_MODE
             )
-        else:
-            request = self._build_new_order_request(signal, symbol_id=symbol_id)
+            self._resolve_order_volume(signal)
+            signal = signal.model_copy(
+                update={
+                    "metadata": {
+                        key: value
+                        for key, value in (signal.metadata or {}).items()
+                        if key not in {"ctrader_volume", "volume"}
+                    }
+                }
+            )
+            persisted_timestamp = await asyncio.to_thread(
+                get_live_signal_timestamp, signal_id
+            )
+            if persisted_timestamp is not None:
+                return await self._recover_persisted_signal_order_id(
+                    signal_id,
+                    signal_timestamp=persisted_timestamp,
+                    unrecovered_error=(
+                        "Persisted cTrader signal has no unique recoverable broker order; "
+                        "refusing possible duplicate submission."
+                    ),
+                    unpersisted_error=(
+                        "Recovered cTrader order but failed to persist broker order id."
+                    ),
+                )
+
+            position_id: int | None = None
+            if exit_only:
+                requested_position_id = self._requested_exit_position_id(
+                    signal.metadata or {}
+                )
+                position_id = self._position_id_for_exit(
+                    signal.symbol, requested_position_id
+                )
+                signal = signal.model_copy(
+                    update={
+                        "metadata": {
+                            **(signal.metadata or {}),
+                            "position_id": position_id,
+                        }
+                    }
+                )
+                self._resolve_order_volume(signal)
+
+            canonical_signal_id, created = await asyncio.to_thread(
+                save_live_signal, signal
+            )
+            if not created:
+                return await self._recover_duplicate_signal_order_id(canonical_signal_id)
+
+            symbol_id = await self._resolve_symbol_id(signal.symbol)
+            if exit_only:
+                if position_id is None:
+                    raise RuntimeError("cTrader exit-only position id was not resolved.")
+                request = self._build_close_position_request(
+                    position_id=position_id,
+                    volume=self._resolve_order_volume(signal),
+                )
+            else:
+                request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
 
         order_id = self._extract_order_id_from_payload(response)

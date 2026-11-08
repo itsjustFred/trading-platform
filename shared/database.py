@@ -9,7 +9,8 @@ import subprocess
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -27,6 +28,7 @@ from sqlalchemy import (
     func,
     or_,
     text,
+    update,
 )
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
@@ -818,6 +820,7 @@ class LiveDeploymentModel(SQLModel, table=True):
     )
     timeframe: str = Field(index=True)
     status: str = Field(default="ACTIVE", index=True)
+    stopped_enforced_at: datetime | None = Field(default=None, index=True)
     signal_source: str = Field(
         default="internal",
         sa_column=Column(
@@ -878,6 +881,10 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols_json=deployment.symbols,
             timeframe=deployment.timeframe,
             status=deployment.status,
+            # Preserved across a status write so stamping enforcement does not
+            # reset it. A transition out of STOPPED clears it explicitly in
+            # `update_live_deployment_status`.
+            stopped_enforced_at=deployment.stopped_enforced_at,
             signal_source=source_name,
             signal_source_type=source_type,
             signal_source_id=source_id,
@@ -898,6 +905,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             symbols=self.symbols_json or [],
             timeframe=self.timeframe,
             status=self.status,
+            stopped_enforced_at=self.stopped_enforced_at,
             signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
             signal_source_id=str(self.signal_source_id or "").strip() or None,
             symbol_filter=[
@@ -909,6 +917,33 @@ class LiveDeploymentModel(SQLModel, table=True):
             signal_config=self.signal_config_json or {},
             settings=self.settings_json or {},
         )
+
+
+class LiveDeploymentSubmissionClaimModel(SQLModel, table=True):
+    """One in-flight submission lease per deployment.
+
+    The claim turns "still ACTIVE" from a snapshot taken earlier in the dispatch
+    into a single atomic database fact read immediately before the broker call.
+    A PAUSE either wins the race (the claim fails and nothing is sent) or is
+    already in effect while the claimed order finishes.
+
+    ``UNIQUE(deployment_id)`` is the point: with a non-unique index a second
+    dispatcher could claim the same ACTIVE deployment and both submit. Expired
+    leases are reaped by :func:`claim_live_deployment_submission`, and a live
+    submission renews its lease, so a slow broker call cannot silently lose it.
+    """
+
+    __tablename__ = "live_deployment_submission_claims"
+    __table_args__ = (
+        UniqueConstraint(
+            "deployment_id", name="uq_live_deployment_submission_claims_deployment"
+        ),
+    )
+
+    token: str = Field(primary_key=True)
+    deployment_id: str = Field(index=True)
+    claimed_at: datetime = Field(default_factory=_utcnow_naive, index=True)
+    expires_at: datetime = Field(index=True)
 
 
 class BackgroundTaskRecord(SQLModel, table=True):
@@ -1456,6 +1491,16 @@ def _add_live_deployment_columns(connection: Connection, column_names: set[str])
                 "ADD COLUMN symbol_filter JSON NOT NULL DEFAULT '[]'"
             )
         )
+    if "stopped_enforced_at" not in column_names:
+        # The STOPPED enforcement ledger used to be a set in daemon memory, so a
+        # restart re-ran cancel/flatten for deployments that were already
+        # stopped. Persisting the stamp makes the ledger survive the process.
+        connection.execute(
+            text(
+                "ALTER TABLE live_deployments "
+                "ADD COLUMN stopped_enforced_at DATETIME"
+            )
+        )
 
 
 def _add_backtests_stat_columns(connection: Connection) -> None:
@@ -1973,6 +2018,108 @@ def _migrate_live_signal_deployment_fk(connection: Connection) -> bool:
     return True
 
 
+def _has_unique_index_on_column(connection: Connection, table: str, column: str) -> bool:
+    """True when ``table`` already enforces UNIQUE on exactly ``column``.
+
+    Covers both shapes SQLite can hold: a named index and the implicit
+    ``sqlite_autoindex_*`` behind a table-level UNIQUE constraint, which is what
+    ``SQLModel.metadata.create_all`` produces from the model declaration. A
+    database created fresh therefore needs no migration, and one created before
+    the constraint existed gets a named unique index instead.
+    """
+    quoted_table = connection.dialect.identifier_preparer.quote(table)
+    for row in connection.execute(text(f"PRAGMA index_list({quoted_table})")).fetchall():
+        if not bool(row[2]):  # row[2] is the "unique" flag
+            continue
+        index_name = str(row[1])
+        quoted_index = connection.dialect.identifier_preparer.quote(index_name)
+        indexed_columns = [
+            str(info[2])
+            for info in connection.execute(
+                text(f"PRAGMA index_info({quoted_index})")
+            ).fetchall()
+        ]
+        if indexed_columns == [column]:
+            return True
+    return False
+
+
+def _prune_duplicate_submission_claims(connection: Connection) -> int:
+    """Collapse concurrent claims for one deployment down to the live one.
+
+    A plain unique index cannot be created while two rows share a deployment, and
+    refusing the migration would take the whole database down for every caller,
+    which is a worse outcome than collapsing the duplicates.
+
+    The keeper is the **in-flight** lease, not merely the one with the latest
+    ``expires_at``. A lease that has not expired is a submission that may still
+    be at the broker, and deleting it would let a second dispatcher submit a
+    duplicate; an expired lease is evidence that an outcome was never observed.
+    So in-flight wins over expired unconditionally, and only among in-flight
+    leases does the latest expiry (the most remaining runway) decide. When every
+    lease has expired, the latest one is kept so the deployment stays claimable.
+    """
+    duplicated = connection.execute(
+        text(
+            "SELECT deployment_id FROM live_deployment_submission_claims "
+            "GROUP BY deployment_id HAVING COUNT(*) > 1"
+        )
+    ).fetchall()
+    now = _utcnow_naive()
+    removed = 0
+    for (deployment_id,) in duplicated:
+        keeper = connection.execute(
+            text(
+                "SELECT token FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id "
+                "ORDER BY (expires_at > :now) DESC, "
+                "expires_at DESC, claimed_at DESC, token DESC LIMIT 1"
+            ),
+            {"deployment_id": str(deployment_id), "now": now},
+        ).first()
+        if keeper is None:  # pragma: no cover - the group is non-empty by query
+            continue
+        result = connection.execute(
+            text(
+                "DELETE FROM live_deployment_submission_claims "
+                "WHERE deployment_id = :deployment_id AND token != :token"
+            ),
+            {"deployment_id": str(deployment_id), "token": str(keeper[0])},
+        )
+        dropped = int(result.rowcount or 0)
+        removed += dropped
+        logger.warning(
+            "Collapsed concurrent live deployment submission claims to satisfy the "
+            "one-lease-per-deployment invariant; the extra leases were superseded",
+            extra={"data": {"deployment_id": str(deployment_id), "dropped": dropped}},
+        )
+    return removed
+
+
+def _migrate_live_submission_claim_uniqueness(connection: Connection) -> None:
+    """Make the live submission claim mutually exclusive per deployment.
+
+    ``deployment_id`` used to carry only a non-unique index, so two dispatchers
+    could both claim the same ACTIVE deployment and both submit. The claim is
+    the only thing standing between a stale "still ACTIVE" snapshot and a real
+    broker order, so the uniqueness is enforced by the database itself.
+    """
+    if not _table_column_names(connection, "live_deployment_submission_claims"):
+        return
+    if _has_unique_index_on_column(
+        connection, "live_deployment_submission_claims", "deployment_id"
+    ):
+        return
+    _prune_duplicate_submission_claims(connection)
+    connection.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_live_deployment_submission_claims_deployment "
+            "ON live_deployment_submission_claims(deployment_id)"
+        )
+    )
+
+
 def _migrate_schema() -> None:
     with _schema_migration_connection() as connection:
         # The column migrations must stay ahead of the backfill: `_backfill_smoke_deployments`
@@ -1996,6 +2143,7 @@ def _migrate_schema() -> None:
 
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
+        _migrate_live_submission_claim_uniqueness(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
@@ -2684,29 +2832,74 @@ def list_services(*, service_type: ServiceType | str | None = None) -> list[Serv
     return [row.to_service() for row in rows]
 
 
+#: Statuses only an operator sets. Automated writers (`respect_operator_intent=True`) never
+#: move a service out of one of them.
+_OPERATOR_INTENT_SERVICE_STATUSES = (
+    ServiceStatus.PAUSED.value,
+    ServiceStatus.STOPPED.value,
+)
+
+
 def update_service_status(
     service_id: str,
     status: ServiceStatus | str,
     *,
     last_activity: datetime | None = None,
+    respect_operator_intent: bool = False,
 ) -> Service | None:
+    """Write a service's status, with PAUSED and STOPPED as an atomic floor.
+
+    `respect_operator_intent=True` makes PAUSED and STOPPED a floor: a service in
+    either state is never moved to any other status by this function. Only automated callers
+    pass it - the pause was set by a person, and nothing the process observes
+    afterwards (a message arriving, a connector failing, a reconnect completing)
+    outranks that.
+
+    The default is `False` because every other caller *is* the operator: the
+    API endpoint that sets and clears a pause, the CLI, a test. Making the floor
+    the default would let it swallow the very request that resumes a paused
+    service - the endpoint would answer 200 while the row stayed PAUSED.
+
+    The check is a conditional ``UPDATE`` rather than read-check-write. The
+    previous shape read the row, compared in Python, and wrote it back, so a
+    FAILED write that committed between the read and the write silently
+    overwrote PAUSED; `_recover_failed_services` then read FAILED and restarted
+    the bot the operator had paused. SQLite serialises writers, so a single
+    statement whose ``WHERE`` re-tests the status cannot lose that race.
+    """
     normalized_id = str(service_id or "").strip()
     if not normalized_id:
         return None
     normalized_status = _normalize_service_status(status)
     init_db()
+    values: dict[str, Any] = {
+        "status": normalized_status,
+        "updated_at": _utcnow_naive(),
+    }
+    if last_activity is not None:
+        values["last_activity"] = last_activity
     with get_session() as session:
+        statement = (
+            update(ServiceModel)
+            .where(ServiceModel.id == normalized_id)
+            .values(**values)
+        )
+        if (
+            respect_operator_intent
+            and normalized_status not in _OPERATOR_INTENT_SERVICE_STATUSES
+        ):
+            # Re-tested in the same statement as the write, so a concurrent
+            # PAUSE/STOP cannot be overwritten by a FAILED/RUNNING landing after it.
+            statement = statement.where(
+                ServiceModel.status.not_in(_OPERATOR_INTENT_SERVICE_STATUSES)
+            )
+        session.execute(statement)
+        session.commit()
         record = session.get(ServiceModel, normalized_id)
         if record is None:
             return None
-        record.status = normalized_status
-        if last_activity is not None:
-            record.last_activity = last_activity
-        record.updated_at = _utcnow_naive()
-        session.add(record)
-        session.commit()
         session.refresh(record)
-    return record.to_service()
+        return record.to_service()
 
 
 def delete_service(service_id: str) -> bool:
@@ -2812,11 +3005,268 @@ def update_live_deployment_status(
         if record is None:
             return None
         record.status = next_status
+        if next_status != "STOPPED":
+            # Clear the enforcement stamp in the *same* transaction as the
+            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
+            # keeps the old stamp, and the second stop is skipped as "already
+            # enforced" while its positions are still open. Doing it in one
+            # commit matters: a crash between the two writes must not leave a
+            # non-STOPPED deployment carrying a stamp that disables the next
+            # enforcement.
+            record.stopped_enforced_at = None
         record.updated_at = _utcnow_naive()
         session.add(record)
         session.commit()
         session.refresh(record)
     return record.to_live_deployment()
+
+
+#: How long one submission lease is valid. Short enough that a crashed
+#: dispatcher does not wedge a deployment for long, long enough that a normal
+#: broker call finishes well inside it. A slow call renews its lease (see
+#: :func:`renew_live_deployment_submission`), so this is not a hard cap on
+#: submission duration.
+LIVE_SUBMISSION_CLAIM_TTL_SECONDS = 30.0
+
+
+def mark_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Record that STOPPED enforcement completed for this deployment.
+
+    Only called when the adapter's cancel/flatten sweeps were *complete*; a
+    partial sweep must stay unmarked so the next tick retries it.
+
+    The stamp is written by a single conditional ``UPDATE`` and refused (returns
+    ``False``, nothing written) unless, at that instant,
+
+    * the deployment is still ``STOPPED`` - a resume between the sweep and the
+      write must not leave a stamp on a live deployment, because the stamp is
+      what disables the next enforcement; and
+    * no submission lease exists for it, live *or* expired-but-unreleased. A
+      lease means a submit may still be in flight at the broker and can fill
+      after the flatten, and an expired lease means an outcome was never
+      observed. Persisting the stamp then would stop the daemon retrying the
+      flatten for exactly the fill it has not seen yet. New leases cannot be
+      taken once the deployment is ``STOPPED`` (the claim is status-gated), so
+      checking here, atomically with the write, is sufficient.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET stopped_enforced_at = :now, updated_at = :now "
+                "WHERE id = :deployment_id AND UPPER(status) = 'STOPPED' "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM live_deployment_submission_claims "
+                "  WHERE deployment_id = :deployment_id)"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
+        session.commit()
+        return int(result.rowcount or 0) == 1
+
+
+def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
+    """Forget the enforcement stamp so a later STOPPED transition re-enforces.
+
+    The status transition clears it transactionally; this helper exists for the
+    daemon's cleanup path, which may observe a deployment that left STOPPED
+    without a status write it performed itself.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        record.stopped_enforced_at = None
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def list_stopped_enforced_deployment_ids() -> set[str]:
+    """Deployment ids whose STOPPED enforcement already completed.
+
+    Read once at daemon startup to rebuild the in-memory ledger, so a restart
+    does not repeat cancel/flatten work that is already done.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveDeploymentModel.id).where(
+                LiveDeploymentModel.stopped_enforced_at.is_not(None)
+            )
+        ).all()
+    return {str(row) for row in rows}
+
+
+def claim_live_deployment_submission(
+    deployment_id: str,
+    token: str,
+    *,
+    ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+) -> bool:
+    """Take the single submission lease for one deployment, or refuse.
+
+    Two independent facts have to hold, and both are decided by the database
+    rather than by a status snapshot taken earlier in the dispatch:
+
+    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
+      live row, so a PAUSE that committed first wins the race);
+    * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    An expired lease is deleted first, in its own committed transaction, so a
+    claimer that died mid-submission cannot wedge the deployment forever. The
+    cleanup is committed separately on purpose: it must survive a refused
+    claim, otherwise a permanently-busy deployment would also stop reaping its
+    own dead leases.
+    """
+    normalized_id = str(deployment_id or "").strip()
+    normalized_token = str(token or "").strip()
+    if not normalized_id or not normalized_token:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    with get_session() as session:
+        session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                (LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+                & (LiveDeploymentSubmissionClaimModel.expires_at <= now)
+            )
+        )
+        session.commit()
+    with get_session() as session:
+        try:
+            result = session.execute(
+                text(
+                    "INSERT INTO live_deployment_submission_claims "
+                    "(token, deployment_id, claimed_at, expires_at) "
+                    "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
+                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                ),
+                {
+                    "token": normalized_token,
+                    "claimed_at": now,
+                    "expires_at": expires_at,
+                    "deployment_id": normalized_id,
+                },
+            )
+            session.commit()
+            return int(result.rowcount or 0) == 1
+        except IntegrityError:
+            # The UNIQUE(deployment_id) lease is held: another dispatcher is
+            # already submitting for this deployment. Refusing is the point.
+            session.rollback()
+            logger.warning(
+                "Live deployment submission already claimed by another "
+                "dispatcher; refusing the second claim",
+                extra={"data": {"deployment_id": normalized_id, "token": normalized_token}},
+            )
+            return False
+        except Exception:
+            session.rollback()
+            raise
+
+
+def renew_live_deployment_submission(
+    token: str,
+    *,
+    ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+) -> bool:
+    """Extend a held lease so a slow broker call does not lose it.
+
+    The claim has a TTL, and a submission that outlives it used to become
+    reclaimable while it was still at the broker: a second dispatcher would then
+    take the lease and submit a duplicate order. Renewal is only valid for the
+    token that still owns the row, so a lease that was already reaped or taken
+    over cannot be revived.
+    """
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    init_db()
+    now = _utcnow_naive()
+    expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployment_submission_claims "
+                "SET expires_at = :expires_at WHERE token = :token"
+            ),
+            {"expires_at": expires_at, "token": normalized_token},
+        )
+        session.commit()
+        return int(result.rowcount or 0) == 1
+
+
+def release_live_deployment_submission(token: str) -> bool:
+    """Release a lease whose submission outcome is known.
+
+    Never called when the outcome is unknown: a broker may have accepted an
+    order whose response was lost, and releasing the lease would let the next
+    signal submit a duplicate before anyone reconciled.
+    """
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
+        return False
+    init_db()
+    with get_session() as session:
+        result = session.exec(
+            delete(LiveDeploymentSubmissionClaimModel).where(
+                LiveDeploymentSubmissionClaimModel.token == normalized_token
+            )
+        )
+        session.commit()
+        return int(result.rowcount or 0) > 0
+
+
+@dataclass(frozen=True)
+class LiveDeploymentSubmissionClaim:
+    """One observed submission lease, and whether it is still within its TTL."""
+
+    token: str
+    expires_at: datetime
+    expired: bool
+
+
+def list_live_deployment_submission_claims(
+    deployment_id: str,
+) -> list[LiveDeploymentSubmissionClaim]:
+    """Read-only inventory of the submission leases held for ``deployment_id``.
+
+    This never deletes anything. An expired-but-never-released claim is
+    *evidence that an outcome was never observed*, and must not read as "nothing
+    was in flight".
+    """
+    normalized_id = str(deployment_id or "").strip()
+    if not normalized_id:
+        return []
+    init_db()
+    now = _utcnow_naive()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveDeploymentSubmissionClaimModel.token,
+                LiveDeploymentSubmissionClaimModel.expires_at,
+            ).where(LiveDeploymentSubmissionClaimModel.deployment_id == normalized_id)
+        ).all()
+    return [
+        LiveDeploymentSubmissionClaim(
+            token=str(row[0]),
+            expires_at=row[1],
+            expired=row[1] <= now,
+        )
+        for row in rows
+    ]
 
 
 class LiveDeploymentInUseError(RuntimeError):

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from shared.logging import get_logger
 from shared.models import LiveSignal
@@ -18,6 +19,44 @@ EXIT_ONLY_RISK_SIZING_MODE = "exit_only"
 #: never inferred. Matched via :func:`is_unbounded_tp`, not string
 #: comparison scattered across daemon + adapters (pre-mortem PM2).
 UNBOUNDED_TP_POLICY = "unbounded_exit_on_opposite_signal"
+
+#: Attribute set on an exception that provably never reached the broker.
+_ORDER_NOT_SUBMITTED_ATTR = "_order_not_submitted"
+
+
+@contextmanager
+def order_not_submitted() -> Iterator[None]:
+    """Mark exceptions raised inside as raised *before* any order request.
+
+    Adapters wrap the part of ``submit_order`` that runs before the call which
+    places the order. Anything raised inside is provably pre-request - local
+    validation, a missing client, a volume floor, a failed symbol lookup - and
+    nothing can have reached the broker, so a caller may safely retry or release
+    its submission lease.
+
+    The exception type and message are preserved; only the marker is added. That
+    keeps every existing caller and assertion working, and keeps the failure
+    loud in the same way it was before.
+
+    Anything raised *outside* the block - including a failure of the submit call
+    itself - is deliberately left unmarked: the broker may have accepted the
+    order and only the response was lost.
+    """
+    try:
+        yield
+    except BaseException as exc:
+        try:
+            setattr(exc, _ORDER_NOT_SUBMITTED_ATTR, True)
+        except Exception:  # pragma: no cover - exotic exception types
+            # An exception that refuses attributes degrades to "outcome
+            # unknown", which is the safe default for every caller.
+            pass
+        raise
+
+
+def is_order_not_submitted(exc: BaseException) -> bool:
+    """Whether an adapter proved the failure happened before any broker write."""
+    return bool(getattr(exc, _ORDER_NOT_SUBMITTED_ATTR, False))
 
 
 def is_unbounded_tp(metadata: object) -> bool:
