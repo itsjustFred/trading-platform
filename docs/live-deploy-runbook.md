@@ -58,3 +58,10 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 > NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Execution prices and commissions (Alpaca, #124)
+
+- `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
+- Alpaca crypto fees are posted end of day as `CFEE` account activities, so crypto fills are stored with `NULL`. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST, once a trade date is two UTC days old and for fills up to 30 days back, allocates each (pair, trade date)'s fee pro rata by received quantity, converts it to USD and writes it. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules.
+- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca crypto fills into `NULL`.
+- A reconciled fill whose order has no usable `filled_avg_price` is not stored; the next reconciliation pass (adapter connect) retries it. A reconciled remainder gets the remainder's own price, derived from the cumulative average and the already-recorded legs. Stream fills set `actual_price_observed` (`observed`/`sent_bad`/`absent`) as cTrader does.

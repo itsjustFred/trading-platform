@@ -1437,3 +1437,21 @@ def test_backfill_ignores_unknown_commissions_outside_the_lookback(db):
     assert _backfill(client) == 0
     assert _commission(db, signal) == [None]
     assert client.calls == []
+
+
+def test_backfill_fails_closed_on_a_fill_activity_without_a_symbol(db):
+    """A fill that names no pair could be any pair's; it must not be silently skipped."""
+    signal, order_id = _crypto_fill(db, label="no-symbol")
+    ours = _fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)
+    nameless = _fill_activity(
+        order_id=_order_id("nameless"),
+        side="buy",
+        qty="0.1",
+        price="60000",
+        at=FILL_AT + timedelta(minutes=5),
+    )
+    nameless["symbol"] = ""
+    client = FakeActivitiesClient(fills=[ours, nameless], cfees=[_cfee(qty="-0.0015")])
+
+    assert _backfill(client) == 0
+    assert _commission(db, signal) == [None]

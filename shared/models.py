@@ -295,7 +295,14 @@ class LiveExecution(BaseModel):
     signal_id: UUID
     actual_price: float
     filled_qty: float
-    commission: float
+    # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
+    #
+    # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
+    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
+    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # purpose - an adapter must decide which of the two it has, rather than inherit a default
+    # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
+    commission: float | None
     timestamp: datetime
     broker_order_id: str
     dedupe_key: str | None = None
@@ -323,9 +330,8 @@ class LiveExecution(BaseModel):
     # existed nothing said which rows those were.
     #
     # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
-    # one is `absent`. Nullable because rows written before this column existed, and adapters that
-    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
-    # `observed`.
+    # one is `absent`. Nullable because rows written before this column existed carry no verdict -
+    # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
 

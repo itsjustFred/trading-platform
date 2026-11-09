@@ -5490,10 +5490,34 @@ def _calculate_realized_live_pnl(
     return total_pnl, wins, losses
 
 
+def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, int]:
+    """The summed commission of ``rows`` and how many are unknown; the sum is None if any is.
+
+    An unknown (NULL) commission is "the broker has not told us yet" - Alpaca posts crypto fees end
+    of day (#124). Netting it as zero would overstate net PnL, so one unknown row makes the total
+    unknown rather than a smaller number that looks complete.
+    """
+    total = 0.0
+    unknown = 0
+    for row in rows:
+        commission = row.get("commission")
+        if commission is None:
+            unknown += 1
+            continue
+        total += _safe_float(commission, 0.0)
+    return (None if unknown else total), unknown
+
+
 def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
+    # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
+    # commission and is reported only when every commission is known.
+    total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
+    net_pnl = (
+        round(total_pnl_realized - total_commission, 2) if total_commission is not None else None
+    )
     # Win rate denominators are closed round trips (a win or a loss), never raw
     # execution rows: partial fills would otherwise deflate the ratio.
     total_trades = wins + losses
@@ -5522,6 +5546,12 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
         "losing_trades": losses,
         "win_rate": round(win_rate, 2),
         "total_pnl": round(total_pnl_realized, 2),
+        "total_commission": (
+            round(total_commission, 2) if total_commission is not None else None
+        ),
+        "commission_unknown_count": commission_unknown_count,
+        "net_pnl": net_pnl,
+        "net_pnl_complete": commission_unknown_count == 0,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
@@ -11988,7 +12018,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                     if row.get("exit_reason") not in (None, "")
                     else None
                 ),
-                "commission": float(row.get("commission", 0.0)),
+                # None is "fee not known yet" (#124), never a zero fee.
+                "commission": (
+                    _safe_float(row.get("commission"))
+                    if row.get("commission") is not None
+                    else None
+                ),
                 "signal_timestamp": signal_iso,
                 "signal_time": signal_unix,
                 "execution_timestamp": execution_iso,

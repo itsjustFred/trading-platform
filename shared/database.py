@@ -39,6 +39,8 @@ from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
+    PRICE_ABSENT,
+    PRICE_SENT_BAD,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -652,7 +654,10 @@ class LiveExecutionModel(SQLModel, table=True):
     signal_id: str = Field(foreign_key="live_signals.id", index=True)
     actual_price: float = Field(default=0.0)
     filled_qty: float = Field(default=0.0)
-    commission: float = Field(default=0.0)
+    # NULL is "fee not known yet" and 0.0 a known zero (#124). Nullable with no default, for the
+    # same reason as `actual_price_observed`: a default would fabricate a fee nobody stated.
+    # `_make_live_executions_commission_nullable` relaxes the NOT NULL a legacy table carries.
+    commission: float | None = Field(default=None, nullable=True)
     timestamp: datetime = Field(index=True)
     broker_order_id: str = Field(index=True)
     dedupe_key: str | None = Field(
@@ -1796,6 +1801,118 @@ def _add_live_executions_actual_price_observed(connection: Connection) -> None:
         )
 
 
+_COMMISSION_NOT_NULL_RE = re.compile(
+    r"((?:\"commission\"|`commission`|\[commission\]|\bcommission\b)\s+[A-Za-z]+(?:\s*\([^)]*\))?)"
+    r"\s+NOT\s+NULL",
+    flags=re.IGNORECASE,
+)
+
+
+def _make_live_executions_commission_nullable(connection: Connection) -> bool:
+    """Relax ``live_executions.commission`` to nullable and un-fake the Alpaca crypto zeros (#124).
+
+    An unknown fee is NULL and ``0.0`` is reserved for a known zero. SQLite cannot drop a NOT NULL
+    constraint in place, so the table is rebuilt the same way `_migrate_live_signal_deployment_fk`
+    rebuilds `live_signals`: capture the index DDL before anything is dropped, reuse the table's own
+    CREATE text with only the constraint removed (a column-list rebuild loses the PRIMARY KEY and
+    the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
+
+    The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
+    NULL on exactly the rows whose zero was never a stated fee: Alpaca crypto fills (an Alpaca
+    account, a ``BASE/QUOTE`` symbol). Before #124 both Alpaca paths hard-coded ``0.0`` - alpaca-py has no
+    commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
+    stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
+    ``CFEE`` from `AlpacaLiveAdapter.backfill_commissions`; older ones stay NULL, which readers
+    report as "net PnL incomplete" - the truth, where ``0.0`` overstated it.
+
+    Returns True when the rebuild ran. No-ops when the column is already nullable or missing.
+    """
+    columns = connection.execute(text("PRAGMA table_info('live_executions')")).fetchall()
+    commission = next((row for row in columns if str(row[1]) == "commission"), None)
+    if commission is None or not int(commission[3]):
+        return False
+
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_executions' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_executions'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        raise RuntimeError("Cannot rebuild live_executions: table definition is missing")
+
+    new_create_sql, relaxed = _COMMISSION_NOT_NULL_RE.subn(r"\1", str(create_sql), count=2)
+    if relaxed != 1:
+        raise RuntimeError(
+            "Cannot safely rebuild live_executions: expected exactly one NOT NULL on commission"
+        )
+    new_create_sql, renamed = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_executions\"|`live_executions`|\[live_executions\]|live_executions)",
+        "CREATE TABLE live_executions__commission_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if renamed != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_executions: could not address the table in its own CREATE "
+            "statement"
+        )
+
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(str(row[1])) for row in columns
+    )
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_executions__commission_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_executions__commission_new ({column_list}) "
+                f"SELECT {column_list} FROM live_executions"
+            )
+        )
+        connection.execute(text("DROP TABLE live_executions"))
+        connection.execute(
+            text("ALTER TABLE live_executions__commission_new RENAME TO live_executions")
+        )
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+
+    unfaked = connection.execute(
+        text(
+            "UPDATE live_executions SET commission = NULL "
+            "WHERE commission = 0.0 AND signal_id IN ("
+            "  SELECT s.id FROM live_signals s"
+            "  JOIN live_deployments d ON d.id = s.deployment_id"
+            "  JOIN live_accounts a ON a.id = d.account_id"
+            "  WHERE lower(a.broker) = 'alpaca' AND instr(s.symbol, '/') > 0"
+            ")"
+        )
+    ).rowcount
+    logger.info(
+        "Rebuilt live_executions with a nullable commission; %s Alpaca crypto fill(s) had a "
+        "hard-coded 0.0 commission and are now NULL (unknown) until their CFEE is backfilled",
+        unfaked,
+    )
+    return True
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -2211,6 +2328,8 @@ def _migrate_schema() -> None:
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
         _add_live_executions_actual_price_observed(connection)
+        # Last: the rebuild copies every column, so the additive ones must already exist.
+        _make_live_executions_commission_nullable(connection)
 
 
 def _find_existing_live_signal(
@@ -2457,14 +2576,48 @@ def save_live_execution(execution: LiveExecution) -> bool:
 
 
 def save_live_execution_up_to_cumulative(
-    execution: LiveExecution, broker_cumulative_filled_qty: float
+    execution: LiveExecution,
+    broker_cumulative_filled_qty: float,
+    *,
+    cumulative_avg_price: float | None = None,
 ) -> float:
-    """Atomically persist only the quantity still missing up to a broker cumulative fill."""
+    """Atomically persist only the quantity still missing up to a broker cumulative fill.
+
+    ``cumulative_avg_price`` is for a caller that knows the broker's average over the WHOLE
+    cumulative quantity but not the price of the missing part - Alpaca's ``filled_avg_price`` on a
+    reconciled order (#124). The missing part's price is then derived here, inside the same
+    transaction that reads the local quantity, so a stream fill landing between the caller's read
+    and this write cannot skew it::
+
+        remainder price = (avg * cumulative - sum(local price * qty)) / missing qty
+
+    It fails closed - persists nothing, logs, returns 0.0 - when any local leg has no usable price
+    (``actual_price_observed`` of ``sent_bad``/``absent``, or a non-positive or non-finite price:
+    the formula would silently move that leg's cost onto the remainder), when the result is not a
+    finite positive price, or when the row would be an amendment of an existing key (its stored
+    price would need re-deriving too). Without it, the caller's ``actual_price`` is stored as-is.
+    """
     normalized_signal_id = str(execution.signal_id or "").strip()
     cumulative_qty = float(broker_cumulative_filled_qty or 0.0)
     requested_qty = float(execution.filled_qty or 0.0)
+    if not (math.isfinite(cumulative_qty) and math.isfinite(requested_qty)):
+        # SQLite stores NaN as NULL, so a non-finite quantity can only fail or corrupt the sum.
+        logger.warning(
+            "Refusing to persist live execution for signal %s: non-finite quantity "
+            "(filled_qty=%r, broker cumulative=%r)",
+            normalized_signal_id,
+            execution.filled_qty,
+            broker_cumulative_filled_qty,
+        )
+        return 0.0
     if not normalized_signal_id or cumulative_qty <= 0.0 or requested_qty <= 0.0:
         return 0.0
+    if cumulative_avg_price is not None:
+        cumulative_avg_price = float(cumulative_avg_price)
+        if not (math.isfinite(cumulative_avg_price) and cumulative_avg_price > 0.0):
+            raise ValueError(
+                f"cumulative_avg_price must be finite and positive, got {cumulative_avg_price!r}"
+            )
 
     init_db()
     with get_session() as session:
@@ -2492,6 +2645,15 @@ def save_live_execution_up_to_cumulative(
                 session.rollback()
                 _log_dedupe_key_owned_by_other_signal(
                     existing, normalized_signal_id, record.dedupe_key
+                )
+                return 0.0
+            if existing is not None and cumulative_avg_price is not None:
+                session.rollback()
+                logger.warning(
+                    "Refusing to amend live execution %s (dedupe key %s) from a cumulative "
+                    "average price: the stored row's own price would need re-deriving",
+                    existing.id,
+                    existing.dedupe_key,
                 )
                 return 0.0
             if existing is not None:
@@ -2523,15 +2685,21 @@ def save_live_execution_up_to_cumulative(
                     session.rollback()
                     return 0.0
                 existing.filled_qty = prior_qty + delta
-                if record.commission:
+                if existing.commission is None or record.commission is None:
+                    # A known fee plus an unknown one is unknown (#124): keeping the known part
+                    # would read as the whole fee and overstate net PnL.
+                    existing.commission = None
+                elif record.commission:
                     # Commission was recorded against the first-seen quantity, so only the
                     # incremental slice needs adding. A deal that reports commission per unit is
                     # handled by the caller scaling it, same as the partial-persist path below.
-                    existing.commission = float(existing.commission or 0.0) + float(
+                    existing.commission = float(existing.commission) + float(
                         record.commission
                     ) * (delta / requested_qty)
                 if record.actual_price and not existing.actual_price:
                     existing.actual_price = float(record.actual_price)
+                    # The verdict describes the stored price, so it travels with it.
+                    existing.actual_price_observed = record.actual_price_observed
                 session.add(existing)
                 session.commit()
                 logger.info(
@@ -2544,10 +2712,24 @@ def save_live_execution_up_to_cumulative(
                 )
                 return delta
 
-            persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
+            missing_qty = cumulative_qty - local_filled_qty
+            persisted_qty = min(requested_qty, missing_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
                 return 0.0
+
+            if cumulative_avg_price is not None:
+                remainder_price = _derive_remainder_price(
+                    session,
+                    normalized_signal_id,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_qty=cumulative_qty,
+                    missing_qty=missing_qty,
+                )
+                if remainder_price is None:
+                    session.rollback()
+                    return 0.0
+                record.actual_price = remainder_price
 
             record.filled_qty = persisted_qty
             if requested_qty != persisted_qty and record.commission:
@@ -2559,6 +2741,191 @@ def save_live_execution_up_to_cumulative(
         except Exception:
             session.rollback()
             raise
+
+
+def _derive_remainder_price(
+    session: Session,
+    signal_id: str,
+    *,
+    cumulative_avg_price: float,
+    cumulative_qty: float,
+    missing_qty: float,
+) -> float | None:
+    """The price of the quantity a signal is still missing, from the broker's cumulative average.
+
+    ``None`` (logged) when it cannot be derived honestly; see
+    `save_live_execution_up_to_cumulative`.
+    """
+    legs = session.exec(
+        select(
+            LiveExecutionModel.id,
+            LiveExecutionModel.actual_price,
+            LiveExecutionModel.filled_qty,
+            LiveExecutionModel.actual_price_observed,
+        ).where(LiveExecutionModel.signal_id == signal_id)
+    ).all()
+    local_notional = 0.0
+    for leg_id, price, qty, observed in legs:
+        leg_price = float(price) if price is not None else math.nan
+        if observed in (PRICE_SENT_BAD, PRICE_ABSENT) or not (
+            math.isfinite(leg_price) and leg_price > 0.0
+        ):
+            logger.warning(
+                "Not persisting reconciled remainder for signal %s: local execution %s has no "
+                "usable price (actual_price=%r, actual_price_observed=%r), so the remainder price "
+                "cannot be derived from the broker's cumulative average; retried next pass",
+                signal_id,
+                leg_id,
+                price,
+                observed,
+            )
+            return None
+        local_notional += leg_price * float(qty or 0.0)
+    remainder_price = (cumulative_avg_price * cumulative_qty - local_notional) / missing_qty
+    if not (math.isfinite(remainder_price) and remainder_price > 0.0):
+        logger.warning(
+            "Not persisting reconciled remainder for signal %s: derived remainder price %r is not "
+            "a finite positive price (broker average %r over %r, local notional %r, missing %r)",
+            signal_id,
+            remainder_price,
+            cumulative_avg_price,
+            cumulative_qty,
+            local_notional,
+            missing_qty,
+        )
+        return None
+    return remainder_price
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """``value`` as the naive UTC wall time SQLite stores, so bounds compare like with like."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _account_execution_rows_query(account_id: str) -> SelectOfScalar:
+    return (
+        select(LiveExecutionModel, LiveSignalModel)
+        .join(LiveSignalModel, LiveSignalModel.id == LiveExecutionModel.signal_id)
+        .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+        .where(LiveDeploymentModel.account_id == account_id)
+    )
+
+
+def _commission_backfill_row(execution: LiveExecutionModel, signal: LiveSignalModel) -> dict:
+    timestamp = execution.timestamp
+    if timestamp is not None and timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return {
+        "execution_id": str(execution.id),
+        "signal_id": str(execution.signal_id),
+        "deployment_id": str(signal.deployment_id),
+        "symbol": str(signal.symbol or ""),
+        "action": str(signal.action or "").strip().lower(),
+        "actual_price": float(execution.actual_price or 0.0),
+        "filled_qty": float(execution.filled_qty or 0.0),
+        "commission": _optional_commission(execution),
+        "timestamp": timestamp,
+        "broker_order_id": str(execution.broker_order_id or ""),
+    }
+
+
+def list_live_executions_missing_commission(
+    account_id: str, *, since: datetime, until: datetime
+) -> list[dict[str, Any]]:
+    """The account's executions whose commission is still unknown (NULL), in ``[since, until)``.
+
+    Scoped through the signal's deployment to ``account_id``, so it spans every deployment of the
+    account - a broker fee is charged per account, not per deployment (#124).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.commission.is_(None))
+            .where(LiveExecutionModel.timestamp >= _naive_utc(since))
+            .where(LiveExecutionModel.timestamp < _naive_utc(until))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def list_live_executions_for_broker_orders(
+    account_id: str, broker_order_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Every execution of ``account_id`` recorded against one of ``broker_order_ids``.
+
+    Includes rows whose commission is already known, so a caller can tell a group it may price
+    from one that is partly priced already, and an order this account never recorded from one it
+    did.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    order_ids = sorted({str(item).strip() for item in broker_order_ids if str(item).strip()})
+    if not normalized_account_id or not order_ids:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.broker_order_id.in_(order_ids))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def apply_live_execution_commissions(account_id: str, commissions: Mapping[str, float]) -> int:
+    """Set the commission of still-unknown executions of one account, all or nothing.
+
+    Every id must belong to ``account_id`` and still have a NULL commission; otherwise nothing is
+    written and 0 is returned (logged). That makes the backfill safe against a concurrent writer and
+    against a stale read: a fee allocated across a group is either applied to the whole group or
+    not at all, and a fee that is already known is never overwritten. Returns the rows updated.
+
+    Raises ValueError on a non-finite or negative commission - a caller bug, not broker data.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    updates: dict[str, float] = {}
+    for execution_id, value in commissions.items():
+        number = float(value)
+        if not (math.isfinite(number) and number >= 0.0):
+            raise ValueError(
+                f"commission for execution {execution_id!r} must be finite and non-negative, "
+                f"got {value!r}"
+            )
+        updates[str(execution_id)] = number
+    if not normalized_account_id or not updates:
+        return 0
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            rows = session.exec(
+                _account_execution_rows_query(normalized_account_id)
+                .where(LiveExecutionModel.id.in_(sorted(updates)))
+                .where(LiveExecutionModel.commission.is_(None))
+            ).all()
+            if len(rows) != len(updates):
+                session.rollback()
+                logger.warning(
+                    "Not applying backfilled commissions for account %s: %s of %s execution(s) "
+                    "are no longer unknown or do not belong to the account",
+                    normalized_account_id,
+                    len(updates) - len(rows),
+                    len(updates),
+                )
+                return 0
+            for execution, _signal in rows:
+                execution.commission = updates[str(execution.id)]
+                session.add(execution)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return len(updates)
 
 
 def get_live_signal_filled_qty(signal_id: str) -> float:
@@ -3897,9 +4264,8 @@ def _live_signal_deployment_execution_fields(
         "filled_qty": (
             float(execution.filled_qty or 0.0) if execution is not None else None
         ),
-        "commission": (
-            float(execution.commission or 0.0) if execution is not None else None
-        ),
+        # NULL stays None: an unknown fee is not a zero fee (#124).
+        "commission": _optional_commission(execution),
         "broker_order_id": (
             str(execution.broker_order_id or "") if execution is not None else None
         ),
@@ -4110,6 +4476,13 @@ def _scalar_stats_for_save(
     return resolved
 
 
+def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
+    """A row's commission, keeping NULL ("not known yet", #124) distinct from a known 0.0."""
+    if execution is None or execution.commission is None:
+        return None
+    return float(execution.commission)
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -4130,7 +4503,7 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
                 "filled_qty": float(execution.filled_qty or 0.0),
-                "commission": float(execution.commission or 0.0),
+                "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,
                 "execution_timestamp": execution.timestamp,
                 "broker_order_id": execution.broker_order_id,
