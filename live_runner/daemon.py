@@ -47,7 +47,11 @@ from live_runner.stockkit_routing import (
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
-from risk.live import entry_deviation_sl_fraction, resolve_live_levels
+from risk.live import (
+    entry_deviation_sl_fraction,
+    entry_gate_settings,
+    resolve_live_levels,
+)
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.constants import normalize_timeframe
@@ -828,10 +832,17 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
-#: Default for the per-deployment ``max_entry_deviation_sl_fraction`` (#125):
-#: the quote may sit up to a quarter of the stop distance from the signal
-#: entry, in either direction.
-DEFAULT_MAX_ENTRY_DEVIATION_SL_FRACTION = 0.25
+#: Gate settings and their defaults are validated by
+#: :func:`risk.live.entry_gate_settings` (#125).
+
+#: How far a quote time may lie in the future before it is treated as a clock
+#: or feed fault rather than skew between our clock and the broker's.
+ENTRY_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+
+
+def _utc_now() -> datetime:
+    """The gate's clock (a seam so tests can freeze it)."""
+    return datetime.now(timezone.utc)
 
 #: Float slack for the gate comparison. Prices are decimal, so a quote exactly
 #: at the threshold (e.g. (100 - 99.6) / 4) must not be rejected by binary
@@ -848,15 +859,24 @@ _ENTRY_QUOTE_METADATA_KEYS = (
     "entry_quote_price",
     "entry_quote_time",
     "entry_quote_source",
+    "entry_quote_time_source",
+    "entry_quote_age_seconds",
+    "max_entry_quote_age_seconds",
     "entry_deviation_sl_fraction",
     "entry_deviation_direction",
     "max_entry_deviation_sl_fraction",
     "entry_gate_rejection_rule",
 )
 
-#: Rejection rules of the entry-deviation gate, checked in this order. The
-#: crossed-level rules come first: they name the more specific problem when
-#: the quote has also moved further than the deviation limit.
+#: Rejection rules of the entry-deviation gate, checked in this order. Quote
+#: freshness comes first: a quote that is not current says nothing about where
+#: the market is, so no price rule may be judged on it. The crossed-level rules
+#: come next: they name the more specific problem when the quote has also moved
+#: further than the deviation limit.
+ENTRY_GATE_RULE_QUOTE_TIME_MISSING = "quote_time_missing"
+ENTRY_GATE_RULE_QUOTE_TIME_INVALID = "quote_time_invalid"
+ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = "quote_time_in_future"
+ENTRY_GATE_RULE_QUOTE_STALE = "quote_stale"
 ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
 ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
 ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
@@ -889,15 +909,25 @@ def _entry_gate_rejection_rule(
     return None
 
 
-def _max_entry_deviation_sl_fraction(deployment: LiveDeploymentConfig) -> float:
-    settings = deployment.settings or {}
-    return _coerce_live_float(
-        settings.get(
-            "max_entry_deviation_sl_fraction", DEFAULT_MAX_ENTRY_DEVIATION_SL_FRACTION
-        ),
-        field_name="max_entry_deviation_sl_fraction",
-        minimum=0.0,
-    )
+def _quote_time_rule(
+    timestamp: object, *, now: datetime, max_age_seconds: float
+) -> tuple[str | None, float | None]:
+    """Freshness verdict and age in seconds for a quote time (#125 review).
+
+    Fails closed: a missing time, anything but a timezone-aware datetime, a
+    time beyond the clock-skew allowance in the future, or a quote older than
+    the limit all reject.
+    """
+    if timestamp is None:
+        return ENTRY_GATE_RULE_QUOTE_TIME_MISSING, None
+    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
+        return ENTRY_GATE_RULE_QUOTE_TIME_INVALID, None
+    age = (now - timestamp).total_seconds()
+    if -age > ENTRY_QUOTE_FUTURE_SKEW_SECONDS:
+        return ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE, age
+    if age > max_age_seconds:
+        return ENTRY_GATE_RULE_QUOTE_STALE, age
+    return None, age
 
 
 def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float]:
@@ -945,6 +975,11 @@ async def _check_entry_deviation(
       the entry in EITHER direction: toward the stop the setup may be invalid,
       away from it the order chases and a fixed stop risks more than sized.
 
+    Before any price rule the quote must be current: a missing or invalid
+    broker time, a time beyond ``ENTRY_QUOTE_FUTURE_SKEW_SECONDS`` in the
+    future, or a quote older than ``max_entry_quote_age_seconds`` rejects (an
+    after-hours "latest" quote can be hours old).
+
     The quote is a gate only: sizing has already run on the signal levels and
     is not touched.
 
@@ -952,7 +987,9 @@ async def _check_entry_deviation(
     reject the entry. Returns the quote/deviation figures to persist on the
     signal.
     """
-    max_fraction = _max_entry_deviation_sl_fraction(deployment)
+    gate_settings = entry_gate_settings(deployment.settings)
+    max_fraction = gate_settings.max_deviation_sl_fraction
+    max_age = gate_settings.max_quote_age_seconds
     log_data: dict[str, object] = {
         "deployment_id": str(deployment.id),
         "account_id": deployment.account_id,
@@ -962,6 +999,7 @@ async def _check_entry_deviation(
         "stop_loss": stop_loss,
         "take_profit": take_profit,
         "max_entry_deviation_sl_fraction": max_fraction,
+        "max_entry_quote_age_seconds": max_age,
     }
     get_quote = getattr(adapter, "get_quote", None)
     try:
@@ -994,6 +1032,9 @@ async def _check_entry_deviation(
         quote_price=quote_price,
     )
     quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
+    time_rule, quote_age = _quote_time_rule(
+        quote_time, now=_utc_now(), max_age_seconds=max_age
+    )
     record: dict[str, object] = {
         "entry_quote_bid": bid,
         "entry_quote_ask": ask,
@@ -1001,6 +1042,9 @@ async def _check_entry_deviation(
         "entry_quote_price": quote_price,
         "entry_quote_time": quote_time.isoformat() if isinstance(quote_time, datetime) else None,
         "entry_quote_source": str(quote.source or type(adapter).__name__),
+        "entry_quote_time_source": str(quote.timestamp_source or ""),
+        "entry_quote_age_seconds": quote_age,
+        "max_entry_quote_age_seconds": max_age,
         # Signed: positive = toward the stop, negative = away from it.
         "entry_deviation_sl_fraction": deviation,
         "entry_deviation_direction": (
@@ -1013,7 +1057,7 @@ async def _check_entry_deviation(
         "max_entry_deviation_sl_fraction": max_fraction,
         "entry_gate_rejection_rule": None,
     }
-    rule = _entry_gate_rejection_rule(
+    rule = time_rule or _entry_gate_rejection_rule(
         signal.action,
         quote_price=quote_price,
         stop_loss=stop_loss,
@@ -1030,7 +1074,8 @@ async def _check_entry_deviation(
         raise ValueError(
             f"Refusing live entry for {signal.symbol}: entry deviation gate rejected "
             f"({rule}): signed deviation {deviation:.4f} of the SL distance "
-            f"(positive = toward the stop), limit +/-{max_fraction} "
+            f"(positive = toward the stop), limit +/-{max_fraction}; quote time "
+            f"{record['entry_quote_time']!r}, age {quote_age!r}s, limit {max_age}s "
             f"(entry={entry_price}, stop={stop_loss}, take_profit={take_profit}, "
             f"{side}={quote_price})."
         )

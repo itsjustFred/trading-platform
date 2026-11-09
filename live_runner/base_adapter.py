@@ -151,15 +151,21 @@ class LiveQuote:
     what the broker sent; the daemon validates it (finite, positive, not
     crossed) and fails closed on anything else.
 
-    ``timestamp`` is the broker's quote time when the broker provides one,
-    otherwise ``None`` (never a locally invented time). ``source`` names the
-    feed so a persisted quote can be traced back (#134).
+    ``timestamp`` must be timezone-aware. The daemon rejects a quote whose time
+    is missing, invalid, in the future or older than the deployment's
+    ``max_entry_quote_age_seconds``. ``timestamp_source`` says where the time
+    came from: ``"broker"`` (the quote's own time, the default) or
+    ``"receive"`` (the local time the adapter received it, for brokers whose
+    stream does not send a time). Adapters never substitute ``now()`` for a
+    broker time that should have been there. ``source`` names the feed so a
+    persisted quote can be traced back (#134).
     """
 
     bid: float
     ask: float
     timestamp: datetime | None = None
     source: str = ""
+    timestamp_source: str = "broker"
 
 
 @dataclass(frozen=True)

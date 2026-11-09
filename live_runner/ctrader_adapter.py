@@ -162,18 +162,27 @@ EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 
 
+def _utc_now() -> datetime:
+    """Receive-time clock for spot events (a seam so tests can freeze it)."""
+    return datetime.now(timezone.utc)
+
+
 @dataclasses.dataclass
 class _SpotWaiter:
     """Collects one bid/ask from spot events for a pending :meth:`get_quote`.
 
     cTrader spot events may carry only the side that changed, so the two
     sides are accumulated across events received after the subscription.
+    ``timestamp`` is the latest broker spot time seen; ``received_at`` the
+    local time the completing event arrived, used only when the broker sent
+    no time at all.
     """
 
     future: asyncio.Future[LiveQuote]
     bid: float | None = None
     ask: float | None = None
     timestamp: datetime | None = None
+    received_at: datetime | None = None
 
 
 def _present_proto_field(payload: Any, name: str) -> Any | None:
@@ -2464,13 +2473,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ValueError(f"cTrader spot event for symbolId {symbol_id} is unreadable: {exc}")
             )
             return
+        waiter.received_at = _utc_now()
         if waiter.bid is not None and waiter.ask is not None:
+            # The broker's spot time when it sent one (subscribeToSpotTimestamp
+            # is requested); otherwise the time this event was received, which
+            # is labelled as such. A spot event is pushed live, so its receive
+            # time bounds its age; it is never an invented time.
+            broker_time = waiter.timestamp
             waiter.future.set_result(
                 LiveQuote(
                     bid=waiter.bid,
                     ask=waiter.ask,
-                    timestamp=waiter.timestamp,
+                    timestamp=broker_time if broker_time is not None else waiter.received_at,
                     source="ctrader_spot_event",
+                    timestamp_source="broker" if broker_time is not None else "receive",
                 )
             )
 
@@ -2502,7 +2518,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """Current bid/ask for the #125 entry-deviation gate.
 
         Subscribes to the symbol's spot stream, takes the first complete
-        bid/ask that arrives after the subscription, then unsubscribes. Raises
+        bid/ask that arrives after the subscription, then unsubscribes. The
+        quote time is the spot event's broker time, else the time the event
+        was received (``timestamp_source="receive"``). Raises
         on an unknown symbol, a refused subscription, or no quote within
         ``quote_timeout_seconds``; it never returns an invented price.
         """

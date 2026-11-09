@@ -1128,12 +1128,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 raise ValueError(
                     f"Alpaca quote for {normalized_symbol} has no usable {side}: {raw!r}"
                 ) from exc
+        # The quote's own time, never now(): an after-hours "latest" quote can
+        # be hours old, and the daemon's freshness rule must see that.
         timestamp = getattr(quote, "timestamp", None)
         return LiveQuote(
             bid=prices["bid_price"],
             ask=prices["ask_price"],
             timestamp=timestamp if isinstance(timestamp, datetime) else None,
             source="alpaca_iex_latest_quote",
+            timestamp_source="broker",
         )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────

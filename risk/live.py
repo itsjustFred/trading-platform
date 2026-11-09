@@ -15,6 +15,8 @@ submits from it, so the size and the broker levels cannot disagree.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from risk.config import RiskConfig
@@ -105,6 +107,66 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
     if take is not None and take <= 0:
         raise ValueError("take_profit must be > 0")
     return entry, stop, take
+
+
+#: Defaults for the per-deployment entry-deviation gate settings (#125).
+DEFAULT_MAX_ENTRY_DEVIATION_SL_FRACTION = 0.25
+DEFAULT_MAX_ENTRY_QUOTE_AGE_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class EntryGateSettings:
+    """Validated entry-deviation gate settings of one deployment."""
+
+    max_deviation_sl_fraction: float
+    max_quote_age_seconds: float
+
+
+def _gate_setting(settings: Mapping[str, Any], key: str, default: float) -> float:
+    if key not in settings:
+        return default
+    raw = settings[key]
+    if raw is None or isinstance(raw, bool):
+        raise ValueError(f"{key} must be a number, got {raw!r}")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{key} must be a number, got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite, got {raw!r}")
+    return value
+
+
+def entry_gate_settings(settings: Mapping[str, Any] | None) -> EntryGateSettings:
+    """Validate a deployment's entry-deviation gate settings (#125).
+
+    ``settings`` is the deployment's ``settings`` mapping (trusted config),
+    never signal metadata. Used at deployment creation and again at dispatch,
+    so a bad value is refused up front and can never silently disable the gate:
+
+    * ``max_entry_deviation_sl_fraction``: within ``[0, 1]`` (default 0.25). A
+      fraction of the SL distance, so ``25`` meant as 25 % is an error.
+    * ``max_entry_quote_age_seconds``: finite and ``> 0`` (default 10).
+
+    Raises ``ValueError`` naming the key.
+    """
+    values = settings or {}
+    fraction = _gate_setting(
+        values, "max_entry_deviation_sl_fraction", DEFAULT_MAX_ENTRY_DEVIATION_SL_FRACTION
+    )
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            "max_entry_deviation_sl_fraction must be within [0, 1] (a fraction of "
+            f"the SL distance, 0.25 = 25 %), got {fraction!r}"
+        )
+    max_age = _gate_setting(
+        values, "max_entry_quote_age_seconds", DEFAULT_MAX_ENTRY_QUOTE_AGE_SECONDS
+    )
+    if max_age <= 0:
+        raise ValueError(f"max_entry_quote_age_seconds must be > 0, got {max_age!r}")
+    return EntryGateSettings(
+        max_deviation_sl_fraction=fraction, max_quote_age_seconds=max_age
+    )
 
 
 def entry_deviation_sl_fraction(

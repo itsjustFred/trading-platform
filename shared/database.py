@@ -3067,7 +3067,12 @@ def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from risk.live import entry_gate_settings
 
+    # Entry-gate settings (#125) are refused at creation, not first at
+    # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
+    # otherwise sit in the database until the first signal is rejected.
+    entry_gate_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)

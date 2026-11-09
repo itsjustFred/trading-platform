@@ -953,7 +953,12 @@ class _DiscordSmokeAdapter:
         # #125 entry-deviation gate: quote at the replayed message price.
         from live_runner.base_adapter import LiveQuote
 
-        return LiveQuote(bid=190.50, ask=190.50, source="discord-smoke")
+        return LiveQuote(
+            bid=190.50,
+            ask=190.50,
+            timestamp=datetime.now(timezone.utc),
+            source="discord-smoke",
+        )
 
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:
