@@ -35,9 +35,14 @@ from live_runner.credential_env import (
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.exit_signals import (
+    EXIT_POSITION_SIDE_KEY,
+    FULL_EXIT,
+    ExitInstruction,
     NothingToExitError,
     exit_instruction_from_metadata,
+    exit_intent_metadata,
     is_exit_intent,
+    is_exit_order,
     resolve_exit_order,
 )
 from live_runner.service_discovery import discover_discord_bots_from_env
@@ -858,154 +863,32 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
-def _resolve_exit_only_target_qty(
-    positions: Iterable[Mapping[str, object]],
-    symbol: str,
-) -> float:
-    quantities: list[float] = []
-    for position in positions:
-        position_symbol = str(position.get("symbol") or "").strip().upper()
-        if position_symbol != symbol.upper():
-            continue
-        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        return 0.0
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {symbol} has multiple broker positions; "
-            "refusing an unaddressed aggregate close."
-        )
-    if quantities[0] < 0:
-        return abs(quantities[0])
-    return quantities[0]
-
-
-def _exit_only_close_action(positions: Iterable[Mapping[str, object]], symbol: str) -> str:
-    quantities: list[float] = []
-    for position in positions:
-        position_symbol = str(position.get("symbol") or "").strip().upper()
-        if position_symbol != symbol.upper():
-            continue
-        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        return "sell"
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {symbol} has multiple broker positions; "
-            "refusing an ambiguous aggregate close."
-        )
-    return "buy" if quantities[0] < 0 else "sell"
-
-
-async def _metadata_for_exit_only_order(
-    signal: LiveSignal,
-    adapter: BaseLiveAdapter,
-    metadata: dict[str, object],
-) -> dict[str, object]:
-    get_positions = getattr(adapter, "get_positions", None)
-    if not callable(get_positions):
-        raise ValueError("Exit-only signal requires broker adapter with get_positions support")
-    positions = list(await get_positions())
-    matching_positions = [
-        position
-        for position in positions
-        if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
-    ]
-    quantities: list[float] = []
-    for position in matching_positions:
-        try:
-            quantity = _coerce_live_float(position.get("qty"), field_name="broker position qty")
-        except ValueError as exc:
-            raise ValueError(
-                f"Exit-only signal for {signal.symbol} received an invalid "
-                "broker position quantity."
-            ) from exc
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {signal.symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        raise ValueError(
-            f"Exit-only signal received for {signal.symbol} but no position is open"
-        )
-    if any(quantity < 0 for quantity in quantities) and any(
-        quantity > 0 for quantity in quantities
-    ):
-        raise ValueError(
-            f"Exit-only signal for {signal.symbol} has mixed long and short broker positions; "
-            "refusing an ambiguous close."
-        )
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {signal.symbol} has multiple broker positions; "
-            "refusing an unaddressed aggregate close."
-        )
-    target_qty = abs(quantities[0])
-    for key in (
-        "qty",
-        "explicit_qty",
-        "ctrader_volume",
-        "volume",
-        "position_id",
-        "position_ids",
-        "position_count",
-    ):
-        metadata.pop(key, None)
-    metadata["qty"] = float(target_qty)
-    metadata["explicit_qty"] = float(target_qty)
-    metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
-    metadata["position_count"] = len(matching_positions)
-    position_ids: list[int] = []
-    for position in matching_positions:
-        raw_position_id = position.get("position_id", position.get("positionId"))
-        if raw_position_id is None:
-            continue
-        try:
-            position_id = int(raw_position_id)
-        except (TypeError, ValueError):
-            continue
-        if position_id > 0:
-            position_ids.append(position_id)
-    if len(matching_positions) == 1 and len(position_ids) == 1:
-        metadata["position_id"] = position_ids[0]
-    elif position_ids:
-        metadata["position_ids"] = position_ids
-    close_action = _exit_only_close_action(positions, signal.symbol)
-    metadata["action"] = close_action
-    metadata["signal_action"] = signal.action
-    return metadata
-
-
 async def prepare_exit_intent_order(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     signal: LiveSignal,
+    *,
+    instruction: ExitInstruction | None = None,
 ) -> tuple[LiveSignal, float]:
-    """Size an exit/close instruction against this deployment's own position (#121).
+    """Size an exit against this deployment's own position (#121).
 
-    The quantity is the deployment's net persisted fills for the symbol (the
-    ledger), capped at the broker position, times the instruction's fraction. The
-    close side comes from that position, never from the message. Raises
-    :class:`NothingToExitError` when there is nothing to close - the caller logs
-    and ignores it - and ``ValueError`` when a close would be ambiguous or would
-    extend exposure. Nothing here places an order.
+    Every exit goes through here: a parsed exit/close message (its instruction is
+    read from the metadata) and a plain or momentum-reversal SELL on a deployment
+    that cannot short (``instruction`` is a full exit). The quantity is the
+    deployment's net persisted fills for the symbol (the ledger), capped at the
+    broker position, times the instruction's fraction, so another deployment's
+    share of a netted position stays open. The close side comes from that
+    position, never from the message. Raises :class:`NothingToExitError` when
+    there is nothing of this deployment's to close - the caller logs and ignores
+    it - and ``ValueError`` when a close would be ambiguous or would extend
+    exposure. Nothing here places an order.
 
     Deliberately independent of the entry path (no risk sizing, no SL/TP guard,
     no deployment-status check), so the exit can be dispatched on its own.
     """
     metadata = dict(signal.metadata or {})
-    instruction = exit_instruction_from_metadata(metadata)
+    if instruction is None:
+        instruction = exit_instruction_from_metadata(metadata)
     get_positions = getattr(adapter, "get_positions", None)
     if not callable(get_positions):
         raise ValueError("Exit signal requires a broker adapter with get_positions support")
@@ -1041,6 +924,11 @@ async def prepare_exit_intent_order(
         "resolved_stop_loss",
     ):
         metadata.pop(key, None)
+    # Stamp the instruction actually executed, so the persisted signal records
+    # every exit the same way whichever producer it came from. A side the
+    # executed instruction does not name must not survive from the payload.
+    metadata.pop(EXIT_POSITION_SIDE_KEY, None)
+    metadata.update(exit_intent_metadata(instruction))
     metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)
     metadata["exit_only"] = True
@@ -1139,25 +1027,21 @@ async def prepare_order_with_risk(
     balance) because sizing has to see broker truth.
     """
     metadata = dict(signal.metadata or {})
-    if is_exit_intent(metadata):
-        # A parsed exit/close message (#121). Checked before the legacy
-        # sell-on-long-only path: it closes only this deployment's own ledger
-        # quantity, whatever the action placeholder says.
-        return await prepare_exit_intent_order(adapter, deployment, signal)
-    if signal.action == "sell" and bool(metadata.get("exit_only")):
-        # Exit-only orders close an existing position at the broker-observed
-        # quantity. They bypass risk sizing and the entry fail-closed SL/TP
-        # guard: they reduce exposure instead of opening a new position.
-        metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
-        # The close side is derived from the broker book (a short must be
-        # bought back), so the stamped action wins over the signal's.
-        update: dict[str, object] = {"metadata": metadata}
-        close_action = metadata.get("action")
-        if close_action in {"buy", "sell"} and close_action != signal.action:
-            update["action"] = close_action
-        # C1/B2: the broker-resolved flatten qty is binding — pass it
-        # explicitly so the adapter never re-sizes.
-        return signal.model_copy(update=update), float(metadata["explicit_qty"])
+    if is_exit_order(signal.action, metadata):
+        # Every exit closes only this deployment's own ledger quantity (#121),
+        # never the whole netted broker position: a parsed exit/close message
+        # (its instruction is in the metadata, whatever the action placeholder
+        # says) and a plain or momentum-reversal SELL on a deployment that cannot
+        # short (a full exit). Exits bypass risk sizing and the entry SL/TP guard
+        # because they reduce exposure. The close side comes from the position (a
+        # short is bought back), and the resolved qty is binding (C1/B2) so the
+        # adapter never re-sizes.
+        return await prepare_exit_intent_order(
+            adapter,
+            deployment,
+            signal,
+            instruction=None if is_exit_intent(metadata) else FULL_EXIT,
+        )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -1809,6 +1693,8 @@ async def _submit_normalized_discord_signal(
         )
         return
 
+    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -1832,6 +1718,23 @@ async def _submit_normalized_discord_signal(
         )
         return
     except Exception as exc:
+        if is_exit:
+            # A refused exit leaves this deployment's position open: an operator
+            # has to look at it, so it is an error, not a skipped signal (#121).
+            logger.error(
+                "Exit signal refused before submission; nothing was sent to the "
+                "broker and the position stays open",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "action": live_signal.action,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
         logger.warning(
             "Discord signal refused before submission; nothing was sent to the broker",
             extra={
@@ -1894,14 +1797,24 @@ async def _submit_normalized_discord_signal(
                     # handled refusal into an exception that aborts the fan-out
                     # to the remaining deployments.
                     logger.exception("Could not release the submission lease")
-                logger.warning(
-                    "Discord signal was refused before the broker request; "
-                    "released the submission lease",
+                # A refused exit leaves the position open (#121): error, so an
+                # operator sees it. A refused entry opened nothing: warning.
+                log = logger.error if is_exit else logger.warning
+                log(
+                    (
+                        "Exit signal was refused before the broker request; "
+                        "released the submission lease and the position stays open"
+                        if is_exit
+                        else "Discord signal was refused before the broker request; "
+                        "released the submission lease"
+                    ),
                     extra={
                         "data": {
                             "account_id": account_id,
                             "deployment_id": str(deployment.id),
                             "symbol": prepared_signal.symbol,
+                            "action": prepared_signal.action,
+                            "exit": is_exit,
                             "error": str(exc),
                         }
                     },
@@ -1921,6 +1834,8 @@ async def _submit_normalized_discord_signal(
                         "account_id": account_id,
                         "deployment_id": str(deployment.id),
                         "symbol": prepared_signal.symbol,
+                        "action": prepared_signal.action,
+                        "exit": is_exit,
                         "error": str(exc),
                     }
                 },

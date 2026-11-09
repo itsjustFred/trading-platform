@@ -459,3 +459,257 @@ def test_parsed_exit_message_end_to_end(monkeypatch) -> None:
     signal, qty = adapter.submitted[0]
     assert signal.action == "sell", "an exit of a long must sell, never buy"
     assert qty == pytest.approx(3.0)
+
+
+# ─── Plain and momentum-reversal SELLs are exits too ─────────────────────────
+#
+# Follow-up decision on #121: *every* exit closes only the deployment's own
+# quantity, not just parsed exit/close messages. A plain SELL or a RocketFuel
+# momentum-reversal SELL on a deployment that cannot short used to flatten the
+# whole netted broker position, closing other deployments' shares with it.
+
+
+def _sell_trade_signal(**extra_metadata: object) -> TradeSignal:
+    metadata: dict[str, object] = {
+        "source": "discord",
+        "discord_channel_id": "100000000000000121",
+        "discord_message_id": "900000000000000123",
+        "discord_author_id": "bot-121",
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        **extra_metadata,
+    }
+    return TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata=metadata,
+    )
+
+
+def _reversal_trade_signal() -> TradeSignal:
+    """What RocketFuel's long-only processor emits for a momentum reversal."""
+    return _sell_trade_signal(
+        exit_only=True,
+        signal_type="momentum_reversal",
+        signal_bot="rocketfuel",
+        rocketfuel_variant="longonly",
+        processor_mode="long-only-exit-on-sell",
+        take_profit_policy="unbounded_exit_on_opposite_signal",
+    )
+
+
+@pytest.mark.parametrize(
+    "trade_signal",
+    [_sell_trade_signal(), _reversal_trade_signal()],
+    ids=["plain-sell", "momentum-reversal"],
+)
+def test_a_sell_exit_keeps_the_other_deployments_share_open(
+    monkeypatch, trade_signal
+) -> None:
+    """Broker holds 25 = 10 (this deployment) + 15 (another): sell 10 only."""
+    deployment = _deployment(allow_short=False)
+    calls = _patch_ledger(monkeypatch, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 25.0}])
+
+    _run_submit(adapter, deployment, trade_signal)
+
+    assert calls == [(str(deployment.id), "AAPL")]
+    assert len(adapter.submitted) == 1
+    signal, qty = adapter.submitted[0]
+    assert signal.action == "sell"
+    assert qty == pytest.approx(10.0)
+    assert signal.metadata["explicit_qty"] == pytest.approx(10.0)
+    assert signal.metadata["risk_sizing_mode"] == "exit_only"
+    # Recorded as the full exit it was executed as.
+    assert signal.metadata["signal_intent"] == "exit"
+    assert signal.metadata["exit_fraction"] == pytest.approx(1.0)
+    assert "stop_loss" not in signal.metadata
+    assert "take_profit" not in signal.metadata
+
+
+@pytest.mark.parametrize(
+    "trade_signal",
+    [_sell_trade_signal(), _reversal_trade_signal()],
+    ids=["plain-sell", "momentum-reversal"],
+)
+def test_a_sell_exit_without_own_quantity_is_ignored(
+    monkeypatch, caplog, trade_signal
+) -> None:
+    """The broker position is entirely another deployment's: close nothing."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, 0.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 25.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, trade_signal)
+
+    assert adapter.submitted == []
+    assert any("Exit signal ignored" in record.getMessage() for record in caplog.records)
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_a_sell_exit_is_capped_at_the_broker_position(monkeypatch) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, 30.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": 12.0}])
+
+    _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0][1] == pytest.approx(12.0)
+
+
+def test_a_sell_exit_of_an_own_short_buys_it_back(monkeypatch) -> None:
+    """#76 still holds: the close side comes from the own position."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, -3.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": -8.0}])
+
+    _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert len(adapter.submitted) == 1
+    signal, qty = adapter.submitted[0]
+    assert signal.action == "buy"
+    assert qty == pytest.approx(3.0)
+
+
+def test_a_sell_on_a_long_and_short_deployment_is_still_an_entry() -> None:
+    """Only a deployment that cannot short turns a plain SELL into an exit."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+    from live_runner.exit_signals import is_exit_order
+
+    live = _trade_signal_to_live_signal(
+        _sell_trade_signal(), _deployment(allow_short=True)
+    )
+    assert not is_exit_order(live.action, live.metadata)
+
+
+def test_is_exit_order_covers_every_exit_and_nothing_else() -> None:
+    from live_runner.exit_signals import is_exit_order
+
+    assert is_exit_order("sell", {"signal_intent": "exit", "exit_fraction": 1.0})
+    # The action of a parsed exit is a placeholder; the intent decides.
+    assert is_exit_order("buy", {"signal_intent": "exit", "exit_fraction": 1.0})
+    assert is_exit_order("sell", {"exit_only": True})
+    assert is_exit_order("SELL", {"exit_only": True})
+    assert not is_exit_order("sell", {})
+    assert not is_exit_order("sell", None)
+    assert not is_exit_order("sell", {"exit_only": False})
+    # exit_only on a buy is not a path the daemon sizes as an exit.
+    assert not is_exit_order("buy", {"exit_only": True})
+
+
+# ─── A refused exit is an ERROR: the position stays open ─────────────────────
+
+
+class _RefusingAdapter(_Adapter):
+    """Refuses every order before the broker request, like a broker-side
+    volume floor or Alpaca's no-position guard."""
+
+    async def submit_order(self, signal, *, qty=None):
+        from live_runner.base_adapter import order_not_submitted
+
+        self.submitted.append((signal, qty))
+        with order_not_submitted():
+            raise ValueError("order rejected: volume below the broker minimum")
+
+
+class _UnknownOutcomeAdapter(_Adapter):
+    """The broker answered with a rejection after the request went out."""
+
+    async def submit_order(self, signal, *, qty=None):
+        self.submitted.append((signal, qty))
+        raise RuntimeError("Order rejected (MARKET_CLOSED): market is closed")
+
+
+def _records_at(caplog, level: int, text: str):
+    return [
+        record
+        for record in caplog.records
+        if record.levelno == level and text in record.getMessage()
+    ]
+
+
+@pytest.mark.parametrize(
+    "trade_signal",
+    [_exit_trade_signal(), _sell_trade_signal(), _reversal_trade_signal()],
+    ids=["exit-message", "plain-sell", "momentum-reversal"],
+)
+def test_a_broker_refused_exit_is_logged_at_error(monkeypatch, caplog, trade_signal) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, 10.0)
+    adapter = _RefusingAdapter([{"symbol": "AAPL", "qty": 10.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, trade_signal)
+
+    assert len(adapter.submitted) == 1
+    assert _records_at(caplog, logging.ERROR, "Exit signal was refused before the broker request")
+    assert not _records_at(caplog, logging.WARNING, "refused before the broker request")
+
+
+def test_a_broker_rejection_after_the_request_is_logged_at_error(monkeypatch, caplog) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, 10.0)
+    adapter = _UnknownOutcomeAdapter([{"symbol": "AAPL", "qty": 10.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    errors = _records_at(caplog, logging.ERROR, "unknown outcome")
+    assert errors
+    assert errors[0].data["exit"] is True
+
+
+def test_an_exit_refused_before_submission_is_logged_at_error(monkeypatch, caplog) -> None:
+    """Own long on a net-short broker book: refused, nothing sent, ERROR."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, 10.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": -5.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert adapter.submitted == []
+    assert _records_at(caplog, logging.ERROR, "Exit signal refused before submission")
+
+
+def test_a_refused_entry_is_still_only_a_warning(monkeypatch, caplog) -> None:
+    """Refusing an entry opens nothing; it must not page anyone."""
+    deployment = _deployment(allow_short=True)
+    adapter = _RefusingAdapter([])
+    entry = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata=dict(_sell_trade_signal().metadata),
+    )
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, entry)
+
+    assert len(adapter.submitted) == 1
+    assert _records_at(
+        caplog, logging.WARNING, "Discord signal was refused before the broker request"
+    )
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_a_sell_exit_records_no_side_it_did_not_execute(monkeypatch) -> None:
+    """A stray exit_position_side on a plain SELL is not what ran: drop it."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, -3.0)
+    adapter = _Adapter([{"symbol": "AAPL", "qty": -3.0}])
+
+    _run_submit(adapter, deployment, _sell_trade_signal(exit_position_side="long"))
+
+    assert len(adapter.submitted) == 1
+    signal, _qty = adapter.submitted[0]
+    assert signal.action == "buy"
+    assert "exit_position_side" not in signal.metadata

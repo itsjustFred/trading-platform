@@ -170,8 +170,19 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   genannte Seite → abgelehnt. Fills von Bracket-Legs (SL/TP), die nicht gegen
   ein Signal persistiert werden, fehlen im Ledger; daher der Deckel auf die
   Broker-Position.
-- Ein einfaches `SELL …`/Momentum-Reversal bleibt wie bisher ein Sell (auf
-  Long-only-Deployments ein Exit der ganzen Broker-Position).
+- **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein
+  Momentum-Reversal (RocketFuel long-only) auf einem Deployment ohne Shorts ist
+  ein Voll-Exit und wird nach derselben Regel gesized (Anteil 1, Seite aus der
+  eigenen Position, ein eigener Short wird zurückgekauft). Der Anteil eines
+  anderen Deployments an derselben genetteten Broker-Position bleibt offen; ohne
+  eigene Menge → ignoriert und geloggt. Auf einem Long+Short-Deployment bleibt
+  ein einfaches `SELL` ein Short-Entry.
+- **Abgelehnte Exits loggen auf `ERROR`:** Ein Exit, der vor dem Senden
+  abgelehnt wird (z. B. eigene Seite ≠ Broker-Seite), vom Adapter vor dem
+  Broker-Request abgelehnt wird (z. B. Mindestvolumen) oder dessen Broker-Antwort
+  ein Fehler ist, lässt die Position offen und wird auf `ERROR` geloggt
+  (`Exit signal refused …` bzw. `… unknown outcome`, mit `"exit": true`). Ein
+  abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ bleibt `INFO`.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.

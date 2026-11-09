@@ -788,102 +788,110 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
 
 
-# ── B-6: exit-only close sums all matching positions ──────────────────────────
+# ── B-6: an exit-only close never sums or guesses across positions ───────────
+#
+# Since #121 every exit-only SELL closes the deployment's own ledger quantity
+# (``live_runner.exit_signals.resolve_exit_order``), capped at the broker
+# position. These pin the broker-book guards that sizing still applies.
 
-def test_exit_only_target_qty_rejects_multiple_matching_positions():
-    from live_runner.daemon import _resolve_exit_only_target_qty
 
+def _patch_exit_ledger(monkeypatch, qty: float) -> None:
+    """The deployment's own net filled quantity, without a database."""
+    import live_runner.daemon as daemon
+
+    monkeypatch.setattr(
+        daemon, "get_live_deployment_net_filled_qty", lambda _deployment_id, _symbol: qty
+    )
+
+
+def _exit_only_sell(deployment_id: str = "dep-1", **metadata: Any) -> LiveSignal:
+    return LiveSignal(
+        deployment_id=deployment_id,
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, **metadata},
+    )
+
+
+def _prepare_exit_only(monkeypatch, positions, *, ledger_qty: float, **metadata: Any):
+    from live_runner.daemon import prepare_order_with_risk
+
+    class _Adapter:
+        async def get_positions(self):
+            return list(positions)
+
+    _patch_exit_ledger(monkeypatch, ledger_qty)
+    deployment = _deployment()
+    signal = _exit_only_sell(str(deployment.id), **metadata)
+    return asyncio.run(prepare_order_with_risk(_Adapter(), deployment, signal))
+
+
+def test_exit_only_rejects_multiple_matching_positions(monkeypatch):
     positions = [
         {"symbol": "EURUSD", "qty": 2.0},
         {"symbol": "eurusd", "qty": 3.5},
     ]
 
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        _resolve_exit_only_target_qty(iter(positions), "EURUSD")
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(monkeypatch, positions, ledger_qty=2.0)
 
 
-def test_exit_only_target_qty_preserves_single_short_position():
-    from live_runner.daemon import _resolve_exit_only_target_qty
+def test_exit_only_preserves_single_short_position(monkeypatch):
+    prepared, qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": -0.5}], ledger_qty=-0.5
+    )
 
-    assert _resolve_exit_only_target_qty(
-        iter([{"symbol": "EURUSD", "qty": -0.5}]), "EURUSD"
-    ) == pytest.approx(0.5)
+    assert qty == pytest.approx(0.5)
+    assert prepared.action == "buy"
 
 
-def test_exit_only_close_action_rejects_mixed_books():
-    from live_runner.daemon import _exit_only_close_action
-
-    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": -2.0}]), "EURUSD") == "buy"
-    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": 2.0}]), "EURUSD") == "sell"
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        _exit_only_close_action(
-            iter([{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -1.0}]),
-            "EURUSD",
+def test_exit_only_rejects_mixed_books(monkeypatch):
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(
+            monkeypatch,
+            [{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -1.0}],
+            ledger_qty=2.0,
         )
 
 
-def test_exit_only_metadata_restamps_action_for_short_book():
-    from live_runner.daemon import _metadata_for_exit_only_order
-
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": -2.0}]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
+def test_exit_only_metadata_restamps_action_for_short_book(monkeypatch):
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": -2.0}], ledger_qty=-2.0
     )
 
-    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    assert prepared.metadata["explicit_qty"] == pytest.approx(2.0)
+    assert prepared.metadata["risk_sizing_mode"] == "exit_only"
+    assert prepared.metadata["action"] == "buy"
+    assert prepared.metadata["signal_action"] == "sell"
+    assert prepared.action == "buy"
 
-    assert metadata["explicit_qty"] == pytest.approx(2.0)
-    assert metadata["risk_sizing_mode"] == "exit_only"
-    assert metadata["action"] == "buy"
-    assert metadata["signal_action"] == "sell"
 
-
-def test_exit_only_metadata_rejects_multiple_positions():
-    from live_runner.daemon import _metadata_for_exit_only_order
-
-    class _Adapter:
-        async def get_positions(self):
-            return [
+def test_exit_only_metadata_rejects_multiple_positions(monkeypatch):
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(
+            monkeypatch,
+            [
                 {"symbol": "EURUSD", "qty": 1.0, "position_id": 10},
                 {"symbol": "EURUSD", "qty": 2.0, "position_id": 11},
-            ]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
-    )
-
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
-
-
-def test_exit_only_target_qty_rejects_unparseable_rows():
-    from live_runner.daemon import _resolve_exit_only_target_qty
-
-    with pytest.raises(ValueError, match="Invalid qty"):
-        _resolve_exit_only_target_qty(
-            iter([{"symbol": "EURUSD", "qty": "not-a-number"}]), "EURUSD"
+            ],
+            ledger_qty=1.0,
         )
 
 
-def test_exit_only_target_qty_returns_zero_when_no_match():
-    from live_runner.daemon import _resolve_exit_only_target_qty
+def test_exit_only_rejects_unparseable_rows(monkeypatch):
+    with pytest.raises(ValueError, match="invalid broker position quantity"):
+        _prepare_exit_only(
+            monkeypatch, [{"symbol": "EURUSD", "qty": "not-a-number"}], ledger_qty=1.0
+        )
 
-    positions = [{"symbol": "AAPL", "qty": 10.0}]
 
-    assert _resolve_exit_only_target_qty(iter(positions), "EURUSD") == 0.0
+def test_exit_only_without_a_matching_position_closes_nothing(monkeypatch):
+    from live_runner.exit_signals import NothingToExitError
+
+    with pytest.raises(NothingToExitError):
+        _prepare_exit_only(monkeypatch, [{"symbol": "AAPL", "qty": 10.0}], ledger_qty=1.0)
 
 
 # ── B-10: exposure fed to the risk engine is risk-at-stake in balance units ───
@@ -3624,11 +3632,12 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
         resolve(naked_signal)
 
 
-def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
+def test_exit_only_orders_still_bypass_sizing_but_close_exact_position(monkeypatch):
     """Exit-only must keep its exact-qty path (no risk sizing) and must not be
     blocked by the entry SL/TP guard."""
     from live_runner.daemon import submit_order_with_risk
 
+    _patch_exit_ledger(monkeypatch, 3.0)
     deployment = _deployment()
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": 3.0}]
@@ -3651,9 +3660,10 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal.action == "sell"
 
 
-def test_exit_only_metadata_discards_untrusted_close_volume() -> None:
+def test_exit_only_metadata_discards_untrusted_close_volume(monkeypatch) -> None:
     from live_runner.daemon import submit_order_with_risk
 
+    _patch_exit_ledger(monkeypatch, 3.0)
     deployment = _deployment()
     adapter = _PositionsAdapter(positions=[{"symbol": "EURUSD", "qty": 3.0}])
     signal = LiveSignal(
@@ -3699,11 +3709,12 @@ def test_entry_metadata_discards_raw_broker_volume_but_keeps_risk_qty() -> None:
     assert "ctrader_volume" not in adapter.submitted_signal.metadata
 
 
-def test_exit_only_orders_close_short_positions_with_a_buy():
+def test_exit_only_orders_close_short_positions_with_a_buy(monkeypatch):
     """#76: an exit-only signal on a net-short book must submit a BUY that
     flattens the short magnitude instead of raising 'no long position'."""
     from live_runner.daemon import submit_order_with_risk
 
+    _patch_exit_ledger(monkeypatch, -3.0)
     deployment = _deployment()
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": -3.0}]
@@ -4284,37 +4295,24 @@ def test_ctrader_disconnect_clears_symbol_session_state() -> None:
     assert adapter._order_id_to_symbol == {}
 
 
-def test_exit_only_metadata_flows_through_adapter_volume_gate() -> None:
+def test_exit_only_metadata_flows_through_adapter_volume_gate(monkeypatch) -> None:
     """Pre-mortem PM1: daemon exit-only metadata must satisfy the adapter's
     volume gate — producer and consumer share one constant, not two
     spellings."""
-    import asyncio
-
     from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
-    from live_runner.daemon import _metadata_for_exit_only_order
 
     assert EXIT_ONLY_RISK_SIZING_MODE == "exit_only"
 
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": 2.0}]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": 2.0}], ledger_qty=2.0
     )
-    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    metadata = prepared.metadata
     assert metadata["risk_sizing_mode"] == EXIT_ONLY_RISK_SIZING_MODE
     assert metadata["qty"] == pytest.approx(2.0)
     assert metadata["explicit_qty"] == pytest.approx(2.0)
 
     _module, adapter = _make_ctrader_adapter()
-    gated = signal.model_copy(update={"metadata": metadata})
-    assert adapter._resolve_order_volume(gated) == 2000
+    assert adapter._resolve_order_volume(prepared) == 2000
 
 
 def test_unbounded_tp_policy_passes_daemon_guard_with_warning(caplog) -> None:

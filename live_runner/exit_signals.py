@@ -3,7 +3,9 @@
 An exit/close message ("Exit long AAPL @ 100", "Trim half AAPL") is not an entry.
 It must never open or extend a position, so it travels as its own kind of
 signal, marked by ``metadata["signal_intent"] == "exit"``, and is sized by a rule
-that only ever *reduces* exposure:
+that only ever *reduces* exposure. A plain or momentum-reversal SELL on a
+deployment that cannot short is an exit too (:data:`FULL_EXIT`) and is sized by
+the same rule:
 
 * The close side comes from the position, never from the message. The signal's
   ``action`` is only a placeholder that :func:`resolve_exit_order` replaces.
@@ -75,13 +77,36 @@ class ExitInstruction:
             )
 
 
+#: A plain or momentum-reversal SELL on a deployment that cannot short: close all
+#: of this deployment's own quantity. No side is named, so the close side comes
+#: from the own position (#76: a short is bought back).
+FULL_EXIT = ExitInstruction(fraction=1.0)
+
+
 def is_exit_intent(metadata: Mapping[str, object] | None) -> bool:
     """True when the signal is a parsed exit/close instruction.
 
-    Deliberately not ``exit_only``: that flag is also set on a plain sell for a
-    long-only deployment, which keeps its own (pre-#121) full-position close.
+    Deliberately not ``exit_only``: that flag also marks a plain sell on a
+    deployment that cannot short, which carries no instruction in its metadata
+    and is sized as :data:`FULL_EXIT`. Use :func:`is_exit_order` to ask whether a
+    signal is any kind of exit.
     """
     return str((metadata or {}).get(SIGNAL_INTENT_KEY) or "") == SIGNAL_INTENT_EXIT
+
+
+def is_exit_order(action: str, metadata: Mapping[str, object] | None) -> bool:
+    """True for every signal the daemon sizes as an exit.
+
+    That is a parsed exit/close instruction, or a SELL flagged ``exit_only`` (a
+    plain or momentum-reversal sell on a deployment that cannot short). The same
+    test the daemon's sizing dispatches on, so "logged as an exit" and "sized as
+    an exit" cannot drift apart.
+    """
+    if is_exit_intent(metadata):
+        return True
+    return str(action or "").strip().lower() == "sell" and bool(
+        (metadata or {}).get("exit_only")
+    )
 
 
 def exit_instruction_from_metadata(metadata: Mapping[str, object]) -> ExitInstruction:
