@@ -1126,3 +1126,122 @@ def test_nothing_to_exit_on_a_flat_book_stays_info(monkeypatch, caplog) -> None:
 
     assert _records_at(caplog, logging.INFO, "Exit signal ignored")
     assert not _records_at(caplog, logging.WARNING, "Exit signal ignored")
+
+
+# ─── Review concern 6: an exit never rounds up to the instrument's step ──────
+#
+# cTrader converted an exit's qty to broker volume with round(), so a partial
+# exit could close up to half a volume unit more than its fraction. Exits
+# (partial and full) round DOWN to the instrument's step; one that rounds to
+# nothing is ignored with a WARNING naming the requested qty and the step.
+
+
+@pytest.mark.parametrize(
+    ("qty", "step", "expected"),
+    [
+        (10 / 3, 1e-9, 3.333333333),
+        (1 / 6, 1e-9, 0.166666666),
+        (0.3336, 0.001, 0.333),
+        (0.5, 0.01, 0.5),
+        # Float noise of a whole quantity is not a lost unit.
+        (2.9999999999999996, 1.0, 3.0),
+        (0.30000000000000004, 0.1, 0.3),
+        (0.125, 1.0, 0.0),
+    ],
+)
+def test_round_exit_qty_down_to_step(qty, step, expected) -> None:
+    from live_runner.exit_signals import round_exit_qty_down
+
+    assert round_exit_qty_down(qty, step) == pytest.approx(expected, abs=1e-15)
+    assert round_exit_qty_down(qty, step) <= qty + 1e-12
+
+
+@pytest.mark.parametrize("step", [0.0, -1.0, float("nan"), float("inf")])
+def test_round_exit_qty_down_refuses_an_unusable_step(step) -> None:
+    from live_runner.exit_signals import round_exit_qty_down
+
+    with pytest.raises(ValueError):
+        round_exit_qty_down(1.0, step)
+
+
+class _SteppedAdapter(_Adapter):
+    """An adapter that names its exit quantity step."""
+
+    def __init__(self, positions, step: float):
+        super().__init__(positions)
+        self.step = step
+
+    def exit_qty_step(self, symbol: str) -> float:
+        return self.step
+
+
+def test_a_partial_exit_rounds_down_to_the_step(monkeypatch) -> None:
+    """1/3 of 0.5 is 0.1666...; a 0.01 step closes 0.16, never 0.17."""
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 0.5)
+    adapter = _SteppedAdapter([{"symbol": "AAPL", "qty": 0.5}], step=0.01)
+
+    _run_submit(adapter, deployment, _exit_trade_signal(fraction=1 / 3))
+
+    assert len(adapter.submitted) == 1
+    signal, qty = adapter.submitted[0]
+    assert qty == pytest.approx(0.16)
+    # What is persisted is what is sent.
+    assert signal.metadata["qty"] == pytest.approx(0.16)
+    assert signal.metadata["explicit_qty"] == pytest.approx(0.16)
+
+
+def test_a_full_exit_rounds_down_to_the_step(monkeypatch) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 0.567)
+    adapter = _SteppedAdapter([{"symbol": "AAPL", "qty": 0.567}], step=0.01)
+
+    _run_submit(adapter, deployment, _sell_trade_signal())
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0][1] == pytest.approx(0.56)
+
+
+def test_an_exit_that_rounds_to_nothing_is_ignored_with_a_warning(monkeypatch, caplog) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 0.5)
+    adapter = _SteppedAdapter([{"symbol": "AAPL", "qty": 0.5}], step=1.0)
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _exit_trade_signal(fraction=0.25))
+
+    assert adapter.submitted == []
+    warnings = _records_at(caplog, logging.WARNING, "below the instrument's quantity step")
+    assert warnings, [record.getMessage() for record in caplog.records]
+    assert warnings[0].data["requested_qty"] == pytest.approx(0.125)
+    assert warnings[0].data["qty_step"] == pytest.approx(1.0)
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+class _AdapterRefusingBelowStep(_Adapter):
+    """The adapter's own floor (defence in depth) refuses before the request."""
+
+    async def submit_order(self, signal, *, qty=None):
+        from live_runner.base_adapter import order_not_submitted
+        from live_runner.exit_signals import ExitBelowStepError
+
+        self.submitted.append((signal, qty))
+        with order_not_submitted():
+            raise ExitBelowStepError(
+                "exit rounds to nothing", requested_qty=0.0004, qty_step=0.001
+            )
+
+
+def test_an_adapter_below_step_refusal_is_a_warning_not_an_error(monkeypatch, caplog) -> None:
+    deployment = _deployment(allow_short=False)
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter = _AdapterRefusingBelowStep([{"symbol": "AAPL", "qty": 10.0}])
+
+    with caplog.at_level(logging.INFO):
+        _run_submit(adapter, deployment, _sell_trade_signal())
+
+    warnings = _records_at(caplog, logging.WARNING, "below the instrument's quantity step")
+    assert warnings, [record.getMessage() for record in caplog.records]
+    assert warnings[0].data["requested_qty"] == pytest.approx(0.0004)
+    assert warnings[0].data["qty_step"] == pytest.approx(0.001)
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]

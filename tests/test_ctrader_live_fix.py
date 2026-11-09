@@ -1300,3 +1300,97 @@ def test_ctrader_position_qty_tolerance_is_half_a_volume_step() -> None:
 
     assert adapter.position_qty_tolerance("EURUSD") == pytest.approx(0.0005)
     assert adapter.position_qty_tolerance("xauusd") == pytest.approx(0.5)
+
+
+# ─── #121 review concern 6: exit volumes round down to the step ──────────────
+
+
+def _volume_adapter(*, volume_per_qty: float = 1000.0, min_volume: int = 1, step_volume: int = 1):
+    from live_runner.ctrader_adapter import CTraderLiveAdapter, SymbolScale
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._symbol_props = {
+        "EURUSD": SymbolScale(
+            volume_per_qty=volume_per_qty,
+            price_digits=5,
+            min_volume=min_volume,
+            lot_size=volume_per_qty * 100.0,
+            step_volume=step_volume,
+        )
+    }
+    return adapter
+
+
+def _volume_signal(qty: float, *, exit_only: bool) -> LiveSignal:
+    metadata: dict[str, Any] = {"qty": qty, "explicit_qty": qty}
+    if exit_only:
+        metadata.update({"exit_only": True, "risk_sizing_mode": "exit_only"})
+    else:
+        metadata.update({"stop_loss": 1.0, "take_profit": 1.2})
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+
+
+def test_ctrader_exit_volume_rounds_down_entry_volume_keeps_rounding() -> None:
+    """0.3336 qty = 333.6 volume units: an exit closes 333, never 334."""
+    adapter = _volume_adapter()
+
+    assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=True)) == 333
+    assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=False)) == 334
+
+
+def test_ctrader_exit_volume_rounds_down_to_the_step_volume() -> None:
+    adapter = _volume_adapter(min_volume=100, step_volume=100)
+
+    assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=True)) == 300
+
+
+def test_ctrader_exit_volume_ignores_float_noise_of_a_whole_volume() -> None:
+    adapter = _volume_adapter(min_volume=1000, step_volume=1000)
+
+    assert adapter._resolve_order_volume(
+        _volume_signal(2.9999999999999996, exit_only=True)
+    ) == 3000
+
+
+def test_ctrader_exit_volume_that_rounds_to_nothing_is_refused_as_below_step() -> None:
+    from live_runner.exit_signals import ExitBelowStepError
+
+    adapter = _volume_adapter(min_volume=1000, step_volume=1000)
+
+    with pytest.raises(ExitBelowStepError) as excinfo:
+        adapter._resolve_order_volume(_volume_signal(0.5, exit_only=True))
+    assert excinfo.value.requested_qty == pytest.approx(0.5)
+    assert excinfo.value.qty_step == pytest.approx(1.0)
+    assert "0.5" in str(excinfo.value)
+
+
+def test_ctrader_exit_qty_step_is_the_step_volume_in_qty_units() -> None:
+    adapter = _volume_adapter(volume_per_qty=1000.0, min_volume=1000, step_volume=1000)
+    assert adapter.exit_qty_step("eurusd") == pytest.approx(1.0)
+    adapter = _volume_adapter(volume_per_qty=1000.0, step_volume=1)
+    assert adapter.exit_qty_step("EURUSD") == pytest.approx(0.001)
+
+
+def test_ctrader_step_volume_comes_from_broker_props() -> None:
+    from live_runner.ctrader_adapter import _symbol_scale_from_broker_props
+
+    scale = _symbol_scale_from_broker_props(
+        digits=5, lot_size=10_000_000, min_volume=1000, step_volume=1000, fallback=None
+    )
+    assert scale is not None
+    assert scale.step_volume == 1000
+    # Unknown or unusable: one broker volume unit, so a full close of the real
+    # position volume is never cut short.
+    for raw in (None, 0, -5, "x"):
+        scale = _symbol_scale_from_broker_props(
+            digits=5, lot_size=10_000_000, min_volume=1000, step_volume=raw, fallback=None
+        )
+        assert scale is not None
+        assert scale.step_volume == 1

@@ -627,3 +627,43 @@ def test_alpaca_position_qty_tolerance_is_below_one_fractional_share_step() -> N
     tolerance = _adapter(_FakeTradingClient()).position_qty_tolerance("AAPL")
 
     assert 0.0 < tolerance < 1e-9
+
+
+# ─── #121 review concern 6: exit quantities round down to 9 decimals ─────────
+
+
+def _exit_signal(qty: float) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only", "qty": qty},
+    )
+
+
+def test_alpaca_exit_qty_rounds_down_to_nine_decimals() -> None:
+    """1/3 of a 0.5-share position: 0.1666... closes 0.166666666, never ...667."""
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    qty = asyncio.run(adapter._require_exit_position(_exit_signal(0.5 / 3), 0.5 / 3))
+
+    assert qty == pytest.approx(0.166666666, abs=1e-15)
+    assert qty <= 0.5 / 3
+
+
+def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
+    from live_runner.exit_signals import ExitBelowStepError
+
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    with pytest.raises(ExitBelowStepError) as excinfo:
+        asyncio.run(adapter._require_exit_position(_exit_signal(4e-10), 4e-10))
+    assert excinfo.value.requested_qty == pytest.approx(4e-10)
+    assert excinfo.value.qty_step == pytest.approx(1e-9)
+
+
+def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
+    adapter = _adapter(_FakeTradingClient())
+    assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
