@@ -2,9 +2,14 @@
 
 Trust boundary: signal metadata is UNTRUSTED publisher payload. It may supply
 market descriptors of the trade itself (entry price, stop, take profit, ATR,
-timeframe, pip value) but never policy: risk limits, position counts, exposure
-state or a precomputed quantity all come from deployment/runtime configuration
-and the risk engine, never from the signal.
+timeframe) but never policy or instrument facts: risk limits, position counts,
+exposure state, a precomputed quantity and the pip value all come from
+deployment/runtime configuration, the broker and the risk engine, never from
+the signal (#125: a payload pip value scaled the size directly).
+
+:func:`resolve_live_levels` is the single source of the live entry/SL/TP
+precedence. The daemon's submission path (``live_runner.daemon``) sizes and
+submits from it, so the size and the broker levels cannot disagree.
 """
 
 from __future__ import annotations
@@ -75,7 +80,13 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
     """Resolve (entry, stop, take) for a live signal under one precedence.
 
     Entry: metadata entry_price, else theoretical_price. SL/TP: metadata
-    aliases only. One function so every sizing path geometry-matches.
+    aliases only, first present non-None alias wins. One function so every
+    sizing path geometry-matches (#125 maintainer decision).
+
+    A missing stop or take profit resolves to ``None``; what a caller does with
+    that is its policy (the risk engine may resolve a fallback stop, the daemon
+    applies its bracket guard). A present but malformed level (non-numeric,
+    boolean, non-finite or ``<= 0``) raises ``ValueError`` naming the key.
     """
     metadata = signal.metadata or {}
     try:
@@ -94,6 +105,44 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
     if take is not None and take <= 0:
         raise ValueError("take_profit must be > 0")
     return entry, stop, take
+
+
+def entry_deviation_sl_fraction(
+    action: str,
+    *,
+    entry_price: float,
+    stop_loss: float,
+    quote_price: float,
+) -> float:
+    """How far the live quote has moved from the signal entry toward the stop.
+
+    Expressed as a fraction of the SL distance ``|entry - stop|`` so one
+    threshold works across instruments (#125). Positive means the quote moved
+    TOWARD the stop (down for a buy, up for a sell); negative means it moved
+    away from the stop (in the trade's favour). ``0.25`` means a quarter of the
+    stop distance has been used up before the order is sent.
+
+    ``quote_price`` is the side the order would fill against: the ask for a
+    buy, the bid for a sell. The caller picks it.
+    """
+    if action not in {"buy", "sell"}:
+        raise ValueError(f"Unsupported action for entry deviation: {action!r}")
+    entry = _to_float(entry_price, default=0.0)
+    stop = _to_float(stop_loss, default=0.0)
+    quote = _to_float(quote_price, default=0.0)
+    if entry <= 0 or stop <= 0 or quote <= 0:
+        raise ValueError("entry, stop and quote prices must be > 0")
+    distance = entry - stop
+    if distance == 0:
+        raise ValueError("stop distance must be non-zero")
+    if (action == "buy") != (distance > 0):
+        raise ValueError(
+            f"stop_loss {stop!r} is on the wrong side of entry {entry!r} for a {action}"
+        )
+    # (entry - quote) / (entry - stop) has the right sign for both sides: for
+    # a buy both terms are positive when the quote fell toward the stop, for a
+    # sell both are negative when the quote rose toward it.
+    return (entry - quote) / distance
 
 
 def size_live_signal(

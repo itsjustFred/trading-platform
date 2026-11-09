@@ -4,6 +4,7 @@ import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Iterator
 
 from shared.logging import get_logger
@@ -142,6 +143,26 @@ def money_scale(money_digits: int) -> int:
 
 
 @dataclass(frozen=True)
+class LiveQuote:
+    """A broker top-of-book quote, in price units of the symbol.
+
+    Used by the daemon's entry-deviation gate (#125) only: it decides whether a
+    signal may still be submitted, and is never a sizing input. Adapters return
+    what the broker sent; the daemon validates it (finite, positive, not
+    crossed) and fails closed on anything else.
+
+    ``timestamp`` is the broker's quote time when the broker provides one,
+    otherwise ``None`` (never a locally invented time). ``source`` names the
+    feed so a persisted quote can be traced back (#134).
+    """
+
+    bid: float
+    ask: float
+    timestamp: datetime | None = None
+    source: str = ""
+
+
+@dataclass(frozen=True)
 class ControlOutcome:
     """What a cancel or flatten sweep actually achieved, including what it did not.
 
@@ -219,6 +240,15 @@ class BaseLiveAdapter(ABC):
     @abstractmethod
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Return the current broker bid/ask for ``symbol``.
+
+        Raises NotImplementedError when the broker cannot provide one. The daemon treats that
+        (and any other failure) as "no quote", which rejects the entry: the deviation gate
+        fails closed rather than submitting an order it could not check.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot provide a live quote")
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #

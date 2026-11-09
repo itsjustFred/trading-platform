@@ -949,6 +949,12 @@ class _DiscordSmokeAdapter:
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
 
+    async def get_quote(self, symbol: str) -> Any:
+        # #125 entry-deviation gate: quote at the replayed message price.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(bid=190.50, ask=190.50, source="discord-smoke")
+
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace

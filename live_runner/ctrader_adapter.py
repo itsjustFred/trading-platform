@@ -20,6 +20,7 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    LiveQuote,
     coerce_positive_live_qty,
     is_unbounded_tp,
     money_digits_from_trader,
@@ -159,6 +160,37 @@ QTY_VOLUME_SCALE = 1000.0
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+
+
+@dataclasses.dataclass
+class _SpotWaiter:
+    """Collects one bid/ask from spot events for a pending :meth:`get_quote`.
+
+    cTrader spot events may carry only the side that changed, so the two
+    sides are accumulated across events received after the subscription.
+    """
+
+    future: asyncio.Future[LiveQuote]
+    bid: float | None = None
+    ask: float | None = None
+    timestamp: datetime | None = None
+
+
+def _present_proto_field(payload: Any, name: str) -> Any | None:
+    """The field's value when it was sent, else ``None``.
+
+    Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
+    side from a sent one. A payload without ``HasField`` (a test double) falls
+    back to attribute presence.
+    """
+    has_field = getattr(payload, "HasField", None)
+    if has_field is not None:
+        try:
+            if not bool(has_field(name)):
+                return None
+        except (TypeError, ValueError):
+            return None
+    return getattr(payload, name, None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -651,6 +683,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._symbol_name_to_id: dict[str, int] = {}
+        # #125: pending get_quote calls by symbolId, and one lock per symbol
+        # (cTrader allows a single spot subscription per symbol and session).
+        self._spot_waiters: dict[int, _SpotWaiter] = {}
+        self._spot_locks: dict[int, asyncio.Lock] = {}
+        self.quote_timeout_seconds = 5.0
         # #80: broker-authoritative per-symbol scales (digits/lotSize), keyed
         # by upper symbol name. Tests/fallbacks use _fallback_symbol_scale.
         self._symbol_props: dict[str, SymbolScale] = {}
@@ -701,7 +738,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionType: Any = None
         self._ProtoOATimeInForce: Any = None
 
+        self._ProtoOASubscribeSpotsReq: Any = None
+        self._ProtoOAUnsubscribeSpotsReq: Any = None
+
         self._heartbeat_payload_type: int | None = None
+        self._spot_payload_type: int | None = None
         self._execution_payload_type: int | None = None
         self._error_payload_type: int | None = None
         self._order_error_payload_type: int | None = None
@@ -735,10 +776,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAReconcileRes,
                 ProtoOARefreshTokenReq,
                 ProtoOARefreshTokenRes,
+                ProtoOASpotEvent,
+                ProtoOASubscribeSpotsReq,
                 ProtoOASymbolsListReq,
                 ProtoOASymbolsListRes,
                 ProtoOATraderReq,
                 ProtoOATraderRes,
+                ProtoOAUnsubscribeSpotsReq,
             )
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
@@ -791,7 +835,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionType = ProtoOAExecutionType
         self._ProtoOATimeInForce = ProtoOATimeInForce
 
+        self._ProtoOASubscribeSpotsReq = ProtoOASubscribeSpotsReq
+        self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
+
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
+        self._spot_payload_type = ProtoOASpotEvent().payloadType
         self._execution_payload_type = ProtoOAExecutionEvent().payloadType
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
@@ -962,6 +1010,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             payload = self._Protobuf.extract(message)
         except Exception as exc:
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
+            return
+
+        if self._spot_payload_type is not None and payload_type == self._spot_payload_type:
+            self._handle_spot_event(payload)
             return
 
         if payload_type == self._execution_payload_type:
@@ -2383,6 +2435,110 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Order rejected ({response.errorCode}): {response.description or 'no description'}"
             )
         return response
+
+    def _handle_spot_event(self, payload: Any) -> None:
+        """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
+        try:
+            symbol_id = int(getattr(payload, "symbolId", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        waiter = self._spot_waiters.get(symbol_id)
+        if waiter is None or waiter.future.done():
+            return
+        # Spot prices are uint64 in 1/100000 of a price unit, like the
+        # relative SL/TP distances (123000 means 1.23).
+        raw_bid = _present_proto_field(payload, "bid")
+        raw_ask = _present_proto_field(payload, "ask")
+        raw_timestamp = _present_proto_field(payload, "timestamp")
+        try:
+            if raw_bid is not None:
+                waiter.bid = float(raw_bid) / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+            if raw_ask is not None:
+                waiter.ask = float(raw_ask) / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+            if raw_timestamp:
+                waiter.timestamp = datetime.fromtimestamp(
+                    int(raw_timestamp) / 1000, tz=timezone.utc
+                )
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            waiter.future.set_exception(
+                ValueError(f"cTrader spot event for symbolId {symbol_id} is unreadable: {exc}")
+            )
+            return
+        if waiter.bid is not None and waiter.ask is not None:
+            waiter.future.set_result(
+                LiveQuote(
+                    bid=waiter.bid,
+                    ask=waiter.ask,
+                    timestamp=waiter.timestamp,
+                    source="ctrader_spot_event",
+                )
+            )
+
+    async def _unsubscribe_spot(self, symbol_id: int) -> None:
+        """Best-effort spot unsubscribe; a failure is logged, never raised.
+
+        Also sent after a failed or timed-out subscribe: a subscription the
+        broker applied but whose response was lost would otherwise block every
+        later subscribe for the symbol (cTrader refuses a second one).
+        """
+        request = self._ProtoOAUnsubscribeSpotsReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.symbolId.append(int(symbol_id))
+        try:
+            await self._send_request_with_refresh_retry(request, timeout_seconds=10)
+        except Exception as exc:
+            logger.warning(
+                "cTrader spot unsubscribe failed",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "symbol_id": int(symbol_id),
+                        "error": str(exc),
+                    }
+                },
+            )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Current bid/ask for the #125 entry-deviation gate.
+
+        Subscribes to the symbol's spot stream, takes the first complete
+        bid/ask that arrives after the subscription, then unsubscribes. Raises
+        on an unknown symbol, a refused subscription, or no quote within
+        ``quote_timeout_seconds``; it never returns an invented price.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if self._ProtoOASubscribeSpotsReq is None or self._ProtoOAUnsubscribeSpotsReq is None:
+            raise RuntimeError("cTrader spot subscription messages are not loaded")
+        symbol_id = int(await self._resolve_symbol_id(symbol))
+        lock = self._spot_locks.setdefault(symbol_id, asyncio.Lock())
+        async with lock:
+            waiter = _SpotWaiter(future=asyncio.get_running_loop().create_future())
+            self._spot_waiters[symbol_id] = waiter
+            try:
+                request = self._ProtoOASubscribeSpotsReq()
+                request.ctidTraderAccountId = self.ctid_trader_account_id
+                request.symbolId.append(symbol_id)
+                request.subscribeToSpotTimestamp = True
+                try:
+                    await self._send_request_with_refresh_retry(request, timeout_seconds=10)
+                except CTraderApiError as exc:
+                    self._raise_terminal_auth_from_api_error(exc)
+                    raise
+                try:
+                    return await asyncio.wait_for(
+                        waiter.future, timeout=self.quote_timeout_seconds
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        f"No cTrader spot quote for {symbol} within "
+                        f"{self.quote_timeout_seconds}s"
+                    ) from exc
+            finally:
+                self._spot_waiters.pop(symbol_id, None)
+                await self._unsubscribe_spot(symbol_id)
 
     async def get_balance(self) -> tuple[float, float]:
         self._raise_if_terminal_auth_failed()

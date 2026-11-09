@@ -856,6 +856,12 @@ class _SignalSubmittingAdapter:
     async def get_positions(self):
         return []
 
+    async def get_quote(self, symbol):
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(bid=200.0, ask=200.0, source="test")
+
 
 def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
