@@ -33,7 +33,15 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import pytest
 from sqlalchemy import text
 
-from shared.models import PRICE_ABSENT, PRICE_OBSERVED, PRICE_SENT_BAD, LiveExecution, LiveSignal
+from shared.models import (
+    PRICE_ABSENT,
+    PRICE_DERIVED,
+    PRICE_DERIVED_UNAVAILABLE,
+    PRICE_OBSERVED,
+    PRICE_SENT_BAD,
+    LiveExecution,
+    LiveSignal,
+)
 
 ACCOUNT = "alpaca-acc-124"
 DEPLOYMENT = "dep-alpaca-124"
@@ -194,7 +202,8 @@ def test_reconcile_retries_on_the_next_pass_once_the_price_arrives(db):
     assert len(rows) == 1
     assert rows[0].filled_qty == pytest.approx(5.0)
     assert rows[0].actual_price == pytest.approx(101.5)
-    assert rows[0].actual_price_observed == PRICE_OBSERVED
+    # From the order's average, not stated for this fill: never `observed` (review of #143).
+    assert rows[0].actual_price_observed == PRICE_DERIVED
 
 
 def test_reconcile_remainder_gets_the_remainder_price_not_the_cumulative_average(db):
@@ -212,7 +221,7 @@ def test_reconcile_remainder_gets_the_remainder_price_not_the_cumulative_average
     remainder = rows[1]
     assert remainder.actual_price == pytest.approx((5 * 102.0 - 2 * 100.0) / 3)
     assert remainder.actual_price != pytest.approx(102.0)
-    assert remainder.actual_price_observed == PRICE_OBSERVED
+    assert remainder.actual_price_observed == PRICE_DERIVED
     total_notional = sum(row.actual_price * row.filled_qty for row in rows)
     assert total_notional == pytest.approx(5 * 102.0), "rows must add up to the broker's average"
 
@@ -229,6 +238,7 @@ def test_reconcile_remainder_sums_over_several_local_legs(db):
     remainder = _rows(db, signal)[-1]
     assert remainder.filled_qty == pytest.approx(1.5)
     assert remainder.actual_price == pytest.approx((4 * 101.25 - 100.0 - 151.5) / 1.5)
+    assert remainder.actual_price_observed == PRICE_DERIVED
 
 
 @pytest.mark.parametrize(
@@ -241,6 +251,7 @@ def test_reconcile_remainder_sums_over_several_local_legs(db):
 def test_reconcile_rejects_a_non_positive_remainder_price(
     db, live_runner_logs, local_price, local_qty, broker_avg, broker_qty
 ):
+    """The price is refused, the QUANTITY is not: the ledger needs it (review of #143)."""
     signal = _signal(db)
     order_id = _order_id(f"negative-{local_price}")
     _local_fill(
@@ -248,16 +259,24 @@ def test_reconcile_rejects_a_non_positive_remainder_price(
     )
     order = _order(signal, filled_qty=broker_qty, filled_avg_price=broker_avg, order_id=order_id)
 
-    assert asyncio.run(_adapter(order).reconcile_executions()) == 0
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
 
     rows = _rows(db, signal)
-    assert len(rows) == 1, "an impossible remainder price must not be persisted"
+    assert len(rows) == 2
     assert rows[0].filled_qty == pytest.approx(local_qty)
+    remainder = rows[1]
+    assert remainder.filled_qty == pytest.approx(float(broker_qty) - local_qty)
+    assert remainder.actual_price == 0.0, "an impossible remainder price must not be persisted"
+    assert remainder.actual_price_observed == PRICE_DERIVED_UNAVAILABLE
 
 
 @pytest.mark.parametrize("observed", [PRICE_SENT_BAD, PRICE_ABSENT])
 def test_reconcile_refuses_to_derive_a_remainder_from_an_unpriced_local_leg(db, observed):
-    """A local leg stored at 0.0 because its price was not observed poisons the formula."""
+    """A local leg stored at 0.0 because its price was not observed poisons the formula.
+
+    The remainder's price is therefore unavailable, but its quantity is still recorded: exit
+    sizing and duplicate-order protection read filled quantity (review of #143).
+    """
     signal = _signal(db)
     order_id = _order_id(f"unpriced-{observed}")
     _local_fill(
@@ -265,8 +284,11 @@ def test_reconcile_refuses_to_derive_a_remainder_from_an_unpriced_local_leg(db, 
     )
     order = _order(signal, filled_qty="5", filled_avg_price="102", order_id=order_id)
 
-    assert asyncio.run(_adapter(order).reconcile_executions()) == 0
-    assert len(_rows(db, signal)) == 1
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+    rows = _rows(db, signal)
+    assert [row.filled_qty for row in rows] == [pytest.approx(2.0), pytest.approx(3.0)]
+    assert rows[1].actual_price == 0.0
+    assert rows[1].actual_price_observed == PRICE_DERIVED_UNAVAILABLE
 
 
 def test_remainder_price_is_derived_inside_the_save_transaction(db):
@@ -1455,3 +1477,399 @@ def test_backfill_fails_closed_on_a_fill_activity_without_a_symbol(db):
 
     assert _backfill(client) == 0
     assert _commission(db, signal) == [None]
+
+
+# ── review of PR #143 ──────────────────────────────────────────────────────────────────────────
+#
+# 1. A stream event whose own price is unusable must not borrow the order's CUMULATIVE average.
+# 2. Crypto is decided from the symbol's data, not from a slash.
+# 3. A derived remainder price is plausibility-checked and labelled `derived`.
+# 4. An unpriced remainder still records its QUANTITY; every PnL reader treats it as incomplete.
+
+
+@pytest.mark.parametrize(("event_price", "verdict"), [("0", PRICE_SENT_BAD), (None, PRICE_ABSENT)])
+def test_stream_partial_fill_does_not_borrow_the_cumulative_average(
+    monkeypatch, event_price, verdict
+):
+    """Fill 1@100 then 1@104: the second update's average is 102, which is no fill's price."""
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id(f"partial-avg-{event_price}"),
+        asset_class="us_equity",
+        symbol="AAPL",
+        price=event_price,
+        qty="1",
+        event="partial_fill",
+    )
+    update.order.filled_qty = "2"
+    update.order.filled_avg_price = "102"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert len(saved) == 1
+    assert saved[0].filled_qty == pytest.approx(1.0)
+    assert saved[0].actual_price == 0.0
+    assert saved[0].actual_price_observed == verdict
+
+
+def test_stream_single_fill_order_may_use_the_average_but_labels_it_derived(monkeypatch):
+    """When this event IS the whole order, the order's average is this fill's price."""
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("single-fill-avg"),
+        asset_class="us_equity",
+        symbol="AAPL",
+        price=None,
+        qty="2",
+    )
+    update.order.filled_qty = "2"
+    update.order.filled_avg_price = "101.5"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved[0].actual_price == pytest.approx(101.5)
+    assert saved[0].actual_price_observed == PRICE_DERIVED
+
+
+def test_stream_fill_without_its_own_quantity_does_not_use_the_average(monkeypatch):
+    """A `fill` event without its own qty falls back to the cumulative qty; that proves nothing."""
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("no-event-qty"),
+        asset_class="us_equity",
+        symbol="AAPL",
+        price=None,
+        qty="2",
+    )
+    update.qty = None
+    update.order.filled_avg_price = "101.5"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved[0].actual_price == 0.0
+    assert saved[0].actual_price_observed == PRICE_ABSENT
+
+
+def test_stream_then_reconcile_never_trusts_a_borrowed_average(db):
+    """The reviewer's sequence end to end: 1@100 observed, 1@? (price "0"), then 1 missed."""
+    signal = _signal(db)
+    order_id = _order_id("stream-then-reconcile")
+    first = _trade_update(
+        signal_id=str(signal.id),
+        order_id=order_id,
+        asset_class="us_equity",
+        symbol="AAPL",
+        price="100",
+        qty="1",
+        event="partial_fill",
+    )
+    second = _trade_update(
+        signal_id=str(signal.id),
+        order_id=order_id,
+        asset_class="us_equity",
+        symbol="AAPL",
+        price="0",
+        qty="1",
+        event="partial_fill",
+    )
+    second.timestamp = datetime(2026, 11, 3, 15, 1, tzinfo=timezone.utc)
+    second.order.filled_qty = "2"
+    second.order.filled_avg_price = "102"
+    adapter = _adapter(_order(signal, filled_qty="3", filled_avg_price="103", order_id=order_id))
+
+    asyncio.run(adapter._on_trade_update(first))
+    asyncio.run(adapter._on_trade_update(second))
+    assert asyncio.run(adapter.reconcile_executions()) == 1
+
+    rows = _rows(db, signal)
+    assert [row.filled_qty for row in rows] == [
+        pytest.approx(1.0),
+        pytest.approx(1.0),
+        pytest.approx(1.0),
+    ]
+    assert [row.actual_price_observed for row in rows] == [
+        PRICE_OBSERVED,
+        PRICE_SENT_BAD,
+        PRICE_DERIVED_UNAVAILABLE,
+    ]
+    assert [row.actual_price for row in rows] == [pytest.approx(100.0), 0.0, 0.0]
+
+
+def test_reconcile_trusts_a_derived_local_leg(db):
+    signal = _signal(db)
+    order_id = _order_id("derived-leg")
+    _local_fill(
+        db,
+        signal,
+        price=100.0,
+        qty=2.0,
+        order_id=order_id,
+        key="alpaca:exec:derived-leg",
+        observed=PRICE_DERIVED,
+    )
+    order = _order(signal, filled_qty="5", filled_avg_price="102", order_id=order_id)
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+    remainder = _rows(db, signal)[-1]
+    assert remainder.actual_price == pytest.approx((510.0 - 200.0) / 3.0)
+    assert remainder.actual_price_observed == PRICE_DERIVED
+
+
+@pytest.mark.parametrize(
+    ("broker_avg", "expected_price", "verdict"),
+    [
+        ("102", (510.0 - 400.0) / 1.0, PRICE_DERIVED),  # 110: +7.8% of the average, inside
+        ("104", 0.0, PRICE_DERIVED_UNAVAILABLE),  # 120: +15.4%, outside the 10% band
+        ("96", 0.0, PRICE_DERIVED_UNAVAILABLE),  # 80: -16.7%, outside the band
+    ],
+)
+def test_reconcile_remainder_price_must_be_plausible(db, broker_avg, expected_price, verdict):
+    signal = _signal(db)
+    order_id = _order_id(f"band-{broker_avg}")
+    _local_fill(db, signal, price=100.0, qty=4.0, order_id=order_id, key="alpaca:exec:band")
+    order = _order(signal, filled_qty="5", filled_avg_price=broker_avg, order_id=order_id)
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+
+    remainder = _rows(db, signal)[-1]
+    assert remainder.filled_qty == pytest.approx(1.0), "the quantity is always recorded"
+    if verdict == PRICE_DERIVED:
+        assert remainder.actual_price == pytest.approx(5 * float(broker_avg) - 400.0)
+    else:
+        assert remainder.actual_price == expected_price
+    assert remainder.actual_price_observed == verdict
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("BTC/USD", "crypto"),
+        ("BTCUSD", "crypto"),
+        ("btcusd", "crypto"),
+        ("ETH/BTC", "crypto"),
+        ("ETHBTC", "crypto"),
+        ("SOLUSDT", "crypto"),
+        ("USDCUSD", "crypto"),
+        ("DOGEUSDC", "crypto"),
+        ("AAPL", "us_equity"),
+        ("USD", "us_equity"),  # ProShares Ultra Semiconductors: an equity named like a quote
+        ("BRK.B", "us_equity"),
+        ("AAPL261120C00200000", "unknown"),  # an option: neither, so unknown
+        ("", "unknown"),
+        ("BTC/", "unknown"),
+        ("XYZABC", "unknown"),  # six letters, no known quote suffix
+    ],
+)
+def test_alpaca_symbol_classification(symbol, expected):
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_alpaca_symbol(symbol) == expected
+
+
+@pytest.mark.parametrize(
+    ("symbol", "pair"),
+    [
+        ("BTC/USD", ("BTC", "USD")),
+        ("BTCUSD", ("BTC", "USD")),
+        ("SOLUSDT", ("SOL", "USDT")),
+        ("ETHBTC", ("ETH", "BTC")),
+        ("AAPL", None),
+        ("AAPL261120C00200000", None),
+    ],
+)
+def test_split_crypto_pair_accepts_both_spellings(symbol, pair):
+    from shared.alpaca_symbols import split_crypto_pair
+
+    assert split_crypto_pair(symbol) == pair
+
+
+def test_backfill_prices_a_crypto_signal_stored_without_a_slash(db):
+    signal, order_id = _crypto_fill(db, label="no-slash", symbol="BTCUSD")
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 1
+    assert _commission(db, signal) == [pytest.approx(75.0)]
+
+
+def test_backfill_logs_every_candidate_it_skips(db, live_runner_logs):
+    option = _signal(db, symbol="AAPL261120C00200000")
+    _local_fill(
+        db,
+        option,
+        price=2.5,
+        qty=1.0,
+        order_id=_order_id("option"),
+        key="k:option",
+        commission=None,
+    )
+    early, _ = _crypto_fill(db, label="too-early", at=NOW - timedelta(hours=6))
+    option_id = str(_rows(db, option)[0].id)
+    early_id = str(_rows(db, early)[0].id)
+
+    assert _backfill(FakeActivitiesClient()) == 0
+
+    text_ = " ".join(
+        record.getMessage() + " " + str(getattr(record, "data", ""))
+        for record in live_runner_logs.records
+    )
+    assert option_id in text_ and "not a crypto pair" in text_
+    assert early_id in text_ and "not posted yet" in text_
+
+
+def test_legacy_migration_classifies_symbols_from_data_not_the_slash(isolated_db_no_schema):
+    database, engine = _build_legacy_database(isolated_db_no_schema)
+    extra = {
+        "sig-nosl": ("BTCUSD", "ex-nosl"),
+        "sig-opt": ("AAPL261120C00200000", "ex-opt"),
+        "sig-brk": ("BRK.B", "ex-brk"),
+    }
+    with engine.begin() as connection:
+        for signal_id, (symbol, execution_id) in extra.items():
+            connection.execute(
+                text(
+                    "INSERT INTO live_signals (id, deployment_id, symbol, action, "
+                    "theoretical_price, timestamp, metadata, source) VALUES "
+                    "(:id, 'dep-acc-alp', :symbol, 'buy', 1.0, '2026-11-03 15:00:00', '{}', "
+                    "'internal')"
+                ),
+                {"id": signal_id, "symbol": symbol},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO live_executions (id, signal_id, actual_price, filled_qty, "
+                    "commission, timestamp, broker_order_id, dedupe_key) VALUES "
+                    "(:id, :sig, 10.0, 1.0, 0.0, '2026-11-03 15:00:00', 'bo', :key)"
+                ),
+                {"id": execution_id, "sig": signal_id, "key": f"k:{execution_id}"},
+            )
+
+    database.init_db()
+
+    with engine.connect() as connection:
+        commissions = dict(
+            connection.execute(text("SELECT id, commission FROM live_executions")).fetchall()
+        )
+    assert commissions["ex-nosl"] is None, "crypto without a slash is still crypto"
+    assert commissions["ex-opt"] is None, "an undeterminable class fails closed to unknown"
+    assert commissions["ex-brk"] == 0.0, "an equity zero is a known zero"
+    assert commissions["ex-equity"] == 0.0
+    assert commissions["ex-ctrader-zero"] == 0.0
+
+
+def test_execution_listings_do_not_present_an_unusable_price_as_zero(db):
+    signal = _signal(db)
+    _local_fill(
+        db,
+        signal,
+        price=0.0,
+        qty=1.0,
+        order_id=_order_id("unpriced-listing"),
+        key="k:unpriced-listing",
+        observed=PRICE_DERIVED_UNAVAILABLE,
+    )
+
+    listed = db.list_live_signal_executions_for_deployments([DEPLOYMENT])
+    _balances, stats_rows = db.load_live_account_stats_inputs(ACCOUNT)
+    signals = db.list_live_signals_for_deployments([DEPLOYMENT])
+
+    for row in (listed[0], stats_rows[0]):
+        assert row["actual_price"] is None
+        assert row["slippage"] is None
+        assert row["slippage_bps"] is None
+        assert row["actual_price_observed"] == PRICE_DERIVED_UNAVAILABLE
+        assert row["filled_qty"] == pytest.approx(1.0), "the quantity is real"
+    assert signals[0]["actual_price"] is None
+
+
+def test_viewer_stats_pnl_is_incomplete_when_any_fill_price_is_unusable(monkeypatch):
+    import viewer.main as viewer_main
+
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.0),
+        {**_stats_row("sell", 0.0, 1.0, 5, 0.0), "actual_price": None},
+    ]
+    rows[1]["actual_price_observed"] = PRICE_DERIVED_UNAVAILABLE
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is False
+    assert payload["price_unknown_count"] == 1
+    assert payload["total_pnl"] is None, "an unknown price must not be realized as zero"
+    assert payload["net_pnl"] is None
+    assert payload["net_pnl_complete"] is False
+
+
+def test_viewer_stats_pnl_is_complete_for_derived_prices(monkeypatch):
+    import viewer.main as viewer_main
+
+    rows = [_stats_row("buy", 100.0, 1.0, 0, 0.0), _stats_row("sell", 110.0, 1.0, 5, 0.0)]
+    rows[1]["actual_price_observed"] = PRICE_DERIVED
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is True
+    assert payload["price_unknown_count"] == 0
+    assert payload["total_pnl"] == pytest.approx(10.0)
+    assert payload["net_pnl"] == pytest.approx(10.0)
+
+
+def test_viewer_live_trades_keep_an_unusable_price_unknown(monkeypatch):
+    import viewer.main as viewer_main
+
+    row = {
+        "signal_id": "s",
+        "execution_id": "e",
+        "deployment_id": DEPLOYMENT,
+        "symbol": "AAPL",
+        "action": "buy",
+        "theoretical_price": 100.0,
+        "actual_price": None,
+        "actual_price_observed": PRICE_SENT_BAD,
+        "slippage": None,
+        "slippage_bps": None,
+        "filled_qty": 1.0,
+        "commission": 0.0,
+        "signal_timestamp": datetime(2026, 11, 3, tzinfo=timezone.utc),
+        "execution_timestamp": datetime(2026, 11, 3, tzinfo=timezone.utc),
+        "broker_order_id": "bo",
+        "signal_metadata": {},
+    }
+    monkeypatch.setattr(viewer_main, "list_live_deployments_for_account", lambda _a: [])
+    monkeypatch.setattr(
+        viewer_main, "list_live_signal_executions_for_deployments", lambda _ids: [row]
+    )
+
+    trade = asyncio.run(viewer_main._live_trades_payload(ACCOUNT))["trades"][0]
+
+    assert trade["actual_price"] is None
+    assert trade["slippage"] is None
+    assert trade["slippage_bps"] is None
+    assert trade["actual_price_observed"] == PRICE_SENT_BAD
+    assert trade["filled_qty"] == pytest.approx(1.0)
+
+
+def test_frontend_live_trade_commission_type_admits_null():
+    """`commission: null` is "fee not known yet"; the type must say so (review of #143)."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "frontend/src/api/types.ts").read_text(
+        encoding="utf-8"
+    )
+    block = source.split("export interface LiveTradeSlippage {", 1)[1].split("}", 1)[0]
+    fields = {
+        line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip().rstrip(";")
+        for line in block.splitlines()
+        if ":" in line
+    }
+    assert fields["commission"] == "number | null"
+    assert fields["actual_price"] == "number | null"
+    assert fields["slippage"] == "number | null"
+    assert fields["slippage_bps"] == "number | null"
