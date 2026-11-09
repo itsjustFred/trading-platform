@@ -34,6 +34,7 @@ from shared.database import (
     save_live_signal,
     set_live_signal_broker_order_id,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import LiveExecution, LiveSignal
 
@@ -265,6 +266,40 @@ def _to_datetime(value: Any) -> datetime:
         except ValueError:
             return datetime.now(timezone.utc)
     return datetime.now(timezone.utc)
+
+
+def _alpaca_fill_dedupe_key(
+    *,
+    execution_id: str,
+    broker_order_id: str,
+    event: str,
+    cumulative_filled_qty: float,
+    raw_timestamp: Any,
+    filled_qty: float,
+) -> str | None:
+    """The dedupe key for one Alpaca trade-update fill, or ``None`` when none can be derived.
+
+    In order of preference:
+
+    1. ``alpaca:exec:{execution_id}`` - the broker's own per-fill id.
+    2. ``alpaca:order:{id}:{event}:cum:{cumulative}`` - the order's cumulative filled quantity
+       strictly increases per fill, so two equal-sized partial fills in the same instant still
+       get different keys, and a redelivery (same cumulative) gets the same one.
+    3. ``alpaca:order:{id}:{event}:{canonical timestamp}:{qty}`` - only when the update really
+       carries a timestamp. Spellings of one instant (naive, aware, offset, ``Z``) collapse; the
+       precision is not rounded.
+
+    ``None`` when none of the three exists. The old code substituted ``now()`` for a missing
+    timestamp, which made every redelivery a brand-new key and stored it again.
+    """
+    if execution_id:
+        return f"alpaca:exec:{execution_id}"
+    if cumulative_filled_qty > 0.0:
+        return f"alpaca:order:{broker_order_id}:{event}:cum:{cumulative_filled_qty:.8f}"
+    stamp = canonical_utc_timestamp(raw_timestamp)
+    if stamp is None:
+        return None
+    return f"alpaca:order:{broker_order_id}:{event}:{stamp}:{filled_qty}"
 
 
 def _default_alpaca_credentials(values: Mapping[str, str]) -> tuple[str, str, bool] | None:
@@ -1732,16 +1767,36 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             actual_price = _to_float(fill_price)
             filled_qty = _to_float(filled_qty_value)
             commission = _to_float(commission_value)
-            fill_ts = _to_datetime(getattr(data, "timestamp", None))
+            raw_fill_ts = getattr(data, "timestamp", None)
+            fill_ts = _to_datetime(raw_fill_ts)
+            broker_cumulative_filled_qty = _to_float(
+                getattr(order, "filled_qty", None), default=0.0
+            )
 
             execution_id = str(getattr(data, "execution_id", "") or "")
-            if execution_id:
-                dedupe_key = f"alpaca:exec:{execution_id}"
-            else:
-                dedupe_key = (
-                    f"alpaca:order:{broker_order_id}:{event}:"
-                    f"{fill_ts.isoformat()}:{filled_qty}"
+            dedupe_key = _alpaca_fill_dedupe_key(
+                execution_id=execution_id,
+                broker_order_id=broker_order_id,
+                event=event,
+                cumulative_filled_qty=broker_cumulative_filled_qty,
+                raw_timestamp=raw_fill_ts,
+                filled_qty=filled_qty,
+            )
+            if dedupe_key is None:
+                logger.warning(
+                    "Alpaca fill carries no execution id, no cumulative order quantity and no "
+                    "usable timestamp; refusing to derive a dedupe key that could count it "
+                    "twice or drop a sibling. reconcile_executions backfills it from the order",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "client_order_id": str(client_order_id),
+                            "broker_order_id": broker_order_id,
+                            "event": event,
+                        }
+                    },
                 )
+                return
 
             execution = LiveExecution(
                 signal_id=signal_uuid,
@@ -1751,9 +1806,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 timestamp=fill_ts,
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
-            )
-            broker_cumulative_filled_qty = _to_float(
-                getattr(order, "filled_qty", None), default=0.0
             )
             persisted_qty = await self._persist_execution_fill(
                 execution, broker_cumulative_filled_qty

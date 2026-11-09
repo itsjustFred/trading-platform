@@ -36,6 +36,7 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     BacktestMeta,
@@ -2292,6 +2293,20 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
                 session, deployment_id, record.idempotency_key
             )
             if existing is not None:
+                # An identical producer event (same key) is treated as a redelivery. A genuine
+                # re-entry byte-identical to an earlier signal cannot be told apart, and
+                # trading it again on a guess is the worse failure, so it is swallowed - but
+                # never silently: an operator can see which key swallowed which signal.
+                logger.warning(
+                    "Skipping duplicate live signal: idempotency_key=%s already persisted as "
+                    "signal %s (deployment_id=%s, symbol=%s, action=%s); a genuine re-entry "
+                    "with identical producer fields is indistinguishable from a redelivery",
+                    record.idempotency_key,
+                    existing.id,
+                    deployment_id,
+                    record.symbol,
+                    record.action,
+                )
                 _reconcile_existing_live_signal(session, existing, record)
                 return str(existing.id), False
         record_id = str(record.id)
@@ -2321,22 +2336,50 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
 
 
 def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
-    """Deterministic dedupe key from fill content (C1).
+    """Deterministic dedupe key for a fill whose caller supplied none (C1, #127).
 
-    A redelivered fill carries identical content, so the key is stable
-    across redeliveries (unlike a random UUID, which would never dedupe).
+    In order of preference:
+
+    1. **The broker's own fill id** (``broker_fill_id``), scoped by signal and order. It is
+       unique per fill by construction, so two genuine partial fills with equal price, quantity
+       and timestamp stay two fills, and a redelivery stays one whatever timestamp precision or
+       zone it arrives with.
+    2. **Fill content**: signal, price, quantity, canonical UTC timestamp and order. A redelivery
+       carries identical content, so the key is stable. The timestamp goes through
+       :func:`shared.fill_keys.canonical_utc_timestamp` - naive/aware/offset spellings of one
+       instant collapse, but precision is never rounded, so fills a microsecond apart differ.
+
+    The content form cannot tell two genuinely distinct fills that agree on every field from one
+    fill delivered twice; only a broker id can. Adapters therefore pass a native key themselves
+    (``ctrader:deal:...``, ``alpaca:exec:...``) and this is the net underneath them.
     """
-    timestamp = execution.timestamp
-    if isinstance(timestamp, datetime):
-        if timestamp.tzinfo:
-            stamp = timestamp.astimezone(timezone.utc).isoformat()
-        else:
-            stamp = timestamp.replace(tzinfo=timezone.utc).isoformat()
-    else:
-        stamp = str(timestamp)
+    fill_id = execution.broker_fill_id
+    if fill_id is not None and int(fill_id) > 0:
+        return f"auto:{execution.signal_id}:fill:{execution.broker_order_id}:{int(fill_id)}"
+    stamp = canonical_utc_timestamp(execution.timestamp)
+    if stamp is None:
+        stamp = str(execution.timestamp)
     return (
         f"auto:{execution.signal_id}:{float(execution.actual_price or 0.0):.8f}:"
         f"{float(execution.filled_qty or 0.0):.8f}:{stamp}:{execution.broker_order_id}"
+    )
+
+
+def _log_dedupe_key_owned_by_other_signal(
+    existing: LiveExecutionModel, incoming_signal_id: str, dedupe_key: str | None
+) -> None:
+    """Shout when a dedupe key already belongs to a different signal (#127, C2).
+
+    The key is unique across the whole table, so a repeat under another signal is not a
+    redelivery of that fill: it is a fill that is about to be dropped (or, worse, merged into
+    someone else's row). Nothing is stored either way; this makes the loss visible.
+    """
+    logger.error(
+        "Dedupe key collision across signals: dedupe_key=%s is already stored for signal %s, "
+        "refusing to treat the fill for signal %s as a redelivery of it; the fill is NOT stored",
+        dedupe_key,
+        existing.signal_id,
+        incoming_signal_id,
     )
 
 
@@ -2352,6 +2395,11 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         .limit(1)
     ).first()
     if existing is not None:
+        if str(existing.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(
+                existing, str(record.signal_id), record.dedupe_key
+            )
+            return False
         logger.info(
             "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
         )
@@ -2371,6 +2419,9 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         ).first()
         if raced is None:
             raise
+        if str(raced.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(raced, str(record.signal_id), record.dedupe_key)
+            return False
         logger.info(
             "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
             record.dedupe_key,
@@ -2426,6 +2477,14 @@ def save_live_execution_up_to_cumulative(
                 ).one()
                 or 0.0
             )
+            if existing is not None and str(existing.signal_id) != normalized_signal_id:
+                # The key belongs to ANOTHER signal. The amendment below would grow that signal's
+                # row using this signal's cumulative, so it must not run (#127, C2).
+                session.rollback()
+                _log_dedupe_key_owned_by_other_signal(
+                    existing, normalized_signal_id, record.dedupe_key
+                )
+                return 0.0
             if existing is not None:
                 # Same dedupe key. Two very different situations share this branch, and conflating
                 # them loses fills:

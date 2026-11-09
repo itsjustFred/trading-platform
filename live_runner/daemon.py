@@ -67,6 +67,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -1167,6 +1168,11 @@ def _mint_signal_idempotency_key(
     producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
     if not producer_stamp:
         return
+    # The same producer event can be redelivered with its timestamp spelled differently (``Z``
+    # vs ``+00:00``, aware vs naive, another UTC offset). Key on the instant, not the spelling,
+    # without rounding it: distinct instants - even a microsecond apart - keep distinct keys.
+    # Text that is not a time keeps its verbatim form.
+    producer_stamp = canonical_utc_timestamp(producer_stamp) or str(producer_stamp)
     key_material = "|".join(
         [
             str(deployment.id),
@@ -1176,7 +1182,7 @@ def _mint_signal_idempotency_key(
             repr(signal.stop_loss),
             repr(signal.take_profit),
             str(signal.timeframe),
-            str(producer_stamp),
+            producer_stamp,
         ]
     )
     metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[

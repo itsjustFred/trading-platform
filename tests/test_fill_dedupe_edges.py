@@ -120,7 +120,9 @@ def test_c19a_equal_partial_fills_with_distinct_broker_fill_ids_are_both_stored(
 def test_c19a_same_broker_fill_id_is_one_fill_whatever_the_timestamp_spelling(database) -> None:
     """A redelivery of fill 9001 with a different timestamp precision is the same fill."""
     signal_id = _persist_signal(database)
-    original = _execution(signal_id, broker_fill_id=9001, timestamp=T0 + timedelta(microseconds=123456))
+    original = _execution(
+        signal_id, broker_fill_id=9001, timestamp=T0 + timedelta(microseconds=123456)
+    )
     redelivered_seconds = _execution(signal_id, broker_fill_id=9001, timestamp=T0)
     redelivered_naive = _execution(
         signal_id,
@@ -367,7 +369,9 @@ def _live_signal(
 def test_c18_safe_entry_exit_reentry_with_new_producer_stamps_are_three_signals(database) -> None:
     """SAFE: a re-entry after an exit is a distinct signal when the producer stamp moved."""
     entry = database.save_live_signal(_live_signal(action="buy", stamp="2026-07-15T10:00:00+00:00"))
-    exit_ = database.save_live_signal(_live_signal(action="sell", stamp="2026-07-15T11:00:00+00:00"))
+    exit_ = database.save_live_signal(
+        _live_signal(action="sell", stamp="2026-07-15T11:00:00+00:00")
+    )
     reentry = database.save_live_signal(
         _live_signal(action="buy", stamp="2026-07-15T12:00:00+00:00")
     )
@@ -435,7 +439,7 @@ def test_c18_same_instant_spelled_differently_is_one_key() -> None:
 
 
 def test_c18_distinct_instants_are_not_merged_by_stamp_normalisation() -> None:
-    """Normalising the stamp must not widen the window: one second / one microsecond apart differ."""
+    """Normalising the stamp must not widen the window: 1 s / 1 us apart still differ."""
     base = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
     keys = {
         _live_signal(stamp=base).metadata["idempotency_key"],
@@ -495,7 +499,13 @@ def _ctrader_adapter() -> CTraderLiveAdapter:
 
 
 def _stream_event(
-    *, signal_id: str, order_id: int, deal_id: int, volume: int, cumulative: int, execution_type: int
+    *,
+    signal_id: str,
+    order_id: int,
+    deal_id: int,
+    volume: int,
+    cumulative: int,
+    execution_type: int,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         executionType=execution_type,
@@ -645,7 +655,7 @@ def test_c2_safe_scale_in_then_partial_close_stream_redelivery_and_reconcile(dat
     assert database.get_live_signal_filled_qty(close_signal) == pytest.approx(500.0)
 
 
-def test_c2_safe_a_deal_skipped_by_the_cap_is_healed_by_reconciliation_not_doubled(database) -> None:
+def test_c2_safe_a_capped_out_deal_is_healed_by_reconciliation_not_doubled(database) -> None:
     """SAFE: deal 2 arrives first (cumulative 600k), deal 1 is capped out; reconcile restores it."""
     signal = _seed_ctrader_signal(database, ENTRY_ORDER)
     adapter = _ctrader_adapter()
