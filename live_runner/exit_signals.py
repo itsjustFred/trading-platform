@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from shared.logging import get_logger
 
@@ -95,6 +96,46 @@ class LedgerMismatchError(ValueError):
 
 class ExitInFlightError(ValueError):
     """An earlier exit of the same deployment and symbol may still be working."""
+
+
+class ExitBelowStepError(ValueError):
+    """The exit rounds down to nothing at the instrument's quantity step.
+
+    Ignored with a warning, not failed: closing one step would close more than
+    the deployment owns or the message asked for.
+    """
+
+    def __init__(self, message: str, *, requested_qty: float, qty_step: float) -> None:
+        super().__init__(message)
+        self.requested_qty = float(requested_qty)
+        self.qty_step = float(qty_step)
+
+
+#: Float noise allowance when flooring to a step, as a fraction of one step. A
+#: ledger sum of 2.9999999999999996 is a whole 3, not 2 plus dust; anything this
+#: close to the next step is below every broker's quantity resolution.
+_STEP_NOISE = Decimal("1e-6")
+
+
+def round_exit_qty_down(qty: float, step: float) -> float:
+    """``qty`` rounded DOWN to a whole number of ``step`` (#121 review).
+
+    An exit must never close more than the deployment's own quantity or the
+    fraction it was asked for, so it is floored, never rounded to nearest.
+    Computed in decimal so a step like 1e-9 is exact. Returns 0.0 when less than
+    one step remains; raises ``ValueError`` for an unusable step.
+    """
+    try:
+        step_value = Decimal(repr(float(step)))
+        qty_value = Decimal(repr(float(qty)))
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise ValueError(f"Unusable exit quantity {qty!r} or step {step!r}") from exc
+    if not step_value.is_finite() or step_value <= 0:
+        raise ValueError(f"Exit quantity step must be finite and positive, got {step!r}")
+    if not qty_value.is_finite() or qty_value < 0:
+        raise ValueError(f"Exit quantity must be finite and non-negative, got {qty!r}")
+    steps = math.floor(qty_value / step_value + _STEP_NOISE)
+    return float(Decimal(steps) * step_value)
 
 
 @dataclass(frozen=True, slots=True)

@@ -179,6 +179,14 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   verpasst) → ignoriert, `WARNING` mit `broker_qty` (`Exit signal ignored`).
   Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht genannte Seite →
   abgelehnt.
+- **Exit-Mengen werden nie aufgerundet:** Jeder Exit (Teil- und Voll-Exit) wird
+  auf den Mengenschritt des Instruments **ab**gerundet (`exit_qty_step` des
+  Adapters: cTrader `stepVolume` aus den Symbol-Properties, unbekannt → eine
+  Broker-Volumeneinheit; Alpaca 1e-9), im Daemon vor dem Persistieren und im
+  Adapter noch einmal (cTrader-Volumen per Floor statt `round()`). Ein Exit
+  schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
+  er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
+  und `qty_step`. Entries runden wie bisher.
 - **Ledger-Abgleich vor jedem Exit:** Die Ledger aller Deployments auf demselben
   Account und Symbol (jeder Status, `get_account_net_filled_qty_by_deployment`)
   müssen vorzeichenrichtig summiert der Broker-Position entsprechen, innerhalb

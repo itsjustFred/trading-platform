@@ -24,6 +24,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from shared.database import (
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
@@ -850,7 +851,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         open it unbounded. The same is true of an order larger than the position:
         the excess becomes a new naked position on the other side.
 
-        Returns the quantity to submit, capped at the broker's current position.
+        Returns the quantity to submit, capped at the broker's current position
+        and rounded down to the quantity step (#121 review).
         Capping rather than refusing is deliberate: the order's intent is to
         close what exists, and refusing would leave the exposure in place. The
         cap is logged because a size mismatch means the daemon's book moved
@@ -907,8 +909,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
-            return position_qty
-        return qty
+            qty = position_qty
+        return self._floor_exit_qty(symbol, qty)
+
+    def _floor_exit_qty(self, symbol: str, qty: float) -> float:
+        """An exit qty rounded DOWN to Alpaca's quantity step (#121 review).
+
+        A partial of a fractional position (1/3 of 0.5 = 0.1666...) has more
+        decimals than Alpaca accepts; rounding it to nearest could close more
+        than asked. Raises :class:`ExitBelowStepError` below one step.
+        """
+        step = self.exit_qty_step(symbol)
+        floored = round_exit_qty_down(qty, step)
+        if floored <= 0.0:
+            raise ExitBelowStepError(
+                f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "
+                f"the quantity step {step:g}.",
+                requested_qty=qty,
+                qty_step=step,
+            )
+        return floored
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         # Everything up to and including the request build is provably before
@@ -1184,6 +1204,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     if order_id is not None:
                         ids.add(order_id)
         return ids
+
+    def exit_qty_step(self, symbol: str) -> float:
+        """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
+        return 1e-9
 
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of Alpaca's smallest quantity step (9 decimals, fractional shares).

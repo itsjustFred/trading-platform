@@ -38,6 +38,7 @@ from live_runner.exit_signals import (
     DEFAULT_QTY_TOLERANCE,
     EXIT_POSITION_SIDE_KEY,
     FULL_EXIT,
+    ExitBelowStepError,
     ExitInFlightError,
     ExitInstruction,
     LedgerMismatchError,
@@ -49,6 +50,7 @@ from live_runner.exit_signals import (
     is_exit_intent,
     is_exit_order,
     resolve_exit_order,
+    round_exit_qty_down,
     usable_qty_tolerance,
 )
 from live_runner.service_discovery import discover_discord_bots_from_env
@@ -896,6 +898,49 @@ def _position_qty_tolerance(adapter: BaseLiveAdapter, symbol: str) -> float:
     return tolerance
 
 
+def _round_exit_qty_to_adapter_step(
+    adapter: BaseLiveAdapter, symbol: str, qty: float
+) -> float:
+    """``qty`` floored to the adapter's exit quantity step for ``symbol``.
+
+    An adapter that names no step is left to its own conversion (both real
+    adapters name one and floor exits again themselves). Raises
+    :class:`ExitBelowStepError` when less than one step remains.
+    """
+    method = getattr(adapter, "exit_qty_step", None)
+    if not callable(method):
+        return float(qty)
+    step = float(method(symbol))
+    rounded = round_exit_qty_down(qty, step)
+    if rounded <= 0.0:
+        raise ExitBelowStepError(
+            f"Exit for {symbol} ignored: the requested {qty:g} is below the "
+            f"instrument's quantity step {step:g}; closing one step would close more "
+            "than this deployment owns or was asked to close.",
+            requested_qty=qty,
+            qty_step=step,
+        )
+    return rounded
+
+
+def _log_exit_below_step(
+    account_id: str, deployment: LiveDeploymentConfig, symbol: str, exc: ExitBelowStepError
+) -> None:
+    logger.warning(
+        "Exit signal ignored: the exit is below the instrument's quantity step",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "deployment_id": str(deployment.id),
+                "symbol": symbol,
+                "requested_qty": exc.requested_qty,
+                "qty_step": exc.qty_step,
+                "reason": str(exc),
+            }
+        },
+    )
+
+
 async def _ensure_no_exit_in_flight(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
 ) -> None:
@@ -1006,6 +1051,10 @@ async def prepare_exit_intent_order(
         broker_qty=broker_position_qty(positions, signal.symbol),
         tolerance=_position_qty_tolerance(adapter, signal.symbol),
     )
+    # Never round an exit up: a partial closes at most its fraction, a full exit
+    # at most the own quantity (#121 review). Done here, before persistence, so
+    # the stored qty is the one sent.
+    target_qty = _round_exit_qty_to_adapter_step(adapter, signal.symbol, target_qty)
     matching_positions = [
         position
         for position in positions
@@ -1825,6 +1874,9 @@ async def _submit_normalized_discord_signal(
             },
         )
         return
+    except ExitBelowStepError as exc:
+        _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
+        return
     except ExitInFlightError as exc:
         # Not an error: the earlier exit is doing the work. The signal is not
         # queued; a later exit signal is sized once the earlier one is over.
@@ -1926,6 +1978,13 @@ async def _submit_normalized_discord_signal(
                     # handled refusal into an exception that aborts the fan-out
                     # to the remaining deployments.
                     logger.exception("Could not release the submission lease")
+                if isinstance(exc, ExitBelowStepError):
+                    # The adapter's own floor found less than one step to close:
+                    # an ignored exit, like the daemon's own check, not a failure.
+                    _log_exit_below_step(
+                        account_id, deployment, prepared_signal.symbol, exc
+                    )
+                    return
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
                 log = logger.error if is_exit else logger.warning
