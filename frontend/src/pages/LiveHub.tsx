@@ -38,7 +38,7 @@ import type {
   StrategyMeta,
 } from "../api/types";
 import { useToast } from "../components/toastContext";
-import { applyFillToPosition } from "../lib/livePositionMath";
+import { calculateRealizedTradeStats } from "../lib/livePositionMath";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import { formatSignedUsd } from "../lib/statFormat";
 
@@ -1447,10 +1447,14 @@ export function LiveHubPage() {
                     <span
                       style={{
                         ...miniStatValueStyle,
-                        color: totalPnl >= 0 ? "#86efac" : "#fecaca",
+                        color: Number.isFinite(totalPnl)
+                          ? totalPnl >= 0
+                            ? "#86efac"
+                            : "#fecaca"
+                          : undefined,
                       }}
                     >
-                      {formatSignedUsd(totalPnl)}
+                      {Number.isFinite(totalPnl) ? formatSignedUsd(totalPnl) : "incomplete"}
                     </span>
                   </div>
                   <div style={miniStatStyle}>
@@ -1680,7 +1684,11 @@ function normalizeLiveHubStats(
 ): LiveHubAccountStats {
   const tradesCount = asFiniteNumber(stats.total_trades, 0);
   const winRate = liveWinRateToPoints(stats.win_rate) ?? 0;
-  const totalPnl = asFiniteNumber(stats.total_pnl, 0);
+  // An incomplete server result is unknown (NaN, shown as "incomplete"), never 0 (#124).
+  const totalPnl =
+    stats.pnl_complete === false || stats.total_pnl === null
+      ? Number.NaN
+      : asFiniteNumber(stats.total_pnl, 0);
   return {
     tradesCount,
     winRate,
@@ -1712,45 +1720,6 @@ function buildLiveHubFallbackStats(
     sparkline: sparklineSource.filter((value) => Number.isFinite(value)),
   };
 }
-
-function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): {
-  totalPnl: number;
-  winningTrades: number;
-  losingTrades: number;
-} {
-  const positions = new Map<string, { qty: number; avg: number }>();
-  const stats = { totalPnl: 0, winningTrades: 0, losingTrades: 0 };
-
-  const orderedTrades = [...trades].sort((a, b) => a.execution_time - b.execution_time);
-  for (const trade of orderedTrades) {
-    const action = String(trade.action || "").toLowerCase();
-    let direction = 0;
-    if (action === "buy") {
-      direction = 1;
-    } else if (action === "sell") {
-      direction = -1;
-    }
-    if (direction === 0) {
-      continue;
-    }
-
-    const quantity = Math.abs(asFiniteNumber(trade.filled_qty, 0));
-    const price = asFiniteNumber(trade.actual_price, 0);
-    if (quantity <= 0 || price <= 0) {
-      continue;
-    }
-
-    const symbol = String(trade.symbol || "UNKNOWN").toUpperCase();
-    const fillStats = applyFillToPosition(positions, symbol, quantity * direction, price);
-    stats.totalPnl += fillStats.totalPnl;
-    stats.winningTrades += fillStats.winningTrades;
-    stats.losingTrades += fillStats.losingTrades;
-  }
-
-  return stats;
-}
-
-
 
 function asFiniteNumber(value: unknown, fallback: number): number {
   if (typeof value === "number" && Number.isFinite(value)) {

@@ -22,7 +22,6 @@ from live_runner.alpaca_fees import (
     fee_day_is_posted,
     fetch_account_activities,
     plan_commission_backfill,
-    split_crypto_pair,
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
@@ -33,6 +32,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
     apply_live_execution_commissions,
     get_live_signal_broker_order_id,
@@ -50,6 +50,7 @@ from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     PRICE_ABSENT,
+    PRICE_DERIVED,
     PRICE_OBSERVED,
     PRICE_SENT_BAD,
     LiveExecution,
@@ -212,23 +213,50 @@ def _positive_finite(value: Any) -> float | None:
     return number
 
 
-def _resolve_fill_price(candidates: tuple[Any, ...]) -> tuple[float, str]:
-    """The first usable price among ``candidates`` and its ``actual_price_observed`` verdict.
+def _is_sent(raw: Any) -> bool:
+    return raw is not None and not (isinstance(raw, str) and not raw.strip())
 
-    The same three states the cTrader adapter records: ``observed`` for a finite positive price,
-    ``sent_bad`` when a price was sent and none is usable (zero, negative, non-finite, unparseable),
-    ``absent`` when no candidate carried a price at all. The stored price is ``0.0`` unless
-    observed, so a row's price is never a number the broker did not state - the verdict says
-    which rows those are (#124).
+
+def _resolve_fill_price(
+    event_prices: tuple[Any, ...],
+    *,
+    order_avg_price: Any,
+    event_qty: Any,
+    cumulative_qty: float,
+) -> tuple[float, str]:
+    """This fill's price and its ``actual_price_observed`` verdict.
+
+    The event's own prices come first; the first finite positive one is ``observed``.
+
+    The order's ``filled_avg_price`` is the average over EVERY fill of the order, so it is this
+    fill's price only when this fill is the whole order: the event states its own quantity and that
+    equals the order's cumulative quantity. Then it is used, labelled ``derived`` - never
+    ``observed``. Otherwise it is not this fill's price at all (fills of 1@100 and 1@104 average to
+    102, which is neither), and borrowing it would hand `_derive_remainder_price` a fake leg
+    (review of #143).
+
+    Without a usable price the stored price is ``0.0`` with ``sent_bad`` (a price was sent and is
+    unusable) or ``absent`` (none was sent), as the cTrader adapter records it.
     """
     sent = False
-    for raw in candidates:
-        if raw is None or (isinstance(raw, str) and not raw.strip()):
+    for raw in event_prices:
+        if not _is_sent(raw):
             continue
         sent = True
         price = _positive_finite(raw)
         if price is not None:
             return price, PRICE_OBSERVED
+    own_qty = _positive_finite(event_qty)
+    single_fill = (
+        own_qty is not None
+        and cumulative_qty > 0.0
+        and math.isclose(own_qty, cumulative_qty, rel_tol=1e-9, abs_tol=1e-12)
+    )
+    if single_fill and _is_sent(order_avg_price):
+        sent = True
+        average = _positive_finite(order_avg_price)
+        if average is not None:
+            return average, PRICE_DERIVED
     return 0.0, PRICE_SENT_BAD if sent else PRICE_ABSENT
 
 
@@ -697,9 +725,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             signal_id=UUID(signal_id),
             # Placeholder: the save derives the remainder's own price from the cumulative average
             # inside its transaction, because part of the order may already be recorded at a
-            # different price.
+            # different price, and sets the verdict (`derived`, or `derived_unavailable` with the
+            # quantity still recorded at 0.0).
             actual_price=cumulative_avg_price,
-            actual_price_observed=PRICE_OBSERVED,
+            actual_price_observed=PRICE_DERIVED,
             filled_qty=missing_filled_qty,
             commission=_known_commission(order),
             timestamp=_to_datetime(getattr(order, "filled_at", None)),
@@ -784,12 +813,32 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             since=now - COMMISSION_BACKFILL_LOOKBACK,
             until=now,
         )
-        candidates = [
-            row
-            for row in rows
-            if split_crypto_pair(row["symbol"]) is not None
-            and all(fee_day_is_posted(day, now) for day in candidate_fee_days(row["timestamp"]))
-        ]
+        candidates: list[dict[str, Any]] = []
+        skipped: dict[str, list[str]] = {}
+        for row in rows:
+            kind = classify_alpaca_symbol(row["symbol"])
+            if kind != "crypto":
+                reason = (
+                    f"not a crypto pair (symbol {row['symbol']!r} classifies as {kind}); no CFEE "
+                    "applies and nothing else prices it"
+                )
+            elif not all(
+                fee_day_is_posted(day, now) for day in candidate_fee_days(row["timestamp"])
+            ):
+                reason = "its trade date's CFEE is not posted yet; retried on a later pass"
+            else:
+                candidates.append(row)
+                continue
+            skipped.setdefault(reason, []).append(str(row["execution_id"]))
+        for reason, execution_ids in skipped.items():
+            logger.info(
+                "Alpaca commission backfill: skipping %s execution(s) with unknown commission: "
+                "%s: %s",
+                len(execution_ids),
+                reason,
+                ", ".join(execution_ids),
+                extra={"data": {"account_id": self.account_id, "execution_ids": execution_ids}},
+            )
         if not candidates:
             return 0
 
@@ -814,12 +863,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return 0
 
-        candidate_pairs = {str(row["symbol"]).replace("/", "").upper() for row in candidates}
+        candidate_pairs = {crypto_pair_key(row["symbol"]) for row in candidates}
         order_ids = sorted(
             {
                 str(item.get("order_id") or "").strip()
                 for item in fills
-                if str(item.get("symbol") or "").replace("/", "").upper() in candidate_pairs
+                if crypto_pair_key(item.get("symbol")) in candidate_pairs
             }
             - {""}
         )
@@ -1954,21 +2003,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
                 return
 
-            # The quantity is still recorded when no price is usable - a fill the database never
-            # saw is how a duplicate order gets submitted - but at 0.0 with a verdict that says so.
-            actual_price, price_observed = _resolve_fill_price(
-                (
-                    getattr(data, "fill_price", None),
-                    getattr(data, "price", None),
-                    getattr(order, "filled_avg_price", None),
-                )
-            )
-
             skip, filled_qty_value = self._resolve_trade_update_qty(
                 data, order, event=event, client_order_id=client_order_id
             )
             if skip:
                 return
+
+            broker_cumulative_filled_qty = _to_float(
+                getattr(order, "filled_qty", None), default=0.0
+            )
+            # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty`
+            # may have substituted: only that proves this fill is the whole order.
+            event_qty = getattr(data, "qty", None)
+            if event_qty is None:
+                event_qty = getattr(data, "filled_qty", None)
+            # The quantity is still recorded when no price is usable - a fill the database never
+            # saw is how a duplicate order gets submitted - but at 0.0 with a verdict that says so.
+            actual_price, price_observed = _resolve_fill_price(
+                (getattr(data, "fill_price", None), getattr(data, "price", None)),
+                order_avg_price=getattr(order, "filled_avg_price", None),
+                event_qty=event_qty,
+                cumulative_qty=broker_cumulative_filled_qty,
+            )
 
             filled_qty = _to_float(filled_qty_value)
             # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
@@ -1976,9 +2032,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
             fill_ts = _to_datetime(raw_fill_ts)
-            broker_cumulative_filled_qty = _to_float(
-                getattr(order, "filled_qty", None), default=0.0
-            )
 
             execution_id = str(getattr(data, "execution_id", "") or "")
             dedupe_key = _alpaca_fill_dedupe_key(

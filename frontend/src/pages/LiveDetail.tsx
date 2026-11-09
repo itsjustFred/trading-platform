@@ -29,8 +29,7 @@ import { Modal } from "../components/Modal";
 import { useToast } from "../components/toastContext";
 import { stringifyUnknownValue } from "../lib/unknownValue";
 import { formatSignedUsd } from "../lib/statFormat";
-import { applyFillToPosition } from "../lib/livePositionMath";
-import type { PositionState, RealizedStats } from "../lib/livePositionMath";
+import { calculateRealizedTradeStats } from "../lib/livePositionMath";
 
 const LIVE_DETAIL_POLL_MS = 30000;
 const DEFAULT_REPLAY_TIMEFRAME = "1h";
@@ -187,8 +186,13 @@ export function LiveDetailPage() {
     const metadataPnlPct = Number(metadata?.pnl_pct ?? Number.NaN);
     const direction = String(row.action || "").toUpperCase();
     const directionFactor = direction === "SELL" ? -1 : 1;
-    const slippagePnl = -asFiniteNumber(row.slippage, 0) * asFiniteNumber(row.filled_qty, 0) * directionFactor;
-    const resolvedPnl = Number.isFinite(metadataPnl) ? metadataPnl : slippagePnl;
+    // An unknown price has no slippage: its PnL is unknown, not 0 (#124).
+    const slippagePnl =
+      row.slippage === null
+        ? Number.NaN
+        : -asFiniteNumber(row.slippage, 0) * asFiniteNumber(row.filled_qty, 0) * directionFactor;
+    const fallbackPnl = Number.isFinite(slippagePnl) ? slippagePnl : null;
+    const resolvedPnl = Number.isFinite(metadataPnl) ? metadataPnl : fallbackPnl;
 
     const durationFromMeta = stringifyUnknownMetadata(
       metadata?.duration ?? metadata?.holding_time ?? metadata?.bars_held,
@@ -499,8 +503,14 @@ export function LiveDetailPage() {
         <MetricCard label="Win Rate" value={formatPercent(stats.winRate)} />
         <MetricCard
           label="Total PnL"
-          value={formatSignedUsd(stats.totalPnl)}
-          valueColor={stats.totalPnl >= 0 ? "#86efac" : "#fecaca"}
+          value={Number.isFinite(stats.totalPnl) ? formatSignedUsd(stats.totalPnl) : "incomplete"}
+          valueColor={
+            Number.isFinite(stats.totalPnl)
+              ? stats.totalPnl >= 0
+                ? "#86efac"
+                : "#fecaca"
+              : undefined
+          }
         />
         <MetricCard label="Current Balance" value={formatUsd(stats.currentBalance)} />
         <MetricCard label="Current Equity" value={formatUsd(stats.currentEquity)} />
@@ -713,7 +723,11 @@ function normalizeStats(
     winningTrades: asFiniteNumber(stats.winning_trades, fallback.winningTrades),
     losingTrades: asFiniteNumber(stats.losing_trades, fallback.losingTrades),
     winRate: liveWinRateToPoints(stats.win_rate) ?? fallback.winRate,
-    totalPnl: asFiniteNumber(stats.total_pnl, fallback.totalPnl),
+    // An incomplete server result stays unknown; it must not fall back to a number (#124).
+    totalPnl:
+      stats.pnl_complete === false || stats.total_pnl === null
+        ? Number.NaN
+        : asFiniteNumber(stats.total_pnl, fallback.totalPnl),
     maxDrawdown: toDrawdownPercent(
       stats.max_drawdown_pct ?? stats.max_drawdown,
       fallback.maxDrawdown,
@@ -748,39 +762,6 @@ function buildFallbackStats(
     currentBalance,
     currentEquity,
   };
-}
-
-function calculateRealizedTradeStats(trades: LiveTradeSlippage[]): RealizedStats {
-  const positions = new Map<string, PositionState>();
-  const stats: RealizedStats = { totalPnl: 0, winningTrades: 0, losingTrades: 0 };
-
-  const orderedTrades = [...trades].sort((a, b) => a.execution_time - b.execution_time);
-  for (const trade of orderedTrades) {
-    const action = String(trade.action || "").toLowerCase();
-    let direction = 0;
-    if (action === "buy") {
-      direction = 1;
-    } else if (action === "sell") {
-      direction = -1;
-    }
-    if (direction === 0) {
-      continue;
-    }
-
-    const quantity = Math.abs(asFiniteNumber(trade.filled_qty, 0));
-    const price = asFiniteNumber(trade.actual_price, 0);
-    if (quantity <= 0 || price <= 0) {
-      continue;
-    }
-
-    const symbol = String(trade.symbol || "UNKNOWN").toUpperCase();
-    const fillStats = applyFillToPosition(positions, symbol, quantity * direction, price);
-    stats.totalPnl += fillStats.totalPnl;
-    stats.winningTrades += fillStats.winningTrades;
-    stats.losingTrades += fillStats.losingTrades;
-  }
-
-  return stats;
 }
 
 function maxDrawdownFromBalances(balances: LiveBalanceRecord[]): number {

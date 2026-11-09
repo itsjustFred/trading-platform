@@ -158,6 +158,7 @@ from shared.models import (
     ServiceType,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+    execution_price_is_usable,
     resolve_defined_stat,
 )
 from shared.models import (
@@ -5508,15 +5509,38 @@ def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, i
     return (None if unknown else total), unknown
 
 
+def _live_unpriced_fill_count(rows: list[dict[str, Any]]) -> int:
+    """How many buy/sell fills carry real quantity at an unusable price (#124, review of #143).
+
+    Such a fill (stored at 0.0 with `sent_bad`, `absent` or `derived_unavailable`, served as
+    `actual_price: None`) still moved the position. `_calculate_realized_live_pnl` cannot price
+    it, so every realized number after it is unknown rather than a smaller real number.
+    """
+    count = 0
+    for row in rows:
+        action = str(row.get("action") or "").strip().lower()
+        if action not in ("buy", "sell") or abs(_safe_float(row.get("filled_qty"), 0.0)) <= 0.0:
+            continue
+        if not execution_price_is_usable(row.get("actual_price"), row.get("actual_price_observed")):
+            count += 1
+    return count
+
+
 def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
+    # A fill at an unknown price makes realized PnL unknown, like an unknown fee makes net PnL
+    # unknown: never a 0.0 price.
+    price_unknown_count = _live_unpriced_fill_count(execution_rows)
+    pnl_complete = price_unknown_count == 0
     # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
     # commission and is reported only when every commission is known.
     total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
     net_pnl = (
-        round(total_pnl_realized - total_commission, 2) if total_commission is not None else None
+        round(total_pnl_realized - total_commission, 2)
+        if total_commission is not None and pnl_complete
+        else None
     )
     # Win rate denominators are closed round trips (a win or a loss), never raw
     # execution rows: partial fills would otherwise deflate the ratio.
@@ -5545,13 +5569,15 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
         "winning_trades": wins,
         "losing_trades": losses,
         "win_rate": round(win_rate, 2),
-        "total_pnl": round(total_pnl_realized, 2),
+        "total_pnl": round(total_pnl_realized, 2) if pnl_complete else None,
+        "pnl_complete": pnl_complete,
+        "price_unknown_count": price_unknown_count,
         "total_commission": (
             round(total_commission, 2) if total_commission is not None else None
         ),
         "commission_unknown_count": commission_unknown_count,
         "net_pnl": net_pnl,
-        "net_pnl_complete": commission_unknown_count == 0,
+        "net_pnl_complete": pnl_complete and commission_unknown_count == 0,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
@@ -12006,9 +12032,11 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "symbol": row.get("symbol", ""),
                 "action": row.get("action", ""),
                 "theoretical_price": float(row.get("theoretical_price", 0.0)),
-                "actual_price": float(row.get("actual_price", 0.0)),
-                "slippage": float(row.get("slippage", 0.0)),
-                "slippage_bps": float(row.get("slippage_bps", 0.0)),
+                # None is "no usable price" (#124, review of #143), never a fill at 0.0.
+                "actual_price": _optional_float(row.get("actual_price")),
+                "actual_price_observed": row.get("actual_price_observed"),
+                "slippage": _optional_float(row.get("slippage")),
+                "slippage_bps": _optional_float(row.get("slippage_bps")),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
                 "position_size": _execution_risk_value(row, metadata, "position_size"),
                 "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),

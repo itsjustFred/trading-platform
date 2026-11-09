@@ -35,12 +35,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
+from shared.alpaca_symbols import classify_alpaca_symbol
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
-    PRICE_ABSENT,
-    PRICE_SENT_BAD,
+    PRICE_DERIVED,
+    PRICE_DERIVED_UNAVAILABLE,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -56,6 +57,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    execution_price_is_usable,
     resolve_defined_stat,
 )
 from shared.models import (
@@ -1818,9 +1820,10 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
 
     The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
-    NULL on exactly the rows whose zero was never a stated fee: Alpaca crypto fills (an Alpaca
-    account, a ``BASE/QUOTE`` symbol). Before #124 both Alpaca paths hard-coded ``0.0`` - alpaca-py has no
-    commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in either spelling
+    (``BTC/USD``, ``BTCUSD``) and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
+    ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
     stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
     ``CFEE`` from `AlpacaLiveAdapter.backfill_commissions`; older ones stay NULL, which readers
     report as "net PnL incomplete" - the truth, where ``0.0`` overstated it.
@@ -1894,20 +1897,32 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     for statement in index_ddl:
         connection.execute(text(statement))
 
-    unfaked = connection.execute(
+    alpaca_zero_rows = connection.execute(
         text(
-            "UPDATE live_executions SET commission = NULL "
-            "WHERE commission = 0.0 AND signal_id IN ("
-            "  SELECT s.id FROM live_signals s"
-            "  JOIN live_deployments d ON d.id = s.deployment_id"
-            "  JOIN live_accounts a ON a.id = d.account_id"
-            "  WHERE lower(a.broker) = 'alpaca' AND instr(s.symbol, '/') > 0"
-            ")"
+            "SELECT e.id, s.symbol FROM live_executions e"
+            " JOIN live_signals s ON s.id = e.signal_id"
+            " JOIN live_deployments d ON d.id = s.deployment_id"
+            " JOIN live_accounts a ON a.id = d.account_id"
+            " WHERE lower(a.broker) = 'alpaca' AND e.commission = 0.0"
         )
-    ).rowcount
+    ).fetchall()
+    # Classified from the symbol's data, not from a slash (`BTCUSD` is crypto too). Only a provable
+    # equity keeps its zero; crypto and anything undeterminable fail closed to unknown.
+    unfaked_ids = [
+        str(execution_id)
+        for execution_id, symbol in alpaca_zero_rows
+        if classify_alpaca_symbol(symbol) != "us_equity"
+    ]
+    for execution_id in unfaked_ids:
+        connection.execute(
+            text("UPDATE live_executions SET commission = NULL WHERE id = :id"),
+            {"id": execution_id},
+        )
+    unfaked = len(unfaked_ids)
     logger.info(
-        "Rebuilt live_executions with a nullable commission; %s Alpaca crypto fill(s) had a "
-        "hard-coded 0.0 commission and are now NULL (unknown) until their CFEE is backfilled",
+        "Rebuilt live_executions with a nullable commission; %s non-equity Alpaca fill(s) had a "
+        "hard-coded 0.0 commission and are now NULL (unknown), crypto until its CFEE is "
+        "backfilled",
         unfaked,
     )
     return True
@@ -2591,11 +2606,13 @@ def save_live_execution_up_to_cumulative(
 
         remainder price = (avg * cumulative - sum(local price * qty)) / missing qty
 
-    It fails closed - persists nothing, logs, returns 0.0 - when any local leg has no usable price
-    (``actual_price_observed`` of ``sent_bad``/``absent``, or a non-positive or non-finite price:
-    the formula would silently move that leg's cost onto the remainder), when the result is not a
-    finite positive price, or when the row would be an amendment of an existing key (its stored
-    price would need re-deriving too). Without it, the caller's ``actual_price`` is stored as-is.
+    The derived price is stored as ``derived``. When it cannot be derived honestly - a local leg
+    has no usable price (the formula would silently move that leg's cost onto the remainder), the
+    result is not a finite positive price, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION``
+    of the average - the QUANTITY is still persisted, at price 0.0 with ``derived_unavailable``
+    (logged): the ledger needs the quantity, and only PnL becomes incomplete. An amendment of an
+    existing key is refused (its stored price would need re-deriving too). Without
+    ``cumulative_avg_price`` the caller's ``actual_price`` and verdict are stored as-is.
     """
     normalized_signal_id = str(execution.signal_id or "").strip()
     cumulative_qty = float(broker_cumulative_filled_qty or 0.0)
@@ -2726,10 +2743,15 @@ def save_live_execution_up_to_cumulative(
                     cumulative_qty=cumulative_qty,
                     missing_qty=missing_qty,
                 )
+                # The QUANTITY is recorded either way: exit sizing and duplicate-order protection
+                # read filled quantity, and a fill dropped here would be dropped on every pass,
+                # because the legs that block the price do not change (review of #143).
                 if remainder_price is None:
-                    session.rollback()
-                    return 0.0
-                record.actual_price = remainder_price
+                    record.actual_price = 0.0
+                    record.actual_price_observed = PRICE_DERIVED_UNAVAILABLE
+                else:
+                    record.actual_price = remainder_price
+                    record.actual_price_observed = PRICE_DERIVED
 
             record.filled_qty = persisted_qty
             if requested_qty != persisted_qty and record.commission:
@@ -2743,6 +2765,17 @@ def save_live_execution_up_to_cumulative(
             raise
 
 
+#: A derived remainder price must lie within this fraction of the order's own ``filled_avg_price``
+#: (review of #143). The average is a quantity-weighted mean of every fill of the ONE order, and
+#: the orders this platform submits (market and bracket entries) fill within seconds, so a real
+#: fill more than 10% away from its own order's average is implausible. The remainder price is
+#: also an amplifier: any error in a local leg's price or quantity is divided by the (often small)
+#: missing quantity. A result outside the band therefore says a local leg is inconsistent, not that
+#: the market moved - and the cost of a false rejection is bounded: the quantity is still recorded
+#: (`derived_unavailable`), only PnL is reported incomplete.
+REMAINDER_PRICE_MAX_REL_DEVIATION = 0.10
+
+
 def _derive_remainder_price(
     session: Session,
     signal_id: str,
@@ -2753,8 +2786,10 @@ def _derive_remainder_price(
 ) -> float | None:
     """The price of the quantity a signal is still missing, from the broker's cumulative average.
 
-    ``None`` (logged) when it cannot be derived honestly; see
-    `save_live_execution_up_to_cumulative`.
+    ``None`` (logged) when it cannot be derived honestly: a local leg has no usable price (an
+    unusable verdict, or a non-positive or non-finite price - `derived` legs are usable), or the
+    result is not finite and positive, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION`` of
+    the average. See `save_live_execution_up_to_cumulative`.
     """
     legs = session.exec(
         select(
@@ -2766,35 +2801,45 @@ def _derive_remainder_price(
     ).all()
     local_notional = 0.0
     for leg_id, price, qty, observed in legs:
-        leg_price = float(price) if price is not None else math.nan
-        if observed in (PRICE_SENT_BAD, PRICE_ABSENT) or not (
-            math.isfinite(leg_price) and leg_price > 0.0
-        ):
+        if not execution_price_is_usable(price, observed):
             logger.warning(
-                "Not persisting reconciled remainder for signal %s: local execution %s has no "
+                "Reconciled remainder for signal %s gets no price: local execution %s has no "
                 "usable price (actual_price=%r, actual_price_observed=%r), so the remainder price "
-                "cannot be derived from the broker's cumulative average; retried next pass",
+                "cannot be derived from the broker's cumulative average; its quantity is still "
+                "recorded",
                 signal_id,
                 leg_id,
                 price,
                 observed,
             )
             return None
-        local_notional += leg_price * float(qty or 0.0)
+        local_notional += float(price) * float(qty or 0.0)
     remainder_price = (cumulative_avg_price * cumulative_qty - local_notional) / missing_qty
     if not (math.isfinite(remainder_price) and remainder_price > 0.0):
-        logger.warning(
-            "Not persisting reconciled remainder for signal %s: derived remainder price %r is not "
-            "a finite positive price (broker average %r over %r, local notional %r, missing %r)",
-            signal_id,
-            remainder_price,
-            cumulative_avg_price,
-            cumulative_qty,
-            local_notional,
-            missing_qty,
+        problem = "is not a finite positive price"
+    elif (
+        abs(remainder_price - cumulative_avg_price)
+        > REMAINDER_PRICE_MAX_REL_DEVIATION * cumulative_avg_price
+    ):
+        problem = (
+            f"is more than {REMAINDER_PRICE_MAX_REL_DEVIATION:.0%} away from the order's own "
+            "average, which says a local leg is inconsistent"
         )
-        return None
-    return remainder_price
+    else:
+        return remainder_price
+    logger.warning(
+        "Reconciled remainder for signal %s gets no price: derived remainder price %r %s "
+        "(broker average %r over %r, local notional %r, missing %r); its quantity is still "
+        "recorded",
+        signal_id,
+        remainder_price,
+        problem,
+        cumulative_avg_price,
+        cumulative_qty,
+        local_notional,
+        missing_qty,
+    )
+    return None
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -4258,8 +4303,9 @@ def _live_signal_deployment_execution_fields(
         "execution_timestamp": (
             execution.timestamp if execution is not None else None
         ),
-        "actual_price": (
-            float(execution.actual_price or 0.0) if execution is not None else None
+        "actual_price": _optional_execution_price(execution),
+        "actual_price_observed": (
+            execution.actual_price_observed if execution is not None else None
         ),
         "filled_qty": (
             float(execution.filled_qty or 0.0) if execution is not None else None
@@ -4476,6 +4522,15 @@ def _scalar_stats_for_save(
     return resolved
 
 
+def _optional_execution_price(execution: LiveExecutionModel | None) -> float | None:
+    """A row's price, or None when it is not a price (see `execution_price_is_usable`)."""
+    if execution is None or not execution_price_is_usable(
+        execution.actual_price, execution.actual_price_observed
+    ):
+        return None
+    return float(execution.actual_price)
+
+
 def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
     """A row's commission, keeping NULL ("not known yet", #124) distinct from a known 0.0."""
     if execution is None or execution.commission is None:
@@ -4487,9 +4542,14 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
         theoretical = float(signal.theoretical_price or 0.0)
-        actual = float(execution.actual_price or 0.0)
-        slippage = actual - theoretical
-        slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
+        # An unusable price (#124, review of #143) is None, not 0.0: a 0.0 here would read as a
+        # fill at zero and a slippage of -100%.
+        actual = _optional_execution_price(execution)
+        slippage = actual - theoretical if actual is not None else None
+        if slippage is None:
+            slippage_bps = None
+        else:
+            slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
         payload.append(
             {
                 "signal_id": signal.id,
@@ -4502,6 +4562,7 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "actual_price": actual,
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
+                "actual_price_observed": execution.actual_price_observed,
                 "filled_qty": float(execution.filled_qty or 0.0),
                 "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,

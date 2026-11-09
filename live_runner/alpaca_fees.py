@@ -26,6 +26,9 @@ What the docs do NOT say, and how each gap is closed here:
   it is that much of the bought asset, paid for at that price. A non-USD quote (``ETH/BTC``) would
   need a second price this module does not have, so it is left NULL.
 
+* **Which symbols are crypto.** Decided from the symbol's data by `shared.alpaca_symbols`, so a
+  signal stored as ``BTCUSD`` is backfilled exactly like ``BTC/USD``.
+
 Everything else that cannot be priced honestly **fails closed**: the group's executions keep a NULL
 commission and the reason is logged; nothing is ever written as ``0.0``. In particular a group is
 refused when the pair traded on an order this account never recorded (a manual trade shares the
@@ -45,6 +48,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from shared.alpaca_symbols import crypto_pair_key, split_crypto_pair
+
 #: A trade date's fees are looked up only once this long has passed since its UTC midnight: the
 #: whole trade day, plus the following UTC day on which the docs say the fee is typically created.
 CFEE_POSTING_DELAY = timedelta(days=2)
@@ -63,15 +68,7 @@ _QTY_ABS_TOL = 1e-12
 
 def pair_key(symbol: Any) -> str:
     """``BTC/USD`` and ``BTCUSD`` (as a ``CFEE`` spells it) to one comparable key."""
-    return str(symbol or "").replace("/", "").strip().upper()
-
-
-def split_crypto_pair(symbol: Any) -> tuple[str, str] | None:
-    """``("BTC", "USD")`` for ``BTC/USD``; ``None`` when the symbol is not a ``BASE/QUOTE`` pair."""
-    parts = str(symbol or "").strip().upper().split("/")
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        return None
-    return parts[0], parts[1]
+    return crypto_pair_key(symbol)
 
 
 def candidate_fee_days(moment: datetime) -> frozenset[date]:

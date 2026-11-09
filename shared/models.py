@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
@@ -280,12 +281,40 @@ class LiveSignal(BaseModel):
 
 #: Verdicts for `LiveExecution.actual_price_observed`.
 #:
-#: `observed`  a finite, positive price was read from the broker payload.
-#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
-#: `absent`    the broker stated no price at all on any field the resolver reads.
+#: `observed`             a finite, positive price was read for THIS fill from the broker payload.
+#: `derived`              a finite, positive price computed from broker-stated prices rather than
+#:                        stated for this fill: Alpaca's order-level `filled_avg_price` on a
+#:                        single-fill order, or a reconciled remainder derived from it (#124).
+#:                        Usable, but it is arithmetic, not a quote - hence its own label.
+#: `sent_bad`             the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`               the broker stated no price at all on any field the resolver reads.
+#: `derived_unavailable`  the broker stated the order's average, but this fill's own price could
+#:                        not be derived honestly (an unpriced sibling leg, or an implausible
+#:                        result). The QUANTITY is real and recorded; the stored price is 0.0.
 PRICE_OBSERVED = "observed"
+PRICE_DERIVED = "derived"
 PRICE_SENT_BAD = "sent_bad"
 PRICE_ABSENT = "absent"
+PRICE_DERIVED_UNAVAILABLE = "derived_unavailable"
+
+#: Verdicts whose stored `actual_price` is not a price. A row carrying one has real quantity at an
+#: unknown price: every PnL reader must report its result as incomplete, never use the 0.0.
+UNUSABLE_PRICE_VERDICTS = frozenset({PRICE_SENT_BAD, PRICE_ABSENT, PRICE_DERIVED_UNAVAILABLE})
+
+
+def execution_price_is_usable(price: Any, verdict: Any) -> bool:
+    """Whether a stored execution price may be used as a price.
+
+    False for an unusable verdict, and for a missing, non-finite or non-positive number whatever
+    its verdict - a legacy row (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
+    """
+    if verdict in UNUSABLE_PRICE_VERDICTS or price is None or isinstance(price, bool):
+        return False
+    try:
+        number = float(price)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
 
 
 class LiveExecution(BaseModel):
@@ -320,8 +349,9 @@ class LiveExecution(BaseModel):
     # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
     broker_fill_id: int | None = None
 
-    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
-    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    # Whether `actual_price` is a price the broker actually stated: `observed`, `sent_bad`,
+    # `absent`, and for prices computed from broker data `derived` / `derived_unavailable` (#124,
+    # see the verdict constants above).
     #
     # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
     # be read" produces the same stored value whether the broker omitted `executionPrice` or
