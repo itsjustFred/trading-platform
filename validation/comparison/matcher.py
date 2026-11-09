@@ -123,23 +123,18 @@ def _canonical_key(data: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _solve_assignment(
+def _solve_dense(
     ref_count: int,
     act_count: int,
     feasible: list[tuple[int, int, float]],
 ) -> dict[int, int]:
-    """Return a maximum-cardinality, minimum-cost ``ref_pos -> act_pos`` map.
+    """Solve one connected component with ``linear_sum_assignment``.
 
-    ``feasible`` holds ``(ref_pos, act_pos, cost)`` for every pair the matcher
-    may pair.  Infeasible cells get a big-M cost above the total of all
-    feasible costs, so ``linear_sum_assignment`` minimises the number of
-    infeasible assignments first and the feasible cost second (#131).  Pairs
-    the solver fills with the sentinel are dropped afterwards, and ``inf`` is
-    never handed to the solver.
+    Infeasible cells get a big-M cost above the total of all feasible costs,
+    so the solver minimises the number of infeasible assignments first and
+    the feasible cost second (#131). Pairs the solver fills with the sentinel
+    are dropped afterwards, and ``inf`` is never handed to the solver.
     """
-    if ref_count == 0 or act_count == 0 or not feasible:
-        return {}
-
     costs = [cost for _ref_pos, _act_pos, cost in feasible]
     # Twice the total plus one stays strictly above any all-feasible total
     # even when that total is large enough for "+ 1" to round away.
@@ -163,6 +158,57 @@ def _solve_assignment(
         # The solver had to fill the unmatched rows/columns with the sentinel.
         if (ref_pos, act_pos) in allowed:
             assigned[ref_pos] = act_pos
+    return assigned
+
+
+def _solve_assignment(
+    ref_count: int,
+    act_count: int,
+    feasible: list[tuple[int, int, float]],
+) -> dict[int, int]:
+    """Return a maximum-cardinality, minimum-cost ``ref_pos -> act_pos`` map.
+
+    ``feasible`` holds ``(ref_pos, act_pos, cost)`` for every pair the matcher
+    may pair. The bipartite graph is split into connected components first
+    and each component is solved on its own dense matrix. That is exact (no
+    pair crosses components, so the optimum is the union of the per-component
+    optima) and keeps memory bounded by the largest component instead of
+    ``ref_count * act_count``, which would be gigabytes for long trade lists.
+    Components are processed in canonical position order, so the result is
+    deterministic.
+    """
+    if ref_count == 0 or act_count == 0 or not feasible:
+        return {}
+
+    # Union-find over refs (0..ref_count-1) and acts (ref_count..).
+    parent = list(range(ref_count + act_count))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for ref_pos, act_pos, _cost in feasible:
+        root_a, root_b = find(ref_pos), find(ref_count + act_pos)
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    components: dict[int, list[tuple[int, int, float]]] = {}
+    for pair in feasible:
+        components.setdefault(find(pair[0]), []).append(pair)
+
+    assigned: dict[int, int] = {}
+    for root in sorted(components):
+        pairs = components[root]
+        # Local, order-preserving indices inside the component.
+        refs = sorted({ref_pos for ref_pos, _act_pos, _cost in pairs})
+        acts = sorted({act_pos for _ref_pos, act_pos, _cost in pairs})
+        ref_local = {pos: i for i, pos in enumerate(refs)}
+        act_local = {pos: i for i, pos in enumerate(acts)}
+        local = [(ref_local[r], act_local[a], cost) for r, a, cost in pairs]
+        for r_loc, a_loc in _solve_dense(len(refs), len(acts), local).items():
+            assigned[refs[r_loc]] = acts[a_loc]
     return assigned
 
 
