@@ -2292,6 +2292,15 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             existing = _find_existing_live_signal_by_idempotency_key(
                 session, deployment_id, record.idempotency_key
             )
+            legacy_key = _normalize_optional_id(
+                (record.metadata_json or {}).get("legacy_idempotency_key")
+            )
+            if existing is None and legacy_key and legacy_key != record.idempotency_key:
+                # #127: rows written before the timestamp canonicalisation carry the key of the
+                # verbatim spelling; a replay across the upgrade must still dedupe against them.
+                existing = _find_existing_live_signal_by_idempotency_key(
+                    session, deployment_id, legacy_key
+                )
             if existing is not None:
                 # An identical producer event (same key) is treated as a redelivery. A genuine
                 # re-entry byte-identical to an earlier signal cannot be told apart, and

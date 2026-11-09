@@ -744,3 +744,34 @@ def test_c2_safe_same_key_same_signal_is_still_a_plain_redelivery(database, capl
     with caplog.at_level(logging.ERROR, logger="shared.database"):
         assert database.save_live_execution(_execution(signal_id, dedupe_key=key)) is False
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_c18_replay_across_the_upgrade_dedupes_against_a_pre_canonical_key(database) -> None:
+    """A row keyed on the verbatim `...Z` spelling (pre-#127) must still catch its replay.
+
+    Producers replay recent signals on restart, and a deploy is a restart, so the first replay
+    after the upgrade is the likeliest one. Without the legacy fallback the canonical key would
+    miss the old row and the replay would place a second broker order.
+    """
+    stamp = "2026-07-15T10:00:00Z"
+    replay = _live_signal(stamp=stamp)
+    legacy_key = replay.metadata["legacy_idempotency_key"]
+    assert legacy_key != replay.metadata["idempotency_key"]
+
+    # Simulate the row a pre-#127 daemon stored: keyed on the verbatim spelling only.
+    pre_upgrade = _live_signal(stamp=stamp)
+    pre_upgrade.metadata["idempotency_key"] = legacy_key
+    pre_upgrade.metadata.pop("legacy_idempotency_key")
+    stored_id, created = database.save_live_signal(pre_upgrade)
+    assert created is True
+
+    replay_id, replay_created = database.save_live_signal(replay)
+
+    assert replay_created is False
+    assert replay_id == stored_id
+
+
+def test_c18_canonical_stamp_carries_no_legacy_key() -> None:
+    """An already-canonical stamp keyed the same before and after; no fallback is needed."""
+    live = _live_signal(stamp="2026-07-15T10:00:00+00:00")
+    assert "legacy_idempotency_key" not in live.metadata
