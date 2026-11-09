@@ -38,3 +38,31 @@ def test_infeasible_universes_are_skipped_with_log(caplog: pytest.LogCaptureFixt
 def test_all_universes_infeasible_raises_clear_error() -> None:
     with pytest.raises(ValueError, match="satisfies min_weight/max_weight"):
         select_best_risk_parity_universe(_frame(), [["SPY", "TLT"]], max_weight=0.4)
+
+
+def test_backtest_script_fallback_respects_max_weight(monkeypatch) -> None:
+    """#129: the script's own solver had the same unbounded inverse-vol fallback."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    import scripts.run_risk_parity_backtest as script
+
+    monkeypatch.setattr(
+        script, "minimize", lambda *_a, **_k: SimpleNamespace(success=False, x=None)
+    )
+    cov = np.diag([1.0 / 64.0, 1.0, 1.0])
+    weights = script.calculate_risk_parity_weights(cov, 0.0, 0.4, ["A", "B", "C"])
+
+    assert sum(weights.values()) == __import__("pytest").approx(1.0)
+    assert max(weights.values()) <= 0.4 + 1e-9
+
+
+def test_backtest_script_rejects_infeasible_max_weight() -> None:
+    import numpy as np
+    import pytest
+
+    import scripts.run_risk_parity_backtest as script
+
+    with pytest.raises(ValueError, match="max_weight"):
+        script.calculate_risk_parity_weights(np.eye(4), 0.0, 0.2, ["A", "B", "C", "D"])

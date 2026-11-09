@@ -52,6 +52,7 @@ _guard.ensure_own_checkout("run_risk_parity_backtest")
 import shared  # noqa: F401
 from shared.constants import ensure_path_within_workspace
 from shared.logging import get_logger
+from runner.risk_parity_optimizer import _project_to_capped_simplex
 
 logger = get_logger("scripts.run-risk-parity-backtest")
 
@@ -123,6 +124,11 @@ def calculate_risk_parity_weights(
 ) -> dict[str, float]:
     """Equal risk contribution weights via SLSQP optimisation."""
     n = len(tickers)
+    # #129: fail closed on infeasible bounds, like runner.risk_parity_optimizer.
+    if min_weight * n > 1.0 + 1e-12:
+        raise ValueError("min_weight is infeasible for the number of assets")
+    if max_weight * n < 1.0 - 1e-12:
+        raise ValueError("max_weight is infeasible for the number of assets")
 
     def portfolio_vol(w):
         return float(np.sqrt(w @ cov @ w))
@@ -153,6 +159,11 @@ def calculate_risk_parity_weights(
         vols = np.sqrt(np.diag(cov))
         inv_vols = 1.0 / vols
         weights = inv_vols / np.sum(inv_vols)
+    # #129: the inverse-vol fallback ignores the bounds and SLSQP can overshoot
+    # them by float noise; project onto the capped simplex on every path.
+    weights = _project_to_capped_simplex(
+        np.asarray(weights, dtype=float), lower=min_weight, upper=max_weight
+    )
 
     return {ticker: float(weights[i]) for i, ticker in enumerate(tickers)}
 
