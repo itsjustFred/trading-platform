@@ -539,27 +539,40 @@ def test_sell_gate_limits_both_directions(bid, rule):
         assert adapter.submitted == []
 
 
+# Levels for the crossed-TP/SL rules: the TP sits within one SL distance of
+# the entry, so with the widest allowed limit (1.0) every boundary case below
+# is decided by the TP/SL rule and not by the deviation limit.
+_NEAR_TP_BUY = {"stop_loss": 96.0, "take_profit": 103.0}
+_NEAR_TP_SELL = {"stop_loss": 104.0, "take_profit": 97.0}
+
+
 @pytest.mark.parametrize(
     ("action", "levels", "quote_price", "rule"),
     [
-        # A wide threshold isolates the TP/SL rules from the deviation limit.
-        ("buy", _BUY, 111.99, None),
+        ("buy", _NEAR_TP_BUY, 102.99, None),
+        ("buy", _NEAR_TP_BUY, 103.0, _AT_TP),
+        ("buy", _NEAR_TP_BUY, 96.01, None),
+        ("buy", _NEAR_TP_BUY, 96.0, _AT_SL),
+        ("sell", _NEAR_TP_SELL, 97.01, None),
+        ("sell", _NEAR_TP_SELL, 97.0, _AT_TP),
+        ("sell", _NEAR_TP_SELL, 103.99, None),
+        ("sell", _NEAR_TP_SELL, 104.0, _AT_SL),
+        # With the default limit the crossed level is still the named rule.
         ("buy", _BUY, 112.0, _AT_TP),
-        ("buy", _BUY, 96.01, None),
         ("buy", _BUY, 96.0, _AT_SL),
-        ("sell", _SELL, 88.01, None),
         ("sell", _SELL, 88.0, _AT_TP),
-        ("sell", _SELL, 103.99, None),
         ("sell", _SELL, 104.0, _AT_SL),
     ],
 )
 def test_gate_rejects_a_quote_at_or_beyond_tp_or_sl_regardless_of_threshold(
     action, levels, quote_price, rule
 ):
+    wide = {"max_entry_deviation_sl_fraction": 1.0} if levels in (
+        _NEAR_TP_BUY,
+        _NEAR_TP_SELL,
+    ) else {}
     deployment = (
-        _short_deployment(max_entry_deviation_sl_fraction=100.0)
-        if action == "sell"
-        else _deployment(max_entry_deviation_sl_fraction=100.0)
+        _short_deployment(**wide) if action == "sell" else _deployment(**wide)
     )
     quote = (
         _quote(bid=quote_price - 0.01, ask=quote_price)
@@ -581,8 +594,9 @@ def test_gate_rejects_a_quote_at_or_beyond_tp_or_sl_regardless_of_threshold(
 def test_gate_without_take_profit_skips_only_the_tp_rule():
     """Explicit unbounded TP: no TP rule, but the deviation limit still binds."""
     unbounded = {"stop_loss": 96.0, "take_profit_policy": "unbounded_exit_on_opposite_signal"}
-    wide = _deployment(max_entry_deviation_sl_fraction=100.0)
-    adapter = _GateAdapter(quote=_quote(bid=149.99, ask=150.0))
+    wide = _deployment(max_entry_deviation_sl_fraction=1.0)
+    # 0.975 of the SL distance away: within the widest limit, and no TP to cross.
+    adapter = _GateAdapter(quote=_quote(bid=103.89, ask=103.9))
     prepared, _ = _prepare(adapter, wide, _signal(wide, dict(unbounded)))
     assert prepared.metadata["entry_gate_rejection_rule"] is None
 
