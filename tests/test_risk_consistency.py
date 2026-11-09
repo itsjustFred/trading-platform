@@ -3,11 +3,23 @@ from datetime import datetime
 
 import pytest
 
+from live_runner.daemon import size_live_signal_for_submission
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.live import size_live_signal
 from risk.models import TradeSignal
-from shared.models import LiveSignal
+from shared.models import LiveDeploymentConfig, LiveSignal
+
+
+def _live_deployment(**settings: object) -> LiveDeploymentConfig:
+    """The deployment the daemon's live sizing reads its RiskConfig from."""
+    return LiveDeploymentConfig(
+        strategy_name="parity",
+        account_id="acc-1",
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        settings=dict(settings),
+    )
 
 
 def test_risk_engine_and_live_use_same_defaults() -> None:
@@ -68,17 +80,19 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
         pip_value=pip_value,
         current_exposure=0.0,
     )
-    live_result = size_live_signal(
+    # The daemon's live sizing path (the only live sizing entry point, #125).
+    live_result = size_live_signal_for_submission(
         live_signal,
+        _live_deployment(max_notional_per_trade=1.0),
         account_balance=100000.0,
-        config=RiskConfig(max_notional_per_trade=1.0),
         pip_value=pip_value,
     )
 
     assert backtest_result.position_size == pytest.approx(expected_size)
-    assert live_result.position_size == pytest.approx(expected_size)
-    assert live_result.risk_amount == pytest.approx(1000.0)
-    assert live_result.risk_percent == pytest.approx(0.01)
+    assert live_result.metadata["qty"] == pytest.approx(expected_size)
+    # Uncapped, so the realised risk (#84) equals the 1 % budget.
+    assert live_result.metadata["risk_amount"] == pytest.approx(1000.0)
+    assert live_result.metadata["risk_percent"] == pytest.approx(0.01)
 
 
 def test_live_size_rejects_wrong_stop_direction() -> None:
@@ -105,11 +119,13 @@ def test_live_size_rejects_wrong_stop_direction() -> None:
         },
     )
 
-    result = size_live_signal(live_signal, account_balance=100000.0)
+    result = size_live_signal_for_submission(
+        live_signal, _live_deployment(), account_balance=100000.0
+    )
 
-    assert result.position_size == 0
-    assert result.risk_amount == 0
-    assert result.risk_percent == 0
+    assert result.metadata["qty"] == 0
+    assert result.metadata["risk_amount"] == 0
+    assert result.metadata["risk_percent"] == 0
 
 
 def test_backtest_engine_allows_wrong_stop_direction() -> None:
