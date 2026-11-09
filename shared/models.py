@@ -711,13 +711,13 @@ class BacktestStats:
     avg_holding_bars: float | None = None
     max_drawdown_pct: float = 0.0
     max_drawdown_duration: int = 0
-    sharpe_ratio: float = 0.0
-    sortino_ratio: float = 0.0
+    sharpe_ratio: float | None = 0.0
+    sortino_ratio: float | None = 0.0
     calmar_ratio: float = 0.0
     cagr: float = 0.0
     total_return: float = 0.0
     psr: float | None = None
-    p_value: float = 1.0
+    p_value: float | None = 1.0
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -743,7 +743,10 @@ class BacktestStats:
         }
         if self.avg_holding_bars is not None:
             data["avg_holding_bars"] = self.avg_holding_bars
-        if self.psr is not None:
+        # PSR is omitted when never computed. A ruined run (#132) publishes it
+        # as an explicit null instead, so the payload says "undefined by ruin"
+        # rather than looking like an artifact that never carried the metric.
+        if self.psr is not None or self.extras.get("ruined") is True:
             data["psr"] = self.psr
         data.update(self.extras)
         return data

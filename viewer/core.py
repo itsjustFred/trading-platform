@@ -1474,6 +1474,10 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     # PSR / p-value
     stats["psr"] = _defined_stat_value(raw, "psr")
     stats["p_value"] = _defined_stat_value(raw, "p_value")
+    # #132: surface the ruin flag so a null Sharpe/PSR is explained, not mistaken
+    # for "not computed". Legacy artifacts predate the flag and read as not ruined.
+    stats["ruined"] = bool(raw.get("ruined", False))
+    stats["ruin_time"] = raw.get("ruin_time")
     return stats
 
 

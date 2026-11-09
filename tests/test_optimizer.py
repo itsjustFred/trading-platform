@@ -742,6 +742,44 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
 
 
+def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial publishes sharpe_ratio=None; it is unrankable, not 0.0.
+
+    0.0 would beat the honest losing trial (-0.5), so the ruined parameter set
+    would be selected as "best".
+    """
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["sharpe_ratio"] = None
+            result.stats["ruined"] = True
+            result.stats["undefined_metrics"] = ["sharpe_ratio"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert payload["best_value"] == -0.5
+    penalties = {
+        trial["params"]["window"]: trial["penalty_applied"]
+        for trial in payload["top_trials"]
+    }
+    assert penalties == {1: True, 2: False}
+
+
 def _patch_grid_sampler(monkeypatch, choices: list[int]) -> None:
     """Pin optuna.create_study to a deterministic GridSampler over choices."""
     original_create_study = optuna.create_study

@@ -211,7 +211,9 @@ def _best_trial_or_raise(
 
     No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
     AC 2): a study whose completed trials are ALL no-trade trials must not
-    hand back a no-trade parameter set as "best".
+    hand back a no-trade parameter set as "best". The same marker covers a
+    trial whose target metric was never measured (#132, e.g. a ruined run), so
+    a sentinel value can never win the study.
 
     ``direction`` must match the study's direction (#82): minimize-studies
     (p_value) rank lower-is-better, so the best trading trial is the MINIMUM.
@@ -231,9 +233,10 @@ def _best_trial_or_raise(
     ]
     if not trading_trials:
         raise RuntimeError(
-            "Every completed optimization trial was a no-trade trial — no "
-            "parameter region produced trades. Widen parameter_ranges or "
-            "relax position-sizing constraints before retrying."
+            "Every completed optimization trial was a no-trade trial or had an "
+            "undefined target metric — no parameter region produced a rankable "
+            "result. Widen parameter_ranges or relax position-sizing "
+            "constraints before retrying."
         )
     if direction == "minimize":
         return min(trading_trials, key=lambda trial: float(trial.value or 0.0))
@@ -559,13 +562,29 @@ def run_optimization(
             trial.set_user_attr("metric_value", float(penalty))
             return penalty
 
+        metric_key = _metric_key(config.target_metric, train_stats)
+        if train_stats.get(metric_key) is None:
+            # #132: a ruined run publishes its return metrics as None, and an
+            # undefined objective is unrankable - it is not a score of 0.0,
+            # which would beat every honest losing trial. It gets the same
+            # worst-trial penalty as a no-trade trial so it can never be
+            # selected as the best parameter set, and the study keeps going
+            # instead of aborting on the whole run.
+            trial.set_user_attr("penalty_applied", True)
+            trial.set_user_attr("metric_name", metric_key)
+            penalty = _no_trade_penalty_value(
+                completed_trading_values,
+                direction=_study_direction(config.target_metric),
+            )
+            trial.set_user_attr("metric_value", float(penalty))
+            return penalty
+
         raw_metric_value = _metric_value(train_stats, config.target_metric)
         metric_value = raw_metric_value
         # C3: raw maximize targets (total_pnl/profit_factor/win_rate/...)
         # carry mandatory trade-count/drawdown haircuts so lucky sparse
         # runs cannot beat robust ones. Terms are recorded for transparency.
         metric_direction = _study_direction(config.target_metric)
-        metric_key = _metric_key(config.target_metric, train_stats)
         if config.risk_adjust_objective:
             metric_value, penalty_terms = _risk_adjusted_metric_value(
                 metric_value,
