@@ -12,10 +12,13 @@ Maintainer decisions pinned here (issue #125 comments):
 * ``pip_value`` comes from trusted callers only, never from signal metadata.
 * Before submitting, the signal entry is compared with the live broker quote
   (ask for buys, bid for sells). The deviation is a fraction of the SL
-  distance; only a move TOWARD the SL beyond
-  ``max_entry_deviation_sl_fraction`` (per deployment, default 0.25) rejects.
-  A move away from the SL is allowed. The quote is a gate only, never a
-  sizing input. A quote that cannot be fetched or is unusable rejects.
+  distance. Revised decision: a move beyond
+  ``max_entry_deviation_sl_fraction`` (per deployment, default 0.25) rejects
+  in EITHER direction (toward the SL: setup possibly invalid; away from it:
+  chasing, more real risk with a fixed stop). A same-side quote already at or
+  beyond the TP (when one is set) or at or beyond the SL also rejects. The
+  quote is a gate only, never a sizing input. A quote that cannot be fetched
+  or is unusable rejects.
 """
 
 from __future__ import annotations
@@ -450,11 +453,16 @@ def test_daemon_fallback_stop_is_submitted_and_used_for_sizing():
 
 # ── entry-deviation gate ──────────────────────────────────────────────────────
 
-# Buy: entry 100, SL 96 -> SL distance 4. 25 % of it is 1.0, so the ask may
-# drop to 99.0 (toward the SL) but not below.
+# Buy: entry 100, SL 96, TP 112 -> SL distance 4. 25 % of it is 1.0, so the
+# ask may sit anywhere in [99.0, 101.0].
 _BUY = {"stop_loss": 96.0, "take_profit": 112.0}
-# Sell: entry 100, SL 104. The bid may rise to 101.0 but not above.
+# Sell: entry 100, SL 104, TP 88. The bid may sit anywhere in [99.0, 101.0].
 _SELL = {"stop_loss": 104.0, "take_profit": 88.0}
+
+_TOWARD = "deviation_toward_stop_loss"
+_AWAY = "deviation_away_from_stop_loss"
+_AT_TP = "quote_at_or_beyond_take_profit"
+_AT_SL = "quote_at_or_beyond_stop_loss"
 
 
 def _short_deployment(**settings: Any) -> LiveDeploymentConfig:
@@ -463,58 +471,122 @@ def _short_deployment(**settings: Any) -> LiveDeploymentConfig:
 
 
 @pytest.mark.parametrize(
-    ("ask", "accepted"),
+    ("ask", "rule"),
     [
-        (100.0, True),
-        (99.5, True),
-        (99.0, True),  # exactly 0.25 of the SL distance: not "more than"
-        (98.99, False),
-        (97.0, False),
-        (95.0, False),  # through the stop
-        (104.0, True),  # away from the SL: allowed, no chasing guard
-        (130.0, True),
+        (100.0, None),
+        (99.5, None),
+        (99.0, None),  # exactly 0.25 toward the SL: not "more than"
+        (98.99, _TOWARD),
+        (97.0, _TOWARD),
+        (100.5, None),
+        (101.0, None),  # exactly 0.25 away from the SL
+        (101.01, _AWAY),  # chasing: fixed stop now further away than sized
+        (104.0, _AWAY),
+        (96.0, _AT_SL),  # at the stop
+        (95.0, _AT_SL),  # through the stop
+        (112.0, _AT_TP),  # at the target
+        (130.0, _AT_TP),
     ],
 )
-def test_buy_gate_rejects_only_a_move_toward_the_stop(ask, accepted):
+def test_buy_gate_limits_both_directions(ask, rule):
     deployment = _deployment()
     adapter = _GateAdapter(quote=_quote(bid=ask - 0.01, ask=ask))
     signal = _signal(deployment, dict(_BUY))
 
-    if accepted:
+    if rule is None:
         prepared, _ = _prepare(adapter, deployment, signal)
         assert prepared.metadata["entry_quote_price"] == pytest.approx(ask)
+        assert prepared.metadata["entry_gate_rejection_rule"] is None
     else:
-        with pytest.raises(ValueError, match="entry deviation"):
+        with pytest.raises(ValueError, match=f"entry deviation gate.*{rule}"):
             _prepare(adapter, deployment, signal)
         assert adapter.submitted == []
     assert adapter.quote_calls == ["AAPL"]
 
 
 @pytest.mark.parametrize(
-    ("bid", "accepted"),
+    ("bid", "rule"),
     [
-        (100.0, True),
-        (100.5, True),
-        (101.0, True),
-        (101.01, False),
-        (103.0, False),
-        (105.0, False),
-        (96.0, True),  # away from the SL
-        (70.0, True),
+        (100.0, None),
+        (100.5, None),
+        (101.0, None),
+        (101.01, _TOWARD),
+        (103.0, _TOWARD),
+        (99.0, None),
+        (98.99, _AWAY),
+        (96.0, _AWAY),
+        (104.0, _AT_SL),
+        (105.0, _AT_SL),
+        (88.0, _AT_TP),
+        (70.0, _AT_TP),
     ],
 )
-def test_sell_gate_rejects_only_a_move_toward_the_stop(bid, accepted):
+def test_sell_gate_limits_both_directions(bid, rule):
     deployment = _short_deployment()
     adapter = _GateAdapter(quote=_quote(bid=bid, ask=bid + 0.01))
     signal = _signal(deployment, dict(_SELL), action="sell")
 
-    if accepted:
+    if rule is None:
         prepared, _ = _prepare(adapter, deployment, signal)
         assert prepared.metadata["entry_quote_price"] == pytest.approx(bid)
+        assert prepared.metadata["entry_gate_rejection_rule"] is None
     else:
-        with pytest.raises(ValueError, match="entry deviation"):
+        with pytest.raises(ValueError, match=f"entry deviation gate.*{rule}"):
             _prepare(adapter, deployment, signal)
         assert adapter.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("action", "levels", "quote_price", "rule"),
+    [
+        # A wide threshold isolates the TP/SL rules from the deviation limit.
+        ("buy", _BUY, 111.99, None),
+        ("buy", _BUY, 112.0, _AT_TP),
+        ("buy", _BUY, 96.01, None),
+        ("buy", _BUY, 96.0, _AT_SL),
+        ("sell", _SELL, 88.01, None),
+        ("sell", _SELL, 88.0, _AT_TP),
+        ("sell", _SELL, 103.99, None),
+        ("sell", _SELL, 104.0, _AT_SL),
+    ],
+)
+def test_gate_rejects_a_quote_at_or_beyond_tp_or_sl_regardless_of_threshold(
+    action, levels, quote_price, rule
+):
+    deployment = (
+        _short_deployment(max_entry_deviation_sl_fraction=100.0)
+        if action == "sell"
+        else _deployment(max_entry_deviation_sl_fraction=100.0)
+    )
+    quote = (
+        _quote(bid=quote_price - 0.01, ask=quote_price)
+        if action == "buy"
+        else _quote(bid=quote_price, ask=quote_price + 0.01)
+    )
+    adapter = _GateAdapter(quote=quote)
+    signal = _signal(deployment, dict(levels), action=action)
+
+    if rule is None:
+        prepared, _ = _prepare(adapter, deployment, signal)
+        assert prepared.metadata["entry_gate_rejection_rule"] is None
+    else:
+        with pytest.raises(ValueError, match=f"entry deviation gate.*{rule}"):
+            _prepare(adapter, deployment, signal)
+        assert adapter.submitted == []
+
+
+def test_gate_without_take_profit_skips_only_the_tp_rule():
+    """Explicit unbounded TP: no TP rule, but the deviation limit still binds."""
+    unbounded = {"stop_loss": 96.0, "take_profit_policy": "unbounded_exit_on_opposite_signal"}
+    wide = _deployment(max_entry_deviation_sl_fraction=100.0)
+    adapter = _GateAdapter(quote=_quote(bid=149.99, ask=150.0))
+    prepared, _ = _prepare(adapter, wide, _signal(wide, dict(unbounded)))
+    assert prepared.metadata["entry_gate_rejection_rule"] is None
+
+    default = _deployment()
+    adapter = _GateAdapter(quote=_quote(bid=101.49, ask=101.5))
+    with pytest.raises(ValueError, match=f"entry deviation gate.*{_AWAY}"):
+        _prepare(adapter, default, _signal(default, dict(unbounded)))
 
 
 def test_buy_gate_uses_the_ask_not_the_bid():
@@ -543,38 +615,51 @@ def test_sell_gate_uses_the_bid_not_the_ask():
     assert prepared.metadata["entry_deviation_sl_fraction"] == pytest.approx(0.1)
 
 
-def test_gate_records_negative_deviation_for_a_move_away_from_the_stop():
+@pytest.mark.parametrize(
+    ("ask", "signed", "direction"),
+    [
+        (100.8, -0.2, "away_from_stop_loss"),
+        (99.2, 0.2, "toward_stop_loss"),
+        (100.0, 0.0, "none"),
+    ],
+)
+def test_gate_persists_the_signed_deviation_and_its_direction(ask, signed, direction):
     deployment = _deployment()
-    adapter = _GateAdapter(quote=_quote(bid=101.9, ask=102.0))
+    adapter = _GateAdapter(quote=_quote(bid=ask - 0.01, ask=ask))
     signal = _signal(deployment, dict(_BUY))
 
     prepared, _ = _prepare(adapter, deployment, signal)
 
-    assert prepared.metadata["entry_deviation_sl_fraction"] == pytest.approx(-0.5)
+    assert prepared.metadata["entry_deviation_sl_fraction"] == pytest.approx(signed)
+    assert prepared.metadata["entry_deviation_direction"] == direction
 
 
 @pytest.mark.parametrize(
-    ("threshold", "ask", "accepted"),
+    ("threshold", "ask", "rule"),
     [
-        (0.5, 98.5, True),  # 0.375 <= 0.5
-        (0.5, 97.9, False),  # 0.525 > 0.5
-        (0.1, 99.5, False),  # 0.125 > 0.1
-        (0.1, 99.6, True),
-        (0.0, 99.99, False),  # zero tolerance: any move toward the SL rejects
-        (0.0, 100.0, True),
-        (0.0, 100.5, True),
+        (0.5, 98.5, None),  # 0.375 toward <= 0.5
+        (0.5, 97.9, _TOWARD),  # 0.525 > 0.5
+        (0.5, 101.9, None),  # 0.475 away <= 0.5
+        (0.5, 102.1, _AWAY),  # 0.525 away > 0.5
+        (0.1, 99.5, _TOWARD),  # 0.125 > 0.1
+        (0.1, 99.6, None),  # exactly 0.1 (float noise absorbed)
+        (0.1, 100.4, None),  # exactly 0.1 away
+        (0.1, 100.5, _AWAY),
+        (0.0, 99.99, _TOWARD),  # zero tolerance: any move rejects
+        (0.0, 100.0, None),
+        (0.0, 100.01, _AWAY),
     ],
 )
-def test_gate_threshold_is_configurable_per_deployment(threshold, ask, accepted):
+def test_gate_threshold_is_configurable_per_deployment(threshold, ask, rule):
     deployment = _deployment(max_entry_deviation_sl_fraction=threshold)
     adapter = _GateAdapter(quote=_quote(bid=ask - 0.01, ask=ask))
     signal = _signal(deployment, dict(_BUY))
 
-    if accepted:
+    if rule is None:
         prepared, _ = _prepare(adapter, deployment, signal)
         assert prepared.metadata["max_entry_deviation_sl_fraction"] == pytest.approx(threshold)
     else:
-        with pytest.raises(ValueError, match="entry deviation"):
+        with pytest.raises(ValueError, match=f"entry deviation gate.*{rule}"):
             _prepare(adapter, deployment, signal)
 
 
@@ -600,9 +685,10 @@ def test_gate_rejects_an_invalid_threshold(bad):
     assert adapter.submitted == []
 
 
-def test_gate_threshold_is_never_read_from_signal_metadata():
+@pytest.mark.parametrize("ask", [97.0, 103.0])
+def test_gate_threshold_is_never_read_from_signal_metadata(ask):
     deployment = _deployment()
-    adapter = _GateAdapter(quote=_quote(bid=96.9, ask=97.0))
+    adapter = _GateAdapter(quote=_quote(bid=ask - 0.1, ask=ask))
     signal = _signal(
         deployment, {**_BUY, "max_entry_deviation_sl_fraction": 10.0}
     )
@@ -617,28 +703,29 @@ def test_gate_measures_against_the_fallback_stop_sizing_used():
     adapter = _GateAdapter(quote=_quote(bid=99.39, ask=99.4))
     signal = _signal(deployment, {"take_profit": 110.0})
 
-    with pytest.raises(ValueError, match="entry deviation"):
+    with pytest.raises(ValueError, match=f"entry deviation gate.*{_TOWARD}"):
         _prepare(adapter, deployment, signal)
 
 
 def test_gate_measures_from_the_resolved_entry():
-    """Entry 102 (metadata), SL 98 -> SL distance 4. An ask of 100.9 is 0.275
-    of it toward the SL and rejects; measured from theoretical 100 (distance
-    2) it would read as a move away from the stop and pass."""
+    """Entry 102 (metadata), SL 98 -> SL distance 4. An ask of 102.9 is 0.225
+    of it away from the SL and passes; measured from theoretical 100
+    (distance 2) it would read as 1.45 away and reject."""
     deployment = _deployment()
-    adapter = _GateAdapter(quote=_quote(bid=100.6, ask=100.9))
+    adapter = _GateAdapter(quote=_quote(bid=102.8, ask=102.9))
     signal = _signal(
         deployment, {"entry_price": 102.0, "stop_loss": 98.0, "take_profit": 110.0}
     )
 
-    with pytest.raises(ValueError, match="entry deviation"):
-        _prepare(adapter, deployment, signal)
+    prepared, _ = _prepare(adapter, deployment, signal)
+
+    assert prepared.metadata["entry_deviation_sl_fraction"] == pytest.approx(-0.225)
 
 
 def test_quote_is_never_a_sizing_input():
     deployment = _deployment()
     quantities = []
-    for ask in (100.0, 99.2, 103.0, 120.0):
+    for ask in (100.0, 99.2, 100.8, 99.5):
         adapter = _GateAdapter(quote=_quote(bid=ask - 0.05, ask=ask))
         signal = _signal(deployment, dict(_BUY))
         prepared, qty = _prepare(adapter, deployment, signal)
@@ -667,7 +754,9 @@ def test_gate_persists_quote_and_deviation_on_the_signal():
     assert metadata["entry_quote_time"] == quote_time.isoformat()
     assert metadata["entry_quote_source"] == "test-broker"
     assert metadata["entry_deviation_sl_fraction"] == pytest.approx(0.125)
+    assert metadata["entry_deviation_direction"] == "toward_stop_loss"
     assert metadata["max_entry_deviation_sl_fraction"] == pytest.approx(0.25)
+    assert metadata["entry_gate_rejection_rule"] is None
     # The persisted figures reach the broker adapter.
     submitted_signal, _ = asyncio.run(_submit_and_capture(deployment, adapter))
     assert submitted_signal.metadata["entry_quote_price"] == pytest.approx(99.5)
@@ -693,6 +782,8 @@ def test_payload_cannot_spoof_the_persisted_quote():
             "entry_quote_time": "1999-01-01T00:00:00+00:00",
             "entry_quote_source": "publisher",
             "entry_deviation_sl_fraction": 0.0,
+            "entry_deviation_direction": "none",
+            "entry_gate_rejection_rule": "publisher",
         },
     )
 
@@ -706,6 +797,8 @@ def test_payload_cannot_spoof_the_persisted_quote():
     assert metadata["entry_quote_time"] is None
     assert metadata["entry_quote_source"] != "publisher"
     assert metadata["entry_deviation_sl_fraction"] == pytest.approx(0.125)
+    assert metadata["entry_deviation_direction"] == "toward_stop_loss"
+    assert metadata["entry_gate_rejection_rule"] is None
 
 
 # ── gate: fail closed when the quote is unavailable or unusable ───────────────
@@ -766,9 +859,20 @@ def test_gate_fails_closed_when_the_adapter_returns_nothing():
         _prepare(adapter, deployment, signal)
 
 
-def test_gate_rejection_is_logged_with_quote_and_deviation(caplog):
+@pytest.mark.parametrize(
+    ("ask", "signed", "direction", "rule"),
+    [
+        (98.0, 0.5, "toward_stop_loss", _TOWARD),
+        (102.0, -0.5, "away_from_stop_loss", _AWAY),
+        (113.0, -3.25, "away_from_stop_loss", _AT_TP),
+        (95.0, 1.25, "toward_stop_loss", _AT_SL),
+    ],
+)
+def test_gate_rejection_is_logged_with_quote_deviation_and_rule(
+    caplog, ask, signed, direction, rule
+):
     deployment = _deployment()
-    adapter = _GateAdapter(quote=_quote(bid=97.9, ask=98.0))
+    adapter = _GateAdapter(quote=_quote(bid=ask - 0.1, ask=ask))
     signal = _signal(deployment, dict(_BUY))
 
     with caplog.at_level(logging.WARNING, logger="live-runner"):
@@ -778,8 +882,10 @@ def test_gate_rejection_is_logged_with_quote_and_deviation(caplog):
     records = [r for r in caplog.records if "entry deviation" in r.getMessage().lower()]
     assert records, "the gate rejection was not logged"
     data = getattr(records[-1], "data", {})
-    assert data["entry_quote_price"] == pytest.approx(98.0)
-    assert data["entry_deviation_sl_fraction"] == pytest.approx(0.5)
+    assert data["entry_quote_price"] == pytest.approx(ask)
+    assert data["entry_deviation_sl_fraction"] == pytest.approx(signed)
+    assert data["entry_deviation_direction"] == direction
+    assert data["entry_gate_rejection_rule"] == rule
     assert data["max_entry_deviation_sl_fraction"] == pytest.approx(0.25)
 
 
