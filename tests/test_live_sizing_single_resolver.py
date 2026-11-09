@@ -44,6 +44,9 @@ from shared.models import LiveDeploymentConfig, LiveSignal
 def _quote(bid: float, ask: float, **kwargs: Any):
     from live_runner.base_adapter import LiveQuote
 
+    # A fresh broker timestamp unless a test says otherwise: the gate rejects
+    # missing and stale quote times (#125 review follow-up).
+    kwargs.setdefault("timestamp", datetime.now(timezone.utc))
     return LiveQuote(bid=bid, ask=ask, **kwargs)
 
 
@@ -738,7 +741,7 @@ def test_quote_is_never_a_sizing_input():
 
 def test_gate_persists_quote_and_deviation_on_the_signal():
     deployment = _deployment()
-    quote_time = datetime(2026, 11, 9, 14, 30, tzinfo=timezone.utc)
+    quote_time = datetime.now(timezone.utc).replace(microsecond=0)
     adapter = _GateAdapter(
         quote=_quote(bid=99.4, ask=99.5, timestamp=quote_time, source="test-broker")
     )
@@ -794,7 +797,7 @@ def test_payload_cannot_spoof_the_persisted_quote():
     assert metadata["entry_quote_bid"] == pytest.approx(99.4)
     assert metadata["entry_quote_ask"] == pytest.approx(99.5)
     assert metadata["entry_quote_side"] == "ask"
-    assert metadata["entry_quote_time"] is None
+    assert metadata["entry_quote_time"] != "1999-01-01T00:00:00+00:00"
     assert metadata["entry_quote_source"] != "publisher"
     assert metadata["entry_deviation_sl_fraction"] == pytest.approx(0.125)
     assert metadata["entry_deviation_direction"] == "toward_stop_loss"
@@ -980,12 +983,19 @@ def test_discord_path_submits_when_quote_is_close(monkeypatch):
     assert math.isclose(submitted.metadata["entry_deviation_sl_fraction"], 0.025, abs_tol=1e-9)
 
 
-def test_quote_time_is_serialised_or_none():
-    """A quote without a timestamp persists None, not a fabricated time."""
+def test_quote_time_is_serialised_and_a_missing_time_rejects():
+    """The broker quote time is persisted as ISO-8601; a quote without one is
+    refused rather than stamped with a fabricated time."""
     deployment = _deployment()
-    adapter = _GateAdapter(quote=_quote(bid=99.9, ask=100.0))
+    stamp = datetime.now(timezone.utc)
+    adapter = _GateAdapter(quote=_quote(bid=99.9, ask=100.0, timestamp=stamp))
     signal = _signal(deployment, dict(_BUY))
 
     prepared, _ = _prepare(adapter, deployment, signal)
 
-    assert prepared.metadata["entry_quote_time"] is None
+    assert prepared.metadata["entry_quote_time"] == stamp.isoformat()
+
+    adapter = _GateAdapter(quote=_quote(bid=99.9, ask=100.0, timestamp=None))
+    with pytest.raises(ValueError, match="quote_time_missing"):
+        _prepare(adapter, deployment, _signal(deployment, dict(_BUY)))
+    assert adapter.submitted == []

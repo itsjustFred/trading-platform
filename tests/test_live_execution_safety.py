@@ -171,7 +171,7 @@ class _PositionsAdapter(BaseLiveAdapter):
         # #125 entry-deviation gate: every entry in this module is at 100, so
         # a quote there passes; the gate itself is pinned in
         # tests/test_live_sizing_single_resolver.py.
-        return LiveQuote(bid=100.0, ask=100.0, source="test")
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 class _NoPositionsAdapter(_PositionsAdapter):

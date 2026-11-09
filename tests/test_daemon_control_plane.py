@@ -73,7 +73,7 @@ class _ControlAdapter:
 
     async def get_quote(self, symbol: str) -> LiveQuote:
         # #125 entry-deviation gate: a quote at the signal entry passes.
-        return LiveQuote(bid=200.0, ask=200.0, source="test")
+        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     async def submit_order(self, signal, *, qty: float | None = None) -> str:
         self.submitted.append((signal, qty))

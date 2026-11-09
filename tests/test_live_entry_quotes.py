@@ -201,7 +201,11 @@ def test_ctrader_get_quote_combines_partial_spot_events():
 
     assert quote.bid == pytest.approx(1.085)
     assert quote.ask == pytest.approx(1.0852)
-    assert quote.timestamp is None
+    # No event carried a broker time: the receive time stands in (#125
+    # review follow-up), and the quote says so.
+    assert quote.timestamp is not None
+    assert quote.timestamp.tzinfo is not None
+    assert quote.timestamp_source == "receive"
 
 
 def test_ctrader_get_quote_ignores_other_symbols():

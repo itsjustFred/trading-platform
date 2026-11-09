@@ -514,7 +514,7 @@ class _DummyAdapter(BaseLiveAdapter):
 
     async def get_quote(self, symbol: str) -> LiveQuote:
         # #125 entry-deviation gate: a quote at the signal entry passes.
-        return LiveQuote(bid=100.0, ask=100.0, source="test")
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 def test_submit_order_with_risk_applies_qty_before_submit():

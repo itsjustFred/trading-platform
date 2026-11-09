@@ -47,7 +47,9 @@ def _signal(deployment: LiveDeploymentConfig, metadata: dict) -> LiveSignal:
 
 class _Adapter:
     def __init__(self, quote=None) -> None:
-        self.quote = quote or LiveQuote(bid=100.0, ask=100.0)
+        self.quote = quote or LiveQuote(
+            bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc)
+        )
         self.submitted: list = []
 
     async def submit_order(self, signal, *, qty=None):
@@ -138,7 +140,8 @@ def test_gate_rejects_a_quote_that_is_not_a_live_quote():
 @pytest.mark.parametrize("bad", ["x", None, True])
 def test_gate_rejects_non_numeric_quote_sides(bad):
     deployment = _deployment()
-    adapter = _Adapter(quote=LiveQuote(bid=bad, ask=100.0))  # type: ignore[arg-type]
+    adapter = _Adapter(quote=LiveQuote(bid=bad, ask=100.0, timestamp=datetime.now(timezone.utc))  # type: ignore[arg-type]
+    )
     signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": 110.0})
 
     with pytest.raises(ValueError, match="unusable"):

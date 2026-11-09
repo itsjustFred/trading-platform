@@ -550,7 +550,7 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
 
-            return LiveQuote(bid=200.0, ask=200.0, source="test")
+            return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     deployments = [
         _deployment_for_test("dep-1", symbols=["AAPL"]),
@@ -624,7 +624,7 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
 
-            return LiveQuote(bid=200.0, ask=200.0, source="test")
+            return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     trusted = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     trusted.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -693,7 +693,7 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
 
-            return LiveQuote(bid=200.0, ask=200.0, source="test")
+            return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     deployment.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -1296,7 +1296,7 @@ def test_dispatch_discards_stale_signals() -> None:
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
 
-            return LiveQuote(bid=200.0, ask=200.0, source="test")
+            return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     deployment.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -4150,7 +4150,7 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
 
-            return LiveQuote(bid=200.0, ask=200.0, source="test")
+            return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     signal = TradeSignal(
         action="buy",

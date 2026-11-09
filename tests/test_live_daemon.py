@@ -860,7 +860,7 @@ class _SignalSubmittingAdapter:
         # #125 entry-deviation gate: a quote at the signal entry passes.
         from live_runner.base_adapter import LiveQuote
 
-        return LiveQuote(bid=200.0, ask=200.0, source="test")
+        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
