@@ -7,6 +7,7 @@ search surface is the asset universe plus portfolio risk contributions.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+
+logger = logging.getLogger(__name__)
+
+# #129: float slack for the bound-feasibility checks (n * bound vs 1.0).
+_FEASIBILITY_TOL = 1e-12
 
 
 @dataclass(frozen=True)
@@ -75,23 +81,52 @@ def risk_contributions(weights: np.ndarray, covariance: np.ndarray) -> np.ndarra
     return contributions
 
 
+def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
+    """Euclidean projection onto {w : sum(w) == 1, lower <= w_i <= upper}.
+
+    #129: clipping then renormalising can push weights back outside the cap
+    (inverse-vol [0.8, 0.1, 0.1] capped at 0.4 renormalises to [0.667, ...]).
+    The projection has the form clip(v_i - tau, lower, upper): its sum is
+    continuous and non-increasing in tau, so bisection finds the unique tau
+    whose sum is 1. The caller must have verified that the set is non-empty.
+    """
+    values = np.asarray(values, dtype=float)
+    low = float(np.min(values)) - upper
+    high = float(np.max(values)) - lower
+    for _ in range(200):
+        tau = 0.5 * (low + high)
+        if tau == low or tau == high:
+            break
+        if float(np.sum(np.clip(values - tau, lower, upper))) > 1.0:
+            low = tau
+        else:
+            high = tau
+    return np.clip(values - 0.5 * (low + high), lower, upper)
+
+
 def solve_risk_parity_weights(
     covariance: np.ndarray,
     *,
     min_weight: float = 0.0,
     max_weight: float = 0.6,
 ) -> np.ndarray:
-    """Solve long-only weights whose risk contributions are as equal as possible."""
+    """Solve long-only weights whose risk contributions are as equal as possible.
+
+    Raises ``ValueError`` when the bounds are infeasible for the asset count.
+    """
     cov = np.asarray(covariance, dtype=float)
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] == 0:
         raise ValueError("covariance must be a non-empty square matrix")
     n_assets = cov.shape[0]
     lower = max(0.0, float(min_weight))
-    upper = min(1.0, max(lower, float(max_weight)))
-    if lower * n_assets > 1.0:
+    upper = min(1.0, float(max_weight))
+    # #129: fail closed on infeasible bounds instead of silently relaxing them.
+    # (upper < lower is caught by one of the two checks below unless both
+    # bounds equal 1/n within float noise, which is feasible.)
+    if lower * n_assets > 1.0 + _FEASIBILITY_TOL:
         raise ValueError("min_weight is infeasible for the number of assets")
-    if upper * n_assets < 1.0:
-        upper = 1.0
+    if upper * n_assets < 1.0 - _FEASIBILITY_TOL:
+        raise ValueError("max_weight is infeasible for the number of assets")
 
     target = np.full(n_assets, 1.0 / n_assets)
     initial = np.full(n_assets, 1.0 / n_assets)
@@ -114,11 +149,9 @@ def solve_risk_parity_weights(
     else:
         weights = np.asarray(result.x, dtype=float)
 
-    weights = np.clip(weights, lower, upper)
-    total = float(np.sum(weights))
-    if total <= 0:
-        return initial
-    return weights / total
+    # #129: project onto the capped simplex on every path so the returned
+    # weights always sum to 1 inside [lower, upper].
+    return _project_to_capped_simplex(weights, lower=lower, upper=upper)
 
 
 def score_risk_parity_universe(
@@ -215,6 +248,7 @@ def select_best_risk_parity_universe(
         raise ValueError("No valid risk parity universes were generated")
 
     selections: list[RiskParitySelection] = []
+    infeasible_skipped = 0
     for universe in configured:
         columns = [symbol for symbol in universe if symbol in returns_frame.columns]
         if len(columns) < 2:
@@ -223,6 +257,23 @@ def select_best_risk_parity_universe(
         subset = returns_frame[columns].dropna()
         if len(subset) < 2:
             continue
+        # #129: bounds that are infeasible for this universe size (e.g.
+        # max_weight=0.4 with 2 assets) must not abort the whole search; skip
+        # that universe explicitly and say so.
+        if (
+            max(0.0, float(min_weight)) * len(columns) > 1.0 + _FEASIBILITY_TOL
+            or min(1.0, float(max_weight)) * len(columns) < 1.0 - _FEASIBILITY_TOL
+        ):
+            logger.warning(
+                "Skipping risk parity universe %s: min_weight=%s / max_weight=%s "
+                "are infeasible for %d assets",
+                columns,
+                min_weight,
+                max_weight,
+                len(columns),
+            )
+            infeasible_skipped += 1
+            continue
         selections.append(
             score_risk_parity_universe(
                 columns,
@@ -230,6 +281,11 @@ def select_best_risk_parity_universe(
                 min_weight=min_weight,
                 max_weight=max_weight,
             )
+        )
+    if not selections and infeasible_skipped:
+        raise ValueError(
+            "No risk parity universe satisfies min_weight/max_weight "
+            f"({infeasible_skipped} skipped as infeasible for their asset count)"
         )
     if not selections:
         raise ValueError("No risk parity universe had enough return history")
