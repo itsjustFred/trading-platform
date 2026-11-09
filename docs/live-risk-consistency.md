@@ -7,7 +7,8 @@ Die Position-Sizing-Logik ist in zwei Modulen implementiert:
 | Modul | Zweck | Unterschiede |
 |-------|-------|--------------|
 | `risk/engine.py` | Backtest-Risk-Engine | Vollständige RiskEngine-Klasse mit konfigurierbarem RiskConfig |
-| `risk/live.py` | Live-Signal-Sizing | Wrapper-Funktion `size_live_signal()` die auf RiskEngine aufbaut |
+| `risk/live.py` | Live-Signal-Sizing | `resolve_live_levels()` (einziger Entry/SL/TP-Resolver, #125) und Wrapper `size_live_signal()` auf RiskEngine |
+| `live_runner/daemon.py` | Live-Submission | `size_live_signal_for_submission()` / `prepare_order_with_risk()`: Sizing mit Deployment-`RiskConfig`, Levels aus `resolve_live_levels()`, Entry-Deviation-Gate |
 
 ## Kritische Unterschiede
 
@@ -59,14 +60,64 @@ Alle Risk-Limits sind Bruchteile des Account-Balance (fraction of balance):
 | `SizedOrder.position_size` / `qty` | Account-Währungseinheiten des Symbols (Shares/Lots) |
 
 Vertrauensgrenze: Signal-Metadata ist **unvertrautes** Publisher-Payload. Sie darf
-nur Handels-Deskriptoren liefern (Entry-Price, Stop, Take-Profit, ATR, Timeframe,
-Pip-Value). Nie aus Metadata gelesen werden: `qty`/`explicit_qty` (Mengen-Override),
+nur Handels-Deskriptoren liefern (Entry-Price, Stop, Take-Profit, ATR, Timeframe).
+Nie aus Metadata gelesen werden: `qty`/`explicit_qty` (Mengen-Override),
 `max_risk_per_trade`, `max_total_exposure`, `max_positions`, `current_positions`,
-`current_exposure`. Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
+`current_exposure`, `pip_value` (#125: ein Payload-Pip-Value skalierte die Menge
+direkt) und `max_entry_deviation_sl_fraction`. Der Pip-Value kommt nur vom
+vertrauten Aufrufer (Config/Broker), sonst gilt der Unit-Contract 1.0.
+Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
 (`RiskConfig`), State (`current_positions`, `current_exposure`) aus dem
 Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
 komplette Risk-Engine ist entfernt; `risk.live.size_live_signal` size't jeden
 Signal durch `RiskEngine`.
+
+## Einheitlicher Level-Resolver (#125)
+
+`risk.live.resolve_live_levels()` ist die einzige Quelle für Entry, SL und TP
+eines Live-Signals. Der Daemon sized **und** submitted daraus, damit Menge und
+Broker-Levels nie auseinanderlaufen:
+
+- **Entry:** Metadata `entry_price`, sonst `theoretical_price`. Der an den Adapter
+  übergebene Signal-`theoretical_price` wird auf diesen Entry gesetzt (cTrader
+  rechnet relative SL/TP-Distanzen davon).
+- **SL:** erster gesetzter Alias aus `stop_loss`, `sl_price`, `stop_price`,
+  `resolved_stop_loss`; fehlt er, setzt die RiskEngine den Fallback-Stop, und genau
+  dieser geht an den Broker. Ein Payload-`resolved_stop_loss` kann den gesizten
+  Stop nicht mehr überschreiben.
+- **TP:** erster gesetzter Alias aus `take_profit`, `tp_price`. Ein fehlender TP
+  ist kein Resolver-Fehler; ein fehlerhafter TP (nicht numerisch, Boolean, nicht
+  endlich, `<= 0`) wird abgelehnt. Die Submission-Regel C1 bleibt: ohne TP nur mit
+  explizitem `take_profit_policy="unbounded_exit_on_opposite_signal"`.
+
+## Entry-Deviation-Gate (#125)
+
+Vor dem Market-Order-Submit vergleicht `prepare_order_with_risk()` den Entry mit
+dem aktuellen Broker-Quote (`adapter.get_quote()`): **Ask für Buys, Bid für Sells**.
+
+```
+deviation = (entry - quote) / (entry - stop)
+```
+
+als Bruchteil der SL-Distanz. Positiv heißt: der Preis ist **Richtung SL**
+gelaufen. Abgelehnt wird nur, wenn `deviation > max_entry_deviation_sl_fraction`
+(pro Deployment in `settings`, Default **0.25**, `>= 0`). Eine Bewegung weg vom SL
+ist erlaubt. Der Quote ist **nur Gate**, nie Sizing-Input: Menge und Levels bleiben
+die des Signals.
+
+Fail-closed: Adapter ohne Quote-Support, Fehler beim Abruf, Timeout, fehlende,
+nicht-positive, nicht-endliche oder gekreuzte Quotes (Bid > Ask) lehnen den Entry
+ab und werden geloggt. Exit-only-Orders laufen nicht durch das Gate.
+
+Quellen: Alpaca `get_stock_latest_quote` (IEX-Feed, wie die Bars); cTrader
+abonniert kurz den Spot-Stream des Symbols, nimmt den ersten vollständigen
+Bid/Ask und meldet sich wieder ab (Timeout `quote_timeout_seconds`, Default 5 s).
+
+Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
+`entry_quote_side`, `entry_quote_price`, `entry_quote_time` (Broker-Zeit oder
+`None`), `entry_quote_source`, `entry_deviation_sl_fraction`,
+`max_entry_deviation_sl_fraction`. Payload-Werte unter diesen Keys werden
+überschrieben. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
 ## Implizite Divergenz
 
