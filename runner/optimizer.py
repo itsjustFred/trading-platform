@@ -1464,6 +1464,9 @@ def _run_risk_parity_covariance_optimization(
         "test_period": test_period,
         "train_stats": {
             "risk_parity_score": selection["best_score"],
+            # "structure_only" => Sharpe undefined (no datetime index) and
+            # excluded from the score; see runner/risk_parity_optimizer.py.
+            "risk_parity_score_basis": selection.get("score_basis"),
             "risk_parity_sharpe": selection["best_sharpe"],
             "risk_parity_volatility": selection["best_volatility"],
             "diversification_ratio": selection["best_diversification_ratio"],
@@ -1506,7 +1509,13 @@ def _asset_returns_frame_from_base_result(result: BacktestResult) -> pd.DataFram
     # NOTE (C3): the 0.0 here fills STRATEGY-equity days (a day without a
     # trade leaves equity flat, so 0% is exact — not fabricated market data).
     # Market-data bars use intersection instead (see above).
-    return pd.DataFrame(series).sort_index().fillna(0.0)
+    frame = pd.DataFrame(series).sort_index().fillna(0.0)
+    # #129 H8: these rows are per-TRADE equity changes, not a fixed-frequency
+    # time series, so no annualisation (sqrt(252)) is valid for them. Drop the
+    # timestamps so the risk-parity scorer sees an unknown observation
+    # frequency and reports Sharpe as undefined instead of inventing one.
+    # Weights/correlations do not need the index.
+    return frame.reset_index(drop=True)
 
 
 def _asset_returns_frame_from_market_data(

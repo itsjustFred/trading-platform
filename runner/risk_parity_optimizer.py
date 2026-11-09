@@ -27,7 +27,9 @@ class RiskParitySelection:
     symbols: list[str]
     weights: dict[str, float]
     score: float
-    sharpe: float
+    # None when the observation frequency is unknown (no datetime index): the
+    # Sharpe is then undefined and the score excludes the Sharpe term.
+    sharpe: float | None
     volatility: float
     diversification_ratio: float
     avg_abs_correlation: float
@@ -42,6 +44,27 @@ def returns_from_equity_matrix(equity_matrix: np.ndarray) -> np.ndarray:
     previous = np.maximum(equity_matrix[:-1], 1e-12)
     returns = np.diff(equity_matrix, axis=0) / previous
     return np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
+    """Resample per-bar returns to daily close-to-close returns.
+
+    Sharpe is annualised with sqrt(252) across the platform
+    (``runner/stats.py``, ``runner/portfolio_optimizer.py``), which is only
+    valid for daily observations (#87, #129 H8). Per-bar returns inside a UTC
+    day are compounded (``prod(1 + r) - 1``), which is exactly the day's
+    close-to-close return because each bar return already spans the gap to the
+    previous bar. Days without any bar (weekends, holidays) are dropped, not
+    zero-filled.
+
+    Returns ``None`` when the frame has no ``DatetimeIndex``: the observation
+    frequency is then unknown and the caller must not invent an annualisation.
+    """
+    if not isinstance(returns_frame.index, pd.DatetimeIndex):
+        return None
+    growth = (1.0 + returns_frame.sort_index()).resample("1D")
+    daily = growth.prod() - 1.0
+    return daily[growth.size() > 0]
 
 
 def shrink_covariance(returns: np.ndarray, *, shrinkage: float = 0.2) -> np.ndarray:
@@ -160,8 +183,17 @@ def score_risk_parity_universe(
     *,
     min_weight: float = 0.0,
     max_weight: float = 0.6,
+    daily: bool = False,
 ) -> RiskParitySelection:
-    """Score one asset universe using covariance risk parity diagnostics."""
+    """Score one asset universe using covariance risk parity diagnostics.
+
+    ``returns`` must already be DAILY close-to-close returns when ``daily`` is
+    true (see :func:`daily_returns_frame`); only then is Sharpe annualised with
+    sqrt(252). With ``daily=False`` the observation frequency is unknown, so
+    Sharpe is left undefined (``None``) and the score uses only the
+    scale-invariant structure terms. Weights, diversification ratio,
+    correlation and risk contributions do not depend on the return scale.
+    """
     if len(symbols) < 2:
         raise ValueError("Risk parity requires at least two symbols")
     cov = shrink_covariance(returns)
@@ -169,10 +201,16 @@ def score_risk_parity_universe(
     portfolio_returns = returns @ weights_array
     mean_return = float(np.mean(portfolio_returns)) if len(portfolio_returns) else 0.0
     volatility = float(np.std(portfolio_returns) + 1e-12)
-    # #87: annualized Sharpe on the daily convention (sqrt(252)), consistent
-    # with runner/stats.py and runner/portfolio_optimizer.py — the previous
-    # raw mean/std was not comparable under the same "sharpe" name.
-    sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
+    # #87 / #129 H8: annualized Sharpe on the daily convention (sqrt(252)),
+    # consistent with runner/stats.py and runner/portfolio_optimizer.py. That
+    # factor is only correct for daily returns, so it is applied only when the
+    # caller says the input is daily; otherwise the Sharpe is undefined rather
+    # than guessed (e.g. per-trade rows have no fixed observation frequency).
+    sharpe: float | None
+    if daily:
+        sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
+    else:
+        sharpe = None
 
     asset_vols = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     weighted_asset_vol = float(weights_array @ asset_vols)
@@ -191,7 +229,7 @@ def score_risk_parity_universe(
     # average absolute correlation (0-1 scale), 2.0 penalizes squared
     # risk-budget deviation (small scale, needs the larger multiplier to
     # bind). Tune explicitly if the selection over/under-weights one axis.
-    score = sharpe + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
+    score = (sharpe or 0.0) + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
     weights = {symbol: float(weight) for symbol, weight in zip(symbols, weights_array)}
     risk = {symbol: float(value) for symbol, value in zip(symbols, rc)}
     return RiskParitySelection(
@@ -255,6 +293,11 @@ def select_best_risk_parity_universe(
             continue
         # C3: intersection, not zero-fill — missing bars are not 0% returns.
         subset = returns_frame[columns].dropna()
+        # #129 H8: covariance, Sharpe and score all use daily close-to-close
+        # returns when timestamps are available (None => frequency unknown).
+        daily_subset = daily_returns_frame(subset)
+        if daily_subset is not None:
+            subset = daily_subset
         if len(subset) < 2:
             continue
         # #129: bounds that are infeasible for this universe size (e.g.
@@ -280,6 +323,7 @@ def select_best_risk_parity_universe(
                 subset.to_numpy(dtype=float),
                 min_weight=min_weight,
                 max_weight=max_weight,
+                daily=daily_subset is not None,
             )
         )
     if not selections and infeasible_skipped:
@@ -290,9 +334,21 @@ def select_best_risk_parity_universe(
     if not selections:
         raise ValueError("No risk parity universe had enough return history")
 
-    selections.sort(key=lambda item: (item.score, item.sharpe, len(item.symbols)), reverse=True)
+    selections.sort(
+        key=lambda item: (
+            item.score,
+            item.sharpe if item.sharpe is not None else 0.0,
+            len(item.symbols),
+        ),
+        reverse=True,
+    )
     best = selections[0]
     return {
+        # "structure_only": no datetime index, Sharpe undefined and excluded
+        # from the score (not comparable with Sharpe-based scores).
+        "score_basis": (
+            "sharpe_and_structure" if best.sharpe is not None else "structure_only"
+        ),
         "best_symbols": best.symbols,
         "best_weights": best.weights,
         "best_score": best.score,
