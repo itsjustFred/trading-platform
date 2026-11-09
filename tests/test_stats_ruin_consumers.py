@@ -84,3 +84,20 @@ def test_viewer_stats_payload_legacy_artifact_reads_as_not_ruined() -> None:
 
     assert payload["ruined"] is False
     assert payload["ruin_time"] is None
+
+
+def test_ruined_backtest_is_never_selected_for_live_deployment() -> None:
+    """#132: a ruined run must not reach cTrader deployment, whatever its other metrics."""
+    from live_runner.ctrader_deployment import score_backtest_for_live, top_backtests_for_ctrader
+
+    healthy = {
+        "id": "a", "symbols": ["EURUSD"], "sharpe_ratio": 0.5, "cagr": 0.05, "psr": 0.6,
+        "max_drawdown": 10.0, "trade_count": 50, "oos_status": "available", "ruined": False,
+    }
+    ruined = {
+        **healthy, "id": "b", "sharpe_ratio": None, "psr": None, "cagr": 0.9,
+        "max_drawdown": 1.0, "ruined": True,
+    }
+
+    assert score_backtest_for_live(ruined) == float("-inf")
+    assert [row["id"] for row in top_backtests_for_ctrader([ruined, healthy])] == ["a"]
