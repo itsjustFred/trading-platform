@@ -99,11 +99,22 @@ dem aktuellen Broker-Quote (`adapter.get_quote()`): **Ask für Buys, Bid für Se
 deviation = (entry - quote) / (entry - stop)
 ```
 
-als Bruchteil der SL-Distanz. Positiv heißt: der Preis ist **Richtung SL**
-gelaufen. Abgelehnt wird nur, wenn `deviation > max_entry_deviation_sl_fraction`
-(pro Deployment in `settings`, Default **0.25**, `>= 0`). Eine Bewegung weg vom SL
-ist erlaubt. Der Quote ist **nur Gate**, nie Sizing-Input: Menge und Levels bleiben
-die des Signals.
+als Bruchteil der SL-Distanz, mit Vorzeichen: positiv heißt **Richtung SL**,
+negativ **weg vom SL**. Abgelehnt wird (Regeln in dieser Prüfreihenfolge, der Name
+landet als `entry_gate_rejection_rule` im Log und in der Fehlermeldung):
+
+| Regel | Bedingung |
+|-------|-----------|
+| `quote_at_or_beyond_stop_loss` | Buy: Ask `<=` SL. Sell: Bid `>=` SL |
+| `quote_at_or_beyond_take_profit` | nur mit TP. Buy: Ask `>=` TP. Sell: Bid `<=` TP |
+| `deviation_toward_stop_loss` | `deviation > max_entry_deviation_sl_fraction` (Setup evtl. ungültig) |
+| `deviation_away_from_stop_loss` | `-deviation > max_entry_deviation_sl_fraction` (Chasing: mit festem SL ist das echte Risiko größer als gesized) |
+
+`max_entry_deviation_sl_fraction` kommt pro Deployment aus `settings` (Default
+**0.25**, `>= 0`; `0` lässt nur einen Quote exakt am Entry zu). Der Vergleich hat
+eine Toleranz von `1e-9`, damit Float-Rundung an der Grenze nicht entscheidet.
+Ohne TP (explizite Unbounded-Policy) entfällt nur die TP-Regel. Der Quote ist
+**nur Gate**, nie Sizing-Input: Menge und Levels bleiben die des Signals.
 
 Fail-closed: Adapter ohne Quote-Support, Fehler beim Abruf, Timeout, fehlende,
 nicht-positive, nicht-endliche oder gekreuzte Quotes (Bid > Ask) lehnen den Entry
@@ -115,9 +126,11 @@ Bid/Ask und meldet sich wieder ab (Timeout `quote_timeout_seconds`, Default 5 s)
 
 Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 `entry_quote_side`, `entry_quote_price`, `entry_quote_time` (Broker-Zeit oder
-`None`), `entry_quote_source`, `entry_deviation_sl_fraction`,
-`max_entry_deviation_sl_fraction`. Payload-Werte unter diesen Keys werden
-überschrieben. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
+`None`), `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
+`entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
+`max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
+akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
+Payload-Werte unter diesen Keys werden überschrieben. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
 ## Implizite Divergenz
 

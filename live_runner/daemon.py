@@ -829,8 +829,8 @@ def size_live_signal_for_submission(
 
 
 #: Default for the per-deployment ``max_entry_deviation_sl_fraction`` (#125):
-#: a fill up to a quarter of the stop distance closer to the stop than the
-#: signal entry is accepted.
+#: the quote may sit up to a quarter of the stop distance from the signal
+#: entry, in either direction.
 DEFAULT_MAX_ENTRY_DEVIATION_SL_FRACTION = 0.25
 
 #: Float slack for the gate comparison. Prices are decimal, so a quote exactly
@@ -849,8 +849,44 @@ _ENTRY_QUOTE_METADATA_KEYS = (
     "entry_quote_time",
     "entry_quote_source",
     "entry_deviation_sl_fraction",
+    "entry_deviation_direction",
     "max_entry_deviation_sl_fraction",
+    "entry_gate_rejection_rule",
 )
+
+#: Rejection rules of the entry-deviation gate, checked in this order. The
+#: crossed-level rules come first: they name the more specific problem when
+#: the quote has also moved further than the deviation limit.
+ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
+ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
+ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
+ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS = "deviation_away_from_stop_loss"
+
+
+def _entry_gate_rejection_rule(
+    action: str,
+    *,
+    quote_price: float,
+    stop_loss: float,
+    take_profit: float | None,
+    deviation: float,
+    max_fraction: float,
+) -> str | None:
+    """Which gate rule, if any, rejects a quote (#125, revised decision)."""
+    buy = action == "buy"
+    if (quote_price <= stop_loss) if buy else (quote_price >= stop_loss):
+        return ENTRY_GATE_RULE_AT_STOP_LOSS
+    if take_profit is not None and (
+        (quote_price >= take_profit) if buy else (quote_price <= take_profit)
+    ):
+        return ENTRY_GATE_RULE_AT_TAKE_PROFIT
+    if abs(deviation) - max_fraction > _ENTRY_DEVIATION_TOLERANCE:
+        return (
+            ENTRY_GATE_RULE_TOWARD_STOP_LOSS
+            if deviation > 0
+            else ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS
+        )
+    return None
 
 
 def _max_entry_deviation_sl_fraction(deployment: LiveDeploymentConfig) -> float:
@@ -895,15 +931,22 @@ async def _check_entry_deviation(
     *,
     entry_price: float,
     stop_loss: float,
+    take_profit: float | None,
 ) -> dict[str, object]:
     """Gate a live entry against the current broker quote (#125).
 
     The signal entry is compared with the side the market order fills
     against (ask for a buy, bid for a sell), as a fraction of the SL distance.
-    Only a move TOWARD the stop beyond the deployment's
-    ``max_entry_deviation_sl_fraction`` rejects; a move away from the stop is
-    allowed (maintainer decision). The quote is a gate only: sizing has
-    already run on the signal levels and is not touched.
+    It rejects (revised maintainer decision) when the quote is
+
+    * at or beyond the SL (buy: ask <= SL, sell: bid >= SL),
+    * at or beyond the TP, when one is set (buy: ask >= TP, sell: bid <= TP),
+    * further than ``max_entry_deviation_sl_fraction`` of the SL distance from
+      the entry in EITHER direction: toward the stop the setup may be invalid,
+      away from it the order chases and a fixed stop risks more than sized.
+
+    The quote is a gate only: sizing has already run on the signal levels and
+    is not touched.
 
     Fails closed: no quote support, a fetch error, or an unusable quote all
     reject the entry. Returns the quote/deviation figures to persist on the
@@ -917,6 +960,7 @@ async def _check_entry_deviation(
         "action": signal.action,
         "entry_price": entry_price,
         "stop_loss": stop_loss,
+        "take_profit": take_profit,
         "max_entry_deviation_sl_fraction": max_fraction,
     }
     get_quote = getattr(adapter, "get_quote", None)
@@ -957,19 +1001,38 @@ async def _check_entry_deviation(
         "entry_quote_price": quote_price,
         "entry_quote_time": quote_time.isoformat() if isinstance(quote_time, datetime) else None,
         "entry_quote_source": str(quote.source or type(adapter).__name__),
+        # Signed: positive = toward the stop, negative = away from it.
         "entry_deviation_sl_fraction": deviation,
+        "entry_deviation_direction": (
+            "toward_stop_loss"
+            if deviation > 0
+            else "away_from_stop_loss"
+            if deviation < 0
+            else "none"
+        ),
         "max_entry_deviation_sl_fraction": max_fraction,
+        "entry_gate_rejection_rule": None,
     }
-    if deviation - max_fraction > _ENTRY_DEVIATION_TOLERANCE:
+    rule = _entry_gate_rejection_rule(
+        signal.action,
+        quote_price=quote_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        deviation=deviation,
+        max_fraction=max_fraction,
+    )
+    if rule is not None:
+        record["entry_gate_rejection_rule"] = rule
         logger.warning(
-            "Live entry deviation gate rejected the signal: the quote moved toward the stop",
+            "Live entry deviation gate rejected the signal",
             extra={"data": {**log_data, **record}},
         )
         raise ValueError(
-            f"Refusing live entry for {signal.symbol}: entry deviation "
-            f"{deviation:.4f} of the SL distance toward the stop exceeds "
-            f"max_entry_deviation_sl_fraction={max_fraction} "
-            f"(entry={entry_price}, stop={stop_loss}, {side}={quote_price})."
+            f"Refusing live entry for {signal.symbol}: entry deviation gate rejected "
+            f"({rule}): signed deviation {deviation:.4f} of the SL distance "
+            f"(positive = toward the stop), limit +/-{max_fraction} "
+            f"(entry={entry_price}, stop={stop_loss}, take_profit={take_profit}, "
+            f"{side}={quote_price})."
         )
     return record
 
@@ -1276,6 +1339,7 @@ async def prepare_order_with_risk(
         signal,
         entry_price=entry_price,
         stop_loss=stop_loss,
+        take_profit=take_profit,
     )
     if take_profit is None and unbounded_tp:
         logger.warning(
