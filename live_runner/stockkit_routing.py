@@ -118,6 +118,57 @@ def infer_stockkit_route(
     return ""
 
 
+#: The explicit StockKit marking on a deployment (#121 decision 5). Present means
+#: "this deployment is a StockKit bot and must route to that bot's account";
+#: absent means a normal Discord bot.
+STOCKKIT_ROUTE_CONFIG_KEY = "stockkit_route"
+
+
+def is_stockkit_marked(deployment: LiveDeploymentConfig) -> bool:
+    """True when the deployment carries an explicit ``stockkit_route``, whatever
+    its value. A marked-but-empty value is still marked, and is rejected."""
+    config = deployment.signal_config if isinstance(deployment.signal_config, dict) else {}
+    return STOCKKIT_ROUTE_CONFIG_KEY in config
+
+
+def resolve_deployment_stockkit_route(deployment: LiveDeploymentConfig) -> str:
+    """The StockKit route a deployment must be validated against, or ``""``.
+
+    An explicitly marked deployment must name a known route: ``normalize_stockkit_route``
+    only knows fixed aliases, so a bot such as ``rocketfuel_shortsonly`` or
+    ``nitro_v2`` normalised to ``""`` and skipped the account check entirely. A
+    marked route that is unknown, blank or not a string raises ``ValueError``, and so
+    does one that contradicts the route inferred from the bot's own identity.
+
+    An unmarked deployment keeps the inferred route, so a deployment whose bot name
+    is a known alias is still validated (stricter than "unmarked means unchecked",
+    and what every existing StockKit deployment relies on until it is marked).
+    """
+    inferred = infer_stockkit_route(
+        signal_source_id=deployment.signal_source_id,
+        signal_config=deployment.signal_config,
+        settings=deployment.settings,
+    )
+    if not is_stockkit_marked(deployment):
+        return inferred
+    raw = deployment.signal_config[STOCKKIT_ROUTE_CONFIG_KEY]
+    marked = normalize_stockkit_route(raw) if isinstance(raw, str) else ""
+    if not marked:
+        raise ValueError(
+            f"Deployment {deployment.id} is marked as StockKit with "
+            f"{STOCKKIT_ROUTE_CONFIG_KEY}={raw!r}, which is not a known route "
+            f"(expected one of {sorted(STOCKKIT_ACCOUNT_ROUTES)}); refusing to "
+            "skip the broker-account check"
+        )
+    if inferred and inferred != marked:
+        raise ValueError(
+            f"Deployment {deployment.id} is marked {STOCKKIT_ROUTE_CONFIG_KEY}="
+            f"{marked!r} but its bot identity says {inferred!r}; refusing an "
+            "ambiguous StockKit route"
+        )
+    return marked
+
+
 def expected_account_for_stockkit_route(route: str) -> str:
     return STOCKKIT_ACCOUNT_ROUTES[route]
 
@@ -200,12 +251,13 @@ def validate_stockkit_deployment_route(
     """
     validate_discord_deployment_signal_config(deployment)
     if str(deployment.signal_source or "").lower() != "discord":
+        if is_stockkit_marked(deployment):
+            raise ValueError(
+                f"Deployment {deployment.id} is marked {STOCKKIT_ROUTE_CONFIG_KEY} but "
+                "is not a Discord deployment"
+            )
         return
-    route = infer_stockkit_route(
-        signal_source_id=deployment.signal_source_id,
-        signal_config=deployment.signal_config,
-        settings=deployment.settings,
-    )
+    route = resolve_deployment_stockkit_route(deployment)
     if not route:
         return
     expected_number = expected_account_number_for_route(route, accounts_env_values)

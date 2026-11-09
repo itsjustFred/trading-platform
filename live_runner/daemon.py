@@ -34,6 +34,12 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.exit_signals import (
+    NothingToExitError,
+    exit_instruction_from_metadata,
+    is_exit_intent,
+    resolve_exit_order,
+)
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import (
     DiscordSignalSource,
@@ -43,6 +49,8 @@ from live_runner.signal_sources import (
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
 from live_runner.stockkit_routing import (
     infer_stockkit_route,
+    is_stockkit_marked,
+    resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
@@ -56,6 +64,7 @@ from shared.database import (
     create_service,
     get_live_account,
     get_live_deployment,
+    get_live_deployment_net_filled_qty,
     get_service,
     list_live_accounts,
     list_live_deployments,
@@ -575,13 +584,14 @@ def _deployment_matches_stockkit_route(
     account_broker_login: str | None = None,
     accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
+    marked = is_stockkit_marked(deployment)
     route = infer_stockkit_route(
         signal_source_id=deployment.signal_source_id,
         signal_config=deployment.signal_config,
         settings=deployment.settings,
         metadata=signal_metadata,
     )
-    if not route:
+    if not route and not marked:
         return True
     try:
         validate_stockkit_deployment_route(
@@ -589,6 +599,10 @@ def _deployment_matches_stockkit_route(
             account_broker_login=account_broker_login,
             accounts_env_values=accounts_env_values,
         )
+        if marked:
+            # The explicit marking is authoritative over inference (#121); it was
+            # validated just above, so this cannot raise a new refusal.
+            route = resolve_deployment_stockkit_route(deployment)
     except ValueError as exc:
         logger.warning(
             "Blocking misrouted StockKit deployment",
@@ -596,13 +610,55 @@ def _deployment_matches_stockkit_route(
                 "data": {
                     "deployment_id": str(deployment.id),
                     "account_id": deployment.account_id,
+                    "stockkit_marked": marked,
                     "error": str(exc),
                 }
             },
         )
+        if marked:
+            # #121 decision 5: a marked StockKit deployment whose route is unknown
+            # or unresolvable is a broken service, not one skipped signal.
+            _mark_discord_deployment_service_unhealthy(deployment, str(exc))
         return False
     signal_route = infer_stockkit_route(metadata=signal_metadata)
     return not signal_route or signal_route == route
+
+
+def _mark_discord_deployment_service_unhealthy(
+    deployment: LiveDeploymentConfig, reason: str
+) -> None:
+    """Mark the deployment's Discord service FAILED, never overriding PAUSE/STOP.
+
+    Best effort: the refusal itself already happened, so a lookup or write
+    failure here is logged and swallowed rather than tearing down the fan-out.
+    """
+    try:
+        service_id = _service_id_for_discord_deployment(deployment)
+        if service_id is None:
+            logger.error(
+                "StockKit route refused but the deployment has no unique service row "
+                "to mark unhealthy",
+                extra={"data": {"deployment_id": str(deployment.id), "reason": reason}},
+            )
+            return
+        update_service_status(
+            service_id, ServiceStatus.FAILED, respect_operator_intent=True
+        )
+        logger.error(
+            "Marked Discord service unhealthy: StockKit route cannot be resolved",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "service_id": service_id,
+                    "reason": reason,
+                }
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Could not mark the Discord service unhealthy after a StockKit route refusal",
+            extra={"data": {"deployment_id": str(deployment.id)}},
+        )
 
 
 def _timeframe_age_budget_seconds(timeframe: str) -> float:
@@ -931,6 +987,85 @@ async def _metadata_for_exit_only_order(
     return metadata
 
 
+async def prepare_exit_intent_order(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+) -> tuple[LiveSignal, float]:
+    """Size an exit/close instruction against this deployment's own position (#121).
+
+    The quantity is the deployment's net persisted fills for the symbol (the
+    ledger), capped at the broker position, times the instruction's fraction. The
+    close side comes from that position, never from the message. Raises
+    :class:`NothingToExitError` when there is nothing to close - the caller logs
+    and ignores it - and ``ValueError`` when a close would be ambiguous or would
+    extend exposure. Nothing here places an order.
+
+    Deliberately independent of the entry path (no risk sizing, no SL/TP guard,
+    no deployment-status check), so the exit can be dispatched on its own.
+    """
+    metadata = dict(signal.metadata or {})
+    instruction = exit_instruction_from_metadata(metadata)
+    get_positions = getattr(adapter, "get_positions", None)
+    if not callable(get_positions):
+        raise ValueError("Exit signal requires a broker adapter with get_positions support")
+    positions = list(await get_positions())
+    ledger_qty = await asyncio.to_thread(
+        get_live_deployment_net_filled_qty, str(deployment.id), signal.symbol
+    )
+    close_action, target_qty = resolve_exit_order(
+        symbol=signal.symbol,
+        ledger_qty=float(ledger_qty),
+        broker_positions=positions,
+        instruction=instruction,
+    )
+    matching_positions = [
+        position
+        for position in positions
+        if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
+    ]
+    for key in (
+        "qty",
+        "explicit_qty",
+        "ctrader_volume",
+        "volume",
+        "position_id",
+        "position_ids",
+        "position_count",
+        # An exit closes; it never carries the entry bracket.
+        "stop_loss",
+        "take_profit",
+        "sl_price",
+        "tp_price",
+        "stop_price",
+        "resolved_stop_loss",
+    ):
+        metadata.pop(key, None)
+    metadata["qty"] = float(target_qty)
+    metadata["explicit_qty"] = float(target_qty)
+    metadata["exit_only"] = True
+    metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
+    metadata["exit_ledger_qty"] = float(ledger_qty)
+    metadata["position_count"] = len(matching_positions)
+    position_ids: list[int] = []
+    for position in matching_positions:
+        raw_position_id = position.get("position_id", position.get("positionId"))
+        if raw_position_id is None:
+            continue
+        try:
+            position_id = int(raw_position_id)
+        except (TypeError, ValueError):
+            continue
+        if position_id > 0:
+            position_ids.append(position_id)
+    if len(matching_positions) == 1 and len(position_ids) == 1:
+        metadata["position_id"] = position_ids[0]
+    metadata["action"] = close_action
+    metadata["signal_action"] = signal.action
+    prepared = signal.model_copy(update={"metadata": metadata, "action": close_action})
+    return prepared, float(target_qty)
+
+
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
     open_positions_count = 0
     for position in positions:
@@ -1004,6 +1139,11 @@ async def prepare_order_with_risk(
     balance) because sizing has to see broker truth.
     """
     metadata = dict(signal.metadata or {})
+    if is_exit_intent(metadata):
+        # A parsed exit/close message (#121). Checked before the legacy
+        # sell-on-long-only path: it closes only this deployment's own ledger
+        # quantity, whatever the action placeholder says.
+        return await prepare_exit_intent_order(adapter, deployment, signal)
     if signal.action == "sell" and bool(metadata.get("exit_only")):
         # Exit-only orders close an existing position at the broker-observed
         # quantity. They bypass risk sizing and the entry fail-closed SL/TP
@@ -1196,7 +1336,16 @@ def _trade_signal_to_live_signal(
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
     _mint_signal_idempotency_key(signal, deployment, metadata)
-    if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
+    if is_exit_intent(metadata):
+        # A parsed exit is reduce-only whatever the deployment allows: on a
+        # long+short deployment a plain sell is a real short, an exit is not
+        # (#121). Validated here so a malformed instruction fails before sizing.
+        exit_instruction_from_metadata(metadata)
+        metadata["exit_only"] = True
+        metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
+        for key in ("stop_loss", "take_profit"):
+            metadata.pop(key, None)
+    elif signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     # Whitelist at the conversion site itself (B-2): never default an unmapped
@@ -1547,7 +1696,11 @@ async def _prepare_discord_signal_for_submission(
             # here, so the gate is told rather than made to sniff metadata.
             require_producer_timestamp=True,
         )
-        normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+        if not is_exit_intent(normalized_signal.metadata):
+            # Entry processors (ATR/SL/TP, BUY-only gates) shape entries. An exit
+            # closes what exists; Nitro's BUY-only processor would refuse every
+            # close on a Nitro deployment (#121).
+            normalized_signal = _apply_signal_processor(normalized_signal, deployment)
     except ValueError as exc:
         logger.warning(
             "Signal processor rejected discord signal",
@@ -1664,6 +1817,20 @@ async def _submit_normalized_discord_signal(
         prepared_signal, prepared_qty = await prepare_order_with_risk(
             adapter, deployment, live_signal
         )
+    except NothingToExitError as exc:
+        # #121 decision 1: no position -> ignore and log. Not an error.
+        logger.info(
+            "Exit signal ignored: nothing of this deployment's to close",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
     except Exception as exc:
         logger.warning(
             "Discord signal refused before submission; nothing was sent to the broker",

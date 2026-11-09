@@ -205,7 +205,9 @@ PARSER_TABLE: list[tuple[str, dict | None]] = [
 ]
 
 
-@pytest.mark.parametrize(("content", "expected"), PARSER_TABLE, ids=[row[0][:60] for row in PARSER_TABLE])
+@pytest.mark.parametrize(
+    ("content", "expected"), PARSER_TABLE, ids=[row[0][:60] for row in PARSER_TABLE]
+)
 def test_parser_table(content: str, expected: dict | None) -> None:
     signal = _parse(content)
     if expected is None:

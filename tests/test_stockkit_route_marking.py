@@ -138,7 +138,9 @@ def test_creation_rejects_a_marked_unknown_route(isolated_db) -> None:
 def test_dispatch_matcher_refuses_a_marked_unknown_route(monkeypatch) -> None:
     import live_runner.daemon as daemon
 
-    monkeypatch.setattr(daemon, "_mark_discord_deployment_service_unhealthy", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        daemon, "_mark_discord_deployment_service_unhealthy", lambda *_a, **_k: None
+    )
     assert not daemon._deployment_matches_stockkit_route(
         _deployment(stockkit_route="nitro_v2", service_name="nitro_v2"),
         {},
@@ -158,7 +160,9 @@ def test_dispatch_rejects_and_marks_the_service_unhealthy(monkeypatch) -> None:
     submitted: list[object] = []
 
     monkeypatch.setattr(daemon, "get_live_deployment", lambda _id: deployment)
-    monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _account_id: "PA-SYNTHETIC-ROCKET")
+    monkeypatch.setattr(
+        daemon, "_live_account_broker_login", lambda _account_id: "PA-SYNTHETIC-ROCKET"
+    )
     monkeypatch.setattr(daemon, "_service_id_for_discord_deployment", lambda _deployment: "svc-121")
 
     def _update(service_id, status, *, respect_operator_intent=True, **_kwargs):

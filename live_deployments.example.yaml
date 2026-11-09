@@ -30,3 +30,6 @@ deployments:
       trusted_author_ids:
         - ${DISCORD_BOT_FX_AUTHOR_ID}
       wait_candle_close: true
+      # A StockKit bot (Nitro / RamJet / RocketFuel on Alpaca) is marked
+      # explicitly; an unknown route then fails closed at creation and dispatch:
+      # stockkit_route: rocketfuel

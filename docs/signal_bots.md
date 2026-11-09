@@ -50,6 +50,15 @@ pro Bot.
 - **Status:** Kein Processor — Discord-Quelle/Server (siehe Registry-Hinweis)
 - **Routing:** `live_runner/stockkit_routing.py` mappt die Discord-Bots
   (`nitro`, `ramjet`, `rocketfuel`) auf ihre Alpaca-Accounts
+- **Explizite Markierung (#121):** Ein StockKit-Deployment setzt
+  `signal_config.stockkit_route` (z. B. `rocketfuel`). Ist der Wert unbekannt,
+  leer oder kein String (etwa `rocketfuel_shortsonly`, `nitro_v2`), oder
+  widerspricht er der aus dem Bot-Namen abgeleiteten Route, wird das Deployment
+  beim Anlegen abgelehnt und beim Dispatch blockiert; der zugehörige
+  Discord-Service wird auf `FAILED` gesetzt (ein vom Operator gesetztes
+  `PAUSED`/`STOPPED` bleibt). Ohne Markierung ist es ein normaler Discord-Bot;
+  ein Bot-Name, der ein bekannter Alias ist, wird aber weiterhin gegen seinen
+  Account geprüft.
 
 ## Health-Check Status
 
@@ -122,6 +131,47 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nie überschrieben; ein normaler Teardown schreibt kein `FAILED`.
 - Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
   verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
+  Ein Komma nach dem Preis (`@ 100, stop $95`) gehört nicht zum Preis.
+
+### Exit-, Report- und Bedingungsnachrichten, Preis-Level (#121)
+
+Keine Nachricht, die einen Exit, einen Gewinnmitnahme-Bericht oder eine
+Bedingung nennt, erzeugt eine neue Entry-Order.
+
+- **Preis-Level:** Entry ist ein `Price:`-Label, sonst der erste `@`/`at`-Preis,
+  sonst der erste `$`-Preis. `target`/`TP`/`take profit`/`PT` wird Take-Profit,
+  `stop`/`SL`/`stop loss` Stop-Loss; diese Klauseln werden vor jeder anderen
+  Extraktion entfernt, können also nie Entry sein. Zwei verschiedene Werte für
+  dasselbe Level, ein fehlerhafter Level-Preis oder ein Level auf der falschen
+  Seite des Entrys → Nachricht verworfen. `at` nach einem Indikator (`RSI at 28`)
+  ist kein Preis.
+- **Reports** (`Took profit on …`, `stopped out`, `target hit`, `Closed …`,
+  `Exited …`) und **Bedingungen/Absicherungen** (`wait`, `if`, `once`, `when`,
+  `watch for`, `looking for`, `potential`, `before you buy` …) werden verworfen
+  und geloggt.
+- **Exit/Close** (`Exit long AAPL @ 100`, `Closing long AAPL at $100`,
+  `Close short TSLA @ 50`) wird ein Exit-only-Signal
+  (`metadata.signal_intent = "exit"`, `exit_fraction`, optional
+  `exit_position_side`). Die Close-Seite kommt aus der Position, nie aus der
+  Nachricht; ein Exit trägt kein SL/TP und läuft nicht durch den
+  Entry-Signal-Processor. Ein Exit braucht genau einen Ticker und einen Preis.
+- **Teil-Exits** (`Trim half`, `Took partials 1/3`, `Sell 25%`, `Scale out 50%`)
+  schließen genau diesen Anteil. Ohne quantifizierbaren Anteil (`Took partials`,
+  `Trim AAPL`), mit zwei verschiedenen Anteilen oder einem Anteil außerhalb
+  (0, 1] → verworfen, nie geraten. Ein Voll-Exit mit Größenangabe ist mehrdeutig
+  und wird verworfen.
+- **Sizing im Daemon** (`live_runner/exit_signals.py`): geschlossen wird nur die
+  *eigene* Menge des Deployments, d. h. die Netto-Fills seiner Signale für das
+  Symbol (`get_live_deployment_net_filled_qty`), gedeckelt auf die
+  Broker-Position (Überhang wird geloggt), mal Anteil; ganzzahlige Positionen
+  werden abgerundet, ein Teil-Exit, der auf 0 fällt, wird abgelehnt. Keine
+  Position bzw. keine eigene Menge → ignoriert und geloggt
+  (`Exit signal ignored`). Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht
+  genannte Seite → abgelehnt. Fills von Bracket-Legs (SL/TP), die nicht gegen
+  ein Signal persistiert werden, fehlen im Ledger; daher der Deckel auf die
+  Broker-Position.
+- Ein einfaches `SELL …`/Momentum-Reversal bleibt wie bisher ein Sell (auf
+  Long-only-Deployments ein Exit der ganzen Broker-Position).
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.
