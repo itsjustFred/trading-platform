@@ -10,6 +10,7 @@ import math
 from typing import Any
 
 from validation.comparison.delta_report import TradeDeltaReport
+from validation.comparison.tolerances import abs_pct_diff
 from validation.readiness.models import (
     PaperReadinessLevel,
     ReadinessCheck,
@@ -22,18 +23,14 @@ from validation.stats.calculator import TradeStatistics
 
 
 def _abs_pct_diff(expected: float, actual: float) -> float:
-    """Relative difference against the EXPECTED base (#83).
+    """Relative difference against the EXPECTED base (#83, #128).
 
     The old ``max(|expected|, |actual|)`` denominator halved real drift
     (100 -> 200 read as 50%, not 100%). Zero expected fails closed unless
-    actual is also zero.
+    actual is also zero. The rule itself lives in the shared comparison
+    helper so every relative deviation uses one definition (#128).
     """
-    denom = abs(expected)
-    if denom <= 0.0:
-        # Exact zero, not a tolerance: with no expected value there is no
-        # proportion to compute, so any non-zero actual is total drift.
-        return 0.0 if abs(actual) <= 0.0 else 1.0
-    return abs(expected - actual) / denom
+    return abs_pct_diff(expected, actual)
 
 
 _NO_TRADE_DELTA_REPORT_MESSAGE = "No trade delta report provided; skipping."
