@@ -202,6 +202,26 @@ PARSER_TABLE: list[tuple[str, dict | None]] = [
     ("BUY AAPL @ 100 target $12,34", None),
     # An exit and an entry in one message: ambiguous, rejected.
     ("BUY AAPL @ 100 and close long MSFT", None),
+    # ── An exit directive whose ticker is a common word (review finding) ──
+    # A bare "ON"/"IT"/"A"/"SO" is English, not a ticker, so no exit can be
+    # parsed. The message is still an exit instruction: it is rejected, never
+    # handed to the entry parser (which read these as BUY ON / BUY AT).
+    ("Exit long ON @ 50", None),
+    ("Close long ON @ 50", None),
+    ("Exit long IT @ 50", None),
+    ("Exit long A @ 100", None),
+    ("Exit long SO @ 100", None),
+    ("Exit long on ON @ 50", None),
+    ("Closing long ON at $50", None),
+    # Marked, the same ticker is unambiguous and the exit parses.
+    ("Exit long $ON @ 50", {
+        "intent": _EXIT, "symbol": "ON", "entry": 50.0, "fraction": 1.0, "side": "long",
+    }),
+    # Prose about a close is not an exit directive: the entry still parses.
+    ("BUY AAPL @ 100 SL 95 TP 120, exit on close below 95", {
+        "intent": _ENTRY, "action": "buy", "symbol": "AAPL", "entry": 100.0,
+        "take_profit": 120.0, "stop_loss": 95.0,
+    }),
 ]
 
 
@@ -269,6 +289,16 @@ _EXIT_REPORT_OR_CONDITIONAL = [
     "Buy AAPL @ 100 when it reclaims VWAP",
     "Looking for a long AAPL @ 100",
     "Potential long AAPL @ 100",
+    "Exit long ON @ 50",
+    "Close long ON @ 50",
+    "Exit long IT @ 50",
+    "Exit long A @ 100",
+    "Exit long SO @ 100",
+    "Exit long on ON @ 50",
+    "Closing long ON at $50",
+    "Exit short IT @ 50",
+    "Close the long in ON @ 50",
+    "Trim half AAPL",
 ]
 
 
@@ -323,3 +353,40 @@ def test_an_indicator_reading_after_at_is_not_an_entry() -> None:
     signal = _parse("**AAPL** is now oversold — buy signal, RSI at 28, $190.50")
     assert signal is not None
     assert signal.entry_price == pytest.approx(190.50)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["Exit long ON @ 50", "Closing long ON at $50", "Exit long on ON @ 50"],
+)
+def test_an_exit_without_a_parseable_ticker_is_rejected_and_logged(
+    content: str, caplog
+) -> None:
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        assert _parse(content) is None
+    assert any(
+        record.levelno == logging.WARNING
+        and "exit directive without an unambiguous ticker" in record.getMessage()
+        for record in caplog.records
+    ), [record.getMessage() for record in caplog.records]
+
+
+def test_an_exit_without_a_price_is_rejected_with_an_explicit_reason(caplog) -> None:
+    """``Trim half AAPL`` is a valid instruction, but the signal type needs a
+    positive price, so it is rejected. The rejection is a WARNING that says
+    why, so an operator can see the exit was not executed."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        assert _parse("Trim half AAPL") is None
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any(
+        "exit without a price" in message and "positive price" in message
+        for message in warnings
+    ), warnings

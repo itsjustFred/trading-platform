@@ -1262,3 +1262,41 @@ def test_describe_reports_a_clean_sweep_differently_from_a_partial_one() -> None
     failed_only = ControlOutcome(completed=0, failed=("42",))
     assert failed_only.complete is False
     assert "nothing outstanding" not in failed_only.describe()
+
+
+# ─── #121 review: what an exit needs to know before it is sized ──────────────
+
+
+def test_ctrader_working_order_ids_lists_only_working_orders() -> None:
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    working = _order(11, ProtoOAOrderType.MARKET, status=ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED)
+    working.clientOrderId = "sig-11"
+    filled = _order(12, ProtoOAOrderType.MARKET, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    filled.clientOrderId = "sig-12"
+    cancelled = _order(
+        13, ProtoOAOrderType.LIMIT, status=ProtoOAOrderStatus.ORDER_STATUS_CANCELLED
+    )
+    adapter = _control_adapter(orders=[working, filled, cancelled])
+
+    ids = _run(adapter.working_order_ids())
+
+    assert set(ids) == {"11", "sig-11"}
+
+
+def test_ctrader_position_qty_tolerance_is_half_a_volume_step() -> None:
+    from live_runner.ctrader_adapter import CTraderLiveAdapter, SymbolScale
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._symbol_props = {
+        "EURUSD": SymbolScale(
+            volume_per_qty=1000.0, price_digits=5, min_volume=1000, lot_size=100_000.0
+        ),
+        "XAUUSD": SymbolScale(volume_per_qty=1.0, price_digits=2, min_volume=1, lot_size=100.0),
+    }
+
+    assert adapter.position_qty_tolerance("EURUSD") == pytest.approx(0.0005)
+    assert adapter.position_qty_tolerance("xauusd") == pytest.approx(0.5)

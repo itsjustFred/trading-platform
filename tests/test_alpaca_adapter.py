@@ -593,3 +593,37 @@ def test_broker_write_failure_is_not_marked_as_not_submitted(
     # The broker may have accepted the order before the connection died, so the
     # caller must treat the outcome as unknown and keep its lease.
     assert is_order_not_submitted(raised.value) is False
+
+
+# ─── #121 review: what an exit needs to know before it is sized ──────────────
+
+
+def test_working_order_ids_lists_broker_and_client_order_ids() -> None:
+    """A previous exit is matched by its broker id, or by its client order id
+    (the signal id) when the broker id was never persisted."""
+    client = _FakeTradingClient(
+        orders=[
+            SimpleNamespace(
+                id="o-1", client_order_id="sig-1", symbol="AAPL", side="sell", legs=[]
+            ),
+            _FakeOrder("o-2", "MSFT", "buy"),
+        ]
+    )
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"o-1", "sig-1", "o-2"} <= set(ids)
+
+
+def test_working_order_ids_fails_closed_without_an_order_listing() -> None:
+    client = SimpleNamespace()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_adapter(client).working_order_ids())
+
+
+def test_alpaca_position_qty_tolerance_is_below_one_fractional_share_step() -> None:
+    """Alpaca quantities have up to 9 decimals: half a step, never a whole one."""
+    tolerance = _adapter(_FakeTradingClient()).position_qty_tolerance("AAPL")
+
+    assert 0.0 < tolerance < 1e-9

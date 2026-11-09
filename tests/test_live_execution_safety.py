@@ -795,12 +795,29 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
 # position. These pin the broker-book guards that sizing still applies.
 
 
-def _patch_exit_ledger(monkeypatch, qty: float) -> None:
-    """The deployment's own net filled quantity, without a database."""
+def _patch_exit_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float) -> None:
+    """Ledgers without a database: this deployment holds ``qty``, nobody else
+    on the account holds anything, and no earlier exit is still pending."""
     import live_runner.daemon as daemon
 
+    deployment_id = str(deployment.id)
     monkeypatch.setattr(
-        daemon, "get_live_deployment_net_filled_qty", lambda _deployment_id, _symbol: qty
+        daemon,
+        "get_account_net_filled_qty_by_deployment",
+        lambda _account_id, _symbol: {deployment_id: qty},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "list_live_deployment_unfilled_exit_orders",
+        lambda _deployment_id, _symbol: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "get_live_deployment_net_filled_qty",
+        lambda _deployment_id, _symbol: qty,
+        raising=False,
     )
 
 
@@ -822,8 +839,8 @@ def _prepare_exit_only(monkeypatch, positions, *, ledger_qty: float, **metadata:
         async def get_positions(self):
             return list(positions)
 
-    _patch_exit_ledger(monkeypatch, ledger_qty)
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, ledger_qty)
     signal = _exit_only_sell(str(deployment.id), **metadata)
     return asyncio.run(prepare_order_with_risk(_Adapter(), deployment, signal))
 
@@ -3637,8 +3654,8 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position(monkeypat
     blocked by the entry SL/TP guard."""
     from live_runner.daemon import submit_order_with_risk
 
-    _patch_exit_ledger(monkeypatch, 3.0)
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 3.0)
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": 3.0}]
     )
@@ -3663,8 +3680,8 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position(monkeypat
 def test_exit_only_metadata_discards_untrusted_close_volume(monkeypatch) -> None:
     from live_runner.daemon import submit_order_with_risk
 
-    _patch_exit_ledger(monkeypatch, 3.0)
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 3.0)
     adapter = _PositionsAdapter(positions=[{"symbol": "EURUSD", "qty": 3.0}])
     signal = LiveSignal(
         deployment_id=str(deployment.id),
@@ -3714,8 +3731,8 @@ def test_exit_only_orders_close_short_positions_with_a_buy(monkeypatch):
     flattens the short magnitude instead of raising 'no long position'."""
     from live_runner.daemon import submit_order_with_risk
 
-    _patch_exit_ledger(monkeypatch, -3.0)
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, -3.0)
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": -3.0}]
     )
