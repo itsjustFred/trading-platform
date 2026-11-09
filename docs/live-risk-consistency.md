@@ -101,32 +101,50 @@ deviation = (entry - quote) / (entry - stop)
 
 als Bruchteil der SL-Distanz, mit Vorzeichen: positiv heißt **Richtung SL**,
 negativ **weg vom SL**. Abgelehnt wird (Regeln in dieser Prüfreihenfolge, der Name
-landet als `entry_gate_rejection_rule` im Log und in der Fehlermeldung):
+landet als `entry_gate_rejection_rule` im Log und in der Fehlermeldung). Zuerst
+muss der Quote **aktuell** sein: ein After-Hours-"Latest"-Quote kann Stunden alt
+sein, und kein Preis-Check darf auf ihm beruhen.
 
 | Regel | Bedingung |
 |-------|-----------|
+| `quote_time_missing` | Quote ohne Zeitstempel |
+| `quote_time_invalid` | Zeitstempel ist kein zeitzonen-behaftetes `datetime` |
+| `quote_time_in_future` | Zeitstempel mehr als 2 s (Clock-Skew-Toleranz, inklusiv) in der Zukunft |
+| `quote_stale` | Quote älter als `max_entry_quote_age_seconds` (genau am Limit ist erlaubt) |
 | `quote_at_or_beyond_stop_loss` | Buy: Ask `<=` SL. Sell: Bid `>=` SL |
 | `quote_at_or_beyond_take_profit` | nur mit TP. Buy: Ask `>=` TP. Sell: Bid `<=` TP |
 | `deviation_toward_stop_loss` | `deviation > max_entry_deviation_sl_fraction` (Setup evtl. ungültig) |
 | `deviation_away_from_stop_loss` | `-deviation > max_entry_deviation_sl_fraction` (Chasing: mit festem SL ist das echte Risiko größer als gesized) |
 
-`max_entry_deviation_sl_fraction` kommt pro Deployment aus `settings` (Default
-**0.25**, `>= 0`; `0` lässt nur einen Quote exakt am Entry zu). Der Vergleich hat
+Beide Grenzen kommen pro Deployment aus `settings`, nie aus Signal-Metadata, und
+werden von `risk.live.entry_gate_settings()` geprüft: beim Anlegen des Deployments
+(`shared.database.create_live_deployment` und der API-Endpoint, 400) und erneut
+beim Dispatch (fail-closed, vor dem Quote-Abruf):
+
+| Setting | Default | Gültig |
+|---------|---------|--------|
+| `max_entry_deviation_sl_fraction` | **0.25** | `0 <= x <= 1` (Bruchteil der SL-Distanz; `25` gemeint als 25 % ist ein Fehler; `0` lässt nur einen Quote exakt am Entry zu) |
+| `max_entry_quote_age_seconds` | **10** | endlich, `> 0` |
+ Der Vergleich hat
 eine Toleranz von `1e-9`, damit Float-Rundung an der Grenze nicht entscheidet.
 Ohne TP (explizite Unbounded-Policy) entfällt nur die TP-Regel. Der Quote ist
 **nur Gate**, nie Sizing-Input: Menge und Levels bleiben die des Signals.
 
 Fail-closed: Adapter ohne Quote-Support, Fehler beim Abruf, Timeout, fehlende,
-nicht-positive, nicht-endliche oder gekreuzte Quotes (Bid > Ask) lehnen den Entry
+nicht-positive, nicht-endliche, gekreuzte (Bid > Ask) oder nicht aktuelle Quotes lehnen den Entry
 ab und werden geloggt. Exit-only-Orders laufen nicht durch das Gate.
 
-Quellen: Alpaca `get_stock_latest_quote` (IEX-Feed, wie die Bars); cTrader
-abonniert kurz den Spot-Stream des Symbols, nimmt den ersten vollständigen
-Bid/Ask und meldet sich wieder ab (Timeout `quote_timeout_seconds`, Default 5 s).
+Quellen: Alpaca `get_stock_latest_quote` (IEX-Feed, wie die Bars), Zeitstempel
+ist der des Quotes selbst, nie `now()`; cTrader abonniert kurz den Spot-Stream des
+Symbols, nimmt den ersten vollständigen Bid/Ask und meldet sich wieder ab (Timeout
+`quote_timeout_seconds`, Default 5 s). Zeitstempel ist die Broker-Zeit des
+Spot-Events, sonst die lokale Empfangszeit (`timestamp_source="receive"`; ein
+Spot-Event wird live gepusht, seine Empfangszeit begrenzt also sein Alter).
 
 Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
-`entry_quote_side`, `entry_quote_price`, `entry_quote_time` (Broker-Zeit oder
-`None`), `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
+`entry_quote_side`, `entry_quote_price`, `entry_quote_time` (ISO-8601),
+`entry_quote_time_source` (`broker` / `receive`), `entry_quote_age_seconds`,
+`max_entry_quote_age_seconds`, `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
 `entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
 `max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
