@@ -2,13 +2,17 @@
 
 ## Problem
 
-Die Position-Sizing-Logik ist in zwei Modulen implementiert:
+Die Position-Sizing-Logik baut in Backtest und Live auf derselben `RiskEngine` auf.
+Live gibt es genau **einen** Sizing-Einstieg (#125):
+`live_runner.daemon.size_live_signal_for_submission()`. Der frühere zweite
+Einstieg `risk.live.size_live_signal()` hatte keinen Produktions-Aufrufer und ist
+entfernt.
 
 | Modul | Zweck | Unterschiede |
 |-------|-------|--------------|
 | `risk/engine.py` | Backtest-Risk-Engine | Vollständige RiskEngine-Klasse mit konfigurierbarem RiskConfig |
-| `risk/live.py` | Live-Signal-Sizing | `resolve_live_levels()` (einziger Entry/SL/TP-Resolver, #125) und Wrapper `size_live_signal()` auf RiskEngine |
-| `live_runner/daemon.py` | Live-Submission | `size_live_signal_for_submission()` / `prepare_order_with_risk()`: Sizing mit Deployment-`RiskConfig`, Levels aus `resolve_live_levels()`, Entry-Deviation-Gate |
+| `risk/live.py` | Live-Levels und Gate-Regeln | `resolve_live_levels()` (einziger Entry/SL/TP-Resolver), `entry_gate_settings()`, `entry_deviation_sl_fraction()`; kein Sizing |
+| `live_runner/daemon.py` | Live-Sizing und -Submission | `size_live_signal_for_submission()` (einziger Live-Sizing-Einstieg) / `prepare_order_with_risk()`: Sizing mit Deployment-`RiskConfig` über `RiskEngine`, Levels aus `resolve_live_levels()`, Entry-Deviation-Gate |
 
 ## Kritische Unterschiede
 
@@ -20,7 +24,7 @@ enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", Fals
 ```
 Standard: `False` (nicht erzwungen)
 
-**Live (`risk/live.py`):**
+**Live (`live_runner/daemon.py`, `size_live_signal_for_submission`):**
 ```python
 "enforce_stop_direction": True,  # hardcoded
 ```
@@ -69,8 +73,8 @@ vertrauten Aufrufer (Config/Broker), sonst gilt der Unit-Contract 1.0.
 Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
 (`RiskConfig`), State (`current_positions`, `current_exposure`) aus dem
 Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
-komplette Risk-Engine ist entfernt; `risk.live.size_live_signal` size't jeden
-Signal durch `RiskEngine`.
+komplette Risk-Engine ist entfernt; `size_live_signal_for_submission` size't
+jedes Live-Signal durch `RiskEngine`.
 
 ## Einheitlicher Level-Resolver (#125)
 
@@ -167,6 +171,7 @@ Der aktuelle Ansatz ist beabsichtigt: Live-Trading soll strengere Validierung ha
 
 Ein parametrierter Test in `tests/test_risk_consistency.py` sollte folgende Fälle abdecken:
 
-1. Identische Inputs → identische Outputs zwischen `engine.size_*` und `live.size_*`
+1. Identische Inputs → identische Outputs zwischen `RiskEngine.calculate_position_size`
+   und dem Live-Pfad `size_live_signal_for_submission`
 2. Strikter Stop-Direction Check wird im Live-Pfad erzwungen
 3. ATR-basierter Fallback wird in beiden Pfaden gleich berechnet

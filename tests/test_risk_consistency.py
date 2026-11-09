@@ -97,14 +97,6 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
 
 def test_live_size_rejects_wrong_stop_direction() -> None:
     """Test that live sizing rejects wrong stop direction."""
-    signal = TradeSignal(
-        action="buy",
-        entry_price=100.0,
-        stop_loss=105.0,  # Wrong direction for LONG
-        take_profit=110.0,
-        symbol="EURUSD",
-        timeframe="1h",
-    )
     live_signal = LiveSignal(
         deployment_id="test-deployment",
         symbol="EURUSD",
