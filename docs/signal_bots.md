@@ -155,6 +155,16 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   `exit_position_side`). Die Close-Seite kommt aus der Position, nie aus der
   Nachricht; ein Exit trägt kein SL/TP und läuft nicht durch den
   Entry-Signal-Processor. Ein Exit braucht genau einen Ticker und einen Preis.
+  Ohne Preis (`Trim half AAPL`) wird er verworfen und auf `WARNING` geloggt
+  (`exit without a price`), weil ein Signal einen positiven Preis braucht.
+- **Exit ohne eindeutigen Ticker:** Ein Exit-Befehl, der eine Seite nennt
+  (`Exit long …`, `Close the short …`) oder dessen Objekt wie ein Ticker
+  geschrieben ist (Großbuchstaben, `$`, `**`), aus dem sich aber kein Exit
+  parsen lässt, wird verworfen (`WARNING`) und erreicht nie den Entry-Parser.
+  Ein nacktes `ON`, `IT`, `A`, `SO` ist ein englisches Wort, kein Ticker:
+  `Exit long ON @ 50` wird verworfen (früher BUY ON), `Exit long $ON @ 50` ist
+  ein Exit auf ON. Kleingeschriebene Prosa (`exit on close below 95`) in einem
+  Entry bleibt erlaubt.
 - **Teil-Exits** (`Trim half`, `Took partials 1/3`, `Sell 25%`, `Scale out 50%`)
   schließen genau diesen Anteil. Ohne quantifizierbaren Anteil (`Took partials`,
   `Trim AAPL`), mit zwei verschiedenen Anteilen oder einem Anteil außerhalb
@@ -162,14 +172,32 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   und wird verworfen.
 - **Sizing im Daemon** (`live_runner/exit_signals.py`): geschlossen wird nur die
   *eigene* Menge des Deployments, d. h. die Netto-Fills seiner Signale für das
-  Symbol (`get_live_deployment_net_filled_qty`), gedeckelt auf die
-  Broker-Position (Überhang wird geloggt), mal Anteil; ganzzahlige Positionen
-  werden abgerundet, ein Teil-Exit, der auf 0 fällt, wird abgelehnt. Keine
-  Position bzw. keine eigene Menge → ignoriert und geloggt
-  (`Exit signal ignored`). Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht
-  genannte Seite → abgelehnt. Fills von Bracket-Legs (SL/TP), die nicht gegen
-  ein Signal persistiert werden, fehlen im Ledger; daher der Deckel auf die
-  Broker-Position.
+  Symbol (Ledger), gedeckelt auf die Broker-Position, mal Anteil; ganzzahlige
+  Positionen werden abgerundet, ein Teil-Exit, der auf 0 fällt, wird abgelehnt.
+  Keine Position → ignoriert, `INFO`; keine eigene Menge, aber eine
+  Broker-Position (gehört jemand anderem oder das Ledger hat einen Fill
+  verpasst) → ignoriert, `WARNING` mit `broker_qty` (`Exit signal ignored`).
+  Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht genannte Seite →
+  abgelehnt.
+- **Ledger-Abgleich vor jedem Exit:** Die Ledger aller Deployments auf demselben
+  Account und Symbol (jeder Status, `get_account_net_filled_qty_by_deployment`)
+  müssen vorzeichenrichtig summiert der Broker-Position entsprechen, innerhalb
+  der Mengenpräzision des Instruments (`position_qty_tolerance` des Adapters:
+  cTrader eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt → strikt
+  1e-9). Sonst wird der Exit abgelehnt und auf `ERROR` geloggt, mit allen
+  Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`) und
+  `broker_qty`. Grund: Broker-seitige Schließungen (SL/TP-Legs, cTrader-SL/TP,
+  Flatten, manuelles Schließen) landen nicht im Ledger; ohne Abgleich könnte ein
+  Exit auf einem genetteten Account die Anteile eines anderen Deployments
+  schließen. Fills von Bracket-Legs gegen das Parent-Signal zu buchen ist die
+  eigentliche Lösung und ein eigenes Issue; bis dahin muss nach so einer
+  Schließung das Ledger abgeglichen werden, bevor Exits wieder laufen.
+- **Ein Exit nach dem anderen:** Solange ein früherer Exit desselben
+  Deployments und Symbols beim Broker noch arbeitet (nicht voll gefüllt und in
+  den offenen Orders des Brokers, per Broker- oder Client-Order-ID), wird ein
+  neuer Exit abgelehnt (`WARNING`, nicht gequeued). Kann der Adapter seine
+  offenen Orders nicht auflisten, gilt das als „nicht bewiesen beendet“ → ebenfalls
+  abgelehnt.
 - **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein
   Momentum-Reversal (RocketFuel long-only) auf einem Deployment ohne Shorts ist
   ein Voll-Exit und wird nach derselben Regel gesized (Anteil 1, Seite aus der
@@ -182,7 +210,8 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Broker-Request abgelehnt wird (z. B. Mindestvolumen) oder dessen Broker-Antwort
   ein Fehler ist, lässt die Position offen und wird auf `ERROR` geloggt
   (`Exit signal refused …` bzw. `… unknown outcome`, mit `"exit": true`). Ein
-  abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ bleibt `INFO`.
+  abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ ist `INFO` bzw.
+  `WARNING` (siehe oben), ein noch laufender früherer Exit `WARNING`.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.

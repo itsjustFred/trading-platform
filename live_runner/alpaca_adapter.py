@@ -1167,6 +1167,32 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "refusing to report a clean sweep"
         )
 
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working (open) order: broker ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). The client order id is the canonical signal id, which
+        names an order whose broker id was never persisted. Nested legs are
+        included. Fails rather than returning an empty set it cannot vouch for.
+        """
+        client = await self._require_trading_client()
+        ids: set[str] = set()
+        for order in await self._list_open_orders(client):
+            for item in (order, *_order_legs(order)):
+                for name in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(item, name))
+                    if order_id is not None:
+                        ids.add(order_id)
+        return ids
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of Alpaca's smallest quantity step (9 decimals, fractional shares).
+
+        Ledger sums and the broker position agree to that step or not at all;
+        half a step absorbs float summation noise without hiding a real share.
+        """
+        return 0.5e-9
+
     @staticmethod
     def _protection_order_ids(
         orders: list[Any], protection_side_by_symbol: dict[str, str]

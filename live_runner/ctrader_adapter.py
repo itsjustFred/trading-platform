@@ -2616,6 +2616,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             self._raise_terminal_auth_from_api_error(exc)
             raise
 
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working order: order ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). "Working" is :meth:`_is_working_order`, which reads a
+        status it cannot interpret as working - the direction that defers an
+        exit rather than sizing it off a ledger that may lack fills.
+        """
+        reconcile_res = await self._reconcile_state()
+        ids: set[str] = set()
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is not None:
+                ids.add(str(order_id))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            if client_order_id:
+                ids.add(client_order_id)
+        return ids
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of one broker volume unit, in qty units, for ``symbol``.
+
+        Positions and fills are whole broker volume units converted by the
+        symbol's ``volume_per_qty``, so anything closer than half a unit is the
+        same position. Raises like :meth:`_scale_for` for an unknown symbol; the
+        caller then falls back to the strict default.
+        """
+        return 0.5 / float(self._scale_for(symbol).volume_per_qty)
+
     async def cancel_open_orders(self) -> ControlOutcome:
         """Cancel every working *detached* order for this cTrader account.
 

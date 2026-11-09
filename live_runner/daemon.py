@@ -35,15 +35,21 @@ from live_runner.credential_env import (
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
 from live_runner.exit_signals import (
+    DEFAULT_QTY_TOLERANCE,
     EXIT_POSITION_SIDE_KEY,
     FULL_EXIT,
+    ExitInFlightError,
     ExitInstruction,
+    LedgerMismatchError,
     NothingToExitError,
+    broker_position_qty,
+    ensure_ledgers_match_broker,
     exit_instruction_from_metadata,
     exit_intent_metadata,
     is_exit_intent,
     is_exit_order,
     resolve_exit_order,
+    usable_qty_tolerance,
 )
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import (
@@ -67,11 +73,12 @@ from shared.database import (
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
-    get_live_deployment_net_filled_qty,
     get_service,
     list_live_accounts,
+    list_live_deployment_unfilled_exit_orders,
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
@@ -863,6 +870,82 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
+def _position_qty_tolerance(adapter: BaseLiveAdapter, symbol: str) -> float:
+    """The instrument's quantity precision, or the strict default.
+
+    An adapter that cannot say (no method, an error, a nonsensical value) gets
+    the strict default: an unknown precision must never widen the match.
+    """
+    method = getattr(adapter, "position_qty_tolerance", None)
+    if not callable(method):
+        return DEFAULT_QTY_TOLERANCE
+    try:
+        raw = method(symbol)
+    except Exception as exc:
+        logger.warning(
+            "Could not read the instrument quantity precision; using the strict default",
+            extra={"data": {"symbol": symbol, "error": str(exc)}},
+        )
+        return DEFAULT_QTY_TOLERANCE
+    tolerance = usable_qty_tolerance(raw)
+    if tolerance == DEFAULT_QTY_TOLERANCE and raw != DEFAULT_QTY_TOLERANCE:
+        logger.warning(
+            "Adapter reported an unusable quantity precision; using the strict default",
+            extra={"data": {"symbol": symbol, "reported": repr(raw)}},
+        )
+    return tolerance
+
+
+async def _ensure_no_exit_in_flight(
+    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
+) -> None:
+    """Refuse while an earlier exit of this deployment and symbol may be working.
+
+    Earlier exits whose persisted fills cover what they asked for are done. Any
+    other one is checked against the broker's working orders, by broker order id
+    or by client order id (the signal id; the broker id can be missing when the
+    response was lost). An adapter that cannot list its working orders cannot
+    prove the earlier exit is over, so that refuses too. Raises
+    :class:`ExitInFlightError`.
+    """
+    pending = await asyncio.to_thread(
+        list_live_deployment_unfilled_exit_orders, str(deployment.id), symbol
+    )
+    if not pending:
+        return
+    working_order_ids = getattr(adapter, "working_order_ids", None)
+    if not callable(working_order_ids):
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit of this deployment is not "
+            "known to be finished and this broker adapter cannot list its working "
+            "orders to prove it."
+        )
+    try:
+        working = {str(order_id) for order_id in await working_order_ids()}
+    except Exception as exc:
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit of this deployment is not "
+            f"known to be finished and the broker's working orders could not be read "
+            f"({exc})."
+        ) from exc
+    blocking = [
+        row
+        for row in pending
+        if (row.get("broker_order_id") and str(row["broker_order_id"]) in working)
+        or str(row.get("signal_id") or "") in working
+    ]
+    if blocking:
+        described = ", ".join(
+            f"signal {row.get('signal_id')} / order {row.get('broker_order_id') or '?'}"
+            for row in blocking
+        )
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit of this deployment is still "
+            f"working at the broker ({described}); the ledger does not include its "
+            "fills yet."
+        )
+
+
 async def prepare_exit_intent_order(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -878,10 +961,16 @@ async def prepare_exit_intent_order(
     deployment's net persisted fills for the symbol (the ledger), capped at the
     broker position, times the instruction's fraction, so another deployment's
     share of a netted position stays open. The close side comes from that
-    position, never from the message. Raises :class:`NothingToExitError` when
-    there is nothing of this deployment's to close - the caller logs and ignores
-    it - and ``ValueError`` when a close would be ambiguous or would extend
-    exposure. Nothing here places an order.
+    position, never from the message. Before an order follows, the ledgers of
+    every deployment on the account must add up to the broker position, and no
+    earlier exit of this deployment and symbol may still be working.
+
+    Raises :class:`NothingToExitError` when there is nothing of this
+    deployment's to close (the caller logs and ignores it),
+    :class:`ExitInFlightError` while an earlier exit may be working,
+    :class:`LedgerMismatchError` when the ledgers do not reconcile, and
+    ``ValueError`` when a close would be ambiguous or would extend exposure.
+    Nothing here places an order.
 
     Deliberately independent of the entry path (no risk sizing, no SL/TP guard,
     no deployment-status check), so the exit can be dispatched on its own.
@@ -892,15 +981,30 @@ async def prepare_exit_intent_order(
     get_positions = getattr(adapter, "get_positions", None)
     if not callable(get_positions):
         raise ValueError("Exit signal requires a broker adapter with get_positions support")
+    # One exit at a time per deployment and symbol: a second exit sized while
+    # the first is still working would size off a ledger without its fills.
+    await _ensure_no_exit_in_flight(adapter, deployment, signal.symbol)
     positions = list(await get_positions())
-    ledger_qty = await asyncio.to_thread(
-        get_live_deployment_net_filled_qty, str(deployment.id), signal.symbol
+    ledgers = await asyncio.to_thread(
+        get_account_net_filled_qty_by_deployment, deployment.account_id, signal.symbol
     )
+    ledger_qty = float(ledgers.get(str(deployment.id), 0.0))
     close_action, target_qty = resolve_exit_order(
         symbol=signal.symbol,
-        ledger_qty=float(ledger_qty),
+        ledger_qty=ledger_qty,
         broker_positions=positions,
         instruction=instruction,
+    )
+    # Only now does an order follow, so only now must the ledgers explain the
+    # broker position. A close none of them saw (a stop or target leg, a
+    # flatten, a manual close) makes every deployment's own quantity
+    # untrustworthy on a netted account: refuse rather than close someone
+    # else's shares (#121 review).
+    ensure_ledgers_match_broker(
+        symbol=signal.symbol,
+        ledgers=ledgers,
+        broker_qty=broker_position_qty(positions, signal.symbol),
+        tolerance=_position_qty_tolerance(adapter, signal.symbol),
     )
     matching_positions = [
         position
@@ -1704,9 +1808,29 @@ async def _submit_normalized_discord_signal(
             adapter, deployment, live_signal
         )
     except NothingToExitError as exc:
-        # #121 decision 1: no position -> ignore and log. Not an error.
-        logger.info(
+        # #121 decision 1: no position -> ignore and log. Not an error. A broker
+        # position that is all somebody else's is worth a warning: either this
+        # deployment never held it, or its ledger missed a fill.
+        log = logger.warning if exc.broker_qty else logger.info
+        log(
             "Exit signal ignored: nothing of this deployment's to close",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "broker_qty": exc.broker_qty,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
+    except ExitInFlightError as exc:
+        # Not an error: the earlier exit is doing the work. The signal is not
+        # queued; a later exit signal is sized once the earlier one is over.
+        logger.warning(
+            "Exit signal refused: a previous exit of this deployment is still "
+            "working or cannot be shown to be finished",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -1731,6 +1855,11 @@ async def _submit_normalized_discord_signal(
                         "symbol": live_signal.symbol,
                         "action": live_signal.action,
                         "error": str(exc),
+                        **(
+                            exc.log_data()
+                            if isinstance(exc, LedgerMismatchError)
+                            else {}
+                        ),
                     }
                 },
             )

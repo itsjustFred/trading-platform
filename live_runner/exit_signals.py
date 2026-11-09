@@ -12,8 +12,10 @@ the same rule:
 * An exit closes **only the deployment's own quantity**: its net persisted fills
   for the symbol (the ledger). Another deployment's share of the same netted
   broker position stays open.
-* The close is capped at the broker position. A ledger larger than the broker
-  position is logged and closes at most the broker quantity.
+* The ledgers of every deployment on the account must add up to the broker
+  position (:func:`ensure_ledgers_match_broker`), or the exit is refused: a
+  close none of them saw makes every own quantity untrustworthy. The close is
+  still capped at the broker position as a last line of defence.
 * A partial exit closes that fraction of the own (capped) quantity. A fraction
   that rounds a whole-unit position down to nothing is refused, never rounded up.
 * No position to close -> :class:`NothingToExitError`: the caller ignores the
@@ -45,8 +47,54 @@ EXIT_POSITION_SIDES = frozenset({"long", "short"})
 _WHOLE_UNIT_TOLERANCE = 1e-9
 
 
+#: Quantity tolerance when the adapter cannot name its instrument's precision.
+#: Strict on purpose: an unknown precision must not widen what "reconciles".
+DEFAULT_QTY_TOLERANCE = 1e-9
+
+
 class NothingToExitError(ValueError):
-    """The deployment holds nothing to close; the exit is ignored, not failed."""
+    """The deployment holds nothing to close; the exit is ignored, not failed.
+
+    ``broker_qty`` is the signed broker position for the symbol (0.0 when flat).
+    A non-zero one means somebody else's position is open: worth a warning.
+    """
+
+    def __init__(self, message: str, *, broker_qty: float = 0.0) -> None:
+        super().__init__(message)
+        self.broker_qty = float(broker_qty)
+
+
+class LedgerMismatchError(ValueError):
+    """The account's ledgers do not add up to the broker position.
+
+    A close happened that no ledger saw (a bracket's stop or target leg, a
+    flatten, a manual close), so no deployment's own quantity can be trusted.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ledgers: Mapping[str, float],
+        broker_qty: float,
+        tolerance: float,
+    ) -> None:
+        super().__init__(message)
+        self.ledgers = dict(ledgers)
+        self.broker_qty = float(broker_qty)
+        self.tolerance = float(tolerance)
+
+    def log_data(self) -> dict[str, object]:
+        return {
+            "ledger_qty_by_deployment": dict(self.ledgers),
+            "ledger_qty_total": float(math.fsum(self.ledgers.values())),
+            "broker_qty": self.broker_qty,
+            "qty_tolerance": self.tolerance,
+        }
+
+
+class ExitInFlightError(ValueError):
+    """An earlier exit of the same deployment and symbol may still be working."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +254,8 @@ def resolve_exit_order(
     if abs(ledger_qty) <= _WHOLE_UNIT_TOLERANCE:
         raise NothingToExitError(
             f"Exit signal for {symbol} ignored: this deployment holds no own "
-            f"quantity (broker position {broker_qty} belongs to someone else)."
+            f"quantity (broker position {broker_qty} belongs to someone else).",
+            broker_qty=broker_qty,
         )
     if (ledger_qty > 0) != (broker_qty > 0):
         raise ValueError(
@@ -243,3 +292,62 @@ def resolve_exit_order(
         )
     close_action = "sell" if ledger_qty > 0 else "buy"
     return close_action, float(qty)
+
+
+def broker_position_qty(positions: Iterable[Mapping[str, object]], symbol: str) -> float:
+    """The signed broker position for ``symbol``; 0.0 when flat.
+
+    Same reading and the same refusals (unparseable, several rows) as the exit
+    sizing itself.
+    """
+    quantity = _broker_quantity(positions, symbol)
+    return 0.0 if quantity is None else quantity
+
+
+def usable_qty_tolerance(raw: object) -> float:
+    """``raw`` when it is a finite, non-negative number, else the strict default."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return DEFAULT_QTY_TOLERANCE
+    value = float(raw)
+    if not math.isfinite(value) or value < 0.0:
+        return DEFAULT_QTY_TOLERANCE
+    return value
+
+
+def ensure_ledgers_match_broker(
+    *,
+    symbol: str,
+    ledgers: Mapping[str, float],
+    broker_qty: float,
+    tolerance: float,
+) -> None:
+    """Refuse when the account's ledgers do not explain the broker position.
+
+    ``ledgers`` maps every deployment on the account to its signed net filled
+    quantity for ``symbol``. Their sum must equal the signed broker position
+    within ``tolerance`` (the instrument's quantity precision). Only then is a
+    deployment's own quantity evidence of what it holds; otherwise a close the
+    ledgers never saw has happened, and an exit sized off them could close
+    another deployment's shares. Raises :class:`LedgerMismatchError`.
+    """
+    total = math.fsum(float(value) for value in ledgers.values())
+    if (
+        not math.isfinite(tolerance)
+        or tolerance < 0.0
+        or not math.isfinite(total)
+        or not math.isfinite(broker_qty)
+        or abs(total - broker_qty) > tolerance
+    ):
+        listing = ", ".join(
+            f"{deployment_id}={float(value):g}" for deployment_id, value in sorted(ledgers.items())
+        ) or "none"
+        raise LedgerMismatchError(
+            f"Refusing exit for {symbol}: the ledgers of the deployments on this "
+            f"account add up to {total:g} ({listing}), but the broker position is "
+            f"{broker_qty:g} (tolerance {tolerance:g}). A close the ledgers never saw "
+            "(a stop or target leg, a flatten, a manual close) would make this exit "
+            "close another deployment's shares; reconcile before exiting.",
+            ledgers=ledgers,
+            broker_qty=broker_qty,
+            tolerance=tolerance,
+        )

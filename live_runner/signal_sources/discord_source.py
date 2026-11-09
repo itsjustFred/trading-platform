@@ -725,6 +725,29 @@ class _RejectedExit(Exception):
     """The message is an exit, but not one that can be executed safely."""
 
 
+def _has_exit_directive(body: str) -> bool:
+    """True when the message issues a close, whether or not its ticker is usable.
+
+    :func:`_parse_exit` only accepts a directive whose object is the message's
+    one ticker. "Exit long ON @ 50" names a ticker that is also an English word
+    ("ON", "IT", "A", "SO"), so no exit is parsed - and the message must then be
+    rejected, never handed to the entry parser, which read it as BUY ON / BUY AT.
+
+    A directive counts when it names a side ("Exit long ...", "Close the short
+    ...") or when its object is written like a ticker (upper case, ``$`` or
+    ``**``). Lower-case prose ("exit on close below 95") is not a directive, so
+    an entry that mentions a close still parses.
+    """
+    for matched in _FULL_EXIT_DIRECTIVE_RE.finditer(body):
+        if matched.group("side"):
+            return True
+        ticker = matched.group("ticker")
+        prefix = body[: matched.start("ticker")].rstrip()
+        if ticker.isupper() or prefix.endswith(("$", "**")):
+            return True
+    return False
+
+
 def _parse_exit(body: str) -> _ParsedExit | None:
     """Classify an exit/close instruction, or ``None`` when the message is none.
 
@@ -1092,6 +1115,16 @@ def _parse_trade_signal_from_message(
             price=levels.entry_price,
             default_timeframe=default_timeframe,
         )
+    if _has_exit_directive(body):
+        # An exit instruction this parser cannot execute is never an entry.
+        _log_parser_rejection(
+            message,
+            "exit directive without an unambiguous ticker (a bare word such as "
+            "ON or IT is not read as a ticker; write $ON); not executed, and "
+            "never read as an entry",
+            warning=True,
+        )
+        return None
 
     signal_type = None
     if _is_ramjet_signal(body):
@@ -1193,7 +1226,12 @@ def _build_exit_signal(
         )
         return None
     if price is None:
-        _log_parser_rejection(message, "exit without a price", warning=True)
+        _log_parser_rejection(
+            message,
+            "exit without a price: a signal needs a positive price, so this exit "
+            "is not executed (add '@ <price>')",
+            warning=True,
+        )
         return None
     instruction = ExitInstruction(
         fraction=parsed_exit.fraction, position_side=parsed_exit.position_side
