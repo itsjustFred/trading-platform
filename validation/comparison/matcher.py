@@ -8,10 +8,13 @@ differences in bar-timestamp resolution do not break the comparison.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
+from scipy.optimize import linear_sum_assignment
 
 from shared.models import Trade
 from validation.comparison.tolerances import finite_float, finite_tolerance
@@ -97,14 +100,87 @@ def _match_cost(
     return time_weight * time_cost + price_weight * price_cost + quantity_weight * qty_cost
 
 
+def _canonical_key(data: dict[str, Any]) -> tuple[Any, ...]:
+    """Stable sort key that makes the assignment independent of input order.
+
+    It covers every field the cost depends on plus the trade id, so distinct
+    trades keep a fixed relative order while exact duplicates (which are
+    interchangeable) keep their input order through the stable sort.
+    """
+    trade = data["trade"]
+    price = float(trade.entry_price or 0.0)
+    quantity = float(trade.quantity or 0.0)
+    # ``nan`` never compares, which would leave the order undefined; clamping
+    # keeps the canonical order total.
+    return (
+        data["entry"],
+        data["exit"],
+        trade.symbol,
+        trade.direction,
+        price if math.isfinite(price) else math.inf,
+        quantity if math.isfinite(quantity) else math.inf,
+        trade.id,
+    )
+
+
+def _solve_assignment(
+    ref_count: int,
+    act_count: int,
+    feasible: list[tuple[int, int, float]],
+) -> dict[int, int]:
+    """Return a maximum-cardinality, minimum-cost ``ref_pos -> act_pos`` map.
+
+    ``feasible`` holds ``(ref_pos, act_pos, cost)`` for every pair the matcher
+    may pair.  Infeasible cells get a big-M cost above the total of all
+    feasible costs, so ``linear_sum_assignment`` minimises the number of
+    infeasible assignments first and the feasible cost second (#131).  Pairs
+    the solver fills with the sentinel are dropped afterwards, and ``inf`` is
+    never handed to the solver.
+    """
+    if ref_count == 0 or act_count == 0 or not feasible:
+        return {}
+
+    costs = [cost for _ref_pos, _act_pos, cost in feasible]
+    # Twice the total plus one stays strictly above any all-feasible total
+    # even when that total is large enough for "+ 1" to round away.
+    big_m = 2.0 * sum(costs) + 1.0
+    if not math.isfinite(big_m):
+        # Only reachable with astronomically large weights: rescale by a
+        # common factor, which preserves the ordering the solve depends on.
+        scale = max(costs)
+        costs = [cost / scale for cost in costs]
+        big_m = float(len(costs) + 1)
+
+    matrix = np.full((ref_count, act_count), big_m, dtype=float)
+    for (ref_pos, act_pos, _cost), cost in zip(feasible, costs):
+        matrix[ref_pos, act_pos] = cost
+
+    rows, cols = linear_sum_assignment(matrix)
+    allowed = {(ref_pos, act_pos) for ref_pos, act_pos, _cost in feasible}
+    assigned: dict[int, int] = {}
+    for row, col in zip(rows, cols):
+        ref_pos, act_pos = int(row), int(col)
+        # The solver had to fill the unmatched rows/columns with the sentinel.
+        if (ref_pos, act_pos) in allowed:
+            assigned[ref_pos] = act_pos
+    return assigned
+
+
 class TradeMatcher:
     """Pair reference trades with actual trades.
 
-    The matcher walks the ``reference_trades`` list in order and picks the
-    minimum-cost still-unmatched ``actual_trade`` satisfying all criteria
-    (direction, symbol, time tolerance). Cost blends time drift with entry-
-    price and quantity differences, so ties no longer fall to array order.
-    Exact ties keep the lowest actual index (deterministic).
+    Matching is a global minimum-cost assignment (#131): all feasible pairs
+    are solved at once with ``scipy.optimize.linear_sum_assignment``, so an
+    earlier reference can no longer take the only feasible partner of a later
+    one.  The solve maximises the number of matched pairs first and minimises
+    the blended cost second.  Feasibility is unchanged: same direction, same
+    symbol when ``match_symbol`` is set, and entry *and* exit within
+    ``time_tolerance_seconds``.
+
+    Both lists are canonicalised before the solve, so the result does not
+    depend on their order; exact cost ties resolve to the first actual in that
+    canonical order (times, symbol, direction, price, quantity, id), which
+    keeps the old deterministic tie-breaking.
     """
 
     @classmethod
@@ -163,21 +239,22 @@ class TradeMatcher:
                 "trade": t,
                 "entry": _normalize_timestamp(t.entry_time),
                 "exit": _normalize_timestamp(t.last_exit_time),
-                "matched": False,
             }
             for t in actual_trades
         ]
 
-        matched: list[tuple[Trade, Trade, MatchKey]] = []
-        missing: list[Trade] = []
-        extra: list[Trade] = []
+        # #131: solve the whole matching problem at once instead of walking the
+        # references greedily.  Both sides are sorted by trade content first so
+        # the assignment cannot depend on input order; the original positions
+        # are kept to report the result in input order.
+        ref_order = sorted(range(len(ref_data)), key=lambda i: _canonical_key(ref_data[i]))
+        act_order = sorted(range(len(act_data)), key=lambda i: _canonical_key(act_data[i]))
 
-        for ref in ref_data:
-            best_idx: int | None = None
-            best_cost = float("inf")
-            for idx, act in enumerate(act_data):
-                if act["matched"]:
-                    continue
+        feasible: list[tuple[int, int, float]] = []
+        for ref_pos, ref_idx in enumerate(ref_order):
+            ref = ref_data[ref_idx]
+            for act_pos, act_idx in enumerate(act_order):
+                act = act_data[act_idx]
 
                 # direction is always required
                 if ref["trade"].direction != act["trade"].direction:
@@ -191,8 +268,6 @@ class TradeMatcher:
                 if _time_diff_seconds(ref["exit"], act["exit"]) > tolerance_seconds:
                     continue
 
-                # C4: minimum cost wins; strict < keeps the lowest index on
-                # exact ties (deterministic, preserves old order behavior).
                 cost = _match_cost(
                     ref,
                     act,
@@ -201,26 +276,34 @@ class TradeMatcher:
                     price_weight=price_weight,
                     quantity_weight=quantity_weight,
                 )
-                if cost < best_cost:
-                    best_cost = cost
-                    best_idx = idx
+                # A non-finite cost can only come from astronomically large
+                # weights. Such a pair was never selected before either, and
+                # ``inf`` must not reach the solver.
+                if math.isfinite(cost):
+                    feasible.append((ref_pos, act_pos, cost))
 
-            found_idx = best_idx
-            if found_idx is not None:
-                act_data[found_idx]["matched"] = True
-                act_trade = act_data[found_idx]["trade"]
-                key = MatchKey(
-                    entry_time=ref["entry"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
-                    exit_time=ref["exit"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
-                    symbol=ref["trade"].symbol,
-                    direction=ref["trade"].direction,
-                )
-                matched.append((ref["trade"], act_trade, key))
-            else:
+        assigned = _solve_assignment(len(ref_data), len(act_data), feasible)
+        # Map back from canonical positions to input indices.
+        match_by_ref: dict[int, int] = {
+            ref_order[ref_pos]: act_order[act_pos] for ref_pos, act_pos in assigned.items()
+        }
+
+        matched: list[tuple[Trade, Trade, MatchKey]] = []
+        missing: list[Trade] = []
+        for ref_idx, ref in enumerate(ref_data):
+            act_idx = match_by_ref.get(ref_idx)
+            if act_idx is None:
                 missing.append(ref["trade"])
+                continue
+            key = MatchKey(
+                entry_time=ref["entry"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
+                exit_time=ref["exit"].isoformat().replace(_UTC_SUFFIX_OFFSET, _UTC_SUFFIX_Z),
+                symbol=ref["trade"].symbol,
+                direction=ref["trade"].direction,
+            )
+            matched.append((ref["trade"], act_data[act_idx]["trade"], key))
 
-        for act in act_data:
-            if not act["matched"]:
-                extra.append(act["trade"])
+        used_acts = set(match_by_ref.values())
+        extra = [act["trade"] for idx, act in enumerate(act_data) if idx not in used_acts]
 
         return MatchResult(matched=matched, missing=missing, extra=extra)
