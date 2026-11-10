@@ -77,3 +77,36 @@ def test_prose_close_is_not_an_exit_directive() -> None:
     assert signal is not None
     assert signal.action == "buy"
     assert "signal_intent" not in signal.metadata
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "BUY AAPL, RSI now at 28, $190.50",
+        "BUY AAPL, RSI is at 28, $190.50",
+        "BUY AAPL, RSI is currently at 28, $190.50",
+        "BUY AAPL, VIX still sitting at 18, $190.50",
+        "BUY AAPL, RSI(14) just at 28, $190.50",
+    ],
+)
+def test_an_indicator_reading_with_filler_words_is_not_the_entry_price(content: str) -> None:
+    """ "RSI now at 28" is still an oscillator reading: sizing off 28 for a
+    190.50 stock would be a 7x-wrong entry (CodeRabbit finding on #142)."""
+    assert ds._extract_price(content) == pytest.approx(190.50)
+    signal = _parse(content)
+    assert signal is not None
+    assert signal.entry_price == pytest.approx(190.50)
+
+
+@pytest.mark.parametrize(
+    ("content", "price"),
+    [
+        # The indicator is mentioned, but the words before "at" are the order
+        # itself, not filler: the price after "at" is the real entry.
+        ("RSI oversold: BUY AAPL at 190.50", 190.50),
+        ("RSI BUY AAPL at 190.50", 190.50),
+        ("VIX is high, now BUY AAPL at 190.50", 190.50),
+    ],
+)
+def test_an_indicator_mention_does_not_hide_the_real_at_price(content: str, price: float) -> None:
+    assert ds._extract_price(content) == pytest.approx(price)
