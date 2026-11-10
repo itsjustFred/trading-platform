@@ -2082,3 +2082,23 @@ def test_alpaca_symbol_classification_unknown_not_crypto(symbol, expected):
     assert classify_alpaca_symbol(symbol) == expected
 
 
+
+
+@pytest.mark.parametrize("verdict", ["observd", "OBSERVED", "unknown", "", 0, True])
+def test_an_unrecognised_price_verdict_is_not_a_usable_price(verdict) -> None:
+    """Allowlist, not denylist: a typo or a future verdict must fail closed.
+
+    Only a missing verdict (rows from before the column existed), `observed`
+    and `derived` vouch for a price (platform-pr-verify finding on PR #143).
+    """
+    from shared.models import execution_price_is_usable
+
+    assert execution_price_is_usable(101.5, verdict) is False
+
+
+@pytest.mark.parametrize("verdict", [None, "observed", "derived"])
+def test_known_good_price_verdicts_stay_usable(verdict) -> None:
+    from shared.models import execution_price_is_usable
+
+    assert execution_price_is_usable(101.5, verdict) is True
+    assert execution_price_is_usable(0.0, verdict) is False
