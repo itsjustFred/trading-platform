@@ -1873,3 +1873,212 @@ def test_frontend_live_trade_commission_type_admits_null():
     assert fields["actual_price"] == "number | null"
     assert fields["slippage"] == "number | null"
     assert fields["slippage_bps"] == "number | null"
+
+
+# ── Tests to kill surviving mutants from mutation testing ───────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        # MIN_CRYPTO_BASE=3: 2-letter base should be equity, not crypto
+        ("ABUSD", "us_equity"),  # 2-letter base + USD
+        ("XYBTC", "us_equity"),  # 2-letter base + BTC
+        # CRYPTO_QUOTES order: ambiguous symbols should match longest quote first
+        ("BTCUSDT", "crypto"),  # Should be BTC/USDT (USDT checked before USD)
+        ("BTCUSDC", "crypto"),  # Should be BTC/USDC (USDC checked before USD)
+        ("BTCUSD", "crypto"),   # Should be BTC/USD
+    ],
+)
+def test_alpaca_symbol_classification_edge_cases(symbol, expected):
+    """Edge cases that would survive MIN_CRYPTO_BASE or CRYPTO_QUOTES mutations."""
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_alpaca_symbol(symbol) == expected
+
+
+@pytest.mark.parametrize(
+    ("symbol", "pair"),
+    [
+        # CRYPTO_QUOTES order: ambiguous symbols should match longest quote first
+        ("BTCUSDT", ("BTC", "USDT")),
+        ("BTCUSDC", ("BTC", "USDC")),
+        ("BTCUSD", ("BTC", "USD")),
+        ("ETHUSDT", ("ETH", "USDT")),
+    ],
+)
+def test_split_crypto_pair_quote_priority(symbol, pair):
+    """Quote matching should prioritize longest match (USDT > USDC > USD > BTC)."""
+    from shared.alpaca_symbols import split_crypto_pair
+
+    assert split_crypto_pair(symbol) == pair
+
+
+def test_backfill_fails_closed_when_buys_have_no_asset_fee_but_sells_have_usd_fee(db):
+    """Buys with no asset fee must fail closed even when sells have a valid USD fee."""
+    # Two orders: one buy, one sell on the same day/pair
+    buy_signal, buy_order = _crypto_fill(db, action="buy", qty=0.5, price=60000.0, label="buy-only")
+    sell_at = FILL_AT + timedelta(hours=1)
+    sell_signal, sell_order = _crypto_fill(db, action="sell", qty=0.5, price=61000.0, label="sell-only", at=sell_at)
+    
+    # Only a USD fee for the sell side, NO asset fee for the buy side
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=buy_order, side="buy", qty="0.5", price="60000", at=FILL_AT),
+            _fill_activity(order_id=sell_order, side="sell", qty="0.5", price="61000", at=sell_at),
+        ],
+        cfees=[_cfee(net_amount="-75.0", description="Coin Pair Transaction Fee (USD)")],  # USD fee only
+    )
+
+    assert _backfill(client) == 0, "Should fail closed: buys have no asset fee"
+    assert _commission(db, buy_signal) == [None]
+    assert _commission(db, sell_signal) == [None]
+
+
+def test_backfill_respects_lookback_window(db):
+    """Commissions older than COMMISSION_BACKFILL_LOOKBACK must be ignored."""
+    # Create an old fill (40 days ago, outside the 30-day lookback)
+    ancient_at = FILL_AT - timedelta(days=40)
+    signal, order_id = _crypto_fill(db, label="ancient", at=ancient_at)
+    
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=ancient_at)],
+        cfees=[_cfee(qty="-0.00125", day=(ancient_at.date()).isoformat())],
+    )
+
+    # Should NOT backfill - too old
+    assert _backfill(client) == 0
+    assert _commission(db, signal) == [None]
+    assert client.calls == [], "No broker calls for executions outside lookback"
+
+
+def test_backfill_ignores_unknown_commissions_outside_the_lookback_explicit(db):
+    """Explicit test for the lookback boundary: 31 days old should be ignored, 5 days should be processed."""
+    # NOW = 2026-11-06 12:00:00, lookback starts at 2026-10-07 12:00:00
+    # 31 days before FILL_AT (Nov 3) = Oct 3 - outside lookback
+    old_at = FILL_AT - timedelta(days=31)
+    old_signal, old_order = _crypto_fill(db, label="old", at=old_at)
+    
+    # 5 days before FILL_AT = Oct 29 - inside lookback (after Oct 7)
+    new_at = FILL_AT - timedelta(days=5)
+    new_signal, new_order = _crypto_fill(db, label="new", at=new_at)
+    
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=old_order, side="buy", qty="0.5", price="60000", at=old_at),
+            _fill_activity(order_id=new_order, side="buy", qty="0.5", price="60000", at=new_at),
+        ],
+        cfees=[
+            _cfee(qty="-0.00125", day=(old_at.date()).isoformat()),
+            _cfee(qty="-0.00125", day=(new_at.date()).isoformat()),
+        ],
+    )
+
+    assert _backfill(client) == 1, "Only the new fill should be backfilled"
+    assert _commission(db, old_signal) == [None], "Old fill should be ignored"
+    assert _commission(db, new_signal) == [pytest.approx(75.0)], "New fill should be priced"
+
+
+def test_viewer_stats_net_pnl_requires_both_pnl_complete_and_known_commission(monkeypatch):
+    """net_pnl is None when pnl_complete=False even if all commissions are known."""
+    import viewer.main as viewer_main
+
+    # One fill with unusable price (pnl_complete=False) but known commission
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.5),
+        {**_stats_row("sell", 0.0, 1.0, 5, 0.5), "actual_price": None},
+    ]
+    rows[1]["actual_price_observed"] = PRICE_DERIVED_UNAVAILABLE
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is False
+    assert payload["commission_unknown_count"] == 0
+    assert payload["total_commission"] == pytest.approx(1.0)
+    assert payload["net_pnl"] is None, "net_pnl must be None when pnl_complete=False"
+    assert payload["net_pnl_complete"] is False
+
+
+def test_viewer_stats_net_pnl_is_none_when_commission_unknown_even_if_pnl_complete(monkeypatch):
+    """net_pnl is None when commission_unknown > 0 even if pnl_complete=True."""
+    import viewer.main as viewer_main
+
+    # All prices known (pnl_complete=True) but one commission unknown
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, None),  # unknown commission
+        _stats_row("sell", 110.0, 1.0, 5, 0.5),
+    ]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is True
+    assert payload["commission_unknown_count"] == 1
+    assert payload["total_commission"] is None
+    assert payload["net_pnl"] is None, "net_pnl must be None when commission unknown"
+    assert payload["net_pnl_complete"] is False
+
+
+
+
+# ── Additional tests for remaining surviving mutants ────────────────────────────────────────────
+
+
+def test_viewer_stats_net_pnl_unknown_commission_treated_as_unknown_not_zero(monkeypatch):
+    """An unknown (NULL) commission must make total_commission None, not a smaller number."""
+    import viewer.main as viewer_main
+
+    # One known commission, one unknown
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.5),
+        _stats_row("sell", 110.0, 1.0, 5, None),  # unknown commission
+    ]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["commission_unknown_count"] == 1
+    assert payload["total_commission"] is None, "Unknown commission must make total None, not 0.5"
+    assert payload["net_pnl"] is None
+    assert payload["net_pnl_complete"] is False
+
+
+def test_viewer_stats_unpriced_fill_counted_even_when_actual_price_nonzero(monkeypatch):
+    """A fill with actual_price=0.0 but observed=sent_bad/absent/derived_unavailable is unpriced."""
+    import viewer.main as viewer_main
+
+    # Fill has price 0.0 but it's because the price was bad/absent, not a real $0 fill
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.0),
+        {**_stats_row("sell", 0.0, 1.0, 5, 0.0), "actual_price": 0.0},
+    ]
+    rows[1]["actual_price_observed"] = PRICE_SENT_BAD  # Price was sent but unusable
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["pnl_complete"] is False
+    assert payload["price_unknown_count"] == 1
+    assert payload["total_pnl"] is None, "Unusable price must not be realized as zero"
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        # Unknown symbols (options, malformed) must NOT be classified as crypto
+        ("AAPL261120C00200000", "unknown"),  # OCC option
+        ("", "unknown"),
+        ("BTC/", "unknown"),
+        ("XYZABC", "unknown"),  # six letters, no known quote suffix
+        ("BT", "us_equity"),  # too short for crypto
+        ("BTC", "us_equity"),  # 3 letters but no quote suffix
+    ],
+)
+def test_alpaca_symbol_classification_unknown_not_crypto(symbol, expected):
+    """Unknown symbols must remain unknown, not become crypto (equivalent mutant check)."""
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_alpaca_symbol(symbol) == expected
+
+
