@@ -129,7 +129,9 @@ beim Dispatch (fail-closed, vor dem Quote-Abruf):
 |---------|---------|--------|
 | `max_entry_deviation_sl_fraction` | **0.25** | `0 <= x <= 1` (Bruchteil der SL-Distanz; `25` gemeint als 25 % ist ein Fehler; `0` lässt nur einen Quote exakt am Entry zu) |
 | `max_entry_quote_age_seconds` | **10** | endlich, `> 0` |
- Der Vergleich hat
+
+Der Quote-Abruf selbst ist im Daemon auf 20 s begrenzt
+(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS`); ein Timeout lehnt den Entry ab. Der Vergleich hat
 eine Toleranz von `1e-9`, damit Float-Rundung an der Grenze nicht entscheidet.
 Ohne TP (explizite Unbounded-Policy) entfällt nur die TP-Regel. Der Quote ist
 **nur Gate**, nie Sizing-Input: Menge und Levels bleiben die des Signals.

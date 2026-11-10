@@ -954,6 +954,12 @@ def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float
     return bid, ask
 
 
+# Upper bound for one quote fetch of the entry-deviation gate (#125). Above the
+# adapters' own limits (cTrader: subscribe 10 s + quote 5 s), so it only cuts off
+# a call that has no bound of its own (Alpaca's REST quote).
+ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS = 20.0
+
+
 async def _check_entry_deviation(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -1005,7 +1011,11 @@ async def _check_entry_deviation(
     try:
         if not callable(get_quote):
             raise NotImplementedError(f"{type(adapter).__name__} has no get_quote")
-        quote = await get_quote(signal.symbol)
+        # Bounded here as well as in the adapters: a stalled broker call must
+        # not stall dispatch. A late quote would fail the freshness rule anyway.
+        quote = await asyncio.wait_for(
+            get_quote(signal.symbol), timeout=ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS
+        )
     except Exception as exc:
         logger.warning(
             "Live quote unavailable; refusing the entry (deviation gate fails closed)",
