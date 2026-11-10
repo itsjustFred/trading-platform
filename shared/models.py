@@ -300,15 +300,23 @@ PRICE_DERIVED_UNAVAILABLE = "derived_unavailable"
 #: Verdicts whose stored `actual_price` is not a price. A row carrying one has real quantity at an
 #: unknown price: every PnL reader must report its result as incomplete, never use the 0.0.
 UNUSABLE_PRICE_VERDICTS = frozenset({PRICE_SENT_BAD, PRICE_ABSENT, PRICE_DERIVED_UNAVAILABLE})
+#: Verdicts that vouch for the stored price. `None` is a row written before the column existed.
+#: Anything else - a typo, a verdict added later without updating the readers - is not a price.
+USABLE_PRICE_VERDICTS = frozenset({PRICE_OBSERVED, PRICE_DERIVED})
 
 
 def execution_price_is_usable(price: Any, verdict: Any) -> bool:
     """Whether a stored execution price may be used as a price.
 
-    False for an unusable verdict, and for a missing, non-finite or non-positive number whatever
-    its verdict - a legacy row (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
+    Allowlist: only no verdict (legacy row), `observed` and `derived` qualify, so an unknown or
+    misspelled verdict fails closed. Also False for a missing, non-finite or non-positive number
+    whatever its verdict - a legacy row (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
     """
-    if verdict in UNUSABLE_PRICE_VERDICTS or price is None or isinstance(price, bool):
+    if verdict is not None and (
+        not isinstance(verdict, str) or verdict not in USABLE_PRICE_VERDICTS
+    ):
+        return False
+    if price is None or isinstance(price, bool):
         return False
     try:
         number = float(price)

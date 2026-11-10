@@ -64,8 +64,8 @@ export function applyFillToPosition(
   return stats;
 }
 
-/** Price verdicts whose stored price is not a price (mirrors shared/models.py). */
-const UNUSABLE_PRICE_VERDICTS = new Set(["sent_bad", "absent", "derived_unavailable"]);
+/** Price verdicts that vouch for the stored price (mirrors shared/models.py); null = legacy row. */
+const USABLE_PRICE_VERDICTS = new Set(["observed", "derived"]);
 
 export interface PricedFill {
   action?: string | null;
@@ -80,7 +80,9 @@ export interface PricedFill {
 export function fillPriceIsUsable(
   fill: Pick<PricedFill, "actual_price" | "actual_price_observed">,
 ): boolean {
-  if (fill.actual_price_observed && UNUSABLE_PRICE_VERDICTS.has(fill.actual_price_observed)) {
+  const verdict = fill.actual_price_observed;
+  // Allowlist: an unknown or misspelled verdict is not a price.
+  if (verdict !== null && verdict !== undefined && !USABLE_PRICE_VERDICTS.has(verdict)) {
     return false;
   }
   const price = fill.actual_price;

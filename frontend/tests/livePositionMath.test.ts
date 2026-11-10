@@ -151,3 +151,9 @@ test("fillPriceIsUsable accepts observed, derived and unlabelled legacy prices",
   assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "sent_bad")), false);
   assert.equal(fillPriceIsUsable(trade("buy", Number.NaN, 1, 1, "observed")), false);
 });
+
+test("fillPriceIsUsable rejects a verdict it does not know", () => {
+  assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "observd")), false);
+  assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "")), false);
+  assert.equal(fillPriceIsUsable(trade("buy", 100, 1, 1, "something_new")), false);
+});
