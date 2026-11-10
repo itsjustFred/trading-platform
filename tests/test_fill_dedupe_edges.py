@@ -775,3 +775,149 @@ def test_c18_canonical_stamp_carries_no_legacy_key() -> None:
     """An already-canonical stamp keyed the same before and after; no fallback is needed."""
     live = _live_signal(stamp="2026-07-15T10:00:00+00:00")
     assert "legacy_idempotency_key" not in live.metadata
+
+
+# ── Mutation killing tests (added to catch surviving mutants) ──────────────────────────────────
+
+
+def test_a_key_owned_by_another_signal_is_refused_on_the_unique_constraint_race(
+    database, caplog
+) -> None:
+    """A unique constraint race with a cross-signal key must be rejected and logged at ERROR.
+
+    Guards against: removing the cross-signal check in the unique constraint
+    race handler (the second check in _insert_live_execution_locked). Without the check,
+    a concurrent insert of a key owned by another signal would silently succeed instead
+    of being rejected and logged.
+    """
+    from uuid import uuid4
+
+    from shared.database import LiveExecutionModel, _insert_live_execution_locked, init_db
+
+    init_db()
+    signal_id_1 = _persist_signal(database, deployment_id=DEP_1)
+    signal_id_2 = _persist_signal(database, deployment_id=DEP_2)
+    key = "cross-signal:race:key"
+
+    # First signal inserts the key
+    exec1 = LiveExecutionModel(
+        id=str(uuid4()),
+        signal_id=signal_id_1,
+        actual_price=100.0,
+        filled_qty=5.0,
+        commission=0.0,
+        timestamp=T0,
+        broker_order_id="order-1",
+        dedupe_key=key,
+        broker_fill_id=None,
+    )
+    from shared.database import get_session
+    with get_session() as session:
+        assert _insert_live_execution_locked(session, exec1) is True
+
+    # Second signal tries to insert the same key concurrently (simulated by
+    # bypassing the first SELECT check and hitting the unique constraint)
+    exec2 = LiveExecutionModel(
+        id=str(uuid4()),
+        signal_id=signal_id_2,
+        actual_price=100.0,
+        filled_qty=5.0,
+        commission=0.0,
+        timestamp=T0,
+        broker_order_id="order-1",
+        dedupe_key=key,
+        broker_fill_id=None,
+    )
+    with get_session() as session:
+        with caplog.at_level(logging.ERROR, logger="shared.database"):
+            result = _insert_live_execution_locked(session, exec2)
+        assert result is False
+        assert any(
+            key in record.getMessage() and record.levelno >= logging.ERROR
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    # Verify the original row is untouched
+    rows = _rows(database)
+    assert len(rows) == 1
+    assert rows[0][0] == key
+
+
+def test_a_zero_broker_fill_id_falls_back_to_the_content_key(database) -> None:
+    """A broker_fill_id of 0 must not be treated as a valid fill identifier.
+
+    Guards against: changing `int(fill_id) > 0` to `fill_id is not None`.
+    A fill_id of 0 should fall through to content-based deduplication, not be
+    used as a broker-native key.
+    """
+    signal_id = _persist_signal(database)
+    # Two fills with broker_fill_id=0 and SAME content should collide on content key
+    first = _execution(signal_id, broker_fill_id=0, timestamp=T0)
+    second = _execution(signal_id, broker_fill_id=0, timestamp=T0)  # Same timestamp
+
+    assert database.save_live_execution(first) is True
+    assert database.save_live_execution(second) is False  # Same content key, redelivery
+    assert len(_rows(database)) == 1
+
+    # A fill with broker_fill_id=0 and different content should be stored
+    third = _execution(signal_id, broker_fill_id=0, timestamp=T0, qty=6.0)
+    assert database.save_live_execution(third) is True
+    assert len(_rows(database)) == 2
+
+
+def test_a_key_owned_by_another_signal_is_refused_before_the_insert(database, caplog) -> None:
+    """A cross-signal key collision at the first check must be rejected and logged at ERROR.
+
+    Guards against: removing the cross-signal check at the first
+    SELECT in _insert_live_execution_locked (before the INSERT attempt).
+    """
+    from uuid import uuid4
+
+    from shared.database import LiveExecutionModel, _insert_live_execution_locked, init_db
+
+    init_db()
+    signal_id_1 = _persist_signal(database, deployment_id=DEP_1)
+    signal_id_2 = _persist_signal(database, deployment_id=DEP_2)
+    key = "cross-signal:first-check:key"
+
+    # First signal inserts the key
+    exec1 = LiveExecutionModel(
+        id=str(uuid4()),
+        signal_id=signal_id_1,
+        actual_price=100.0,
+        filled_qty=5.0,
+        commission=0.0,
+        timestamp=T0,
+        broker_order_id="order-1",
+        dedupe_key=key,
+        broker_fill_id=None,
+    )
+    from shared.database import get_session
+    with get_session() as session:
+        assert _insert_live_execution_locked(session, exec1) is True
+
+    # Second signal tries to insert the same key (first check should catch it)
+    exec2 = LiveExecutionModel(
+        id=str(uuid4()),
+        signal_id=signal_id_2,
+        actual_price=100.0,
+        filled_qty=5.0,
+        commission=0.0,
+        timestamp=T0,
+        broker_order_id="order-1",
+        dedupe_key=key,
+        broker_fill_id=None,
+    )
+    with get_session() as session:
+        with caplog.at_level(logging.ERROR, logger="shared.database"):
+            result = _insert_live_execution_locked(session, exec2)
+        assert result is False
+        assert any(
+            key in record.getMessage() and record.levelno >= logging.ERROR
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    # Verify the original row is untouched
+    rows = _rows(database)
+    assert len(rows) == 1
+    assert rows[0][0] == key
