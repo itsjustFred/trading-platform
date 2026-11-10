@@ -300,6 +300,17 @@ class TradeEngine:
                 elif self._max_position_exposure_pct is not None:
                     max_value = self.equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
+                # Issue #151: the leverage/exposure cap is a raw
+                # equity/price ratio, so it can leave a size that is below
+                # `min_lot` or off the `lot_step` grid -- a size the broker
+                # would reject. Re-normalise after the cap with the same
+                # float-safe floor as above. A floored size below `min_lot`
+                # is SKIPPED (size 0), not raised back up: the cap is
+                # binding, so the trade is not affordable at the minimum.
+                if lot_step > 0:
+                    shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+                if min_lot > 0 and shares < min_lot:
+                    return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(

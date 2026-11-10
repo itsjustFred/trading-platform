@@ -5,23 +5,22 @@ from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
 
 
-def _engine(params=None):
+def _engine(params=None, **config_overrides):
     # #84: explicit no-cost declaration for engine fixtures.
     merged_params = {"fees": "zero"}
     merged_params.update(params or {})
-    return TradeEngine(
-        BacktestConfig(
-            strategy_name="test",
-            symbols=["EURUSD"],
-            timeframe="1m",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            initial_capital=100_000.0,
-            risk_per_trade_pct=0.01,
-            parameters=merged_params,
-        ),
-        symbol="EURUSD",
-    )
+    config = {
+        "strategy_name": "test",
+        "symbols": ["EURUSD"],
+        "timeframe": "1m",
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "initial_capital": 100_000.0,
+        "risk_per_trade_pct": 0.01,
+        "parameters": merged_params,
+    }
+    config.update(config_overrides)
+    return TradeEngine(BacktestConfig(**config), symbol="EURUSD")
 
 
 def test_native_engine_reads_native_stop_and_take_profit_aliases():
@@ -65,6 +64,122 @@ def test_native_engine_fixed_risk_amount_honors_mt5_tick_metadata():
     )
 
     assert quantity == 1.0
+
+
+def test_fixed_risk_leverage_cap_floors_to_lot_step():  # Issue #151
+    # Raw lots 5.0; the leverage cap binds at 0.37 units. A broker accepts
+    # only the 0.1 grid, so the capped size must be re-floored to 0.3.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.1,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.00037,  # cap = 100_000 * 0.00037 / 100 = 0.37 units
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(0.3)
+    assert quantity % 0.1 == pytest.approx(0.0, abs=1e-12)
+
+
+def test_fixed_risk_leverage_cap_below_min_lot_skips_trade():  # Issue #151
+    # The cap binds at 0.25 units; floored to the grid that is 0.2, below
+    # min_lot 0.5. A broker would reject it, so no trade: size 0, not min_lot.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.5,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.00025,  # cap = 0.25 units
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == 0.0
+
+
+def test_fixed_risk_uncapped_path_is_unchanged_by_cap_normalisation():  # Issue #151
+    # Same config but a leverage cap that does not bind: the risk-derived
+    # size (5.0) is already on the grid and above min_lot, so it passes
+    # through unchanged.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.1,
+            "max_lot": 100.0,
+        },
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(5.0)
+
+
+def test_fixed_risk_cap_below_min_lot_creates_no_order():  # Issue #151
+    # End-to-end: the cap binds below min_lot, so _create_order skips the
+    # order entirely rather than opening a sub-minimum position.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 102.0],
+            "high": [100.5, 101.5, 102.5],
+            "low": [99.5, 100.5, 101.5],
+            "close": [100.0, 101.0, 102.0],
+            "sl_price": [95.0, float("nan"), float("nan")],
+        }
+    )
+
+    def strategy(df, params):
+        entries = pd.Series([True, False, False], index=df.index)
+        exits = pd.Series([False, False, True], index=df.index)
+        return entries, exits, {}, []
+
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.5,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.00025,  # cap = 0.25 units, below min_lot after flooring
+    )
+
+    result = engine.run(frame, strategy)
+
+    assert result.trades == []
 
 
 def test_fixed_risk_prefers_explicit_stop_distance():

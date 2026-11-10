@@ -161,7 +161,12 @@ Implementation:
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
-  `cap_fixed_risk_by_leverage = false`.
+  `cap_fixed_risk_by_leverage = false`. Because the leverage/exposure cap is
+  a raw equity/price ratio, the capped size is re-normalised afterwards
+  (Issue #151): floored to `lot_step` with the same float-safe guard as the
+  pre-cap floor, and **skipped** (size 0, no trade) when it lands below
+  `min_lot` — it is never raised back up to `min_lot`, since the cap is what
+  makes it unaffordable. Sizes that do not hit the cap are unchanged.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
