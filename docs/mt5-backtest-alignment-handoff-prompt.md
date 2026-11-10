@@ -22,7 +22,7 @@ Read these first:
 - `runner/engines/native_adapter.py`
 - `runner/engines/vectorbt_adapter.py`
 - `data_tools/downloaders/dukascopy_native.py`
-- `todo/codex-todo.md` (historisch, alte Todo-Lage; aktuelle Stand: `docs/todo/todo.md`)
+- `todo/codex-todo.md` (historisch, alte Todo-Lage; beide Sammellisten sind entfernt, offene Punkte stehen in den GitHub-Issues)
 
 Important correction: Dukascopy does have intraday US index CFDs. Do not reintroduce old notes that say otherwise. `SP500`/`US500` and `US100`/`NAS100`/`USTEC` should use Dukascopy, not yfinance proxies.
 
