@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
@@ -280,12 +281,48 @@ class LiveSignal(BaseModel):
 
 #: Verdicts for `LiveExecution.actual_price_observed`.
 #:
-#: `observed`  a finite, positive price was read from the broker payload.
-#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
-#: `absent`    the broker stated no price at all on any field the resolver reads.
+#: `observed`             a finite, positive price was read for THIS fill from the broker payload.
+#: `derived`              a finite, positive price computed from broker-stated prices rather than
+#:                        stated for this fill: Alpaca's order-level `filled_avg_price` on a
+#:                        single-fill order, or a reconciled remainder derived from it (#124).
+#:                        Usable, but it is arithmetic, not a quote - hence its own label.
+#: `sent_bad`             the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`               the broker stated no price at all on any field the resolver reads.
+#: `derived_unavailable`  the broker stated the order's average, but this fill's own price could
+#:                        not be derived honestly (an unpriced sibling leg, or an implausible
+#:                        result). The QUANTITY is real and recorded; the stored price is 0.0.
 PRICE_OBSERVED = "observed"
+PRICE_DERIVED = "derived"
 PRICE_SENT_BAD = "sent_bad"
 PRICE_ABSENT = "absent"
+PRICE_DERIVED_UNAVAILABLE = "derived_unavailable"
+
+#: Verdicts whose stored `actual_price` is not a price. A row carrying one has real quantity at an
+#: unknown price: every PnL reader must report its result as incomplete, never use the 0.0.
+UNUSABLE_PRICE_VERDICTS = frozenset({PRICE_SENT_BAD, PRICE_ABSENT, PRICE_DERIVED_UNAVAILABLE})
+#: Verdicts that vouch for the stored price. `None` is a row written before the column existed.
+#: Anything else - a typo, a verdict added later without updating the readers - is not a price.
+USABLE_PRICE_VERDICTS = frozenset({PRICE_OBSERVED, PRICE_DERIVED})
+
+
+def execution_price_is_usable(price: Any, verdict: Any) -> bool:
+    """Whether a stored execution price may be used as a price.
+
+    Allowlist: only no verdict (legacy row), `observed` and `derived` qualify, so an unknown or
+    misspelled verdict fails closed. Also False for a missing, non-finite or non-positive number
+    whatever its verdict - a legacy row (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
+    """
+    if verdict is not None and (
+        not isinstance(verdict, str) or verdict not in USABLE_PRICE_VERDICTS
+    ):
+        return False
+    if price is None or isinstance(price, bool):
+        return False
+    try:
+        number = float(price)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
 
 
 class LiveExecution(BaseModel):
@@ -295,7 +332,14 @@ class LiveExecution(BaseModel):
     signal_id: UUID
     actual_price: float
     filled_qty: float
-    commission: float
+    # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
+    #
+    # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
+    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
+    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # purpose - an adapter must decide which of the two it has, rather than inherit a default
+    # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
+    commission: float | None
     timestamp: datetime
     broker_order_id: str
     dedupe_key: str | None = None
@@ -313,8 +357,9 @@ class LiveExecution(BaseModel):
     # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
     broker_fill_id: int | None = None
 
-    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
-    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    # Whether `actual_price` is a price the broker actually stated: `observed`, `sent_bad`,
+    # `absent`, and for prices computed from broker data `derived` / `derived_unavailable` (#124,
+    # see the verdict constants above).
     #
     # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
     # be read" produces the same stored value whether the broker omitted `executionPrice` or
@@ -323,9 +368,8 @@ class LiveExecution(BaseModel):
     # existed nothing said which rows those were.
     #
     # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
-    # one is `absent`. Nullable because rows written before this column existed, and adapters that
-    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
-    # `observed`.
+    # one is `absent`. Nullable because rows written before this column existed carry no verdict -
+    # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
 

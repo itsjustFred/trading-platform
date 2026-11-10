@@ -2412,10 +2412,13 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
 
     _client = SimpleNamespace(
@@ -2439,6 +2442,8 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     assert str(saved[0][0].signal_id) == signal_id
     assert saved[0][1] == 25.0
+    # #124: the broker's cumulative average goes to the save, which derives the remainder price.
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
@@ -2473,7 +2478,9 @@ def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     monkeypatch.setattr(
-        module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
+        module,
+        "save_live_execution_up_to_cumulative",
+        lambda execution, _cap, **_kwargs: execution.filled_qty,
     )
     broker_queries: list[str] = []
     adapter._trading_client = SimpleNamespace(
@@ -2515,10 +2522,13 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         module, "get_live_signal_filled_qty", lambda _signal_id: 1.0, raising=False
     )
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
@@ -2539,6 +2549,7 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         f"alpaca:order:{_alpaca_order_id('partial-recovery')}:reconciled:3.0"
     )
     assert saved[0][1] == 3.0
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 @pytest.mark.parametrize("local_filled_qty", [3.0, 4.0])

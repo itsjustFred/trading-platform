@@ -15,6 +15,14 @@ import pandas as pd
 from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
 
+from live_runner.alpaca_fees import (
+    COMMISSION_BACKFILL_LOOKBACK,
+    candidate_fee_days,
+    day_start_utc,
+    fee_day_is_posted,
+    fetch_account_activities,
+    plan_commission_backfill,
+)
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
@@ -24,10 +32,14 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
+    apply_live_execution_commissions,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
     get_live_signal_reconciliation_cursor,
+    list_live_executions_for_broker_orders,
+    list_live_executions_missing_commission,
     list_live_signal_ids_for_reconciliation,
     save_live_execution,
     save_live_execution_up_to_cumulative,
@@ -36,7 +48,14 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
-from shared.models import LiveExecution, LiveSignal
+from shared.models import (
+    PRICE_ABSENT,
+    PRICE_DERIVED,
+    PRICE_OBSERVED,
+    PRICE_SENT_BAD,
+    LiveExecution,
+    LiveSignal,
+)
 
 logger = get_logger("live-runner")
 
@@ -179,6 +198,79 @@ def _to_float(value: Any, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _positive_finite(value: Any) -> float | None:
+    """``value`` as a finite, positive float, or ``None`` when it is missing or unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(Decimal(str(value).strip()))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0.0:
+        return None
+    return number
+
+
+def _is_sent(raw: Any) -> bool:
+    return raw is not None and not (isinstance(raw, str) and not raw.strip())
+
+
+def _resolve_fill_price(
+    event_prices: tuple[Any, ...],
+    *,
+    order_avg_price: Any,
+    event_qty: Any,
+    cumulative_qty: float,
+) -> tuple[float, str]:
+    """This fill's price and its ``actual_price_observed`` verdict.
+
+    The event's own prices come first; the first finite positive one is ``observed``.
+
+    The order's ``filled_avg_price`` is the average over EVERY fill of the order, so it is this
+    fill's price only when this fill is the whole order: the event states its own quantity and that
+    equals the order's cumulative quantity. Then it is used, labelled ``derived`` - never
+    ``observed``. Otherwise it is not this fill's price at all (fills of 1@100 and 1@104 average to
+    102, which is neither), and borrowing it would hand `_derive_remainder_price` a fake leg
+    (review of #143).
+
+    Without a usable price the stored price is ``0.0`` with ``sent_bad`` (a price was sent and is
+    unusable) or ``absent`` (none was sent), as the cTrader adapter records it.
+    """
+    sent = False
+    for raw in event_prices:
+        if not _is_sent(raw):
+            continue
+        sent = True
+        price = _positive_finite(raw)
+        if price is not None:
+            return price, PRICE_OBSERVED
+    own_qty = _positive_finite(event_qty)
+    single_fill = (
+        own_qty is not None
+        and cumulative_qty > 0.0
+        and math.isclose(own_qty, cumulative_qty, rel_tol=1e-9, abs_tol=1e-12)
+    )
+    if single_fill and _is_sent(order_avg_price):
+        sent = True
+        average = _positive_finite(order_avg_price)
+        if average is not None:
+            return average, PRICE_DERIVED
+    return 0.0, PRICE_SENT_BAD if sent else PRICE_ABSENT
+
+
+def _known_commission(order: Any) -> float | None:
+    """``0.0`` for an equity order (commission-free on Alpaca), ``None`` (unknown) otherwise.
+
+    Alpaca reports no commission on the order or the trade update. Crypto fees are posted end of day
+    as ``CFEE`` activities and priced later by `AlpacaLiveAdapter.backfill_commissions`; options and
+    an unreadable asset class are unknown too. Maintainer decision on #124: ``0.0`` only for a known
+    zero, NULL for everything else.
+    """
+    raw = _order_attr(order, "asset_class", None)
+    asset_class = str(getattr(raw, "value", raw) or "").strip().lower().rsplit(".", 1)[-1]
+    return 0.0 if asset_class == "us_equity" else None
 
 
 def _is_parseable_qty(value: Any) -> bool:
@@ -590,6 +682,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         broker_filled_qty = _to_float(
             getattr(order, "filled_qty", None), default=0.0
         )
+        if not math.isfinite(broker_filled_qty):
+            logger.warning(
+                "Alpaca order reports a non-finite filled_qty; not reconciling it",
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "filled_qty": str(getattr(order, "filled_qty", None)),
+                    }
+                },
+            )
+            return False
         local_filled_qty = await asyncio.to_thread(
             get_live_signal_filled_qty, signal_id
         )
@@ -599,13 +702,35 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
             return False
+        # `filled_avg_price` is the broker's average over the order's WHOLE cumulative quantity.
+        # Without it there is no price to record, and a fill at 0.0 is not a fill (#124): persist
+        # nothing, and the next reconciliation pass retries.
+        cumulative_avg_price = _positive_finite(getattr(order, "filled_avg_price", None))
+        if cumulative_avg_price is None:
+            logger.warning(
+                "Alpaca order has filled quantity but no usable filled_avg_price; not persisting "
+                "the missed fill, the next reconciliation pass retries",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "signal_id": signal_id,
+                        "broker_order_id": broker_order_id,
+                        "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
+                        "missing_filled_qty": missing_filled_qty,
+                    }
+                },
+            )
+            return False
         execution = LiveExecution(
             signal_id=UUID(signal_id),
-            actual_price=_to_float(
-                getattr(order, "filled_avg_price", None), default=0.0
-            ),
+            # Placeholder: the save derives the remainder's own price from the cumulative average
+            # inside its transaction, because part of the order may already be recorded at a
+            # different price, and sets the verdict (`derived`, or `derived_unavailable` with the
+            # quantity still recorded at 0.0).
+            actual_price=cumulative_avg_price,
+            actual_price_observed=PRICE_DERIVED,
             filled_qty=missing_filled_qty,
-            commission=0.0,
+            commission=_known_commission(order),
             timestamp=_to_datetime(getattr(order, "filled_at", None)),
             broker_order_id=broker_order_id,
             dedupe_key=(
@@ -613,7 +738,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             ),
         )
         persisted_qty = await asyncio.to_thread(
-            save_live_execution_up_to_cumulative, execution, broker_filled_qty
+            save_live_execution_up_to_cumulative,
+            execution,
+            broker_filled_qty,
+            cumulative_avg_price=cumulative_avg_price,
         )
         if persisted_qty <= 0.0:
             return False
@@ -659,6 +787,133 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 break
             before = next_before
         return recovered
+
+    async def backfill_commissions(self, *, now: datetime | None = None) -> int:
+        """Price this account's still-unknown crypto commissions from posted ``CFEE`` activities.
+
+        Crypto fees are posted end of day, so fills are stored with a NULL commission and this pass
+        - run periodically by the daemon - fills them in once their trade date has been posted
+        (``CFEE_POSTING_DELAY``) and while they are inside ``COMMISSION_BACKFILL_LOOKBACK``. It
+        reads ``FILL``, ``CFEE`` and ``FEE`` activities over REST (alpaca-py has no activities
+        method), allocates each (pair, trade date)'s fee as documented in `live_runner.alpaca_fees`,
+        and
+        writes a group's commissions all or nothing. Every group that cannot be priced honestly
+        keeps NULL and is logged; nothing is ever written as ``0.0``.
+
+        Returns the number of executions whose commission was set. Never raises for broker data or
+        a failed request: those are logged and retried on the next pass.
+        """
+        client = self._trading_client
+        if client is None:
+            return 0
+        now = now or datetime.now(timezone.utc)
+        rows = await asyncio.to_thread(
+            list_live_executions_missing_commission,
+            self.account_id,
+            since=now - COMMISSION_BACKFILL_LOOKBACK,
+            until=now,
+        )
+        candidates: list[dict[str, Any]] = []
+        skipped: dict[str, list[str]] = {}
+        for row in rows:
+            kind = classify_alpaca_symbol(row["symbol"])
+            if kind != "crypto":
+                reason = (
+                    f"not a crypto pair (symbol {row['symbol']!r} classifies as {kind}); no CFEE "
+                    "applies and nothing else prices it"
+                )
+            elif not all(
+                fee_day_is_posted(day, now) for day in candidate_fee_days(row["timestamp"])
+            ):
+                reason = "its trade date's CFEE is not posted yet; retried on a later pass"
+            else:
+                candidates.append(row)
+                continue
+            skipped.setdefault(reason, []).append(str(row["execution_id"]))
+        for reason, execution_ids in skipped.items():
+            logger.info(
+                "Alpaca commission backfill: skipping %s execution(s) with unknown commission: "
+                "%s: %s",
+                len(execution_ids),
+                reason,
+                ", ".join(execution_ids),
+                extra={"data": {"account_id": self.account_id, "execution_ids": execution_ids}},
+            )
+        if not candidates:
+            return 0
+
+        days = {day for row in candidates for day in candidate_fee_days(row["timestamp"])}
+        window_start = day_start_utc(min(days)) - timedelta(days=1)
+        fill_window_end = min(day_start_utc(max(days)) + timedelta(days=2), now)
+        try:
+            fills = await asyncio.to_thread(
+                fetch_account_activities, client, "FILL", after=window_start, until=fill_window_end
+            )
+            cfees = await asyncio.to_thread(
+                fetch_account_activities, client, "CFEE", after=window_start, until=now
+            )
+            usd_fees = await asyncio.to_thread(
+                fetch_account_activities, client, "FEE", after=window_start, until=now
+            )
+        except Exception as exc:
+            logger.warning(
+                "Alpaca commission backfill: reading account activities failed; commissions stay "
+                "unknown until the next pass",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
+            return 0
+
+        candidate_pairs = {crypto_pair_key(row["symbol"]) for row in candidates}
+        order_ids = sorted(
+            {
+                str(item.get("order_id") or "").strip()
+                for item in fills
+                if crypto_pair_key(item.get("symbol")) in candidate_pairs
+            }
+            - {""}
+        )
+        local_rows = await asyncio.to_thread(
+            list_live_executions_for_broker_orders, self.account_id, order_ids
+        )
+        plans, unplaced = plan_commission_backfill(
+            candidates=candidates,
+            fill_activities=fills,
+            cfee_activities=cfees,
+            fee_activities=usd_fees,
+            local_rows=local_rows,
+            now=now,
+        )
+        for message in unplaced:
+            logger.warning(
+                "Alpaca commission backfill: leaving commission unknown (CFEE not attributable): "
+                "%s",
+                message,
+                extra={"data": {"account_id": self.account_id}},
+            )
+        updated = 0
+        for plan in plans:
+            if plan.problem is not None:
+                logger.warning(
+                    "Alpaca commission backfill: leaving the CFEE of %s on %s unallocated, "
+                    "commissions stay unknown: %s",
+                    plan.pair,
+                    plan.day.isoformat(),
+                    plan.problem,
+                    extra={"data": {"account_id": self.account_id}},
+                )
+                continue
+            applied = await asyncio.to_thread(
+                apply_live_execution_commissions, self.account_id, plan.commissions
+            )
+            updated += applied
+            logger.info(
+                "Alpaca commission backfill: priced %s execution(s) of %s on %s from CFEE",
+                applied,
+                plan.pair,
+                plan.day.isoformat(),
+                extra={"data": {"account_id": self.account_id, "commissions": plan.commissions}},
+            )
+        return updated
 
     async def disconnect(self) -> None:
         stream = self._trading_stream
@@ -1748,30 +2003,35 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
                 return
 
-            fill_price = getattr(data, "fill_price", None)
-            if fill_price is None:
-                fill_price = getattr(data, "price", None)
-            if fill_price is None:
-                fill_price = getattr(order, "filled_avg_price", None)
-
             skip, filled_qty_value = self._resolve_trade_update_qty(
                 data, order, event=event, client_order_id=client_order_id
             )
             if skip:
                 return
 
-            commission_value = getattr(data, "commission", None)
-            if commission_value is None:
-                commission_value = getattr(order, "commission", None)
-
-            actual_price = _to_float(fill_price)
-            filled_qty = _to_float(filled_qty_value)
-            commission = _to_float(commission_value)
-            raw_fill_ts = getattr(data, "timestamp", None)
-            fill_ts = _to_datetime(raw_fill_ts)
             broker_cumulative_filled_qty = _to_float(
                 getattr(order, "filled_qty", None), default=0.0
             )
+            # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty`
+            # may have substituted: only that proves this fill is the whole order.
+            event_qty = getattr(data, "qty", None)
+            if event_qty is None:
+                event_qty = getattr(data, "filled_qty", None)
+            # The quantity is still recorded when no price is usable - a fill the database never
+            # saw is how a duplicate order gets submitted - but at 0.0 with a verdict that says so.
+            actual_price, price_observed = _resolve_fill_price(
+                (getattr(data, "fill_price", None), getattr(data, "price", None)),
+                order_avg_price=getattr(order, "filled_avg_price", None),
+                event_qty=event_qty,
+                cumulative_qty=broker_cumulative_filled_qty,
+            )
+
+            filled_qty = _to_float(filled_qty_value)
+            # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
+            # of day and backfilled, so here it is unknown unless it is a known zero (#124).
+            commission = _known_commission(order)
+            raw_fill_ts = getattr(data, "timestamp", None)
+            fill_ts = _to_datetime(raw_fill_ts)
 
             execution_id = str(getattr(data, "execution_id", "") or "")
             dedupe_key = _alpaca_fill_dedupe_key(
@@ -1801,6 +2061,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             execution = LiveExecution(
                 signal_id=signal_uuid,
                 actual_price=actual_price,
+                actual_price_observed=price_observed,
                 filled_qty=filled_qty,
                 commission=commission,
                 timestamp=fill_ts,
@@ -1822,6 +2083,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         "execution_id": str(execution.id),
                         "event": event,
                         "actual_price": actual_price,
+                        "actual_price_observed": price_observed,
+                        "commission": commission,
                         "filled_qty": filled_qty,
                         "persisted_qty": persisted_qty,
                         "broker_cumulative_filled_qty": broker_cumulative_filled_qty,

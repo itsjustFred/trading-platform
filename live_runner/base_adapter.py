@@ -267,3 +267,11 @@ class BaseLiveAdapter(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} cannot identify orphaned protections"
         )
+
+    async def backfill_commissions(self) -> int:
+        """Fill in commissions the broker reports only after the fill. Returns the rows updated.
+
+        A no-op by default: a broker that states its fee on the fill has nothing to backfill.
+        Alpaca posts crypto fees end of day and overrides this (#124).
+        """
+        return 0
