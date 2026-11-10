@@ -1013,3 +1013,103 @@ def test_quote_time_is_serialised_and_a_missing_time_rejects():
     with pytest.raises(ValueError, match="quote_time_missing"):
         _prepare(adapter, deployment, _signal(deployment, dict(_BUY)))
     assert adapter.submitted == []
+
+
+# ── mutation-testing gaps (platform-pr-verify on PR #141) ───────────────────────
+
+
+def test_resolver_rejects_zero_or_negative_entry_price():
+    """The resolver must reject entry_price <= 0 (mutation test gap)."""
+    deployment = _deployment()
+    for bad_entry in (0.0, -1.0):
+        signal = _signal(deployment, {"entry_price": bad_entry, "stop_loss": 95.0})
+        with pytest.raises(ValueError, match="entry_price must be > 0"):
+            resolve_live_levels(signal)
+
+
+def test_resolver_rejects_zero_stop_loss_and_take_profit():
+    """The resolver must reject stop_loss <= 0 and take_profit <= 0 (mutation test gap)."""
+    deployment = _deployment()
+    for bad_stop in (0.0, -1.0):
+        signal = _signal(deployment, {"stop_loss": bad_stop, "take_profit": 110.0})
+        with pytest.raises(ValueError, match="stop_loss must be > 0"):
+            resolve_live_levels(signal)
+    for bad_take in (0.0, -1.0):
+        signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": bad_take})
+        with pytest.raises(ValueError, match="take_profit must be > 0"):
+            resolve_live_levels(signal)
+
+
+def test_entry_gate_settings_rejects_fraction_above_one():
+    """entry_gate_settings must reject max_entry_deviation_sl_fraction > 1 (mutation test gap)."""
+    from risk.live import entry_gate_settings
+    with pytest.raises(ValueError, match="max_entry_deviation_sl_fraction must be within"):
+        entry_gate_settings({"max_entry_deviation_sl_fraction": 1.5})
+    with pytest.raises(ValueError, match="max_entry_deviation_sl_fraction must be within"):
+        entry_gate_settings({"max_entry_deviation_sl_fraction": 2.0})
+
+
+def test_entry_gate_settings_rejects_zero_max_age():
+    """entry_gate_settings must reject max_entry_quote_age_seconds <= 0 (mutation test gap)."""
+    from risk.live import entry_gate_settings
+    with pytest.raises(ValueError, match="max_entry_quote_age_seconds must be > 0"):
+        entry_gate_settings({"max_entry_quote_age_seconds": 0})
+    with pytest.raises(ValueError, match="max_entry_quote_age_seconds must be > 0"):
+        entry_gate_settings({"max_entry_quote_age_seconds": -1})
+
+
+def test_entry_deviation_rejects_wrong_side_stop_for_buy():
+    """entry_deviation_sl_fraction must reject stop_loss >= entry_price for a buy (mutation test gap)."""
+    from risk.live import entry_deviation_sl_fraction
+    with pytest.raises(ValueError, match="wrong side"):
+        entry_deviation_sl_fraction("buy", entry_price=100.0, stop_loss=105.0, quote_price=100.0)
+
+
+def test_entry_deviation_rejects_wrong_side_stop_for_sell():
+    """entry_deviation_sl_fraction must reject stop_loss <= entry_price for a sell (mutation test gap)."""
+    from risk.live import entry_deviation_sl_fraction
+    with pytest.raises(ValueError, match="wrong side"):
+        entry_deviation_sl_fraction("sell", entry_price=100.0, stop_loss=95.0, quote_price=100.0)
+
+
+def test_daemon_sizing_metadata_does_not_leak_payload_current_positions():
+    """The payload's current_positions must not appear in the sized metadata (mutation test gap)."""
+    deployment = _deployment()
+    adapter = _GateAdapter(quote=_at_entry())
+    signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": 110.0, "current_positions": 999})
+    prepared, _ = _prepare(adapter, deployment, signal)
+    # The payload value should be dropped, not forwarded
+    assert prepared.metadata.get("current_positions") == 0
+
+
+def test_crossed_take_profit_is_named_even_when_the_deviation_limit_is_also_exceeded():
+    """The more specific rule wins: with a tight limit a quote at the TP breaks
+    both rules, and the rejection must name the crossed level."""
+    deployment = _deployment(max_entry_deviation_sl_fraction=0.1)
+    adapter = _GateAdapter(quote=_quote(bid=109.9, ask=110.0))
+    signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": 110.0})
+    with pytest.raises(ValueError, match="quote_at_or_beyond_take_profit"):
+        _prepare(adapter, deployment, signal)
+    assert adapter.submitted == []
+
+
+def test_a_quote_fetch_that_hangs_is_cut_off_and_refuses_the_entry(monkeypatch):
+    """A stalled broker quote call must not stall dispatch: the daemon bounds
+    it itself and fails closed (CodeRabbit finding on PR #141)."""
+    import asyncio
+
+    import live_runner.daemon as daemon_module
+
+    class _HangingAdapter(_GateAdapter):
+        async def get_quote(self, symbol: str):
+            self.quote_calls.append(symbol)
+            await asyncio.sleep(30)
+
+    monkeypatch.setattr(daemon_module, "ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS", 0.05)
+    deployment = _deployment()
+    adapter = _HangingAdapter()
+    signal = _signal(deployment, {"stop_loss": 95.0, "take_profit": 110.0})
+    with pytest.raises(ValueError, match="no live broker quote"):
+        _prepare(adapter, deployment, signal)
+    assert len(adapter.quote_calls) == 1
+    assert adapter.submitted == []
