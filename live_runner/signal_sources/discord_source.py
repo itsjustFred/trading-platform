@@ -113,6 +113,17 @@ _NON_PRICE_AT_CONTEXT = frozenset(
         "levels", "target", "stop", "sl", "tp", "pt", "tgt",
     }
 )
+# Words that may sit between an indicator and its reading: "RSI now at 28",
+# "VIX is currently sitting at 18". Only these are skipped when looking back
+# for the indicator, so an order between the two ("RSI oversold: BUY AAPL at
+# 190") keeps its real price.
+_INDICATOR_READING_FILLER = frozenset(
+    {
+        "is", "was", "now", "currently", "still", "just", "only", "already",
+        "back", "sits", "sitting", "holding", "hovering", "reading", "reads",
+        "printing", "prints", "stands", "standing", "right", "around", "near",
+    }
+)
 # The mirror of _ACTION_SELL_RE, and the same hazard in the other direction: a
 # buy is the fallback, so an incidental "buy" opens a real position. Matched
 # bare, "could buy here" and - worse - "do not buy" both read as a BUY signal.
@@ -425,8 +436,15 @@ def _at_price_matches(content: str) -> Iterable[re.Match[str]]:
     """``@``/``at`` price markers, in order, minus indicator readings."""
     for matched in _AT_PRICE_RE.finditer(content):
         if matched.group("marker") != "@":
-            preceding = re.findall(r"[A-Za-z]+", content[: matched.start()])
-            if preceding and preceding[-1].lower() in _NON_PRICE_AT_CONTEXT:
+            preceding = [
+                word.lower()
+                for word in re.findall(r"[A-Za-z]+", content[: matched.start()])
+            ]
+            # Look back past filler ("RSI is currently at 28") to the word the
+            # reading belongs to.
+            while preceding and preceding[-1] in _INDICATOR_READING_FILLER:
+                preceding.pop()
+            if preceding and preceding[-1] in _NON_PRICE_AT_CONTEXT:
                 continue
         yield matched
 
