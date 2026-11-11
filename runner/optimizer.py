@@ -246,7 +246,13 @@ class OptimizationConfig(BaseModel):
     base_backtest_id: str
     target_metric: str
     n_trials: int = Field(default=100, gt=0)
-    train_split_pct: float = Field(default=0.7, ge=0.1, le=0.95)
+    # Three-way split: train / validation / test. Defaults give 60/20/20.
+    # If validation_split_pct and test_split_pct are not provided, the remainder
+    # 1 - train_split_pct is split equally between validation and test.
+    # Constraints relaxed here; full validation in _validate_three_way_split.
+    train_split_pct: float = Field(default=0.6, ge=0.0, le=1.0)
+    validation_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    test_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
@@ -262,6 +268,17 @@ class OptimizationConfig(BaseModel):
     embargo_pct: float = Field(default=0.0, ge=0.0, le=0.4)
     # Number of sequential walk-forward folds reported as a robustness check.
     walk_forward_splits: int = Field(default=3, ge=1, le=20)
+    # Share of trials, ranked by validation score, that get evaluated on test.
+    # Default 0.10 means the top 10% of trials by validation metric.
+    test_top_fraction: float = Field(default=0.10, gt=0.0, le=1.0)
+    # Overfitting thresholds. A failed check flags the result; it does not
+    # block the run (blocking happens at the promotion gate, #165).
+    # max_train_validation_degradation: validation metric may be at most this
+    # fraction worse than train (relative drop). Default 0.5 = 50% degradation.
+    max_train_validation_degradation: float = Field(default=0.5, ge=0.0)
+    # min_deflated_sharpe: probability that the selected trial's Sharpe is not
+    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.95.
+    min_deflated_sharpe: float = Field(default=0.95, gt=0.0, le=1.0)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -349,6 +366,49 @@ class OptimizationConfig(BaseModel):
         ):
             raise ValueError(
                 "Configure at least one parameter range or symbol universe for optimization"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_three_way_split(self) -> "OptimizationConfig":
+        """Validate train/validation/test split fractions.
+
+        If validation_split_pct and test_split_pct are not provided, the remainder
+        1 - train_split_pct is split equally between validation and test.
+        All three fractions must be > 0 and sum to 1 (tolerance 1e-9).
+        """
+        train = self.train_split_pct
+        validation = self.validation_split_pct
+        test = self.test_split_pct
+
+        if validation is None and test is None:
+            # Old config: split remainder equally between validation and test
+            remainder = 1.0 - train
+            if remainder <= 0:
+                raise ValueError(
+                    "train_split_pct must be < 1.0 to leave room for validation and test"
+                )
+            validation = remainder / 2.0
+            test = remainder / 2.0
+            # Store the derived values back for downstream use
+            object.__setattr__(self, "validation_split_pct", validation)
+            object.__setattr__(self, "test_split_pct", test)
+        elif validation is None or test is None:
+            raise ValueError(
+                "Both validation_split_pct and test_split_pct must be provided together, "
+                "or neither (to use the equal-split default)"
+            )
+
+        if not (validation > 0 and test > 0 and train > 0):
+            raise ValueError(
+                "train_split_pct, validation_split_pct, and test_split_pct must all be > 0"
+            )
+
+        total = train + validation + test
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(
+                f"train_split_pct + validation_split_pct + test_split_pct must sum to 1.0, "
+                f"got {total:.10f}"
             )
         return self
 

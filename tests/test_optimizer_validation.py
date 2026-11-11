@@ -684,3 +684,206 @@ def test_run_optimization_forwards_the_configured_embargo():
         "run_optimization must pass embargo_pct into _split_backtest_period; "
         "without it the embargo is never applied to the windows that run"
     )
+
+# ─── Three-way split config validation (Issue #164) ─────────────────────────
+
+
+def test_three_way_split_defaults_to_60_20_20():
+    """Default train=0.6, validation and test derived as 0.2 each."""
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=10,
+        parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+    )
+    assert config.train_split_pct == 0.6
+    assert config.validation_split_pct == pytest.approx(0.2)
+    assert config.test_split_pct == pytest.approx(0.2)
+    # Sum must be 1.0 within tolerance
+    total = config.train_split_pct + config.validation_split_pct + config.test_split_pct
+    assert abs(total - 1.0) <= 1e-9
+
+
+def test_three_way_split_explicit_fractions():
+    """Explicit validation and test fractions are respected."""
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=10,
+        train_split_pct=0.5,
+        validation_split_pct=0.3,
+        test_split_pct=0.2,
+        parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+    )
+    assert config.train_split_pct == 0.5
+    assert config.validation_split_pct == 0.3
+    assert config.test_split_pct == 0.2
+
+
+def test_three_way_split_old_config_maps_remainder_equally():
+    """Old config with only train_split_pct splits remainder equally."""
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=10,
+        train_split_pct=0.7,  # Old default
+        parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+    )
+    # Remainder 0.3 split equally -> 0.15 each
+    assert config.train_split_pct == 0.7
+    assert config.validation_split_pct == pytest.approx(0.15)
+    assert config.test_split_pct == pytest.approx(0.15)
+    total = config.train_split_pct + config.validation_split_pct + config.test_split_pct
+    assert abs(total - 1.0) <= 1e-9
+
+
+def test_three_way_split_rejects_only_one_of_validation_test():
+    """Providing only validation_split_pct or only test_split_pct fails."""
+    with pytest.raises(ValueError, match="Both validation_split_pct and test_split_pct"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.6,
+            validation_split_pct=0.2,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError, match="Both validation_split_pct and test_split_pct"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.6,
+            test_split_pct=0.2,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+
+
+def test_three_way_split_rejects_non_positive_fractions():
+    """All three fractions must be > 0."""
+    with pytest.raises(ValueError, match="must all be > 0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.0,
+            validation_split_pct=0.5,
+            test_split_pct=0.5,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError, match="must all be > 0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.6,
+            validation_split_pct=0.0,
+            test_split_pct=0.4,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError, match="must all be > 0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.6,
+            validation_split_pct=0.4,
+            test_split_pct=0.0,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+
+
+def test_three_way_split_rejects_sum_not_one():
+    """Fractions must sum to 1.0 within 1e-9 tolerance."""
+    with pytest.raises(ValueError, match="must sum to 1.0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.5,
+            validation_split_pct=0.3,
+            test_split_pct=0.3,  # Sum = 1.1
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError, match="must sum to 1.0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=0.5,
+            validation_split_pct=0.2,
+            test_split_pct=0.2,  # Sum = 0.9
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+
+
+def test_three_way_split_rejects_train_ge_one():
+    """train_split_pct must leave room for validation and test."""
+    with pytest.raises(ValueError, match="must be < 1.0"):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            train_split_pct=1.0,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+
+
+def test_overfitting_thresholds_defaults():
+    """Default overfitting threshold values."""
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="sharpe_ratio",
+        n_trials=10,
+        parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+    )
+    assert config.test_top_fraction == pytest.approx(0.10)
+    assert config.max_train_validation_degradation == pytest.approx(0.5)
+    assert config.min_deflated_sharpe == pytest.approx(0.95)
+
+
+def test_overfitting_thresholds_bounds():
+    """Overfitting thresholds respect their bounds."""
+    # test_top_fraction in (0, 1]
+    with pytest.raises(ValueError):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            test_top_fraction=0.0,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            test_top_fraction=1.5,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    # max_train_validation_degradation >= 0
+    with pytest.raises(ValueError):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            max_train_validation_degradation=-0.1,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    # min_deflated_sharpe in (0, 1]
+    with pytest.raises(ValueError):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            min_deflated_sharpe=0.0,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
+    with pytest.raises(ValueError):
+        OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="sharpe_ratio",
+            n_trials=10,
+            min_deflated_sharpe=1.5,
+            parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
+        )
