@@ -432,7 +432,7 @@ def _detect_date_range(symbols: list[str], timeframe: str) -> tuple[str, str]:
 
 **For Optimization**:
 - Optuna trials should respect these bounds
-- If splitting train/test or walk-forward, ensure dates don't overlap and cover available data
+- If splitting train/validation/test or walk-forward, ensure dates don't overlap and cover available data
 - Parse dates as `datetime.strptime(date_str, "%Y-%m-%d")` before arithmetic
 
 ### B. Parameter Serialization
@@ -600,17 +600,19 @@ trusted.
 }
 ```
 
-- `embargo_pct` (default `0.0`, max `0.4`) drops a gap between the train and test
-  windows **and is applied to the windows that actually run**: `run_optimization`
-  forwards it into `_split_backtest_period`, so no trial ever sees data across the
-  gap. A trade opened just before the split can close inside the test window, so
-  its label is partly test information; without the gap that leaks backwards into
-  training. The gap is additionally reported in bars via the context timeframe.
+- `embargo_pct` (default `0.0`, max `0.4`) drops a gap between every pair of
+  adjacent segments (train / validation and validation / test, see the three-way
+  split section below) **and is applied to the windows that actually run**:
+  `run_optimization` forwards it into `_split_backtest_period`, so no trial ever
+  sees data across a gap. A trade opened just before a boundary can close inside
+  the next segment, so its label partly carries that segment's information;
+  without the gap that leaks backwards. The gaps are additionally reported in
+  bars via the context timeframe.
 - `walk_forward_splits` (default `3`) is **report-only**. The repeated sequential
   folds are computed and published as a robustness diagnostic, but the selected
-  parameters still come from the single train/test split above; the backtest is
-  not re-run per fold. Folds never overlap and never train on an earlier fold's
-  test window. The block is published as `walk_forward_folds` (fold boundaries
+  parameters still come from the single train/validation/test split; the backtest
+  is not re-run per fold. Folds cover only the range before the test holdout and
+  its embargo, never overlap and never train on an earlier fold's held-out window. The block is published as `walk_forward_folds` (fold boundaries
   only, with a `walk_forward_note` saying so); it was called `walk_forward`,
   which read like a performance result.
 - `plateau` is centred on the trial the study selects: the highest metric for a
