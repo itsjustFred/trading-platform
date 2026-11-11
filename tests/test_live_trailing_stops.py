@@ -715,6 +715,58 @@ def test_alpaca_amend_replaces_in_place_and_never_cancels() -> None:
     assert client.stop_prices() == [96.12]
 
 
+def test_alpaca_amend_waits_for_a_running_flatten_and_leaves_no_orphan() -> None:
+    """A replace must not land between a flatten's order listing and its cancels.
+
+    The replace gives the stop a new id; landing mid-sweep, that new stop would
+    survive the flatten (and, once the position is gone, an orphaned sell stop
+    opens a short). The adapter serialises both, so the amend runs after the
+    flatten, finds its order gone, and fails without leaving anything behind.
+    """
+    import threading
+
+    class _SlowCancelClient(_ReplacingClient):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.cancel_started = threading.Event()
+            self.release_cancel = threading.Event()
+
+        def cancel_order_by_id(self, order_id: str) -> None:
+            self.cancel_started.set()
+            assert self.release_cancel.wait(5), "test did not release the cancel"
+            super().cancel_order_by_id(order_id)
+
+    client = _SlowCancelClient(
+        positions=[_FakePosition("AAPL", 10)],
+        orders=[_FakeOrder("sl", "AAPL", "sell", order_type="stop", qty=10, stop_price=95.0)],
+    )
+    adapter = _adapter(client)
+    (stop,) = asyncio.run(adapter.list_protective_stops())
+
+    async def scenario() -> BaseException | None:
+        flatten = asyncio.create_task(adapter.close_all_positions())
+        assert await asyncio.to_thread(client.cancel_started.wait, 5)
+        amend = asyncio.create_task(adapter.amend_protective_stop(stop, 96.0))
+        await asyncio.sleep(0.05)
+        replace_calls_while_flattening = list(client.replace_calls)
+        client.release_cancel.set()
+        outcome = await flatten
+        assert outcome.failed == ()
+        assert replace_calls_while_flattening == []
+        try:
+            await amend
+        except Exception as exc:  # the stop it was asked to move is gone
+            return exc
+        return None
+
+    error = asyncio.run(scenario())
+
+    assert isinstance(error, RuntimeError)
+    assert client.positions == []
+    assert client.orders == []
+    assert client.submitted == []
+
+
 # ── daemon wiring ────────────────────────────────────────────────────────────
 
 

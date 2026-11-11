@@ -48,7 +48,9 @@ not declare the `supports_stop_amendment` capability. Unknown brokers get `none`
   to 5 min).
 - Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
   previous stop keeps working until the replacement is accepted and stays if it is refused; the
-  stop is never cancelled in order to move it.
+  stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
+  flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
+  flatten never misses a stop that was replaced under it.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry

@@ -504,6 +504,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # NEW stream — a silent mute after disconnect/reconnect).
         self._subscribed_stream: Any | None = None
         self._connected = False
+        # #167: serialises stop amendments with the sweeps that cancel orders
+        # (see `_order_book_lock`). Bound to the loop that first uses it.
+        self._order_book_lock_state: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1151,6 +1154,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable after connect.")
         return client
 
+    def _order_book_lock(self) -> asyncio.Lock:
+        """Lock held while this adapter replaces or cancels protective orders (#167).
+
+        A trailing-stop replace gives the stop a new order id. Without the lock it could land
+        between a sweep's order listing and its cancels: the sweep would then try to cancel the
+        replaced id and miss the new one, which could survive a flatten as an orphaned stop
+        (an orphaned sell stop opens a short). Holding one lock for the replace and for every
+        sweep makes each sweep see either the old stop or the new one, never a half-state.
+        """
+        loop = asyncio.get_running_loop()
+        state = getattr(self, "_order_book_lock_state", None)
+        if state is None or state[0] is not loop:
+            state = (loop, asyncio.Lock())
+            self._order_book_lock_state = state
+        return state[1]
+
     async def _list_open_orders(self, client: Any) -> list[Any]:
         """Every working order, or a hard failure - never a silent empty list."""
         get_orders = getattr(client, "get_orders", None)
@@ -1230,6 +1249,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         await asyncio.to_thread(cancel, order_id)
 
     async def cancel_open_orders(self) -> ControlOutcome:
+        """Cancel exposure-opening orders; see :meth:`_cancel_open_orders_locked`."""
+        async with self._order_book_lock():
+            return await self._cancel_open_orders_locked()
+
+    async def _cancel_open_orders_locked(self) -> ControlOutcome:
         """Cancel working orders that could open or extend exposure.
 
         SL/TP legs on a live position are deliberately left alone: the flatten
@@ -1449,6 +1473,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return reason
 
     async def _flatten_symbol(self, client: Any, symbol: str, qty: float) -> str | None:
+        """Flatten one symbol; see :meth:`_flatten_symbol_locked`."""
+        async with self._order_book_lock():
+            return await self._flatten_symbol_locked(client, symbol, qty)
+
+    async def _flatten_symbol_locked(
+        self, client: Any, symbol: str, qty: float
+    ) -> str | None:
         """Cancel this symbol's working orders, then close its position.
 
         Returns ``None`` on success, or a short reason for the failure.
@@ -1583,6 +1614,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
 
     async def cancel_orphaned_protections(self) -> ControlOutcome:
+        """Cancel orders on flat symbols; see :meth:`_cancel_orphaned_protections_locked`."""
+        async with self._order_book_lock():
+            return await self._cancel_orphaned_protections_locked()
+
+    async def _cancel_orphaned_protections_locked(self) -> ControlOutcome:
         """Cancel working orders left on symbols with no open position.
 
         Called after a successful flatten, when every symbol is flat: what
@@ -1624,7 +1660,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     # Alpaca's order replace (PATCH /v2/orders/{id}) is atomic from the position's point of
     # view: the original order keeps working until the replacement is accepted, and stays in
     # force when the replace is refused. That is what makes the capability safe to declare -
-    # the stop is never cancelled by this adapter in order to move it.
+    # the stop is never cancelled by this adapter in order to move it. The replace holds
+    # `_order_book_lock`, like every sweep that cancels orders, so a flatten never races it.
 
     @property
     def supports_stop_amendment(self) -> bool:
@@ -1687,9 +1724,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         replace = getattr(client, "replace_order_by_id", None)
         if not callable(replace):
             raise RuntimeError("Alpaca client cannot replace an order by id")
-        replaced = await asyncio.to_thread(
-            replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
-        )
+        async with self._order_book_lock():
+            replaced = await asyncio.to_thread(
+                replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
+            )
         new_order_id = _control_order_id(_order_attr(replaced, "id"))
         confirmed_price = _to_float(_order_attr(replaced, "stop_price", None), default=0.0)
         if new_order_id is None or not math.isclose(
