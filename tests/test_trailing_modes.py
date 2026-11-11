@@ -440,3 +440,55 @@ def test_order_preparation_lets_percent_through_on_a_trailing_adapter(monkeypatc
     with pytest.raises(RuntimeError, match="stop after the gate"):
         asyncio.run(daemon.prepare_order_with_risk(_ALPACA_LIKE, _deployment(), signal))
     assert reached.sizing
+
+
+# ── #168: a complete supertrend_flip config is still refused live ────────────
+
+_FULL_FLIP_CONFIG = {
+    "mode": "supertrend_flip",
+    "breakeven_after_tp1": True,
+    "activation_phase": "wait_for_first_green_after_tp1",
+    "exit_phase": "exit_on_first_red_after_activation",
+    "supertrend_period": 10,
+    "supertrend_multiplier": 3.0,
+}
+
+
+@pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE, None])
+def test_live_signal_with_a_complete_supertrend_flip_config_is_refused(
+    monkeypatch, adapter
+) -> None:
+    """Replay executes supertrend_flip (#168); live refuses it on every broker
+    even when the config is complete — the refusal is about the mode."""
+    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+        _process(monkeypatch, _FULL_FLIP_CONFIG, adapter)
+
+
+@pytest.mark.parametrize("adapter", [_ALPACA_LIKE, _CTRADER_LIKE])
+def test_order_preparation_refuses_a_complete_supertrend_flip_config(
+    monkeypatch, adapter
+) -> None:
+    async def _exposure(adapter, deployment):
+        raise AssertionError("sizing was reached past the trailing gate")
+
+    monkeypatch.setattr(daemon, "_broker_exposure_estimate", _exposure)
+    signal = _live_signal(
+        {
+            "trailing_sl_config": _FULL_FLIP_CONFIG,
+            "stop_loss": 95.0,
+            "tp1_price": 110.0,
+            "tp1_exit_percent": 0.5,
+        }
+    )
+    with pytest.raises(ValueError, match="'supertrend_flip' is not supported"):
+        asyncio.run(daemon.prepare_order_with_risk(adapter, _deployment(), signal))
+
+
+@pytest.mark.parametrize("broker", ["alpaca", "ctrader", None, "ibkr"])
+def test_deployment_override_supertrend_flip_is_refused_per_broker(broker) -> None:
+    with pytest.raises(ValueError, match="supertrend_flip"):
+        validate_live_deployment_trailing_override(
+            {"signal_processor_config": {"trailing_mode": "supertrend_flip"}},
+            context="test",
+            broker=broker,
+        )

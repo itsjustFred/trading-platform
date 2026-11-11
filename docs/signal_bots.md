@@ -46,12 +46,30 @@ pro Bot.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
     nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
-  - **Unterstützt:** Replay-Backtest `none`, `percent`. Live je Broker: Alpaca `none`, `percent`;
+  - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
     nachgezogen und der Stop beim Broker ersetzt; Details und Betriebsgrenzen in
-    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` ist bekannt, aber
-    bis #168 nirgends ausführbar.
+    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` wird live auf keinem
+    Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
+  - **`supertrend_flip` im Replay (#168):**
+    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`.
+    2. Danach Stop auf Einstand (Entry-Preis), wenn `breakeven_after_tp1`; wirksam ab der Kerze
+       nach der TP1-Kerze.
+    3. Aktivierung: erste geschlossene Kerze ab der TP1-Kerze (inklusive), deren Supertrend
+       bereit und grün ist. "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
+    4. Ausstieg: erste bereite rote Kerze nach der Aktivierung; der Rest wird zum OPEN der
+       folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
+       Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
+       geschlossen (`end_of_data`).
+    - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
+      `resolve_same_bar_exit`); dann gibt es kein TP1.
+    - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
+      `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
+      Kerzen.
+    - Ein Trade mit mehreren Exits (`tp1`, dann `supertrend_flip`/`breakeven_stop`/`stop_loss`/
+      `end_of_data`); Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
+      Parameter brechen den Lauf ab (keine erfundenen Defaults). Nur Long-Einstiege.
   - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 

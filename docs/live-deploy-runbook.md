@@ -19,11 +19,37 @@ Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROK
 
 | Broker  | `none` | `percent` | `supertrend_flip` |
 |---------|--------|-----------|-------------------|
-| Alpaca  | yes    | yes       | no (#168)         |
-| cTrader | yes    | no        | no (#168)         |
+| Alpaca  | yes    | yes       | no (see below)    |
+| cTrader | yes    | no        | no                |
 
 cTrader stays on `none`: the daemon has no cTrader market data to trail on, and the adapter does
 not declare the `supports_stop_amendment` capability. Unknown brokers get `none` only.
+
+**Why `supertrend_flip` is not live yet (#168)**
+
+The replay backtest executes it (`runner/engines/signal_replay_adapter.py`); live rejects it on
+every broker, at deployment validation and at signal time like any other unsupported mode. The
+blocker is the entry order, not the trailing loop:
+
+- The Alpaca entry is a BRACKET for the full quantity. Its take-profit leg sits at the signal's
+  `take_profit`, which for RamJet *is* the TP1 price, so a `supertrend_flip` entry would close
+  100 % at TP1 instead of `tp1_exit_percent`.
+- Alpaca reserves the quantity of every working reducing-side order. While the bracket's stop
+  leg holds the full quantity, no separate TP1 limit (or partial market) order for part of it
+  is accepted, and shrinking the stop first would leave the TP1 part without a stop.
+
+Proposed design for the follow-up: for `supertrend_flip` entries, submit the position as two
+orders with deterministic client order ids derived from the signal id: a BRACKET for the TP1
+tranche (take profit at TP1, stop at the initial stop) and an OTO for the remainder (stop only).
+Tranche quantities must be whole shares (Alpaca brackets refuse fractional quantities) and the
+rounding must be mirrored by the replay. The trailing loop then (a) detects TP1 as the tranche
+bracket's take-profit fill and amends the remainder's stop to breakeven with the existing
+replace, (b) evaluates the RamJet Supertrend on each closed bar, with enough history to match the
+replay's warm-up, and (c) on the first red bar after activation closes the remainder through the
+adapter's locked flatten path (cancel, close, restore the stop on failure), so no stop is left
+orphaned. The only state that is not derivable from the broker is "activated"; it would be
+persisted on the entry signal row (`live_signals.metadata`). This changes order submission,
+recovery and fill reconciliation, which today assume one broker order per signal.
 
 **Where an unsupported mode is rejected**
 

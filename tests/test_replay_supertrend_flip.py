@@ -262,9 +262,8 @@ def test_supertrend_is_ignored_before_tp1(monkeypatch) -> None:
 
 def test_no_activation_while_not_ready_or_red_then_exit_after_first_red(monkeypatch) -> None:
     # bars:   0 entry, 1 TP1, 2 n, 3 r, 4 n, 5 g (activates), 6 g, 7 r (flip), 8 fill
-    frame = _frame(
-        [ENTRY_BAR, TP1_BAR, _flat(), _flat(), _flat(), _flat(), _flat(), _flat(), (104.0, 105.0, 101.0, 101.5)]
-    )
+    fill_bar = (104.0, 105.0, 101.0, 101.5)
+    frame = _frame([ENTRY_BAR, TP1_BAR, *[_flat()] * 6, fill_bar])
     _stub_supertrend(monkeypatch, "nnnrnggrg")
     trade = _run(frame).trades[0]
 
@@ -477,15 +476,19 @@ def test_remainder_after_tp1_carries_no_stop_risk_at_breakeven(monkeypatch) -> N
 # ── validation (fail closed, no invented defaults) ───────────────────────────
 
 
+def _without(key: str) -> dict:
+    return {name: value for name, value in FLIP_CONFIG.items() if name != key}
+
+
 @pytest.mark.parametrize(
     ("trailing", "metadata", "match"),
     [
-        ({k: v for k, v in FLIP_CONFIG.items() if k != "supertrend_period"}, {}, "supertrend_period"),
+        (_without("supertrend_period"), {}, "supertrend_period"),
         ({**FLIP_CONFIG, "supertrend_period": 0}, {}, "supertrend_period"),
         ({**FLIP_CONFIG, "supertrend_period": 2.5}, {}, "supertrend_period"),
-        ({k: v for k, v in FLIP_CONFIG.items() if k != "supertrend_multiplier"}, {}, "supertrend_multiplier"),
+        (_without("supertrend_multiplier"), {}, "supertrend_multiplier"),
         ({**FLIP_CONFIG, "supertrend_multiplier": -1.0}, {}, "supertrend_multiplier"),
-        ({k: v for k, v in FLIP_CONFIG.items() if k != "breakeven_after_tp1"}, {}, "breakeven_after_tp1"),
+        (_without("breakeven_after_tp1"), {}, "breakeven_after_tp1"),
         ({**FLIP_CONFIG, "breakeven_after_tp1": "yes"}, {}, "breakeven_after_tp1"),
         ({**FLIP_CONFIG, "exit_phase": "exit_on_close_below_ema"}, {}, "exit_phase"),
         ({**FLIP_CONFIG, "activation_phase": "immediately"}, {}, "activation_phase"),

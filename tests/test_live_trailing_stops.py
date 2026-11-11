@@ -29,7 +29,10 @@ from live_runner.trailing_stops import (
 from risk.config import RiskConfig
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
-from shared.trailing import LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER
+from shared.trailing import (
+    LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER,
+    live_supported_trailing_modes,
+)
 from tests.test_alpaca_adapter import (
     _adapter,
     _FakeOrder,
@@ -848,3 +851,44 @@ def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:
     assert qty > 0
     assert prepared.metadata["trailing_sl_config"] == trailing_cfg
     assert prepared.metadata["stop_loss"] == 98.0
+
+
+# ── supertrend_flip stays refused live (#168) ────────────────────────────────
+
+_FULL_FLIP_CONFIG = {
+    "mode": "supertrend_flip",
+    "breakeven_after_tp1": True,
+    "activation_phase": "wait_for_first_green_after_tp1",
+    "exit_phase": "exit_on_first_red_after_activation",
+    "supertrend_period": 10,
+    "supertrend_multiplier": 3.0,
+}
+
+
+def test_no_live_broker_executes_supertrend_flip() -> None:
+    """Replay executes supertrend_flip; live does not, on any broker, because
+    the full-quantity entry bracket would close everything at TP1."""
+    for broker in ("alpaca", "ctrader", "unknown", None):
+        assert "supertrend_flip" not in live_supported_trailing_modes(broker)
+
+
+def test_persisted_supertrend_flip_entry_is_surfaced_and_never_amended(
+    live: _Live, surfaced
+) -> None:
+    """A fully parameterised supertrend_flip entry that reached the database
+    anyway is reported on every pass and its stop is left alone."""
+    manager = LiveTrailingStopManager()
+    live.add_signal(
+        "buy",
+        _FULL_FLIP_CONFIG,
+        at=T0 + timedelta(seconds=1),
+        extra={"tp1_price": 110.0, "tp1_exit_percent": 0.5},
+    )
+
+    live.feed(manager, [103.0, 108.0])
+
+    assert live.client.replace_calls == []
+    assert live.client.cancelled == []
+    assert live.client.stop_prices() == [98.0]
+    assert surfaced, "the unsupported persisted mode must be surfaced"
+    assert all("supertrend_flip" in event[1]["error"] for event in surfaced)
