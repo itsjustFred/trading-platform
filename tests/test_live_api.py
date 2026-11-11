@@ -244,6 +244,16 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": account_id, "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",
@@ -438,6 +448,16 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "ct-1", "broker": "ctrader", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_accounts",
@@ -2780,6 +2800,16 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "acc-1", "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",

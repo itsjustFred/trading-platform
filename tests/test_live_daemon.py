@@ -840,6 +840,10 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
 
 
 class _SignalSubmittingAdapter:
+    # A double has to prove it is a demo account (`_adapter_is_demo`); without
+    # the flag it is real money and the promotion gate (#165) refuses entries.
+    demo = True
+
     def __init__(self) -> None:
         self.submitted: list[object] = []
 

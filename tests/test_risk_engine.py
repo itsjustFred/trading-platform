@@ -497,6 +497,9 @@ def test_risk_decision_rejects_malformed_wire_values():
 @dataclass(slots=True)
 class _DummyAdapter(BaseLiveAdapter):
     submitted_signal: LiveSignal | None = None
+    # A double has to prove it is a demo account (`_adapter_is_demo`); without
+    # the flag it is real money and the promotion gate (#165) refuses entries.
+    demo: bool = True
 
     async def connect(self) -> None:
         return None

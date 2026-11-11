@@ -536,6 +536,10 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -604,6 +608,10 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -667,6 +675,10 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -4112,6 +4124,10 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
