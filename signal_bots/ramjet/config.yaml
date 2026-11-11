@@ -13,9 +13,17 @@ ram_jet:
   tp1_multiplier: 3.0
   tp1_exit_percent: 0.50
 
-  # Supertrend (trailing stop after TP1)
+  # Supertrend (entry-bar context metadata; trailing workflow pending #168)
   supertrend_period: 10
   supertrend_multiplier: 3.0
+
+  # Trailing stop mode (issue #150): none | percent | supertrend_flip.
+  # Default 'none' = initial ATR stop only, deliberately: the live path does
+  # not trail yet (#167) and the Supertrend-flip workflow is not implemented
+  # yet (#168). Unsupported modes are REJECTED at validation and signal time,
+  # never traded without their trailing. 'percent' additionally requires
+  # trailing_percent in (0, 1).
+  trailing_mode: "none"
 
   # Timing
   candle_timeframe: "5Min"

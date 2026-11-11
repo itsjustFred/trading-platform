@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 from risk.config import RiskConfig
 from risk.models import RiskDecision, SizedOrder, TradeSignal
+from shared.trailing import (
+    RISK_ENGINE_SUPPORTED_TRAILING_MODES,
+    TRAILING_MODE_NONE,
+    validate_trailing_sl_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -400,21 +405,23 @@ class RiskEngine:
         if price <= 0:
             raise ValueError("market_price must be > 0")
 
-        trailing_cfg = signal.metadata.get("trailing_sl_config")
-        if not isinstance(trailing_cfg, dict):
+        # #150 fail closed: an unknown mode, a malformed config, or a mode the
+        # engine cannot execute (e.g. supertrend_flip until #168) raises — the
+        # old warned no-op traded signals without the trailing they requested.
+        # Executing paths must gate their own supported set BEFORE calling this
+        # (replay: shared.trailing.REPLAY_SUPPORTED_TRAILING_MODES) so the
+        # signal is refused instead of traded untrailed; this check is the
+        # engine's own last line of defence.
+        mode = validate_trailing_sl_config(
+            signal.metadata.get("trailing_sl_config"),
+            supported=RISK_ENGINE_SUPPORTED_TRAILING_MODES,
+            context=f"risk engine trailing for {signal.symbol}",
+        )
+        if mode is None or mode == TRAILING_MODE_NONE:
+            # No trailing requested, or explicit "initial stop only".
             return signal.stop_loss
 
-        mode = str(trailing_cfg.get("mode") or "").strip().lower()
-        if mode != "percent":
-            # C1: unsupported trailing modes (e.g. supertrend_flip) are an
-            # explicit warned no-op — never a silent one.
-            logger.warning(
-                "Unsupported trailing stop mode %r; leaving stop unchanged",
-                mode,
-                extra={"data": {"symbol": signal.symbol, "mode": mode}},
-            )
-            return signal.stop_loss
-
+        trailing_cfg = signal.metadata["trailing_sl_config"]
         percent = float(trailing_cfg.get("percent") or 0.0)
         if percent <= 0 or percent >= 1:
             raise ValueError("trailing_sl_config.percent must be between 0 and 1")
