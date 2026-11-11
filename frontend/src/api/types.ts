@@ -1043,12 +1043,46 @@ export interface MatrixGridOverview {
 
 export interface MaintenanceDeleteItem {
   id: string;
-  status: "deleted" | "not_found" | "failed" | "cleanup_pending";
+  status: "deleted" | "not_found" | "failed" | "cleanup_pending" | "skipped";
   database: string;
   artifact: string;
   error?: string;
   journal_pending?: boolean;
+  /** Set on `skipped` items of a two-phase bulk delete: why the confirmed id
+   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `not_found`). */
+  reason?: string;
 }
+
+/** Display info of one backtest a two-phase bulk delete would remove. */
+export interface BacktestBulkDeleteCandidate {
+  id: string;
+  display_name: string;
+  strategy_name: string;
+  symbols: string[];
+  timeframe: string;
+  trade_count: number;
+  created_at: string;
+}
+
+/** Display info of one portfolio a two-phase bulk delete would remove. */
+export interface PortfolioBulkDeleteCandidate {
+  id: string;
+  name: string;
+  component_count: number;
+  created_at: string;
+}
+
+/** Fields every deduplicate dry-run candidate carries on top of its display info. */
+export interface DuplicateCandidateInfo {
+  status: "candidate";
+  fingerprint: string;
+  kept_id: string;
+  is_kept: boolean;
+}
+
+/** Request body of the two-phase bulk-delete endpoints. */
+export type BulkDeleteDryRunRequest = { dry_run: true };
+export type BulkDeleteConfirmRequest = { dry_run: false; ids: string[] };
 
 export interface BacktestsBulkDeleteResponse {
   deleted: number;
@@ -1056,14 +1090,8 @@ export interface BacktestsBulkDeleteResponse {
 }
 
 export interface BacktestsRemoveEmptyDryRunResponse {
-    id: string;
-    display_name: string;
-    strategy_name: string;
-    symbols: string[];
-    timeframe: string;
-    trade_count: number;
-    created_at: string;
-  }>;
+  dry_run: true;
+  candidates: BacktestBulkDeleteCandidate[];
   candidate_ids: string[];
 }
 
@@ -1074,7 +1102,6 @@ export interface BacktestsRemoveEmptyConfirmResponse {
   failed: number;
   removed_ids: string[];
   items: MaintenanceDeleteItem[];
-  remaining: number;
 }
 
 export type BacktestsRemoveEmptyResponse =
@@ -1113,12 +1140,7 @@ export interface BacktestsDeduplicateDryRunResponse {
   candidate_ids: string[];
   skipped_ids: string[];
   groups_affected: number;
-  items: Array<MaintenanceDeleteItem & {
-    status: "candidate";
-    fingerprint: string;
-    kept_id: string;
-    is_kept: boolean;
-  }>;
+  items: Array<BacktestBulkDeleteCandidate & DuplicateCandidateInfo>;
 }
 
 export interface BacktestsDeduplicateConfirmResponse {
@@ -1160,12 +1182,7 @@ export interface PortfoliosDeduplicateDryRunResponse {
   candidate_ids: string[];
   skipped_ids: string[];
   groups_affected: number;
-  items: Array<MaintenanceDeleteItem & {
-    status: "candidate";
-    fingerprint: string;
-    kept_id: string;
-    is_kept: boolean;
-  }>;
+  items: Array<PortfolioBulkDeleteCandidate & DuplicateCandidateInfo>;
 }
 
 export interface PortfoliosDeduplicateConfirmResponse {
@@ -1184,12 +1201,7 @@ export type PortfoliosDeduplicateResponse =
 
 export interface PortfoliosRemoveEmptyDryRunResponse {
   dry_run: true;
-  candidates: Array<{
-    id: string;
-    name: string;
-    component_count: number;
-    created_at: string;
-  }>;
+  candidates: PortfolioBulkDeleteCandidate[];
   candidate_ids: string[];
 }
 

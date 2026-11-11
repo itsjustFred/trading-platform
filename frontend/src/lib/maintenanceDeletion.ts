@@ -49,10 +49,14 @@ export function formatMaintenanceDeletionResult(
   let failed = 0;
   let cleanupPending = 0;
   let notFound = 0;
+  let skipped = 0;
 
   for (const item of items) {
     if (item.status === "failed") failed += 1;
     else if (item.status === "not_found") notFound += 1;
+    // A confirmed id that no longer met the deletion criterion: left alone on
+    // purpose, so it is reported but is not a failure.
+    else if (item.status === "skipped") skipped += 1;
     else if (item.status === "cleanup_pending") cleanupPending += 1;
     else if (item.status !== "deleted") failed += 1;
 
@@ -69,6 +73,7 @@ export function formatMaintenanceDeletionResult(
   if (failed > 0) issues.push(`${failed} failed`);
   if (cleanupPending > 0) issues.push(`${cleanupPending} pending cleanup`);
   if (notFound > 0) issues.push(`${notFound} not found`);
+  if (skipped > 0) issues.push(`${skipped} skipped (no longer eligible)`);
 
   if (issues.length === 0) {
     if (successful === 0) {

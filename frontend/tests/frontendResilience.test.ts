@@ -146,13 +146,59 @@ test("batch maintenance pages use item-aware result notices", async () => {
   assert.match(portfoliosPage, /applyMaintenanceResult\(payload\.items\)/);
 });
 
-test("portfolio remove-empty requires confirmation before calling the API", async () => {
-  const source = await read("../src/pages/PortfoliosPage.tsx");
-  const start = source.indexOf("const handleRemoveEmpty");
-  const end = source.indexOf("const inputStyle", start);
-  assert.ok(start >= 0 && end > start);
-  assert.match(source.slice(start, end), /window\.confirm\(/);
-  assert.match(source.slice(start, end), /if \(!confirmed\) return;/);
+test("bulk maintenance deletes are two-phase: dry run first, delete only confirmed ids", async () => {
+  // Issue #156: the server selects the items, so the user must see the exact
+  // list before anything is deleted. The first handler may only ask for a dry
+  // run; the delete call lives in the confirm handler and sends the ids of
+  // the list that was shown.
+  const [backtestsPage, portfoliosPage] = await Promise.all([
+    read("../src/pages/BacktestsPage.tsx"),
+    read("../src/pages/PortfoliosPage.tsx"),
+  ]);
+  const cases = [
+    [backtestsPage, "handleDeduplicate", "deduplicateBacktests"],
+    [backtestsPage, "handleRemoveEmpty", "removeEmptyBacktests"],
+    [portfoliosPage, "handleDeduplicate", "deduplicatePortfolios"],
+    [portfoliosPage, "handleRemoveEmpty", "removeEmptyPortfolios"],
+  ] as const;
+  for (const [source, handler, apiCall] of cases) {
+    const start = source.indexOf(`const ${handler} = `);
+    const confirmStart = source.indexOf(`const ${handler}Confirm = `);
+    const cancelStart = source.indexOf(`const ${handler}Cancel = `);
+    assert.ok(
+      start >= 0 && confirmStart > start && cancelStart > confirmStart,
+      `${handler}, ${handler}Confirm and ${handler}Cancel must exist in this order`,
+    );
+    const preview = source.slice(start, confirmStart);
+    const confirm = source.slice(confirmStart, cancelStart);
+    assert.match(preview, new RegExp(`${apiCall}\\(\\{ dry_run: true \\}\\)`));
+    assert.doesNotMatch(preview, /dry_run: false/, `${handler} must not delete`);
+    assert.match(
+      confirm,
+      new RegExp(`${apiCall}\\(\\{ dry_run: false, ids: candidateIds \\}\\)`),
+    );
+    assert.match(confirm, /candidate_ids/, `${handler}Confirm must send the shown list`);
+  }
+});
+
+test("a skipped bulk-delete item is reported, not counted as a failure", async () => {
+  const { formatMaintenanceDeletionResult } = await import(
+    "../src/lib/maintenanceDeletion.ts"
+  );
+  const notice = formatMaintenanceDeletionResult("empty backtest(s)", 1, [
+    { id: "a", status: "deleted", database: "deleted", artifact: "deleted" },
+    {
+      id: "b",
+      status: "skipped",
+      database: "not_attempted",
+      artifact: "not_attempted",
+      reason: "no_longer_empty",
+    },
+  ]);
+  assert.equal(notice.tone, "warning");
+  assert.match(notice.message, /Deleted 1 empty backtest\(s\)/);
+  assert.match(notice.message, /1 skipped/);
+  assert.doesNotMatch(notice.message, /failed/);
 });
 
 test("manual-required, partial, skipped, and cleanup statuses are terminal, not active", () => {
