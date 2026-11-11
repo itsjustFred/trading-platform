@@ -12,6 +12,7 @@ from runner.optimization_diagnostics import (
     multiple_testing_correction,
     plateau_analysis,
     realized_pnl_by_subperiod,
+    select_by_validation,
     subperiod_parameter_stability,
     subperiods_from_walk_forward,
     three_way_split,
@@ -1310,3 +1311,107 @@ def test_walk_forward_train_validation_folds_error_cases():
         walk_forward_train_validation_folds(
             "2024-01-01", "2024-01-11", test_fraction=0.9, embargo_pct=0.5
         )
+
+
+# ─── select_by_validation (Issue #164) ────────────────────────────────────────
+
+
+def test_select_by_validation_ranks_by_score_descending():
+    """Trials ranked by validation score descending."""
+    trials = [
+        {"number": 1, "validation_score": 0.5},
+        {"number": 2, "validation_score": 1.0},
+        {"number": 3, "validation_score": 0.8},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert [t["validation_score"] for t in result["ranked"]] == [1.0, 0.8, 0.5]
+    assert result["winner"]["validation_score"] == 1.0
+
+
+def test_select_by_validation_tie_break_by_trial_number():
+    """Equal scores ordered by lower trial number first."""
+    trials = [
+        {"number": 3, "validation_score": 1.0},
+        {"number": 1, "validation_score": 1.0},
+        {"number": 2, "validation_score": 1.0},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert [t["number"] for t in result["ranked"]] == [1, 2, 3]
+    assert result["winner"]["number"] == 1
+
+
+def test_select_by_validation_excludes_non_finite_scores():
+    """NaN, inf, None scores are excluded."""
+    trials = [
+        {"number": 1, "validation_score": 1.0},
+        {"number": 2, "validation_score": float("nan")},
+        {"number": 3, "validation_score": float("inf")},
+        {"number": 4, "validation_score": -float("inf")},
+        {"number": 5, "validation_score": None},
+        {"number": 6, "validation_score": "not-a-number"},
+    ]
+    result = select_by_validation(trials, top_fraction=1.0)
+    assert len(result["ranked"]) == 1
+    assert result["ranked"][0]["number"] == 1
+
+
+def test_select_by_validation_top_fraction():
+    """Top fraction determines size of top_set."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(10)]
+    result = select_by_validation(trials, top_fraction=0.3)
+    # 10 * 0.3 = 3, ceil = 3
+    assert len(result["top_set"]) == 3
+    assert result["top_set"][0]["number"] == 9
+    assert result["top_set"][2]["number"] == 7
+
+
+def test_select_by_validation_top_fraction_at_least_one():
+    """Top set has at least 1 trial even for small fractions."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(10)]
+    result = select_by_validation(trials, top_fraction=0.05)
+    # 10 * 0.05 = 0.5, ceil = 1
+    assert len(result["top_set"]) == 1
+
+
+def test_select_by_validation_all_missing_scores():
+    """All scores missing -> winner None, empty top_set."""
+    trials = [
+        {"number": 1, "validation_score": None},
+        {"number": 2, "validation_score": float("nan")},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert result["ranked"] == []
+    assert result["winner"] is None
+    assert result["top_set"] == []
+
+
+def test_select_by_validation_n_equals_one():
+    """Single trial works correctly."""
+    trials = [{"number": 1, "validation_score": 0.5}]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert result["winner"]["number"] == 1
+    assert len(result["top_set"]) == 1
+    assert result["top_set"][0]["number"] == 1
+
+
+def test_select_by_validation_custom_keys():
+    """Custom score and trial number keys work."""
+    trials = [
+        {"trial_id": 10, "val_metric": 0.5},
+        {"trial_id": 20, "val_metric": 1.0},
+    ]
+    result = select_by_validation(
+        trials, top_fraction=0.5, score_key="val_metric", trial_number_key="trial_id"
+    )
+    assert result["winner"]["trial_id"] == 20
+
+
+def test_select_by_validation_rejects_invalid_top_fraction():
+    """top_fraction must be in (0, 1]."""
+    trials = [{"number": 1, "validation_score": 1.0}]
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=0.0)
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=1.5)
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=-0.1)

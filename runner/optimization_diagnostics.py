@@ -43,6 +43,7 @@ __all__ = [
     "three_way_split",
     "walk_forward_splits",
     "walk_forward_train_validation_folds",
+    "select_by_validation",
     "plateau_analysis",
     "multiple_testing_correction",
     "subperiods_from_walk_forward",
@@ -312,6 +313,63 @@ def walk_forward_train_validation_folds(
         holding_bars=holding_bars,
     )
     return folds
+
+
+def select_by_validation(
+    trials: Sequence[Mapping[str, Any]],
+    *,
+    top_fraction: float,
+    score_key: str = "validation_score",
+    trial_number_key: str = "number",
+) -> dict[str, Any]:
+    """Select top trials by validation score.
+
+    Each trial must have a trial number (``trial_number_key``) and a validation
+    score (``score_key``). Trials without a finite validation score are excluded.
+    Higher scores are better.
+
+    Returns a dict with:
+    - ``ranked``: all trials with finite scores, sorted by score descending,
+      then by trial number ascending (deterministic tie-break).
+    - ``winner``: the top-ranked trial (rank 1), or None if no valid trials.
+    - ``top_set``: the top ``max(1, ceil(top_fraction * n_ranked))`` trials.
+
+    Deterministic tie-break: equal scores are ordered by lower trial number first.
+    """
+    if not 0.0 < top_fraction <= 1.0:
+        raise ValueError("top_fraction must be in (0, 1]")
+
+    valid_trials = []
+    for trial in trials:
+        score = trial.get(score_key)
+        number = trial.get(trial_number_key)
+        if score is None or number is None:
+            continue
+        try:
+            score_float = float(score)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score_float):
+            continue
+        try:
+            number_int = int(number)
+        except (TypeError, ValueError):
+            continue
+        valid_trials.append((score_float, number_int, trial))
+
+    # Sort by score descending, then by trial number ascending (tie-break)
+    valid_trials.sort(key=lambda x: (-x[0], x[1]))
+    ranked = [t for _, _, t in valid_trials]
+
+    if not ranked:
+        return {"ranked": [], "winner": None, "top_set": []}
+
+    winner = ranked[0]
+    n_ranked = len(ranked)
+    top_k = max(1, math.ceil(top_fraction * n_ranked))
+    top_set = ranked[:top_k]
+
+    return {"ranked": ranked, "winner": winner, "top_set": top_set}
 
 
 def walk_forward_splits(
