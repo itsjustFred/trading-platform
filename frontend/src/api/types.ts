@@ -1055,10 +1055,31 @@ export interface BacktestsBulkDeleteResponse {
   items: MaintenanceDeleteItem[];
 }
 
-export interface BacktestsRemoveEmptyResponse {
-  removed: number;
-  items: MaintenanceDeleteItem[];
+export interface BacktestsRemoveEmptyDryRunResponse {
+    id: string;
+    display_name: string;
+    strategy_name: string;
+    symbols: string[];
+    timeframe: string;
+    trade_count: number;
+    created_at: string;
+  }>;
+  candidate_ids: string[];
 }
+
+export interface BacktestsRemoveEmptyConfirmResponse {
+  dry_run: false;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  removed_ids: string[];
+  items: MaintenanceDeleteItem[];
+  remaining: number;
+}
+
+export type BacktestsRemoveEmptyResponse =
+  | BacktestsRemoveEmptyDryRunResponse
+  | BacktestsRemoveEmptyConfirmResponse;
 
 export interface PortfoliosBulkDeleteResponse {
   deleted: number;
@@ -1085,12 +1106,34 @@ export interface BacktestsDuplicatesResponse {
   total_backtests: number;
 }
 
-export interface BacktestsDeduplicateResponse {
+export interface BacktestsDeduplicateDryRunResponse {
+  dry_run: true;
   deleted_ids: string[];
   kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
+  groups_affected: number;
+  items: Array<MaintenanceDeleteItem & {
+    status: "candidate";
+    fingerprint: string;
+    kept_id: string;
+    is_kept: boolean;
+  }>;
+}
+
+export interface BacktestsDeduplicateConfirmResponse {
+  dry_run: false;
+  deleted_ids: string[];
+  kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
   groups_affected: number;
   items: MaintenanceDeleteItem[];
 }
+
+export type BacktestsDeduplicateResponse =
+  | BacktestsDeduplicateDryRunResponse
+  | BacktestsDeduplicateConfirmResponse;
 
 export interface PortfolioDuplicateGroup {
   fingerprint: string;
@@ -1110,19 +1153,59 @@ export interface PortfoliosDuplicatesResponse {
   total_portfolios: number;
 }
 
-export interface PortfoliosDeduplicateResponse {
+export interface PortfoliosDeduplicateDryRunResponse {
+  dry_run: true;
   deleted_ids: string[];
   kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
+  groups_affected: number;
+  items: Array<MaintenanceDeleteItem & {
+    status: "candidate";
+    fingerprint: string;
+    kept_id: string;
+    is_kept: boolean;
+  }>;
+}
+
+export interface PortfoliosDeduplicateConfirmResponse {
+  dry_run: false;
+  deleted_ids: string[];
+  kept_ids: string[];
+  candidate_ids: string[];
+  skipped_ids: string[];
   groups_affected: number;
   items: MaintenanceDeleteItem[];
 }
 
-export interface PortfoliosRemoveEmptyResponse {
-  removed: number;
-  remaining: number;
+export type PortfoliosDeduplicateResponse =
+  | PortfoliosDeduplicateDryRunResponse
+  | PortfoliosDeduplicateConfirmResponse;
+
+export interface PortfoliosRemoveEmptyDryRunResponse {
+  dry_run: true;
+  candidates: Array<{
+    id: string;
+    name: string;
+    component_count: number;
+    created_at: string;
+  }>;
+  candidate_ids: string[];
+}
+
+export interface PortfoliosRemoveEmptyConfirmResponse {
+  dry_run: false;
+  deleted: number;
+  skipped: number;
+  failed: number;
   removed_ids: string[];
   items: MaintenanceDeleteItem[];
+  remaining: number;
 }
+
+export type PortfoliosRemoveEmptyResponse =
+  | PortfoliosRemoveEmptyDryRunResponse
+  | PortfoliosRemoveEmptyConfirmResponse;
 
 export interface TradeDetail extends Trade {
   ohlcv: OHLCVBar[];
@@ -1136,9 +1219,7 @@ export interface ChartMarkerDrawing {
   color?: string;
   text?: string;
   symbol?: string;
-}
-
-export interface ChartLineDrawing {
+}export interface ChartLineDrawing {
   type: "line";
   start_time: number;
   end_time: number;
