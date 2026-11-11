@@ -13,16 +13,17 @@ ram_jet:
   tp1_multiplier: 3.0
   tp1_exit_percent: 0.50
 
-  # Supertrend (entry-bar context metadata; trailing workflow pending #168)
+  # Supertrend (entry-bar context metadata; also the supertrend_flip trailing parameters)
   supertrend_period: 10
   supertrend_multiplier: 3.0
 
   # Trailing stop mode (issue #150): none | percent | supertrend_flip.
-  # Default 'none' = initial ATR stop only, deliberately: the live path does
-  # not trail yet (#167) and the Supertrend-flip workflow is not implemented
-  # yet (#168). Unsupported modes are REJECTED at validation and signal time,
-  # never traded without their trailing. 'percent' additionally requires
-  # trailing_percent in (0, 1).
+  # Default 'none' = initial ATR stop only. 'percent' (requires
+  # trailing_percent in (0, 1)) runs in replay and live on Alpaca.
+  # 'supertrend_flip' (#168) runs in the replay backtest only; live rejects it
+  # on every broker, so it stays off as the default for live deployments.
+  # Unsupported modes are REJECTED at validation and signal time, never traded
+  # without their trailing.
   trailing_mode: "none"
 
   # Timing

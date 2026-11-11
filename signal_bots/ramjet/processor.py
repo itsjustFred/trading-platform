@@ -47,16 +47,16 @@ class RamJetSignalProcessor:
 
     Trailing modes (``shared.trailing.KNOWN_TRAILING_MODES``):
     - ``none`` (default): initial ATR stop only — no trailing is requested.
-      This is the deliberate default until the Supertrend-flip workflow
-      (#168) lands; unsupported modes are rejected by every executing path,
-      never traded untrailed.
+      Unsupported modes are rejected by every executing path, never traded
+      untrailed.
     - ``percent``: stop trails at a fixed relative distance; requires
       ``trailing_percent`` in (0, 1). Executed by the replay backtest and,
       live, on brokers whose adapter can amend a stop (Alpaca; see
       ``shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``).
-    - ``supertrend_flip``: known but unsupported everywhere for now — signals
-      carrying it are rejected by the executing path (replay/live), so this
-      mode cannot silently trade without its workflow.
+    - ``supertrend_flip``: TP1 partial exit, breakeven stop, exit on the first
+      red Supertrend bar after the first green one (#168). Executed by the
+      replay backtest; the live path rejects it on every broker (see
+      ``shared.trailing``), so it cannot trade live without its workflow.
     """
 
     def __init__(self, config: dict[str, Any]):
@@ -251,11 +251,12 @@ class RamJetSignalProcessor:
 
         - ``none`` (default) must not ask for trailing: only the mode is
           emitted, without the Supertrend-flip workflow fields — with the
-          default mode those fields would promise a workflow that no path
-          runs (flip workflow: #168).
-        - ``supertrend_flip`` keeps the workflow description so #168 can
-          enable it by extending the path support sets; until then every
-          executing path rejects signals carrying it.
+          default mode those fields would describe a workflow the configured
+          mode does not request.
+        - ``supertrend_flip`` carries the workflow parameters the replay
+          adapter executes (``shared.trailing.parse_supertrend_flip_plan``);
+          ``tp1_price`` / ``tp1_exit_percent`` travel in the signal metadata.
+          The live path rejects it.
         """
         if self.trailing_mode == TRAILING_MODE_SUPERTREND_FLIP:
             return {
@@ -363,3 +364,20 @@ class RamJetSignalProcessor:
             timeframe=timeframe,
             metadata=metadata,
         )
+
+
+def calculate_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.DataFrame:
+    """Public entry point to the RamJet Supertrend (the one implementation).
+
+    Returns a copy of ``df`` with a boolean ``supertrend`` column (``True`` =
+    green/bullish) and a boolean ``supertrend_ready`` warm-up marker; while
+    ``supertrend_ready`` is ``False`` the direction is unknown, neither green
+    nor red. The computation is a forward recursion: the row for bar ``N``
+    depends on bars ``0..N`` only, so it may be computed once over a whole
+    series without lookahead.
+
+    Consumers outside the processor (the replay adapter's ``supertrend_flip``
+    workflow, issue #168) call this so the processor and the executing paths
+    can never drift apart onto two different Supertrend definitions.
+    """
+    return RamJetSignalProcessor._calculate_supertrend(df, period, multiplier)
