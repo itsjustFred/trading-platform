@@ -316,13 +316,15 @@ export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
   fetchJSON<MatrixGridOverview>(
     `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
   );
-export const deduplicateBacktests = () =>
+export const deduplicateBacktests = (payload?: { dry_run?: boolean; ids?: string[] }) =>
   fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
     method: "POST",
+    body: JSON.stringify(payload ?? { dry_run: true }),
   });
-export const removeEmptyBacktests = () =>
+export const removeEmptyBacktests = (payload?: { dry_run?: boolean; ids?: string[] }) =>
   fetchJSON<BacktestsRemoveEmptyResponse>("/backtests/remove-empty", {
     method: "POST",
+    body: JSON.stringify(payload ?? { dry_run: true }),
   });
 export const deleteBacktest = (id: string) =>
   fetchJSON<{ id: string; status: string }>(
@@ -600,13 +602,15 @@ export const deletePortfoliosBulk = (ids: string[]) =>
   });
 export const getPortfolioDuplicates = () =>
   fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
-export const deduplicatePortfolios = () =>
+export const deduplicatePortfolios = (payload?: { dry_run?: boolean; ids?: string[] }) =>
   fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
     method: "POST",
+    body: JSON.stringify(payload ?? { dry_run: true }),
   });
-export const removeEmptyPortfolios = () =>
+export const removeEmptyPortfolios = (payload?: { dry_run?: boolean; ids?: string[] }) =>
   fetchJSON<PortfoliosRemoveEmptyResponse>("/portfolios/remove-empty", {
     method: "POST",
+    body: JSON.stringify(payload ?? { dry_run: true }),
   });
 export const comparePortfolios = (ids: string[]) =>
   fetchJSON<{ portfolios: PortfolioDetail[] }>(
