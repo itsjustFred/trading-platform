@@ -280,7 +280,11 @@ def test_diagnostics_payload_centres_the_plateau_on_the_minimum_for_p_value():
     payload = opt._build_diagnostics_payload(
         trials=trials,
         config=config,
-        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-03-01T00:00:00+00:00",
+            "end": "2024-04-01T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="p_value",
         timeframe="1h",
@@ -442,6 +446,10 @@ def test_diagnostics_payload_reports_embargo_in_bars():
         # than the embargo that ran. The reported windows are now the ones handed
         # in, so a gapless fixture honestly reports zero.
         train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-04-02T00:00:00+00:00",
+            "end": "2024-04-07T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-08T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="sharpe_ratio",
         timeframe="1h",
@@ -493,7 +501,11 @@ def test_diagnostics_payload_corrects_a_p_value_study_from_the_minimum_end():
     payload = opt._build_diagnostics_payload(
         trials=trials,
         config=config,
-        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-03-01T00:00:00+00:00",
+            "end": "2024-04-01T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="p_value",
         timeframe="1h",
@@ -564,6 +576,10 @@ def _payload_for(trials, **config_kwargs):
         config=config,
         train_period={
             "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
+        validation_period={
+            "start": "2024-03-02T00:00:00+00:00",
             "end": "2024-04-01T00:00:00+00:00",
         },
         test_period={

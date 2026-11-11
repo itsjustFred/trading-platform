@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
@@ -20,6 +21,7 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimization_diagnostics import (
     ThreeWaySplit,
+    select_by_validation,
     three_way_split,
     walk_forward_train_validation_folds,
 )
@@ -728,11 +730,14 @@ def run_optimization(
             f"parameter set from failed backtests. Last trials: {failure_summary}"
         ) from last_trial_exception
 
-    best_trial = _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
+    # Guard only: fails loudly when the study completed no trials or every
+    # completed trial was a no-trade trial. The winner itself is chosen on
+    # validation below, not by this train ranking.
+    _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
     # Every completed trial is evaluated on the VALIDATION segment, after the
     # search is over and before the winner is fixed. Nothing in the objective
     # or the search can see this window.
-    _evaluate_trials_on_validation(
+    validation_rows = _evaluate_trials_on_validation(
         trials=completed_trials,
         validation_period=validation_period,
         config=config,
@@ -745,6 +750,36 @@ def run_optimization(
         strategy_path=strategy_path,
         progress_callback=progress_callback,
     )
+    selectable_rows = [
+        row
+        for row in validation_rows
+        if row["selectable"]
+        and row["validation_score"] is not None
+        and math.isfinite(float(row["validation_score"]))
+    ]
+    if not selectable_rows:
+        raise RuntimeError(
+            "No completed optimization trial produced a selectable validation "
+            "result; every trial either never traded, failed on validation, or "
+            "had a non-finite validation score. Widen parameter_ranges or relax "
+            "position-sizing constraints before retrying."
+        )
+    # The winner is fixed HERE, on validation only. From this point the
+    # selection is immutable: the test evaluation below reads it and cannot
+    # change it. The score is oriented higher-is-better inside
+    # `_trial_selection_score`, which negates a minimize target.
+    selection = select_by_validation(
+        selectable_rows,
+        top_fraction=config.test_top_fraction,
+    )
+    winner_row = selection["winner"]
+    if winner_row is None:
+        raise RuntimeError(
+            "Validation selection produced no winner despite "
+            f"{len(selectable_rows)} selectable trials."
+        )
+    best_trial = winner_row["trial"]
+
     best_params = {
         key: value
         for key, value in dict(best_trial.params).items()
@@ -763,20 +798,26 @@ def run_optimization(
         and best_raw_value >= 0
     )
 
-    test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
-            symbols=best_symbols,
-            timeframe=timeframe,
-            start_date=test_period["start"],
-            end_date=test_period["end"],
-            initial_capital=initial_capital,
-            parameters=effective_best_params,
-            **base_runtime,
-        ),
-        strategy_path,
+    # Only now, with the winner fixed, is the TEST holdout read. The top set
+    # is evaluated for the reported distribution; the winner's test result is
+    # the headline.
+    test_rows = _evaluate_top_set_on_test(
+        selection=selection,
+        test_period=test_period,
+        config=config,
+        base_parameters=base_parameters,
+        symbols=symbols,
+        timeframe=timeframe,
+        initial_capital=initial_capital,
+        base_runtime=base_runtime,
+        strategy_slug=strategy_slug,
+        strategy_path=strategy_path,
     )
-    test_stats = _canonical_stats(test_result)
+    winner_test_row = next(
+        row for row in test_rows if row["number"] == int(best_trial.number)
+    )
+    final_test_stats = dict(winner_test_row["test_stats"])
+    validation_stats = dict(winner_row["validation_stats"])
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -800,6 +841,8 @@ def run_optimization(
         "target_metric": config.target_metric,
         "n_trials": config.n_trials,
         "train_split_pct": config.train_split_pct,
+        "validation_split_pct": float(config.validation_split_pct or 0.0),
+        "test_split_pct": float(config.test_split_pct or 0.0),
         "optimization_mode": config.optimization_mode,
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
@@ -817,10 +860,40 @@ def run_optimization(
             "compatible": True,
         },
         "train_period": train_period,
-        "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
-        "test_stats": _json_safe(test_stats),
+        # Legacy payload keys (#164). Before the three-way split these were
+        # "the held-out result used to judge the trial": the run searched on
+        # train and judged on test. That job now belongs to VALIDATION, so
+        # `test_period`/`test_stats` carry the VALIDATION window and result and
+        # the viewer keeps comparing the train score against the window the
+        # winner was actually selected on. The untouched test holdout is in
+        # `final_test_period`/`final_test_stats` and `three_way.segments.test`.
+        "test_period": validation_period,
+        "test_stats": _json_safe(validation_stats),
+        "validation_period": validation_period,
+        "validation_stats": _json_safe(validation_stats),
+        "final_test_period": test_period,
+        "final_test_stats": _json_safe(final_test_stats),
         "oos_status": "available",
+        "three_way": {
+            "segments": split.as_dict(),
+            "winner": {
+                "trial_number": int(best_trial.number),
+                "train_metrics": _json_safe(best_train_stats),
+                "validation_metrics": _json_safe(validation_stats),
+                "test_metrics": _json_safe(final_test_stats),
+            },
+            "selection": _selection_payload(
+                selection=selection,
+                validation_rows=validation_rows,
+                config=config,
+            ),
+            "test_distribution": _test_distribution_payload(
+                selection=selection,
+                test_rows=test_rows,
+                target_metric=config.target_metric,
+            ),
+        },
         "top_trials": _top_trials_payload(
             study.trials,
             limit=10,
@@ -1169,6 +1242,176 @@ def _evaluate_trials_on_validation(
         )
         rows.append(row)
     return rows
+
+
+def _evaluate_top_set_on_test(
+    *,
+    selection: Mapping[str, Any],
+    test_period: Mapping[str, str],
+    config: OptimizationConfig,
+    base_parameters: Mapping[str, Any],
+    symbols: Sequence[str],
+    timeframe: str,
+    initial_capital: float,
+    base_runtime: Mapping[str, Any],
+    strategy_slug: str,
+    strategy_path: Path,
+) -> list[dict[str, Any]]:
+    """Evaluate the already-fixed top set on the TEST holdout (#164).
+
+    Takes the selection as read-only input and returns test results only: it
+    never re-ranks, never writes trial attrs and never changes the winner. The
+    test holdout is read for the first time here, after the selection is fixed.
+    """
+    ranked = list(selection["ranked"])
+    validation_rank = {
+        int(row["number"]): rank for rank, row in enumerate(ranked, start=1)
+    }
+    rows: list[dict[str, Any]] = []
+    for selected in selection["top_set"]:
+        trial = selected["trial"]
+        result = _run_period_backtest(
+            strategy_slug=strategy_slug,
+            strategy_path=strategy_path,
+            symbols=trial.user_attrs.get("symbols") or symbols,
+            timeframe=timeframe,
+            period=test_period,
+            initial_capital=initial_capital,
+            parameters=_trial_effective_parameters(trial, base_parameters),
+            base_runtime=base_runtime,
+        )
+        stats = _canonical_stats(result)
+        rows.append(
+            {
+                "number": int(trial.number),
+                "validation_rank": validation_rank[int(trial.number)],
+                "validation_score": float(selected["validation_score"]),
+                "validation_metric_value": _safe_float_or_none(
+                    selected.get("validation_metric_value")
+                ),
+                "test_metric_value": _metric_value(stats, config.target_metric),
+                "test_stats": _json_safe(stats),
+            }
+        )
+    return rows
+
+
+def _test_distribution_payload(
+    *,
+    selection: Mapping[str, Any],
+    test_rows: Sequence[Mapping[str, Any]],
+    target_metric: str,
+) -> dict[str, Any]:
+    """Summarise the top set's TEST results without touching the selection.
+
+    Reports whether the validation ranking survived on the holdout: the share
+    that stayed profitable, the median target metric, and the Spearman rank
+    correlation between validation rank and test rank (None when fewer than
+    three candidates were tested, where a correlation says nothing).
+    """
+    from scipy.stats import spearmanr
+
+    rows = list(test_rows)
+    direction = _study_direction(target_metric)
+    sign = -1.0 if direction == "minimize" else 1.0
+    metric_values = [
+        float(row["test_metric_value"])
+        for row in rows
+        if row.get("test_metric_value") is not None
+        and math.isfinite(float(row["test_metric_value"]))
+    ]
+    profitable = 0
+    for row in rows:
+        stats = row.get("test_stats") or {}
+        try:
+            pnl = float(stats.get("total_pnl", stats.get("total_return", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        if pnl > 0:
+            profitable += 1
+
+    test_order = sorted(
+        rows,
+        key=lambda row: (
+            -sign * float(row["test_metric_value"]),
+            int(row["number"]),
+        ),
+    )
+    test_rank = {
+        int(row["number"]): rank for rank, row in enumerate(test_order, start=1)
+    }
+    spearman: float | None = None
+    if len(rows) >= 3:
+        correlation = spearmanr(
+            [int(row["validation_rank"]) for row in rows],
+            [test_rank[int(row["number"])] for row in rows],
+        ).statistic
+        if correlation is not None and math.isfinite(float(correlation)):
+            spearman = round(float(correlation), 6)
+
+    return {
+        "count": len(rows),
+        "share_profitable": (
+            round(profitable / len(rows), 6) if rows else None
+        ),
+        "median_target_metric": (
+            round(float(statistics.median(metric_values)), 6) if metric_values else None
+        ),
+        "target_metric": TARGET_METRIC_ALIASES.get(target_metric, target_metric),
+        "spearman_validation_to_test": spearman,
+        "ranked_by_test": [
+            {
+                "number": int(row["number"]),
+                "validation_rank": int(row["validation_rank"]),
+                "test_rank": test_rank[int(row["number"])],
+                "test_metric_value": _safe_float_or_none(row["test_metric_value"]),
+            }
+            for row in test_order
+        ],
+        "note": (
+            "Test results are reported as a distribution of the top set; they "
+            "never change the winner, which was fixed on validation."
+        ),
+    }
+
+
+def _selection_payload(
+    *,
+    selection: Mapping[str, Any],
+    validation_rows: Sequence[Mapping[str, Any]],
+    config: OptimizationConfig,
+) -> dict[str, Any]:
+    """The fixed selection: winner, ranked top set and the tie-break rule."""
+    ranked = list(selection["ranked"])
+    winner = selection["winner"]
+    return {
+        "winner_trial_number": (
+            int(winner["trial"].number) if winner is not None else None
+        ),
+        "score_source": "validation",
+        "target_metric": config.target_metric,
+        "study_direction": _study_direction(config.target_metric),
+        "top_fraction": float(config.test_top_fraction),
+        "top_set_size": len(selection["top_set"]),
+        "n_selectable_trials": len(ranked),
+        "n_unselectable_trials": max(len(validation_rows) - len(ranked), 0),
+        "tie_break": (
+            "higher validation score first; equal scores by lower trial number"
+        ),
+        "ranked_top_set": [
+            {
+                "rank": rank,
+                "trial_number": int(row["trial"].number),
+                "validation_score": _safe_float_or_none(row["validation_score"]),
+                "validation_metric_value": _safe_float_or_none(
+                    row.get("validation_metric_value")
+                ),
+                "params": _json_safe(dict(row["trial"].params)),
+                "is_winner": row is winner,
+            }
+            for rank, row in enumerate(selection["top_set"], start=1)
+        ],
+    }
 
 
 def _build_diagnostics_payload(
@@ -1891,6 +2134,17 @@ def _top_trials_payload(
                     trial.user_attrs.get("raw_metric_value")
                 ),
                 "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
+                # #164: the trial's out-of-search result, recorded when it was
+                # validated. None for trials the validation pass could not score.
+                "validation_score": _safe_float_or_none(
+                    trial.user_attrs.get(VALIDATION_SCORE_ATTR)
+                ),
+                "validation_metric_value": _safe_float_or_none(
+                    trial.user_attrs.get(VALIDATION_METRIC_ATTR)
+                ),
+                "validation_stats": _json_safe(
+                    dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
+                ),
             }
         )
     return payload
