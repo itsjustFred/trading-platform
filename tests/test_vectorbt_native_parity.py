@@ -50,7 +50,10 @@ def _frame() -> pd.DataFrame:
 def _strategy_text(direction: str) -> str:
     return (
         "import pandas as pd\n"
-        "STRATEGY_META = {'name': 'vbt_parity', 'version': '1.0'}\n"
+        # Issue #153: the exit below stands in for a time exit (last bar), so
+        # the fixture declares time-based signal exits to keep open-fill valid.
+        "STRATEGY_META = {'name': 'vbt_parity', 'version': '1.0',"
+        " 'signal_exits_time_based': True}\n"
         "def generate_signals(df, params):\n"
         "    n = len(df)\n"
         "    entries = pd.Series([i == 0 for i in range(n)], index=df.index)\n"

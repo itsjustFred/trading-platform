@@ -30,6 +30,7 @@ from runner.codegen_safety import BANNED_CALL_NAMES, import_root
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines._shared import (
+    require_time_based_signal_exits_for_path,
     resolve_bar_spread,
 )
 from runner.engines._shared import (
@@ -256,6 +257,10 @@ class PyneCoreAdapter(EngineAdapter):
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
         require_generated_strategy_approval(strategy_path)
+        # Issue #153: pynecore does not import the strategy module, so the
+        # shared guard reads STRATEGY_META statically. Runs before the CLI
+        # lookup so a config error is reported as such, not as a missing pyne.
+        require_time_based_signal_exits_for_path(config, strategy_path)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.

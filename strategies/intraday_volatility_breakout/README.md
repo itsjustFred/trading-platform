@@ -47,6 +47,9 @@ Intraday-Breakout-Strategie (bzw. Fade-Breakout im Reverse Mode). Pro Tag wird e
 - **Stop-Loss:** `sl = entry_price +/- stop_distance` (kein Take-Profit).
 - **Stale-Position-Schutz:** Positionen, die vom Vortag stammen (nicht am selben Tag eröffnet), werden ebenfalls geschlossen.
 - Keine Trailing-Stops, keine Partial Exits, keine TP-Logik.
+- **MT5-Parität (Issue #153):** weil alle Signal-Exits zeitbasiert sind, deklariert
+  `STRATEGY_META["signal_exits_time_based"] = True` den `signal_exit_fill="open"`-Opt-in
+  (Open der Trigger-Bar) als zulässig; ohne diese Deklaration lehnt jeder Engine den Lauf ab.
 
 ### Stop-Loss
 - `stop_distance = ATR(D1, ATR_Period) * Stop_ATR_Multiplier`

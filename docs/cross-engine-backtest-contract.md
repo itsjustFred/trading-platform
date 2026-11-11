@@ -79,6 +79,30 @@ unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
 MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
 
+**Open-fill requires time-based exits (Issue #153).** `signal_exit_fill="open"`
+takes the price from the open of the bar that produced the exit signal, so it
+is only sound when the exit is time-based (the decision to leave predates the
+bar). For an exit computed from the trigger bar itself (close, high/low, an
+indicator) that open precedes the information that triggered the exit — a
+lookahead. A strategy therefore opts in with a `STRATEGY_META` flag:
+
+```python
+STRATEGY_META = {
+    ...
+    "signal_exits_time_based": True,  # required for signal_exit_fill="open"
+}
+```
+
+The check is the single shared function
+`runner.engines._shared.require_time_based_signal_exits`, called by the
+native, vectorbt and pynecore adapters (pynecore reads the meta statically,
+the other two from the imported module). If `signal_exit_fill == "open"` and
+the strategy does not declare the flag as the boolean `True`, the run fails
+with a `ValueError` before any data or engine work — in every engine, with the
+same message. The default `"close"` convention needs no declaration and is
+completely unaffected. Strategies whose signal exits are time-based (e.g.
+`intraday_volatility_breakout`) declare the flag once in their meta.
+
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
 `datetime.fromisoformat` and resolves a NAIVE result through `timestamp()` —

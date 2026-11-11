@@ -28,6 +28,9 @@ STRATEGY_META = {
     "name": "intraday_volatility_breakout",
     "version": "1.0.0",
     "engine": "native",
+    # Issue #153: every signal exit is time-based (exit_time / last bar of the
+    # day), so the MT5-parity signal_exit_fill="open" opt-in is sound here.
+    "signal_exits_time_based": True,
     "parameters": {
         "atr_period": 5,
         "atr_multiplier": 0.25,
