@@ -249,8 +249,9 @@ class OptimizationConfig(BaseModel):
     # Three-way split: train / validation / test. Defaults give 60/20/20.
     # If validation_split_pct and test_split_pct are not provided, the remainder
     # 1 - train_split_pct is split equally between validation and test.
-    # Constraints relaxed here; full validation in _validate_three_way_split.
-    train_split_pct: float = Field(default=0.6, ge=0.0, le=1.0)
+    # The bounds on train_split_pct are unchanged; the three fractions together
+    # are validated in _validate_three_way_split.
+    train_split_pct: float = Field(default=0.6, ge=0.1, le=0.95)
     validation_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     test_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)

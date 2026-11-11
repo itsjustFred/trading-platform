@@ -761,7 +761,8 @@ def test_three_way_split_rejects_only_one_of_validation_test():
 
 def test_three_way_split_rejects_non_positive_fractions():
     """All three fractions must be > 0."""
-    with pytest.raises(ValueError, match="must all be > 0"):
+    # train_split_pct keeps its own field bound (>= 0.1).
+    with pytest.raises(ValueError, match="train_split_pct"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",
@@ -818,8 +819,8 @@ def test_three_way_split_rejects_sum_not_one():
 
 
 def test_three_way_split_rejects_train_ge_one():
-    """train_split_pct must leave room for validation and test."""
-    with pytest.raises(ValueError, match="must be < 1.0"):
+    """train_split_pct must leave room for validation and test (field bound <= 0.95)."""
+    with pytest.raises(ValueError, match="train_split_pct"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",
