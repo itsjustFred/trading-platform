@@ -930,6 +930,11 @@ async def _ctrader_demo_roundtrip(
 
 
 class _DiscordSmokeAdapter:
+    # This fake never reaches a broker. The daemon treats an adapter that does
+    # not prove it is demo/paper as real money (`_adapter_is_demo`), and the
+    # promotion gate (#165) refuses entries there, so the fake says what it is.
+    demo = True
+
     def __init__(self) -> None:
         self.submitted_signal: Any | None = None
 

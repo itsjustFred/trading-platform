@@ -111,6 +111,33 @@ die technische Infrastruktur für Paper Trading.  Er beantwortet lediglich die
 Frage: "Sind die Backtest-Ergebnisse unserer Plattform hinreichend identisch
 mit der externen Referenz, sodass wir Vertrauen in die Signalgenerierung haben?"
 
+## Strategy Promotion Gate (#165)
+
+Paper trading is one of three required pieces of evidence for promoting a
+strategy or signal bot to `production`, the precondition for a real-money
+account (details: `docs/live-deploy-runbook.md`, section "Strategy Promotion
+Gate").
+
+The paper-trading evidence needs:
+- a run on a paper/demo account (Alpaca paper or cTrader demo) of at least
+  **60 days** that has ended (default, configurable),
+- at least **30 trades** (default, configurable),
+- a report file, whose SHA256 is recorded in the promotion ledger.
+
+The other two are an out-of-sample result with a passed overfitting verdict
+(test segment ≥ 180 days and ≥ 50 trades) and cross-engine or reference parity
+within 2 %.
+
+| Aspect | Paper readiness validator (this document) | Promotion gate |
+|--------|---------------------------|----------------|
+| Scope | Platform-wide backtest vs. reference parity | One strategy file or bot processor with one parameter set |
+| Output | `NOT_READY` / `READY_WITH_WARNINGS` / `READY` | `experimental` / `production` |
+| Enforcement | Advisory | Fail closed on real-money accounts (preflight, daemon, viewer) |
+
+A parity report produced here can serve as the parity evidence of a promotion.
+Paper/demo accounts never need a promotion; the existing demo-only block on
+real money is unchanged by the gate.
+
 ## Nächste Schritte für echtes Paper Trading
 
 1. **Broker-Adapter**

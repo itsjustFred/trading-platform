@@ -106,6 +106,25 @@ def get_signal_processor_config_path(name: str) -> Path:
     return _bot_config_path(bot_dir)
 
 
+#: The module that holds each bot's processor class. Every bot package follows
+#: the same layout, so this is derived from `_BOT_DIRS` like the config path.
+PROCESSOR_MODULE_FILENAME = "processor.py"
+
+
+def get_signal_processor_module_path(name: str) -> Path:
+    """Return the processor module file that backs a registered processor id.
+
+    This is the file the promotion gate hashes for a signal-bot deployment
+    (#165). Derived from `_BOT_DIRS`, not from the requested string: an unknown
+    id raises instead of producing a filesystem path.
+    """
+    normalized = str(name or "").strip().lower()
+    bot_dir = _BOT_DIRS.get(normalized)
+    if bot_dir is None:
+        raise ValueError(f"Unknown signal processor: {name}")
+    return _ROOT / bot_dir / PROCESSOR_MODULE_FILENAME
+
+
 def _build_from_bot_dir(
     bot_dir: str,
     factory: Callable[[dict[str, Any]], object],

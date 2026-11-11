@@ -15,6 +15,8 @@ from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.promotion import enforce_promotion_gate, is_real_money
+from runner.promotion_gate import StrategyNotPromotedError
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -309,6 +311,17 @@ def _preflight_account(
     )
 
 
+def _account_result_is_real_money(result: LivePreflightAccountResult) -> bool:
+    """Real money unless preflight resolved the account to paper/demo mode.
+
+    Uses the mode preflight itself resolved from the credentials (Alpaca
+    ``paper``, cTrader ``demo``). An account whose mode could not be resolved
+    (missing credentials) is real money.
+    """
+    resolved_demo = result.paper if result.broker == "alpaca" else result.demo
+    return is_real_money(resolved_demo)
+
+
 def _validate_deployments(
     accounts: Sequence[LiveAccountConfig],
     deployments: Sequence[LiveDeploymentConfig],
@@ -331,6 +344,36 @@ def _validate_deployments(
                 warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
 
     return errors, warnings
+
+
+def _promotion_gate_errors(
+    deployments: Sequence[LiveDeploymentConfig],
+    account_results: Sequence[LivePreflightAccountResult],
+    *,
+    strategies_dir: Path | None = None,
+) -> list[str]:
+    """Promotion gate (#165) for every deployment of the config.
+
+    A deployment on an account that preflight did not resolve to paper/demo
+    mode must be promoted to production. A deployment that references an
+    account the config does not define is skipped here: `_validate_deployments`
+    already fails the preflight for it, and there is no account to judge.
+    """
+    results_by_account = {result.account_id: result for result in account_results}
+    errors: list[str] = []
+    for deployment in deployments:
+        account_result = results_by_account.get(deployment.account_id)
+        if account_result is None:
+            continue
+        try:
+            enforce_promotion_gate(
+                deployment,
+                real_money=_account_result_is_real_money(account_result),
+                strategies_dir=strategies_dir,
+            )
+        except StrategyNotPromotedError as exc:
+            errors.append(f"{deployment.strategy_name} ({deployment.account_id}): {exc}")
+    return errors
 
 
 def run_live_preflight(
@@ -380,6 +423,7 @@ def run_live_preflight(
         for account in accounts
     ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
+    deployment_errors.extend(_promotion_gate_errors(deployments, account_results))
 
     ok = all(result.ok for result in account_results) and not deployment_errors
     return LivePreflightResult(

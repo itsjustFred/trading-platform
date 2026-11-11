@@ -34,6 +34,11 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.promotion import (
+    deployment_signal_processor_name,
+    enforce_promotion_gate,
+    is_real_money,
+)
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import (
     DiscordSignalSource,
@@ -534,11 +539,9 @@ def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
 
 
 def _deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
-    configured = deployment.signal_config or {}
-    settings = deployment.settings or {}
-    return str(
-        configured.get("signal_processor") or settings.get("signal_processor") or ""
-    ).strip().lower()
+    # One definition, shared with the promotion gate: the gate must hash the
+    # processor that is actually applied here.
+    return deployment_signal_processor_name(deployment)
 
 
 def _live_account_broker_login(account_id: str) -> str:
@@ -1018,6 +1021,16 @@ async def prepare_order_with_risk(
         # C1/B2: the broker-resolved flatten qty is binding — pass it
         # explicitly so the adapter never re-sizes.
         return signal.model_copy(update=update), float(metadata["explicit_qty"])
+    # Promotion gate (#165). Every entry order of every deployment - Discord
+    # and internal alike - is prepared here, so this is the one place the daemon
+    # enforces it. The verdict comes from the adapter, the same source of truth
+    # as the demo-only block in `_ensure_adapter_for_active_account`: an adapter
+    # that is not provably demo/paper is real money. Exit-only orders returned
+    # above: closing a position must never be blocked by a missing promotion.
+    # Raises StrategyNotPromotedError before any broker state is read.
+    enforce_promotion_gate(
+        deployment, real_money=is_real_money(_adapter_is_demo(adapter))
+    )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(

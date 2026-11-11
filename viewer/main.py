@@ -77,11 +77,13 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
+from runner.promotion_gate import StrategyNotPromotedError
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
@@ -12567,6 +12569,16 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             detail="No eligible cTrader account or backtest candidates found",
         )
 
+    # Promotion gate (#165), before the dry-run return on purpose: a plan that
+    # could not be deployed must not be presented as deployable.
+    demo_flags: dict[str, bool | None] = {}
+    for deployment in plan:
+        if deployment.account_id not in demo_flags:
+            demo_flags[deployment.account_id] = await _broker_reported_demo_flag(
+                deployment.account_id
+            )
+        _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
+
     if payload.dry_run:
         return {
             "status": "planned",
@@ -12586,6 +12598,55 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "dry_run": False,
         "deployments": created,
     }
+
+
+async def _broker_reported_demo_flag(account_id: str) -> bool | None:
+    """What broker discovery says about ``account_id``: demo, not demo, or unknown.
+
+    The promotion gate's real-money verdict for deployment create and the
+    cTrader top-N deploy (#165). It reads the same discovery payload the
+    activation path re-verifies against, never the stored account row. ``None``
+    means discovery failed, did not return the account, or did not assert the
+    flag; the gate treats that as real money.
+    """
+    try:
+        discovered = await asyncio.to_thread(_cached_live_accounts_payload)
+    except Exception as exc:
+        logger.warning(
+            "Broker discovery failed; the promotion gate treats the account as real money",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return None
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if account.get("is_demo_asserted") is not True:
+            return None
+        return account.get("is_demo") is True
+    return None
+
+
+def _promotion_gate_refusal(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> str | None:
+    """The promotion gate's refusal for ``deployment``, or None when it passes.
+
+    The single viewer-side call into :func:`enforce_promotion_gate`; create,
+    activate and the cTrader top-N deploy all go through here.
+    """
+    try:
+        enforce_promotion_gate(deployment, real_money=is_real_money(demo_flag))
+    except StrategyNotPromotedError as exc:
+        return str(exc)
+    return None
+
+
+def _require_promotion_gate(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> None:
+    refusal = _promotion_gate_refusal(deployment, demo_flag=demo_flag)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
 
 
 def _validate_live_deployment_route(
@@ -12702,6 +12763,11 @@ async def create_live_deployment_endpoint(
         settings=payload.settings or {},
     )
     _validate_live_deployment_route(deployment, account_payload)
+    # Promotion gate (#165). A deployment is created ACTIVE, so this is a
+    # deploy action in its own right, not only a record being written.
+    _require_promotion_gate(
+        deployment, demo_flag=await _broker_reported_demo_flag(deployment.account_id)
+    )
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:
@@ -12915,7 +12981,15 @@ async def update_live_deployment_status_endpoint(
 
         # Re-verify the account against the broker immediately before arming so
         # a stale identity can never be reused to arm a deployment.
-        if not await _reverify_account_against_broker(deployment.account_id):
+        demo_confirmed = await _reverify_account_against_broker(deployment.account_id)
+        # Promotion gate (#165), on the verdict of that same fresh broker
+        # answer. It is an additional layer: the demo-only block below still
+        # refuses every account the broker did not confirm as demo, promoted or
+        # not, and a refusal names both reasons.
+        promotion_refusal = _promotion_gate_refusal(
+            deployment, demo_flag=True if demo_confirmed else None
+        )
+        if not demo_confirmed:
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",
@@ -12926,6 +13000,7 @@ async def update_live_deployment_status_endpoint(
                     "requested_status": requested_status,
                     "reason": "broker could not confirm a demo account",
                     "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal or "promoted",
                 },
             )
             raise HTTPException(
@@ -12933,8 +13008,27 @@ async def update_live_deployment_status_endpoint(
                 detail=(
                     "Broker could not confirm the account is a demo account; "
                     "refusing to activate"
+                    + (f". {promotion_refusal}" if promotion_refusal else "")
                 ),
             )
+        if promotion_refusal is not None:
+            # Unreachable while the demo-only block above stands (a confirmed
+            # demo account always passes the gate). Kept so that lifting that
+            # block cannot silently lift the promotion gate with it.
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "promotion gate refused the deployment",
+                    "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal,
+                },
+            )
+            raise HTTPException(status_code=409, detail=promotion_refusal)
 
     # Inventory the leases to account for *before* the write, so a lease that is
     # reaped in the window between the commit and the drain's first poll is still
