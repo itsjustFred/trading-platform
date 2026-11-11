@@ -46,8 +46,12 @@ pro Bot.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
     nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
-  - **Unterstützt:** Replay-Backtest `none`, `percent`; Live nur `none` (Live-Trailing fehlt
-    noch, #167). `supertrend_flip` ist bekannt, aber bis #168 nirgends ausführbar.
+  - **Unterstützt:** Replay-Backtest `none`, `percent`. Live je Broker: Alpaca `none`, `percent`;
+    cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
+    live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
+    nachgezogen und der Stop beim Broker ersetzt; Details und Betriebsgrenzen in
+    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` ist bekannt, aber
+    bis #168 nirgends ausführbar.
   - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 

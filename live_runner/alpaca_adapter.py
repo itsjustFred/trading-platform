@@ -7,18 +7,19 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
 import pandas as pd
 from alpaca.trading.enums import OrderClass
-from alpaca.trading.requests import StopLossRequest, TakeProfitRequest
+from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    ProtectiveStop,
     coerce_positive_live_qty,
     is_unbounded_tp,
     order_not_submitted,
@@ -96,6 +97,20 @@ def _order_side(order: Any) -> str:
     raw = _order_attr(order, "side", "")
     text = str(getattr(raw, "value", raw) or "").strip().lower()
     return text.rsplit(".", 1)[-1]
+
+
+def _order_type(order: Any) -> str:
+    """The order's type (``stop``, ``limit``, ...), from an enum or a string."""
+    raw = _order_attr(order, "order_type", None)
+    if raw is None or raw == "":
+        raw = _order_attr(order, "type", "")
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    return text.rsplit(".", 1)[-1]
+
+
+#: Alpaca rejects sub-penny prices: two decimals at or above $1, four below.
+_ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
+_ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
 
 
 def _alpaca_timeframe(value: str):
@@ -447,6 +462,8 @@ def resolve_alpaca_credentials(
 
 class AlpacaLiveAdapter(BaseLiveAdapter):
     """Live adapter for Alpaca trading + trade update streaming."""
+
+    broker_name = "alpaca"
 
     def __init__(
         self,
@@ -1600,6 +1617,96 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             completed=completed,
             unidentified=tuple(unidentified),
             failed=tuple(failed),
+        )
+
+    # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
+    #
+    # Alpaca's order replace (PATCH /v2/orders/{id}) is atomic from the position's point of
+    # view: the original order keeps working until the replacement is accepted, and stays in
+    # force when the replace is refused. That is what makes the capability safe to declare -
+    # the stop is never cancelled by this adapter in order to move it.
+
+    @property
+    def supports_stop_amendment(self) -> bool:
+        return True
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """Working plain stop orders on the reducing side of each open position.
+
+        Only ``stop`` orders count. A stop-limit or a broker-native trailing stop is not
+        something a ``stop_price`` replace can move safely, so it is not offered for
+        amendment; the caller then reports the position as having no amendable stop.
+        """
+        client = await self._require_trading_client()
+        reducing_sides = await self._protection_sides_by_symbol()
+        if not reducing_sides:
+            return []
+        orders = await self._list_open_orders(client)
+        stops: dict[str, ProtectiveStop] = {}
+        for order in orders:
+            for candidate in (order, *_order_legs(order)):
+                symbol = _order_symbol(candidate) or _order_symbol(order)
+                side = _order_side(candidate)
+                if not symbol or reducing_sides.get(symbol) != side:
+                    continue
+                if _order_type(candidate) != "stop":
+                    continue
+                order_id = _control_order_id(_order_attr(candidate, "id"))
+                stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
+                if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
+                    continue
+                stops[order_id] = ProtectiveStop(
+                    order_id=order_id, symbol=symbol, side=side, stop_price=stop_price
+                )
+        return list(stops.values())
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
+            )
+        tick = _ALPACA_TICK_AT_OR_ABOVE_ONE if value >= 1.0 else _ALPACA_TICK_BELOW_ONE
+        # Away from the market: never tighter than the computed stop.
+        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
+        # Float noise is removed first (101.96999999999998 is 101.97): flooring
+        # the raw float would otherwise give away a whole tick to a rounding
+        # artefact of the stop arithmetic.
+        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
+        if rounded <= 0:
+            raise ValueError(
+                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
+            )
+        return rounded
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        price = self.round_stop_price(stop, new_stop_price)
+        client = await self._require_trading_client()
+        replace = getattr(client, "replace_order_by_id", None)
+        if not callable(replace):
+            raise RuntimeError("Alpaca client cannot replace an order by id")
+        replaced = await asyncio.to_thread(
+            replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
+        )
+        new_order_id = _control_order_id(_order_attr(replaced, "id"))
+        confirmed_price = _to_float(_order_attr(replaced, "stop_price", None), default=0.0)
+        if new_order_id is None or not math.isclose(
+            confirmed_price, price, rel_tol=0.0, abs_tol=1e-9
+        ):
+            # Not a confirmed amendment. The broker's own state decides what is in force; the
+            # caller re-reads it on its next pass instead of trusting this response.
+            raise RuntimeError(
+                f"Alpaca did not confirm the stop replacement for {stop.symbol} "
+                f"(order_id={new_order_id!r}, stop_price={confirmed_price!r}, "
+                f"requested={price!r})"
+            )
+        return ProtectiveStop(
+            order_id=new_order_id,
+            symbol=stop.symbol,
+            side=stop.side,
+            stop_price=confirmed_price,
         )
 
     async def get_positions(self) -> list[dict[str, Any]]:

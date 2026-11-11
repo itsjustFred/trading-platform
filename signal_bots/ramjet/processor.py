@@ -47,11 +47,13 @@ class RamJetSignalProcessor:
 
     Trailing modes (``shared.trailing.KNOWN_TRAILING_MODES``):
     - ``none`` (default): initial ATR stop only — no trailing is requested.
-      This is the deliberate default until the live trailing path (#167) and
-      the Supertrend-flip workflow (#168) land; unsupported modes are
-      rejected by every executing path, never traded untrailed.
+      This is the deliberate default until the Supertrend-flip workflow
+      (#168) lands; unsupported modes are rejected by every executing path,
+      never traded untrailed.
     - ``percent``: stop trails at a fixed relative distance; requires
-      ``trailing_percent`` in (0, 1).
+      ``trailing_percent`` in (0, 1). Executed by the replay backtest and,
+      live, on brokers whose adapter can amend a stop (Alpaca; see
+      ``shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``).
     - ``supertrend_flip``: known but unsupported everywhere for now — signals
       carrying it are rejected by the executing path (replay/live), so this
       mode cannot silently trade without its workflow.
@@ -250,7 +252,7 @@ class RamJetSignalProcessor:
         - ``none`` (default) must not ask for trailing: only the mode is
           emitted, without the Supertrend-flip workflow fields — with the
           default mode those fields would promise a workflow that no path
-          runs (live trailing: #167, flip workflow: #168).
+          runs (flip workflow: #168).
         - ``supertrend_flip`` keeps the workflow description so #168 can
           enable it by extending the path support sets; until then every
           executing path rejects signals carrying it.

@@ -579,6 +579,11 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
+    broker_name = "ctrader"
+    # No `supports_stop_amendment`: the daemon has no cTrader market data to
+    # trail on, so this adapter stays on trailing mode "none" (issue #167; see
+    # `shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`).
+
     def __init__(
         self,
         *,

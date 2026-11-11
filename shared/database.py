@@ -64,6 +64,7 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
+from shared.trailing import validate_live_deployment_trailing_override
 
 logger = get_logger("database")
 
@@ -2561,6 +2562,91 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
     return metadata
 
 
+#: Page size for the newest-first scan in
+#: :func:`find_latest_filled_live_entry_signals`. The entry signal of an open
+#: position is normally the newest or second-newest filled signal of its symbol.
+_ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
+
+
+def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    return bool(metadata.get("exit_only")) or (
+        str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
+    )
+
+
+def find_latest_filled_live_entry_signals(
+    deployment_ids: list[str],
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Newest filled *entry* signal per symbol among the given deployments.
+
+    This is the persisted half of live trailing-stop state (issue #167): the
+    signal that opened a broker position carries the trailing config
+    (``metadata["trailing_sl_config"]``) the position must be trailed with, so
+    a restarted daemon recovers it from here instead of from process memory.
+
+    - Only signals with at least one persisted fill count: a later signal that
+      was refused or never filled must not displace the one whose position is
+      actually open.
+    - Exit-only signals are skipped: a partial close must not end the trail of
+      the remaining position. Whether a position is still open is the broker's
+      truth and is checked by the caller.
+
+    Returns ``{SYMBOL: {signal_id, deployment_id, symbol, action, timestamp,
+    metadata}}`` (symbol upper-cased, timestamp tz-aware UTC). Symbols without
+    a filled entry signal are absent.
+    """
+    normalized_ids = sorted({str(item).strip() for item in deployment_ids if str(item).strip()})
+    normalized_symbols = sorted(
+        {str(item).strip().upper() for item in symbols if str(item).strip()}
+    )
+    if not normalized_ids or not normalized_symbols:
+        return {}
+
+    init_db()
+    found: dict[str, dict[str, Any]] = {}
+    with get_session() as session:
+        for symbol in normalized_symbols:
+            has_fill = (
+                select(LiveExecutionModel.id)
+                .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
+                .where(LiveExecutionModel.filled_qty > 0)
+                .exists()
+            )
+            statement = (
+                select(LiveSignalModel)
+                .where(LiveSignalModel.deployment_id.in_(normalized_ids))
+                .where(func.upper(LiveSignalModel.symbol) == symbol)
+                .where(has_fill)
+                .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+            )
+            offset = 0
+            while symbol not in found:
+                rows = session.exec(
+                    statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)
+                ).all()
+                if not rows:
+                    break
+                for row in rows:
+                    metadata = dict(row.metadata_json or {})
+                    if _is_exit_only_signal_metadata(metadata):
+                        continue
+                    timestamp = row.timestamp
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    found[symbol] = {
+                        "signal_id": str(row.id),
+                        "deployment_id": str(row.deployment_id),
+                        "symbol": symbol,
+                        "action": str(row.action or "").strip().lower(),
+                        "timestamp": timestamp.astimezone(timezone.utc),
+                        "metadata": metadata,
+                    }
+                    break
+                offset += len(rows)
+    return found
+
+
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
     """Return the persisted signal timestamp used for bounded broker recovery."""
     normalized_signal_id = str(signal_id or "").strip()
@@ -3097,6 +3183,13 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             account_broker_login=account.broker_login or account.ctid or "",
             accounts_env_values=route_env,
         )
+        # #150/#167 fail closed: live trailing support is per broker, and this
+        # is where the deployment's broker is first known.
+        validate_live_deployment_trailing_override(
+            deployment.signal_config,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account.broker,
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
@@ -3478,6 +3571,14 @@ def update_live_deployment_account(
                 raise ValueError(
                     f"Refusing to re-point at unknown account '{account_id}'"
                 )
+
+            # #150/#167 fail closed: the new account may sit on a broker that
+            # cannot execute the deployment's trailing mode.
+            validate_live_deployment_trailing_override(
+                record.to_live_deployment().signal_config,
+                context=f"live deployment '{record.strategy_name}' re-point",
+                broker=account.broker,
+            )
 
             current_status = str(record.status or "").strip().upper()
             if current_status == "ACTIVE":

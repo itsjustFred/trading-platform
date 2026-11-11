@@ -195,8 +195,28 @@ def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float
     return parsed
 
 
+@dataclass(frozen=True)
+class ProtectiveStop:
+    """One working broker-side stop order that protects an open position.
+
+    ``side`` is the *order* side: a ``sell`` stop protects a long, a ``buy``
+    stop protects a short. ``order_id`` names the order for an amendment and
+    changes when the broker replaces the order.
+    """
+
+    order_id: str
+    symbol: str
+    side: str
+    stop_price: float
+
+
 class BaseLiveAdapter(ABC):
     """Abstract broker adapter for live order routing and fill streaming."""
+
+    #: Broker key as used by ``LiveAccountConfig.broker`` and by the per-broker
+    #: trailing-mode table in ``shared.trailing``. Blank means "unknown", which
+    #: every per-broker lookup treats as the fail-closed baseline.
+    broker_name: str = ""
 
     @abstractmethod
     async def connect(self) -> None:
@@ -230,6 +250,47 @@ class BaseLiveAdapter(ABC):
     #
     # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
     # instead of reading a silent no-op as "nothing was open".
+
+    # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
+    #
+    # A trailing stop is executed live by moving the broker-side protective stop. An adapter
+    # may only declare the capability when its amendment can never leave the position without
+    # a stop: either the broker amends in place, or it replaces atomically (the previous stop
+    # keeps working until the replacement is accepted, and stays if it is refused). An adapter
+    # that would have to cancel and re-submit must NOT declare it. Without the capability the
+    # live path refuses every trailing mode except "none" for that adapter.
+
+    @property
+    def supports_stop_amendment(self) -> bool:
+        """Whether this adapter can safely amend a broker-side protective stop."""
+        return False
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """Working stop orders on the reducing side of each open position.
+
+        Read from the broker on every call: this is the source of truth a trail continues
+        from, including after a daemon restart.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        """Round a computed stop to a price the broker accepts.
+
+        Rounds away from the market (down for a sell stop, up for a buy stop), so the rounded
+        stop is never tighter than the computed one.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot round stop prices")
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        """Move one protective stop to ``new_stop_price`` and return the stop now working.
+
+        Must raise when the broker refuses or the outcome is not confirmed; in that case the
+        previous stop must still be in force. Never cancels before the replacement is
+        confirmed.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot amend protective stops")
 
     @property
     def supports_cancel_orders(self) -> bool:
