@@ -11,6 +11,7 @@ import yaml
 from live_runner.account_routing import validate_live_account_routes
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
+from shared.trailing import validate_live_deployment_trailing_override
 
 logger = get_logger("live-runner")
 
@@ -106,8 +107,16 @@ def parse_live_deployments_config(
     deployments = [LiveDeploymentConfig.model_validate(item) for item in raw_deployments]
     validate_live_account_routes(accounts)
 
-    account_ids = {account.id for account in accounts}
+    account_brokers = {account.id: account.broker for account in accounts}
+    account_ids = set(account_brokers)
     for deployment in deployments:
+        # #150/#167 fail closed: live trailing support is per broker. An
+        # unknown account has no broker, which supports mode "none" only.
+        validate_live_deployment_trailing_override(
+            deployment.signal_config,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account_brokers.get(deployment.account_id),
+        )
         if deployment.account_id not in account_ids:
             logger.warning(
                 "Live deployment references unknown account_id",
