@@ -192,7 +192,9 @@ export function OptimizeModal({
   const [optimizationMode, setOptimizationMode] = useState<OptimizationMode>("parameter");
   const [symbolUniversesText, setSymbolUniversesText] = useState("");
   const [nTrials, setNTrials] = useState("100");
-  const [trainSplitPct, setTrainSplitPct] = useState("0.7");
+  const [trainSplitPct, setTrainSplitPct] = useState("0.6");
+  const [validationSplitPct, setValidationSplitPct] = useState("0.2");
+  const [testSplitPct, setTestSplitPct] = useState("0.2");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
 
@@ -220,7 +222,9 @@ export function OptimizeModal({
     setOptimizationMode("parameter");
     setSymbolUniversesText("");
     setNTrials("100");
-    setTrainSplitPct("0.7");
+    setTrainSplitPct("0.6");
+    setValidationSplitPct("0.2");
+    setTestSplitPct("0.2");
     setError("");
   }, [open, parameters]);
 
@@ -278,9 +282,21 @@ export function OptimizeModal({
         throw new Error("Number of trials must be greater than 0.");
       }
 
-      const parsedSplit = parseNumericField(trainSplitPct, "Train/Test split");
-      if (parsedSplit < 0.1 || parsedSplit > 0.95) {
-        throw new Error("Train/Test split must be between 0.1 and 0.95.");
+      const parsedTrainSplit = parseNumericField(trainSplitPct, "Train split");
+      const parsedValidationSplit = parseNumericField(validationSplitPct, "Validation split");
+      const parsedTestSplit = parseNumericField(testSplitPct, "Test split");
+      const totalSplit = parsedTrainSplit + parsedValidationSplit + parsedTestSplit;
+      if (Math.abs(totalSplit - 1.0) > 1e-9) {
+        throw new Error("Train + Validation + Test splits must sum to 1.0.");
+      }
+      if (parsedTrainSplit < 0.1 || parsedTrainSplit > 0.8) {
+        throw new Error("Train split must be between 0.1 and 0.8.");
+      }
+      if (parsedValidationSplit < 0.05 || parsedValidationSplit > 0.4) {
+        throw new Error("Validation split must be between 0.05 and 0.4.");
+      }
+      if (parsedTestSplit < 0.05 || parsedTestSplit > 0.4) {
+        throw new Error("Test split must be between 0.05 and 0.4.");
       }
 
       const parameterRanges = buildRangePayload(parameterDrafts);
@@ -297,7 +313,9 @@ export function OptimizeModal({
         base_backtest_id: backtestId,
         target_metric: targetMetric,
         n_trials: parsedTrials,
-        train_split_pct: parsedSplit,
+        train_split_pct: parsedTrainSplit,
+        validation_split_pct: parsedValidationSplit,
+        test_split_pct: parsedTestSplit,
         parameter_ranges: parameterRanges,
         optimization_mode: optimizationMode,
         symbol_universes: symbolUniverses,
@@ -643,7 +661,7 @@ export function OptimizeModal({
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
             gap: "12px",
             borderRadius: "22px",
             border: "1px solid rgba(148, 163, 184, 0.16)",
@@ -673,14 +691,40 @@ export function OptimizeModal({
             />
           </div>
           <div>
-            <label htmlFor="optimize-train-split" style={labelStyle}>Train / Test Split %</label>
+            <label htmlFor="optimize-train-split" style={labelStyle}>Train Split %</label>
             <input
               id="optimize-train-split"              type="number"
               min="0.1"
-              max="0.95"
+              max="0.8"
               step="0.05"
               value={trainSplitPct}
               onChange={(event) => setTrainSplitPct(event.target.value)}
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label htmlFor="optimize-validation-split" style={labelStyle}>Validation Split %</label>
+            <input
+              id="optimize-validation-split"
+              type="number"
+              min="0.05"
+              max="0.4"
+              step="0.05"
+              value={validationSplitPct}
+              onChange={(event) => setValidationSplitPct(event.target.value)}
+              style={inputStyle}
+            />
+          </div>
+          <div>
+            <label htmlFor="optimize-test-split" style={labelStyle}>Test Split %</label>
+            <input
+              id="optimize-test-split"
+              type="number"
+              min="0.05"
+              max="0.4"
+              step="0.05"
+              value={testSplitPct}
+              onChange={(event) => setTestSplitPct(event.target.value)}
               style={inputStyle}
             />
           </div>

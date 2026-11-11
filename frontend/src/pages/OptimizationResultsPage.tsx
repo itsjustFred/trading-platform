@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target } from "lucide-react";
+import { ArrowLeft, ArrowUpRight, Gauge, Layers3, Target, AlertTriangle, CheckCircle, AlertCircle } from "lucide-react";
 
 import { getBacktestInfo, getOptimization } from "../api/client";
 import { DataTable } from "../components/DataTable";
-import type { BacktestInfo, OptimizationDetail } from "../api/types";
+import type { BacktestInfo, OptimizationDetail, ThreeWayPayload } from "../api/types";
 import {
   classifyOptimizationOosEvidence,
   resolveCompatibleInSampleValue,
@@ -58,6 +58,353 @@ function formatSymbols(symbols: string[] | null | undefined) {
     .map((symbol) => String(symbol || "").trim())
     .filter(Boolean);
   return cleaned.length ? cleaned.join(", ") : "—";
+}
+
+function formatPeriod(period: { start: string; end: string } | undefined) {
+  if (!period) return "—";
+  return `${period.start.slice(0, 10)} → ${period.end.slice(0, 10)}`;
+}
+
+function renderThreeWaySegments(threeWay: ThreeWayPayload) {
+  const segments = threeWay.segments;
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+        gap: "10px",
+        marginTop: "8px",
+      }}
+    >
+      {[
+        { label: "Train", period: segments.train, tone: "#7dd3fc" },
+        { label: "Validation (selection)", period: segments.validation, tone: "#fbbf24" },
+        { label: "Test (holdout)", period: segments.test, tone: "#86efac" },
+        { label: "Embargo T→V", period: segments.embargo_train_val, tone: "#94a3b8" },
+        { label: "Embargo V→T", period: segments.embargo_val_test, tone: "#94a3b8" },
+      ].map((item) => (
+        <div
+          key={item.label}
+          style={{
+            borderRadius: "14px",
+            border: "1px solid rgba(148, 163, 184, 0.16)",
+            background: "rgba(15, 23, 42, 0.78)",
+            padding: "12px 14px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: "0.68rem",
+              textTransform: "uppercase",
+              letterSpacing: "0.1em",
+              color: item.tone,
+            }}
+          >
+            {item.label}
+          </div>
+          <div style={{ marginTop: "4px", color: "#e2e8f0", fontSize: "0.85rem", fontFamily: "ui-monospace, monospace" }}>
+            {formatPeriod(item.period)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function renderThreeWayWinnerMetrics(threeWay: ThreeWayPayload) {
+  const winner = threeWay.winner;
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+        gap: "12px",
+      }}
+    >
+      {[
+        {
+          title: "Train (search)",
+          metrics: winner.train_metrics,
+          tone: "#7dd3fc",
+        },
+        {
+          title: "Validation (selection window)",
+          metrics: winner.validation_metrics,
+          tone: "#fbbf24",
+        },
+        {
+          title: "Test (untouched holdout)",
+          metrics: winner.test_metrics,
+          tone: "#86efac",
+        },
+      ].map((panel) => (
+        <div
+          key={panel.title}
+          style={{
+            borderRadius: "18px",
+            border: "1px solid rgba(148, 163, 184, 0.16)",
+            background: "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+            padding: "16px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <Layers3 size={16} color={panel.tone} />
+            <div style={{ fontSize: "0.95rem", fontWeight: 700 }}>
+              {panel.title}
+            </div>
+          </div>
+          <div style={{ marginTop: "12px", display: "grid", gap: "8px" }}>
+            {COMPARISON_ROWS.map((row) => (
+              <div
+                key={row.key}
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: "12px",
+                  borderRadius: "12px",
+                  border: "1px solid rgba(148, 163, 184, 0.12)",
+                  background: "rgba(15, 23, 42, 0.78)",
+                  padding: "10px 12px",
+                }}
+              >
+                <span style={{ color: "var(--color-text-muted)", fontSize: "0.85rem" }}>
+                  {row.label}
+                </span>
+                <span style={{ fontWeight: 700, color: panel.tone, fontSize: "0.9rem" }}>
+                  {formatComparisonValue(row.key, panel.metrics?.[row.key])}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function renderOverfittingVerdict(overfitting: ThreeWayPayload["overfitting"]) {
+  const passed = overfitting.passed;
+  const checks = overfitting.checks;
+  const isFlagged = !passed;
+
+  return (
+    <section
+      style={{
+        borderRadius: "18px",
+        border: `1px solid ${isFlagged ? "#fbbf24" : "#86efac"}`,
+        background: isFlagged
+          ? "rgba(251, 191, 36, 0.08)"
+          : "rgba(134, 239, 172, 0.08)",
+        padding: "16px 18px",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          marginBottom: "12px",
+        }}
+      >
+        {isFlagged ? (
+          <AlertTriangle size={18} color="#fbbf24" />
+        ) : (
+          <CheckCircle size={18} color="#86efac" />
+        )}
+        <div
+          style={{
+            color: isFlagged ? "#fbbf24" : "#86efac",
+            fontSize: "0.76rem",
+            fontWeight: 700,
+            textTransform: "uppercase",
+            letterSpacing: "0.12em",
+          }}
+        >
+          {isFlagged ? "Overfitting check: FLAGGED" : "Overfitting check: PASSED"}
+        </div>
+        {isFlagged && (
+          <span
+            style={{
+              marginLeft: "auto",
+              fontSize: "0.7rem",
+              color: "#fbbf24",
+              background: "rgba(251, 191, 36, 0.15)",
+              padding: "4px 8px",
+              borderRadius: "999px",
+            }}
+          >
+            Result not blocked — flagged for review
+          </span>
+        )}
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+          gap: "10px",
+          marginBottom: "12px",
+        }}
+      >
+        {[
+          {
+            label: "Train → Validation degradation",
+            check: checks.degradation,
+          },
+          {
+            label: "Deflated Sharpe ratio",
+            check: checks.deflated_sharpe,
+          },
+        ].map((item) => (
+          <div
+            key={item.label}
+            style={{
+              borderRadius: "12px",
+              border: `1px solid ${item.check.passed ? "rgba(134, 239, 172, 0.3)" : "rgba(251, 191, 36, 0.3)"}`,
+              background: item.check.passed
+                ? "rgba(134, 239, 172, 0.05)"
+                : "rgba(251, 191, 36, 0.05)",
+              padding: "10px 12px",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.68rem",
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              {item.label}
+            </div>
+            <div style={{ marginTop: "4px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <span style={{ fontWeight: 700, fontSize: "0.95rem" }}>
+                {item.check.value != null ? item.check.value.toFixed(3) : "N/A"}
+              </span>
+              <span style={{ color: "var(--color-text-muted)", fontSize: "0.8rem" }}>
+                threshold {item.check.threshold.toFixed(3)}
+              </span>
+              {item.check.passed ? (
+                <CheckCircle size={14} color="#86efac" />
+              ) : (
+                <AlertCircle size={14} color="#fbbf24" />
+              )}
+              {!item.check.computable && (
+                <span
+                  style={{
+                    fontSize: "0.7rem",
+                    color: "#94a3b8",
+                    background: "rgba(148, 163, 184, 0.15)",
+                    padding: "2px 6px",
+                    borderRadius: "999px",
+                  }}
+                >
+                  not computable
+                </span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {overfitting.reasons.length > 0 && (
+        <div style={{ marginTop: "8px" }}>
+          <div
+            style={{
+              fontSize: "0.68rem",
+              textTransform: "uppercase",
+              letterSpacing: "0.08em",
+              color: "var(--color-text-muted)",
+              marginBottom: "6px",
+            }}
+          >
+            Reasons
+          </div>
+          <ul style={{ margin: 0, paddingLeft: "18px", color: "#fecdd3", fontSize: "0.85rem", lineHeight: 1.6 }}>
+            {overfitting.reasons.map((reason, idx) => (
+              <li key={idx}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function renderTestDistribution(dist: ThreeWayPayload["test_distribution"], selection: ThreeWayPayload["selection"]) {
+  return (
+    <section
+      style={{
+        borderRadius: "18px",
+        border: "1px solid rgba(148, 163, 184, 0.16)",
+        background: "rgba(15, 23, 42, 0.78)",
+        padding: "16px 18px",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "0.72rem",
+          textTransform: "uppercase",
+          letterSpacing: "0.12em",
+          color: "#93c5fd",
+          marginBottom: "10px",
+        }}
+      >
+        Test distribution (top {selection.top_fraction * 100 || 10}% by validation)
+      </div>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+          gap: "10px",
+        }}
+      >
+        {[
+          { label: "Candidates tested", value: String(dist.count) },
+          { label: "Share profitable", value: `${(dist.share_profitable * 100).toFixed(1)}%` },
+          { label: "Median {dist.target_metric}", value: dist.median_target_metric?.toFixed(3) ?? "—" },
+          { label: "Rank correlation (val→test)", value: dist.spearman_validation_to_test?.toFixed(2) ?? "—" },
+        ].map((item) => (
+          <div
+            key={item.label}
+            style={{
+              borderRadius: "12px",
+              border: "1px solid rgba(148, 163, 184, 0.12)",
+              background: "rgba(15, 23, 42, 0.6)",
+              padding: "10px 12px",
+            }}
+          >
+            <div
+              style={{
+                fontSize: "0.68rem",
+                textTransform: "uppercase",
+                letterSpacing: "0.08em",
+                color: "var(--color-text-muted)",
+              }}
+            >
+              {item.label}
+            </div>
+            <div style={{ marginTop: "4px", fontWeight: 700, color: "#86efac" }}>
+              {item.value}
+            </div>
+          </div>
+        ))}
+      </div>
+      {dist.note && (
+        <div
+          style={{
+            marginTop: "10px",
+            fontSize: "0.75rem",
+            color: "var(--color-text-muted)",
+            fontStyle: "italic",
+          }}
+        >
+          {dist.note}
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function OptimizationResultsPage() {
@@ -178,6 +525,9 @@ export function OptimizationResultsPage() {
       </div>
     );
   }
+
+  const hasThreeWay = !!optimization.three_way;
+  const threeWay = optimization.three_way as ThreeWayPayload | undefined;
 
   const compatibleMetric = optimization.oos_comparison ?? {
     metric_key: optimization.best_metric_key,
@@ -336,13 +686,17 @@ export function OptimizationResultsPage() {
                 tone: "#c4b5fd",
               },
               {
-                label: "Train split",
-                value: `${Math.round(optimization.train_split_pct * 100)}%`,
+                label: hasThreeWay ? "Train split" : "Train split",
+                value: hasThreeWay
+                  ? `${Math.round((optimization.validation_split_pct ?? optimization.train_split_pct) * 100)}% / ${Math.round((optimization.validation_split_pct ?? 0) * 100)}% / ${Math.round((optimization.test_split_pct ?? 0) * 100)}%`
+                  : `${Math.round(optimization.train_split_pct * 100)}%`,
                 tone: "#fbbf24",
               },
               {
-                label: "OOS window",
-                value: `${optimization.test_period.start.slice(0, 10)} → ${optimization.test_period.end.slice(0, 10)}`,
+                label: hasThreeWay ? "Test holdout" : "OOS window",
+                value: hasThreeWay
+                  ? formatPeriod(optimization.final_test_period ?? optimization.test_period)
+                  : formatPeriod(optimization.test_period),
                 tone: "#86efac",
               },
             ].map((item) => (
@@ -378,6 +732,30 @@ export function OptimizationResultsPage() {
               </div>
             ))}
           </div>
+
+          {hasThreeWay && threeWay && (
+            <div
+              style={{
+                borderRadius: "16px",
+                border: "1px solid rgba(251, 191, 36, 0.2)",
+                background: "rgba(251, 191, 36, 0.06)",
+                padding: "16px",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: "0.72rem",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.12em",
+                  color: "#fbbf24",
+                  marginBottom: "8px",
+                }}
+              >
+                Three-way split segments
+              </div>
+              {renderThreeWaySegments(threeWay)}
+            </div>
+          )}
         </div>
       </section>
 
@@ -405,6 +783,54 @@ export function OptimizationResultsPage() {
           {oosEvidence.message}
         </div>
       </section>
+
+      {hasThreeWay && threeWay && (
+        <>
+          <section
+            style={{
+              borderRadius: "22px",
+              border: "1px solid rgba(148, 163, 184, 0.16)",
+              background:
+                "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+              padding: "18px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "12px",
+                alignItems: "center",
+                marginBottom: "16px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <div
+                  style={{
+                    fontSize: "0.72rem",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.14em",
+                    color: "#fbbf24",
+                  }}
+                >
+                  Winner metrics per segment
+                </div>
+                <div
+                  style={{ marginTop: "4px", fontSize: "1.02rem", fontWeight: 700 }}
+                >
+                  Trial #{threeWay.winner.trial_number} — validation-selected, test-reported
+                </div>
+              </div>
+            </div>
+            {renderThreeWayWinnerMetrics(threeWay)}
+          </section>
+
+          {renderOverfittingVerdict(threeWay.overfitting)}
+
+          {renderTestDistribution(threeWay.test_distribution, threeWay.selection)}
+        </>
+      )}
 
       <section
         style={{
@@ -580,68 +1006,70 @@ export function OptimizationResultsPage() {
         </div>
       </section>
 
-      <section
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
-          gap: "14px",
-        }}
-      >
-        {[
-          {
-            title: "In-Sample",
-            tone: "#7dd3fc",
-            stats: optimization.train_stats,
-          },
-          {
-            title: "Out-of-Sample",
-            tone: "#86efac",
-            stats: optimization.test_stats,
-          },
-        ].map((panel) => (
-          <div
-            key={panel.title}
-            style={{
-              borderRadius: "22px",
-              border: "1px solid rgba(148, 163, 184, 0.16)",
-              background:
-                "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
-              padding: "18px",
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <Layers3 size={16} color={panel.tone} />
-              <div style={{ fontSize: "1rem", fontWeight: 700 }}>
-                {panel.title}
+      {!hasThreeWay && (
+        <section
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+            gap: "14px",
+          }}
+        >
+          {[
+            {
+              title: "In-Sample",
+              tone: "#7dd3fc",
+              stats: optimization.train_stats,
+            },
+            {
+              title: "Out-of-Sample",
+              tone: "#86efac",
+              stats: optimization.test_stats,
+            },
+          ].map((panel) => (
+            <div
+              key={panel.title}
+              style={{
+                borderRadius: "22px",
+                border: "1px solid rgba(148, 163, 184, 0.16)",
+                background:
+                  "linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 0.94))",
+                padding: "18px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <Layers3 size={16} color={panel.tone} />
+                <div style={{ fontSize: "1rem", fontWeight: 700 }}>
+                  {panel.title}
+                </div>
+              </div>
+              <div style={{ marginTop: "14px", display: "grid", gap: "10px" }}>
+                {COMPARISON_ROWS.map((row) => (
+                  <div
+                    key={row.key}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "12px",
+                      borderRadius: "16px",
+                      border: "1px solid rgba(148, 163, 184, 0.12)",
+                      background: "rgba(15, 23, 42, 0.78)",
+                      padding: "12px 14px",
+                    }}
+                  >
+                    <span style={{ color: "var(--color-text-muted)" }}>
+                      {row.label}
+                    </span>
+                    <span style={{ fontWeight: 700, color: panel.tone }}>
+                      {formatComparisonValue(row.key, panel.stats?.[row.key])}
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
-            <div style={{ marginTop: "14px", display: "grid", gap: "10px" }}>
-              {COMPARISON_ROWS.map((row) => (
-                <div
-                  key={row.key}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: "12px",
-                    borderRadius: "16px",
-                    border: "1px solid rgba(148, 163, 184, 0.12)",
-                    background: "rgba(15, 23, 42, 0.78)",
-                    padding: "12px 14px",
-                  }}
-                >
-                  <span style={{ color: "var(--color-text-muted)" }}>
-                    {row.label}
-                  </span>
-                  <span style={{ fontWeight: 700, color: panel.tone }}>
-                    {formatComparisonValue(row.key, panel.stats?.[row.key])}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-      </section>
+          ))}
+        </section>
+      )}
 
       <section
         style={{
