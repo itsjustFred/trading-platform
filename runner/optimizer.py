@@ -24,7 +24,7 @@ from runner.optimization_diagnostics import (
     walk_forward_train_validation_folds,
 )
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
-from runner.stats import compute_stats_for_result
+from runner.stats import compute_stats_for_result, daily_returns_moments
 from runner.universe_provenance import (
     UNIVERSE_PROVENANCE_KEY,
     observe_symbol_coverage,
@@ -729,6 +729,22 @@ def run_optimization(
         ) from last_trial_exception
 
     best_trial = _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
+    # Every completed trial is evaluated on the VALIDATION segment, after the
+    # search is over and before the winner is fixed. Nothing in the objective
+    # or the search can see this window.
+    _evaluate_trials_on_validation(
+        trials=completed_trials,
+        validation_period=validation_period,
+        config=config,
+        base_parameters=base_parameters,
+        symbols=symbols,
+        timeframe=timeframe,
+        initial_capital=initial_capital,
+        base_runtime=base_runtime,
+        strategy_slug=strategy_slug,
+        strategy_path=strategy_path,
+        progress_callback=progress_callback,
+    )
     best_params = {
         key: value
         for key, value in dict(best_trial.params).items()
@@ -899,6 +915,15 @@ def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
 #: the study optimises, only what can be said about the choice afterwards.
 SUBPERIOD_PNL_ATTR = "subperiod_pnl"
 
+#: Optuna user attrs recording a trial's VALIDATION result (#164). Written
+#: once, after the search, for every completed trial; selection reads them and
+#: the test holdout is never stored here.
+VALIDATION_STATS_ATTR = "validation_stats"
+VALIDATION_MOMENTS_ATTR = "validation_moments"
+VALIDATION_SCORE_ATTR = "validation_score"
+VALIDATION_METRIC_ATTR = "validation_metric_value"
+VALIDATION_FAILURE_ATTR = "validation_failure_reason"
+
 
 def _stability_subperiods(
     train_period: Mapping[str, str],
@@ -979,6 +1004,171 @@ def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]
         ((_trade_realization_time(trade), _trade_net_pnl(trade)) for trade in result.trades),
         subperiods,
     )
+
+
+def _run_period_backtest(
+    *,
+    strategy_slug: str,
+    strategy_path: Path,
+    symbols: Sequence[str],
+    timeframe: str,
+    period: Mapping[str, str],
+    initial_capital: float,
+    parameters: Mapping[str, Any],
+    base_runtime: Mapping[str, Any],
+) -> BacktestResult:
+    """Run one trial's parameter set over one segment."""
+    return _run_vectorbt_backtest(
+        BacktestConfig(
+            strategy_name=strategy_slug,
+            symbols=list(symbols),
+            timeframe=timeframe,
+            start_date=period["start"],
+            end_date=period["end"],
+            initial_capital=initial_capital,
+            parameters=dict(parameters),
+            **dict(base_runtime),
+        ),
+        strategy_path,
+    )
+
+
+def _trial_effective_parameters(
+    trial: Any,
+    base_parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The full parameter set a trial ran with.
+
+    Read from the attr the objective recorded, so a validation re-run uses
+    exactly the configuration the study scored (including the derived symbol
+    universe). Falls back to base + suggested params for a study that did not
+    record it.
+    """
+    stored = getattr(trial, "user_attrs", {}).get("effective_parameters")
+    if isinstance(stored, Mapping) and stored:
+        return dict(stored)
+    combined = dict(base_parameters)
+    for key, value in dict(getattr(trial, "params", {}) or {}).items():
+        if str(key).startswith(_INTERNAL_PARAM_PREFIX):
+            continue
+        combined[key] = value
+    return combined
+
+
+def _trial_selection_score(
+    stats: Mapping[str, Any],
+    config: OptimizationConfig,
+) -> tuple[float, float]:
+    """Validation score of a trial, oriented so higher is always better.
+
+    Returns ``(score, raw_metric)``. Raw maximize targets get the same
+    trade-count/drawdown haircut the objective applies, so a lucky sparse
+    validation run cannot outrank a robust one; for a ``minimize`` study
+    (p_value) the score is negated, so the pure selection function's
+    higher-is-better contract still holds.
+    """
+    raw_metric = _metric_value(dict(stats), config.target_metric)
+    score = raw_metric
+    if config.risk_adjust_objective:
+        metric_key = _metric_key(config.target_metric, dict(stats))
+        score, _terms = _risk_adjusted_metric_value(
+            raw_metric,
+            dict(stats),
+            metric_key=metric_key,
+            direction=_study_direction(config.target_metric),
+            min_trades_for_full_credit=config.min_trades_for_full_credit,
+            drawdown_penalty_weight=config.drawdown_penalty_weight,
+        )
+    if _study_direction(config.target_metric) == "minimize":
+        # p_value: smaller is better, so negate it to keep "higher is better".
+        score = -score
+    return score, raw_metric
+
+
+def _evaluate_trials_on_validation(
+    *,
+    trials: Sequence[Any],
+    validation_period: Mapping[str, str],
+    config: OptimizationConfig,
+    base_parameters: Mapping[str, Any],
+    symbols: Sequence[str],
+    timeframe: str,
+    initial_capital: float,
+    base_runtime: Mapping[str, Any],
+    strategy_slug: str,
+    strategy_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Evaluate every completed trial on the VALIDATION segment (#164).
+
+    The search never sees this window. Each trial's train result is already
+    stored by the objective; this adds its validation result, validation score
+    and daily-return moments (the deflated Sharpe needs them per trial).
+
+    A trial whose validation run fails, or whose target metric cannot be
+    computed, is recorded as unselectable rather than aborting the study: one
+    bad parameter region must not hide the rest. Returns one row per completed
+    trial; ``selectable`` is False for penalty (no-trade) trials and for
+    validation failures.
+    """
+    rows: list[dict[str, Any]] = []
+    total = max(len(trials), 1)
+    for index, trial in enumerate(trials, start=1):
+        _emit_progress(
+            progress_callback,
+            100.0,
+            f"Evaluating trial {index}/{total} on validation.",
+        )
+        user_attrs = getattr(trial, "user_attrs", {})
+        penalty_applied = bool(user_attrs.get("penalty_applied", False))
+        row: dict[str, Any] = {
+            "number": int(trial.number),
+            "trial": trial,
+            "selectable": False,
+            "validation_score": None,
+            "validation_metric_value": None,
+            "validation_stats": {},
+            "validation_moments": None,
+        }
+        try:
+            result = _run_period_backtest(
+                strategy_slug=strategy_slug,
+                strategy_path=strategy_path,
+                symbols=user_attrs.get("symbols") or symbols,
+                timeframe=timeframe,
+                period=validation_period,
+                initial_capital=initial_capital,
+                parameters=_trial_effective_parameters(trial, base_parameters),
+                base_runtime=base_runtime,
+            )
+            stats = _canonical_stats(result)
+            score, raw_metric = _trial_selection_score(stats, config)
+            moments = daily_returns_moments(result.equity_curve)
+        except (ValueError, RuntimeError, KeyError) as exc:
+            trial.set_user_attr(
+                VALIDATION_FAILURE_ATTR, f"{type(exc).__name__}: {exc}"
+            )
+            rows.append(row)
+            continue
+
+        trial.set_user_attr(VALIDATION_STATS_ATTR, _json_safe(stats))
+        trial.set_user_attr(VALIDATION_MOMENTS_ATTR, _json_safe(moments))
+        trial.set_user_attr(VALIDATION_SCORE_ATTR, float(score))
+        trial.set_user_attr(VALIDATION_METRIC_ATTR, float(raw_metric))
+        row.update(
+            {
+                # A no-trade trial stays unselectable even if it happens to
+                # trade on validation: the penalty marks a parameter region the
+                # study must not hand back as its answer.
+                "selectable": not penalty_applied,
+                "validation_score": float(score),
+                "validation_metric_value": float(raw_metric),
+                "validation_stats": stats,
+                "validation_moments": moments,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def _build_diagnostics_payload(

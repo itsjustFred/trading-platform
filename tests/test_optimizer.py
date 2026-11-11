@@ -496,7 +496,9 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert len(payload["top_trials"]) == 4
     assert payload["top_trials"][0]["params"] == {"window": 3}
     assert any(trial["penalty_applied"] for trial in payload["top_trials"])
-    assert len(calls) == 5
+    # 4 train runs + 4 validation runs + 1 test run for the top-set winner
+    # (10% of 4 trials rounds up to one).
+    assert len(calls) == 9
     assert progress_updates[0] == (0.0, "Starting Optuna optimization.")
     assert any("✅ Trial" in message for _, message in progress_updates)
     assert progress_updates[-1][0] == 100.0
