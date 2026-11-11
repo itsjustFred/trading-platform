@@ -1,8 +1,15 @@
+import math
+
 import pandas as pd
 import pytest
 
 from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
+
+# Issue #151: a (lot_step, steps) pair for which `(steps * lot_step) / lot_step`
+# is an ulp below `steps`, i.e. a second floor would lose a step.
+_NON_IDEMPOTENT_LOT_STEP = 0.01
+_NON_IDEMPOTENT_STEPS = 25602
 
 
 def _engine(params=None, **config_overrides):
@@ -141,6 +148,37 @@ def test_fixed_risk_uncapped_path_is_unchanged_by_cap_normalisation():  # Issue 
     )
 
     assert quantity == pytest.approx(5.0)
+
+
+def test_fixed_risk_uncapped_size_is_not_floored_a_second_time():  # Issue #151
+    # Flooring `k * lot_step` twice is not idempotent in floating point: for
+    # this k the quotient `(k * lot_step) / lot_step` lands an ulp below k, so
+    # a second floor would silently drop a whole lot step from a size the cap
+    # never touched. The re-normalisation must only run when the cap binds.
+    lot_step = _NON_IDEMPOTENT_LOT_STEP
+    k = _NON_IDEMPOTENT_STEPS
+    assert math.floor((k * lot_step) / lot_step + 1e-12) != k, "fixture must be non-idempotent"
+    engine = _engine(
+        {
+            # Risk-derived raw size sits half a step above k steps.
+            "fixed_risk_amount": k * lot_step + lot_step / 2,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": lot_step,
+            "min_lot": lot_step,
+        },
+        initial_capital=1_000_000_000.0,
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=99.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == k * lot_step
 
 
 def test_fixed_risk_cap_below_min_lot_creates_no_order():  # Issue #151
