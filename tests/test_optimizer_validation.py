@@ -23,6 +23,24 @@ from runner import optimizer as optimizer_module
 from runner.engines.base import BacktestConfig
 from runner.optimizer import OptimizationConfig, run_optimization
 
+
+def _fixed_three_way_split() -> optimizer_module.ThreeWaySplit:
+    """Three-way split with every segment and gap on a fixed date, for tests
+    that patch ``_split_backtest_period`` and need to know each window."""
+    return optimizer_module.ThreeWaySplit(
+        train={"start": "2024-01-01T00:00:00+00:00", "end": "2024-05-01T00:00:00+00:00"},
+        validation={"start": "2024-06-01T00:00:00+00:00", "end": "2024-09-01T00:00:00+00:00"},
+        test={"start": "2024-10-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
+        embargo_train_val={
+            "start": "2024-05-01T00:00:00+00:00",
+            "end": "2024-06-01T00:00:00+00:00",
+        },
+        embargo_val_test={
+            "start": "2024-09-01T00:00:00+00:00",
+            "end": "2024-10-01T00:00:00+00:00",
+        },
+    )
+
 # ─── F30: covariance from market data, not trade-PnL pseudo-equity ──────────
 
 
@@ -136,10 +154,7 @@ class TestNoTradeTrialsCannotWin:
         )
         monkeypatch.setattr(
             optimizer_module, "_split_backtest_period",
-            lambda s, e, pct, **kwargs: (
-                {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
-                {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
-            ),
+            lambda *args, **kwargs: _fixed_three_way_split(),
         )
         monkeypatch.setattr(
             optimizer_module,
@@ -402,10 +417,7 @@ class TestMetricDirection:
         monkeypatch.setattr(
             optimizer_module,
             "_split_backtest_period",
-            lambda s, e, pct, **kwargs: (
-                {"start": "2024-01-01T00:00:00+00:00", "end": "2024-06-01T00:00:00+00:00"},
-                {"start": "2024-06-01T00:00:00+00:00", "end": "2024-12-31T00:00:00+00:00"},
-            ),
+            lambda *args, **kwargs: _fixed_three_way_split(),
         )
         monkeypatch.setattr(
             optimizer_module,
@@ -555,28 +567,32 @@ class TestRiskAdjustedObjectiveWiring:
 # ─── embargo is applied to the windows that actually run ────────────────────
 
 
-def test_split_period_applies_an_embargo_gap():
-    """The embargo must move the real test start, not only be reported."""
+def test_split_period_applies_an_embargo_gap_between_every_pair():
+    """The embargo must move the real segment starts, not only be reported."""
     import pandas as pd
 
     import runner.optimizer as opt
 
-    train, test = opt._split_backtest_period(
+    split = opt._split_backtest_period(
         "2024-01-01T00:00:00+00:00",
-        "2024-01-11T00:00:00+00:00",
-        0.7,
+        "2024-01-21T00:00:00+00:00",
+        0.6,
+        validation_split_pct=0.2,
+        test_split_pct=0.2,
         embargo_days=0,
-        embargo_pct=0.1,
+        embargo_pct=0.05,
     )
-    train_end = pd.Timestamp(train["end"])
-    test_start = pd.Timestamp(test["start"])
-    assert test_start > train_end
-    # 10-day window, 10% embargo => a day of dead time. Asserted as an explicit
-    # interval rather than an approximate Timedelta: the percentage is applied
-    # in floating point, so the exact nanosecond is not a contract, but "a day,
-    # not an hour and not two days" is.
-    gap = test_start - train_end
-    assert pd.Timedelta(hours=23) < gap <= pd.Timedelta(days=1, seconds=1)
+    train_to_validation = pd.Timestamp(split.validation["start"]) - pd.Timestamp(
+        split.train["end"]
+    )
+    validation_to_test = pd.Timestamp(split.test["start"]) - pd.Timestamp(
+        split.validation["end"]
+    )
+    # 20-day window, 5% embargo => a day of dead time before each of the two
+    # later segments. Asserted as an interval: the percentage is applied in
+    # floating point, so the exact nanosecond is not a contract.
+    for gap in (train_to_validation, validation_to_test):
+        assert pd.Timedelta(hours=23) < gap <= pd.Timedelta(days=1, seconds=1)
 
 
 def test_split_period_without_embargo_stays_contiguous():
@@ -584,27 +600,30 @@ def test_split_period_without_embargo_stays_contiguous():
 
     import runner.optimizer as opt
 
-    train, test = opt._split_backtest_period(
+    split = opt._split_backtest_period(
         "2024-01-01T00:00:00+00:00",
         "2024-01-11T00:00:00+00:00",
-        0.7,
+        0.6,
+        validation_split_pct=0.2,
+        test_split_pct=0.2,
         embargo_days=0,
     )
-    # No embargo requested: the windows are contiguous but must not share the
-    # split bar, so the gap is exactly the one-microsecond offset.
-    assert (
-        pd.Timestamp(test["start"]) - pd.Timestamp(train["end"])
-    ) == pd.Timedelta(microseconds=1)
+    # No embargo requested: each segment starts exactly where the previous one
+    # ends. Production runs default to a one-day embargo.
+    assert pd.Timestamp(split.validation["start"]) == pd.Timestamp(split.train["end"])
+    assert pd.Timestamp(split.test["start"]) == pd.Timestamp(split.validation["end"])
 
 
-def test_split_period_rejects_an_embargo_that_eats_the_test_window():
+def test_split_period_rejects_an_embargo_that_eats_a_segment():
     import runner.optimizer as opt
 
-    with pytest.raises(ValueError, match="empty train or test period"):
+    with pytest.raises(ValueError, match="train segment would be empty"):
         opt._split_backtest_period(
             "2024-01-01T00:00:00+00:00",
             "2024-01-11T00:00:00+00:00",
-            0.9,
+            0.4,
+            validation_split_pct=0.2,
+            test_split_pct=0.4,
             embargo_days=0,
             embargo_pct=0.5,
         )
@@ -617,7 +636,7 @@ def test_split_period_rejects_a_negative_embargo():
         opt._split_backtest_period(
             "2024-01-01T00:00:00+00:00",
             "2024-01-11T00:00:00+00:00",
-            0.7,
+            0.6,
             embargo_pct=-0.1,
         )
 
@@ -626,7 +645,8 @@ def test_reported_split_geometry_matches_the_applied_split():
     """The diagnostics must describe the windows that actually ran.
 
     Previously the embargo was applied only in the report, so the payload
-    described a dead gap that the optimizer never used.
+    described a dead gap that the optimizer never used. Now the report carries
+    all three segments and both gaps that ran (#164).
     """
     from types import SimpleNamespace
 
@@ -638,33 +658,44 @@ def test_reported_split_geometry_matches_the_applied_split():
         base_backtest_id="bt_x",
         target_metric="sharpe_ratio",
         n_trials=2,
-        train_split_pct=0.7,
+        train_split_pct=0.6,
         embargo_pct=0.1,
         walk_forward_splits=2,
         parameter_ranges={"window": {"type": "int", "min": 2, "max": 3}},
     )
-    train, test = opt._split_backtest_period(
+    split = opt._split_backtest_period(
         "2024-01-01T00:00:00+00:00",
         "2024-07-01T00:00:00+00:00",
-        config.train_split_pct,
+        train_split_pct=config.train_split_pct,
+        validation_split_pct=config.validation_split_pct,
+        test_split_pct=config.test_split_pct,
         embargo_pct=config.embargo_pct,
     )
     payload = opt._build_diagnostics_payload(
         trials=[SimpleNamespace(params={"window": 2}, value=1.0)],
         config=config,
-        train_period=train,
-        test_period=test,
+        train_period=split.train,
+        validation_period=split.validation,
+        test_period=split.test,
         target_metric="sharpe_ratio",
     )
-    reported_gap = pd.Timestamp(payload["split"]["test"]["start"]) - pd.Timestamp(
-        payload["split"]["train"]["end"]
-    )
-    assert reported_gap > pd.Timedelta(0), (
-        "the reported embargo must be a real gap, not a contiguous boundary"
-    )
-    # The reported train/test boundaries must match the applied ones.
-    assert payload["split"]["train"]["start"] == train["start"]
-    assert payload["split"]["test"]["end"] == test["end"]
+    for earlier_end, later_start in (
+        (payload["split"]["train"]["end"], payload["split"]["validation"]["start"]),
+        (payload["split"]["validation"]["end"], payload["split"]["test"]["start"]),
+    ):
+        assert pd.Timestamp(later_start) - pd.Timestamp(earlier_end) > pd.Timedelta(0), (
+            "each reported embargo must be a real gap"
+        )
+    # The reported boundaries must match the applied ones.
+    assert payload["split"]["train"]["start"] == split.train["start"]
+    assert payload["split"]["validation"] == split.validation
+    assert payload["split"]["test"]["end"] == split.test["end"]
+    # The walk-forward folds must stop at the validation end, i.e. before the
+    # test holdout and its embargo.
+    folds = payload["walk_forward_folds"]
+    assert folds
+    last_fold_end = pd.Timestamp(folds[-1]["test"]["end"])
+    assert last_fold_end <= pd.Timestamp(split.validation["end"])
 
 
 def test_run_optimization_forwards_the_configured_embargo():

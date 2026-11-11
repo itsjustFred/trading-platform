@@ -651,7 +651,8 @@ def _train_subperiods() -> list[dict[str, str]]:
     import runner.optimizer as opt
     from runner.optimization_diagnostics import subperiods_from_walk_forward, walk_forward_splits
 
-    train_period, _test_period = opt._split_backtest_period("2024-01-01", "2024-06-01", 0.7)
+    split = opt._split_backtest_period("2024-01-01", "2024-06-01", 0.7)
+    train_period = split.train
     folds = walk_forward_splits(
         train_period["start"], train_period["end"], n_splits=2, train_fraction=0.7
     )

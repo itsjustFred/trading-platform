@@ -48,22 +48,38 @@ def test_optimization_config_enforces_inclusive_train_split_upper_bound():
 
 
 def test_split_backtest_period_returns_positive_non_overlapping_segments():
-    train_period, test_period = optimizer_module._split_backtest_period(
+    split = optimizer_module._split_backtest_period(
         "2024-01-01",
         "2024-01-10",
-        0.7,
+        0.6,
+        validation_split_pct=0.2,
+        test_split_pct=0.2,
     )
 
-    train_start = datetime.fromisoformat(train_period["start"])
-    train_end = datetime.fromisoformat(train_period["end"])
-    test_start = datetime.fromisoformat(test_period["start"])
-    test_end = datetime.fromisoformat(test_period["end"])
+    train_start = datetime.fromisoformat(split.train["start"])
+    train_end = datetime.fromisoformat(split.train["end"])
+    validation_start = datetime.fromisoformat(split.validation["start"])
+    validation_end = datetime.fromisoformat(split.validation["end"])
+    test_start = datetime.fromisoformat(split.test["start"])
+    test_end = datetime.fromisoformat(split.test["end"])
 
-    assert train_start < train_end < test_start < test_end
+    assert train_start < train_end < validation_start < validation_end < test_start < test_end
 
 
-def test_split_backtest_period_rejects_range_too_short_for_both_segments():
-    with pytest.raises(ValueError, match="empty train or test period"):
+def test_split_backtest_period_derives_equal_validation_and_test_shares():
+    split = optimizer_module._split_backtest_period("2024-01-01", "2024-01-10", 0.7)
+
+    validation = datetime.fromisoformat(split.validation["end"]) - datetime.fromisoformat(
+        split.validation["start"]
+    )
+    test = datetime.fromisoformat(split.test["end"]) - datetime.fromisoformat(
+        split.test["start"]
+    )
+    assert validation == test
+
+
+def test_split_backtest_period_rejects_range_too_short_for_all_segments():
+    with pytest.raises(ValueError, match="train segment would be empty"):
         optimizer_module._split_backtest_period(
             "2024-01-01T00:00:00+00:00",
             "2024-01-01T00:00:00.000001+00:00",
@@ -293,8 +309,8 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: dense train coverage (01-01..01-07 daily) so the TRAIN gate
-    # passes and the TEST gate (01-07..01-10, empty) is the one that fails.
+    # #86: dense TRAIN and VALIDATION coverage (01-01..01-07 daily) so their
+    # gates pass and the TEST gate (01-09..01-10, empty) is the one that fails.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
@@ -329,7 +345,9 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
         _forbid_call("Backtest started before exact bar coverage validation"),
     )
 
-    config = _optimization_config(train_split_pct=0.7)
+    # 60/20/20 puts train on 01-01..01-04, validation on 01-06..01-07 and the
+    # empty test holdout on 01-09..01-10.
+    config = _optimization_config(train_split_pct=0.6)
     with pytest.raises(ValueError, match=r"test.*AAPL 1d"):
         optimizer_module.run_optimization(config)
 
@@ -379,8 +397,9 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: AAPL dense across the full window (passes both gates);
-    # MSFT dense in train only (01-01..01-07) so the TEST gate names MSFT.
+    # #86: AAPL dense across the full window (passes every gate);
+    # MSFT dense in train and validation only (01-01..01-07) so the TEST gate
+    # names MSFT.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
@@ -415,7 +434,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
         base_backtest_id="base-demo",
         target_metric="sharpe",
         n_trials=1,
-        train_split_pct=0.7,
+        train_split_pct=0.6,
         parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
         symbol_universes=[["AAPL", "MSFT"]],
     )
@@ -951,21 +970,22 @@ class TestRiskAdjustedObjective:
                 direction="maximize",
             )
 
-    def test_embargo_separates_train_and_test(self) -> None:
+    def test_embargo_separates_train_and_validation(self) -> None:
         from datetime import datetime
 
-        train, test = optimizer_module._split_backtest_period(
-            "2024-01-01", "2024-01-10", 0.7, embargo_days=1
+        split = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.6, embargo_days=1
         )
-        test_start = datetime.fromisoformat(test["start"])
-        train_end = datetime.fromisoformat(train["end"])
-        assert (test_start - train_end).days >= 1
+        validation_start = datetime.fromisoformat(split.validation["start"])
+        train_end = datetime.fromisoformat(split.train["end"])
+        assert (validation_start - train_end).days >= 1
 
     def test_zero_embargo_keeps_adjacent_segments(self) -> None:
-        train, test = optimizer_module._split_backtest_period(
-            "2024-01-01", "2024-01-10", 0.7, embargo_days=0
+        split = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.6, embargo_days=0
         )
-        assert train["end"] < test["start"]
+        assert split.train["end"] == split.validation["start"]
+        assert split.validation["end"] == split.test["start"]
 
 
 class TestGridHardening:

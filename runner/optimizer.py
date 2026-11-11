@@ -18,6 +18,11 @@ from data_tools.auto_download import ensure_backtest_data, has_sufficient_segmen
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from runner.optimization_diagnostics import (
+    ThreeWaySplit,
+    three_way_split,
+    walk_forward_train_validation_folds,
+)
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result
 from runner.universe_provenance import (
@@ -453,13 +458,18 @@ def run_optimization(
         backtest_start = backtest_start or detected_start
         backtest_end = backtest_end or detected_end
 
-    train_period, test_period = _split_backtest_period(
+    split = _split_backtest_period(
         backtest_start,
         backtest_end,
-        config.train_split_pct,
+        train_split_pct=config.train_split_pct,
+        validation_split_pct=config.validation_split_pct,
+        test_split_pct=config.test_split_pct,
         embargo_days=config.embargo_days,
         embargo_pct=float(config.embargo_pct or 0.0),
     )
+    train_period = split.train
+    validation_period = split.validation
+    test_period = split.test
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
@@ -482,6 +492,10 @@ def run_optimization(
     )
 
     if config.optimization_mode == "risk_parity_covariance":
+        # This mode has no Optuna trial search: covariance is fitted on train
+        # and the selected universe is reported on the test holdout. The
+        # validation segment exists in `split` but plays no role here because
+        # there is no trial selection to make.
         return _run_risk_parity_covariance_optimization(
             config=config,
             base_result=base_result,
@@ -514,7 +528,11 @@ def run_optimization(
         end=backtest_end,
         data_dir=data_dir,
     )
-    for segment_name, period in (("train", train_period), ("test", test_period)):
+    for segment_name, period in (
+        ("train", train_period),
+        ("validation", validation_period),
+        ("test", test_period),
+    ):
         for symbol in required_symbols:
             coverage_kwargs: dict[str, Any] = {
                 "symbol": symbol,
@@ -797,6 +815,7 @@ def run_optimization(
                 trials=study.trials,
                 config=config,
                 train_period=train_period,
+                validation_period=validation_period,
                 test_period=test_period,
                 target_metric=config.target_metric,
                 timeframe=timeframe,
@@ -890,9 +909,9 @@ def _stability_subperiods(
 
     Taken from the walk-forward folds of the TRAIN window — the window the
     trials were actually scored on — so the comparison is like-for-like. The
-    reported walk-forward folds cover train+test, so the sub-periods here are
-    deliberately a different, narrower set; both are reported, and each carries
-    its own bounds.
+    reported walk-forward folds cover train+validation (never the test
+    holdout), so the sub-periods here are deliberately a different, narrower
+    set; both are reported, and each carries its own bounds.
 
     Returns [] when the window is too short for a fold. That is a reportable
     absence, not a failure: the stability view then says "unknown".
@@ -967,6 +986,7 @@ def _build_diagnostics_payload(
     trials: Sequence[Any],
     config: OptimizationConfig,
     train_period: Mapping[str, str],
+    validation_period: Mapping[str, str],
     test_period: Mapping[str, str],
     target_metric: str,
     timeframe: str | None = None,
@@ -992,70 +1012,68 @@ def _build_diagnostics_payload(
     reports "unknown" rather than silently disappearing).
     """
     from runner.optimization_diagnostics import (
-        embargo_split,
         multiple_testing_correction,
         plateau_analysis,
         subperiod_parameter_stability,
-        walk_forward_splits,
     )
 
     payload: dict[str, Any] = {}
     bar_duration = _timeframe_bar_duration(timeframe)
 
-    # 1. Split geometry, including the gap between train and test.
+    # 1. Split geometry, including both embargo gaps (#164).
+    #    The three segments and their gaps are the windows that RAN, not a
+    #    recomputation: a re-derived split has drifted from the applied one
+    #    before (see the removed `embargo_split` call), and a reader cannot
+    #    tell which of two answers in the same artifact to trust.
     try:
-        split = embargo_split(
-            train_period["start"],
-            test_period["end"],
-            train_split_pct=config.train_split_pct,
-            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
-            bar_duration=bar_duration,
-        )
-        reported = split.as_dict()
-        # The gap is `embargo_days` PLUS `embargo_pct` - `_split_backtest_period`
-        # applies both, and `embargo_split` models only the percentage. So this
-        # re-derived split was not the one that ran: with the default
-        # embargo_days=1 the reported test start came out a full day earlier than
-        # the real one, and `embargo_bars_equivalent` read 0.0 for a study that
-        # dropped a day.
-        #
-        # `9d6a29c` removed one fiction from this payload and left another of the
-        # opposite sign, and the artifact carried both answers - the correct
-        # `train_period`/`test_period` beside this one. The fix is to report the
-        # windows that ran rather than recompute them, and to take the embargo
-        # geometry from the same place they came from.
-        actual_gap = pd.Timedelta(
-            pd.Timestamp(test_period["start"]) - pd.Timestamp(train_period["end"])
-        )
-        reported["test"] = dict(test_period)
-        reported["embargo"] = {
+        embargo_train_val = {
             "start": train_period["end"],
+            "end": validation_period["start"],
+        }
+        embargo_val_test = {
+            "start": validation_period["end"],
             "end": test_period["start"],
         }
-        reported["embargo_bars_equivalent"] = (
-            float(actual_gap / bar_duration) if bar_duration else 0.0
+        train_validation_gap = pd.Timedelta(
+            pd.Timestamp(validation_period["start"]) - pd.Timestamp(train_period["end"])
         )
+        reported: dict[str, Any] = {
+            "train": dict(train_period),
+            "validation": dict(validation_period),
+            "test": dict(test_period),
+            "embargo_train_val": embargo_train_val,
+            "embargo_val_test": embargo_val_test,
+            # Legacy key: before #164 the split had one gap, into the segment
+            # trial results were judged on. That segment is now validation.
+            "embargo": dict(embargo_train_val),
+            "embargo_bars_equivalent": (
+                float(train_validation_gap / bar_duration) if bar_duration else 0.0
+            ),
+        }
         payload["split"] = reported
     except (ValueError, KeyError) as exc:
         payload["split"] = {"error": str(exc)}
 
-    # 2. Walk-forward fold BOUNDARIES (train/test windows per fold). This is
-    #    the geometry used to cut the sub-periods for the stability view below;
-    #    no parameter is re-fitted per fold and no per-fold performance is
-    #    computed, so it is not walk-forward evidence. The key says so (it was
-    #    ``walk_forward``, which read like a result).
+    # 2. Walk-forward fold BOUNDARIES inside the range before the test holdout
+    #    and its embargo. This is the geometry used to cut the sub-periods for
+    #    the stability view below; no parameter is re-fitted per fold and no
+    #    per-fold performance is computed, so it is not walk-forward evidence.
+    #    The key says so (it was ``walk_forward``, which read like a result).
     payload["walk_forward_note"] = (
-        "Fold boundaries only: no per-fold performance was computed, so this is "
-        "not walk-forward evidence."
+        "Fold boundaries only, inside the range before the test holdout and its "
+        "embargo: no per-fold performance was computed, so this is not "
+        "walk-forward evidence."
     )
     try:
-        payload["walk_forward_folds"] = walk_forward_splits(
+        payload["walk_forward_folds"] = walk_forward_train_validation_folds(
             train_period["start"],
             test_period["end"],
             n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
             train_fraction=config.train_split_pct,
             embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
             bar_duration=bar_duration,
+            test_fraction=float(config.test_split_pct or 0.0),
+            embargo_days=int(getattr(config, "embargo_days", 0) or 0),
         )
     except (ValueError, KeyError) as exc:
         payload["walk_forward_folds"] = {"error": str(exc)}
@@ -1212,18 +1230,29 @@ def _resolve_strategy_reference(result: BacktestResult) -> tuple[str, Path, str]
 def _split_backtest_period(
     start_value: str,
     end_value: str,
-    train_split_pct: float,
+    train_split_pct: float = 0.6,
+    validation_split_pct: float | None = None,
+    test_split_pct: float | None = None,
     embargo_days: int = 1,
     embargo_pct: float = 0.0,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Split into train / embargo-gap / test windows.
+) -> ThreeWaySplit:
+    """Split the base range into train / validation / test windows (#164).
 
-    ``embargo_pct`` drops a gap between the two windows, on top of the fixed
-    ``embargo_days``. A trade opened just before the split can still be open
-    during the test window, so its label contains test information; without the
-    gap that leaks backwards into training. The gap is applied here, to the
+    The split itself is :func:`runner.optimization_diagnostics.three_way_split`:
+    train, embargo, validation, embargo, test, with test as the final holdout.
+    Callers must not derive a two-way split from the result: the search runs on
+    ``train`` only, selection on ``validation``, and ``test`` is read once the
+    winner is fixed.
+
+    ``embargo_pct`` drops a gap between each pair of segments, on top of the
+    fixed ``embargo_days``. A trade opened just before a split can still be open
+    in the next segment, so its label contains that segment's information;
+    without the gap that leaks backwards. The gap is applied here, to the
     windows that actually run, rather than only being reported by the
     diagnostics.
+
+    ``validation_split_pct``/``test_split_pct`` default to the remainder
+    ``1 - train_split_pct`` split equally, matching ``OptimizationConfig``.
     """
     if embargo_pct < 0.0:
         raise ValueError("embargo_pct must not be negative")
@@ -1235,36 +1264,25 @@ def _split_backtest_period(
             f"Base backtest period is invalid: start={start_value!r}, end={end_value!r}"
         )
 
-    split_ts = start_ts + ((end_ts - start_ts) * train_split_pct)
-    if split_ts <= start_ts:
-        split_ts = start_ts + pd.Timedelta(microseconds=1)
-    if split_ts >= end_ts:
-        split_ts = end_ts - pd.Timedelta(microseconds=1)
-    if split_ts <= start_ts or split_ts >= end_ts:
+    if validation_split_pct is None and test_split_pct is None:
+        remainder = 1.0 - train_split_pct
+        validation_split_pct = remainder / 2.0
+        test_split_pct = remainder / 2.0
+    elif validation_split_pct is None or test_split_pct is None:
         raise ValueError(
-            "train_split_pct produces an empty train or test period for the base backtest range"
+            "Both validation_split_pct and test_split_pct must be provided together, "
+            "or neither (to use the equal-split default)"
         )
 
-    # C3: embargo gap — the test window starts after the split so no bar
-    # (and no indicator warmup overlap) is shared. The old split+1µs
-    # boundary leaked the split bar into both segments. `embargo_pct` scales
-    # the gap with the length of the backtest; `embargo_days` is the fixed
-    # component. Both are applied to the windows that run, not just reported.
-    embargo = pd.Timedelta(days=max(int(embargo_days), 0)) + (
-        (end_ts - start_ts) * float(embargo_pct)
+    return three_way_split(
+        start_ts,
+        end_ts,
+        train_fraction=train_split_pct,
+        validation_fraction=validation_split_pct,
+        test_fraction=test_split_pct,
+        embargo_days=embargo_days,
+        embargo_pct=embargo_pct,
     )
-    test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
-    train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
-    if test_start_ts >= end_ts:
-        raise ValueError(
-            "train_split_pct/embargo_days/embargo_pct leave an empty train or "
-            "test period for the base backtest range"
-        )
-    test_period = {
-        "start": test_start_ts.isoformat(),
-        "end": end_ts.isoformat(),
-    }
-    return train_period, test_period
 
 
 def _parse_period_boundary(value: str, *, is_end: bool) -> pd.Timestamp:
