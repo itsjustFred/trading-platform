@@ -14,7 +14,9 @@ from runner.optimization_diagnostics import (
     realized_pnl_by_subperiod,
     subperiod_parameter_stability,
     subperiods_from_walk_forward,
+    three_way_split,
     walk_forward_splits,
+    walk_forward_train_validation_folds,
 )
 
 # ─── embargo_split ───────────────────────────────────────────────────────────
@@ -1094,3 +1096,217 @@ def test_an_unbounded_metric_still_uses_the_sigma_scaled_bar():
         "an unbounded maximize study cannot clear its own bar, so the "
         "z-construction was lost"
     )
+
+
+# ─── three_way_split (Issue #164) ─────────────────────────────────────────────
+
+
+def test_three_way_split_segments_ordered_non_overlapping():
+    """Segments are in time order: train, embargo, validation, embargo, test."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-02-01T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=1,
+        embargo_pct=0.0,
+    )
+    train_end = pd.Timestamp(split.train["end"])
+    emb1_start = pd.Timestamp(split.embargo_train_val["start"])
+    emb1_end = pd.Timestamp(split.embargo_train_val["end"])
+    val_start = pd.Timestamp(split.validation["start"])
+    val_end = pd.Timestamp(split.validation["end"])
+    emb2_start = pd.Timestamp(split.embargo_val_test["start"])
+    emb2_end = pd.Timestamp(split.embargo_val_test["end"])
+    test_start = pd.Timestamp(split.test["start"])
+    test_end = pd.Timestamp(split.test["end"])
+
+    assert train_end == emb1_start
+    assert emb1_end == val_start
+    assert val_end == emb2_start
+    assert emb2_end == test_start
+    assert test_end == pd.Timestamp("2024-02-01T00:00:00+00:00")
+
+
+def test_three_way_split_test_ends_at_end():
+    """Test segment ends exactly at the provided end."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-02-01T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+    )
+    assert split.test["end"] == "2024-02-01T00:00:00+00:00"
+
+
+def test_three_way_split_embargo_gap_size():
+    """Embargo gaps have exactly the requested size (days + pct of whole range)."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",  # 10 days
+        train_fraction=0.5,
+        validation_fraction=0.25,
+        test_fraction=0.25,
+        embargo_days=1,
+        embargo_pct=0.1,  # 1 day
+    )
+    # Each embargo gap should be 1 day (fixed) + 1 day (10% of 10 days) = 2 days
+    emb1_start = pd.Timestamp(split.embargo_train_val["start"])
+    emb1_end = pd.Timestamp(split.embargo_train_val["end"])
+    emb2_start = pd.Timestamp(split.embargo_val_test["start"])
+    emb2_end = pd.Timestamp(split.embargo_val_test["end"])
+
+    gap1 = emb1_end - emb1_start
+    gap2 = emb2_end - emb2_start
+    # 2 days +/- a bit for floating point
+    assert pd.Timedelta(days=1, hours=23) <= gap1 <= pd.Timedelta(days=2, hours=1)
+    assert pd.Timedelta(days=1, hours=23) <= gap2 <= pd.Timedelta(days=2, hours=1)
+
+
+def test_three_way_split_no_embargo():
+    """Without embargo, segments are contiguous."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=0,
+        embargo_pct=0.0,
+    )
+    assert pd.Timestamp(split.train["end"]) == pd.Timestamp(split.embargo_train_val["start"])
+    assert pd.Timestamp(split.embargo_train_val["end"]) == pd.Timestamp(split.validation["start"])
+    assert pd.Timestamp(split.validation["end"]) == pd.Timestamp(split.embargo_val_test["start"])
+    assert pd.Timestamp(split.embargo_val_test["end"]) == pd.Timestamp(split.test["start"])
+
+
+def test_three_way_split_rejects_empty_segments():
+    """ValueError when any segment would be empty."""
+    # Too much embargo
+    with pytest.raises(ValueError, match="empty"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_days=5,
+            embargo_pct=0.5,
+        )
+    # Fractions don't sum to 1
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.5,
+            validation_fraction=0.3,
+            test_fraction=0.3,
+        )
+    # Non-positive fractions
+    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.0,
+            validation_fraction=0.5,
+            test_fraction=0.5,
+        )
+    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.0,
+            test_fraction=0.4,
+        )
+    # Negative embargo
+    with pytest.raises(ValueError, match="must not be negative"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_days=-1,
+        )
+    with pytest.raises(ValueError, match="must not be negative"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_pct=-0.1,
+        )
+    # Invalid period (end <= start)
+    with pytest.raises(ValueError, match="Invalid period"):
+        three_way_split(
+            "2024-01-11T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+        )
+
+
+def test_walk_forward_train_validation_folds_no_fold_reaches_test():
+    """No fold reaches into the embargo before test or into test itself."""
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.05,
+        test_fraction=0.2,
+    )
+    # Test holdout starts at 80% of the range
+    test_start = pd.Timestamp("2024-01-01T00:00:00+00:00") + pd.Timedelta(days=91) * 0.8
+    # Embargo before test
+    total = pd.Timestamp("2024-04-01T00:00:00+00:00") - pd.Timestamp("2024-01-01T00:00:00+00:00")
+    embargo_gap = total * 0.05
+    wf_end = test_start - embargo_gap
+
+    for fold in folds:
+        fold_test_end = pd.Timestamp(fold["test"]["end"])
+        assert fold_test_end <= wf_end, "fold test window must not reach into test holdout"
+
+
+def test_walk_forward_train_validation_folds_reuses_walk_forward_splits():
+    """Folds have the same structure as walk_forward_splits output."""
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.05,
+        test_fraction=0.2,
+    )
+    assert len(folds) == 3
+    for fold in folds:
+        assert "fold" in fold
+        assert "train" in fold
+        assert "test" in fold
+        assert "embargo" in fold
+        assert "embargo_bars_equivalent" in fold
+
+
+def test_walk_forward_train_validation_folds_error_cases():
+    """Error cases for walk_forward_train_validation_folds."""
+    with pytest.raises(ValueError, match="test_fraction must be strictly between 0 and 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", test_fraction=0.0
+        )
+    with pytest.raises(ValueError, match="test_fraction must be strictly between 0 and 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", test_fraction=1.0
+        )
+    with pytest.raises(ValueError, match="n_splits must be at least 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", n_splits=0
+        )
+    with pytest.raises(ValueError, match="no room for walk-forward folds"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-01-11", test_fraction=0.9, embargo_pct=0.5
+        )

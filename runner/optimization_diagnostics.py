@@ -39,7 +39,10 @@ import pandas as pd
 __all__ = [
     "EmbargoSplit",
     "embargo_split",
+    "ThreeWaySplit",
+    "three_way_split",
     "walk_forward_splits",
+    "walk_forward_train_validation_folds",
     "plateau_analysis",
     "multiple_testing_correction",
     "subperiods_from_walk_forward",
@@ -150,6 +153,165 @@ def embargo_split(
         embargo={"start": _iso(split_ts), "end": _iso(test_start_ts)},
         embargo_bars_equivalent=bars_equivalent,
     )
+
+
+@dataclass(frozen=True)
+class ThreeWaySplit:
+    """A train/validation/test split with embargo gaps between segments."""
+
+    train: dict[str, str]
+    validation: dict[str, str]
+    test: dict[str, str]
+    embargo_train_val: dict[str, str]
+    embargo_val_test: dict[str, str]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "train": self.train,
+            "validation": self.validation,
+            "test": self.test,
+            "embargo_train_val": self.embargo_train_val,
+            "embargo_val_test": self.embargo_val_test,
+        }
+
+
+def three_way_split(
+    start: Any,
+    end: Any,
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+    test_fraction: float,
+    embargo_days: int = 0,
+    embargo_pct: float = 0.0,
+) -> ThreeWaySplit:
+    """Split a period into train / embargo / validation / embargo / test.
+
+    Layout in time order: train, embargo gap, validation, embargo gap, test.
+    TEST is the last segment and ends at ``end``.
+
+    The embargo gap has the same size semantics as ``_split_backtest_period``:
+    fixed ``embargo_days`` plus ``embargo_pct`` of the whole range.
+
+    Raises ValueError if any segment would be empty.
+    """
+    if not (0.0 < train_fraction < 1.0):
+        raise ValueError("train_fraction must be strictly between 0 and 1")
+    if not (0.0 < validation_fraction < 1.0):
+        raise ValueError("validation_fraction must be strictly between 0 and 1")
+    if not (0.0 < test_fraction < 1.0):
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+    total_frac = train_fraction + validation_fraction + test_fraction
+    if abs(total_frac - 1.0) > 1e-9:
+        raise ValueError(
+            f"train_fraction + validation_fraction + test_fraction must sum to 1.0, "
+            f"got {total_frac:.10f}"
+        )
+    if embargo_days < 0:
+        raise ValueError("embargo_days must not be negative")
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
+    start_ts = _as_timestamp(start)
+    end_ts = _as_timestamp(end)
+    if end_ts <= start_ts:
+        raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
+
+    total = end_ts - start_ts
+    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+
+    # Compute segment boundaries working backwards from end (test ends at end)
+    test_end_ts = end_ts
+    test_start_ts = end_ts - total * test_fraction
+    embargo_val_test_end_ts = test_start_ts
+    embargo_val_test_start_ts = embargo_val_test_end_ts - embargo_gap
+    validation_end_ts = embargo_val_test_start_ts
+    validation_start_ts = validation_end_ts - total * validation_fraction
+    embargo_train_val_end_ts = validation_start_ts
+    embargo_train_val_start_ts = embargo_train_val_end_ts - embargo_gap
+    train_end_ts = embargo_train_val_start_ts
+    train_start_ts = start_ts
+
+    # Verify all segments have positive duration (embargo gaps can be zero)
+    if train_end_ts <= train_start_ts:
+        raise ValueError("train segment would be empty")
+    if embargo_train_val_end_ts < embargo_train_val_start_ts:
+        raise ValueError("embargo between train and validation would be negative")
+    if validation_end_ts <= validation_start_ts:
+        raise ValueError("validation segment would be empty")
+    if embargo_val_test_end_ts < embargo_val_test_start_ts:
+        raise ValueError("embargo between validation and test would be negative")
+    if test_end_ts <= test_start_ts:
+        raise ValueError("test segment would be empty")
+
+    # Verify order
+    if not (train_start_ts < train_end_ts <= embargo_train_val_start_ts <= embargo_train_val_end_ts <= validation_start_ts < validation_end_ts <= embargo_val_test_start_ts <= embargo_val_test_end_ts <= test_start_ts < test_end_ts):
+        raise ValueError("segment boundaries are not in correct order")
+
+    return ThreeWaySplit(
+        train={"start": _iso(train_start_ts), "end": _iso(train_end_ts)},
+        validation={"start": _iso(validation_start_ts), "end": _iso(validation_end_ts)},
+        test={"start": _iso(test_start_ts), "end": _iso(test_end_ts)},
+        embargo_train_val={"start": _iso(embargo_train_val_start_ts), "end": _iso(embargo_train_val_end_ts)},
+        embargo_val_test={"start": _iso(embargo_val_test_start_ts), "end": _iso(embargo_val_test_end_ts)},
+    )
+
+
+def walk_forward_train_validation_folds(
+    start: Any,
+    end: Any,
+    *,
+    n_splits: int = 3,
+    train_fraction: float = 0.7,
+    embargo_pct: float = 0.0,
+    bar_duration: pd.Timedelta | None = None,
+    holding_bars: int = 0,
+    test_fraction: float = 0.2,
+) -> list[dict[str, Any]]:
+    """Walk-forward folds applied ONLY to the range before the test holdout.
+
+    The test holdout is the last ``test_fraction`` of the period (plus an embargo
+    gap before it). Walk-forward folds split the remaining range (train +
+    validation) into ``n_splits`` sequential folds, each being train + embargo +
+    validation.
+
+    Reuses ``walk_forward_splits`` for the fold logic.
+    """
+    if not (0.0 < test_fraction < 1.0):
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1")
+
+    start_ts = _as_timestamp(start)
+    end_ts = _as_timestamp(end)
+    if end_ts <= start_ts:
+        raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
+
+    total = end_ts - start_ts
+    # The range available for walk-forward is everything before the test holdout
+    # Test starts at end - total * test_fraction, minus embargo gap
+    # For the walk-forward folds, we use the range [start, test_start - embargo)
+    # Since embargo_pct applies to the whole range, the embargo before test is:
+    embargo_gap = total * embargo_pct
+    test_start_ts = end_ts - total * test_fraction
+    wf_end_ts = test_start_ts - embargo_gap
+    if wf_end_ts <= start_ts:
+        raise ValueError(
+            "test_fraction and embargo leave no room for walk-forward folds"
+        )
+
+    # Use walk_forward_splits on the range before the test holdout
+    # The train_fraction here is relative to each fold, not the whole range
+    folds = walk_forward_splits(
+        start_ts,
+        wf_end_ts,
+        n_splits=n_splits,
+        train_fraction=train_fraction,
+        embargo_pct=embargo_pct,
+        bar_duration=bar_duration,
+        holding_bars=holding_bars,
+    )
+    return folds
 
 
 def walk_forward_splits(
