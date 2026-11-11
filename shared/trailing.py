@@ -42,7 +42,7 @@ KNOWN_TRAILING_MODES: frozenset[str] = frozenset(
 #: Modes the replay backtest adapter (`runner/engines/signal_replay_adapter.py`)
 #: executes.
 REPLAY_SUPPORTED_TRAILING_MODES: frozenset[str] = frozenset(
-    {TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}
+    {TRAILING_MODE_NONE, TRAILING_MODE_PERCENT, TRAILING_MODE_SUPERTREND_FLIP}
 )
 
 #: Modes the live path executes. Live trailing does not exist yet (#167): the

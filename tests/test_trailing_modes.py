@@ -40,7 +40,7 @@ def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
 
 def test_support_sets_are_what_the_paths_can_execute() -> None:
     assert KNOWN_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
-    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent"}
+    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
     assert RISK_ENGINE_SUPPORTED_TRAILING_MODES == {"none", "percent"}
     # Live trailing does not exist yet (#167).
     assert LIVE_SUPPORTED_TRAILING_MODES == {"none"}
@@ -60,11 +60,11 @@ def test_unknown_mode_is_rejected(value) -> None:
 
 
 def test_known_but_unsupported_mode_is_rejected_with_its_own_message() -> None:
-    with pytest.raises(ValueError, match="not supported by the replay path"):
+    with pytest.raises(ValueError, match="not supported by the live path"):
         validate_trailing_mode(
-            "supertrend_flip",
-            supported=REPLAY_SUPPORTED_TRAILING_MODES,
-            context="the replay path",
+            "percent",
+            supported=LIVE_SUPPORTED_TRAILING_MODES,
+            context="the live path",
         )
 
 

@@ -21,9 +21,11 @@ from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from shared.trailing import (
     REPLAY_SUPPORTED_TRAILING_MODES,
+    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_trailing_sl_config,
 )
+from signal_bots.ramjet.processor import RamJetSignalProcessor
 from signal_bots.registry import get_signal_processor
 
 logger = logging.getLogger(__name__)
@@ -144,6 +146,17 @@ class _OpenPosition:
     trailing_updates: int = 0
     mae: float = 0.0
     mfe: float = 0.0
+    original_quantity: float = 0.0
+    exits: list = field(default_factory=list)
+    trailing_mode: str = "none"
+    tp1_price: float | None = None
+    tp1_exit_percent: float = 0.0
+    breakeven_after_tp1: bool = False
+    tp1_done: bool = False
+    activated: bool = False
+    pending_flip_exit: bool = False
+    supertrend_values: list = field(default_factory=list)
+    supertrend_ready_values: list = field(default_factory=list)
 
 
 def _net_pnl_of(trade: Trade) -> float:
@@ -274,6 +287,28 @@ class SignalReplayAdapter:
         return max(float(self.initial_capital) + float(realized_pnl) + unrealized, 1.0)
 
     @staticmethod
+    def _compute_supertrend_series(
+        frame: pd.DataFrame, period: int, multiplier: float
+    ) -> tuple[list, list]:
+        try:
+            calc = RamJetSignalProcessor._calculate_supertrend(frame, period, multiplier)
+        except Exception:
+            return [], []
+        st = calc.get("supertrend")
+        ready = calc.get("supertrend_ready")
+        st_list = list(st) if st is not None else []
+        ready_list = list(ready) if ready is not None else [False] * len(st_list)
+        # Convert to bool safely.
+        def _to_bool(x: Any) -> bool:
+            if isinstance(x, float) and pd.isna(x):
+                return False
+            return bool(x)
+
+        st_list = [_to_bool(x) for x in st_list]
+        ready_list = [_to_bool(x) for x in ready_list]
+        return st_list, ready_list
+
+    @staticmethod
     def _update_excursions(position: _OpenPosition, bar: pd.Series) -> None:
         high = float(bar["high"])
         low = float(bar["low"])
@@ -319,13 +354,31 @@ class SignalReplayAdapter:
         exit_reason: str,
         exit_bar_index: int,
     ) -> Trade:
-        if position.direction == "LONG":
-            pnl = (exit_price - position.entry_price) * position.quantity
-        else:
-            pnl = (position.entry_price - exit_price) * position.quantity
+        remaining = float(position.quantity)
+        if remaining > 0:
+            if position.direction == "LONG":
+                partial_pnl = (float(exit_price) - position.entry_price) * remaining
+            else:
+                partial_pnl = (position.entry_price - float(exit_price)) * remaining
+            position.exits.append(
+                TradeExit(
+                    time=_to_iso(exit_time),
+                    price=float(exit_price),
+                    quantity=remaining,
+                    pnl=float(partial_pnl),
+                    reason=exit_reason,
+                )
+            )
+            position.quantity = 0.0
+
+        total_quantity = float(position.original_quantity or remaining or 0.0)
+        if total_quantity <= 0:
+            total_quantity = float(sum(e.quantity for e in position.exits) or 0.0)
+        exits = list(position.exits)
+        pnl = float(sum(float(e.pnl or 0.0) for e in exits))
 
         risk_amount = float(position.risk_amount or 0.0)
-        gross_notional = position.entry_price * position.quantity
+        gross_notional = position.entry_price * total_quantity
         pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
         r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
         signal_price = float(position.signal_entry_price)
@@ -338,16 +391,22 @@ class SignalReplayAdapter:
         if position.source:
             tags.append(str(position.source))
 
-        # #84: price the fill through the active fee model (set in run();
-        # direct _close_position callers in tests must set _active_fee_model).
         fee_model = getattr(self, "_active_fee_model", None)
         if fee_model is None:
             fee_model = resolve_fee_model(dict(self._fee_params))
             self._active_fee_model = fee_model
+        total_exit_qty = float(sum(float(e.quantity or 0.0) for e in exits) or 0.0)
+        if total_exit_qty > 0:
+            avg_exit_price = (
+                sum(float(e.price or 0.0) * float(e.quantity or 0.0) for e in exits)
+                / total_exit_qty
+            )
+        else:
+            avg_exit_price = float(exit_price)
         fees = round(
             float(
                 fee_model.fee_for_trade(
-                    float(position.entry_price), float(exit_price), float(position.quantity)
+                    float(position.entry_price), float(avg_exit_price), float(total_quantity)
                 )
             ),
             2,
@@ -359,18 +418,10 @@ class SignalReplayAdapter:
             direction=position.direction,
             entry_time=_to_iso(position.entry_time),
             entry_price=float(position.entry_price),
-            quantity=float(position.quantity),
-            exits=[
-                TradeExit(
-                    time=_to_iso(exit_time),
-                    price=float(exit_price),
-                    quantity=float(position.quantity),
-                    pnl=float(pnl),
-                    reason=exit_reason,
-                )
-            ],
+            quantity=float(total_quantity),
+            exits=exits,
             pnl=float(pnl),
-            position_size=float(position.quantity),
+            position_size=float(total_quantity),
             risk_amount=float(position.risk_amount) if position.risk_amount is not None else None,
             risk_percent=(
                 float(position.risk_percent) if position.risk_percent is not None else None
@@ -417,6 +468,104 @@ class SignalReplayAdapter:
         stop-first tie-break applies when both levels are hit.
         """
         self._update_excursions(position, bar)
+
+        trailing_cfg = position.signal_metadata.get("trailing_sl_config")
+        mode = (trailing_cfg or {}).get("mode") if isinstance(trailing_cfg, dict) else None
+        mode = str(mode or position.trailing_mode or "none").strip().lower()
+
+        if mode == TRAILING_MODE_SUPERTREND_FLIP:
+            # Pending flip exit decided on the previous bar: fill at this bar's open.
+            if position.pending_flip_exit:
+                position.pending_flip_exit = False
+                return self._close_position(
+                    position,
+                    exit_time=pd.Timestamp(bar["timestamp"]),
+                    exit_price=float(bar["open"]),
+                    exit_reason="supertrend_flip",
+                    exit_bar_index=int(index),
+                )
+
+            is_long = position.direction == "LONG"
+            stop = position.stop_loss
+            # Stop-first intrabar ordering convention.
+            stop_hit = False
+            if stop is not None:
+                if is_long and float(bar["low"]) <= float(stop):
+                    stop_hit = True
+                if (not is_long) and float(bar["high"]) >= float(stop):
+                    stop_hit = True
+            if stop_hit:
+                exit_price = float(stop)
+                if position.trailing_updates > 0 or position.tp1_done:
+                    reason = "trailing_stop"
+                else:
+                    reason = "stop_loss"
+                # after TP1 breakeven, a stop hit is breakeven stop
+                if (
+                    position.tp1_done
+                    and position.breakeven_after_tp1
+                    and stop is not None
+                ):
+                    if is_long and abs(float(stop) - position.entry_price) < 1e-9:
+                        reason = "breakeven_stop"
+                    if (not is_long) and abs(float(stop) - position.entry_price) < 1e-9:
+                        reason = "breakeven_stop"
+                return self._close_position(
+                    position,
+                    exit_time=pd.Timestamp(bar["timestamp"]),
+                    exit_price=exit_price,
+                    exit_reason=reason,
+                    exit_bar_index=int(index),
+                )
+
+            # TP1 partial exit.
+            tp1_price = position.tp1_price
+            if (not position.tp1_done) and tp1_price is not None:
+                tp_hit = False
+                if is_long and float(bar["high"]) >= float(tp1_price):
+                    tp_hit = True
+                if (not is_long) and float(bar["low"]) <= float(tp1_price):
+                    tp_hit = True
+                if tp_hit:
+                    qty = float(position.quantity) * float(position.tp1_exit_percent or 0.0)
+                    if qty > 0:
+                        if is_long:
+                            partial_pnl = (float(tp1_price) - position.entry_price) * qty
+                        else:
+                            partial_pnl = (position.entry_price - float(tp1_price)) * qty
+                        position.exits.append(
+                            TradeExit(
+                                time=_to_iso(pd.Timestamp(bar["timestamp"])),
+                                price=float(tp1_price),
+                                quantity=qty,
+                                pnl=float(partial_pnl),
+                                reason="tp1",
+                            )
+                        )
+                        position.quantity = float(position.quantity) - qty
+                        position.trailing_updates += 0
+                    if position.breakeven_after_tp1:
+                        position.stop_loss = float(position.entry_price)
+                    position.tp1_done = True
+
+            # Supertrend activation / flip scheduling (only after TP1).
+            if position.tp1_done:
+                idx = int(index)
+                ready = False
+                green = False
+                if idx < len(position.supertrend_ready_values):
+                    ready = bool(position.supertrend_ready_values[idx])
+                if idx < len(position.supertrend_values):
+                    green = bool(position.supertrend_values[idx])
+                if not position.activated:
+                    if ready and green:
+                        position.activated = True
+                else:
+                    if ready and (not green):
+                        position.pending_flip_exit = True
+
+            return None
+
         event = resolve_same_bar_exit(
             direction=position.direction,
             high=float(bar["high"]),
@@ -673,6 +822,36 @@ class SignalReplayAdapter:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
 
+            trailing_cfg = (effective_signal.metadata or {}).get("trailing_sl_config")
+            if not isinstance(trailing_cfg, dict):
+                trailing_cfg = {}
+            tmode = str(trailing_cfg.get("mode") or "none").strip().lower()
+            tp1_price = effective_signal.take_profit
+            # allow metadata tp1_price override
+            if (effective_signal.metadata or {}).get("tp1_price") is not None:
+                tp1_price = (effective_signal.metadata or {}).get("tp1_price")
+            tp1_exit_percent = float(
+                (effective_signal.metadata or {}).get("tp1_exit_percent")
+                or trailing_cfg.get("tp1_exit_percent")
+                or 0.0
+            )
+            if tp1_exit_percent <= 0:
+                tp1_exit_percent = 0.5
+            be = bool(trailing_cfg.get("breakeven_after_tp1", False))
+            ramjet_cfg = (effective_signal.metadata or {}).get("ramjet_config", {}) or {}
+            st_period = int(
+                trailing_cfg.get("supertrend_period")
+                or ramjet_cfg.get("supertrend_period", 10)
+            )
+            st_mult = float(
+                trailing_cfg.get("supertrend_multiplier")
+                or ramjet_cfg.get("supertrend_multiplier", 3.0)
+            )
+            st_vals = []
+            st_ready = []
+            if tmode == TRAILING_MODE_SUPERTREND_FLIP:
+                st_vals, st_ready = self._compute_supertrend_series(frame, st_period, st_mult)
+
             opened = _OpenPosition(
                 symbol=effective_signal.symbol,
                 direction=target_direction,
@@ -694,6 +873,13 @@ class SignalReplayAdapter:
                 signal_time=effective_signal.timestamp,
                 signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
+                original_quantity=quantity,
+                trailing_mode=tmode,
+                tp1_price=float(tp1_price) if tp1_price is not None else None,
+                tp1_exit_percent=tp1_exit_percent,
+                breakeven_after_tp1=be,
+                supertrend_values=st_vals,
+                supertrend_ready_values=st_ready,
             )
             open_positions[signal.symbol] = opened
             emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)

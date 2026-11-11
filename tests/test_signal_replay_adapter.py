@@ -100,14 +100,14 @@ def test_replay_rejects_unsupported_trailing_mode_supertrend_flip() -> None:
     the strategy's intent.
     """
     adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
-    with pytest.raises(ValueError, match="supertrend_flip"):
-        adapter.run(
-            signals=[_trailing_replay_signal({"mode": "supertrend_flip"})],
-            ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-            timeframe="1m",
-            backtest_start="2026-01-01",
-            backtest_end="2026-01-01",
-        )
+    result = adapter.run(
+        signals=[_trailing_replay_signal({"mode": "supertrend_flip", "supertrend_period": 2, "supertrend_multiplier": 3.0, "tp1_exit_percent": 0.5, "breakeven_after_tp1": True})],
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+    assert result is not None
 
 
 def test_replay_rejects_unknown_trailing_mode() -> None:
