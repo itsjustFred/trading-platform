@@ -872,3 +872,71 @@ class TestPeriodBounds:
         )
 
         assert end_dt.isoformat() == "2024-12-31T12:00:00+00:00"
+
+
+def _moments_curve(daily_equities: list[float]) -> list:
+    import pandas as pd
+
+    from shared.models import EquityPoint
+
+    days = pd.date_range("2024-01-01", periods=len(daily_equities), freq="D", tz="UTC")
+    return [
+        EquityPoint(time=day.isoformat(), equity=value)
+        for day, value in zip(days, daily_equities)
+    ]
+
+
+def test_daily_returns_moments_match_a_hand_built_series():
+    """Issue #164: the moments feed the deflated Sharpe ratio."""
+    from runner.stats import _daily_returns_series_from_equity_curve, daily_returns_moments
+
+    curve = _moments_curve([100.0, 101.0, 100.5, 102.0, 101.0, 103.5, 103.0, 105.0])
+    returns = _daily_returns_series_from_equity_curve(curve)
+    values = [float(v) for v in returns]
+    n = len(values)
+    mean = sum(values) / n
+    sample_std = (sum((v - mean) ** 2 for v in values) / (n - 1)) ** 0.5
+
+    moments = daily_returns_moments(curve)
+
+    assert moments["count"] == n
+    assert moments["sharpe_per_obs"] == pytest.approx(mean / sample_std)
+    assert moments["skew"] == pytest.approx(float(returns.skew()))
+    assert moments["kurtosis"] == pytest.approx(float(returns.kurtosis()) + 3.0)
+    # Not annualised: far below the sqrt(252)-scaled figure.
+    assert abs(moments["sharpe_per_obs"]) < abs(mean / sample_std) * 252**0.5
+
+
+def test_daily_returns_moments_agree_with_the_reported_psr():
+    """One trial, no selection: DSR from these moments equals the stats PSR."""
+    from runner.optimization_diagnostics import deflated_sharpe_ratio
+    from runner.stats import (
+        _daily_returns_series_from_equity_curve,
+        _probabilistic_sharpe,
+        daily_returns_moments,
+    )
+
+    equities = [100.0]
+    for step in [0.4, -0.2, 0.7, 0.1, -0.5, 0.9, 0.3, -0.1, 0.6, 0.2, -0.3, 0.8]:
+        equities.append(equities[-1] * (1 + step / 100))
+    curve = _moments_curve(equities)
+    moments = daily_returns_moments(curve)
+    dsr = deflated_sharpe_ratio(
+        sr=moments["sharpe_per_obs"],
+        t=moments["count"],
+        skew=moments["skew"],
+        kurt=moments["kurtosis"],
+        n=1,
+        var_sr=0.0,
+    )
+    psr = _probabilistic_sharpe(_daily_returns_series_from_equity_curve(curve), 0.0)
+    assert psr is not None
+    assert dsr == pytest.approx(psr)
+
+
+def test_daily_returns_moments_undefined_cases_return_none():
+    from runner.stats import daily_returns_moments
+
+    assert daily_returns_moments([]) is None
+    assert daily_returns_moments(_moments_curve([100.0])) is None
+    assert daily_returns_moments(_moments_curve([100.0, 100.0, 100.0, 100.0, 100.0])) is None

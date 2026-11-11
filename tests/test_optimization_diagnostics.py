@@ -8,14 +8,17 @@ import pandas as pd
 import pytest
 
 from runner.optimization_diagnostics import (
+    deflated_sharpe_ratio,
     embargo_split,
     multiple_testing_correction,
+    overfitting_verdict,
     plateau_analysis,
     realized_pnl_by_subperiod,
     select_by_validation,
     subperiod_parameter_stability,
     subperiods_from_walk_forward,
     three_way_split,
+    train_validation_degradation,
     walk_forward_splits,
     walk_forward_train_validation_folds,
 )
@@ -1415,3 +1418,260 @@ def test_select_by_validation_rejects_invalid_top_fraction():
         select_by_validation(trials, top_fraction=1.5)
     with pytest.raises(ValueError, match="top_fraction must be in"):
         select_by_validation(trials, top_fraction=-0.1)
+
+
+# ─── Overfitting measures (Issue #164) ────────────────────────────────────────
+
+
+def test_train_validation_degradation_basic():
+    """Basic degradation calculation."""
+    # 50% drop
+    assert train_validation_degradation(1.0, 0.5) == pytest.approx(0.5)
+    # No drop
+    assert train_validation_degradation(1.0, 1.0) == pytest.approx(0.0)
+    # Improvement (negative degradation)
+    assert train_validation_degradation(1.0, 1.5) == pytest.approx(-0.5)
+    # Train negative, validation more negative -> degradation is positive
+    # (train - validation) / |train| = (-1 - (-2)) / 1 = 1.0
+    assert train_validation_degradation(-1.0, -2.0) == pytest.approx(1.0)
+    # Train negative, validation less negative -> improvement (negative degradation)
+    assert train_validation_degradation(-2.0, -1.0) == pytest.approx(-0.5)
+
+
+def test_train_validation_degradation_edge_cases():
+    """Edge cases return None."""
+    # Train is zero
+    assert train_validation_degradation(0.0, 0.5) is None
+    assert train_validation_degradation(0.0, -0.5) is None
+    assert train_validation_degradation(0.0, 0.0) is None
+    # Non-finite inputs
+    assert train_validation_degradation(float("nan"), 0.5) is None
+    assert train_validation_degradation(1.0, float("inf")) is None
+    assert train_validation_degradation(float("-inf"), 0.5) is None
+
+
+def test_deflated_sharpe_ratio_basic():
+    """Test DSR formula against hand-computed values."""
+    # Simple case: SR=1.0, T=100, skew=0, kurt=3 (normal), N=10, V=0.04
+    # SR0 = sqrt(0.04) * ((1-g)*Phi^-1(0.9) + g*Phi^-1(0.963))
+    #   = 0.2 * (0.4228 * 1.2816 + 0.5772 * 1.785)
+    #   = 0.2 * (0.542 + 1.030) = 0.314
+    # denom = sqrt(1 - 0 + (3-1)/4 * 1) = sqrt(1.5) = 1.225
+    # z = (1.0 - 0.314) * sqrt(99) / 1.225 = 0.686 * 9.95 / 1.225 = 5.57
+    # DSR = Phi(5.57) ≈ 1.0
+    dsr = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr is not None
+    assert dsr > 0.99
+
+
+def test_deflated_sharpe_ratio_n_equals_one():
+    """N=1 means no selection bias, SR0=0."""
+    # With N=1, SR0=0, so DSR depends only on SR, T, skew, kurt
+    dsr = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=1, var_sr=0.04)
+    assert dsr is not None
+    # Should be higher than N=10 case
+    dsr_n10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr > dsr_n10
+
+
+def test_deflated_sharpe_ratio_monotonicity_n():
+    """More trials -> lower DSR (more selection bias)."""
+    dsr_10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_100 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=100, var_sr=0.04)
+    dsr_1000 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=1000, var_sr=0.04)
+    assert dsr_10 > dsr_100 > dsr_1000
+
+
+def test_deflated_sharpe_ratio_monotonicity_sr():
+    """Higher SR -> higher DSR."""
+    dsr_05 = deflated_sharpe_ratio(sr=0.5, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_15 = deflated_sharpe_ratio(sr=1.5, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr_05 < dsr_10 < dsr_15
+
+
+def test_deflated_sharpe_ratio_edge_cases():
+    """Edge cases return None."""
+    # T < 2
+    assert deflated_sharpe_ratio(1.0, 1, 0.0, 3.0, 10, 0.04) is None
+    # N < 1
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, 0, 0.04) is None
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, -1, 0.04) is None
+    # Non-finite inputs
+    assert deflated_sharpe_ratio(float("nan"), 100, 0.0, 3.0, 10, 0.04) is None
+    assert deflated_sharpe_ratio(1.0, 100, float("inf"), 3.0, 10, 0.04) is None
+    # Negative variance
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, 10, -0.01) is None
+    # Non-positive denominator (e.g., very high skew)
+    # denom_sq = 1 - skew*sr + (kurt-1)/4 * sr^2
+    # With high skew, this can go negative
+    assert deflated_sharpe_ratio(10.0, 100, 100.0, 3.0, 10, 0.04) is None
+
+
+def test_overfitting_verdict_all_pass():
+    """All checks computable and passed -> passed=True."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is True
+    assert verdict["checks"]["degradation"]["passed"] is True
+    assert verdict["checks"]["deflated_sharpe"]["passed"] is True
+    assert verdict["reasons"] == []
+
+
+def test_overfitting_verdict_degradation_fail():
+    """Degradation exceeds threshold -> passed=False."""
+    verdict = overfitting_verdict(
+        degradation=0.7,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["degradation"]["passed"] is False
+    assert any("degradation" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_deflated_sharpe_fail():
+    """Deflated Sharpe below threshold -> passed=False."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=0.90,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["deflated_sharpe"]["passed"] is False
+    assert any("deflated Sharpe" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_degradation_uncomputable():
+    """Uncomputable degradation -> passed=False, reason listed."""
+    verdict = overfitting_verdict(
+        degradation=None,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["degradation"]["computable"] is False
+    assert any("could not be computed" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_deflated_sharpe_uncomputable():
+    """Uncomputable deflated Sharpe -> passed=False, reason listed."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=None,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["deflated_sharpe"]["computable"] is False
+    assert any("could not be computed" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_both_uncomputable():
+    """Both uncomputable -> passed=False, both reasons listed."""
+    verdict = overfitting_verdict(
+        degradation=None,
+        deflated_sharpe=None,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert len(verdict["reasons"]) == 2
+
+
+def test_deflated_sharpe_ratio_matches_the_formula_written_out():
+    """Exact value, with the published formula spelled out independently."""
+    from statistics import NormalDist
+
+    sr, t, skew, kurt, n, var_sr = 0.12, 250, -0.4, 4.5, 50, 0.0025
+    normal = NormalDist()
+    gamma = 0.5772156649015329
+    sr0 = (var_sr**0.5) * (
+        (1 - gamma) * normal.inv_cdf(1 - 1 / n) + gamma * normal.inv_cdf(1 - 1 / (n * math.e))
+    )
+    z = (sr - sr0) * (t - 1) ** 0.5 / (1 - skew * sr + (kurt - 1) / 4 * sr**2) ** 0.5
+    expected = normal.cdf(z)
+
+    assert 0.1 < sr0 < 0.12, "fixture: the hurdle must sit just below the observed Sharpe"
+    result = deflated_sharpe_ratio(sr=sr, t=t, skew=skew, kurt=kurt, n=n, var_sr=var_sr)
+    assert result == pytest.approx(expected, abs=1e-9)
+    assert 0.5 < result < 0.95, "a value in the open interval, so a wrong hurdle shows"
+
+
+def test_deflated_sharpe_ratio_single_trial_is_the_plain_psr():
+    """Without selection the hurdle is zero, whatever the trial variance."""
+    from runner.stats import _psr_formula
+
+    result = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.3, kurt=3.6, n=1, var_sr=0.5)
+    assert result == pytest.approx(_psr_formula(0.08, 0.0, 120, 0.3, 3.6))
+
+
+def test_deflated_sharpe_ratio_zero_trial_variance_has_no_hurdle():
+    """Identical trials cannot produce a lucky maximum."""
+    many = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0)
+    one = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=1, var_sr=0.0)
+    assert many == pytest.approx(one)
+
+
+def test_walk_forward_folds_stop_where_three_way_validation_ends():
+    """Fixed embargo days count for the gap before test, exactly as in the split."""
+    from runner.optimization_diagnostics import (
+        three_way_split,
+        walk_forward_train_validation_folds,
+    )
+
+    start, end = "2020-01-01", "2024-01-01"
+    split = three_way_split(
+        start,
+        end,
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=30,
+        embargo_pct=0.01,
+    )
+    folds = walk_forward_train_validation_folds(
+        start,
+        end,
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.01,
+        embargo_days=30,
+        test_fraction=0.2,
+    )
+    validation_end = pd.Timestamp(split.validation["end"])
+    fold_ends = [pd.Timestamp(fold["test"]["end"]) for fold in folds]
+    assert max(fold_ends) == validation_end
+    assert all(end_ts <= validation_end for end_ts in fold_ends)
+    assert validation_end < pd.Timestamp(split.test["start"]) - pd.Timedelta(days=30)
+
+
+def test_three_way_split_takes_the_embargo_out_of_train():
+    """Validation and test keep their configured share of the whole range."""
+    from runner.optimization_diagnostics import three_way_split
+
+    start, end = pd.Timestamp("2020-01-01", tz="UTC"), pd.Timestamp("2022-09-27", tz="UTC")
+    total = end - start  # 1000 days
+    split = three_way_split(
+        start,
+        end,
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=10,
+        embargo_pct=0.0,
+    )
+
+    def length(segment):
+        return pd.Timestamp(segment["end"]) - pd.Timestamp(segment["start"])
+
+    assert length(split.validation) == total * 0.2
+    assert length(split.test) == total * 0.2
+    assert length(split.train) == total * 0.6 - pd.Timedelta(days=20)
