@@ -17,11 +17,17 @@ per-broker table lives here (``LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``);
 the live runner additionally requires the adapter instance to declare the
 ``supports_stop_amendment`` capability at signal time.
 
-Follow-ups extend the support sets in one place:
-- #168 implements ``supertrend_flip`` (extends the replay/live/engine sets).
+``supertrend_flip`` (#168) is executed by the replay backtest only. Its
+parameters are validated by ``parse_supertrend_flip_plan`` (fail closed, no
+invented defaults). The live path keeps rejecting it: the Alpaca entry is a
+full-quantity bracket whose take-profit leg would close the whole position at
+TP1, so a TP1 *partial* exit needs a different entry order structure first
+(see ``docs/live-deploy-runbook.md``).
 """
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Any
 
 #: Metadata key a signal processor uses to request trailing-stop behaviour.
@@ -31,8 +37,8 @@ TRAILING_SL_CONFIG_METADATA_KEY = "trailing_sl_config"
 TRAILING_MODE_NONE = "none"
 #: Stop trails the market price at a fixed relative distance (0 < percent < 1).
 TRAILING_MODE_PERCENT = "percent"
-#: Two-phase Supertrend-flip workflow (breakeven after TP1, flip exit). Known
-#: but not implemented anywhere yet — see #168.
+#: Supertrend-flip workflow (#168): TP1 partial exit, breakeven stop, then exit
+#: on the first red Supertrend bar after the first green one. Replay only.
 TRAILING_MODE_SUPERTREND_FLIP = "supertrend_flip"
 
 #: Every trailing mode this codebase knows. A config value outside this set is
@@ -46,9 +52,10 @@ KNOWN_TRAILING_MODES: frozenset[str] = frozenset(
 )
 
 #: Modes the replay backtest adapter (`runner/engines/signal_replay_adapter.py`)
-#: executes.
+#: executes. ``supertrend_flip`` is run by the adapter itself (it needs the bar
+#: series and partial exits), not by ``RiskEngine.apply_trailing_stop``.
 REPLAY_SUPPORTED_TRAILING_MODES: frozenset[str] = frozenset(
-    {TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}
+    {TRAILING_MODE_NONE, TRAILING_MODE_PERCENT, TRAILING_MODE_SUPERTREND_FLIP}
 )
 
 #: Modes a live adapter runs when it cannot amend a broker-side stop, and the
@@ -60,6 +67,8 @@ LIVE_BASELINE_TRAILING_MODES: frozenset[str] = frozenset({TRAILING_MODE_NONE})
 #:   which replaces the protective stop order in place (#167).
 #: - ``ctrader``: the daemon has no cTrader market data to trail on and the
 #:   adapter declares no stop-amendment capability, so only ``none``.
+#: ``supertrend_flip`` is on no broker: its TP1 partial exit cannot coexist
+#: with the full-quantity entry bracket (module docstring, #168).
 LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
     "alpaca": frozenset({TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}),
     "ctrader": LIVE_BASELINE_TRAILING_MODES,
@@ -74,6 +83,9 @@ LIVE_ANY_BROKER_TRAILING_MODES: frozenset[str] = frozenset().union(
 
 #: Modes ``RiskEngine.apply_trailing_stop`` can execute. This is the engine's
 #: own executable set (a backstop behind the per-path gates), not a path's.
+#: ``supertrend_flip`` is deliberately absent: it is a position workflow
+#: (partial exit, bar-close decisions, next-open fill) that the executing path
+#: runs itself, never a per-price stop recomputation.
 RISK_ENGINE_SUPPORTED_TRAILING_MODES: frozenset[str] = frozenset(
     {TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}
 )
@@ -216,4 +228,142 @@ def validate_live_deployment_trailing_override(
         processor_config.get("trailing_mode"),
         supported=supported,
         context=where,
+    )
+
+
+# ── supertrend_flip workflow parameters (#168) ───────────────────────────────
+
+#: The only activation/exit phases implemented. A config that names another
+#: phase asks for a workflow nothing runs and is rejected.
+SUPERTREND_FLIP_ACTIVATION_PHASE = "wait_for_first_green_after_tp1"
+SUPERTREND_FLIP_EXIT_PHASE = "exit_on_first_red_after_activation"
+
+
+@dataclass(frozen=True)
+class SupertrendFlipPlan:
+    """Validated parameters of one ``supertrend_flip`` position.
+
+    Workflow (long entries only, as emitted by the RamJet processor):
+
+    1. TP1: exit ``tp1_exit_fraction`` of the entry quantity at ``tp1_price``.
+    2. After TP1: move the stop to the entry price if ``breakeven_after_tp1``.
+    3. Activation: the first closed bar after TP1 whose Supertrend is ready
+       and green.
+    4. Exit: the remainder on the first closed bar after activation whose
+       Supertrend is ready and red; filled at the next bar's open.
+    """
+
+    tp1_price: float
+    tp1_exit_fraction: float
+    breakeven_after_tp1: bool
+    supertrend_period: int
+    supertrend_multiplier: float
+
+
+def _finite_float(value: Any, *, field: str, context: str) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"supertrend_flip in {context} requires numeric {field}, got {value!r}.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"supertrend_flip in {context} requires numeric {field}, got {value!r}."
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError(f"supertrend_flip in {context} requires a finite {field}, got {value!r}.")
+    return number
+
+
+def parse_supertrend_flip_plan(
+    trailing_cfg: Any,
+    metadata: Any,
+    *,
+    action: str,
+    take_profit: float | None,
+    context: str,
+) -> SupertrendFlipPlan:
+    """Validate a ``supertrend_flip`` signal and return its plan.
+
+    Fail closed, no invented defaults: every parameter must be present and
+    valid, otherwise ``ValueError`` and the signal is not traded.
+
+    - ``trailing_cfg``: ``supertrend_period`` (integer >= 1),
+      ``supertrend_multiplier`` (> 0), ``breakeven_after_tp1`` (bool); the
+      optional ``activation_phase`` / ``exit_phase`` descriptions must name
+      the implemented phases.
+    - ``metadata`` (the signal metadata): ``tp1_price`` (> 0) and
+      ``tp1_exit_percent`` — a *fraction* in (0, 1] despite its name, as the
+      RamJet processor emits it (0.5 = half the position).
+    - ``action`` must be ``buy``: the workflow (green activates, red exits) is
+      defined for long positions only.
+    - ``take_profit``, when set, must equal ``tp1_price``. The workflow has no
+      full-position take profit; a different level would be ambiguous.
+    """
+    if not isinstance(trailing_cfg, dict):
+        raise ValueError(f"trailing_sl_config in {context} must be a mapping.")
+    if normalize_trailing_mode(trailing_cfg.get("mode")) != TRAILING_MODE_SUPERTREND_FLIP:
+        raise ValueError(f"trailing_sl_config in {context} is not a supertrend_flip config.")
+    if str(action or "").strip().lower() not in {"buy", "long"}:
+        raise ValueError(
+            f"supertrend_flip in {context} is defined for long entries only, got action "
+            f"{action!r}."
+        )
+    if not isinstance(metadata, dict):
+        raise ValueError(f"supertrend_flip in {context} requires signal metadata.")
+
+    raw_period = trailing_cfg.get("supertrend_period")
+    period_value = _finite_float(raw_period, field="supertrend_period", context=context)
+    if period_value < 1 or not period_value.is_integer():
+        raise ValueError(
+            f"supertrend_flip in {context} requires an integer supertrend_period >= 1, got "
+            f"{raw_period!r}."
+        )
+    multiplier = _finite_float(
+        trailing_cfg.get("supertrend_multiplier"), field="supertrend_multiplier", context=context
+    )
+    if multiplier <= 0:
+        raise ValueError(
+            f"supertrend_flip in {context} requires supertrend_multiplier > 0, got {multiplier!r}."
+        )
+    breakeven = trailing_cfg.get("breakeven_after_tp1")
+    if not isinstance(breakeven, bool):
+        raise ValueError(
+            f"supertrend_flip in {context} requires a boolean breakeven_after_tp1, got "
+            f"{breakeven!r}."
+        )
+    for key, expected in (
+        ("activation_phase", SUPERTREND_FLIP_ACTIVATION_PHASE),
+        ("exit_phase", SUPERTREND_FLIP_EXIT_PHASE),
+    ):
+        if key in trailing_cfg and trailing_cfg[key] != expected:
+            raise ValueError(
+                f"supertrend_flip in {context} declares {key}={trailing_cfg[key]!r}; only "
+                f"{expected!r} is implemented."
+            )
+
+    tp1_price = _finite_float(metadata.get("tp1_price"), field="tp1_price", context=context)
+    if tp1_price <= 0:
+        raise ValueError(f"supertrend_flip in {context} requires tp1_price > 0, got {tp1_price!r}.")
+    fraction = _finite_float(
+        metadata.get("tp1_exit_percent"), field="tp1_exit_percent", context=context
+    )
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(
+            f"supertrend_flip in {context} requires tp1_exit_percent as a fraction in (0, 1], "
+            f"got {fraction!r}."
+        )
+    if take_profit is not None and not math.isclose(
+        float(take_profit), tp1_price, rel_tol=1e-9, abs_tol=1e-12
+    ):
+        raise ValueError(
+            f"supertrend_flip in {context}: take_profit {take_profit!r} differs from tp1_price "
+            f"{tp1_price!r}; the workflow exits only part of the position at TP1 and has no "
+            "full-position take profit."
+        )
+    return SupertrendFlipPlan(
+        tp1_price=tp1_price,
+        tp1_exit_fraction=fraction,
+        breakeven_after_tp1=breakeven,
+        supertrend_period=int(period_value),
+        supertrend_multiplier=multiplier,
     )

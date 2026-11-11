@@ -363,3 +363,20 @@ class RamJetSignalProcessor:
             timeframe=timeframe,
             metadata=metadata,
         )
+
+
+def calculate_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.DataFrame:
+    """Public entry point to the RamJet Supertrend (the one implementation).
+
+    Returns a copy of ``df`` with a boolean ``supertrend`` column (``True`` =
+    green/bullish) and a boolean ``supertrend_ready`` warm-up marker; while
+    ``supertrend_ready`` is ``False`` the direction is unknown, neither green
+    nor red. The computation is a forward recursion: the row for bar ``N``
+    depends on bars ``0..N`` only, so it may be computed once over a whole
+    series without lookahead.
+
+    Consumers outside the processor (the replay adapter's ``supertrend_flip``
+    workflow, issue #168) call this so the processor and the executing paths
+    can never drift apart onto two different Supertrend definitions.
+    """
+    return RamJetSignalProcessor._calculate_supertrend(df, period, multiplier)

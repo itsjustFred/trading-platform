@@ -48,7 +48,8 @@ def _deployment(signal_config: dict | None = None) -> LiveDeploymentConfig:
 
 def test_support_sets_are_what_the_paths_can_execute() -> None:
     assert KNOWN_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
-    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent"}
+    # #168: replay executes supertrend_flip itself; the risk engine does not.
+    assert REPLAY_SUPPORTED_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
     assert RISK_ENGINE_SUPPORTED_TRAILING_MODES == {"none", "percent"}
     # Live support is per broker (#167): percent on Alpaca only.
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER == {
@@ -88,11 +89,13 @@ def test_unknown_mode_is_rejected(value) -> None:
 
 
 def test_known_but_unsupported_mode_is_rejected_with_its_own_message() -> None:
-    with pytest.raises(ValueError, match="not supported by the replay path"):
+    # #168 made replay support supertrend_flip; the live Alpaca set still
+    # lacks it, so it carries the "known but unsupported" case now.
+    with pytest.raises(ValueError, match="not supported by the live path"):
         validate_trailing_mode(
             "supertrend_flip",
-            supported=REPLAY_SUPPORTED_TRAILING_MODES,
-            context="the replay path",
+            supported=LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["alpaca"],
+            context="the live path",
         )
 
 

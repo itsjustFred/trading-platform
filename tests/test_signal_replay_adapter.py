@@ -92,13 +92,50 @@ def _one_bar_frame() -> pd.DataFrame:
     )
 
 
-def test_replay_rejects_unsupported_trailing_mode_supertrend_flip() -> None:
-    """#150: supertrend_flip is known but replay cannot execute it (#168).
+def test_replay_executes_supertrend_flip() -> None:
+    """#168 (decided change of the #150 rejection): replay now executes
+    supertrend_flip instead of rejecting it. The workflow itself is covered
+    in ``tests/test_replay_supertrend_flip.py``."""
+    signal = ReplaySignal.from_payload(
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "symbol": "AAPL",
+            "action": "buy",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit": 102.0,
+            "timeframe": "1m",
+            "metadata": {
+                "trailing_sl_config": {
+                    "mode": "supertrend_flip",
+                    "breakeven_after_tp1": True,
+                    "supertrend_period": 2,
+                    "supertrend_multiplier": 1.0,
+                },
+                "tp1_price": 102.0,
+                "tp1_exit_percent": 0.5,
+            },
+        },
+        default_timeframe="1m",
+    )
+    adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
+    result = adapter.run(
+        signals=[signal],
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exits[0].reason == "tp1"
+    assert trade.exits[0].price == 102.0
+    assert trade.meta["supertrend_flip"]["tp1_time"] is not None
 
-    The signal is rejected with a clear error — never traded untrailed — and
-    the run aborts instead of silently returning a result that differs from
-    the strategy's intent.
-    """
+
+def test_replay_rejects_supertrend_flip_without_its_parameters() -> None:
+    """A bare {"mode": "supertrend_flip"} names the workflow without its
+    parameters; it is refused, never run with invented defaults."""
     adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, default_timeframe="1m")
     with pytest.raises(ValueError, match="supertrend_flip"):
         adapter.run(
