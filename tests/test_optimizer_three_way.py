@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import optuna
+import pytest
 
 import runner.optimizer as optimizer_module
 from runner.optimizer import OptimizationConfig
@@ -149,6 +150,7 @@ def _patch_environment(
     config: OptimizationConfig,
     metrics: dict[str, dict[int, float]],
     trade_counts: dict[tuple[str, int], int] | None = None,
+    with_equity: bool = True,
 ) -> dict[str, object]:
     """Fake backtest environment; returns the recorded runs and the split."""
     backtests_dir = tmp_path / "backtests"
@@ -214,6 +216,7 @@ def _patch_environment(
             backtest_config,
             metric=metrics[segment][window],
             trade_count=trade_count,
+            with_equity=with_equity,
         )
 
     monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
@@ -560,3 +563,117 @@ def test_saved_optimization_round_trips_the_three_way_section(
         payload["three_way"]["selection"]["winner_trial_number"]
     )
     assert saved_payload["three_way"]["segments"] == payload["three_way"]["segments"]
+
+
+def test_verdict_reports_degradation_and_deflated_sharpe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 4.0, 2: 2.0},
+            "validation": {1: 1.0, 2: 3.0},
+            "test": {1: 1.0, 2: 3.0},
+        },
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    overfitting = payload["three_way"]["overfitting"]
+    assert payload["best_params"] == {"window": 2}
+    # Winner: train 2.0 -> validation 3.0 => (2 - 3) / |2| = -0.5.
+    assert overfitting["degradation"] == pytest.approx(-0.5)
+    assert overfitting["deflated_sharpe"] is not None
+    assert 0.0 <= overfitting["deflated_sharpe"] <= 1.0
+    assert overfitting["n_selectable_trials"] == 2
+    assert overfitting["var_sharpe_per_obs"] is not None
+    assert overfitting["thresholds"] == {
+        "max_train_validation_degradation": 0.5,
+        "min_deflated_sharpe": 0.95,
+    }
+    assert "checks" in overfitting and "reasons" in overfitting
+
+
+def test_failing_overfitting_verdict_still_returns_the_full_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, max_train_validation_degradation=0.1)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 4.0, 2: 2.0},
+            "validation": {1: 1.0, 2: 1.5},
+            "test": {1: 1.0, 2: 2.0},
+        },
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    overfitting = payload["three_way"]["overfitting"]
+    # 0.25 degradation against a 0.1 threshold: flagged, not blocked.
+    assert overfitting["degradation"] == pytest.approx(0.25)
+    assert overfitting["passed"] is False
+    assert any("degradation" in reason for reason in overfitting["reasons"])
+    # The result is complete: winner, per-segment metrics and test report.
+    assert payload["best_params"] == {"window": 2}
+    assert payload["three_way"]["winner"]["trial_number"] == (
+        payload["three_way"]["selection"]["winner_trial_number"]
+    )
+    assert payload["final_test_stats"]["sharpe_ratio"] == 2.0
+    assert payload["three_way"]["test_distribution"]["count"] == 1
+
+
+def test_minimize_degradation_is_positive_when_validation_is_worse(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(target_metric="p_value", n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 0.02, 2: 0.90},
+            "validation": {1: 0.50, 2: 0.95},
+            "test": {1: 0.50, 2: 0.95},
+        },
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    overfitting = payload["three_way"]["overfitting"]
+    assert payload["best_params"] == {"window": 1}
+    # p_value rose from 0.02 to 0.50 on validation, which is worse; the sign
+    # convention makes "worse on validation" positive: (-0.02 + 0.50)/0.02.
+    assert overfitting["degradation"] == pytest.approx(24.0)
+
+
+def test_uncomputable_deflated_sharpe_flags_but_keeps_the_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 2.0, 2: 1.0},
+            "validation": {1: 1.0, 2: 2.0},
+            "test": {1: 1.0, 2: 2.0},
+        },
+        with_equity=False,
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    overfitting = payload["three_way"]["overfitting"]
+    assert overfitting["deflated_sharpe"] is None
+    assert overfitting["passed"] is False
+    assert any("deflated Sharpe" in reason for reason in overfitting["reasons"])
+    # A verdict that cannot be computed does not withhold the result.
+    assert payload["best_params"] == {"window": 2}
+    assert payload["final_test_stats"]

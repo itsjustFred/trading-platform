@@ -21,8 +21,11 @@ from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimization_diagnostics import (
     ThreeWaySplit,
+    deflated_sharpe_ratio,
+    overfitting_verdict,
     select_by_validation,
     three_way_split,
+    train_validation_degradation,
     walk_forward_train_validation_folds,
 )
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
@@ -818,6 +821,14 @@ def run_optimization(
     )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
+    # Flags the winner's overfitting risk; it never changes the selection or
+    # drops the result.
+    overfitting = _overfitting_payload(
+        winner_row=winner_row,
+        train_stats=best_train_stats,
+        selectable_rows=selectable_rows,
+        config=config,
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -893,6 +904,7 @@ def run_optimization(
                 test_rows=test_rows,
                 target_metric=config.target_metric,
             ),
+            "overfitting": _json_safe(overfitting),
         },
         "top_trials": _top_trials_payload(
             study.trials,
@@ -1411,6 +1423,78 @@ def _selection_payload(
             }
             for rank, row in enumerate(selection["top_set"], start=1)
         ],
+    }
+
+
+def _overfitting_payload(
+    *,
+    winner_row: Mapping[str, Any],
+    train_stats: Mapping[str, Any],
+    selectable_rows: Sequence[Mapping[str, Any]],
+    config: OptimizationConfig,
+) -> dict[str, Any]:
+    """The winner's train->validation degradation and deflated Sharpe (#164).
+
+    Degradation sign: for a maximize target ``(train - validation) / |train|``
+    is positive when validation is worse. A minimize target (p_value) is worse
+    when LARGER, so both metrics are negated before the same calculation, which
+    keeps "worse on validation" positive in both directions.
+
+    The deflated Sharpe uses the winner's VALIDATION daily-return moments,
+    ``n`` = the number of completed selectable trials the winner was picked
+    from, and ``var_sr`` = variance of those trials' per-observation validation
+    Sharpes. A verdict of False only flags the result; nothing is dropped.
+    """
+    direction = _study_direction(config.target_metric)
+    train_metric = _metric_value(dict(train_stats), config.target_metric)
+    validation_metric = float(winner_row["validation_metric_value"])
+    if direction == "minimize":
+        # p_value: worse on validation means larger, so negate both inputs.
+        degradation = train_validation_degradation(-train_metric, -validation_metric)
+    else:
+        degradation = train_validation_degradation(train_metric, validation_metric)
+
+    moments = winner_row.get("validation_moments")
+    trial_sharpes = [
+        float(row["validation_moments"]["sharpe_per_obs"])
+        for row in selectable_rows
+        if isinstance(row.get("validation_moments"), Mapping)
+        and row["validation_moments"].get("sharpe_per_obs") is not None
+    ]
+    n_selectable = len(selectable_rows)
+    var_sr = statistics.variance(trial_sharpes) if len(trial_sharpes) >= 2 else 0.0
+
+    deflated: float | None = None
+    if isinstance(moments, Mapping):
+        deflated = deflated_sharpe_ratio(
+            sr=float(moments["sharpe_per_obs"]),
+            t=int(moments["count"]),
+            skew=float(moments["skew"]),
+            kurt=float(moments["kurtosis"]),
+            n=n_selectable,
+            var_sr=float(var_sr),
+        )
+
+    verdict = overfitting_verdict(
+        degradation=degradation,
+        deflated_sharpe=deflated,
+        max_degradation=config.max_train_validation_degradation,
+        min_deflated_sharpe=config.min_deflated_sharpe,
+    )
+    return {
+        **verdict,
+        "degradation": _safe_float_or_none(degradation),
+        "deflated_sharpe": _safe_float_or_none(deflated),
+        "metric": TARGET_METRIC_ALIASES.get(config.target_metric, config.target_metric),
+        "train_metric_value": _safe_float_or_none(train_metric),
+        "validation_metric_value": _safe_float_or_none(validation_metric),
+        "n_selectable_trials": n_selectable,
+        "var_sharpe_per_obs": _safe_float_or_none(var_sr),
+        "note": (
+            "A failed verdict only flags this result: the winner and its "
+            "metrics are reported unchanged. Promotion decisions belong to the "
+            "promotion gate."
+        ),
     }
 
 
