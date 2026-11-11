@@ -1418,7 +1418,13 @@ def _selection_payload(
                 "validation_metric_value": _safe_float_or_none(
                     row.get("validation_metric_value")
                 ),
-                "params": _json_safe(dict(row["trial"].params)),
+                "params": _json_safe(
+                    {
+                        key: value
+                        for key, value in dict(row["trial"].params).items()
+                        if not str(key).startswith(_INTERNAL_PARAM_PREFIX)
+                    }
+                ),
                 "is_winner": row is winner,
             }
             for rank, row in enumerate(selection["top_set"], start=1)

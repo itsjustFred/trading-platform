@@ -677,3 +677,76 @@ def test_uncomputable_deflated_sharpe_flags_but_keeps_the_result(
     # A verdict that cannot be computed does not withhold the result.
     assert payload["best_params"] == {"window": 2}
     assert payload["final_test_stats"]
+
+
+def test_old_two_way_optimization_payload_still_loads(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Stored pre-#164 results have no validation/test split or verdict.
+
+    The migration decision is "none": old artifacts are left as they are and
+    must keep loading and listing without error. Nothing may be invented into
+    them (no ``three_way`` section on an old payload).
+    """
+    from viewer import core as viewer_core
+
+    old_payload = {
+        "id": "opt_old_two_way",
+        "file": "opt_old_two_way.json",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "engine": "vectorbt",
+        "base_backtest_id": "base-demo",
+        "strategy": {"identifier": "s", "slug": "s", "path": "s.py"},
+        "symbols": ["AAPL"],
+        "best_symbols": ["AAPL"],
+        "timeframe": "1d",
+        "target_metric": "sharpe",
+        "n_trials": 3,
+        "train_split_pct": 0.7,
+        "optimization_mode": "parameter",
+        "parameter_ranges": {"window": {"type": "int", "min": 2, "max": 4}},
+        "best_params": {"window": 3},
+        "effective_best_parameters": {"fixed": 3, "window": 3},
+        "best_value": 2.0,
+        "best_metric_key": "sharpe_ratio",
+        "best_raw_value": 2.0,
+        "best_value_is_risk_adjusted": False,
+        "oos_comparison": {
+            "metric_key": "sharpe_ratio",
+            "in_sample_value": 2.0,
+            "compatible": True,
+        },
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-08-01T00:00:00+00:00",
+        },
+        "test_period": {
+            "start": "2024-08-01T00:00:00+00:00",
+            "end": "2024-12-31T00:00:00+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 2.0},
+        "test_stats": {"sharpe_ratio": 1.2},
+        "oos_status": "available",
+        "top_trials": [
+            {"number": 0, "state": "COMPLETE", "value": 2.0, "params": {"window": 3}}
+        ],
+    }
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True)
+    (optimizations_dir / "opt_old_two_way.json").write_text(
+        json.dumps(old_payload), encoding="utf-8"
+    )
+    monkeypatch.setattr(viewer_core, "OPTIMIZATIONS_DIR", optimizations_dir)
+
+    loaded = viewer_core._load_optimization_payload("opt_old_two_way")
+    assert loaded == old_payload
+
+    summary = viewer_core._optimization_summary_payload(
+        loaded, optimizations_dir / "opt_old_two_way.json"
+    )
+    assert summary["train_split_pct"] == 0.7
+    assert summary["train_period"] == old_payload["train_period"]
+    assert summary["test_period"] == old_payload["test_period"]
+    assert summary["test_stats"] == {"sharpe_ratio": 1.2}
+    assert summary["oos_comparison"] == old_payload["oos_comparison"]
+    assert "three_way" not in summary, "an old artifact must not gain a new section"
