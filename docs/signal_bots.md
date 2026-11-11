@@ -38,7 +38,17 @@ pro Bot.
 
 ### RamJet
 - **Status:** Aktiv, registriert
-- **Features:** ATR + Supertrend BUY-only Setup mit TP1 und trailing metadata
+- **Features:** ATR + Supertrend BUY-only Setup mit TP1; Trailing-Modus konfigurierbar
+- **Trailing-Modus (`trailing_mode`):** `none` (Default), `percent` (benötigt `trailing_percent`
+  in (0, 1)) oder `supertrend_flip`. Der Modus ist eine Einstellung des Bots bzw. des Deployments
+  (`signal_config.signal_processor_config.trailing_mode`), nicht fest verdrahtet. Zentrale
+  Definition: `shared/trailing.py`.
+  - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
+    abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
+    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
+  - **Unterstützt:** Replay-Backtest `none`, `percent`; Live nur `none` (Live-Trailing fehlt
+    noch, #167). `supertrend_flip` ist bekannt, aber bis #168 nirgends ausführbar.
+  - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 
 ### RocketFuel (Long-only & Long+Short)
