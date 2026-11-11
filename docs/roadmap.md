@@ -22,7 +22,7 @@ ready work belong in the issue tracker, not here.
 
 | Idea | Status | Notes |
 |---|---|---|
-| Three-way optimization split (train/validation/test) with overfitting detection | `done` | #164 (implemented in `feat/optimizer-three-way-split`) |
+| Three-way optimization split (train/validation/test) with overfitting detection | `issue` | #164 |
 | Strategy governance: promotion gate experimental to production | `issue` | #165 |
 | Volatility targeting overlay | `issue` | #166 |
 | Multi-broker portfolio | `idea` | Combined equity and risk across Alpaca and cTrader. Large; start after the promotion gate (#165). Missing: definition of "combined" (one risk budget or per-broker budgets), currency handling, behaviour when one broker is unreachable. |
@@ -35,6 +35,6 @@ ready work belong in the issue tracker, not here.
 |---|---|---|
 | Tranching / rebalance timing luck | `next` | Rebalance date choice alone can move results by up to 350 bp. Candidate for the risk-parity rebalance; natural follow-up to #166. Missing: measure the effect on our own risk-parity backtest first. |
 | Strategy ideas from the paper survey | `idea` | SPY intraday momentum, VWAP+ADX for FX, hierarchical risk parity (HRP), deep reinforcement learning. Source: `docs/todo/architektur/research-papers-trading-strategies.md`. Missing: pick one candidate and define the reference result to reproduce. |
-| Meta-learning strategy ensemble | `next` | arXiv:2505.03659 (NYU Stern, 2025). The platform has many strategies but no layer that learns how to weight them. Missing: time-boxed investigation; depends on trustworthy out-of-sample numbers (#164 — now done). |
+| Meta-learning strategy ensemble | `idea` | arXiv:2505.03659 (NYU Stern, 2025). The platform has many strategies but no layer that learns how to weight them. Missing: time-boxed investigation; depends on trustworthy out-of-sample numbers (#164). |
 | Order flow / footprint for cTrader | `idea` | VPIN, order book imbalance, footprint imbalance, absorption, high-volume price levels. Reference: GitHub `dhruuvsharma/Trading-Strategies` (portable C#/Python). Missing: check which tick and depth data cTrader actually provides, live and historically. |
 | Alternative data, HFT, limit order book, DeFi | `idea` | Broad themes with no concrete proposal retained. Keep only as a reminder; needs a specific question before any work. |

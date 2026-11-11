@@ -289,14 +289,13 @@ export function OptimizeModal({
       if (Math.abs(totalSplit - 1.0) > 1e-9) {
         throw new Error("Train + Validation + Test splits must sum to 1.0.");
       }
-      if (parsedTrainSplit < 0.1 || parsedTrainSplit > 0.8) {
-        throw new Error("Train split must be between 0.1 and 0.8.");
+      // Same bounds as the backend's OptimizationConfig: train in [0.1, 0.95],
+      // validation and test strictly positive.
+      if (parsedTrainSplit < 0.1 || parsedTrainSplit > 0.95) {
+        throw new Error("Train split must be between 0.1 and 0.95.");
       }
-      if (parsedValidationSplit < 0.05 || parsedValidationSplit > 0.4) {
-        throw new Error("Validation split must be between 0.05 and 0.4.");
-      }
-      if (parsedTestSplit < 0.05 || parsedTestSplit > 0.4) {
-        throw new Error("Test split must be between 0.05 and 0.4.");
+      if (parsedValidationSplit <= 0 || parsedTestSplit <= 0) {
+        throw new Error("Validation and test splits must be greater than 0.");
       }
 
       const parameterRanges = buildRangePayload(parameterDrafts);
@@ -695,7 +694,7 @@ export function OptimizeModal({
             <input
               id="optimize-train-split"              type="number"
               min="0.1"
-              max="0.8"
+              max="0.95"
               step="0.05"
               value={trainSplitPct}
               onChange={(event) => setTrainSplitPct(event.target.value)}
@@ -708,7 +707,7 @@ export function OptimizeModal({
               id="optimize-validation-split"
               type="number"
               min="0.05"
-              max="0.4"
+              max="0.85"
               step="0.05"
               value={validationSplitPct}
               onChange={(event) => setValidationSplitPct(event.target.value)}
@@ -721,7 +720,7 @@ export function OptimizeModal({
               id="optimize-test-split"
               type="number"
               min="0.05"
-              max="0.4"
+              max="0.85"
               step="0.05"
               value={testSplitPct}
               onChange={(event) => setTestSplitPct(event.target.value)}
