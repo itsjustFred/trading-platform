@@ -1350,6 +1350,101 @@ class TestIssueB2Backfill:
         assert numeric == [str(1000 + index) for index in range(1, total + 1)]
         assert source._last_seen_message_ids["channel-1"] == str(1000 + total)
 
+    def test_page_that_does_not_pass_the_cursor_stops_after_one_request(self) -> None:
+        """A server that ignores `after` must not be re-requested page after page."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        cursor = str(1000 + ds.POLL_LIMIT)
+        source._last_seen_message_ids["channel-1"] = cursor
+        stale = [_burst_message(i) for i in range(ds.POLL_LIMIT, 0, -1)]  # newest == cursor
+        calls: list[str | None] = []
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls.append(after)
+            return list(stale)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert calls == [cursor]
+        assert source._last_seen_message_ids["channel-1"] == cursor
+
+    def test_first_poll_without_cursor_emits_in_order_and_seeds_the_cursor(self) -> None:
+        """Without a cursor the newest page is read once, oldest first."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        page = [_burst_message(i) for i in range(5, 0, -1)]  # newest-first
+        calls: list[dict[str, object]] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            return list(page)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1001", "1002", "1003", "1004", "1005"]
+        assert calls == [{}], "no cursor means no `after` and exactly one request"
+        assert source._last_seen_message_ids["channel-1"] == "1005"
+
+    def test_gap_spanning_three_polls_is_drained_completely(self) -> None:
+        """The seen-set retention must not interfere with a drain over several polls."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        per_poll = ds.MAX_BACKFILL_PAGES * ds.POLL_LIMIT
+        total = 2 * per_poll + 30
+        assert total > ds.SEEN_ID_RETENTION
+        burst = [_burst_message(i) for i in range(1, total + 1)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            anchor = int(after or 0)
+            return list(
+                reversed([m for m in burst if int(m["id"]) > anchor][: ds.POLL_LIMIT])
+            )
+
+        source._fetch_messages = _fetch
+        emitted_per_poll: list[int] = []
+
+        async def _three_polls() -> None:
+            for _ in range(3):
+                before = source._queue.qsize()
+                await source._poll_once("channel-1")
+                emitted_per_poll.append(source._queue.qsize() - before)
+
+        asyncio.run(_three_polls())
+
+        assert emitted_per_poll == [per_poll, per_poll, 30]
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == [str(1000 + index) for index in range(1, total + 1)]
+
+    def test_non_emitting_poll_advances_the_cursor_without_queueing(self) -> None:
+        """`emit=False` walks the same pages but queues nothing."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        burst = [_burst_message(i) for i in range(1, 8)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            anchor = int(after or 0)
+            return list(reversed([m for m in burst if int(m["id"]) > anchor]))
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1", emit=False))
+        assert source._queue.empty()
+        assert source._last_seen_message_ids["channel-1"] == "1007"
+
+        # The skipped messages stay skipped: a later emitting poll sees nothing new.
+        asyncio.run(source._poll_once("channel-1"))
+        assert source._queue.empty()
+
     def test_page_order_does_not_decide_emission_order_or_cursor(self) -> None:
         """An oldest-first page still emits chronologically and anchors on the newest id."""
         import asyncio
