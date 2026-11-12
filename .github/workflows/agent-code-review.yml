@@ -1,12 +1,36 @@
 name: Agent Code Review
 
-# Our own automated, read-only code review on every push to a PR, using the
-# `.agents/skills/actions-code-review` skill as the system prompt of an
-# opencode agent. Advisory only: it posts (and on later pushes updates) one PR
-# comment and never fails the PR because of its verdict.
+# Stage 2 of the PR verification pipeline (see the `platform-pr-verify` skill):
+#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> CodeRabbit
+#
+# On every push to a PR it waits for the SonarCloud check of the head commit.
+# Only if SonarCloud is green does it run the `.agents/skills/actions-code-review`
+# skill as the system prompt of a read-only opencode agent, post (and on later
+# pushes update) one PR comment, and set the commit status `agent/code-review`
+# on the head SHA. On PASS it dispatches `agent-mutation-testing.yml` for the
+# same SHA.
+#
+# Pipeline state lives in commit statuses, not labels: a status belongs to one
+# SHA, so a new push resets the pipeline without any clean-up. Labels set with
+# GITHUB_TOKEN would not trigger the next workflow anyway; workflow_dispatch is
+# the one event GITHUB_TOKEN may trigger.
+#
+# Statuses set here (state: description):
+#   agent/code-review       pending: waiting for SonarCloud / running
+#                           success: PASS
+#                           failure: BLOCK or CHANGES-REQUESTED
+#                           error:   INCOMPLETE, the agent run failed, or not run
+#                                    because SonarCloud is not green
+#   agent/mutation-testing  pending: waiting for agent/code-review (on push)
+#                           error:   not run because agent/code-review is not PASS
+#
+# Override (red stage, findings judged irrelevant): justify each finding in a PR
+# comment, then dispatch the next stage by hand. A manual dispatch of this
+# workflow skips the SonarCloud gate:
+#   gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N>
 #
 # opencode's free Zen models need no login and no API key, so this workflow
-# holds no secret besides the default GITHUB_TOKEN of the posting job.
+# holds no secret besides the default GITHUB_TOKEN.
 #
 # Trust model:
 # - The review rules (the skill) are read from the base branch, so a PR cannot
@@ -14,16 +38,13 @@ name: Agent Code Review
 #   used, and the prompt says so.
 # - The agent is defined in the runner's global opencode config, outside the
 #   checkout. Its edit tool and .env reads are denied, but it has a shell, so
-#   those denies are a hint, not a boundary. The real guards: the job holds no
-#   token or secret, and the run fails if HEAD moved or the tree is dirty.
+#   those denies are a hint, not a boundary. The real guards: the review job
+#   holds no token or secret, and the run fails if HEAD moved or the tree is
+#   dirty. Only the jobs that run no repo code hold a token.
 # - This workflow file itself is not pinned: on pull_request GitHub runs the
 #   PR's copy. Accepted, since only collaborators with write access can open
-#   same-repo PRs. Fork PRs are skipped.
-#
-# Manual run on any open PR (also before this workflow is on main):
-#   gh workflow run agent-code-review.yml --ref <branch-with-this-workflow> -f pr_number=<N>
-#   (the run uses the workflow and, if the base has no skill yet, the skill
-#   from that branch)
+#   same-repo PRs, and they can add any workflow to a PR anyway. Fork PRs are
+#   skipped.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
@@ -35,7 +56,7 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Number of the open PR to review
+        description: Number of the open PR to review (skips the SonarCloud gate)
         required: true
         type: number
 
@@ -48,19 +69,26 @@ env:
   MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.REVIEW_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
+  SONAR_CHECK: SonarCloud Code Analysis
+  REVIEW_CONTEXT: agent/code-review
+  MUTATION_CONTEXT: agent/mutation-testing
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
-  # via jq, never via ${{ }} interpolation into a shell script).
+  # via jq, never via ${{ }} interpolation into a shell script). On a push it
+  # also cancels mutation runs of older commits and marks both stages pending.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       pull-requests: read
+      statuses: write
+      actions: write
     outputs:
       number: ${{ steps.pr.outputs.number }}
       base: ${{ steps.pr.outputs.base }}
       head: ${{ steps.pr.outputs.head }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
       same_repo: ${{ steps.pr.outputs.same_repo }}
     steps:
       - name: Resolve PR
@@ -84,8 +112,48 @@ jobs:
             echo "number=$(jq -r .number pr.json)"
             echo "base=$(jq -r .base.sha pr.json)"
             echo "head=$(jq -r .head.sha pr.json)"
+            echo "head_ref=$(jq -r .head.ref pr.json)"
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Mark stages pending
+        if: steps.pr.outputs.same_repo == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            desc="Waiting for ${SONAR_CHECK}"
+          else
+            desc="Running (manual dispatch, SonarCloud gate skipped)"
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$REVIEW_CONTEXT" -f description="$desc" \
+            -f target_url="$RUN_URL" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$MUTATION_CONTEXT" \
+            -f description="Waiting for ${REVIEW_CONTEXT}" > /dev/null
+
+      # Mutation runs are dispatched with run-name "... PR #<n> @ <sha>". A new
+      # push makes those of older commits worthless; stop them to save minutes.
+      - name: Cancel mutation runs of older commits
+        if: steps.pr.outputs.same_repo == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          for state in queued in_progress; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/agent-mutation-testing.yml/runs?status=${state}&per_page=100" \
+              --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
+              2>/dev/null || true
+          done | while read -r id; do
+            echo "Cancelling superseded mutation run ${id}"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/cancel" > /dev/null || true
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,14 +161,75 @@ jobs:
           path: meta.json
           retention-days: 1
 
-  review:
+  # Stage 1 gate: wait for the SonarCloud check of the head commit. Skipped on
+  # a manual dispatch, which is the override for an acceptable SonarCloud
+  # failure.
+  sonar-gate:
     needs: resolve
-    # Fork PRs get no secrets on pull_request and are not reviewed.
-    if: ${{ needs.resolve.outputs.same_repo == 'true' }}
+    if: ${{ github.event_name == 'pull_request' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      checks: read
+      statuses: write
+    outputs:
+      passed: ${{ steps.wait.outputs.passed }}
+    steps:
+      - name: Wait for SonarCloud
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+          PR_NUMBER: ${{ needs.resolve.outputs.number }}
+          HEAD_REF: ${{ needs.resolve.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          status=""; conclusion=""
+          # Up to 20 minutes, polling every 20 s.
+          for _ in $(seq 1 60); do
+            line=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
+              -f check_name="$SONAR_CHECK" -X GET \
+              --jq '.check_runs | sort_by(.started_at) | last | select(. != null) | "\(.status) \(.conclusion)"')
+            status="${line%% *}"; conclusion="${line#* }"
+            if [ "$status" = "completed" ]; then break; fi
+            sleep 20
+          done
+          echo "SonarCloud: status=${status:-missing} conclusion=${conclusion:-none}"
+          if [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          if [ "$status" = "completed" ]; then
+            reason="${SONAR_CHECK}: ${conclusion}"
+          else
+            reason="${SONAR_CHECK} did not finish in 20 min"
+          fi
+          # Status descriptions are limited to 140 characters.
+          desc=$(printf 'Not run, %s. Override: dispatch with pr_number=%s' "$reason" "$PR_NUMBER" | cut -c1-140)
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$REVIEW_CONTEXT" -f description="$desc" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
+          echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER}"
+
+  review:
+    needs: [resolve, sonar-gate]
+    # Fork PRs get no secrets on pull_request and are not reviewed. On a push
+    # the SonarCloud gate must pass; a manual dispatch skips it.
+    if: >-
+      ${{ !cancelled()
+          && needs.resolve.result == 'success'
+          && needs.resolve.outputs.same_repo == 'true'
+          && (needs.sonar-gate.outputs.passed == 'true'
+              || (github.event_name == 'workflow_dispatch' && needs.sonar-gate.result == 'skipped')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      verdict: ${{ steps.run.outputs.verdict }}
     env:
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       BASE_SHA: ${{ needs.resolve.outputs.base }}
@@ -187,6 +316,7 @@ jobs:
           path: ${{ runner.temp }}/review
 
       - name: Run review agent
+        id: run
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
         run: |
@@ -206,9 +336,13 @@ jobs:
           fi
           tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
           # The verdict must be the last non-empty line (a verdict quoted from the
-          # diff elsewhere in the output does not count).
-          if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
-            echo "::error::Review output does not end with a verdict line; not posting."
+          # diff elsewhere in the output does not count), and it must be one of
+          # the four the skill allows.
+          last=$(grep -v '^[[:space:]]*$' "$out" | tail -n 1)
+          verdict=$(printf '%s\n' "$last" | tr -d '*' \
+            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
+          if [ -z "$verdict" ]; then
+            echo "::error::Review output does not end with a valid verdict line; not posting."
             cat "$out.raw"
             exit 1
           fi
@@ -217,6 +351,7 @@ jobs:
             git status --porcelain
             exit 1
           fi
+          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
           # Footer: the model, its variant and the skill the review rules came
           # from (the skill directory's name, not its path), so a reader can
           # map the verdict to the rules that produced it.
@@ -234,27 +369,55 @@ jobs:
           path: ${{ runner.temp }}/review/comment.md
           retention-days: 14
 
+  # Posts the comment, sets the statuses and, on PASS, dispatches the mutation
+  # stage. Runs no repo code. Also reports a failed review run as `error`.
   post:
     needs: [resolve, review]
+    if: ${{ !cancelled() && (needs.review.result == 'success' || needs.review.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Verified on PR #178: pull-requests: write is enough for the
     # issues/{n}/comments endpoints on a pull request; issues: write is not needed.
     permissions:
       pull-requests: write
+      statuses: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      HEAD_REF: ${{ needs.resolve.outputs.head_ref }}
+      VERDICT: ${{ needs.review.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      - name: Report failed review run
+        if: needs.review.result == 'failure'
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$REVIEW_CONTEXT" \
+            -f description="Review run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
+
       - uses: actions/download-artifact@v4
+        if: needs.review.result == 'success'
         with:
           name: agent-code-review
 
       # One comment per PR, identified by a hidden marker and updated in place.
-      # Uses the REST API only.
+      # Uses the REST API only. A result for a commit that is no longer the PR
+      # head does not overwrite the comment (its status still lands on its SHA).
       - name: Post or update review comment
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ needs.resolve.outputs.number }}
+        if: needs.review.result == 'success'
         run: |
           set -euo pipefail
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
           marker='<!-- actions-code-review -->'
           { echo "$marker"; cat comment.md; } > body.md
           existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
@@ -263,4 +426,26 @@ jobs:
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
+
+      - name: Set status and start mutation testing
+        if: needs.review.result == 'success'
+        run: |
+          set -euo pipefail
+          case "$VERDICT" in
+            PASS) state=success ;;
+            BLOCK|CHANGES-REQUESTED) state=failure ;;
+            *) state=error ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$REVIEW_CONTEXT" \
+            -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+          if [ "$VERDICT" = "PASS" ]; then
+            gh workflow run agent-mutation-testing.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF" \
+              -f pr_number="$PR_NUMBER" -f head_sha="$HEAD_SHA"
+            echo "Dispatched mutation testing for ${HEAD_SHA}."
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
