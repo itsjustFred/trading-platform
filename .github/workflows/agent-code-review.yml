@@ -1,6 +1,6 @@
-name: PR review (advisory)
+name: Agent Code Review
 
-# Automated, read-only code review on every push to a PR, using the
+# Our own automated, read-only code review on every push to a PR, using the
 # `.agents/skills/actions-code-review` skill as the system prompt of an
 # opencode agent. Advisory only: it posts (and on later pushes updates) one PR
 # comment and never fails the PR because of its verdict.
@@ -20,6 +20,11 @@ name: PR review (advisory)
 #   PR's copy. Accepted, since only collaborators with write access can open
 #   same-repo PRs. Fork PRs are skipped.
 #
+# Manual run on any open PR (also before this workflow is on main):
+#   gh workflow run agent-code-review.yml --ref <branch-with-this-workflow> -f pr_number=<N>
+#   (the run uses the workflow and, if the base has no skill yet, the skill
+#   from that branch)
+#
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
 #   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: high)
@@ -27,9 +32,15 @@ name: PR review (advisory)
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR to review
+        required: true
+        type: number
 
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number }}
+  group: agent-code-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 env:
@@ -39,16 +50,65 @@ env:
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 
 jobs:
+  # Resolves the PR for both triggers and writes its metadata (title and body
+  # via jq, never via ${{ }} interpolation into a shell script).
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+            if [ "$(jq -r .state pr.json)" != "open" ]; then
+              echo "::error::PR #${INPUT_PR} is not open."
+              exit 1
+            fi
+          fi
+          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=$(jq -r .head.sha pr.json)"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-code-review-meta
+          path: meta.json
+          retention-days: 1
+
   review:
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    needs: resolve
+    # Fork PRs get no secrets on pull_request and are not reviewed.
+    if: ${{ needs.resolve.outputs.same_repo == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.resolve.outputs.head }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -63,20 +123,27 @@ jobs:
           npm install -g "@opencode/cli@${OPENCODE_VERSION}"
           opencode --version
 
+      # Review rules: the base branch's skill if it has one. Otherwise (only
+      # while the skill is not merged yet) the copy from the commit this
+      # workflow runs from, then the PR's own copy. Any git failure other than
+      # "no skill at base" stops the job.
       - name: Select skill revision
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/review"
-          # Fall back to the PR's copy only when the base commit is readable and
-          # really has no skill; any other git failure stops the job.
+          skill="$RUNNER_TEMP/review/skill.md"
           git cat-file -e "${BASE_SHA}^{commit}"
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
-            git show "${BASE_SHA}:${SKILL_PATH}" > "$RUNNER_TEMP/review/skill.md"
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-          else
-            cp "$SKILL_PATH" "$RUNNER_TEMP/review/skill.md"
+          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
+          elif [ -f "$SKILL_PATH" ]; then
+            cp "$SKILL_PATH" "$skill"
             echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          else
+            echo "::error::No review skill found at base, workflow ref or PR head."
+            exit 1
           fi
 
       # The agent lives in the global config, not in the checkout. Its system
@@ -114,19 +181,13 @@ jobs:
           OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
             | jq -e '.[] | select(.id == "pr-review") | .model' > /dev/null
 
-      # Title and body come from the event file, never from ${{ }} interpolation
-      # into a shell script (script injection).
-      - name: Write PR metadata
-        run: |
-          jq '{number: .pull_request.number, title: .pull_request.title, body: .pull_request.body,
-               base: .pull_request.base.sha, head: .pull_request.head.sha}' \
-            "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/review/meta.json"
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-code-review-meta
+          path: ${{ runner.temp }}/review
 
       - name: Run review agent
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
         run: |
           set -euo pipefail
@@ -161,12 +222,12 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pr-review
+          name: agent-code-review
           path: ${{ runner.temp }}/review/comment.md
           retention-days: 14
 
   post:
-    needs: review
+    needs: [resolve, review]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Verified on PR #178: pull-requests: write is enough for the
@@ -176,14 +237,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: pr-review
+          name: agent-code-review
 
       # One comment per PR, identified by a hidden marker and updated in place.
       # Uses the REST API only.
       - name: Post or update review comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ needs.resolve.outputs.number }}
         run: |
           set -euo pipefail
           marker='<!-- actions-code-review -->'
