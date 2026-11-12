@@ -5,11 +5,16 @@ name: PR review (advisory)
 # The review is advisory: it posts (and on later pushes updates) one PR comment
 # and never fails the PR because of its verdict.
 #
+# The model is reached through any OpenAI-compatible endpoint, declared in pi's
+# models.json at run time (no pi extension needed).
+#
 # Configuration (Settings -> Secrets and variables -> Actions):
-#   secret REVIEW_API_KEY   API key for the provider
-#   var    REVIEW_PROVIDER  pi provider name (default: kilo)
-#   var    REVIEW_MODEL     model id (default: baidu/ernie-5.5-flash-preview:free)
-#   var    REVIEW_THINKING  pi thinking level (default: high)
+#   secret REVIEW_API_KEY    API key for the endpoint
+#   var    REVIEW_PROVIDER   provider label (default: kilo)
+#   var    REVIEW_BASE_URL   OpenAI-compatible base URL (default: Kilo gateway)
+#   var    REVIEW_MODEL      model id (default: baidu/ernie-5.5-flash-preview:free)
+#   var    REVIEW_THINKING   pi thinking level (default: high)
+#   var    REVIEW_COMPAT     pi model "compat" JSON (default: Kilo/OpenRouter settings)
 
 on:
   pull_request:
@@ -21,7 +26,6 @@ concurrency:
 
 env:
   PI_VERSION: "1.5.2"
-  PI_FREE_VERSION: "2.8.6"
 
 jobs:
   review:
@@ -43,7 +47,22 @@ jobs:
           node-version: 22
 
       - name: Install pi
-        run: npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" "pi-free@${PI_FREE_VERSION}"
+        run: npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+      # The key itself is not written anywhere: models.json references it as
+      # $REVIEW_API_KEY, which pi resolves from the environment at request time.
+      - name: Configure model endpoint
+        env:
+          PROVIDER: ${{ vars.REVIEW_PROVIDER || 'kilo' }}
+          BASE_URL: ${{ vars.REVIEW_BASE_URL || 'https://api.kilo.ai/api/gateway' }}
+          MODEL: ${{ vars.REVIEW_MODEL || 'baidu/ernie-5.5-flash-preview:free' }}
+          COMPAT: ${{ vars.REVIEW_COMPAT || '{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"supportsUsageInStreaming":false,"supportsStrictMode":false,"thinkingFormat":"openrouter","maxTokensField":"max_tokens"}' }}
+        run: |
+          mkdir -p "$HOME/.pi/agent"
+          jq -n --arg p "$PROVIDER" --arg u "$BASE_URL" --arg m "$MODEL" --argjson c "$COMPAT" \
+            '{providers: {($p): {baseUrl: $u, api: "openai-completions", apiKey: "$REVIEW_API_KEY",
+              models: [{id: $m, reasoning: true, contextWindow: 262144, maxTokens: 65536, compat: $c}]}}}' \
+            > "$HOME/.pi/agent/models.json"
 
       # Title and body come from the event file, never from ${{ }} interpolation
       # into a shell script (script injection).
@@ -66,12 +85,10 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/review/comment.md"
-          pi -p --no-session --no-context-files --no-mcp \
-            --no-extensions --extension "$(npm root -g)/pi-free" \
+          pi -p --no-session --no-context-files --no-mcp --no-extensions \
             --tools read,grep,find,ls,bash \
             --skill .agents/skills/actions-code-review \
             --provider "$PROVIDER" --model "$MODEL" --thinking "$THINKING" \
-            --api-key "$REVIEW_API_KEY" \
             "/skill:actions-code-review Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Reviewer: ${MODEL} via pi (${PROVIDER})." \
             > "$out"
           if ! grep -q '^\*\*Verdict:' "$out"; then
