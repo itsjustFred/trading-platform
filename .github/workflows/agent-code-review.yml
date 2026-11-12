@@ -217,7 +217,12 @@ jobs:
             git status --porcelain
             exit 1
           fi
-          printf '\n\n---\n_Automated review using %s_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}" >> "$out"
+          # Footer: the model, its variant and the skill the review rules came
+          # from (the skill directory's name, not its path), so a reader can
+          # map the verdict to the rules that produced it.
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          printf '\n\n---\n_Automated review using %s with `%s` skill_\n' \
+            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
