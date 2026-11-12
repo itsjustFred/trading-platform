@@ -13,8 +13,9 @@ name: PR review (advisory)
 #   weaken its own review. Only while the base has no skill yet is the PR's copy
 #   used, and the prompt says so.
 # - The agent is defined in the runner's global opencode config, outside the
-#   checkout. It may read, search and run shell commands, but not edit files;
-#   the run fails if the checkout changed anyway.
+#   checkout. Its edit tool and .env reads are denied, but it has a shell, so
+#   those denies are a hint, not a boundary. The real guards: the job holds no
+#   token or secret, and the run fails if HEAD moved or the tree is dirty.
 # - This workflow file itself is not pinned: on pull_request GitHub runs the
 #   PR's copy. Accepted, since only collaborators with write access can open
 #   same-repo PRs. Fork PRs are skipped.
@@ -55,15 +56,23 @@ jobs:
         with:
           node-version: 22
 
+      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
+      # the platform binary. The job holds no token, so the exposure is bounded.
       - name: Install opencode
-        run: npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+        run: |
+          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          opencode --version
 
       - name: Select skill revision
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/review"
-          if git show "${BASE_SHA}:${SKILL_PATH}" > "$RUNNER_TEMP/review/skill.md" 2>/dev/null; then
+          # Fall back to the PR's copy only when the base commit is readable and
+          # really has no skill; any other git failure stops the job.
+          git cat-file -e "${BASE_SHA}^{commit}"
+          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$RUNNER_TEMP/review/skill.md"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
           else
             cp "$SKILL_PATH" "$RUNNER_TEMP/review/skill.md"
@@ -90,6 +99,7 @@ jobs:
             printf '  - { action: glob, resource: "*", effect: allow }\n'
             printf '  - { action: grep, resource: "*", effect: allow }\n'
             printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
             printf '  - { action: edit, resource: "*", effect: deny }\n'
             printf '  - { action: read, resource: "*.env", effect: deny }\n'
             printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
