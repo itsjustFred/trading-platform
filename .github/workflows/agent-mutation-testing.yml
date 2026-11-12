@@ -131,6 +131,23 @@ jobs:
           path: meta.json
           retention-days: 1
 
+      # After "Mark running" a failure here (artifact upload) would leave the
+      # stage `pending` with every later job skipped.
+      - name: Report resolve failure
+        if: failure() && steps.pr.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Resolve step failed; see the run log" > /dev/null
+          fi
+
   mutate:
     needs: resolve
     # Fork PRs are not mutation-tested.
@@ -210,7 +227,11 @@ jobs:
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |
+          set -euo pipefail
           skill="$RUNNER_TEMP/mutation/skill.md"
+          # Refuse when the base commit is unreachable, as the review workflow
+          # does: falling through would run rules the PR may have weakened.
+          git cat-file -e "${BASE_SHA}^{commit}"
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"

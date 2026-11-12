@@ -161,6 +161,25 @@ jobs:
           path: meta.json
           retention-days: 1
 
+      # After "Mark stages pending" a failure here (cancel query, artifact
+      # upload) would leave both stages `pending` with every later job skipped.
+      - name: Report resolve failure
+        if: failure() && steps.pr.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Resolve step failed; see the run log" > /dev/null
+            fi
+          done
+
   # Stage 1 gate: wait for the SonarCloud check of the head commit. Skipped on
   # a manual dispatch, which is the override for an acceptable SonarCloud
   # failure.
@@ -246,7 +265,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      verdict: ${{ steps.run.outputs.verdict }}
+      verdict: ${{ steps.verdict.outputs.verdict }}
     env:
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       BASE_SHA: ${{ needs.resolve.outputs.base }}
@@ -378,7 +397,9 @@ jobs:
             git status --porcelain
             exit 1
           fi
-          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
+          # A file, not $GITHUB_OUTPUT: the agent shares this step's
+          # environment and could otherwise append its own verdict.
+          printf '%s\n' "$verdict" > "$RUNNER_TEMP/review/verdict.txt"
           # Footer: the model, its variant and the skill the review rules came
           # from (the skill directory's name, not its path), so a reader can
           # map the verdict to the rules that produced it.
@@ -389,6 +410,14 @@ jobs:
           { printf '# Code Review Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      # A separate step, so the verdict reaches $GITHUB_OUTPUT from a file the
+      # agent never had this step's env file to append to.
+      - name: Read verdict
+        id: verdict
+        run: |
+          set -euo pipefail
+          echo "verdict=$(cat "$RUNNER_TEMP/review/verdict.txt")" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
