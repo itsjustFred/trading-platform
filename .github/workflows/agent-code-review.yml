@@ -27,7 +27,7 @@ name: Agent Code Review
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
-#   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: high)
+#   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
   pull_request:
@@ -46,7 +46,7 @@ concurrency:
 env:
   OPENCODE_VERSION: "2.2.7"
   MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
-  VARIANT: ${{ vars.REVIEW_VARIANT || 'high' }}
+  VARIANT: ${{ vars.REVIEW_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 
 jobs:
@@ -106,13 +106,13 @@ jobs:
       BASE_SHA: ${{ needs.resolve.outputs.base }}
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.head }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
