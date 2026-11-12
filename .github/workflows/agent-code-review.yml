@@ -223,6 +223,9 @@ jobs:
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
           printf '\n\n---\n_Automated review using %s with `%s` skill_\n' \
             "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          # Title first, so the comment is recognisable among the other bots'.
+          { printf '# Code Review Action\n\n'; cat "$out"; } > "$out.titled"
+          mv "$out.titled" "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
