@@ -1,5 +1,8 @@
 name: Agent Mutation Testing
-run-name: Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}
+# Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
+# the PR number and SHA from display_title and made the superseded-run cancel
+# in agent-code-review.yml a no-op.
+run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
 
 # Stage 3 of the PR verification pipeline (see the `platform-pr-verify` skill):
 #   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> CodeRabbit
@@ -261,9 +264,15 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/mutation/comment.md"
-          opencode run --standalone --archived --agent pr-mutation \
-            "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}." \
-            > "$out.raw"
+          # Captured through a variable, never a file the agent can reach: it
+          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
+          # in $out.raw would otherwise be posted as the verdict.
+          if ! raw=$(opencode run --standalone --archived --agent pr-mutation \
+            "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}."); then
+            printf '%s\n' "$raw" > "$out.raw"
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
           # opencode prints every assistant message; keep only the final comment,
           # which starts at the last "**Summary:**" line. Drop a closing code
           # fence the model may have wrapped around it.

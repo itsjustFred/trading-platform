@@ -214,6 +214,23 @@ jobs:
             -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
           echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER}"
 
+      # Without this, a step failure here (e.g. an API error under `set -e`)
+      # leaves both stages `pending` forever: `review` is skipped and `post`
+      # only runs for a finished review.
+      - name: Report gate failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$REVIEW_CONTEXT" \
+            -f description="SonarCloud gate failed; see the run log" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Not run: SonarCloud gate failed" > /dev/null
+
   review:
     needs: [resolve, sonar-gate]
     # Fork PRs get no secrets on pull_request and are not reviewed. On a push
@@ -322,9 +339,15 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/review/comment.md"
-          opencode run --standalone --archived --agent pr-review \
-            "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}." \
-            > "$out.raw"
+          # Captured through a variable, never a file the agent can reach: it
+          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
+          # in $out.raw would otherwise be posted as the verdict.
+          if ! raw=$(opencode run --standalone --archived --agent pr-review \
+            "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}."); then
+            printf '%s\n' "$raw" > "$out.raw"
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
           # opencode prints every assistant message; keep only the final comment,
           # which starts at the last "**Summary:**" line. Drop a closing code
           # fence the model may have wrapped around it.
