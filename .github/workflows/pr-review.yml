@@ -5,8 +5,15 @@ name: PR review (advisory)
 # The review is advisory: it posts (and on later pushes updates) one PR comment
 # and never fails the PR because of its verdict.
 #
-# Review rules are read from the base branch (a PR cannot weaken its own
-# review); fork PRs are skipped because they get no secrets.
+# Review rules (the skill) are read from the base branch, so a PR cannot
+# weaken its own review. This workflow file itself is NOT pinned: on
+# pull_request GitHub runs the PR's copy, so a PR can change its permissions
+# and guards. Accepted because only collaborators with write access can open
+# same-repo PRs; fork PRs are skipped (they get no secrets).
+#
+# Known trade-off: the agent has a bash tool and the API key is in its
+# environment, so a successful prompt injection could exfiltrate the key.
+# Use a dedicated, revocable, free-tier key for REVIEW_API_KEY.
 #
 # The model is reached through any OpenAI-compatible endpoint, declared in pi's
 # models.json at run time (no pi extension needed).
@@ -103,12 +110,14 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/review/comment.md"
-          pi -p --no-session --no-context-files --no-mcp --no-extensions \
+          pi -p --no-session --no-context-files --no-mcp --no-extensions --no-approve \
             --tools read,grep,find,ls,bash \
             --skill "$RUNNER_TEMP/skill/actions-code-review" \
             --provider "$PROVIDER" --model "$MODEL" --thinking "$THINKING" \
             "/skill:actions-code-review Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Reviewer: ${MODEL} via pi (${PROVIDER}). Review rules loaded from: ${SKILL_SOURCE}." \
-            > "$out"
+            > "$out.raw"
+          # Drop a code fence the model may have wrapped around the whole comment.
+          sed -e '1{/^```[a-z]*[[:space:]]*$/d}' "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count).
           if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then

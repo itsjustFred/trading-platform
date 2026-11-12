@@ -91,7 +91,7 @@ Judgement calls. Each item says *what it is → how to fix* and names what the n
 
 ## Output
 
-Your final message is exactly this block, with no preamble and at most 1,200 words. Leave out severity sections that have no findings. With no findings at all, write `No findings.` in their place.
+Your final message is exactly this block, with no preamble and at most 1,200 words. Do not wrap it in a code fence; the fence below only marks the template. Leave out severity sections that have no findings. With no findings at all, write `No findings.` in their place.
 
 ```markdown
 **Summary:** <one line: risk surface and counts, e.g. "Touches live sizing. 1 blocker, 2 should-fix, 1 nit.">
