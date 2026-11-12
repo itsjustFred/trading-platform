@@ -203,6 +203,10 @@ jobs:
       # Rules: the base branch's skill if it has one. Otherwise (only while the
       # skill is not merged yet) the copy from the commit this workflow runs
       # from, then the PR's own copy.
+      #
+      # Duplicated by hand in agent-code-review.yml: skill selection, agent
+      # config, verdict parse, tree-clean check and comment poster. A change to
+      # one copy must land in the other in the same commit.
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |

@@ -273,6 +273,10 @@ jobs:
       # while the skill is not merged yet) the copy from the commit this
       # workflow runs from, then the PR's own copy. Any git failure other than
       # "no skill at base" stops the job.
+      #
+      # Duplicated by hand in agent-mutation-testing.yml: skill selection,
+      # agent config, verdict parse, tree-clean check and comment poster. A
+      # change to one copy must land in the other in the same commit.
       - name: Select skill revision
         run: |
           mkdir -p "$RUNNER_TEMP/review"
@@ -464,8 +468,16 @@ jobs:
             -f state="$state" -f context="$REVIEW_CONTEXT" \
             -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
           if [ "$VERDICT" = "PASS" ]; then
-            gh workflow run agent-mutation-testing.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF" \
-              -f pr_number="$PR_NUMBER" -f head_sha="$HEAD_SHA"
+            # A failed dispatch would otherwise leave agent/mutation-testing
+            # `pending` forever on this SHA, with no error anywhere.
+            if ! gh workflow run agent-mutation-testing.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF" \
+              -f pr_number="$PR_NUMBER" -f head_sha="$HEAD_SHA"; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$MUTATION_CONTEXT" \
+                -f description="Not run: dispatch of mutation testing failed" > /dev/null
+              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} to error."
+              exit 1
+            fi
             echo "Dispatched mutation testing for ${HEAD_SHA}."
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
