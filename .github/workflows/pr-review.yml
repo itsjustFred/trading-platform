@@ -1,0 +1,180 @@
+name: PR review (advisory)
+
+# Automated, read-only code review on every push to a PR, using the
+# `.agents/skills/actions-code-review` skill as the system prompt of an
+# opencode agent. Advisory only: it posts (and on later pushes updates) one PR
+# comment and never fails the PR because of its verdict.
+#
+# opencode's free Zen models need no login and no API key, so this workflow
+# holds no secret besides the default GITHUB_TOKEN of the posting job.
+#
+# Trust model:
+# - The review rules (the skill) are read from the base branch, so a PR cannot
+#   weaken its own review. Only while the base has no skill yet is the PR's copy
+#   used, and the prompt says so.
+# - The agent is defined in the runner's global opencode config, outside the
+#   checkout. It may read, search and run shell commands, but not edit files;
+#   the run fails if the checkout changed anyway.
+# - This workflow file itself is not pinned: on pull_request GitHub runs the
+#   PR's copy. Accepted, since only collaborators with write access can open
+#   same-repo PRs. Fork PRs are skipped.
+#
+# Configuration (Settings -> Secrets and variables -> Actions -> Variables):
+#   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: high)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  OPENCODE_VERSION: "2.2.7"
+  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
+  VARIANT: ${{ vars.REVIEW_VARIANT || 'high' }}
+  SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install opencode
+        run: npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+
+      - name: Select skill revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/review"
+          if git show "${BASE_SHA}:${SKILL_PATH}" > "$RUNNER_TEMP/review/skill.md" 2>/dev/null; then
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          else
+            cp "$SKILL_PATH" "$RUNNER_TEMP/review/skill.md"
+            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          fi
+
+      # The agent lives in the global config, not in the checkout. Its system
+      # prompt is the skill body (the skill's own frontmatter is dropped).
+      - name: Configure review agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only automated PR reviewer (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*", effect: allow }\n'
+            printf '  - { action: glob, resource: "*", effect: allow }\n'
+            printf '  - { action: grep, resource: "*", effect: allow }\n'
+            printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: edit, resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
+            printf -- '---\n'
+            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/review/skill.md"
+          } > "$conf/agents/pr-review.md"
+          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
+            | jq -e '.[] | select(.id == "pr-review") | .model' > /dev/null
+
+      # Title and body come from the event file, never from ${{ }} interpolation
+      # into a shell script (script injection).
+      - name: Write PR metadata
+        run: |
+          jq '{number: .pull_request.number, title: .pull_request.title, body: .pull_request.body,
+               base: .pull_request.base.sha, head: .pull_request.head.sha}' \
+            "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/review/meta.json"
+
+      - name: Run review agent
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/review/comment.md"
+          opencode run --standalone --archived --agent pr-review \
+            "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}." \
+            > "$out.raw"
+          # opencode prints every assistant message; keep only the final comment,
+          # which starts at the last "**Summary:**" line. Drop a closing code
+          # fence the model may have wrapped around it.
+          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
+          if [ -z "$start" ]; then
+            echo "::error::Review output has no summary line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+          # The verdict must be the last non-empty line (a verdict quoted from the
+          # diff elsewhere in the output does not count).
+          if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
+            echo "::error::Review output does not end with a verdict line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The review agent modified the checkout; not posting."
+            git status --porcelain
+            exit 1
+          fi
+          printf '\n\n---\n_Automated review using %s_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}" >> "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-review
+          path: ${{ runner.temp }}/review/comment.md
+          retention-days: 14
+
+  post:
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-review
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only.
+      - name: Post or update review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          marker='<!-- actions-code-review -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
