@@ -45,9 +45,11 @@ timeout 300 uv run --no-sync --no-build pytest -q -p no:cacheprovider -x <test p
 4. **Baseline.** Run each selected test set once on the unmodified code. It must exit 0. If it does not, drop that file's mutations, list the file as `baseline red` under "Not verified" with the failing test, and continue with the others. If every baseline is red, output `INCOMPLETE`.
 5. **Map the change.** Read each scope file's hunks (`git diff <base>...<head> -- <file>`) and the whole function around each hunk, and build a model of the module's data flow, so you choose mutations that are meaningful rather than trivially dead. Mutate what the PR added or changed, not untouched code elsewhere in the file.
 
-## Time budget
+## Budget
 
-The job is killed after 75 minutes, and a killed job posts nothing. Stop starting new mutations when you estimate about 45 minutes of work have passed, and report what you have. Work through files in this order so the most important ones are done first: code that touches money (live and paper orders, brokers, risk, sizing, backtest engines, stats, optimization, strategies, validation, data), then the rest. List every file or hunk you did not get to under "Not verified".
+- At most **6 mutations per file** and **30 in total**. With more scope files than the budget allows, prioritise code that touches money (live and paper orders, brokers, risk, sizing, backtest engines, stats, optimization, strategies, validation, data), then the rest.
+- The job is killed after 75 minutes, and a killed job posts nothing. Stop starting new mutations when you estimate about 45 minutes of work have passed, and report what you have.
+- List every file or hunk you did not get to under "Not verified".
 
 ## Choosing mutations
 
@@ -98,7 +100,7 @@ Your final message is exactly this block, with no preamble and at most 900 words
 ### Weak diagnostics
 - `path:line` · <Indirect | Cascading> · how a more focused assertion would point at the bug. (Optional; leave out if none.)
 
-**Not verified:** <files or hunks not reached in the time budget, baseline red, no tests reference the module, mutations not run and why; or "nothing material">
+**Not verified:** <files or hunks skipped by budget, baseline red, no tests reference the module, mutations not run and why; or "nothing material">
 **Verdict: GAPS** — <one line: the most important test to add first>
 ```
 
