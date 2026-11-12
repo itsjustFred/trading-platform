@@ -1,0 +1,122 @@
+name: PR review (advisory)
+
+# Automated, read-only code review of every non-draft PR, using the
+# `.agents/skills/actions-code-review` skill under the pi agent harness.
+# The review is advisory: it posts (and on later pushes updates) one PR comment
+# and never fails the PR because of its verdict.
+#
+# Configuration (Settings -> Secrets and variables -> Actions):
+#   secret REVIEW_API_KEY   API key for the provider
+#   var    REVIEW_PROVIDER  pi provider name (default: kilo)
+#   var    REVIEW_MODEL     model id (default: baidu/ernie-5.5-flash-preview:free)
+#   var    REVIEW_THINKING  pi thinking level (default: high)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PI_VERSION: "1.5.2"
+  PI_FREE_VERSION: "2.8.6"
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Read-only: the agent step gets no write token and no stored git credentials.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pi
+        run: npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" "pi-free@${PI_FREE_VERSION}"
+
+      # Title and body come from the event file, never from ${{ }} interpolation
+      # into a shell script (script injection).
+      - name: Write PR metadata
+        run: |
+          mkdir -p "$RUNNER_TEMP/review"
+          jq '{number: .pull_request.number, title: .pull_request.title, body: .pull_request.body,
+               base: .pull_request.base.sha, head: .pull_request.head.sha}' \
+            "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/review/meta.json"
+
+      - name: Run review agent
+        env:
+          REVIEW_API_KEY: ${{ secrets.REVIEW_API_KEY }}
+          PROVIDER: ${{ vars.REVIEW_PROVIDER || 'kilo' }}
+          MODEL: ${{ vars.REVIEW_MODEL || 'baidu/ernie-5.5-flash-preview:free' }}
+          THINKING: ${{ vars.REVIEW_THINKING || 'high' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/review/comment.md"
+          pi -p --no-session --no-context-files --no-mcp \
+            --no-extensions --extension "$(npm root -g)/pi-free" \
+            --tools read,grep,find,ls,bash \
+            --skill .agents/skills/actions-code-review \
+            --provider "$PROVIDER" --model "$MODEL" --thinking "$THINKING" \
+            --api-key "$REVIEW_API_KEY" \
+            "/skill:actions-code-review Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Reviewer: ${MODEL} via pi (${PROVIDER})." \
+            > "$out"
+          if ! grep -q '^\*\*Verdict:' "$out"; then
+            echo "::error::Review output has no verdict line; not posting."
+            cat "$out"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The review agent modified the checkout; not posting."
+            git status --porcelain
+            exit 1
+          fi
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-review
+          path: ${{ runner.temp }}/review/comment.md
+          retention-days: 14
+
+  post:
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-review
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only.
+      - name: Post or update review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          marker='<!-- actions-code-review -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
