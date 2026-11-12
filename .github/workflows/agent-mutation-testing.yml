@@ -1,0 +1,318 @@
+name: Agent Mutation Testing
+
+# Automated mutation testing of the production Python a PR changes, on every
+# push to a PR, using the `.agents/skills/actions-mutation-testing` skill as the
+# system prompt of an opencode agent. Advisory only: it posts (and on later
+# pushes updates) one PR comment and never fails the PR because of its verdict.
+#
+# opencode's free Zen models need no login and no API key, so this workflow
+# holds no secret besides the default GITHUB_TOKEN of the posting job.
+#
+# Trust model:
+# - The rules (the skill) are read from the base branch, so a PR cannot weaken
+#   its own run. Only while the base has no skill yet is another copy used, and
+#   the prompt says so.
+# - Unlike the code review, this job runs the PR's code: it installs the locked
+#   dependencies and runs pytest, as the `ci` workflow does. The agent may edit
+#   files (to apply a mutation) and has a shell. The guards: the job holds no
+#   token or secret (`persist-credentials: false`, no GH_TOKEN), and the run
+#   fails if HEAD moved or the tree is dirty, so a mutation left in place is
+#   never reported as a clean result.
+# - This workflow file itself is not pinned: on pull_request GitHub runs the
+#   PR's copy. Accepted, since only collaborators with write access can open
+#   same-repo PRs. Fork PRs are skipped.
+#
+# Manual run on any open PR (also before this workflow is on main):
+#   gh workflow run agent-mutation-testing.yml --ref <branch-with-this-workflow> -f pr_number=<N>
+#
+# Configuration (Settings -> Secrets and variables -> Actions -> Variables):
+#   MUTATION_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   MUTATION_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR to mutation-test
+        required: true
+        type: number
+
+concurrency:
+  group: agent-mutation-testing-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  OPENCODE_VERSION: "2.2.7"
+  MODEL: ${{ vars.MUTATION_MODEL || 'opencode/inkling-2-small-free' }}
+  VARIANT: ${{ vars.MUTATION_VARIANT || 'max' }}
+  SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
+
+jobs:
+  # Resolves the PR for both triggers and writes its metadata (title and body
+  # via jq, never via ${{ }} interpolation into a shell script).
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+            if [ "$(jq -r .state pr.json)" != "open" ]; then
+              echo "::error::PR #${INPUT_PR} is not open."
+              exit 1
+            fi
+          fi
+          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=$(jq -r .head.sha pr.json)"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-mutation-testing-meta
+          path: meta.json
+          retention-days: 1
+
+  mutate:
+    needs: resolve
+    # Fork PRs are not mutation-tested.
+    if: ${{ needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    # The skill stops starting mutations at about 45 minutes of work.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-mutation-testing-meta
+          path: ${{ runner.temp }}/mutation
+
+      # Scope: production Python the PR adds, modifies or renames. Tests and
+      # conftest files are never mutated. An empty scope posts a fixed comment
+      # without starting the agent.
+      - name: Compute scope
+        id: scope
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          scope="$RUNNER_TEMP/mutation/scope.txt"
+          git diff --name-only --diff-filter=AMR "${BASE_SHA}...${HEAD_SHA}" -- '*.py' \
+            ':(exclude)tests/**' ':(exclude)**/conftest.py' > "$scope"
+          echo "Scope:"; cat "$scope"
+          if [ -s "$scope" ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.scope.outputs.empty == 'false'
+        with:
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          python -m pip install --only-binary=:all: uv==0.10.4
+          uv sync --frozen --all-extras --no-install-project --no-build
+
+      - uses: actions/setup-node@v7
+        if: steps.scope.outputs.empty == 'false'
+        with:
+          node-version: 22
+
+      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
+      # the platform binary. The job holds no token, so the exposure is bounded.
+      - name: Install opencode
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          opencode --version
+
+      # Rules: the base branch's skill if it has one. Otherwise (only while the
+      # skill is not merged yet) the copy from the commit this workflow runs
+      # from, then the PR's own copy.
+      - name: Select skill revision
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          skill="$RUNNER_TEMP/mutation/skill.md"
+          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
+          elif [ -f "$SKILL_PATH" ]; then
+            cp "$SKILL_PATH" "$skill"
+            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          else
+            echo "::error::No mutation-testing skill found at base, workflow ref or PR head."
+            exit 1
+          fi
+
+      # The agent lives in the global config, not in the checkout. Its system
+      # prompt is the skill body (the skill's own frontmatter is dropped). It may
+      # edit (to apply mutations); .env reads stay denied.
+      - name: Configure mutation agent
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Automated PR mutation tester (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*", effect: allow }\n'
+            printf '  - { action: glob, resource: "*", effect: allow }\n'
+            printf '  - { action: grep, resource: "*", effect: allow }\n'
+            printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: edit, resource: "*", effect: allow }\n'
+            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
+            printf '  - { action: read, resource: "*.env", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
+            printf -- '---\n'
+            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/mutation/skill.md"
+          } > "$conf/agents/pr-mutation.md"
+          if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/pr-mutation.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
+            echo "::error::Mutation agent has an empty system prompt."
+            exit 1
+          fi
+          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
+            | jq -e '.[] | select(.id == "pr-mutation") | .model' > /dev/null
+
+      - name: Run mutation agent
+        if: steps.scope.outputs.empty == 'false'
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mutation/comment.md"
+          opencode run --standalone --archived --agent pr-mutation \
+            "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}." \
+            > "$out.raw"
+          # opencode prints every assistant message; keep only the final comment,
+          # which starts at the last "**Summary:**" line. Drop a closing code
+          # fence the model may have wrapped around it.
+          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
+          if [ -z "$start" ]; then
+            echo "::error::Mutation output has no summary line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+          if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
+            echo "::error::Mutation output does not end with a verdict line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+
+      - name: No-scope comment
+        if: steps.scope.outputs.empty == 'true'
+        run: |
+          {
+            echo "**Summary:** No production Python changed; nothing to mutate."
+            echo "**Scope:** 0 files · base ${BASE_SHA} … head ${HEAD_SHA} · 0 mutations run"
+            echo
+            echo "**Not verified:** nothing material"
+            echo "**Verdict: PASS** — nothing to mutate; advisory; tests not added by this job"
+          } > "$RUNNER_TEMP/mutation/comment.md"
+
+      # A mutation left in place, or any other change, invalidates the result.
+      - name: Check checkout is unchanged
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The checkout was modified (a mutation may not have been reverted); not posting."
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      # Footer: the model, its variant and the skill, so a reader can map the
+      # verdict to the rules that produced it. Then the title goes first.
+      - name: Finish comment
+        env:
+          SCOPE_EMPTY: ${{ steps.scope.outputs.empty }}
+        run: |
+          out="$RUNNER_TEMP/mutation/comment.md"
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          if [ "$SCOPE_EMPTY" = "true" ]; then
+            printf '\n\n---\n_Automated mutation testing: no agent run, empty scope (`%s` skill)_\n' "$skill_name" >> "$out"
+          else
+            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          fi
+          { printf '# Mutation Testing Action\n\n'; cat "$out"; } > "$out.titled"
+          mv "$out.titled" "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-mutation-testing
+          path: ${{ runner.temp }}/mutation/comment.md
+          retention-days: 14
+
+  post:
+    needs: [resolve, mutate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-mutation-testing
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only.
+      - name: Post or update mutation-testing comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.resolve.outputs.number }}
+        run: |
+          set -euo pipefail
+          marker='<!-- actions-mutation-testing -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
