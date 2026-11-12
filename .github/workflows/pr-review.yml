@@ -5,6 +5,9 @@ name: PR review (advisory)
 # The review is advisory: it posts (and on later pushes updates) one PR comment
 # and never fails the PR because of its verdict.
 #
+# Review rules are read from the base branch (a PR cannot weaken its own
+# review); fork PRs are skipped because they get no secrets.
+#
 # The model is reached through any OpenAI-compatible endpoint, declared in pi's
 # models.json at run time (no pi extension needed).
 #
@@ -26,10 +29,14 @@ concurrency:
 
 env:
   PI_VERSION: "1.5.2"
+  PROVIDER: ${{ vars.REVIEW_PROVIDER || 'kilo' }}
+  MODEL: ${{ vars.REVIEW_MODEL || 'baidu/ernie-5.5-flash-preview:free' }}
+  SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 
 jobs:
   review:
-    if: ${{ !github.event.pull_request.draft }}
+    # Fork PRs get no secrets, so they are skipped instead of failing.
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Read-only: the agent step gets no write token and no stored git credentials.
@@ -53,9 +60,7 @@ jobs:
       # $REVIEW_API_KEY, which pi resolves from the environment at request time.
       - name: Configure model endpoint
         env:
-          PROVIDER: ${{ vars.REVIEW_PROVIDER || 'kilo' }}
           BASE_URL: ${{ vars.REVIEW_BASE_URL || 'https://api.kilo.ai/api/gateway' }}
-          MODEL: ${{ vars.REVIEW_MODEL || 'baidu/ernie-5.5-flash-preview:free' }}
           COMPAT: ${{ vars.REVIEW_COMPAT || '{"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"supportsUsageInStreaming":false,"supportsStrictMode":false,"thinkingFormat":"openrouter","maxTokensField":"max_tokens"}' }}
         run: |
           mkdir -p "$HOME/.pi/agent"
@@ -63,6 +68,21 @@ jobs:
             '{providers: {($p): {baseUrl: $u, api: "openai-completions", apiKey: "$REVIEW_API_KEY",
               models: [{id: $m, reasoning: true, contextWindow: 262144, maxTokens: 65536, compat: $c}]}}}' \
             > "$HOME/.pi/agent/models.json"
+
+      # The reviewer's rules come from the base branch, so a PR cannot weaken the
+      # review of itself. Only when the base has no skill yet (bootstrap) is the
+      # PR's copy used, and the prompt says so.
+      - name: Select skill revision
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/skill/actions-code-review"
+          if git show "${BASE_SHA}:${SKILL_PATH}" > "$RUNNER_TEMP/skill/actions-code-review/SKILL.md" 2>/dev/null; then
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          else
+            cp "$SKILL_PATH" "$RUNNER_TEMP/skill/actions-code-review/SKILL.md"
+            echo "SKILL_SOURCE=this PR (not on base yet)" >> "$GITHUB_ENV"
+          fi
 
       # Title and body come from the event file, never from ${{ }} interpolation
       # into a shell script (script injection).
@@ -76,8 +96,6 @@ jobs:
       - name: Run review agent
         env:
           REVIEW_API_KEY: ${{ secrets.REVIEW_API_KEY }}
-          PROVIDER: ${{ vars.REVIEW_PROVIDER || 'kilo' }}
-          MODEL: ${{ vars.REVIEW_MODEL || 'baidu/ernie-5.5-flash-preview:free' }}
           THINKING: ${{ vars.REVIEW_THINKING || 'high' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -87,16 +105,23 @@ jobs:
           out="$RUNNER_TEMP/review/comment.md"
           pi -p --no-session --no-context-files --no-mcp --no-extensions \
             --tools read,grep,find,ls,bash \
-            --skill .agents/skills/actions-code-review \
+            --skill "$RUNNER_TEMP/skill/actions-code-review" \
             --provider "$PROVIDER" --model "$MODEL" --thinking "$THINKING" \
-            "/skill:actions-code-review Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Reviewer: ${MODEL} via pi (${PROVIDER})." \
+            "/skill:actions-code-review Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Reviewer: ${MODEL} via pi (${PROVIDER}). Review rules loaded from: ${SKILL_SOURCE}." \
             > "$out"
-          if ! grep -q '^\*\*Verdict:' "$out"; then
-            echo "::error::Review output has no verdict line; not posting."
+          # The verdict must be the last non-empty line (a verdict quoted from the
+          # diff elsewhere in the output does not count).
+          if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
+            echo "::error::Review output does not end with a verdict line; not posting."
             cat "$out"
             exit 1
           fi
-          if [ -n "$(git status --porcelain)" ]; then
+          # Never post anything that contains the API key (e.g. after prompt injection).
+          if grep -qF -- "$REVIEW_API_KEY" "$out"; then
+            echo "::error::Review output contains the API key; not posting."
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
             echo "::error::The review agent modified the checkout; not posting."
             git status --porcelain
             exit 1
