@@ -413,3 +413,20 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$MUTATION_CONTEXT" \
             -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+
+      # A failure above (artifact download, comment POST/PATCH, status write)
+      # would otherwise leave the stage `pending` on this SHA forever. Only a
+      # still-pending context is touched, so a terminal verdict stands.
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Post step failed; see the run log" > /dev/null
+          fi

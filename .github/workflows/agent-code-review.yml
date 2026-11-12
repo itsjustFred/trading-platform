@@ -271,8 +271,8 @@ jobs:
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
       # while the skill is not merged yet) the copy from the commit this
-      # workflow runs from, then the PR's own copy. Any git failure other than
-      # "no skill at base" stops the job.
+      # workflow runs from, then the PR's own copy. If none of the three
+      # exists, the job stops.
       #
       # Duplicated by hand in agent-mutation-testing.yml: skill selection,
       # agent config, verdict parse, tree-clean check and comment poster. A
@@ -403,7 +403,8 @@ jobs:
     if: ${{ !cancelled() && (needs.review.result == 'success' || needs.review.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Verified on PR #178: pull-requests: write is enough for the
+    # Verified on PR #178, and on PR #180 where this workflow posted and
+    # updated its comment in place: pull-requests: write is enough for the
     # issues/{n}/comments endpoints on a pull request; issues: write is not needed.
     permissions:
       pull-requests: write
@@ -484,3 +485,22 @@ jobs:
               -f state=error -f context="$MUTATION_CONTEXT" \
               -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
+
+      # A failure above (artifact download, comment POST/PATCH, status write)
+      # would otherwise leave a stage `pending` on this SHA forever. Only
+      # contexts still pending are touched, so a terminal verdict stands.
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Post step failed; see the run log" > /dev/null
+            fi
+          done
