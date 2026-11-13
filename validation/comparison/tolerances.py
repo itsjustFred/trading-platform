@@ -29,10 +29,20 @@ def finite_tolerance(value: Any, name: str, *, optional: bool = False) -> float 
     return number
 
 
+def abs_pct_diff(expected: float, actual: float) -> float:
+    """Return relative drift against the EXPECTED (reference) magnitude (#128).
+
+    Using ``max(|expected|, |actual|)`` as the denominator halved real drift
+    (100 -> 200 read as 50%, not 100%). A zero expected value has no
+    proportion to compute, so any non-zero actual is total drift.
+    """
+    if expected == 0.0:
+        return 0.0 if actual == 0.0 else 1.0
+    return abs(expected - actual) / abs(expected)
+
+
 def relative_difference(expected: float, actual: float) -> float:
     """Return relative drift using the expected value as the denominator."""
     expected_float = finite_float(expected, "expected")
     actual_float = finite_float(actual, "actual")
-    if expected_float == 0.0:
-        return 0.0 if actual_float == 0.0 else 1.0
-    return abs(expected_float - actual_float) / abs(expected_float)
+    return abs_pct_diff(expected_float, actual_float)
