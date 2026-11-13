@@ -78,7 +78,8 @@ Das bedeutet:
 - subagent-driven-development
 - mutation-testing
 - requesting-code-review
-- CodeRabbit CLI (max 3 Reviews/Stunde)
+- cubic (automatischer PR-Review, P0/P1 blockierend)
+- CodeRabbit CLI (auf Anfrage, z. B. `@coderabbitai review`; max 3 Reviews/Stunde)
 - Plan-Mode (starke Modelle für Planung, schwächere für Implementierung)
 
 ---

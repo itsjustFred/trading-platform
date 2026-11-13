@@ -324,4 +324,4 @@ Golden tests should assert event-level facts, not only final summary metrics:
 4. Rebase dependent branches after contract changes merge.
 5. Do not tune MT5/QC parity numbers without stronger reference evidence.
 6. Every branch must document changed contracts, focused tests, and remaining
-   compatibility risks before CodeRabbit review.
+   compatibility risks before the automated review chain (cubic) runs.

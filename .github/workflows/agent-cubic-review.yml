@@ -1,0 +1,409 @@
+name: Agent Cubic Review
+# Quoted: an unquoted "#" after a space starts a YAML comment, which dropped the
+# PR number and SHA from display_title (see agent-mutation-testing.yml for what
+# that broke: the superseded-run cancel in agent-code-review.yml).
+run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
+
+# Stage 5, the last stage of the PR verification pipeline (see the
+# `platform-pr-verify` skill):
+#   SonarCloud -> Agent Code Review -> Agent Mutation Testing -> Agent Pre-Mortem -> Cubic
+#
+# Cubic (cubic.dev) is a GitHub App that reviews every PR by itself, on open and
+# on every push; there is nothing to install and no agent to run here. What this
+# workflow adds is the gate: it waits for cubic's review of the analysed head
+# commit, classifies its findings by priority, and writes the commit status
+# `agent/cubic-review`:
+#   pending: waiting for cubic's review (or for the pre-mortem dispatch)
+#   success: cubic reviewed the head commit and found no P0/P1 finding
+#            (P2/P3 are advisory and do not block)
+#   failure: cubic found at least one P0/P1 finding
+#   error:   no cubic review arrived within the wait, the run failed, or not run
+#
+# How completion is detected: cubic submits a PR review whose body carries the
+# `<!-- cubic:review-summary:start -->` block and lists the unresolved findings
+# with their `P0:`-`P3:` prefix inside its "Prompt for AI agents" section. The
+# stage polls `pulls/{n}/reviews` for a review by the cubic bot whose
+# `commit_id` is the head SHA, so a review of an older commit never counts.
+#
+# Scope of the gate: cubic's first review of a PR covers the whole diff, later
+# ones only the commits since (its body says "changes from recent commits"), so
+# the gate reads the review of the analysed commit. A finding cubic raised on an
+# earlier commit and that is still open stays in its thread - the status for that
+# earlier commit was red - and a push that leaves the code untouched does not
+# re-raise it.
+#
+# It has no pull_request trigger. `agent-pre-mortem.yml` dispatches it with the
+# PR head SHA when the pre-mortem verdict is PASS. The run-name carries the PR
+# number and SHA, so a later push can cancel runs of older commits. A run whose
+# SHA is no longer the PR head stops without doing anything. On PASS it
+# dispatches nothing: this is the last stage, and CodeRabbit is an on-demand
+# second opinion triggered by hand (see the skill).
+#
+# Override (pre-mortem red, findings judged irrelevant): justify each finding in
+# a PR comment, then dispatch by hand:
+#   gh workflow run agent-cubic-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# Override (cubic red, P0/P1 judged irrelevant): justify each finding in a PR
+# comment; nothing runs after this stage.
+#
+# A PR that cubic never reviewed (a draft, a rate limit, a skipped review) ends
+# as `error` after the wait instead of blocking: the fix is to re-trigger cubic
+# from its review footer ("Re-trigger cubic") and dispatch the stage again.
+#
+# Trust model:
+# - The job holds a token only to read reviews and write statuses/comments, and
+#   runs no repo code and no agent. Nothing from the PR is executed.
+# - The workflow file runs from the dispatched ref (the PR branch), like the
+#   PR's copy on pull_request. Accepted for the same reason as in the review
+#   workflow. Fork PRs are skipped.
+# - The bot login is matched exactly: the `[bot]` suffix is reserved for GitHub
+#   Apps, so a PR author cannot post a review that this stage counts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR whose cubic review to gate
+        required: true
+        type: number
+      head_sha:
+        description: Commit to gate; the run stops if it is no longer the PR head (default the current head)
+        required: false
+        type: string
+
+concurrency:
+  group: agent-cubic-review-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  CUBIC_CONTEXT: agent/cubic-review
+  # The review body marker and the bot that posts it. Both are cubic's, not
+  # ours; change them here if cubic renames either.
+  CUBIC_MARKER: "cubic:review-summary"
+  CUBIC_BOT: "cubic-dev-ai[bot]"
+
+jobs:
+  # Resolves the PR and writes its metadata (title and body via jq, never via
+  # ${{ }} interpolation into a shell script). Marks the stage running and
+  # stops when the analysed SHA is no longer the PR head.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+      current: ${{ steps.pr.outputs.current }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+          if [ "$(jq -r .state pr.json)" != "open" ]; then
+            echo "::error::PR #${INPUT_PR} is not open."
+            exit 1
+          fi
+          # The SHA the pre-mortem passed must still be the head; otherwise a
+          # newer push has its own pipeline run and this one has nothing to do.
+          if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+            echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            # Close what the push marked on the superseded commit, so its stage
+            # status ends terminal instead of pending (only if still pending).
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${CUBIC_CONTEXT}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${INPUT_SHA}" \
+                -f state=error -f context="$CUBIC_CONTEXT" \
+                -f description="Superseded: the PR head moved on" > /dev/null
+            fi
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=$(jq -r .head.sha pr.json)"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mark running
+        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$CUBIC_CONTEXT" -f description="Running" \
+            -f target_url="$RUN_URL" > /dev/null
+
+      # After "Mark running" a failure here (an API error) would leave the stage
+      # `pending` with every later job skipped. The reporter clears the resolved
+      # head and falls back to the dispatch input: a failure of the first step
+      # (before `head` is written) must still leave it a SHA to clear.
+      - name: Report resolve failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
+            exit 0
+          fi
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${CUBIC_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$CUBIC_CONTEXT" \
+              -f description="Resolve step failed; see the run log" > /dev/null
+          fi
+
+  # Waits for cubic's review of the head commit and classifies its findings.
+  # Cubic reviews on open and on every push, so by the time the chain reaches
+  # this stage (mutation testing and the pre-mortem run in between) the review
+  # is normally already there; the wait only covers the slow cases.
+  wait:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    # Up to 20 minutes of polling plus the API calls.
+    timeout-minutes: 25
+    permissions:
+      pull-requests: read
+    outputs:
+      verdict: ${{ steps.classify.outputs.verdict }}
+      blocking: ${{ steps.classify.outputs.blocking }}
+      advisory: ${{ steps.classify.outputs.advisory }}
+      review_id: ${{ steps.classify.outputs.review_id }}
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+    steps:
+      # Polls until cubic reviewed HEAD_SHA, the head moves on, or the wait
+      # runs out. The filtered list is newest first: a re-review of the same
+      # commit supersedes the earlier verdict, as a newer status would.
+      - name: Wait for cubic review
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cubic"
+          found=false
+          superseded=false
+          # 40 attempts, 30 s apart: 20 minutes.
+          for _ in $(seq 1 40); do
+            head=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+            if [ "$head" != "$HEAD_SHA" ]; then
+              echo "::notice::PR head moved to ${head}; superseded, nothing to do."
+              superseded=true
+              break
+            fi
+            # --paginate prints one JSON array per page; `jq -s add` joins them.
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+              | jq -s --arg sha "$HEAD_SHA" --arg bot "$CUBIC_BOT" --arg marker "$CUBIC_MARKER" \
+                'add | [.[] | select(.user.login == $bot and .commit_id == $sha
+                       and (.body | contains($marker)))] | sort_by(.id) | reverse' \
+                > "$RUNNER_TEMP/cubic/reviews.json"
+            if [ "$(jq length "$RUNNER_TEMP/cubic/reviews.json")" -gt 0 ]; then
+              found=true
+              break
+            fi
+            sleep 30
+          done
+          {
+            echo "found=$found"
+            echo "superseded=$superseded"
+          } >> "$GITHUB_OUTPUT"
+
+      # Priority is cubic's own: `P0:`-`P3:` prefixes inside the review's
+      # "Prompt for AI agents" block, which lists the unresolved findings of
+      # that commit. P0/P1 block the pipeline; P2/P3 are advisory.
+      - name: Classify cubic findings
+        id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FOUND: ${{ steps.wait.outputs.found }}
+          SUPERSEDED: ${{ steps.wait.outputs.superseded }}
+        run: |
+          set -euo pipefail
+          reviews="$RUNNER_TEMP/cubic/reviews.json"
+          blocking=0
+          advisory=0
+          review_id=""
+          if [ "$SUPERSEDED" = "true" ]; then
+            verdict=SUPERSEDED
+          elif [ "$FOUND" != "true" ]; then
+            verdict=INCOMPLETE
+          else
+            review_id=$(jq -r '.[0].id' "$reviews")
+            body=$(jq -r '.[0].body' "$reviews")
+            # `|| true` keeps a no-match grep from failing the step under
+            # `pipefail`; wc still prints the 0.
+            blocking=$(printf '%s\n' "$body" | grep -oE 'P[01]:' | wc -l || true)
+            advisory=$(printf '%s\n' "$body" | grep -oE 'P[23]:' | wc -l || true)
+            if [ "$blocking" -gt 0 ]; then verdict=BLOCK; else verdict=PASS; fi
+          fi
+          {
+            echo "verdict=$verdict"
+            echo "blocking=$blocking"
+            echo "advisory=$advisory"
+            echo "review_id=$review_id"
+          } >> "$GITHUB_OUTPUT"
+          echo "Cubic: verdict=${verdict} blocking(P0/P1)=${blocking} advisory(P2/P3)=${advisory}"
+
+  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # failed wait as `error`. No dispatch: this is the last stage.
+  post:
+    needs: [resolve, wait]
+    if: ${{ !cancelled() && (needs.wait.result == 'success' || needs.wait.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      VERDICT: ${{ needs.wait.outputs.verdict }}
+      BLOCKING: ${{ needs.wait.outputs.blocking }}
+      ADVISORY: ${{ needs.wait.outputs.advisory }}
+      REVIEW_ID: ${{ needs.wait.outputs.review_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report failed cubic stage run
+        if: needs.wait.result == 'failure'
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$CUBIC_CONTEXT" \
+            -f description="Cubic stage run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only. A result for a commit that is no longer the PR
+      # head does not overwrite the comment (its status still lands on its SHA).
+      - name: Post or update cubic-review comment
+        if: needs.wait.result == 'success' && needs.wait.outputs.verdict != 'SUPERSEDED'
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
+          marker='<!-- actions-cubic-review -->'
+          review_url="https://github.com/${GITHUB_REPOSITORY}/pull/${PR_NUMBER}"
+          if [ -n "$REVIEW_ID" ]; then
+            review_url="${review_url}#pullrequestreview-${REVIEW_ID}"
+          fi
+          {
+            echo "$marker"
+            echo "# Cubic Review Action"
+            echo
+            case "$VERDICT" in
+              PASS)
+                echo "Cubic reviewed \`${HEAD_SHA}\` and found no P0/P1 finding."
+                ;;
+              BLOCK)
+                echo "Cubic reviewed \`${HEAD_SHA}\` and found **${BLOCKING} blocking (P0/P1)** finding(s)."
+                ;;
+              *)
+                echo "No cubic review of \`${HEAD_SHA}\` arrived within 20 minutes, so the stage could not run."
+                ;;
+            esac
+            echo
+            echo "- Blocking (P0/P1): ${BLOCKING}"
+            echo "- Advisory (P2/P3): ${ADVISORY}"
+            echo
+            if [ -n "$REVIEW_ID" ]; then
+              echo "Review: ${review_url}"
+              echo
+            fi
+            echo "P0/P1 findings block this stage; P2/P3 are advisory. Fix them in the PR, or reply in the finding's thread with why it does not apply and resolve the thread."
+            echo
+            echo "If cubic did not review the head commit, re-trigger it from its review footer and re-dispatch this stage."
+            echo
+            echo "---"
+            echo "_Cubic is the automatic AI reviewer of the pipeline; CodeRabbit is an on-demand second opinion (see the \`platform-pr-verify\` skill)._"
+          } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
+
+      - name: Set status
+        if: needs.wait.result == 'success'
+        run: |
+          set -euo pipefail
+          case "$VERDICT" in
+            PASS) state=success; desc="No P0/P1 finding (${ADVISORY} advisory P2/P3)" ;;
+            BLOCK) state=failure; desc="${BLOCKING} blocking P0/P1 finding(s) (${ADVISORY} advisory)" ;;
+            SUPERSEDED) state=error; desc="Superseded: the PR head moved on" ;;
+            *) state=error; desc="No cubic review of this commit within 20 min; re-trigger it" ;;
+          esac
+          # Status descriptions are limited to 140 characters.
+          desc=$(printf '%s' "$desc" | cut -c1-140)
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$CUBIC_CONTEXT" \
+            -f description="$desc" -f target_url="$RUN_URL" > /dev/null
+
+      # A failure above (comment POST/PATCH, status write) would otherwise leave
+      # the stage `pending` on this SHA forever. Only a still-pending context is
+      # touched, so a terminal verdict stands.
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${CUBIC_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$CUBIC_CONTEXT" \
+              -f description="Post step failed; see the run log" > /dev/null
+          fi
+
+  # A cancelled run (a hand-cancel, or a newer dispatch for the same PR through
+  # the concurrency group) skips every reporter above, which would leave the
+  # stage `pending` with no signal. This job runs only on cancellation and
+  # turns a still-pending status of the analysed commit into an error. A newer
+  # run that already wrote its final status is not touched (pending only).
+  report-cancelled:
+    needs: [resolve, wait, post]
+    if: ${{ cancelled() && (needs.resolve.outputs.head != '' || inputs.head_sha != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A run cancelled before resolve wrote `head` still names its commit.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled cubic stage run
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${CUBIC_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$CUBIC_CONTEXT" \
+              -f description="Cubic stage run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+          fi

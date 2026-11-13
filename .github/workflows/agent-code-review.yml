@@ -1,7 +1,7 @@
 name: Agent Code Review
 
 # Stage 2 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> Agent Pre-Mortem -> CodeRabbit
+#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> Agent Pre-Mortem -> Cubic
 #
 # On every push to a PR it waits for the SonarCloud check of the head commit.
 # Only if SonarCloud is green does it run the `.agents/skills/actions-code-review`
@@ -24,6 +24,8 @@ name: Agent Code Review
 #   agent/mutation-testing  pending: waiting for agent/code-review (on push)
 #                           error:   not run because agent/code-review is not PASS
 #   agent/pre-mortem        pending: waiting for agent/mutation-testing (on push)
+#                           error:   not run because agent/code-review is not PASS
+#   agent/cubic-review      pending: waiting for agent/pre-mortem (on push)
 #                           error:   not run because agent/code-review is not PASS
 #
 # Override (red stage, findings judged irrelevant): justify each finding in a PR
@@ -81,11 +83,12 @@ env:
   REVIEW_CONTEXT: agent/code-review
   MUTATION_CONTEXT: agent/mutation-testing
   PREMORTEM_CONTEXT: agent/pre-mortem
+  CUBIC_CONTEXT: agent/cubic-review
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
   # via jq, never via ${{ }} interpolation into a shell script). On a push it
-  # also cancels the downstream stage runs of older commits and marks all three
+  # also cancels the downstream stage runs of older commits and marks all four
   # stages pending.
   resolve:
     runs-on: ubuntu-latest
@@ -155,6 +158,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=pending -f context="$PREMORTEM_CONTEXT" \
             -f description="Waiting for ${MUTATION_CONTEXT}" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$CUBIC_CONTEXT" \
+            -f description="Waiting for ${PREMORTEM_CONTEXT}" > /dev/null
 
       # The downstream stage runs are dispatched with run-name
       # "... PR #<n> @ <sha>". A new push makes those of older commits
@@ -167,7 +173,7 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          for wf in agent-mutation-testing.yml agent-pre-mortem.yml; do
+          for wf in agent-mutation-testing.yml agent-pre-mortem.yml agent-cubic-review.yml; do
             for state in queued in_progress; do
               gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=${state}&per_page=100" \
                 --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
@@ -185,7 +191,7 @@ jobs:
           retention-days: 1
 
       # After "Mark stages pending" a failure here (cancel query, artifact
-      # upload) would leave all three stages `pending` with every later job skipped.
+      # upload) would leave all four stages `pending` with every later job skipped.
       # The SHA is the resolved head (the commit "Mark stages pending" marked),
       # or, when the first step failed before writing `head`, the dispatch input
       # or the pushed head of a pull_request event.
@@ -202,7 +208,7 @@ jobs:
             echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
             exit 0
           fi
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -266,6 +272,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$CUBIC_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
           echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER} -f head_sha=${HEAD_SHA}"
 
       # Without this, a step failure here (e.g. an API error under `set -e`)
@@ -286,6 +295,9 @@ jobs:
             -f description="Not run: SonarCloud gate failed" > /dev/null
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: SonarCloud gate failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$CUBIC_CONTEXT" \
             -f description="Not run: SonarCloud gate failed" > /dev/null
 
   review:
@@ -507,6 +519,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$CUBIC_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.review.result == 'success'
@@ -558,7 +573,10 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$PREMORTEM_CONTEXT" \
                 -f description="Not run: dispatch of mutation testing failed" > /dev/null
-              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} and ${PREMORTEM_CONTEXT} to error."
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$CUBIC_CONTEXT" \
+                -f description="Not run: dispatch of mutation testing failed" > /dev/null
+              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT}, ${PREMORTEM_CONTEXT} and ${CUBIC_CONTEXT} to error."
               exit 1
             fi
             echo "Dispatched mutation testing for ${HEAD_SHA}."
@@ -568,6 +586,9 @@ jobs:
               -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$CUBIC_CONTEXT" \
               -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
 
@@ -580,7 +601,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -591,8 +612,8 @@ jobs:
           done
 
   # A cancelled run (a hand-cancel, or a newer push through the concurrency
-  # group) skips every reporter above. This stage marks all three statuses
-  # pending on push, so without this job a cancel would strand all three on the
+  # group) skips every reporter above. This stage marks all four statuses
+  # pending on push, so without this job a cancel would strand all four on the
   # commit. It runs only on cancellation and turns every still-pending stage
   # status of the analysed commit into an error; a newer run that already wrote
   # a final status is not touched (pending only).
@@ -612,7 +633,7 @@ jobs:
       - name: Report cancelled review run
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
