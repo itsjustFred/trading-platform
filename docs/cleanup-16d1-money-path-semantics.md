@@ -216,6 +216,11 @@ the curve does not — the two paths measure different capital by design, and
 that is the documented distortion. Closing it fully (an MTM-marked replay
 curve) requires the structural replay rework deferred to 16-D2.
 
+> **Superseded (reporting equity is now mark-to-market on every engine).** The
+> replay curve is built with `runner/engines/mtm_equity.py`, so sizing-time and
+> reporting-time equity now measure the same capital. See
+> `docs/cross-engine-backtest-contract.md` §4b.
+
 **Pinned by:** `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`.
 
 ## D10 — vectorbt: max_leverage is an independent cap; sizing semantics (F35, F7)
@@ -245,6 +250,15 @@ over **exit** time, replayed in exit order (documented limitation: not an
 intraday mark-to-market path — per-symbol sizing compounds from shared
 capital and summing those paths would multiply capital by symbol count).
 Pynecore's curve is aligned to exit time for cross-engine comparability.
+
+> **Superseded (D11 curve semantics).** The "realized-only, drawdown/Sharpe
+> describe the realized portfolio" limitation was a defect: a 40 % crash inside
+> one long hold reported `max_drawdown_pct == 0` and real runs under-reported
+> drawdown by roughly 2x. Every engine now persists a mark-to-market portfolio
+> curve (`runner/engines/mtm_equity.py`; one point per bar, fees at the final
+> exit, last point == capital + Σ net PnL, so total return is unchanged). The
+> balance drawdown stays available as `max_drawdown_realized_pct`. Pinned by
+> `tests/test_mtm_equity.py`. See `docs/cross-engine-backtest-contract.md` §4b.
 
 **Pinned by:** `tests/test_vectorbt_sizing_semantics.py::TestTotalBarsIsBarCount`,
 `::TestPortfolioEquityCurveSemantics`.
