@@ -79,7 +79,8 @@ env:
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
   # via jq, never via ${{ }} interpolation into a shell script). On a push it
-  # also cancels mutation runs of older commits and marks both stages pending.
+  # also cancels the downstream stage runs of older commits and marks all three
+  # stages pending.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5

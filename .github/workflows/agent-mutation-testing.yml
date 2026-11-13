@@ -139,7 +139,8 @@ jobs:
           retention-days: 1
 
       # After "Mark running" a failure here (artifact upload) would leave the
-      # stage `pending` with every later job skipped.
+      # stage `pending` with every later job skipped, and with it the downstream
+      # stage's status the review workflow already marked pending.
       - name: Report resolve failure
         if: failure() && steps.pr.outputs.head != ''
         env:
@@ -147,13 +148,15 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-              -f state=error -f context="$MUTATION_CONTEXT" \
-              -f description="Resolve step failed; see the run log" > /dev/null
-          fi
+          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Resolve step failed; see the run log" > /dev/null
+            fi
+          done
 
   mutate:
     needs: resolve
@@ -228,9 +231,10 @@ jobs:
       # skill is not merged yet) the copy from the commit this workflow runs
       # from, then the PR's own copy.
       #
-      # Duplicated by hand in agent-code-review.yml: skill selection, agent
-      # config, verdict parse, tree-clean check and comment poster. A change to
-      # one copy must land in the other in the same commit.
+      # Duplicated by hand in agent-code-review.yml and agent-pre-mortem.yml:
+      # skill selection, agent config, verdict parse, tree-clean check and
+      # comment poster. A change to one copy must land in the others in the
+      # same commit.
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |

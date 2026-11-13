@@ -61,6 +61,7 @@ Rank the impact of every scenario against these; a scenario that reaches none of
 5. Check detectability: what would surface the failure today - a test (name it), a log line, a commit status, an operator action - or nothing. "Nothing" raises severity; a named, clear test lowers it.
 6. State the mitigation: the smallest change that stops the scenario - an assertion, an enforced invariant, a test that names it, a guard, or a comment that records the constraint. Do not propose abstractions the diff does not need.
 7. Rank the scenarios most plausible first within each severity, and cap at **8**. All SEVERE scenarios are always listed. Drop the least plausible first when over the cap, and say how many you dropped.
+8. **Budget.** Stop starting new scenarios when you estimate about 20 minutes of work have passed, and report what you have. The job is killed at 30 minutes, and a killed job posts nothing - a partial report beats no report. List every file or hunk you did not get to under "Not verified".
 
 A defect that is **already true today** is still a scenario: it is the most likely one. Report it first, with trigger "already the case", and the impact it has now.
 
