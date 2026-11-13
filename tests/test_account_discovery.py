@@ -433,3 +433,33 @@ def test_a_negative_login_is_refused_not_accepted():
     assert account_discovery._ctrader_extract_login(SimpleNamespace(traderLogin=46736452)) == (
         "46736452"
     )
+
+
+def test_loading_ctrader_protocol_does_not_install_twisted_reactor():
+    """Discovery must not leave an epoll reactor that breaks CTraderLiveAdapter later."""
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import sys
+        import live_runner.account_discovery as d
+        assert "twisted.internet.reactor" not in sys.modules, "import installed reactor"
+        d._load_ctrader_protocol()
+        assert "twisted.internet.reactor" not in sys.modules, "load installed reactor"
+        assert "twisted.internet.epollreactor" not in sys.modules
+        from twisted.internet import asyncioreactor
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncioreactor.install(loop)
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
