@@ -161,3 +161,16 @@ select = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+# Scope is deliberately narrow: the packages whose type errors can become a
+# wrong order. Widen by adding paths here, not by loosening the flags.
+files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py"]
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true
+# Imported-but-unchecked modules are followed so signatures resolve, but their
+# own errors are not reported (they are outside `files`).
+follow_imports = "silent"

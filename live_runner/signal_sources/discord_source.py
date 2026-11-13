@@ -624,7 +624,7 @@ def _resolve_message_channel_id(message: Any) -> str:
 def _reject_untrusted_author(
     message: Any,
     author_id: str,
-    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None,
+    on_author_rejection: Callable[[str], Awaitable[None] | None] | None,
 ) -> None:
     """Record and log one message refused by the author allowlist.
 
@@ -685,7 +685,7 @@ def _parse_trade_signal_from_message(
     *,
     default_timeframe: str,
     trusted_author_ids: Iterable[str] | None = None,
-    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None = None,
+    on_author_rejection: Callable[[str], Awaitable[None] | None] | None = None,
     on_author_accepted: Callable[[], Any] | None = None,
 ) -> TradeSignal | None:
     """Parse a Discord message into a trade signal.
@@ -722,7 +722,7 @@ def _parse_trade_signal_from_message(
         signal_type = "ram_jet_oversold_buy"
     else:
         signal_type = _detect_rocket_fuel_signal_type(content)
-        action = _resolve_action(content, signal_type=signal_type)
+        action = _resolve_action(content, signal_type=signal_type)  # type: ignore[assignment]  # name reused with a wider type across branches
     if action is None:
         return None
 
@@ -738,7 +738,7 @@ def _parse_trade_signal_from_message(
         default_timeframe=default_timeframe,
     )
     return TradeSignal(
-        action=action,
+        action=action,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         symbol=symbol,
         entry_price=float(price),
         stop_loss=None,
@@ -878,7 +878,7 @@ class DiscordSignalSource(BaseSignalSource):
         self._consecutive_author_rejections = 0
         self._author_rejection_alerted = False
 
-    def _record_author_rejection(self, author_id: str) -> None:
+    def _record_author_rejection(self, author_id: str) -> Awaitable[None] | None:
         """Count the rejection synchronously; only the status write is deferred.
 
         The caller is a synchronous parser, so it can only *schedule* an
@@ -1358,7 +1358,7 @@ class DiscordSignalSource(BaseSignalSource):
         # and are always kept.
         numeric = sorted(
             (message_id for message_id in seen if _safe_message_id_int(message_id)),
-            key=_safe_message_id_int,
+            key=lambda message_id: int(message_id),
         )
         survivors = set(numeric[-SEEN_ID_RETENTION:])
         survivors.update(

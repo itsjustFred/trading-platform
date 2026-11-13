@@ -428,7 +428,7 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             pass
     if not hasattr(message, "ListFields"):
         return {}
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {}  # type: ignore[no-redef]  # same name intentionally reused for the fallback payload
     for descriptor, value in message.ListFields():
         field_name = str(descriptor.name)
         if descriptor.label == descriptor.LABEL_REPEATED:

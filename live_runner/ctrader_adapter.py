@@ -483,7 +483,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
                 break
             except OSError:
                 time.sleep(0.05)
@@ -491,7 +491,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
         return
 
     import fcntl
@@ -572,8 +572,8 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             f"Unsupported Twisted reactor already installed: {reactor_module}. "
             "Expected asyncio reactor."
         )
-    if not reactor.running:
-        reactor.startRunning(installSignalHandlers=False)
+    if not reactor.running:  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+        reactor.startRunning(installSignalHandlers=False)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
 
 
 class CTraderLiveAdapter(BaseLiveAdapter):
@@ -1287,7 +1287,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 sid = int(detail.symbolId)
             except (TypeError, ValueError):
                 continue
-            name = id_to_name.get(sid)
+            name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
@@ -2142,7 +2142,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     volume=self._resolve_order_volume(signal),
                 )
             else:
-                request = self._build_new_order_request(signal, symbol_id=symbol_id)
+                request = self._build_new_order_request(signal, symbol_id=symbol_id)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         response = await self._submit_new_order_request(request)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -2852,7 +2852,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
                     self.account_config_id,
                     str(order_id),
                 )

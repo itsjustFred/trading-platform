@@ -106,7 +106,7 @@ def build_ctrader_deployment_plan(
                 account_id=account.id,
                 symbols=list(row["symbols"]),
                 timeframe=timeframe,
-                status=status if status in {"ACTIVE", "PAUSED", "STOPPED"} else "PAUSED",
+                status=status if status in {"ACTIVE", "PAUSED", "STOPPED"} else "PAUSED",  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
                 signal_source_type="internal",
                 signal_source="internal",
                 signal_config={

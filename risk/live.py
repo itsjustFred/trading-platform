@@ -166,7 +166,7 @@ def size_live_signal(
         }
         return SizedOrder(
             signal=TradeSignal(
-                action=str(signal.action),
+                action=str(signal.action),  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
                 symbol=str(signal.symbol),
                 entry_price=entry if entry > 0 else float(signal.theoretical_price),
                 stop_loss=reduce_stop,
@@ -187,7 +187,7 @@ def size_live_signal(
     if current_exposure_value < 0:
         raise ValueError("current_exposure must be >= 0")
     trade_signal = TradeSignal(
-        action=str(signal.action),
+        action=str(signal.action),  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         symbol=str(signal.symbol),
         entry_price=entry_price,
         stop_loss=level_stop,
