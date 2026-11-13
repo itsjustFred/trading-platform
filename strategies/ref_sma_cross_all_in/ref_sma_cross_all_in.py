@@ -29,10 +29,9 @@ Execution semantics the platform supplies (documented differences, see
 ``docs/reports/parity-reference-libraries.md``)
 -----------------------------------------------------------------------------
 * **Entries match exactly**: both fill a market order at the *next bar's open*.
-* **Signal exits differ by convention**: backtesting.py fills a market close
-  order at the *next bar's open*; the platform fills a signal exit at the
-  *trigger bar's close* (``docs/cross-engine-backtest-contract.md`` section 1,
-  decision record D4). The gap is exactly ``close(signal bar) - open(bar + 1)``.
+* **Signal exits match exactly**: backtesting.py fills a market close order at
+  the *next bar's open*; the platform does the same by default
+  (``signal_exit_fill="next_open"``, owner decision 2026-11-13, #208 B).
 * **Quantity differs by the commission gross-up**: backtesting.py floors the
   fraction onto ``fill_price + commission_per_unit`` (a broker cannot buy more
   than the cash allows including cost), the platform sizes on the raw notional

@@ -206,8 +206,8 @@ def _classify_exit(frame: pd.DataFrame, row: pd.Series, forced: bool) -> str:
     exit price repeating it: backtesting.py fills a contingent stop at
     ``min(open, level)`` and a contingent target at ``max(open, level)``, so a
     bar that opens through the level produces a fill *different* from the level
-    (which is precisely the documented divergence from the platform's
-    level-fill contract). A bar that pierces both resolves stop-first, matching
+    (the platform fills identically since the 2026-11-13 decision, #208 A:
+    at the open when the bar opens beyond the level, else at the level). A bar that pierces both resolves stop-first, matching
     the reference's order-queue priority.
     """
     if forced:

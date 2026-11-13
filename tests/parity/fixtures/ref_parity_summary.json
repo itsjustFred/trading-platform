@@ -11,10 +11,17 @@
     "bracket_long": {
       "commission": 0.0,
       "exit_kinds": {
-        "stop_loss": 16,
-        "take_profit": 14
+        "stop_loss": 15,
+        "take_profit": 15
       },
-      "final_equity": 11395.00034172138,
+      "final_equity": 11286.873246532778,
+      "gap_through_exits": [
+        "1:stop_loss",
+        "8:stop_loss",
+        "10:stop_loss",
+        "21:take_profit",
+        "22:take_profit"
+      ],
       "invariant_violations": [],
       "library_strategy": "BracketLong",
       "size_fraction": 0.5,
@@ -23,10 +30,20 @@
     "bracket_short": {
       "commission": 0.0,
       "exit_kinds": {
-        "stop_loss": 23,
-        "take_profit": 7
+        "stop_loss": 21,
+        "take_profit": 9
       },
-      "final_equity": 8481.547448381636,
+      "final_equity": 8854.59008686325,
+      "gap_through_exits": [
+        "1:stop_loss",
+        "2:take_profit",
+        "3:stop_loss",
+        "9:take_profit",
+        "15:take_profit",
+        "17:stop_loss",
+        "21:stop_loss",
+        "29:stop_loss"
+      ],
       "invariant_violations": [],
       "library_strategy": "BracketShort",
       "size_fraction": 0.5,
@@ -37,7 +54,8 @@
       "exit_kinds": {
         "signal": 64
       },
-      "final_equity": 10089.80899902844,
+      "final_equity": 10665.4307075427,
+      "gap_through_exits": [],
       "invariant_violations": [],
       "library_strategy": "SmaCross",
       "size_fraction": 1.0,
@@ -48,7 +66,8 @@
       "exit_kinds": {
         "signal": 64
       },
-      "final_equity": 13033.542748069241,
+      "final_equity": 13777.10391364988,
+      "gap_through_exits": [],
       "invariant_violations": [],
       "library_strategy": "SmaCross",
       "size_fraction": 1.0,
