@@ -1,6 +1,6 @@
 # Parity of the platform on well-known published strategies
 
-Branch `test/parity-published-strategies` (base `integration/backtest-fixes`). Engine under
+Branch `test/parity-published-strategies` (base `integration/backtest-fixes-v2`). Engine under
 test: `NativeAdapter` / `TradeEngine`. Reference: plain-Python event loops in
 `tests/parity/ref_published.py` (signals **and** fills, no import from `runner/`, `strategies/`,
 `risk/`, `shared/`; enforced by `test_published_reference_independence.py`). Numbers below are
@@ -36,32 +36,39 @@ Yahoo Finance daily data (yfinance 1.6.0), committed as gzip CSV in `tests/parit
 
 ## Execution conventions (identical in engine and reference)
 
-Decision on the close of bar *i*; entry fills at the **open** of bar *i+1*; exit fills at the **close**
-of bar *i* (`signal_exit_fill="close"`); one fully invested position (`risk_per_trade_pct=1.0`,
+Decision on the close of bar *i*; entry fills at the **open** of bar *i+1*; a signal exit also fills at the
+**open** of bar *i+1* (`signal_exit_fill="next_open"`, the platform default since the 2026-11-13 owner
+decision; an exit and the following entry of a rotation fill at the same open, the entry sized on the
+cash the exit just realized, #190); one fully invested position (`risk_per_trade_pct=1.0`,
 `max_position_exposure_pct=1.0`, `max_leverage=1.0`, so the 100 % cap is the binding rule);
 quantity = cash / **fill-bar open**; a proportional fee is charged on top and is not reserved by the
-sizing; an open position is closed at the last bar's close (`end_of_data`). These are platform
-conventions and differ from the papers' "fill at the signal close" (Faber, Antonacci).
+sizing; a position still open on the last bar (or an exit signalled on it, flagged
+`signal_exit_deferred_to_end_of_data`) is closed at that bar's close (`end_of_data`). The equity curve is
+mark-to-market per bar (#196: capital + closed net PnL + unrealized gross PnL; fees are recognised when the
+trade fully closes), and the reference computes exactly that, so the compared curve is the reference's
+`marked` series only. These are platform conventions and differ from the papers' "fill at the signal
+close" (Faber, Antonacci). Daily bars have no intrabar stop/target here, so the gap-at-open stop rule
+(#208 A) is not exercised by these strategies.
 
 ## Parity: platform vs independent reference (all must be exact)
 
 Compared per trade: symbol, entry date and price, quantity, exit date and price, net PnL; plus every
-published equity-curve point against the reference's realized/marked equity. Tolerances: price 1e-6,
+published equity-curve point against the reference's marked equity. Tolerances: price 1e-6,
 quantity 1e-9 relative, PnL 0.005, curve 0.02. Multi-symbol GEM runs go through the adapter's shared-equity
 replay, which rounds quantities to 4 decimals and sizes later trades on the rounded-PnL equity; there the
 tolerance is 5.1e-5 absolute + 1e-6 relative (observed relative drift about 2e-7), and the final equity
-differs by 0.04 on 410,934.93 (1e-7). Every other row is identical to the cent.
+differs by 0.02-0.03 on ~400,000 (1e-7). Every other row is identical to the cent.
 
 | Scenario | Engine trades | Reference trades | Differences | Final equity engine = reference |
 |---|---|---|---|---|
-| Faber SMA10, S&P 500 price index 1928-2012 | 62 | 62 | 0 | 11,553,163.60 |
-| Faber SMA10, S&P 500 TR index 1988-2012 | 15 | 15 | 0 | 835,197.14 |
-| Faber SMA10, SPY adj. 1993-2025 | 23 | 23 | 0 | 1,811,696.41 |
+| Faber SMA10, S&P 500 price index 1928-2012 | 62 | 62 | 0 | 12,425,600.25 |
+| Faber SMA10, S&P 500 TR index 1988-2012 | 15 | 15 | 0 | 885,286.00 |
+| Faber SMA10, SPY adj. 1993-2025 | 23 | 23 | 0 | 1,726,724.91 |
 | Faber SMA10, SPY, 0.1 % fee per side | match | match | 0 | |
-| Connors RSI(2), SPY adj. 1993-2025 | 255 | 255 | 0 | 355,031.83 |
+| Connors RSI(2), SPY adj. 1993-2025 | 255 | 255 | 0 | 458,854.00 |
 | Connors RSI(2), SPY 2015-2025, 0.05 % fee | match | match | 0 | |
-| GEM SPY/VEU/AGG (BIL hurdle) 2007-2025 | 32 | 32 | 0 | 410,934.93 (ref 410,934.89) |
-| GEM SPY/EFA/AGG (BIL hurdle) 2007-2025 | 33 | 33 | 0 | 404,619.61 (ref 404,619.58) |
+| GEM SPY/VEU/AGG (BIL hurdle) 2007-2025 | 32 | 32 | 0 | 404,327.06 (ref 404,327.08) |
+| GEM SPY/EFA/AGG (BIL hurdle) 2007-2025 | 33 | 33 | 0 | 396,413.99 (ref 396,413.96) |
 | GEM VEU variant with 0.05 % fee | match | match | 0 | |
 
 Non-vacuity: with a deliberately wrong rule on the engine side (Faber 9-month SMA, Connors RSI<5) the
@@ -73,8 +80,11 @@ SPY 15, EFA 11, AGG 7 (EFA run), i.e. all three slots rotate.
 ## Platform vs reference vs paper
 
 Reference metrics are computed on daily mark-to-market equity from the (identical) trades, Sharpe with
-rf = 0. "Platform" is `runner.stats.compute_stats_for_result` on the engine result, whose equity curve only
-contains realized equity (see Engine findings, #1).
+rf = 0. "Platform" is `runner.stats.compute_stats_for_result` on the engine result, whose equity curve is
+now mark-to-market too (#196), so its CAGR and max drawdown equal the reference's (before #196 the platform
+maxDD was -35.9 % / -12.4 % / -14.6 % / -10.6 % / -13.2 % on the first five rows below vs -52.5 % / -23.6 % / -25.8 % /
+-14.5 % / -33.7 % marked). The numbers moved from the previous report revision only through the new
+next-open exit fill (rule B); the paper comparison is unchanged in substance.
 
 ### Faber (2007), S&P 500 10-month SMA timing
 
@@ -83,15 +93,15 @@ Paper (SSRN 962461, 2013 update, 1901-2012, S&P 500 **total return** from Shille
 These figures were taken from secondary summaries (the paper itself could not be read here); treat them as
 approximate.
 
-| Series / window | Strategy CAGR | Buy&hold CAGR | Strategy maxDD (daily MTM) | B&H maxDD | Platform CAGR / maxDD (realized curve) |
+| Series / window | Strategy CAGR | Buy&hold CAGR | Strategy maxDD (daily MTM) | B&H maxDD | Platform CAGR / maxDD (MTM curve) |
 |---|---|---|---|---|---|
 | Paper, 1901-2012, TR, T-bill cash | ~10.2 % | ~9.3 % | ~-50.3 % | ~-83.7 % | n/a |
-| S&P price index 1928-2012 (no dividends, no cash) | 5.75 % | 5.30 % | -52.5 % | -86.2 % | 5.75 % / -35.9 % |
-| same + T-bill cash leg (reference only) | 6.90 % | 5.30 % | -52.5 % | -86.2 % | |
-| S&P TR index 1988-2012 (no cash) | 8.86 % | 9.55 % | -23.6 % | -55.3 % | 8.86 % / -12.4 % |
-| same + T-bill cash leg (reference only) | 9.78 % | 9.55 % | -22.1 % | -55.3 % | |
-| SPY adj. 1993-2025 (no cash) | 9.20 % | 10.69 % | -25.8 % | -55.2 % | 9.20 % / -14.6 % |
-| same + T-bill cash leg (reference only) | 9.77 % | 10.69 % | -24.3 % | -55.2 % | |
+| S&P price index 1928-2012 (no dividends, no cash) | 5.84 % | 5.30 % | -53.8 % | -86.2 % | 5.84 % / -53.8 % |
+| same + T-bill cash leg (reference only) | 6.98 % | 5.30 % | -53.8 % | -86.2 % | |
+| S&P TR index 1988-2012 (no cash) | 9.12 % | 9.55 % | -23.3 % | -55.3 % | 9.12 % / -23.3 % |
+| same + T-bill cash leg (reference only) | 10.02 % | 9.55 % | -21.9 % | -55.3 % | |
+| SPY adj. 1993-2025 (no cash) | 9.04 % | 10.69 % | -25.6 % | -55.2 % | 9.04 % / -25.6 % |
+| same + T-bill cash leg (reference only) | 9.61 % | 10.69 % | -24.2 % | -55.2 % | |
 
 Explanation of the deviation from the paper:
 
@@ -100,14 +110,14 @@ Explanation of the deviation from the paper:
   CAGRs cannot match on a price index. On total-return data (`sp500tr`, SPY adj.) the B&H level (9.55 %,
   10.69 %) is back in the paper's neighbourhood.
 * **Cash leg.** The port is long/flat in one symbol, flat months earn 0; the paper earns T-bill interest.
-  Adding it (reference only) raises timing by about 1.15 points (price, 1928-2012; 64 % of the time invested)
+  Adding it (reference only) raises timing by about 1.1 points (price, 1928-2012; 65 % of the time invested)
   and 0.9 / 0.6 points (TR windows).
-* **What does reproduce:** the drawdown protection (-86.2 % -> -52.5 % vs the paper's -83.7 % -> -50.3 %),
-  the volatility reduction (19.2 % -> 12.9 %), Sharpe improvement (0.37 -> 0.50 / 0.58 with cash) and time in
+* **What does reproduce:** the drawdown protection (-86.2 % -> -53.8 % vs the paper's -83.7 % -> -50.3 %),
+  the volatility reduction (19.2 % -> 13.0 %), Sharpe improvement (0.37 -> 0.50 / 0.59 with cash) and time in
   market (64-75 %). The paper's ~0.9 point CAGR edge over buy-and-hold shows up on the 1928-2012 window
-  with the cash leg (+1.6 points) but not on 1988-2012 (-0.7 / +0.2 points) or 1993-2025 (-1.5 / -0.9
+  with the cash leg (+1.7 points) but not on 1988-2012 (-0.4 / +0.5 points) or 1993-2025 (-1.7 / -1.1
   points): the edge is regime dependent, it is the drawdown/vol benefit that is robust.
-* **Execution and data.** Entries fill at the next open (paper: signal close); daily month-end bars instead
+* **Execution and data.** Entries and exits fill at the next open (paper: signal close); daily month-end bars instead
   of Shiller monthly averages/closes; 1901-1927 is not available from the data source; no costs in either.
 
 ### Connors/Alvarez RSI(2), SPY daily
@@ -119,14 +129,14 @@ reliable published figures for the exact rule could be found. So this is parity 
 | SPY adj. 1993-2025 | Result |
 |---|---|
 | Trades (engine = reference) | 255 |
-| Total return / CAGR / vol / Sharpe / maxDD (daily MTM) | 255.0 % / 3.92 % / 6.35 % / 0.64 / -14.5 % |
+| Total return / CAGR / vol / Sharpe / maxDD (daily MTM; platform curve identical) | 358.9 % / 4.74 % / 6.49 % / 0.75 / -14.9 % |
 | Buy and hold | 2734.0 % / 10.69 % / 18.63 % / 0.64 / -55.2 % |
-| Time in market | 7.4 % |
-| Platform win rate | 77.7 % |
+| Time in market | 10.5 % (7.4 % when exits filled at the signal close) |
+| Platform win rate | 76.5 % |
 
-The strategy is in the market 7 % of the time; its Sharpe equals buy-and-hold with a third of the volatility
+The strategy is in the market 10 % of the time; its Sharpe (0.75) exceeds buy-and-hold's (0.64) with a third of the volatility
 and a quarter of the drawdown, which is the qualitative claim of the source (high win rate, short holding, small
-exposure). Absolute return is low because capital is idle 93 % of the time (no cash yield here).
+exposure). Absolute return is low because capital is idle 90 % of the time (no cash yield here).
 
 ### Antonacci Global Equity Momentum
 
@@ -136,26 +146,24 @@ start in 2007 (VEU, BIL; EFA 2001, AGG 2003), so the paper's 1974-2007 history, 
 indices and the T-bill series are not available; 2007-2025 includes 2008, 2022 and a decade of US dominance.
 Parity is therefore against the reference only; the platform run on the ETFs:
 
-| 2007-05 .. 2025-12 | Total return | CAGR | Vol | Sharpe | maxDD (daily MTM) | Platform CAGR / maxDD (realized curve) |
+| 2007-05 .. 2025-12 | Total return | CAGR | Vol | Sharpe | maxDD (daily MTM) | Platform CAGR / maxDD (MTM curve) |
 |---|---|---|---|---|---|---|
-| GEM SPY/VEU/AGG, BIL hurdle | 310.9 % | 7.90 % | 15.64 % | 0.57 | -33.7 % | 7.90 % / -13.2 % |
-| GEM SPY/EFA/AGG, BIL hurdle | 304.6 % | 7.81 % | 15.52 % | 0.56 | -33.7 % | 7.81 % / -11.7 % |
+| GEM SPY/VEU/AGG, BIL hurdle | 304.3 % | 7.81 % | 15.71 % | 0.56 | -33.7 % | 7.80 % / -33.7 % |
+| GEM SPY/EFA/AGG, BIL hurdle | 296.4 % | 7.69 % | 15.59 % | 0.55 | -33.7 % | 7.69 % / -33.7 % |
 | SPY buy and hold, same window | 534.1 % | 10.45 % | 19.91 % | 0.60 | -55.2 % | |
 
 Deviation drivers: window (the paper's edge came largely from 1974-2008 non-US and bond regimes); ETF
-total-return proxies instead of MSCI indices; entry fills at the next open; no costs (a 0.05 % fee run is
+total-return proxies instead of MSCI indices; entries and exits fill at the next open; no costs (a 0.05 % fee run is
 also exact against the reference). The 2008-2009 and 2020 drawdown cuts relative to buy-and-hold (-33.7 % vs
 -55.2 %) are consistent with the paper's drawdown story.
 
 ## Engine findings
 
-1. **Equity curve and stats are realized-only.** Drawdowns of an open position are invisible: `max_drawdown_pct`
-   and Sharpe are computed from a curve with points at trade exits (plus start/end). A long hold through a
-   40 % intramonth crash reports `max_drawdown_pct == 0.0`. On real runs: Faber S&P 1928-2012 platform
-   -35.9 % vs -52.5 % marked; SPY Faber -14.6 % vs -25.8 %; GEM -13.2 % vs -33.7 %; platform Sharpe 0.29 vs 0.52
-   for Faber S&P 1928-2025. CAGR/total return are unaffected. Reproduction:
-   `tests/parity/test_published_engine_findings.py` (strict `xfail`, 12 monthly steps up then a ten-bar -40 % dip
-   inside one Faber hold).
+1. **Equity curve and stats were realized-only (FIXED by #196).** Drawdowns of an open position were invisible:
+   a long hold through a 40 % intramonth crash reported `max_drawdown_pct == 0.0`; on real runs the platform
+   maxDD was -35.9 % vs -52.5 % marked (Faber S&P 1928-2012), -14.6 % vs -25.8 % (SPY Faber) and -13.2 % vs
+   -33.7 % (GEM). With the MTM curve the platform equals the reference (-53.8 % / -25.6 % / -33.7 %). The
+   former strict `xfail` is now a plain regression test (`tests/parity/test_published_engine_findings.py`).
 2. **Sizing price vs fill price (documented here, not a bug):** quantity is `equity / fill-bar open`, not the
    signal-bar close; the fee is not reserved, so a 100 %-invested position with a fee exceeds 100 % of cash by
    the fee. Both are encoded in the reference.

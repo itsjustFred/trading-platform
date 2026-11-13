@@ -9,7 +9,11 @@ identically to every strategy:
 
 * a decision is taken on the CLOSE of bar ``i``;
 * an entry fills at the OPEN of bar ``i+1`` (no fill if ``i`` is the last bar);
-* an exit fills at the CLOSE of bar ``i`` (``signal_exit_fill="close"``);
+* a signal exit fills at the OPEN of bar ``i+1`` (``signal_exit_fill="next_open"``, the platform default
+  since the 2026-11-13 owner decision, rule B); on the last bar there is no next open and the exit fills
+  at that bar's close (end-of-data, flagged ``signal_exit_deferred_to_end_of_data`` by the engine);
+* an exit and a following entry on the same open both fill at that open: the entry is sized on the cash
+  the exit just realized (rule #190, sizing on realized cash);
 * quantity is ``cash / open`` at the fill (fully invested; the 100 % position cap is the binding sizing rule,
   measured on the FILL price; the fee is charged on top, not reserved);
 * a position still open on the last bar is closed at that bar's close
@@ -50,8 +54,9 @@ class Trade:
 @dataclass
 class SimResult:
     trades: list[Trade] = field(default_factory=list)
-    realized: dict[str, float] = field(default_factory=dict)  # day -> realized equity
-    marked: dict[str, float] = field(default_factory=dict)  # day -> cash + qty*close
+    # day -> mark-to-market equity at the bar's close (#196): capital + net PnL of closed trades
+    # + unrealized GROSS PnL of the open position (its fees are recognised when it fully closes).
+    marked: dict[str, float] = field(default_factory=dict)
     final_equity: float = 0.0
 
 
@@ -71,54 +76,59 @@ def simulate(
     """
     res = SimResult()
     cash = capital
+    closed_net = 0.0
     holding: str | None = None
     qty = entry_price = entry_fees = 0.0
     entry_day = ""
-    pending: tuple[str, float] | None = None  # (symbol, qty) filled at next open
-    calendars = {s: [b.day for b in bars] for s, bars in bars_by_symbol.items()}
-    days = sorted({d for cal in calendars.values() for d in cal})
+    pending_entry = False  # entry decided on the previous bar, fills at today's open
+    pending_exit = False  # signal exit decided on the previous bar, fills at today's open
+    pending_symbol: str | None = None
+    days = sorted({b.day for bars in bars_by_symbol.values() for b in bars})
     index = {s: {b.day: b for b in bars} for s, bars in bars_by_symbol.items()}
     last_day = days[-1]
+
+    def close_position(day: str, price: float) -> None:
+        nonlocal cash, closed_net, holding, qty
+        fee = fee_rate * qty * price
+        cash += qty * price - fee
+        trade = Trade(holding, entry_day, entry_price, qty, day, price, entry_fees + fee)
+        res.trades.append(trade)
+        closed_net += trade.net_pnl
+        holding = None
+        qty = 0.0
+
     for day in days:
-        # 1. fill the entry decided on the previous bar at today's open
-        if pending is not None:
-            symbol, _ = pending
-            pending = None
-            bar = index[symbol].get(day)
+        # 1. signal exit decided on the previous bar fills at today's open
+        if pending_exit and holding is not None:
+            close_position(day, index[holding][day].open)
+        pending_exit = False
+        # 2. entry decided on the previous bar fills at today's open
+        if pending_entry and pending_symbol is not None:
+            bar = index[pending_symbol].get(day)
             if bar is not None and holding is None:
                 q = cash / bar.open  # fees are NOT reserved by the engine's sizing
                 fee = fee_rate * q * bar.open
                 cash -= q * bar.open + fee
-                holding, qty, entry_price, entry_day, entry_fees = symbol, q, bar.open, day, fee
-        # 2. decisions on today's close
+                holding, qty, entry_price, entry_day, entry_fees = pending_symbol, q, bar.open, day, fee
+        pending_entry, pending_symbol = False, None
+        # 3. decisions on today's close
         decisions = {s: target[s][day] for s in target if day in target[s]}
         if holding is not None and holding in decisions and not decisions[holding]:
-            bar = index[holding][day]
-            fee = fee_rate * qty * bar.close
-            cash += qty * bar.close - fee
-            res.trades.append(
-                Trade(holding, entry_day, entry_price, qty, day, bar.close, entry_fees + fee)
-            )
-            holding = None
-            qty = 0.0
+            if day == last_day:  # no next open: end-of-data close
+                close_position(day, index[holding][day].close)
+            else:
+                pending_exit = True
         if holding is not None and day == last_day:
-            bar = index[holding][day]
-            fee = fee_rate * qty * bar.close
-            cash += qty * bar.close - fee
-            res.trades.append(
-                Trade(holding, entry_day, entry_price, qty, day, bar.close, entry_fees + fee)
-            )
-            holding = None
-            qty = 0.0
-        if holding is None and day != last_day:
+            close_position(day, index[holding][day].close)
+        if (holding is None or pending_exit) and day != last_day:
             for symbol, want in decisions.items():
                 if want:
-                    close = index[symbol][day].close
-                    pending = (symbol, 0.0)  # quantity is fixed at the fill (cash / open)
+                    pending_entry, pending_symbol = True, symbol  # quantity fixed at the fill (cash / open)
                     break
-        res.realized[day] = cash
-        mark = cash + (qty * index[holding][day].close if holding and day in index[holding] else 0.0)
-        res.marked[day] = mark
+        mark = closed_net
+        if holding is not None:
+            mark += qty * (index[holding][day].close - entry_price)
+        res.marked[day] = capital + mark
     res.final_equity = res.marked[last_day]
     return res
 

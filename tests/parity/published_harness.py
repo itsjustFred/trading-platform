@@ -99,7 +99,6 @@ def run_engine(
         max_position_exposure_pct=1.0,
         max_leverage=1.0,
         modeling_resolution="main_timeframe",
-        signal_exit_fill="close",
         data_dir=str(data_dir),
         parameters=parameters,
     )
