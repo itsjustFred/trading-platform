@@ -28,9 +28,16 @@ def _check(tmp_path, fixture, *, fee_rate=0.0, start=None, end=None):
     return run, ref, compare(run, ref, {"x": "SYN"})
 
 
-@pytest.mark.parametrize("fixture", ["spy", "sp500tr", "gspc"])
-def test_faber_engine_equals_reference(tmp_path, fixture):
-    run, ref, diffs = _check(tmp_path, fixture)
+@pytest.mark.parametrize(
+    "fixture,end",
+    [
+        ("spy", None),
+        pytest.param("sp500tr", "2012-12-31", marks=[pytest.mark.slow, pytest.mark.timeout(900)]),
+        pytest.param("gspc", "2012-12-31", marks=[pytest.mark.slow, pytest.mark.timeout(900)]),
+    ],
+)
+def test_faber_engine_equals_reference(tmp_path, fixture, end):
+    run, ref, diffs = _check(tmp_path, fixture, end=end)
     assert not diffs, "\n".join(diffs[:10])
     assert len(ref.trades) >= 10
 
