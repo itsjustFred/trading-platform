@@ -158,6 +158,18 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
+- **`entry` is the price the order actually fills at**, for every order type
+  (MARKET: the next bar's open; LIMIT/STOP: their trigger price). Pre-fill
+  creation sizing is only a pending-order estimate and must never survive into
+  the position: because the caps are evaluated against the fill price, a
+  quantity derived from the signal bar's close sizes a position *beyond* the
+  cap whenever the next open gaps (repro: 103.4k notional on 100k equity at a
+  1x cap). Native's `_fill_pending_orders` re-sizes at the fill for every
+  order type, the no-explicit-stop fallback included.
+- **The sizing `equity` is realized cash** (`initial_capital +` closed-trade
+  PnL, net of fees — Cleanup 16-D1 F21/D2), never the mark-to-market
+  reporting equity of the curve: an open position's paper profit is not
+  spendable and a paper drawdown must not deflate new sizes.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
@@ -165,8 +177,12 @@ Implementation:
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
-  distance (native/risk engine: `fallback_stop_pct = 2%`; vectorbt: 2% of
-  entry) — the fallback must be visible in the trade meta, not silent.
+  distance — **2% of the fill price** (native/risk engine:
+  `fallback_stop_pct = 2%`, applied to the entry the risk engine is handed;
+  vectorbt: `entry_price * 0.02`) — the fallback must be visible in the trade
+  meta, not silent. It is a real fill-time risk input, so a stopless order is
+  sized from it like any other order (this supersedes the 16-D1 stopless-MARKET
+  exception recorded in `docs/cleanup-16d1-money-path-semantics.md` D4).
 - **Multi-symbol shared equity (D5, A-M4):** per-symbol engines size each
   trade from the full starting capital; on multi-symbol runs the adapters
   replay all trades onto ONE running portfolio equity
