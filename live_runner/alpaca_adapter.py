@@ -87,6 +87,11 @@ def _order_legs(order: Any) -> list[Any]:
     return list(legs) if isinstance(legs, (list, tuple)) else []
 
 
+def _order_status(order: Any) -> str:
+    raw = _order_attr(order, "status", "")
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
 def _order_symbol(order: Any) -> str:
     return str(_order_attr(order, "symbol", "") or "").strip().upper()
 
@@ -1229,6 +1234,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancel_accepted: set[str] = set()
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
@@ -1238,6 +1244,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 continue
             try:
                 await self._cancel_one(client, order_id)
+                cancel_accepted.add(order_id)
             except Exception as exc:
                 failed.append(f"{order_id}:{exc}")
                 logger.warning(
@@ -1259,10 +1266,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 unidentified=tuple(unidentified),
                 failed=tuple(failed) + (f"verify:{exc}",),
             )
+        # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
+        # cancel settles. That is the broker confirming our request, not a dropped
+        # cancel, so it must not be reported as a failure. Only ids this sweep
+        # cancelled count; an order that was never ours to cancel and sits in
+        # ``pending_cancel`` is not vouched for.
         still_working = {
             _control_order_id(_order_attr(order, "id"))
             for order in remaining
             if _control_order_id(_order_attr(order, "id")) not in protected
+            and not (
+                _control_order_id(_order_attr(order, "id")) in cancel_accepted
+                and _order_status(order) == "pending_cancel"
+            )
         }
         still_working.discard(None)
         failed.extend(sorted(still_working))
