@@ -1,0 +1,453 @@
+name: Agent Mutation Testing
+# Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
+# the PR number and SHA from display_title and made the superseded-run cancel
+# in agent-code-review.yml a no-op.
+run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
+
+# Stage 3 of the PR verification pipeline (see the `platform-pr-verify` skill):
+#   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> CodeRabbit
+#
+# Mutation-tests the production Python a PR changes, using the
+# `.agents/skills/actions-mutation-testing` skill as the system prompt of an
+# opencode agent, posts (and on later runs updates) one PR comment, and sets
+# the commit status `agent/mutation-testing` on the tested SHA:
+#   pending: running · success: PASS · failure: GAPS · error: INCOMPLETE or the
+#   run failed
+#
+# It has no pull_request trigger. `agent-code-review.yml` dispatches it with
+# the PR head SHA when the review verdict is PASS. The run-name carries the PR
+# number and SHA, so a later push can cancel runs of older commits. A run whose
+# SHA is no longer the PR head stops without doing anything.
+#
+# Override (review red, findings judged irrelevant): justify each finding in a
+# PR comment, then dispatch by hand (head_sha defaults to the current head):
+#   gh workflow run agent-mutation-testing.yml --ref <pr-branch> -f pr_number=<N>
+#
+# opencode's free Zen models need no login and no API key, so this workflow
+# holds no secret besides the default GITHUB_TOKEN of the jobs that run no
+# repo code.
+#
+# Trust model:
+# - The rules (the skill) are read from the base branch, so a PR cannot weaken
+#   its own run. Only while the base has no skill yet is another copy used, and
+#   the prompt says so.
+# - Unlike the code review, this job runs the PR's code: it installs the locked
+#   dependencies and runs pytest, as the `ci` workflow does. The agent may edit
+#   files (to apply a mutation) and has a shell. The guards: the job holds no
+#   token or secret (`persist-credentials: false`, no GH_TOKEN), and the run
+#   fails if HEAD moved or the tree is dirty, so a mutation left in place is
+#   never reported as a clean result.
+# - The workflow file runs from the dispatched ref (the PR branch), like the
+#   PR's copy on pull_request. Accepted for the same reason as in the review
+#   workflow. Fork PRs are skipped.
+#
+# Configuration (Settings -> Secrets and variables -> Actions -> Variables):
+#   MUTATION_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   MUTATION_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR to mutation-test
+        required: true
+        type: number
+      head_sha:
+        description: Commit to test; the run stops if it is no longer the PR head (default the current head)
+        required: false
+        type: string
+
+concurrency:
+  group: agent-mutation-testing-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  OPENCODE_VERSION: "2.2.7"
+  MODEL: ${{ vars.MUTATION_MODEL || 'opencode/inkling-2-small-free' }}
+  VARIANT: ${{ vars.MUTATION_VARIANT || 'max' }}
+  SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
+  MUTATION_CONTEXT: agent/mutation-testing
+
+jobs:
+  # Resolves the PR for both triggers and writes its metadata (title and body
+  # via jq, never via ${{ }} interpolation into a shell script).
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+      current: ${{ steps.pr.outputs.current }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+          if [ "$(jq -r .state pr.json)" != "open" ]; then
+            echo "::error::PR #${INPUT_PR} is not open."
+            exit 1
+          fi
+          # The SHA the review passed must still be the head; otherwise a newer
+          # push has its own pipeline run and this one has nothing to do.
+          if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+            echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=$(jq -r .head.sha pr.json)"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mark running
+        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$MUTATION_CONTEXT" -f description="Running" \
+            -f target_url="$RUN_URL" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: steps.pr.outputs.current == 'true'
+        with:
+          name: agent-mutation-testing-meta
+          path: meta.json
+          retention-days: 1
+
+      # After "Mark running" a failure here (artifact upload) would leave the
+      # stage `pending` with every later job skipped.
+      - name: Report resolve failure
+        if: failure() && steps.pr.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Resolve step failed; see the run log" > /dev/null
+          fi
+
+  mutate:
+    needs: resolve
+    # Fork PRs are not mutation-tested.
+    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    # The skill stops starting mutations at about 45 minutes of work.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-mutation-testing-meta
+          path: ${{ runner.temp }}/mutation
+
+      # Scope: production Python the PR adds, modifies or renames. Tests and
+      # conftest files are never mutated. An empty scope posts a fixed comment
+      # without starting the agent.
+      - name: Compute scope
+        id: scope
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          scope="$RUNNER_TEMP/mutation/scope.txt"
+          git diff --name-only --diff-filter=AMR "${BASE_SHA}...${HEAD_SHA}" -- '*.py' \
+            ':(exclude)tests/**' ':(exclude)**/conftest.py' > "$scope"
+          echo "Scope:"; cat "$scope"
+          if [ -s "$scope" ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.scope.outputs.empty == 'false'
+        with:
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          python -m pip install --only-binary=:all: uv==0.10.4
+          uv sync --frozen --all-extras --no-install-project --no-build
+
+      - uses: actions/setup-node@v7
+        if: steps.scope.outputs.empty == 'false'
+        with:
+          node-version: 22
+
+      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
+      # the platform binary. The job holds no token, so the exposure is bounded.
+      - name: Install opencode
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          opencode --version
+
+      # Rules: the base branch's skill if it has one. Otherwise (only while the
+      # skill is not merged yet) the copy from the commit this workflow runs
+      # from, then the PR's own copy.
+      #
+      # Duplicated by hand in agent-code-review.yml: skill selection, agent
+      # config, verdict parse, tree-clean check and comment poster. A change to
+      # one copy must land in the other in the same commit.
+      - name: Select skill revision
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          set -euo pipefail
+          skill="$RUNNER_TEMP/mutation/skill.md"
+          # Refuse when the base commit is unreachable, as the review workflow
+          # does: falling through would run rules the PR may have weakened.
+          git cat-file -e "${BASE_SHA}^{commit}"
+          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
+          elif [ -f "$SKILL_PATH" ]; then
+            cp "$SKILL_PATH" "$skill"
+            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          else
+            echo "::error::No mutation-testing skill found at base, workflow ref or PR head."
+            exit 1
+          fi
+
+      # The agent lives in the global config, not in the checkout. Its system
+      # prompt is the skill body (the skill's own frontmatter is dropped). It may
+      # edit (to apply mutations); .env reads stay denied.
+      - name: Configure mutation agent
+        if: steps.scope.outputs.empty == 'false'
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Automated PR mutation tester (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*", effect: allow }\n'
+            printf '  - { action: glob, resource: "*", effect: allow }\n'
+            printf '  - { action: grep, resource: "*", effect: allow }\n'
+            printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: edit, resource: "*", effect: allow }\n'
+            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
+            printf '  - { action: read, resource: "*.env", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
+            printf -- '---\n'
+            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/mutation/skill.md"
+          } > "$conf/agents/pr-mutation.md"
+          if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/pr-mutation.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
+            echo "::error::Mutation agent has an empty system prompt."
+            exit 1
+          fi
+          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
+            | jq -e '.[] | select(.id == "pr-mutation") | .model' > /dev/null
+
+      - name: Run mutation agent
+        if: steps.scope.outputs.empty == 'false'
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mutation/comment.md"
+          # Captured through a variable, never a file the agent can reach: it
+          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
+          # in $out.raw would otherwise be posted as the verdict.
+          if ! raw=$(opencode run --standalone --archived --agent pr-mutation \
+            "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}."); then
+            printf '%s\n' "$raw" > "$out.raw"
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
+          # opencode prints every assistant message; keep only the final comment,
+          # which starts at the last "**Summary:**" line. Drop a closing code
+          # fence the model may have wrapped around it.
+          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
+          if [ -z "$start" ]; then
+            echo "::error::Mutation output has no summary line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+
+      - name: No-scope comment
+        if: steps.scope.outputs.empty == 'true'
+        run: |
+          {
+            echo "**Summary:** No production Python changed; nothing to mutate."
+            echo "**Scope:** 0 files · base ${BASE_SHA} … head ${HEAD_SHA} · 0 mutations run"
+            echo
+            echo "**Not verified:** nothing material"
+            echo "**Verdict: PASS** — nothing to mutate; advisory; tests not added by this job"
+          } > "$RUNNER_TEMP/mutation/comment.md"
+
+      # A mutation left in place, or any other change, invalidates the result.
+      - name: Check checkout is unchanged
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The checkout was modified (a mutation may not have been reverted); not posting."
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      # The verdict must be the last non-empty line and one of the three the
+      # skill allows (the fixed no-scope comment passes the same check).
+      - name: Read verdict
+        id: verdict
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/mutation/comment.md"
+          last=$(grep -v '^[[:space:]]*$' "$out" | tail -n 1)
+          verdict=$(printf '%s\n' "$last" | tr -d '*' \
+            | sed -nE 's/^Verdict:[[:space:]]*(PASS|GAPS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
+          if [ -z "$verdict" ]; then
+            echo "::error::Mutation output does not end with a valid verdict line; not posting."
+            cat "$out.raw" 2>/dev/null || cat "$out"
+            exit 1
+          fi
+          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
+
+      # Footer: the model, its variant and the skill, so a reader can map the
+      # verdict to the rules that produced it. Then the title goes first.
+      - name: Finish comment
+        env:
+          SCOPE_EMPTY: ${{ steps.scope.outputs.empty }}
+        run: |
+          out="$RUNNER_TEMP/mutation/comment.md"
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          if [ "$SCOPE_EMPTY" = "true" ]; then
+            printf '\n\n---\n_Automated mutation testing: no agent run, empty scope (`%s` skill)_\n' "$skill_name" >> "$out"
+          else
+            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          fi
+          { printf '# Mutation Testing Action\n\n'; cat "$out"; } > "$out.titled"
+          mv "$out.titled" "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-mutation-testing
+          path: ${{ runner.temp }}/mutation/comment.md
+          retention-days: 14
+
+  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # failed mutation run as `error`.
+  post:
+    needs: [resolve, mutate]
+    if: ${{ !cancelled() && (needs.mutate.result == 'success' || needs.mutate.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      VERDICT: ${{ needs.mutate.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report failed mutation run
+        if: needs.mutate.result == 'failure'
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Mutation run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+
+      - uses: actions/download-artifact@v4
+        if: needs.mutate.result == 'success'
+        with:
+          name: agent-mutation-testing
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only. A result for a commit that is no longer the PR
+      # head does not overwrite the comment (its status still lands on its SHA).
+      - name: Post or update mutation-testing comment
+        if: needs.mutate.result == 'success'
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
+          marker='<!-- actions-mutation-testing -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
+
+      - name: Set status
+        if: needs.mutate.result == 'success'
+        run: |
+          set -euo pipefail
+          case "$VERDICT" in
+            PASS) state=success ;;
+            GAPS) state=failure ;;
+            *) state=error ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$MUTATION_CONTEXT" \
+            -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+
+      # A failure above (artifact download, comment POST/PATCH, status write)
+      # would otherwise leave the stage `pending` on this SHA forever. Only a
+      # still-pending context is touched, so a terminal verdict stands.
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Post step failed; see the run log" > /dev/null
+          fi
