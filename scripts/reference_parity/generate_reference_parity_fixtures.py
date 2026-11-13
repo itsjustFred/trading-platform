@@ -44,6 +44,7 @@ published quickstart statistics.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -54,6 +55,7 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_DIR = REPO_ROOT / "tests" / "parity" / "fixtures"
 DATA_FIXTURE = FIXTURE_DIR / "ref_parity_daily.csv"
+SUMMARY_FIXTURE = FIXTURE_DIR / "ref_parity_summary.json"
 
 # A direct ``python scripts/reference_parity/generate_reference_parity_fixtures.py``
 # puts *this* directory on sys.path, not the repository root, so the absolute
@@ -154,13 +156,15 @@ def protective_gap_throughs(frame: pd.DataFrame, trades: pd.DataFrame) -> list[s
     for _, trade in trades.iterrows():
         if trade["exit_kind"] == "end_of_data":
             continue
+        stop_side = trade["exit_kind"] == "stop_loss"
+        level_key = "stop_level" if stop_side else "take_profit_level"
         bar = _bar_at(frame, trade["exit_time"])
         open_price = float(bar["open"])
-        level = float(trade["stop_level"] if trade["exit_kind"] == "stop_loss" else trade["take_profit_level"])
+        level = float(trade[level_key])
         if trade["side"] == "LONG":
-            through = open_price < level if trade["exit_kind"] == "stop_loss" else open_price > level
+            through = open_price < level if stop_side else open_price > level
         else:
-            through = open_price > level if trade["exit_kind"] == "stop_loss" else open_price < level
+            through = open_price > level if stop_side else open_price < level
         if through:
             problems.append(
                 f"trade {int(trade['trade'])} ({trade['side']} {trade['exit_kind']}): "
@@ -239,6 +243,12 @@ def _commission_for(name: str) -> float:
     return {"QUICKSTART": 0.002, "ZERO": 0.0}[name]
 
 
+def _backtesting_version() -> str:
+    import backtesting
+
+    return str(backtesting.__version__)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -254,9 +264,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from scripts.reference_parity.reference_strategies import (
+        FRACTIONAL_UNIT,
+        REFERENCE_CASH,
+        SIZE_FRACTIONS,
         BracketLong,
         BracketShort,
         SmaCross,
+        reference_size_fraction,
         run_reference,
     )
 
@@ -276,6 +290,21 @@ def main(argv: list[str] | None = None) -> int:
 
     failures: list[str] = []
     summary = []
+    #: What the committed fixture is, so the test suite can re-derive every recorded
+    #: quantity from the trade list alone (see ``run_summary`` in the parity test).
+    manifest: dict[str, object] = {
+        "generator": "scripts/reference_parity/generate_reference_parity_fixtures.py",
+        "library": f"backtesting.py {_backtesting_version()}",
+        "license": "AGPL-3.0 (reference library; only its numeric output is committed)",
+        "seed": SEED,
+        "bars": len(frame),
+        "bars_generated": len(full),
+        "cash": REFERENCE_CASH,
+        "fractional_unit": FRACTIONAL_UNIT,
+        "size_fractions": dict(SIZE_FRACTIONS),
+        "data_fixture": DATA_FIXTURE.name,
+        "runs": {},
+    }
     for slug, strategy_name, commission_name in RUNS:
         strategy = strategies[strategy_name]
         commission = _commission_for(commission_name)
@@ -284,6 +313,18 @@ def main(argv: list[str] | None = None) -> int:
         problems.append(gate_bound(frame, strategy, commission))
         problems = [p for p in problems if p]
         summary.append((slug, strategy_name, commission, len(trades), final_equity, problems))
+        manifest["runs"][slug] = {
+            "library_strategy": strategy_name,
+            "commission": commission,
+            "size_fraction": reference_size_fraction(strategy),
+            "trades": int(len(trades)),
+            "final_equity": float(final_equity),
+            "exit_kinds": {
+                str(kind): int(count)
+                for kind, count in trades["exit_kind"].value_counts().items()
+            },
+            "invariant_violations": list(problems),
+        }
         if not args.no_write and not problems:
             FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
             target = FIXTURE_DIR / f"ref_parity_{slug}_trades.csv"
@@ -297,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         DATA_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(DATA_FIXTURE, index=False)
         print(f"wrote {DATA_FIXTURE.relative_to(REPO_ROOT)} ({len(frame)} bars)")
+        payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        SUMMARY_FIXTURE.write_text(payload, encoding="utf-8")
+        print(f"wrote {SUMMARY_FIXTURE.relative_to(REPO_ROOT)} ({len(manifest['runs'])} runs)")
     else:
         print(f"data fixture unchanged: {DATA_FIXTURE.relative_to(REPO_ROOT)}")
 

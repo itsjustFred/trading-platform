@@ -181,6 +181,24 @@ class BracketShort(Strategy):
             )
 
 
+#: ``Strategy.buy()`` without a ``size`` argument means "everything the available liquidity
+#: allows" (backtesting.py's ``Broker``: ``size`` between 0 and 1 is a fraction of
+#: ``margin_available``), which the reference quickstart uses. The bracketed examples pass an
+#: explicit ``size=0.5``. These fractions are recorded with every fixture so the committed trade
+#: list can be re-derived without the library installed (see
+#: ``tests/parity/test_reference_library_parity.py``).
+SIZE_FRACTIONS: dict[str, float] = {
+    "SmaCross": 1.0,
+    "BracketLong": 0.5,
+    "BracketShort": 0.5,
+}
+
+
+def reference_size_fraction(strategy: type[Strategy]) -> float:
+    """The ``size`` fraction of available liquidity this strategy trades with."""
+    return SIZE_FRACTIONS[strategy.__name__]
+
+
 def _classify_exit(frame: pd.DataFrame, row: pd.Series, forced: bool) -> str:
     """Label one reference exit: ``end_of_data`` / ``stop_loss`` / ``take_profit`` / ``signal``.
 
