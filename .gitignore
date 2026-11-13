@@ -61,6 +61,10 @@ logs/
 !tests/fixtures/*.csv
 !tests/fixtures/validation/quantconnect-reference/*.csv
 !tests/fixtures/*.json
+# Committed parity fixtures: small (<1 MB each) trade lists the native engine is asserted
+# against (docs/reports/parity-reference-libraries.md). Market *data* stays out of the repo.
+!tests/parity/fixtures/*.csv
+!tests/parity/fixtures/*.json
 
 # Node
 node_modules/
