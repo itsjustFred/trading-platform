@@ -21,6 +21,7 @@ from scripts.run_risk_parity_backtest import (
     ASSETS,
     TICKERS,
     _simulate_portfolio_value,
+    compounded_growth,
     adjust_for_regime,
     apply_tail_risk_hedge,
     apply_volatility_scaling,
@@ -621,3 +622,63 @@ def test_checked_in_reference_stays_within_lean_ground_truth():
     assert abs(abs(stats["max_drawdown"]) - abs(truth["max_drawdown"])) <= 0.005
     assert abs(stats["sharpe_ratio"] - truth["sharpe_ratio"]) <= 0.03
     assert abs(stats["annualized_volatility"] - 0.087) <= 0.003
+
+
+def _flat_prices(start: str, end: str, drop: str | None = None) -> pd.DataFrame:
+    dates = pd.bdate_range(start, end)
+    if drop:
+        dates = dates[dates != pd.Timestamp(drop)]
+    rng = np.random.default_rng(7)
+    steps = 1.0 + rng.normal(0.0003, 0.01, size=(len(dates), len(TICKERS)))
+    return pd.DataFrame(100.0 * np.cumprod(steps, axis=0), index=dates, columns=TICKERS)
+
+
+def test_compounded_growth_matches_the_simulated_curve():
+    """A-M9: the rebalance mark-to-market and the equity curve share one compounding."""
+    prices = _flat_prices("2024-01-01", "2024-03-29")
+    returns = prices.pct_change().dropna()
+    start, end = returns.index[3], returns.index[40]
+    growth = compounded_growth(returns, start, end)
+    weights = {t: 1.0 / len(TICKERS) for t in TICKERS}
+    sim = _simulate_portfolio_value(returns, 1000.0, {start: weights})
+    expected = sim.loc[end] / sim.loc[start]
+    got = sum(weights[t] * growth[t] for t in TICKERS)
+    assert got == pytest.approx(expected, rel=1e-12)
+
+
+def test_compounded_growth_refuses_non_finite_returns():
+    prices = _flat_prices("2024-01-01", "2024-02-29")
+    returns = prices.pct_change().dropna()
+    returns.iloc[5, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite compounded growth"):
+        compounded_growth(returns, returns.index[2], returns.index[10])
+
+
+def test_compounded_growth_refuses_unknown_bar():
+    returns = _flat_prices("2024-01-01", "2024-02-29").pct_change().dropna()
+    with pytest.raises(ValueError, match="not a return bar"):
+        compounded_growth(returns, pd.Timestamp("2023-12-01"), returns.index[3])
+
+
+def test_rebalance_without_completed_bar_is_skipped_visibly(caplog):
+    prices = _flat_prices("2024-01-31", "2024-03-15")  # first return bar is 2024-02-01
+    with caplog.at_level("WARNING"):
+        result = run_backtest(
+            start_date="2024-01-31",
+            end_date="2024-03-15",
+            prices=prices,
+            warm_up_days=0,
+        )
+    assert any("no completed return bar" in r.message for r in caplog.records)
+    assert result["portfolio_target_signals"][0]["timestamp"] != "2024-02-01T00:00:00Z"
+
+
+def test_short_covariance_window_is_logged_and_recorded(caplog):
+    prices = _flat_prices("2023-10-02", "2024-03-15")
+    with caplog.at_level("WARNING"):
+        result = run_backtest(
+            start_date="2024-01-01", end_date="2024-03-15", prices=prices, warm_up_days=0
+        )
+    first = result["portfolio_target_signals"][0]["metadata"]
+    assert first["covariance_observations"] < first["covariance_lookback_days"]
+    assert any("covariance window" in r.message for r in caplog.records)

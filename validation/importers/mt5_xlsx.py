@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 
+from shared.broker_clock import BrokerClock, resolve_broker_clock
 from shared.models import Trade, TradeExit
 from validation.importers._numbers import detect_decimal_comma, parse_locale_number
 from validation.importers._pairing import (
@@ -98,6 +99,16 @@ def _resolve_source_timezone(source_tz: str | tzinfo | None) -> tzinfo | None:
         raise ValueError(f"Unknown source timezone: {source_tz}") from exc
 
 
+def _resolve_report_clock(
+    broker_clock: str | BrokerClock | None,
+) -> BrokerClock | None:
+    if broker_clock is None:
+        return None
+    if isinstance(broker_clock, BrokerClock):
+        return broker_clock
+    return resolve_broker_clock(broker_clock)
+
+
 class MT5XLSXImporter(BaseImporter):
     """Import MT5 Strategy Tester XLSX reports (German UI)."""
 
@@ -105,6 +116,8 @@ class MT5XLSXImporter(BaseImporter):
         self,
         source: str | Path,
         source_timezone: str | tzinfo | None = None,
+        *,
+        broker_clock: str | BrokerClock | None = None,
         **kwargs: Any,
     ) -> ValidationReference:
         """Read an MT5 XLSX report and return a ``ValidationReference``.
@@ -118,6 +131,13 @@ class MT5XLSXImporter(BaseImporter):
             the report's timestamps.
             If provided, naive timestamps will be interpreted in this timezone and
             converted to UTC. Defaults to UTC if not provided.
+        broker_clock:
+            Optional name of a broker server clock (``shared.broker_clock``) or
+            the clock itself. A report prints ``TimeCurrent()``, i.e. the
+            broker's server wall clock, which is not a civil time zone and has
+            changed offsets over the years; the clock resolves every timestamp
+            against its historical segments. Mutually exclusive with
+            ``source_timezone``.
         **kwargs:
             Forwarded to ``pandas.read_excel`` (e.g. ``engine``).
         """
@@ -126,6 +146,12 @@ class MT5XLSXImporter(BaseImporter):
             raise FileNotFoundError(f"MT5 XLSX report not found: {path}")
 
         resolved_timezone = _resolve_source_timezone(source_timezone)
+        resolved_clock = _resolve_report_clock(broker_clock)
+        if resolved_timezone is not None and resolved_clock is not None:
+            raise ValueError(
+                "source_timezone and broker_clock are mutually exclusive: a report's "
+                "timestamps are either a civil zone's wall time or a broker server clock"
+            )
         df_raw = pd.read_excel(path, header=None, sheet_name=0, **kwargs)
         rows = df_raw.values.tolist()
 
@@ -157,7 +183,10 @@ class MT5XLSXImporter(BaseImporter):
         raw_metadata = {
             "parsed_meta": meta,
             "parsed_stats": stats,
-            "source_timezone": str(resolved_timezone or timezone.utc),
+            "source_timezone": (
+                str(resolved_timezone or timezone.utc) if resolved_clock is None else None
+            ),
+            "broker_clock": resolved_clock.name if resolved_clock is not None else None,
         }
 
         # Parse Orders table for SL/TP from Orders table
@@ -166,7 +195,9 @@ class MT5XLSXImporter(BaseImporter):
 
         # Parse Trades / Deals table
         trades_df = self._extract_table(df_raw, trades_header_idx, end_idx=None)
-        trades, fill_summary = self._build_trades(trades_df, sltp_map, resolved_timezone)
+        trades, fill_summary = self._build_trades(
+            trades_df, sltp_map, resolved_timezone, resolved_clock
+        )
         raw_metadata["position_fills"] = fill_summary
         raw_metadata["open_positions"] = fill_summary
         if fill_summary.get("open_position_count_including_partial"):
@@ -617,6 +648,7 @@ class MT5XLSXImporter(BaseImporter):
         trades_df: pd.DataFrame,
         sltp_map: dict[Any, dict[str, float | None]],
         source_timezone: str | tzinfo | None = None,
+        broker_clock: BrokerClock | None = None,
     ) -> tuple[list[Trade], dict[str, Any]]:
         if trades_df.empty:
             return [], position_fill_summary([])
@@ -765,7 +797,7 @@ class MT5XLSXImporter(BaseImporter):
                 exit_reason = MT5XLSXImporter._infer_exit_reason(exit_comment)
                 exits.append(
                     TradeExit(
-                        time=MT5XLSXImporter._to_iso(exit_time_raw, source_timezone),
+                        time=MT5XLSXImporter._to_iso(exit_time_raw, source_timezone, broker_clock),
                         price=exit_price if exit_price is not None else 0.0,
                         quantity=exit_volume if exit_volume is not None else 0.0,
                         pnl=exit_pnl,
@@ -792,7 +824,7 @@ class MT5XLSXImporter(BaseImporter):
                 id=trade_id_counter,
                 symbol=symbol,
                 direction=direction_str,
-                entry_time=MT5XLSXImporter._to_iso(entry_time_raw, source_timezone),
+                entry_time=MT5XLSXImporter._to_iso(entry_time_raw, source_timezone, broker_clock),
                 entry_price=entry_price if entry_price is not None else 0.0,
                 quantity=entry_volume,
                 exits=exits,
@@ -872,13 +904,29 @@ class MT5XLSXImporter(BaseImporter):
             return default
 
     @staticmethod
-    def _to_iso(raw: str, source_tz: str | tzinfo | None = None) -> str:
-        """Convert MT5 datetime string to ISO-8601 UTC string."""
+    def _to_iso(
+        raw: str,
+        source_tz: str | tzinfo | None = None,
+        broker_clock: BrokerClock | None = None,
+    ) -> str:
+        """Convert an MT5 datetime string to an ISO-8601 UTC string.
+
+        The report prints server wall time with no zone. ``source_tz`` reads it
+        as a civil zone's wall time; ``broker_clock`` reads it on the broker's
+        server clock, which is the only correct reading for a report that spans
+        the broker's offset changes.
+        """
         text = raw.strip() if raw else ""
         tz = _resolve_source_timezone(source_tz)
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(text, fmt)
+                if broker_clock is not None:
+                    return (
+                        broker_clock.to_utc([pd.Timestamp(dt)])[0]
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
                 if tz:
                     dt = dt.replace(tzinfo=tz)
                     dt = dt.astimezone(timezone.utc)

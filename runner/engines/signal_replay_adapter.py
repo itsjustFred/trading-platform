@@ -15,10 +15,15 @@ from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
+from runner.engines.mtm_equity import (
+    build_mark_to_market_curve,
+    closes_from_frame,
+    describe_basis,
+)
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
-from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
 from signal_bots.registry import get_signal_processor
 
 logger = logging.getLogger(__name__)
@@ -157,6 +162,14 @@ class SignalReplayAdapter:
     handling); bars with NaN OHLC are dropped loudly (count-logged, never
     silently skipped); protective exits settle across ALL open positions per
     signal, not just the signaled symbol.
+
+    Owner decision 2026-11-13 in this engine: (A) a protective exit whose bar
+    OPENS beyond the stop/target fills at that open, intrabar touches at the
+    level. (B) "Signal exits fill like entries" holds trivially: external
+    signals (entries and flip/exit-only exits alike) are executed when they
+    arrive, at the fill bar's close - the documented replay model - so there is
+    no separate next-open exit rule to apply. The end-of-data close of a
+    still-open position fills at the last bar's close.
     """
 
     def __init__(
@@ -424,16 +437,30 @@ class SignalReplayAdapter:
         if event is None:
             self._apply_trailing_stop(position, bar)
             return None
+        # Owner decision 2026-11-13: a bar that OPENS beyond the level gapped
+        # through it and fills at its OPEN (the price actually available), not at
+        # the skipped level. Intrabar touches keep filling at the level.
+        bar_open = float(bar["open"])
         if event == "stop":
             exit_price = (
-                float(position.stop_loss)
+                contract.level_fill_price(
+                    direction=position.direction,
+                    kind="stop",
+                    level=float(position.stop_loss),
+                    bar_open=bar_open,
+                )
                 if position.stop_loss is not None
                 else float(bar["close"])
             )
             reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
         else:
             exit_price = (
-                float(position.take_profit)
+                contract.level_fill_price(
+                    direction=position.direction,
+                    kind="tp",
+                    level=float(position.take_profit),
+                    bar_open=bar_open,
+                )
                 if position.take_profit is not None
                 else float(bar["close"])
             )
@@ -713,7 +740,6 @@ class SignalReplayAdapter:
         for idx, trade in enumerate(closed_trades, start=1):
             trade.id = idx
 
-        running_equity = float(self.initial_capital)
         curve_start = pd.to_datetime(
             backtest_start or (closed_trades[0].entry_time if closed_trades else ""),
             utc=True,
@@ -721,20 +747,21 @@ class SignalReplayAdapter:
         )
         if pd.isna(curve_start):
             curve_start = pd.Timestamp.now(tz="UTC")
-        equity_curve: list[EquityPoint] = [
-            EquityPoint(time=pd.Timestamp(curve_start).isoformat(), equity=round(running_equity, 2))
-        ]
-        for trade in closed_trades:
-            # #84: the equity path accumulates NET pnl.
-            running_equity += _net_pnl_of(trade)
-            point = EquityPoint(
-                time=trade.last_exit_time,
-                equity=round(running_equity, 2),
-            )
-            if equity_curve[-1].time == point.time:
-                equity_curve[-1] = point
-            else:
-                equity_curve.append(point)
+        # Reporting equity is MARK-TO-MARKET (one observation per bar of the
+        # replayed frames): drawdown / Sharpe must see the paper drawdown of
+        # open positions. Sizing above already marks open positions to market
+        # (`_sizing_account_balance`, D9), so sizing-time and reporting-time
+        # equity now measure the same capital.
+        equity_curve, unmarked_symbols = build_mark_to_market_curve(
+            closed_trades,
+            {
+                symbol: closes
+                for symbol, frame in frames.items()
+                if (closes := closes_from_frame(frame)) is not None
+            },
+            float(self.initial_capital),
+            start_time=pd.Timestamp(curve_start).isoformat(),
+        )
 
         signal_sources = self._collect_signal_sources(replay_signals)
         tags = [
@@ -753,6 +780,7 @@ class SignalReplayAdapter:
             backtest_start=str(inferred_start),
             backtest_end=str(inferred_end),
             data={
+                **describe_basis(unmarked_symbols),
                 "symbols": sorted(frames.keys()),
                 "timeframes": [normalized_timeframe],
                 "source": ",".join(signal_sources) if signal_sources else "internal",

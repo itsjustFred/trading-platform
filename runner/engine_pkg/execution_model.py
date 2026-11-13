@@ -28,6 +28,11 @@ class ExecutionModelSettings:
     stop_trigger_side: str = "bar_low_high"
     take_profit_trigger_side: str = "bar_high_low"
     same_bar_order: str = "stop_first"
+    #: Owner decision 2026-11-13: a bar that opens beyond a stop/target fills at
+    #: its open (``"open"``), not at the level. Intrabar touches fill at the level.
+    protective_gap_fill: str = "open"
+    #: Where signal-driven exits fill (``BacktestConfig.signal_exit_fill``).
+    signal_exit_fill: str = "next_open"
     intrabar_resolution: str | None = None
     lower_timeframe_replay: bool = False
 
@@ -57,6 +62,7 @@ class ExecutionModelSettings:
             stop_trigger_side=str(params.get("stop_trigger_side") or "bar_low_high"),
             take_profit_trigger_side=str(params.get("take_profit_trigger_side") or "bar_high_low"),
             same_bar_order=same_bar_order,
+            signal_exit_fill=str(getattr(config, "signal_exit_fill", "next_open")),
             intrabar_resolution=intrabar_resolution,
             lower_timeframe_replay=intrabar_resolution is not None,
         )
@@ -68,6 +74,8 @@ class ExecutionModelSettings:
             "stop_trigger_side": self.stop_trigger_side,
             "take_profit_trigger_side": self.take_profit_trigger_side,
             "same_bar_order": self.same_bar_order,
+            "protective_gap_fill": self.protective_gap_fill,
+            "signal_exit_fill": self.signal_exit_fill,
             "intrabar_resolution": self.intrabar_resolution,
             "lower_timeframe_replay": self.lower_timeframe_replay,
         }
