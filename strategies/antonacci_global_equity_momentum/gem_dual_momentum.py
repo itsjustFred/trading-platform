@@ -128,8 +128,13 @@ def slot_symbols(params: dict) -> dict[str, str]:
 
 
 def peer_close_columns(params: dict) -> dict[str, str]:
-    """Return ``{slot: peer column name}`` for every configured slot."""
-    return {slot: f"{PEER_CLOSE_PREFIX}{symbol}" for slot, symbol in slot_symbols(params).items()}
+    """Return ``{slot: peer column name}`` for every configured slot.
+
+    Column names are LOWER-CASE: the engines lower-case every data column on
+    load (``native_adapter._load_ohlcv``), so a mixed-case ``peer_close_SPY``
+    would arrive as ``peer_close_spy`` and never be found.
+    """
+    return {slot: f"{PEER_CLOSE_PREFIX}{symbol.lower()}" for slot, symbol in slot_symbols(params).items()}
 
 
 def _month_keys(timestamps: pd.Series) -> pd.PeriodIndex:
@@ -272,7 +277,7 @@ def attach_peer_closes(frames: dict[str, pd.DataFrame], params: dict) -> dict[st
                 continue
             peer_close = peer_frame["close"].astype(float)
             peer_timestamps = pd.to_datetime(peer_frame["timestamp"], utc=True)
-            attached[f"{PEER_CLOSE_PREFIX}{peer_symbol}"] = pd.Series(
+            attached[f"{PEER_CLOSE_PREFIX}{peer_symbol.lower()}"] = pd.Series(
                 peer_close.to_numpy(), index=peer_timestamps.to_numpy(), dtype=float
             ).reindex(own_timestamps.to_numpy()).to_numpy()
         out[symbol] = attached
