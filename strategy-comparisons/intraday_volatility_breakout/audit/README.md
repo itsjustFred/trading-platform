@@ -62,3 +62,88 @@ SL-Exits centgenau, Lots exakt, Time-Exits = 22:55-Open (+Spread bei SHORT).
 
 Framework: **native** (vectorbt ignoriert Stops ohne Intrabar-Resolution und kennt
 kein Fixed-Risk — für diesen EA ungeeignet; 7 s vs. ~110 s Laufzeit).
+
+## Volle Historie 2018–2026: ATR-Glättung, D1-Bars, Broker-Uhr
+
+Die drei Ursachen unten erklären fast alle Abweichungen über die volle Historie
+(492/597/512 MT5-Trades). Evidenzquelle ist jeweils das EA-Log: Pro Handelstag
+schreibt der EA um 16:30 Serverzeit `Levels calculated | Open: … | Stop: …`, also
+den M1-Open um 16:30 Server und `Stop = 0.25 · iATR(D1, 5)[shift 1]`.
+
+1. **iATR ist SMA(TR, 5), nicht Wilder.** Der EA nutzt den eingebauten
+   `iATR(_Symbol, PERIOD_D1, …)` (MetaQuotes-ATR: laufende Summe / Periode). Auf
+   Broker-D1-Bars nachgerechnet trifft SMA(TR,5) den geloggten ATR auf 1e-14
+   (EURUSD 2024–2026: 568 von 641 Tagen; NAS100 1.334, SP500 1.325 Tage gesamt),
+   Wilder an keinem einzigen Tag. Der alte Test `test_mt5_atr_uses_sma_seed_then_wilder_recurrence`
+   hat also falsche MT5-Semantik festgeschrieben; Wilder ist jetzt `_wilder_atr`
+   (`atr_smoothing="wilder"`), `_mt5_atr` ist die SMA.
+2. **D1-Bars = Handelstage auf der Serveruhr.** Die Platform nahm für EURUSD das
+   UTC-Tages-Parquet (Sonntagabend-Zeilen, falsche Tagesgrenzen) bzw. resamplte
+   M1-Bars, die an Wochenenden/Feiertagen/geschlossenen Stunden mit flachen
+   Volumen-0-Bars aufgefüllt sind (`m1_bid.parquet`: ~940k Filler-Bars je Symbol).
+   Diese erzeugten Sa/So-Zeilen im 5-Tage-Fenster. MT5 hat nur Bars mit Ticks.
+   Jetzt: D1 aus M1 auf der Broker-Uhr, Filler-Bars ignoriert
+   (`daily_skip_filler_bars`), Sa/So-Zeilen verworfen, außer die Broker-Historie
+   führt sie (`daily_weekend_bars="auto"`). Belegt: 2018–2023 hat MT5 *keine*
+   Sonntag-23:00-Bars (US-only-DST-Wochen), 2024-03-10/17/24/31 und 2024-11-09
+   *schon* (ATR jeweils nur mit dieser Wahl exakt).
+3. **Serveruhr ist keine zivile Zeitzone.** Aus dem geloggten 16:30-Open gegen
+   UTC-M1 (nur Tage, an denen genau ein Offset passt: 3.999 Tage) und den
+   MT5-M1-CSV-Exports (EURUSD 2026-02-20..04-02 über US- *und* EU-Umstellung):
+   - Legacy-Historie bis 2023-12: Forex = `Europe/Athens` (EU-Daten), Indizes =
+     **fix UTC+2** ohne DST (0 Widersprüche bei je ~1.100 entschiedenen Tagen);
+   - 2023-12 bis 2024-04-05: fix UTC+2 für alle (Woche 2024-04-01 noch +2);
+   - ab 2024-04-06: New-York-Close (`America/New_York` + 7 h, UTC+2/+3 an
+     **US**-Daten), aber Herbst 2024 eine Woche zu spät (2024-11-04..08 noch +3).
+   Kein IANA-Zonenname passt; modelliert als explizite Segmente in
+   `shared/broker_clock.py` (`dukascopy_mt5_forex`, `dukascopy_mt5_index`,
+   generisch `ny_close`), Tests um jede Umstellung 2018–2026. Modell vs.
+   Log: 3.993/3.999 Tage; die 6 Ausreißer sind isolierte EURUSD-Tage mitten in der
+   Saison (zufällig gleicher Preis eine Stunde früher).
+
+### Parität vorher/nachher (Paarung: Server-Handelstag + Richtung)
+
+`score_parity.py` (dieses Verzeichnis) gegen `parse_mt5_reference.py`-Output;
+PnL = Preis·Lots·Kontrakt (USD, wie die Log-Runs), ohne Währungsumrechnung.
+
+| Symbol | MT5 | vorher matched / mt5_only / pf_only | nachher matched / mt5_only / pf_only | gleiche Entry-Minute nachher | PnL MT5 | PnL vorher | PnL nachher |
+|---|---|---|---|---|---|---|---|
+| EURUSD H1 | 492 | 265 / 227 / 233 | **484 / 8 / 7** | 479 | 22.080,69 | 29.537,38 | 21.391,36 |
+| NAS100 M15 | 597 | 244 / 353 / 345 | **525 / 72 / 47** | 508 | 51.682,60 | 42.599,10 | 43.319,01 |
+| SP500 M1 | 512 | 222 / 290 / 355 | **484 / 28 / 20** | 461 | 47.379,01 | 71.758,82 | 32.633,26 |
+
+Ablation (EURUSD/NAS100/SP500 matched): nur SMA 220/204/197, nur Wochenend-Drop
+420/408/344, nur Broker-Uhr 253/291/280, Wochenend-Drop+SMA 448/431/381,
+Uhr+Drop+SMA 482/515/474, + Filler-Skip + Auto-Wochenende (final) 484/525/484.
+Die Einzelfaktoren helfen allein kaum (SMA allein verschlechtert sogar, weil das
+Fenster mit Wochenend-Zeilen verseucht ist) – erst zusammen wird der ATR exakt.
+
+### Verbleibende Abweichungen
+
+- **Datenquelle vor 2024 / vor 2020 (Indizes):** Platform-M1 (Dukascopy) weicht
+  von der Broker-Historie ab, ATR median 0,1–0,2 % (EURUSD 2018–2023), NAS100
+  2018–2019 median 2,5–9,5 %, SP500 2020–2023 1–4 %. Knappe Level-Kreuzungen
+  kippen (z. B. EURUSD 2019-03-11 SHORT nur MT5, 2018-04-19 SHORT nur Platform).
+  2018–2019 stellen 90 der 119 NAS100- und 34 der 48 SP500-Waisen.
+- **Broker-Historienlücke:** USATECH hat 2023-08-28..2023-11-09 keine EA-Aktivität
+  im Log (keine `Levels calculated`) → 11 Platform-only-Trades.
+- **Platform-Datenlücke:** USTEC M1 fehlt 2026-04-06..08 → mt5_only.
+- **Warm-up:** Platform-Daten beginnen 2018-01-01, MT5 hat D1 ab 2017
+  (EURUSD 2018-01-04 LONG fehlt).
+- **Jahreswechsel-D1:** 2019-01-02, 2020-12-30/31 (EURUSD) ATR 14–24 % daneben –
+  Feiertags-D1-Bars der Broker-Historie anders.
+- Einzelne Tage mit exaktem ATR (EURUSD 2026-02-17/05-27, SP500 2024-05-30,
+  2026-03-05/06-02): M15-Close-/Level-Gleichstand bzw. Tick-vs-M1-Unterschiede.
+- **PnL-Delta** trotz hoher Match-Quote kommt aus den Waisen und dem Exit-Pfad:
+  SP500 −14,7k = Waisen −11,2k (davon 2018–2019 −9,6k) + gematchte −3,5k (davon
+  −3,2k aus 10 Trades mit anderem Exit-Typ SL↔Time, Real-Ticks vs. M1);
+  NAS100 −8,4k = Waisen −5,6k + gematchte −2,8k; EURUSD −0,7k.
+
+### Gleicher Bug außerhalb dieser Strategie (nicht geändert)
+
+`validation/statistics/cross_platform.py` (`MT5_REPORT_SOURCE_TIMEZONE`),
+`scripts/analyze_mt5_parity.py` und `docs/reference-artifact-contract.md`
+lesen die MT5-XLSX-Zeiten als `Europe/Athens`. Für diese Broker-Historie ist
+das 2018–2023 für Indizes im Sommer und ab 2024-04 in den US-only-DST-Wochen
+falsch (1 h). Betrifft Zeitstempel/Tagesgrenzen der Vergleichsmatrix, nicht die
+Trade-Anzahl; Follow-up.

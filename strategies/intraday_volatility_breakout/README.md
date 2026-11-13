@@ -62,7 +62,7 @@ Nicht vorhanden.
 ## Indikator-Einstellungen
 | Indikator | Parameter | Wert | Quelle (MQL5) |
 |-----------|-----------|------|---------------|
-| ATR (Haupt) | Periode | 5 | `iATR(_Symbol, PERIOD_D1, ATR_Period)` |
+| ATR (Haupt) | Periode / Glättung | 5 / SMA (MT5-iATR) | `iATR(_Symbol, PERIOD_D1, ATR_Period)` |
 | ATR (Regime Short) | Periode | 1 | `iATR(_Symbol, PERIOD_D1, ATR_Short_Period)` |
 | ATR (Regime Long) | Periode | 5 | `iATR(_Symbol, PERIOD_D1, ATR_Long_Period)` |
 | Confirmation Close | Timeframe | M15 | `iClose(_Symbol, Confirmation_Timeframe, 1)` |
@@ -112,7 +112,9 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 
 | MQL5-Konstrukt | Python-Äquivalent | Hinweis |
 |----------------|-------------------|---------|
-| `iATR(_Symbol, PERIOD_D1, period)` | `pandas_ta.atr(df["high"], df["low"], df["close"], length=period)` auf Daily-Resampling, dann auf Haupt-Timeframe forward-fillen. | ATR vom Vortages-Bar (Shift=1) verwenden. |
+| `iATR(_Symbol, PERIOD_D1, period)` | `_mt5_atr`: **SMA(TR, period)** über die D1-Bars der Broker-Serverzeit, Shift 1, dann auf den Haupt-Timeframe forward-fillen. | MT5s eingebauter ATR ist ein einfacher gleitender Mittelwert der True Range (laufende Summe/period), **nicht** Wilder (MT4/pandas_ta/TradingView). Belegt am geloggten EA-ATR (`Stop`/0.25): EURUSD 2024–2026 auf 1e-14 identisch, Wilder trifft keinen Tag. `atr_smoothing="wilder"` bleibt wählbar. |
+| `PERIOD_D1`-Bars | Resampling der M1-Bars auf Kalendertage der **Broker-Serveruhr** (`broker_clock`); Filler-Bars (flach, Volumen 0) zählen nicht; Sa/So-Zeilen nur, wenn die Broker-Historie sie führt (`daily_weekend_bars="auto"`). | MT5 hat nur Bars mit Ticks. Native UTC-Tages-Parquets haben andere Tagesgrenzen (Sonntagabend-Zeilen) und werden mit `broker_clock` abgelehnt. |
+| `TimeCurrent()` / `"16:30"` | `broker_clock` (z. B. `dukascopy_mt5_forex`, `dukascopy_mt5_index`, `ny_close`), siehe `shared/broker_clock.py`. | Serverzeit ist keine zivile Zeitzone: Dukascopy-demo-Historie = Athen (Forex) bzw. fix UTC+2 (Indizes) bis 2023-12, fix UTC+2 bis 2024-04-05, danach New-York-Close (UTC+2/+3 an **US**-Umstelltagen), Herbst 2024 eine Woche verspätet. `session_timezone` bleibt für zivile Zonen. |
 | `iOpen(_Symbol, PERIOD_M1, shift)` | Nächste M1-Bar zur `Entry_Time` pro Tag (Ties → frühere Bar) | MT5-`iBarShift(..., exact=false)`-Parität: fehlt die Entry-Bar (Datenlücke), wird die zeitlich nächste Bar genommen — verifiziert am 2026-04-28 USATECH (16:30/16:31 fehlten, MT5 nutzte 16:29). |
 | `iClose(_Symbol, Confirmation_Timeframe, 1)` | `df["close"].shift(1)` auf dem Resampled Confirmation-DataFrame; oder direkt `df["close"]` wenn Haupt-TF = Confirmation-TF. | In vektorbasiertem Backtest: Signal triggert am Close der vorherigen Bar. |
 | `Use_Candle_Close` | Bestätigungs-Logik als separate boolesche Serie: `signal_price = confirmation_df["close"].shift(1)` | Nur ein Signal pro neuer Confirmation-Bar erlauben. |
@@ -125,6 +127,16 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 | `Magic_Number` | Strategie-Name in `STRATEGY_META["name"]"` | Dient nur zur Zuordnung/Filterung. |
 | `ParseTime("HH:MM")` | Python `datetime.strptime` oder direkt als `params["entry_hour"], params["entry_min"]` | Parameter als ints übergeben. |
 | `IsNewDay()` / `ResetDailyState()` | In vektorbasiertem Backtest: Gruppierung nach `df.index.date`; nur erstes Signal pro Tag erlauben; Levels pro Tag einmalig berechnen. | `groupby(date)`-Pattern. |
+
+## Parameter für MT5-Parität (Platform-seitig)
+| Parameter | Default | Bedeutung |
+|-----------|---------|-----------|
+| `atr_smoothing` | `"sma"` | `"sma"` = MT5-iATR (SMA der TR); `"wilder"` = Wilder-Glättung (nicht MT5). |
+| `broker_clock` | `""` | Benannte Broker-Serveruhr aus `shared/broker_clock.py`; schließt `session_timezone`/`session_timezone_offset_hours` und `daily_ohlcv` aus. |
+| `daily_weekend_bars` | `"auto"` | `"auto"`: Sa/So-D1-Zeilen verwerfen, außer die Broker-Uhr meldet sie für den Zeitraum; `"drop"`/`"keep"` erzwingen. |
+| `daily_skip_filler_bars` | `true` | Flache Bars mit Volumen ≤ 0 (Feed-Padding an Wochenenden/Feiertagen/geschlossenen Stunden) bilden keine D1-Bars. |
+
+Evidenz und Parität pro Symbol: `strategy-comparisons/intraday_volatility_breakout/audit/README.md`.
 
 ## Bekannte Abweichungen
 - `ORDER_FILLING_FOK` wird nicht explizit simuliert; vectorbt nutzt Market-Order am Open der nächsten Bar.
