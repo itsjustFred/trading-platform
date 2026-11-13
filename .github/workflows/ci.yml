@@ -92,3 +92,22 @@ jobs:
         run: npm run test:focused
       - name: Frontend TypeScript and production build
         run: npm run build
+
+  # Parses every workflow the way GitHub does (expressions, contexts, job
+  # graph, shell). A workflow that is valid YAML but fails GitHub's parse
+  # produces a run that dies before any job, so a dispatched agent stage would
+  # leave its commit status pending with no reporter. SC2016 is ignored: it
+  # flags literal "$" inside single quotes ('$schema', jq filters), which the
+  # agent workflows use on purpose.
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install actionlint
+        run: bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+      - name: Lint workflows
+        run: ./actionlint -color -ignore 'SC2016'
