@@ -13,6 +13,10 @@ Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result
 
 `scripts/gate-tests.sh` runs the checks whose silent failure would make a green result a lie (the import-origin guard, the output-path guard, the runner's own tests, F-lint on the scripts that mutate data). It fails a gate that has no command and exits 2 when the roster does not match what ran. `PYTHON=... scripts/gate-tests.sh` picks the interpreter; `--list` prints the roster. It is a fast subset, not a replacement for the test suite; CI runs both.
 
+## Lint and type checking
+
+Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Run `ruff check <changed files>` and `mypy` (no arguments; scope comes from `files`) before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog) and mypy (blocking). mypy is pinned in `.github/workflows/ci.yml`, not in the dev extra.
+
 ## Issues
 
 When creating an issue, give the appropriate labels. If things are unclear, give the `needs-decision` label. This signals that a maintainer needs to look at the issue and decide on unclear points, like open questions.
