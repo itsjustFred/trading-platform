@@ -10,7 +10,7 @@ UTC entry times onto the broker's server clock with ``shared.broker_clock``.
       [--clock eurusd=dukascopy_mt5_forex ...] [--out <dir for per-trade CSVs>]
 
 Per symbol it prints: trades on each side, matched / mt5_only / pf_only, how many
-matched trades also share the exact entry minute, and PnL in *price units x lots x
+matched trades also share the exact entry minute / exit minute / exit price, and PnL in *price units x lots x
 contract* on both sides (the MT5 log runs are USD-denominated; using the same
 formula for the platform keeps currency conversion out of the trade comparison).
 """
@@ -31,6 +31,8 @@ if str(REPO) not in sys.path:
 from shared.broker_clock import resolve_broker_clock  # noqa: E402
 
 CONTRACT = {"eurusd": 100_000.0, "nas100": 1.0, "sp500": 1.0}
+# Exit prices count as equal within this many price units (MT5 logs 3-5 decimals).
+EXIT_PRICE_TOLERANCE = 1e-6
 DEFAULT_ARTIFACT = {
     "eurusd": "data/backtests/intraday_volatility_breakout_eurusd_h1.json",
     "nas100": "data/backtests/intraday_volatility_breakout_nas100_m15.json",
@@ -102,6 +104,10 @@ def score(key: str, mt5: pd.DataFrame, pf: pd.DataFrame) -> tuple[dict, pd.DataF
     same_minute = both["entry_server_mt5"].dt.floor("min") == both["entry_server_pf"].dt.floor(
         "min"
     )
+    same_exit_minute = both["exit_server_mt5"].dt.floor("min") == both["exit_server_pf"].dt.floor(
+        "min"
+    )
+    same_exit_price = (both["exit_mt5"] - both["exit_pf"]).abs() <= EXIT_PRICE_TOLERANCE
     summary = {
         "symbol": key,
         "mt5_trades": len(mt5),
@@ -110,6 +116,8 @@ def score(key: str, mt5: pd.DataFrame, pf: pd.DataFrame) -> tuple[dict, pd.DataF
         "mt5_only": int((merged["_merge"] == "left_only").sum()),
         "pf_only": int((merged["_merge"] == "right_only").sum()),
         "matched_same_entry_minute": int(same_minute.sum()),
+        "matched_same_exit_minute": int(same_exit_minute.sum()),
+        "matched_same_exit_price": int(same_exit_price.sum()),
         "mt5_pnl": round(float(mt5["pnl_px"].sum()), 2),
         "pf_pnl": round(float(pf["pnl_px"].sum()), 2),
         "matched_pnl_delta": round(float((both["pnl_px_pf"] - both["pnl_px_mt5"]).sum()), 2),
