@@ -8,13 +8,19 @@ import pandas as pd
 import pytest
 
 from runner.optimization_diagnostics import (
+    deflated_sharpe_ratio,
     embargo_split,
     multiple_testing_correction,
+    overfitting_verdict,
     plateau_analysis,
     realized_pnl_by_subperiod,
+    select_by_validation,
     subperiod_parameter_stability,
     subperiods_from_walk_forward,
+    three_way_split,
+    train_validation_degradation,
     walk_forward_splits,
+    walk_forward_train_validation_folds,
 )
 
 # ─── embargo_split ───────────────────────────────────────────────────────────
@@ -274,7 +280,11 @@ def test_diagnostics_payload_centres_the_plateau_on_the_minimum_for_p_value():
     payload = opt._build_diagnostics_payload(
         trials=trials,
         config=config,
-        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-03-01T00:00:00+00:00",
+            "end": "2024-04-01T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="p_value",
         timeframe="1h",
@@ -436,6 +446,10 @@ def test_diagnostics_payload_reports_embargo_in_bars():
         # than the embargo that ran. The reported windows are now the ones handed
         # in, so a gapless fixture honestly reports zero.
         train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-04-02T00:00:00+00:00",
+            "end": "2024-04-07T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-08T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="sharpe_ratio",
         timeframe="1h",
@@ -487,7 +501,11 @@ def test_diagnostics_payload_corrects_a_p_value_study_from_the_minimum_end():
     payload = opt._build_diagnostics_payload(
         trials=trials,
         config=config,
-        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-04-01T00:00:00+00:00"},
+        train_period={"start": "2024-01-01T00:00:00+00:00", "end": "2024-03-01T00:00:00+00:00"},
+        validation_period={
+            "start": "2024-03-01T00:00:00+00:00",
+            "end": "2024-04-01T00:00:00+00:00",
+        },
         test_period={"start": "2024-04-01T00:00:00+00:00", "end": "2024-07-01T00:00:00+00:00"},
         target_metric="p_value",
         timeframe="1h",
@@ -558,6 +576,10 @@ def _payload_for(trials, **config_kwargs):
         config=config,
         train_period={
             "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-03-01T00:00:00+00:00",
+        },
+        validation_period={
+            "start": "2024-03-02T00:00:00+00:00",
             "end": "2024-04-01T00:00:00+00:00",
         },
         test_period={
@@ -1094,3 +1116,578 @@ def test_an_unbounded_metric_still_uses_the_sigma_scaled_bar():
         "an unbounded maximize study cannot clear its own bar, so the "
         "z-construction was lost"
     )
+
+
+# ─── three_way_split (Issue #164) ─────────────────────────────────────────────
+
+
+def test_three_way_split_segments_ordered_non_overlapping():
+    """Segments are in time order: train, embargo, validation, embargo, test."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-02-01T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=1,
+        embargo_pct=0.0,
+    )
+    train_end = pd.Timestamp(split.train["end"])
+    emb1_start = pd.Timestamp(split.embargo_train_val["start"])
+    emb1_end = pd.Timestamp(split.embargo_train_val["end"])
+    val_start = pd.Timestamp(split.validation["start"])
+    val_end = pd.Timestamp(split.validation["end"])
+    emb2_start = pd.Timestamp(split.embargo_val_test["start"])
+    emb2_end = pd.Timestamp(split.embargo_val_test["end"])
+    test_start = pd.Timestamp(split.test["start"])
+    test_end = pd.Timestamp(split.test["end"])
+
+    assert train_end == emb1_start
+    assert emb1_end == val_start
+    assert val_end == emb2_start
+    assert emb2_end == test_start
+    assert test_end == pd.Timestamp("2024-02-01T00:00:00+00:00")
+
+
+def test_three_way_split_test_ends_at_end():
+    """Test segment ends exactly at the provided end."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-02-01T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+    )
+    assert split.test["end"] == "2024-02-01T00:00:00+00:00"
+
+
+def test_three_way_split_embargo_gap_size():
+    """Embargo gaps have exactly the requested size (days + pct of whole range)."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",  # 10 days
+        train_fraction=0.5,
+        validation_fraction=0.25,
+        test_fraction=0.25,
+        embargo_days=1,
+        embargo_pct=0.1,  # 1 day
+    )
+    # Each embargo gap should be 1 day (fixed) + 1 day (10% of 10 days) = 2 days
+    emb1_start = pd.Timestamp(split.embargo_train_val["start"])
+    emb1_end = pd.Timestamp(split.embargo_train_val["end"])
+    emb2_start = pd.Timestamp(split.embargo_val_test["start"])
+    emb2_end = pd.Timestamp(split.embargo_val_test["end"])
+
+    gap1 = emb1_end - emb1_start
+    gap2 = emb2_end - emb2_start
+    # 2 days +/- a bit for floating point
+    assert pd.Timedelta(days=1, hours=23) <= gap1 <= pd.Timedelta(days=2, hours=1)
+    assert pd.Timedelta(days=1, hours=23) <= gap2 <= pd.Timedelta(days=2, hours=1)
+
+
+def test_three_way_split_no_embargo():
+    """Without embargo, segments are contiguous."""
+    split = three_way_split(
+        "2024-01-01T00:00:00+00:00",
+        "2024-01-11T00:00:00+00:00",
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=0,
+        embargo_pct=0.0,
+    )
+    assert pd.Timestamp(split.train["end"]) == pd.Timestamp(split.embargo_train_val["start"])
+    assert pd.Timestamp(split.embargo_train_val["end"]) == pd.Timestamp(split.validation["start"])
+    assert pd.Timestamp(split.validation["end"]) == pd.Timestamp(split.embargo_val_test["start"])
+    assert pd.Timestamp(split.embargo_val_test["end"]) == pd.Timestamp(split.test["start"])
+
+
+def test_three_way_split_rejects_empty_segments():
+    """ValueError when any segment would be empty."""
+    # Too much embargo
+    with pytest.raises(ValueError, match="empty"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_days=5,
+            embargo_pct=0.5,
+        )
+    # Fractions don't sum to 1
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.5,
+            validation_fraction=0.3,
+            test_fraction=0.3,
+        )
+    # Non-positive fractions
+    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.0,
+            validation_fraction=0.5,
+            test_fraction=0.5,
+        )
+    with pytest.raises(ValueError, match="strictly between 0 and 1"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.0,
+            test_fraction=0.4,
+        )
+    # Negative embargo
+    with pytest.raises(ValueError, match="must not be negative"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_days=-1,
+        )
+    with pytest.raises(ValueError, match="must not be negative"):
+        three_way_split(
+            "2024-01-01T00:00:00+00:00",
+            "2024-01-11T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+            embargo_pct=-0.1,
+        )
+    # Invalid period (end <= start)
+    with pytest.raises(ValueError, match="Invalid period"):
+        three_way_split(
+            "2024-01-11T00:00:00+00:00",
+            "2024-01-01T00:00:00+00:00",
+            train_fraction=0.6,
+            validation_fraction=0.2,
+            test_fraction=0.2,
+        )
+
+
+def test_walk_forward_train_validation_folds_no_fold_reaches_test():
+    """No fold reaches into the embargo before test or into test itself."""
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.05,
+        test_fraction=0.2,
+    )
+    # Test holdout starts at 80% of the range
+    test_start = pd.Timestamp("2024-01-01T00:00:00+00:00") + pd.Timedelta(days=91) * 0.8
+    # Embargo before test
+    total = pd.Timestamp("2024-04-01T00:00:00+00:00") - pd.Timestamp("2024-01-01T00:00:00+00:00")
+    embargo_gap = total * 0.05
+    wf_end = test_start - embargo_gap
+
+    for fold in folds:
+        fold_test_end = pd.Timestamp(fold["test"]["end"])
+        assert fold_test_end <= wf_end, "fold test window must not reach into test holdout"
+
+
+def test_walk_forward_train_validation_folds_reuses_walk_forward_splits():
+    """Folds have the same structure as walk_forward_splits output."""
+    folds = walk_forward_train_validation_folds(
+        "2024-01-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.05,
+        test_fraction=0.2,
+    )
+    assert len(folds) == 3
+    for fold in folds:
+        assert "fold" in fold
+        assert "train" in fold
+        assert "test" in fold
+        assert "embargo" in fold
+        assert "embargo_bars_equivalent" in fold
+
+
+def test_walk_forward_train_validation_folds_error_cases():
+    """Error cases for walk_forward_train_validation_folds."""
+    with pytest.raises(ValueError, match="test_fraction must be strictly between 0 and 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", test_fraction=0.0
+        )
+    with pytest.raises(ValueError, match="test_fraction must be strictly between 0 and 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", test_fraction=1.0
+        )
+    with pytest.raises(ValueError, match="n_splits must be at least 1"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-04-01", n_splits=0
+        )
+    with pytest.raises(ValueError, match="no room for walk-forward folds"):
+        walk_forward_train_validation_folds(
+            "2024-01-01", "2024-01-11", test_fraction=0.9, embargo_pct=0.5
+        )
+
+
+# ─── select_by_validation (Issue #164) ────────────────────────────────────────
+
+
+def test_select_by_validation_ranks_by_score_descending():
+    """Trials ranked by validation score descending."""
+    trials = [
+        {"number": 1, "validation_score": 0.5},
+        {"number": 2, "validation_score": 1.0},
+        {"number": 3, "validation_score": 0.8},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert [t["validation_score"] for t in result["ranked"]] == [1.0, 0.8, 0.5]
+    assert result["winner"]["validation_score"] == 1.0
+
+
+def test_select_by_validation_tie_break_by_trial_number():
+    """Equal scores ordered by lower trial number first."""
+    trials = [
+        {"number": 3, "validation_score": 1.0},
+        {"number": 1, "validation_score": 1.0},
+        {"number": 2, "validation_score": 1.0},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert [t["number"] for t in result["ranked"]] == [1, 2, 3]
+    assert result["winner"]["number"] == 1
+
+
+def test_select_by_validation_excludes_non_finite_scores():
+    """NaN, inf, None scores are excluded."""
+    trials = [
+        {"number": 1, "validation_score": 1.0},
+        {"number": 2, "validation_score": float("nan")},
+        {"number": 3, "validation_score": float("inf")},
+        {"number": 4, "validation_score": -float("inf")},
+        {"number": 5, "validation_score": None},
+        {"number": 6, "validation_score": "not-a-number"},
+    ]
+    result = select_by_validation(trials, top_fraction=1.0)
+    assert len(result["ranked"]) == 1
+    assert result["ranked"][0]["number"] == 1
+
+
+def test_select_by_validation_top_fraction():
+    """Top fraction determines size of top_set."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(10)]
+    result = select_by_validation(trials, top_fraction=0.3)
+    # 10 * 0.3 = 3, ceil = 3
+    assert len(result["top_set"]) == 3
+    assert result["top_set"][0]["number"] == 9
+    assert result["top_set"][2]["number"] == 7
+
+
+def test_select_by_validation_top_fraction_at_least_one():
+    """Top set has at least 1 trial even for small fractions."""
+    trials = [{"number": i, "validation_score": float(i)} for i in range(10)]
+    result = select_by_validation(trials, top_fraction=0.05)
+    # 10 * 0.05 = 0.5, ceil = 1
+    assert len(result["top_set"]) == 1
+
+
+def test_select_by_validation_all_missing_scores():
+    """All scores missing -> winner None, empty top_set."""
+    trials = [
+        {"number": 1, "validation_score": None},
+        {"number": 2, "validation_score": float("nan")},
+    ]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert result["ranked"] == []
+    assert result["winner"] is None
+    assert result["top_set"] == []
+
+
+def test_select_by_validation_n_equals_one():
+    """Single trial works correctly."""
+    trials = [{"number": 1, "validation_score": 0.5}]
+    result = select_by_validation(trials, top_fraction=0.5)
+    assert result["winner"]["number"] == 1
+    assert len(result["top_set"]) == 1
+    assert result["top_set"][0]["number"] == 1
+
+
+def test_select_by_validation_custom_keys():
+    """Custom score and trial number keys work."""
+    trials = [
+        {"trial_id": 10, "val_metric": 0.5},
+        {"trial_id": 20, "val_metric": 1.0},
+    ]
+    result = select_by_validation(
+        trials, top_fraction=0.5, score_key="val_metric", trial_number_key="trial_id"
+    )
+    assert result["winner"]["trial_id"] == 20
+
+
+def test_select_by_validation_rejects_invalid_top_fraction():
+    """top_fraction must be in (0, 1]."""
+    trials = [{"number": 1, "validation_score": 1.0}]
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=0.0)
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=1.5)
+    with pytest.raises(ValueError, match="top_fraction must be in"):
+        select_by_validation(trials, top_fraction=-0.1)
+
+
+# ─── Overfitting measures (Issue #164) ────────────────────────────────────────
+
+
+def test_train_validation_degradation_basic():
+    """Basic degradation calculation."""
+    # 50% drop
+    assert train_validation_degradation(1.0, 0.5) == pytest.approx(0.5)
+    # No drop
+    assert train_validation_degradation(1.0, 1.0) == pytest.approx(0.0)
+    # Improvement (negative degradation)
+    assert train_validation_degradation(1.0, 1.5) == pytest.approx(-0.5)
+    # Train negative, validation more negative -> degradation is positive
+    # (train - validation) / |train| = (-1 - (-2)) / 1 = 1.0
+    assert train_validation_degradation(-1.0, -2.0) == pytest.approx(1.0)
+    # Train negative, validation less negative -> improvement (negative degradation)
+    assert train_validation_degradation(-2.0, -1.0) == pytest.approx(-0.5)
+
+
+def test_train_validation_degradation_edge_cases():
+    """Edge cases return None."""
+    # Train is zero
+    assert train_validation_degradation(0.0, 0.5) is None
+    assert train_validation_degradation(0.0, -0.5) is None
+    assert train_validation_degradation(0.0, 0.0) is None
+    # Non-finite inputs
+    assert train_validation_degradation(float("nan"), 0.5) is None
+    assert train_validation_degradation(1.0, float("inf")) is None
+    assert train_validation_degradation(float("-inf"), 0.5) is None
+
+
+def test_deflated_sharpe_ratio_basic():
+    """Test DSR formula against hand-computed values."""
+    # Simple case: SR=1.0, T=100, skew=0, kurt=3 (normal), N=10, V=0.04
+    # SR0 = sqrt(0.04) * ((1-g)*Phi^-1(0.9) + g*Phi^-1(0.963))
+    #   = 0.2 * (0.4228 * 1.2816 + 0.5772 * 1.785)
+    #   = 0.2 * (0.542 + 1.030) = 0.314
+    # denom = sqrt(1 - 0 + (3-1)/4 * 1) = sqrt(1.5) = 1.225
+    # z = (1.0 - 0.314) * sqrt(99) / 1.225 = 0.686 * 9.95 / 1.225 = 5.57
+    # DSR = Phi(5.57) ≈ 1.0
+    dsr = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr is not None
+    assert dsr > 0.99
+
+
+def test_deflated_sharpe_ratio_n_equals_one():
+    """N=1 means no selection bias, SR0=0."""
+    # With N=1, SR0=0, so DSR depends only on SR, T, skew, kurt
+    dsr = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=1, var_sr=0.04)
+    assert dsr is not None
+    # Should be higher than N=10 case
+    dsr_n10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr > dsr_n10
+
+
+def test_deflated_sharpe_ratio_monotonicity_n():
+    """More trials -> lower DSR (more selection bias)."""
+    dsr_10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_100 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=100, var_sr=0.04)
+    dsr_1000 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=1000, var_sr=0.04)
+    assert dsr_10 > dsr_100 > dsr_1000
+
+
+def test_deflated_sharpe_ratio_monotonicity_sr():
+    """Higher SR -> higher DSR."""
+    dsr_05 = deflated_sharpe_ratio(sr=0.5, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_10 = deflated_sharpe_ratio(sr=1.0, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    dsr_15 = deflated_sharpe_ratio(sr=1.5, t=100, skew=0.0, kurt=3.0, n=10, var_sr=0.04)
+    assert dsr_05 < dsr_10 < dsr_15
+
+
+def test_deflated_sharpe_ratio_edge_cases():
+    """Edge cases return None."""
+    # T < 2
+    assert deflated_sharpe_ratio(1.0, 1, 0.0, 3.0, 10, 0.04) is None
+    # N < 1
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, 0, 0.04) is None
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, -1, 0.04) is None
+    # Non-finite inputs
+    assert deflated_sharpe_ratio(float("nan"), 100, 0.0, 3.0, 10, 0.04) is None
+    assert deflated_sharpe_ratio(1.0, 100, float("inf"), 3.0, 10, 0.04) is None
+    # Negative variance
+    assert deflated_sharpe_ratio(1.0, 100, 0.0, 3.0, 10, -0.01) is None
+    # Non-positive denominator (e.g., very high skew)
+    # denom_sq = 1 - skew*sr + (kurt-1)/4 * sr^2
+    # With high skew, this can go negative
+    assert deflated_sharpe_ratio(10.0, 100, 100.0, 3.0, 10, 0.04) is None
+
+
+def test_overfitting_verdict_all_pass():
+    """All checks computable and passed -> passed=True."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is True
+    assert verdict["checks"]["degradation"]["passed"] is True
+    assert verdict["checks"]["deflated_sharpe"]["passed"] is True
+    assert verdict["reasons"] == []
+
+
+def test_overfitting_verdict_degradation_fail():
+    """Degradation exceeds threshold -> passed=False."""
+    verdict = overfitting_verdict(
+        degradation=0.7,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["degradation"]["passed"] is False
+    assert any("degradation" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_deflated_sharpe_fail():
+    """Deflated Sharpe below threshold -> passed=False."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=0.90,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["deflated_sharpe"]["passed"] is False
+    assert any("deflated Sharpe" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_degradation_uncomputable():
+    """Uncomputable degradation -> passed=False, reason listed."""
+    verdict = overfitting_verdict(
+        degradation=None,
+        deflated_sharpe=0.97,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["degradation"]["computable"] is False
+    assert any("could not be computed" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_deflated_sharpe_uncomputable():
+    """Uncomputable deflated Sharpe -> passed=False, reason listed."""
+    verdict = overfitting_verdict(
+        degradation=0.3,
+        deflated_sharpe=None,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert verdict["checks"]["deflated_sharpe"]["computable"] is False
+    assert any("could not be computed" in r for r in verdict["reasons"])
+
+
+def test_overfitting_verdict_both_uncomputable():
+    """Both uncomputable -> passed=False, both reasons listed."""
+    verdict = overfitting_verdict(
+        degradation=None,
+        deflated_sharpe=None,
+        max_degradation=0.5,
+        min_deflated_sharpe=0.95,
+    )
+    assert verdict["passed"] is False
+    assert len(verdict["reasons"]) == 2
+
+
+def test_deflated_sharpe_ratio_matches_the_formula_written_out():
+    """Exact value, with the published formula spelled out independently."""
+    from statistics import NormalDist
+
+    sr, t, skew, kurt, n, var_sr = 0.12, 250, -0.4, 4.5, 50, 0.0025
+    normal = NormalDist()
+    gamma = 0.5772156649015329
+    sr0 = (var_sr**0.5) * (
+        (1 - gamma) * normal.inv_cdf(1 - 1 / n) + gamma * normal.inv_cdf(1 - 1 / (n * math.e))
+    )
+    z = (sr - sr0) * (t - 1) ** 0.5 / (1 - skew * sr + (kurt - 1) / 4 * sr**2) ** 0.5
+    expected = normal.cdf(z)
+
+    assert 0.1 < sr0 < 0.12, "fixture: the hurdle must sit just below the observed Sharpe"
+    result = deflated_sharpe_ratio(sr=sr, t=t, skew=skew, kurt=kurt, n=n, var_sr=var_sr)
+    assert result == pytest.approx(expected, abs=1e-9)
+    assert 0.5 < result < 0.95, "a value in the open interval, so a wrong hurdle shows"
+
+
+def test_deflated_sharpe_ratio_single_trial_is_the_plain_psr():
+    """Without selection the hurdle is zero, whatever the trial variance."""
+    from runner.stats import _psr_formula
+
+    result = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.3, kurt=3.6, n=1, var_sr=0.5)
+    assert result == pytest.approx(_psr_formula(0.08, 0.0, 120, 0.3, 3.6))
+
+
+def test_deflated_sharpe_ratio_zero_trial_variance_has_no_hurdle():
+    """Identical trials cannot produce a lucky maximum."""
+    many = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=500, var_sr=0.0)
+    one = deflated_sharpe_ratio(sr=0.08, t=120, skew=0.0, kurt=3.0, n=1, var_sr=0.0)
+    assert many == pytest.approx(one)
+
+
+def test_walk_forward_folds_stop_where_three_way_validation_ends():
+    """Fixed embargo days count for the gap before test, exactly as in the split."""
+    from runner.optimization_diagnostics import (
+        three_way_split,
+        walk_forward_train_validation_folds,
+    )
+
+    start, end = "2020-01-01", "2024-01-01"
+    split = three_way_split(
+        start,
+        end,
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=30,
+        embargo_pct=0.01,
+    )
+    folds = walk_forward_train_validation_folds(
+        start,
+        end,
+        n_splits=3,
+        train_fraction=0.7,
+        embargo_pct=0.01,
+        embargo_days=30,
+        test_fraction=0.2,
+    )
+    validation_end = pd.Timestamp(split.validation["end"])
+    fold_ends = [pd.Timestamp(fold["test"]["end"]) for fold in folds]
+    assert max(fold_ends) == validation_end
+    assert all(end_ts <= validation_end for end_ts in fold_ends)
+    assert validation_end < pd.Timestamp(split.test["start"]) - pd.Timedelta(days=30)
+
+
+def test_three_way_split_takes_the_embargo_out_of_train():
+    """Validation and test keep their configured share of the whole range."""
+    from runner.optimization_diagnostics import three_way_split
+
+    start, end = pd.Timestamp("2020-01-01", tz="UTC"), pd.Timestamp("2022-09-27", tz="UTC")
+    total = end - start  # 1000 days
+    split = three_way_split(
+        start,
+        end,
+        train_fraction=0.6,
+        validation_fraction=0.2,
+        test_fraction=0.2,
+        embargo_days=10,
+        embargo_pct=0.0,
+    )
+
+    def length(segment):
+        return pd.Timestamp(segment["end"]) - pd.Timestamp(segment["start"])
+
+    assert length(split.validation) == total * 0.2
+    assert length(split.test) == total * 0.2
+    assert length(split.train) == total * 0.6 - pd.Timedelta(days=20)

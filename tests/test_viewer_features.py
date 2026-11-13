@@ -3590,6 +3590,193 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
     assert detail_resp.json() == payload
 
 
+def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_path):
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": "opt_threeway_20260311_100000",
+        "file": "opt_threeway_20260311_100000.json",
+        "created_at": "2026-03-11T10:00:00+00:00",
+        "base_backtest_id": "base-demo",
+        "target_metric": "sharpe",
+        "n_trials": 25,
+        "train_split_pct": 0.6,
+        "validation_split_pct": 0.2,
+        "test_split_pct": 0.2,
+        "best_value": 1.2345,
+        "best_params": {"window": 10},
+        "effective_best_parameters": {"window": 10, "fixed": 3},
+        "symbols": ["SPY", "TLT", "GLD"],
+        "best_symbols": ["SPY", "TLT"],
+        "optimization_mode": "parameter",
+        "symbol_universes": [],
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-05-31T23:59:59+00:00",
+        },
+        "test_period": {
+            "start": "2024-06-01T00:00:00+00:00",
+            "end": "2024-08-31T23:59:59+00:00",
+        },
+        "validation_period": {
+            "start": "2024-06-01T00:00:00+00:00",
+            "end": "2024-08-31T23:59:59+00:00",
+        },
+        "final_test_period": {
+            "start": "2024-09-01T00:00:00+00:00",
+            "end": "2024-11-30T23:59:59+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 1.5},
+        "test_stats": {"sharpe_ratio": 1.2},
+        "validation_stats": {"sharpe_ratio": 1.2},
+        "final_test_stats": {"sharpe_ratio": 1.1},
+        "three_way": {
+            "segments": {
+                "train": {"start": "2024-01-01T00:00:00+00:00", "end": "2024-05-31T23:59:59+00:00"},
+                "validation": {"start": "2024-06-01T00:00:00+00:00", "end": "2024-08-31T23:59:59+00:00"},
+                "test": {"start": "2024-09-01T00:00:00+00:00", "end": "2024-11-30T23:59:59+00:00"},
+                "embargo_train_val": {"start": "2024-05-31T23:59:59+00:00", "end": "2024-06-01T00:00:00+00:00"},
+                "embargo_val_test": {"start": "2024-08-31T23:59:59+00:00", "end": "2024-09-01T00:00:00+00:00"},
+            },
+            "winner": {
+                "trial_number": 5,
+                "train_metrics": {"sharpe_ratio": 1.5},
+                "validation_metrics": {"sharpe_ratio": 1.2},
+                "test_metrics": {"sharpe_ratio": 1.1},
+            },
+            "selection": {
+                "winner_trial_number": 5,
+                "score_source": "validation",
+                "target_metric": "sharpe_ratio",
+                "study_direction": "maximize",
+                "top_fraction": 0.1,
+                "top_set_size": 3,
+                "n_selectable_trials": 20,
+                "n_unselectable_trials": 5,
+                "tie_break": "trial_number",
+                "ranked_top_set": [
+                    {"rank": 1, "trial_number": 5, "validation_score": 1.2, "validation_metric_value": 1.2, "params": {"window": 10}, "is_winner": True}
+                ],
+            },
+            "test_distribution": {
+                "count": 3,
+                "share_profitable": 0.67,
+                "median_target_metric": 1.05,
+                "target_metric": "sharpe_ratio",
+                "spearman_validation_to_test": 0.5,
+                "ranked_by_test": [],
+                "note": "test never changes winner",
+            },
+            "overfitting": {
+                "passed": True,
+                "checks": {
+                    "degradation": {"value": 0.2, "threshold": 0.5, "passed": True, "computable": True},
+                    "deflated_sharpe": {"value": 0.97, "threshold": 0.95, "passed": True, "computable": True},
+                },
+                "thresholds": {"max_train_validation_degradation": 0.5, "min_deflated_sharpe": 0.95},
+                "reasons": [],
+                "degradation": 0.2,
+                "deflated_sharpe": 0.97,
+                "metric": "sharpe_ratio",
+                "train_metric_value": 1.5,
+                "validation_metric_value": 1.2,
+                "n_selectable_trials": 20,
+                "var_sharpe_per_obs": 0.01,
+                "note": "",
+            },
+        },
+        "top_trials": [
+            {"number": 5, "value": 1.2, "params": {"window": 10}, "symbols": ["SPY", "TLT"]}
+        ],
+    }
+    (optimizations_dir / "opt_threeway_20260311_100000.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    list_resp = viewer_client.get("/api/optimizations")
+    assert list_resp.status_code == 200
+    listed = list_resp.json()
+    assert len(listed) == 1
+    summary = listed[0]
+    # Check new three-way keys are present in summary
+    assert summary["validation_split_pct"] == 0.2
+    assert summary["test_split_pct"] == 0.2
+    assert summary["validation_period"] == payload["validation_period"]
+    assert summary["validation_stats"] == payload["validation_stats"]
+    assert summary["final_test_period"] == payload["final_test_period"]
+    assert summary["final_test_stats"] == payload["final_test_stats"]
+    assert summary["three_way"] == payload["three_way"]
+    # Old keys still present
+    assert summary["train_split_pct"] == 0.6
+    assert summary["test_period"] == payload["test_period"]
+    assert summary["test_stats"] == payload["test_stats"]
+
+    detail_resp = viewer_client.get("/api/optimizations/opt_threeway_20260311_100000")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json() == payload
+
+
+def test_optimizations_list_and_detail_without_three_way_is_unchanged(viewer_client, tmp_path):
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": "opt_twoway_20260311_100000",
+        "file": "opt_twoway_20260311_100000.json",
+        "created_at": "2026-03-11T10:00:00+00:00",
+        "base_backtest_id": "base-demo",
+        "target_metric": "sharpe",
+        "n_trials": 25,
+        "train_split_pct": 0.7,
+        "best_value": 1.2345,
+        "best_params": {"window": 10},
+        "effective_best_parameters": {"window": 10, "fixed": 3},
+        "symbols": ["SPY", "TLT", "GLD"],
+        "best_symbols": ["SPY", "TLT"],
+        "optimization_mode": "risk_parity_universe",
+        "symbol_universes": [["SPY", "TLT"], ["SPY", "GLD"]],
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-07T23:59:59+00:00",
+        },
+        "test_period": {
+            "start": "2024-01-08T00:00:00+00:00",
+            "end": "2024-01-10T23:59:59+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 1.2345},
+        "test_stats": {"sharpe_ratio": 0.9876},
+        "top_trials": [
+            {"number": 0, "value": 1.2345, "params": {"window": 10}, "symbols": ["SPY", "TLT"]}
+        ],
+    }
+    (optimizations_dir / "opt_twoway_20260311_100000.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    list_resp = viewer_client.get("/api/optimizations")
+    assert list_resp.status_code == 200
+    listed = list_resp.json()
+    assert len(listed) == 1
+    summary = listed[0]
+    # Old keys present
+    assert summary["train_split_pct"] == 0.7
+    assert summary["test_period"] == payload["test_period"]
+    assert summary["test_stats"] == payload["test_stats"]
+    # New three-way keys NOT present
+    assert "validation_split_pct" not in summary
+    assert "test_split_pct" not in summary
+    assert "validation_period" not in summary
+    assert "validation_stats" not in summary
+    assert "final_test_period" not in summary
+    assert "final_test_stats" not in summary
+    assert "three_way" not in summary
+
+    detail_resp = viewer_client.get("/api/optimizations/opt_twoway_20260311_100000")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json() == payload
+
+
 def _equity_curve_from_returns(
     returns: list[float],
     *,

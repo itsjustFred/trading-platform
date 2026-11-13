@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from itertools import combinations
@@ -18,8 +19,17 @@ from data_tools.auto_download import ensure_backtest_data, has_sufficient_segmen
 from runner.cli import _detect_date_range
 from runner.engines.base import BacktestConfig
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from runner.optimization_diagnostics import (
+    ThreeWaySplit,
+    deflated_sharpe_ratio,
+    overfitting_verdict,
+    select_by_validation,
+    three_way_split,
+    train_validation_degradation,
+    walk_forward_train_validation_folds,
+)
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
-from runner.stats import compute_stats_for_result
+from runner.stats import compute_stats_for_result, daily_returns_moments
 from runner.universe_provenance import (
     UNIVERSE_PROVENANCE_KEY,
     observe_symbol_coverage,
@@ -246,7 +256,14 @@ class OptimizationConfig(BaseModel):
     base_backtest_id: str
     target_metric: str
     n_trials: int = Field(default=100, gt=0)
-    train_split_pct: float = Field(default=0.7, ge=0.1, le=0.95)
+    # Three-way split: train / validation / test. Defaults give 60/20/20.
+    # If validation_split_pct and test_split_pct are not provided, the remainder
+    # 1 - train_split_pct is split equally between validation and test.
+    # The bounds on train_split_pct are unchanged; the three fractions together
+    # are validated in _validate_three_way_split.
+    train_split_pct: float = Field(default=0.6, ge=0.1, le=0.95)
+    validation_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    test_split_pct: float | None = Field(default=None, ge=0.0, le=1.0)
     parameter_ranges: dict[str, dict[str, Any]] = Field(default_factory=dict)
     optimization_mode: str = "parameter"
     symbol_universes: list[list[str]] = Field(default_factory=list)
@@ -262,6 +279,17 @@ class OptimizationConfig(BaseModel):
     embargo_pct: float = Field(default=0.0, ge=0.0, le=0.4)
     # Number of sequential walk-forward folds reported as a robustness check.
     walk_forward_splits: int = Field(default=3, ge=1, le=20)
+    # Share of trials, ranked by validation score, that get evaluated on test.
+    # Default 0.10 means the top 10% of trials by validation metric.
+    test_top_fraction: float = Field(default=0.10, gt=0.0, le=1.0)
+    # Overfitting thresholds. A failed check flags the result; it does not
+    # block the run (blocking happens at the promotion gate, #165).
+    # max_train_validation_degradation: validation metric may be at most this
+    # fraction worse than train (relative drop). Default 0.5 = 50% degradation.
+    max_train_validation_degradation: float = Field(default=0.5, ge=0.0)
+    # min_deflated_sharpe: probability that the selected trial's Sharpe is not
+    # due to selection bias (Bailey & Lopez de Prado 2014). Default 0.95.
+    min_deflated_sharpe: float = Field(default=0.95, gt=0.0, le=1.0)
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -352,6 +380,49 @@ class OptimizationConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_three_way_split(self) -> "OptimizationConfig":
+        """Validate train/validation/test split fractions.
+
+        If validation_split_pct and test_split_pct are not provided, the remainder
+        1 - train_split_pct is split equally between validation and test.
+        All three fractions must be > 0 and sum to 1 (tolerance 1e-9).
+        """
+        train = self.train_split_pct
+        validation = self.validation_split_pct
+        test = self.test_split_pct
+
+        if validation is None and test is None:
+            # Old config: split remainder equally between validation and test
+            remainder = 1.0 - train
+            if remainder <= 0:
+                raise ValueError(
+                    "train_split_pct must be < 1.0 to leave room for validation and test"
+                )
+            validation = remainder / 2.0
+            test = remainder / 2.0
+            # Store the derived values back for downstream use
+            object.__setattr__(self, "validation_split_pct", validation)
+            object.__setattr__(self, "test_split_pct", test)
+        elif validation is None or test is None:
+            raise ValueError(
+                "Both validation_split_pct and test_split_pct must be provided together, "
+                "or neither (to use the equal-split default)"
+            )
+
+        if not (validation > 0 and test > 0 and train > 0):
+            raise ValueError(
+                "train_split_pct, validation_split_pct, and test_split_pct must all be > 0"
+            )
+
+        total = train + validation + test
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(
+                f"train_split_pct + validation_split_pct + test_split_pct must sum to 1.0, "
+                f"got {total:.10f}"
+            )
+        return self
+
 
 def _coverage_session_from_result(result: BacktestResult) -> Mapping[str, object] | None:
     data = result.meta.data if isinstance(result.meta.data, dict) else {}
@@ -392,13 +463,18 @@ def run_optimization(
         backtest_start = backtest_start or detected_start
         backtest_end = backtest_end or detected_end
 
-    train_period, test_period = _split_backtest_period(
+    split = _split_backtest_period(
         backtest_start,
         backtest_end,
-        config.train_split_pct,
+        train_split_pct=config.train_split_pct,
+        validation_split_pct=config.validation_split_pct,
+        test_split_pct=config.test_split_pct,
         embargo_days=config.embargo_days,
         embargo_pct=float(config.embargo_pct or 0.0),
     )
+    train_period = split.train
+    validation_period = split.validation
+    test_period = split.test
     strategy_identifier, strategy_path, strategy_slug = _resolve_strategy_reference(base_result)
 
     base_parameters = dict(base_result.meta.parameters or {})
@@ -421,6 +497,10 @@ def run_optimization(
     )
 
     if config.optimization_mode == "risk_parity_covariance":
+        # This mode has no Optuna trial search: covariance is fitted on train
+        # and the selected universe is reported on the test holdout. The
+        # validation segment exists in `split` but plays no role here because
+        # there is no trial selection to make.
         return _run_risk_parity_covariance_optimization(
             config=config,
             base_result=base_result,
@@ -453,7 +533,11 @@ def run_optimization(
         end=backtest_end,
         data_dir=data_dir,
     )
-    for segment_name, period in (("train", train_period), ("test", test_period)):
+    for segment_name, period in (
+        ("train", train_period),
+        ("validation", validation_period),
+        ("test", test_period),
+    ):
         for symbol in required_symbols:
             coverage_kwargs: dict[str, Any] = {
                 "symbol": symbol,
@@ -649,7 +733,56 @@ def run_optimization(
             f"parameter set from failed backtests. Last trials: {failure_summary}"
         ) from last_trial_exception
 
-    best_trial = _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
+    # Guard only: fails loudly when the study completed no trials or every
+    # completed trial was a no-trade trial. The winner itself is chosen on
+    # validation below, not by this train ranking.
+    _best_trial_or_raise(study, direction=_study_direction(config.target_metric))
+    # Every completed trial is evaluated on the VALIDATION segment, after the
+    # search is over and before the winner is fixed. Nothing in the objective
+    # or the search can see this window.
+    validation_rows = _evaluate_trials_on_validation(
+        trials=completed_trials,
+        validation_period=validation_period,
+        config=config,
+        base_parameters=base_parameters,
+        symbols=symbols,
+        timeframe=timeframe,
+        initial_capital=initial_capital,
+        base_runtime=base_runtime,
+        strategy_slug=strategy_slug,
+        strategy_path=strategy_path,
+        progress_callback=progress_callback,
+    )
+    selectable_rows = [
+        row
+        for row in validation_rows
+        if row["selectable"]
+        and row["validation_score"] is not None
+        and math.isfinite(float(row["validation_score"]))
+    ]
+    if not selectable_rows:
+        raise RuntimeError(
+            "No completed optimization trial produced a selectable validation "
+            "result; every trial either never traded, failed on validation, or "
+            "had a non-finite validation score. Widen parameter_ranges or relax "
+            "position-sizing constraints before retrying."
+        )
+    # The winner is fixed HERE, on validation only. From this point the
+    # selection is immutable: the test evaluation below reads it and cannot
+    # change it. The score is oriented higher-is-better inside
+    # `_trial_selection_score`, which negates a minimize target.
+    selection = select_by_validation(
+        selectable_rows,
+        top_fraction=config.test_top_fraction,
+    )
+    winner_row = selection["winner"]
+    if winner_row is None:
+        raise RuntimeError(
+            "Validation selection produced no winner despite "
+            f"{len(selectable_rows)} selectable trials."
+        )
+    best_trial = winner_row["trial"]
+
     best_params = {
         key: value
         for key, value in dict(best_trial.params).items()
@@ -668,20 +801,34 @@ def run_optimization(
         and best_raw_value >= 0
     )
 
-    test_result = _run_vectorbt_backtest(
-        BacktestConfig(
-            strategy_name=strategy_slug,
-            symbols=best_symbols,
-            timeframe=timeframe,
-            start_date=test_period["start"],
-            end_date=test_period["end"],
-            initial_capital=initial_capital,
-            parameters=effective_best_params,
-            **base_runtime,
-        ),
-        strategy_path,
+    # Only now, with the winner fixed, is the TEST holdout read. The top set
+    # is evaluated for the reported distribution; the winner's test result is
+    # the headline.
+    test_rows = _evaluate_top_set_on_test(
+        selection=selection,
+        test_period=test_period,
+        config=config,
+        base_parameters=base_parameters,
+        symbols=symbols,
+        timeframe=timeframe,
+        initial_capital=initial_capital,
+        base_runtime=base_runtime,
+        strategy_slug=strategy_slug,
+        strategy_path=strategy_path,
     )
-    test_stats = _canonical_stats(test_result)
+    winner_test_row = next(
+        row for row in test_rows if row["number"] == int(best_trial.number)
+    )
+    final_test_stats = dict(winner_test_row["test_stats"])
+    validation_stats = dict(winner_row["validation_stats"])
+    # Flags the winner's overfitting risk; it never changes the selection or
+    # drops the result.
+    overfitting = _overfitting_payload(
+        winner_row=winner_row,
+        train_stats=best_train_stats,
+        selectable_rows=selectable_rows,
+        config=config,
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -705,6 +852,8 @@ def run_optimization(
         "target_metric": config.target_metric,
         "n_trials": config.n_trials,
         "train_split_pct": config.train_split_pct,
+        "validation_split_pct": float(config.validation_split_pct or 0.0),
+        "test_split_pct": float(config.test_split_pct or 0.0),
         "optimization_mode": config.optimization_mode,
         "parameter_ranges": _json_safe(config.parameter_ranges),
         "symbol_universes": _json_safe(candidate_universes),
@@ -722,10 +871,41 @@ def run_optimization(
             "compatible": True,
         },
         "train_period": train_period,
-        "test_period": test_period,
         "train_stats": _json_safe(best_train_stats),
-        "test_stats": _json_safe(test_stats),
+        # Legacy payload keys (#164). Before the three-way split these were
+        # "the held-out result used to judge the trial": the run searched on
+        # train and judged on test. That job now belongs to VALIDATION, so
+        # `test_period`/`test_stats` carry the VALIDATION window and result and
+        # the viewer keeps comparing the train score against the window the
+        # winner was actually selected on. The untouched test holdout is in
+        # `final_test_period`/`final_test_stats` and `three_way.segments.test`.
+        "test_period": validation_period,
+        "test_stats": _json_safe(validation_stats),
+        "validation_period": validation_period,
+        "validation_stats": _json_safe(validation_stats),
+        "final_test_period": test_period,
+        "final_test_stats": _json_safe(final_test_stats),
         "oos_status": "available",
+        "three_way": {
+            "segments": split.as_dict(),
+            "winner": {
+                "trial_number": int(best_trial.number),
+                "train_metrics": _json_safe(best_train_stats),
+                "validation_metrics": _json_safe(validation_stats),
+                "test_metrics": _json_safe(final_test_stats),
+            },
+            "selection": _selection_payload(
+                selection=selection,
+                validation_rows=validation_rows,
+                config=config,
+            ),
+            "test_distribution": _test_distribution_payload(
+                selection=selection,
+                test_rows=test_rows,
+                target_metric=config.target_metric,
+            ),
+            "overfitting": _json_safe(overfitting),
+        },
         "top_trials": _top_trials_payload(
             study.trials,
             limit=10,
@@ -736,6 +916,7 @@ def run_optimization(
                 trials=study.trials,
                 config=config,
                 train_period=train_period,
+                validation_period=validation_period,
                 test_period=test_period,
                 target_metric=config.target_metric,
                 timeframe=timeframe,
@@ -819,6 +1000,15 @@ def _timeframe_bar_duration(timeframe: str | None) -> pd.Timedelta | None:
 #: the study optimises, only what can be said about the choice afterwards.
 SUBPERIOD_PNL_ATTR = "subperiod_pnl"
 
+#: Optuna user attrs recording a trial's VALIDATION result (#164). Written
+#: once, after the search, for every completed trial; selection reads them and
+#: the test holdout is never stored here.
+VALIDATION_STATS_ATTR = "validation_stats"
+VALIDATION_MOMENTS_ATTR = "validation_moments"
+VALIDATION_SCORE_ATTR = "validation_score"
+VALIDATION_METRIC_ATTR = "validation_metric_value"
+VALIDATION_FAILURE_ATTR = "validation_failure_reason"
+
 
 def _stability_subperiods(
     train_period: Mapping[str, str],
@@ -829,9 +1019,9 @@ def _stability_subperiods(
 
     Taken from the walk-forward folds of the TRAIN window — the window the
     trials were actually scored on — so the comparison is like-for-like. The
-    reported walk-forward folds cover train+test, so the sub-periods here are
-    deliberately a different, narrower set; both are reported, and each carries
-    its own bounds.
+    reported walk-forward folds cover train+validation (never the test
+    holdout), so the sub-periods here are deliberately a different, narrower
+    set; both are reported, and each carries its own bounds.
 
     Returns [] when the window is too short for a fold. That is a reportable
     absence, not a failure: the stability view then says "unknown".
@@ -901,11 +1091,425 @@ def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]
     )
 
 
+def _run_period_backtest(
+    *,
+    strategy_slug: str,
+    strategy_path: Path,
+    symbols: Sequence[str],
+    timeframe: str,
+    period: Mapping[str, str],
+    initial_capital: float,
+    parameters: Mapping[str, Any],
+    base_runtime: Mapping[str, Any],
+) -> BacktestResult:
+    """Run one trial's parameter set over one segment."""
+    return _run_vectorbt_backtest(
+        BacktestConfig(
+            strategy_name=strategy_slug,
+            symbols=list(symbols),
+            timeframe=timeframe,
+            start_date=period["start"],
+            end_date=period["end"],
+            initial_capital=initial_capital,
+            parameters=dict(parameters),
+            **dict(base_runtime),
+        ),
+        strategy_path,
+    )
+
+
+def _trial_effective_parameters(
+    trial: Any,
+    base_parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The full parameter set a trial ran with.
+
+    Read from the attr the objective recorded, so a validation re-run uses
+    exactly the configuration the study scored (including the derived symbol
+    universe). Falls back to base + suggested params for a study that did not
+    record it.
+    """
+    stored = getattr(trial, "user_attrs", {}).get("effective_parameters")
+    if isinstance(stored, Mapping) and stored:
+        return dict(stored)
+    combined = dict(base_parameters)
+    for key, value in dict(getattr(trial, "params", {}) or {}).items():
+        if str(key).startswith(_INTERNAL_PARAM_PREFIX):
+            continue
+        combined[key] = value
+    return combined
+
+
+def _trial_selection_score(
+    stats: Mapping[str, Any],
+    config: OptimizationConfig,
+) -> tuple[float, float]:
+    """Validation score of a trial, oriented so higher is always better.
+
+    Returns ``(score, raw_metric)``. Raw maximize targets get the same
+    trade-count/drawdown haircut the objective applies, so a lucky sparse
+    validation run cannot outrank a robust one; for a ``minimize`` study
+    (p_value) the score is negated, so the pure selection function's
+    higher-is-better contract still holds.
+    """
+    raw_metric = _metric_value(dict(stats), config.target_metric)
+    score = raw_metric
+    if config.risk_adjust_objective:
+        metric_key = _metric_key(config.target_metric, dict(stats))
+        score, _terms = _risk_adjusted_metric_value(
+            raw_metric,
+            dict(stats),
+            metric_key=metric_key,
+            direction=_study_direction(config.target_metric),
+            min_trades_for_full_credit=config.min_trades_for_full_credit,
+            drawdown_penalty_weight=config.drawdown_penalty_weight,
+        )
+    if _study_direction(config.target_metric) == "minimize":
+        # p_value: smaller is better, so negate it to keep "higher is better".
+        score = -score
+    return score, raw_metric
+
+
+def _evaluate_trials_on_validation(
+    *,
+    trials: Sequence[Any],
+    validation_period: Mapping[str, str],
+    config: OptimizationConfig,
+    base_parameters: Mapping[str, Any],
+    symbols: Sequence[str],
+    timeframe: str,
+    initial_capital: float,
+    base_runtime: Mapping[str, Any],
+    strategy_slug: str,
+    strategy_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
+    """Evaluate every completed trial on the VALIDATION segment (#164).
+
+    The search never sees this window. Each trial's train result is already
+    stored by the objective; this adds its validation result, validation score
+    and daily-return moments (the deflated Sharpe needs them per trial).
+
+    A trial whose validation run fails, or whose target metric cannot be
+    computed, is recorded as unselectable rather than aborting the study: one
+    bad parameter region must not hide the rest. Returns one row per completed
+    trial; ``selectable`` is False for penalty (no-trade) trials and for
+    validation failures.
+    """
+    rows: list[dict[str, Any]] = []
+    total = max(len(trials), 1)
+    for index, trial in enumerate(trials, start=1):
+        _emit_progress(
+            progress_callback,
+            100.0,
+            f"Evaluating trial {index}/{total} on validation.",
+        )
+        user_attrs = getattr(trial, "user_attrs", {})
+        penalty_applied = bool(user_attrs.get("penalty_applied", False))
+        row: dict[str, Any] = {
+            "number": int(trial.number),
+            "trial": trial,
+            "selectable": False,
+            "validation_score": None,
+            "validation_metric_value": None,
+            "validation_stats": {},
+            "validation_moments": None,
+        }
+        try:
+            result = _run_period_backtest(
+                strategy_slug=strategy_slug,
+                strategy_path=strategy_path,
+                symbols=user_attrs.get("symbols") or symbols,
+                timeframe=timeframe,
+                period=validation_period,
+                initial_capital=initial_capital,
+                parameters=_trial_effective_parameters(trial, base_parameters),
+                base_runtime=base_runtime,
+            )
+            stats = _canonical_stats(result)
+            score, raw_metric = _trial_selection_score(stats, config)
+            moments = daily_returns_moments(result.equity_curve)
+        except (ValueError, RuntimeError, KeyError) as exc:
+            trial.set_user_attr(
+                VALIDATION_FAILURE_ATTR, f"{type(exc).__name__}: {exc}"
+            )
+            rows.append(row)
+            continue
+
+        trial.set_user_attr(VALIDATION_STATS_ATTR, _json_safe(stats))
+        trial.set_user_attr(VALIDATION_MOMENTS_ATTR, _json_safe(moments))
+        trial.set_user_attr(VALIDATION_SCORE_ATTR, float(score))
+        trial.set_user_attr(VALIDATION_METRIC_ATTR, float(raw_metric))
+        row.update(
+            {
+                # A no-trade trial stays unselectable even if it happens to
+                # trade on validation: the penalty marks a parameter region the
+                # study must not hand back as its answer.
+                "selectable": not penalty_applied,
+                "validation_score": float(score),
+                "validation_metric_value": float(raw_metric),
+                "validation_stats": stats,
+                "validation_moments": moments,
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+def _evaluate_top_set_on_test(
+    *,
+    selection: Mapping[str, Any],
+    test_period: Mapping[str, str],
+    config: OptimizationConfig,
+    base_parameters: Mapping[str, Any],
+    symbols: Sequence[str],
+    timeframe: str,
+    initial_capital: float,
+    base_runtime: Mapping[str, Any],
+    strategy_slug: str,
+    strategy_path: Path,
+) -> list[dict[str, Any]]:
+    """Evaluate the already-fixed top set on the TEST holdout (#164).
+
+    Takes the selection as read-only input and returns test results only: it
+    never re-ranks, never writes trial attrs and never changes the winner. The
+    test holdout is read for the first time here, after the selection is fixed.
+    """
+    ranked = list(selection["ranked"])
+    validation_rank = {
+        int(row["number"]): rank for rank, row in enumerate(ranked, start=1)
+    }
+    rows: list[dict[str, Any]] = []
+    for selected in selection["top_set"]:
+        trial = selected["trial"]
+        result = _run_period_backtest(
+            strategy_slug=strategy_slug,
+            strategy_path=strategy_path,
+            symbols=trial.user_attrs.get("symbols") or symbols,
+            timeframe=timeframe,
+            period=test_period,
+            initial_capital=initial_capital,
+            parameters=_trial_effective_parameters(trial, base_parameters),
+            base_runtime=base_runtime,
+        )
+        stats = _canonical_stats(result)
+        rows.append(
+            {
+                "number": int(trial.number),
+                "validation_rank": validation_rank[int(trial.number)],
+                "validation_score": float(selected["validation_score"]),
+                "validation_metric_value": _safe_float_or_none(
+                    selected.get("validation_metric_value")
+                ),
+                "test_metric_value": _metric_value(stats, config.target_metric),
+                "test_stats": _json_safe(stats),
+            }
+        )
+    return rows
+
+
+def _test_distribution_payload(
+    *,
+    selection: Mapping[str, Any],
+    test_rows: Sequence[Mapping[str, Any]],
+    target_metric: str,
+) -> dict[str, Any]:
+    """Summarise the top set's TEST results without touching the selection.
+
+    Reports whether the validation ranking survived on the holdout: the share
+    that stayed profitable, the median target metric, and the Spearman rank
+    correlation between validation rank and test rank (None when fewer than
+    three candidates were tested, where a correlation says nothing).
+    """
+    from scipy.stats import spearmanr
+
+    rows = list(test_rows)
+    direction = _study_direction(target_metric)
+    sign = -1.0 if direction == "minimize" else 1.0
+    metric_values = [
+        float(row["test_metric_value"])
+        for row in rows
+        if row.get("test_metric_value") is not None
+        and math.isfinite(float(row["test_metric_value"]))
+    ]
+    profitable = 0
+    for row in rows:
+        stats = row.get("test_stats") or {}
+        try:
+            pnl = float(stats.get("total_pnl", stats.get("total_return", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        if pnl > 0:
+            profitable += 1
+
+    test_order = sorted(
+        rows,
+        key=lambda row: (
+            -sign * float(row["test_metric_value"]),
+            int(row["number"]),
+        ),
+    )
+    test_rank = {
+        int(row["number"]): rank for rank, row in enumerate(test_order, start=1)
+    }
+    spearman: float | None = None
+    if len(rows) >= 3:
+        correlation = spearmanr(
+            [int(row["validation_rank"]) for row in rows],
+            [test_rank[int(row["number"])] for row in rows],
+        ).statistic
+        if correlation is not None and math.isfinite(float(correlation)):
+            spearman = round(float(correlation), 6)
+
+    return {
+        "count": len(rows),
+        "share_profitable": (
+            round(profitable / len(rows), 6) if rows else None
+        ),
+        "median_target_metric": (
+            round(float(statistics.median(metric_values)), 6) if metric_values else None
+        ),
+        "target_metric": TARGET_METRIC_ALIASES.get(target_metric, target_metric),
+        "spearman_validation_to_test": spearman,
+        "ranked_by_test": [
+            {
+                "number": int(row["number"]),
+                "validation_rank": int(row["validation_rank"]),
+                "test_rank": test_rank[int(row["number"])],
+                "test_metric_value": _safe_float_or_none(row["test_metric_value"]),
+            }
+            for row in test_order
+        ],
+        "note": (
+            "Test results are reported as a distribution of the top set; they "
+            "never change the winner, which was fixed on validation."
+        ),
+    }
+
+
+def _selection_payload(
+    *,
+    selection: Mapping[str, Any],
+    validation_rows: Sequence[Mapping[str, Any]],
+    config: OptimizationConfig,
+) -> dict[str, Any]:
+    """The fixed selection: winner, ranked top set and the tie-break rule."""
+    ranked = list(selection["ranked"])
+    winner = selection["winner"]
+    return {
+        "winner_trial_number": (
+            int(winner["trial"].number) if winner is not None else None
+        ),
+        "score_source": "validation",
+        "target_metric": config.target_metric,
+        "study_direction": _study_direction(config.target_metric),
+        "top_fraction": float(config.test_top_fraction),
+        "top_set_size": len(selection["top_set"]),
+        "n_selectable_trials": len(ranked),
+        "n_unselectable_trials": max(len(validation_rows) - len(ranked), 0),
+        "tie_break": (
+            "higher validation score first; equal scores by lower trial number"
+        ),
+        "ranked_top_set": [
+            {
+                "rank": rank,
+                "trial_number": int(row["trial"].number),
+                "validation_score": _safe_float_or_none(row["validation_score"]),
+                "validation_metric_value": _safe_float_or_none(
+                    row.get("validation_metric_value")
+                ),
+                "params": _json_safe(
+                    {
+                        key: value
+                        for key, value in dict(row["trial"].params).items()
+                        if not str(key).startswith(_INTERNAL_PARAM_PREFIX)
+                    }
+                ),
+                "is_winner": row is winner,
+            }
+            for rank, row in enumerate(selection["top_set"], start=1)
+        ],
+    }
+
+
+def _overfitting_payload(
+    *,
+    winner_row: Mapping[str, Any],
+    train_stats: Mapping[str, Any],
+    selectable_rows: Sequence[Mapping[str, Any]],
+    config: OptimizationConfig,
+) -> dict[str, Any]:
+    """The winner's train->validation degradation and deflated Sharpe (#164).
+
+    Degradation sign: for a maximize target ``(train - validation) / |train|``
+    is positive when validation is worse. A minimize target (p_value) is worse
+    when LARGER, so both metrics are negated before the same calculation, which
+    keeps "worse on validation" positive in both directions.
+
+    The deflated Sharpe uses the winner's VALIDATION daily-return moments,
+    ``n`` = the number of completed selectable trials the winner was picked
+    from, and ``var_sr`` = variance of those trials' per-observation validation
+    Sharpes. A verdict of False only flags the result; nothing is dropped.
+    """
+    direction = _study_direction(config.target_metric)
+    train_metric = _metric_value(dict(train_stats), config.target_metric)
+    validation_metric = float(winner_row["validation_metric_value"])
+    if direction == "minimize":
+        # p_value: worse on validation means larger, so negate both inputs.
+        degradation = train_validation_degradation(-train_metric, -validation_metric)
+    else:
+        degradation = train_validation_degradation(train_metric, validation_metric)
+
+    moments = winner_row.get("validation_moments")
+    trial_sharpes = [
+        float(row["validation_moments"]["sharpe_per_obs"])
+        for row in selectable_rows
+        if isinstance(row.get("validation_moments"), Mapping)
+        and row["validation_moments"].get("sharpe_per_obs") is not None
+    ]
+    n_selectable = len(selectable_rows)
+    var_sr = statistics.variance(trial_sharpes) if len(trial_sharpes) >= 2 else 0.0
+
+    deflated: float | None = None
+    if isinstance(moments, Mapping):
+        deflated = deflated_sharpe_ratio(
+            sr=float(moments["sharpe_per_obs"]),
+            t=int(moments["count"]),
+            skew=float(moments["skew"]),
+            kurt=float(moments["kurtosis"]),
+            n=n_selectable,
+            var_sr=float(var_sr),
+        )
+
+    verdict = overfitting_verdict(
+        degradation=degradation,
+        deflated_sharpe=deflated,
+        max_degradation=config.max_train_validation_degradation,
+        min_deflated_sharpe=config.min_deflated_sharpe,
+    )
+    return {
+        **verdict,
+        "degradation": _safe_float_or_none(degradation),
+        "deflated_sharpe": _safe_float_or_none(deflated),
+        "metric": TARGET_METRIC_ALIASES.get(config.target_metric, config.target_metric),
+        "train_metric_value": _safe_float_or_none(train_metric),
+        "validation_metric_value": _safe_float_or_none(validation_metric),
+        "n_selectable_trials": n_selectable,
+        "var_sharpe_per_obs": _safe_float_or_none(var_sr),
+        "note": (
+            "A failed verdict only flags this result: the winner and its "
+            "metrics are reported unchanged. Promotion decisions belong to the "
+            "promotion gate."
+        ),
+    }
+
+
 def _build_diagnostics_payload(
     *,
     trials: Sequence[Any],
     config: OptimizationConfig,
     train_period: Mapping[str, str],
+    validation_period: Mapping[str, str],
     test_period: Mapping[str, str],
     target_metric: str,
     timeframe: str | None = None,
@@ -931,70 +1535,68 @@ def _build_diagnostics_payload(
     reports "unknown" rather than silently disappearing).
     """
     from runner.optimization_diagnostics import (
-        embargo_split,
         multiple_testing_correction,
         plateau_analysis,
         subperiod_parameter_stability,
-        walk_forward_splits,
     )
 
     payload: dict[str, Any] = {}
     bar_duration = _timeframe_bar_duration(timeframe)
 
-    # 1. Split geometry, including the gap between train and test.
+    # 1. Split geometry, including both embargo gaps (#164).
+    #    The three segments and their gaps are the windows that RAN, not a
+    #    recomputation: a re-derived split has drifted from the applied one
+    #    before (see the removed `embargo_split` call), and a reader cannot
+    #    tell which of two answers in the same artifact to trust.
     try:
-        split = embargo_split(
-            train_period["start"],
-            test_period["end"],
-            train_split_pct=config.train_split_pct,
-            embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
-            bar_duration=bar_duration,
-        )
-        reported = split.as_dict()
-        # The gap is `embargo_days` PLUS `embargo_pct` - `_split_backtest_period`
-        # applies both, and `embargo_split` models only the percentage. So this
-        # re-derived split was not the one that ran: with the default
-        # embargo_days=1 the reported test start came out a full day earlier than
-        # the real one, and `embargo_bars_equivalent` read 0.0 for a study that
-        # dropped a day.
-        #
-        # `9d6a29c` removed one fiction from this payload and left another of the
-        # opposite sign, and the artifact carried both answers - the correct
-        # `train_period`/`test_period` beside this one. The fix is to report the
-        # windows that ran rather than recompute them, and to take the embargo
-        # geometry from the same place they came from.
-        actual_gap = pd.Timedelta(
-            pd.Timestamp(test_period["start"]) - pd.Timestamp(train_period["end"])
-        )
-        reported["test"] = dict(test_period)
-        reported["embargo"] = {
+        embargo_train_val = {
             "start": train_period["end"],
+            "end": validation_period["start"],
+        }
+        embargo_val_test = {
+            "start": validation_period["end"],
             "end": test_period["start"],
         }
-        reported["embargo_bars_equivalent"] = (
-            float(actual_gap / bar_duration) if bar_duration else 0.0
+        train_validation_gap = pd.Timedelta(
+            pd.Timestamp(validation_period["start"]) - pd.Timestamp(train_period["end"])
         )
+        reported: dict[str, Any] = {
+            "train": dict(train_period),
+            "validation": dict(validation_period),
+            "test": dict(test_period),
+            "embargo_train_val": embargo_train_val,
+            "embargo_val_test": embargo_val_test,
+            # Legacy key: before #164 the split had one gap, into the segment
+            # trial results were judged on. That segment is now validation.
+            "embargo": dict(embargo_train_val),
+            "embargo_bars_equivalent": (
+                float(train_validation_gap / bar_duration) if bar_duration else 0.0
+            ),
+        }
         payload["split"] = reported
     except (ValueError, KeyError) as exc:
         payload["split"] = {"error": str(exc)}
 
-    # 2. Walk-forward fold BOUNDARIES (train/test windows per fold). This is
-    #    the geometry used to cut the sub-periods for the stability view below;
-    #    no parameter is re-fitted per fold and no per-fold performance is
-    #    computed, so it is not walk-forward evidence. The key says so (it was
-    #    ``walk_forward``, which read like a result).
+    # 2. Walk-forward fold BOUNDARIES inside the range before the test holdout
+    #    and its embargo. This is the geometry used to cut the sub-periods for
+    #    the stability view below; no parameter is re-fitted per fold and no
+    #    per-fold performance is computed, so it is not walk-forward evidence.
+    #    The key says so (it was ``walk_forward``, which read like a result).
     payload["walk_forward_note"] = (
-        "Fold boundaries only: no per-fold performance was computed, so this is "
-        "not walk-forward evidence."
+        "Fold boundaries only, inside the range before the test holdout and its "
+        "embargo: no per-fold performance was computed, so this is not "
+        "walk-forward evidence."
     )
     try:
-        payload["walk_forward_folds"] = walk_forward_splits(
+        payload["walk_forward_folds"] = walk_forward_train_validation_folds(
             train_period["start"],
             test_period["end"],
             n_splits=int(getattr(config, "walk_forward_splits", 3) or 3),
             train_fraction=config.train_split_pct,
             embargo_pct=float(getattr(config, "embargo_pct", 0.0) or 0.0),
             bar_duration=bar_duration,
+            test_fraction=float(config.test_split_pct or 0.0),
+            embargo_days=int(getattr(config, "embargo_days", 0) or 0),
         )
     except (ValueError, KeyError) as exc:
         payload["walk_forward_folds"] = {"error": str(exc)}
@@ -1151,18 +1753,29 @@ def _resolve_strategy_reference(result: BacktestResult) -> tuple[str, Path, str]
 def _split_backtest_period(
     start_value: str,
     end_value: str,
-    train_split_pct: float,
+    train_split_pct: float = 0.6,
+    validation_split_pct: float | None = None,
+    test_split_pct: float | None = None,
     embargo_days: int = 1,
     embargo_pct: float = 0.0,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Split into train / embargo-gap / test windows.
+) -> ThreeWaySplit:
+    """Split the base range into train / validation / test windows (#164).
 
-    ``embargo_pct`` drops a gap between the two windows, on top of the fixed
-    ``embargo_days``. A trade opened just before the split can still be open
-    during the test window, so its label contains test information; without the
-    gap that leaks backwards into training. The gap is applied here, to the
+    The split itself is :func:`runner.optimization_diagnostics.three_way_split`:
+    train, embargo, validation, embargo, test, with test as the final holdout.
+    Callers must not derive a two-way split from the result: the search runs on
+    ``train`` only, selection on ``validation``, and ``test`` is read once the
+    winner is fixed.
+
+    ``embargo_pct`` drops a gap between each pair of segments, on top of the
+    fixed ``embargo_days``. A trade opened just before a split can still be open
+    in the next segment, so its label contains that segment's information;
+    without the gap that leaks backwards. The gap is applied here, to the
     windows that actually run, rather than only being reported by the
     diagnostics.
+
+    ``validation_split_pct``/``test_split_pct`` default to the remainder
+    ``1 - train_split_pct`` split equally, matching ``OptimizationConfig``.
     """
     if embargo_pct < 0.0:
         raise ValueError("embargo_pct must not be negative")
@@ -1174,36 +1787,25 @@ def _split_backtest_period(
             f"Base backtest period is invalid: start={start_value!r}, end={end_value!r}"
         )
 
-    split_ts = start_ts + ((end_ts - start_ts) * train_split_pct)
-    if split_ts <= start_ts:
-        split_ts = start_ts + pd.Timedelta(microseconds=1)
-    if split_ts >= end_ts:
-        split_ts = end_ts - pd.Timedelta(microseconds=1)
-    if split_ts <= start_ts or split_ts >= end_ts:
+    if validation_split_pct is None and test_split_pct is None:
+        remainder = 1.0 - train_split_pct
+        validation_split_pct = remainder / 2.0
+        test_split_pct = remainder / 2.0
+    elif validation_split_pct is None or test_split_pct is None:
         raise ValueError(
-            "train_split_pct produces an empty train or test period for the base backtest range"
+            "Both validation_split_pct and test_split_pct must be provided together, "
+            "or neither (to use the equal-split default)"
         )
 
-    # C3: embargo gap — the test window starts after the split so no bar
-    # (and no indicator warmup overlap) is shared. The old split+1µs
-    # boundary leaked the split bar into both segments. `embargo_pct` scales
-    # the gap with the length of the backtest; `embargo_days` is the fixed
-    # component. Both are applied to the windows that run, not just reported.
-    embargo = pd.Timedelta(days=max(int(embargo_days), 0)) + (
-        (end_ts - start_ts) * float(embargo_pct)
+    return three_way_split(
+        start_ts,
+        end_ts,
+        train_fraction=train_split_pct,
+        validation_fraction=validation_split_pct,
+        test_fraction=test_split_pct,
+        embargo_days=embargo_days,
+        embargo_pct=embargo_pct,
     )
-    test_start_ts = split_ts + embargo + pd.Timedelta(microseconds=1)
-    train_period = {"start": start_ts.isoformat(), "end": split_ts.isoformat()}
-    if test_start_ts >= end_ts:
-        raise ValueError(
-            "train_split_pct/embargo_days/embargo_pct leave an empty train or "
-            "test period for the base backtest range"
-        )
-    test_period = {
-        "start": test_start_ts.isoformat(),
-        "end": end_ts.isoformat(),
-    }
-    return train_period, test_period
 
 
 def _parse_period_boundary(value: str, *, is_end: bool) -> pd.Timestamp:
@@ -1622,6 +2224,17 @@ def _top_trials_payload(
                     trial.user_attrs.get("raw_metric_value")
                 ),
                 "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
+                # #164: the trial's out-of-search result, recorded when it was
+                # validated. None for trials the validation pass could not score.
+                "validation_score": _safe_float_or_none(
+                    trial.user_attrs.get(VALIDATION_SCORE_ATTR)
+                ),
+                "validation_metric_value": _safe_float_or_none(
+                    trial.user_attrs.get(VALIDATION_METRIC_ATTR)
+                ),
+                "validation_stats": _json_safe(
+                    dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
+                ),
             }
         )
     return payload

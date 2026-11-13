@@ -812,3 +812,37 @@ def _psr_formula(sr: float, sr_bench: float, n: int, skew: float, kurt: float) -
         return None
     z = (sr - sr_bench) * math.sqrt(n - 1) / math.sqrt(denom_inner)
     return float(_norm_dist.cdf(z))
+
+
+def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] | None:
+    """Moments of the daily returns, as the deflated Sharpe ratio needs them.
+
+    Uses the same conventions as :func:`_probabilistic_sharpe` (sample
+    standard deviation, pandas sample skewness, pandas excess kurtosis + 3),
+    so a deflated Sharpe built from these moments with a single trial equals
+    the PSR reported in the stats.
+
+    Returns ``None`` when there are fewer than two daily returns or their
+    standard deviation is zero or undefined. Keys:
+
+    - ``count``: number of daily return observations
+    - ``sharpe_per_obs``: per-observation Sharpe, NOT annualised
+    - ``skew``: skewness (normal = 0)
+    - ``kurtosis``: non-excess kurtosis (normal = 3)
+    """
+    returns = _daily_returns_series_from_equity_curve(equity_curve)
+    if returns is None or len(returns) < 2:
+        return None
+    std_r = float(returns.std())
+    if not math.isfinite(std_r) or std_r == 0.0:
+        return None
+    skew = float(returns.skew())
+    kurtosis = float(returns.kurtosis()) + 3.0
+    if not (math.isfinite(skew) and math.isfinite(kurtosis)):
+        return None
+    return {
+        "count": int(len(returns)),
+        "sharpe_per_obs": float(returns.mean()) / std_r,
+        "skew": skew,
+        "kurtosis": kurtosis,
+    }

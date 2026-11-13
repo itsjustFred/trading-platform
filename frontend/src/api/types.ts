@@ -294,6 +294,8 @@ export interface OptimizationRunRequest {
   target_metric: "sharpe" | "net_profit" | "calmar" | "cagr" | "win_rate";
   n_trials: number;
   train_split_pct: number;
+  validation_split_pct?: number;
+  test_split_pct?: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
   optimization_mode?:
     | "parameter"
@@ -311,6 +313,88 @@ export interface OptimizationRunResponse {
 export interface OptimizationPeriod {
   start: string;
   end: string;
+}
+
+// Three-way split types (issue #164)
+export interface ThreeWaySplitSegments {
+  train: OptimizationPeriod;
+  validation: OptimizationPeriod;
+  test: OptimizationPeriod;
+  embargo_train_val: OptimizationPeriod;
+  embargo_val_test: OptimizationPeriod;
+}
+
+export interface ThreeWayWinnerMetrics {
+  trial_number: number;
+  train_metrics: OptimizationStatMap;
+  validation_metrics: OptimizationStatMap;
+  test_metrics: OptimizationStatMap;
+}
+
+export interface ThreeWaySelection {
+  winner_trial_number: number;
+  score_source: string;
+  target_metric: string;
+  study_direction: string;
+  top_fraction: number;
+  top_set_size: number;
+  n_selectable_trials: number;
+  n_unselectable_trials: number;
+  tie_break: string;
+  ranked_top_set: Array<{
+    rank: number;
+    trial_number: number;
+    validation_score: number;
+    validation_metric_value: number;
+    params: Record<string, StrategyParameterValue>;
+    is_winner: boolean;
+  }>;
+}
+
+export interface ThreeWayTestDistribution {
+  count: number;
+  share_profitable: number;
+  median_target_metric: number;
+  target_metric: string;
+  spearman_validation_to_test: number;
+  ranked_by_test: Array<Record<string, unknown>>;
+  note: string;
+}
+
+export interface ThreeWayOverfittingCheck {
+  value: number | null;
+  threshold: number;
+  passed: boolean;
+  computable: boolean;
+}
+
+export interface ThreeWayOverfitting {
+  passed: boolean;
+  checks: {
+    degradation: ThreeWayOverfittingCheck;
+    deflated_sharpe: ThreeWayOverfittingCheck;
+  };
+  thresholds: {
+    max_train_validation_degradation: number;
+    min_deflated_sharpe: number;
+  };
+  reasons: string[];
+  degradation: number | null;
+  deflated_sharpe: number | null;
+  metric: string;
+  train_metric_value: number;
+  validation_metric_value: number;
+  n_selectable_trials: number;
+  var_sharpe_per_obs: number;
+  note: string;
+}
+
+export interface ThreeWayPayload {
+  segments: ThreeWaySplitSegments;
+  winner: ThreeWayWinnerMetrics;
+  selection: ThreeWaySelection;
+  test_distribution: ThreeWayTestDistribution;
+  overfitting: ThreeWayOverfitting;
 }
 
 export interface OptimizationTrial {
@@ -364,6 +448,14 @@ export interface OptimizationSummary {
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface OptimizationDetail {
@@ -400,6 +492,14 @@ export interface OptimizationDetail {
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
   top_trials: OptimizationTrial[];
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface BacktestStats {

@@ -36,10 +36,19 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
 
+from runner.stats import _psr_formula
+
 __all__ = [
     "EmbargoSplit",
     "embargo_split",
+    "ThreeWaySplit",
+    "three_way_split",
     "walk_forward_splits",
+    "walk_forward_train_validation_folds",
+    "select_by_validation",
+    "train_validation_degradation",
+    "deflated_sharpe_ratio",
+    "overfitting_verdict",
     "plateau_analysis",
     "multiple_testing_correction",
     "subperiods_from_walk_forward",
@@ -150,6 +159,234 @@ def embargo_split(
         embargo={"start": _iso(split_ts), "end": _iso(test_start_ts)},
         embargo_bars_equivalent=bars_equivalent,
     )
+
+
+@dataclass(frozen=True)
+class ThreeWaySplit:
+    """A train/validation/test split with embargo gaps between segments."""
+
+    train: dict[str, str]
+    validation: dict[str, str]
+    test: dict[str, str]
+    embargo_train_val: dict[str, str]
+    embargo_val_test: dict[str, str]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "train": self.train,
+            "validation": self.validation,
+            "test": self.test,
+            "embargo_train_val": self.embargo_train_val,
+            "embargo_val_test": self.embargo_val_test,
+        }
+
+
+def three_way_split(
+    start: Any,
+    end: Any,
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+    test_fraction: float,
+    embargo_days: int = 0,
+    embargo_pct: float = 0.0,
+) -> ThreeWaySplit:
+    """Split a period into train / embargo / validation / embargo / test.
+
+    Layout in time order: train, embargo gap, validation, embargo gap, test.
+    TEST is the last segment and ends at ``end``.
+
+    The embargo gap has the same size semantics as ``_split_backtest_period``:
+    fixed ``embargo_days`` plus ``embargo_pct`` of the whole range.
+
+    ``validation_fraction`` and ``test_fraction`` are fractions of the WHOLE
+    range and are honoured exactly. The two embargo gaps are taken out of the
+    train segment, which is therefore shorter than ``train_fraction`` of the
+    range by twice the gap: validation and test, the segments results are
+    judged on, keep their configured length.
+
+    Raises ValueError if any segment would be empty.
+    """
+    if not (0.0 < train_fraction < 1.0):
+        raise ValueError("train_fraction must be strictly between 0 and 1")
+    if not (0.0 < validation_fraction < 1.0):
+        raise ValueError("validation_fraction must be strictly between 0 and 1")
+    if not (0.0 < test_fraction < 1.0):
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+    total_frac = train_fraction + validation_fraction + test_fraction
+    if abs(total_frac - 1.0) > 1e-9:
+        raise ValueError(
+            f"train_fraction + validation_fraction + test_fraction must sum to 1.0, "
+            f"got {total_frac:.10f}"
+        )
+    if embargo_days < 0:
+        raise ValueError("embargo_days must not be negative")
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
+    start_ts = _as_timestamp(start)
+    end_ts = _as_timestamp(end)
+    if end_ts <= start_ts:
+        raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
+
+    total = end_ts - start_ts
+    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+
+    # Compute segment boundaries working backwards from end (test ends at end)
+    test_end_ts = end_ts
+    test_start_ts = end_ts - total * test_fraction
+    embargo_val_test_end_ts = test_start_ts
+    embargo_val_test_start_ts = embargo_val_test_end_ts - embargo_gap
+    validation_end_ts = embargo_val_test_start_ts
+    validation_start_ts = validation_end_ts - total * validation_fraction
+    embargo_train_val_end_ts = validation_start_ts
+    embargo_train_val_start_ts = embargo_train_val_end_ts - embargo_gap
+    train_end_ts = embargo_train_val_start_ts
+    train_start_ts = start_ts
+
+    # Verify all segments have positive duration (embargo gaps can be zero)
+    if train_end_ts <= train_start_ts:
+        raise ValueError("train segment would be empty")
+    if embargo_train_val_end_ts < embargo_train_val_start_ts:
+        raise ValueError("embargo between train and validation would be negative")
+    if validation_end_ts <= validation_start_ts:
+        raise ValueError("validation segment would be empty")
+    if embargo_val_test_end_ts < embargo_val_test_start_ts:
+        raise ValueError("embargo between validation and test would be negative")
+    if test_end_ts <= test_start_ts:
+        raise ValueError("test segment would be empty")
+
+    return ThreeWaySplit(
+        train={"start": _iso(train_start_ts), "end": _iso(train_end_ts)},
+        validation={"start": _iso(validation_start_ts), "end": _iso(validation_end_ts)},
+        test={"start": _iso(test_start_ts), "end": _iso(test_end_ts)},
+        embargo_train_val={
+            "start": _iso(embargo_train_val_start_ts),
+            "end": _iso(embargo_train_val_end_ts),
+        },
+        embargo_val_test={
+            "start": _iso(embargo_val_test_start_ts),
+            "end": _iso(embargo_val_test_end_ts),
+        },
+    )
+
+
+def walk_forward_train_validation_folds(
+    start: Any,
+    end: Any,
+    *,
+    n_splits: int = 3,
+    train_fraction: float = 0.7,
+    embargo_pct: float = 0.0,
+    bar_duration: pd.Timedelta | None = None,
+    holding_bars: int = 0,
+    test_fraction: float = 0.2,
+    embargo_days: int = 0,
+) -> list[dict[str, Any]]:
+    """Walk-forward folds applied ONLY to the range before the test holdout.
+
+    The test holdout is the last ``test_fraction`` of the period, preceded by
+    the same embargo gap :func:`three_way_split` puts before it (fixed
+    ``embargo_days`` plus ``embargo_pct`` of the whole range). The folds split
+    only what lies before that gap, so no fold can reach into the gap or into
+    test. Each fold is train + embargo + validation.
+
+    Reuses ``walk_forward_splits`` for the fold logic.
+    """
+    if not (0.0 < test_fraction < 1.0):
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1")
+    if embargo_days < 0:
+        raise ValueError("embargo_days must not be negative")
+    if embargo_pct < 0.0:
+        raise ValueError("embargo_pct must not be negative")
+
+    start_ts = _as_timestamp(start)
+    end_ts = _as_timestamp(end)
+    if end_ts <= start_ts:
+        raise ValueError(f"Invalid period: start={start!r}, end={end!r}")
+
+    total = end_ts - start_ts
+    # Same gap arithmetic as `three_way_split`, so the fold range ends exactly
+    # where that function ends the validation segment.
+    embargo_gap = pd.Timedelta(days=max(int(embargo_days), 0)) + (total * float(embargo_pct))
+    test_start_ts = end_ts - total * test_fraction
+    wf_end_ts = test_start_ts - embargo_gap
+    if wf_end_ts <= start_ts:
+        raise ValueError(
+            "test_fraction and embargo leave no room for walk-forward folds"
+        )
+
+    # Use walk_forward_splits on the range before the test holdout
+    # The train_fraction here is relative to each fold, not the whole range
+    folds = walk_forward_splits(
+        start_ts,
+        wf_end_ts,
+        n_splits=n_splits,
+        train_fraction=train_fraction,
+        embargo_pct=embargo_pct,
+        bar_duration=bar_duration,
+        holding_bars=holding_bars,
+    )
+    return folds
+
+
+def select_by_validation(
+    trials: Sequence[Mapping[str, Any]],
+    *,
+    top_fraction: float,
+    score_key: str = "validation_score",
+    trial_number_key: str = "number",
+) -> dict[str, Any]:
+    """Select top trials by validation score.
+
+    Each trial must have a trial number (``trial_number_key``) and a validation
+    score (``score_key``). Trials without a finite validation score are excluded.
+    Higher scores are better.
+
+    Returns a dict with:
+    - ``ranked``: all trials with finite scores, sorted by score descending,
+      then by trial number ascending (deterministic tie-break).
+    - ``winner``: the top-ranked trial (rank 1), or None if no valid trials.
+    - ``top_set``: the top ``max(1, ceil(top_fraction * n_ranked))`` trials.
+
+    Deterministic tie-break: equal scores are ordered by lower trial number first.
+    """
+    if not 0.0 < top_fraction <= 1.0:
+        raise ValueError("top_fraction must be in (0, 1]")
+
+    valid_trials = []
+    for trial in trials:
+        score = trial.get(score_key)
+        number = trial.get(trial_number_key)
+        if score is None or number is None:
+            continue
+        try:
+            score_float = float(score)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score_float):
+            continue
+        try:
+            number_int = int(number)
+        except (TypeError, ValueError):
+            continue
+        valid_trials.append((score_float, number_int, trial))
+
+    # Sort by score descending, then by trial number ascending (tie-break)
+    valid_trials.sort(key=lambda x: (-x[0], x[1]))
+    ranked = [t for _, _, t in valid_trials]
+
+    if not ranked:
+        return {"ranked": [], "winner": None, "top_set": []}
+
+    winner = ranked[0]
+    n_ranked = len(ranked)
+    top_k = max(1, math.ceil(top_fraction * n_ranked))
+    top_set = ranked[:top_k]
+
+    return {"ranked": ranked, "winner": winner, "top_set": top_set}
 
 
 def walk_forward_splits(
@@ -810,4 +1047,164 @@ def subperiod_parameter_stability(
             "measured by no sub-period."
         ),
         "undefined_metrics": sorted(undefined_metrics),
+    }
+
+
+def train_validation_degradation(
+    train_metric: float,
+    validation_metric: float,
+) -> float | None:
+    """Relative drop from train to validation: (train - validation) / |train|.
+
+    Returns None when train == 0 or either metric is non-finite, since
+    a relative degradation is not meaningful in those cases.
+
+    Higher values mean more degradation (worse overfitting).
+    """
+    if not (math.isfinite(train_metric) and math.isfinite(validation_metric)):
+        return None
+    if train_metric == 0.0:
+        return None
+    return (train_metric - validation_metric) / abs(train_metric)
+
+
+#: Euler-Mascheroni constant, used by the expected-maximum-Sharpe estimate.
+_EULER_MASCHERONI = 0.5772156649015329
+
+
+def deflated_sharpe_ratio(
+    sr: float,
+    t: int,
+    skew: float,
+    kurt: float,
+    n: int,
+    var_sr: float,
+) -> float | None:
+    """Deflated Sharpe Ratio after Bailey & Lopez de Prado (2014).
+
+    The DSR is the Probabilistic Sharpe Ratio of the selected trial measured
+    against the Sharpe that the best of ``n`` unskilled trials is expected to
+    reach, instead of against zero. It is the probability that the selected
+    Sharpe is real rather than the product of picking the best of ``n``.
+
+    Args:
+        sr: Per-observation (NON-annualised) Sharpe of the selected trial.
+        t: Number of return observations of the selected trial.
+        skew: Skewness of those returns (normal = 0).
+        kurt: Non-excess kurtosis of those returns (normal = 3).
+        n: Number of trials the selection was made from.
+        var_sr: Variance of the trials' per-observation Sharpes.
+
+    Expected maximum Sharpe under the null, with g the Euler-Mascheroni
+    constant and V = ``var_sr``::
+
+        SR0 = sqrt(V) * ((1 - g) * Phi^-1(1 - 1/n) + g * Phi^-1(1 - 1/(n*e)))
+        DSR = Phi((sr - SR0) * sqrt(t - 1) / sqrt(1 - skew*sr + (kurt - 1)/4 * sr^2))
+
+    ``n == 1`` means nothing was selected, so SR0 = 0 and the DSR equals the
+    plain PSR against zero. Returns ``None`` when it cannot be computed:
+    ``t < 2``, ``n < 1``, a non-finite input, a negative variance or a
+    non-positive term under the root.
+    """
+    if not all(math.isfinite(float(x)) for x in (sr, skew, kurt, var_sr)):
+        return None
+    if t < 2 or n < 1 or var_sr < 0:
+        return None
+    if n == 1:
+        sr0 = 0.0
+    else:
+        normal = statistics.NormalDist()
+        sr0 = math.sqrt(var_sr) * (
+            (1.0 - _EULER_MASCHERONI) * normal.inv_cdf(1.0 - 1.0 / n)
+            + _EULER_MASCHERONI * normal.inv_cdf(1.0 - 1.0 / (n * math.e))
+        )
+    # One PSR formula for the whole code base: the DSR must agree with the
+    # PSR reported in the stats for the same returns.
+    return _psr_formula(float(sr), sr0, int(t), float(skew), float(kurt))
+
+
+def overfitting_verdict(
+    *,
+    degradation: float | None,
+    deflated_sharpe: float | None,
+    max_degradation: float,
+    min_deflated_sharpe: float,
+) -> dict[str, Any]:
+    """Combine overfitting checks into a verdict.
+
+    Args:
+        degradation: Result from train_validation_degradation (None if uncomputable).
+        deflated_sharpe: Result from deflated_sharpe_ratio (None if uncomputable).
+        max_degradation: Threshold for max allowed degradation (e.g., 0.5 = 50%).
+        min_deflated_sharpe: Minimum acceptable deflated Sharpe probability (e.g., 0.95).
+
+    Returns:
+        Dict with:
+        - passed: True only if every check was computable AND passed.
+          False if any check failed or was uncomputable.
+        - checks: Dict with per-check results (degradation, deflated_sharpe).
+        - thresholds: The thresholds used.
+        - reasons: Human-readable reasons for each failed or uncomputable check.
+    """
+    checks = {}
+    reasons = []
+
+    # Degradation check
+    if degradation is None:
+        checks["degradation"] = {
+            "value": None,
+            "threshold": max_degradation,
+            "passed": False,
+            "computable": False,
+        }
+        reasons.append("train/validation degradation could not be computed")
+    else:
+        passed = degradation <= max_degradation
+        checks["degradation"] = {
+            "value": degradation,
+            "threshold": max_degradation,
+            "passed": passed,
+            "computable": True,
+        }
+        if not passed:
+            reasons.append(
+                f"train/validation degradation {degradation:.3f} exceeds threshold "
+                f"{max_degradation:.3f}"
+            )
+
+    # Deflated Sharpe check
+    if deflated_sharpe is None:
+        checks["deflated_sharpe"] = {
+            "value": None,
+            "threshold": min_deflated_sharpe,
+            "passed": False,
+            "computable": False,
+        }
+        reasons.append("deflated Sharpe ratio could not be computed")
+    else:
+        passed = deflated_sharpe >= min_deflated_sharpe
+        checks["deflated_sharpe"] = {
+            "value": deflated_sharpe,
+            "threshold": min_deflated_sharpe,
+            "passed": passed,
+            "computable": True,
+        }
+        if not passed:
+            reasons.append(
+                f"deflated Sharpe {deflated_sharpe:.3f} below threshold {min_deflated_sharpe:.3f}"
+            )
+
+    # Overall verdict: True only if ALL checks were computable and passed
+    all_computable = all(c["computable"] for c in checks.values())
+    all_passed = all(c["passed"] for c in checks.values())
+    passed = all_computable and all_passed
+
+    return {
+        "passed": passed,
+        "checks": checks,
+        "thresholds": {
+            "max_train_validation_degradation": max_degradation,
+            "min_deflated_sharpe": min_deflated_sharpe,
+        },
+        "reasons": reasons,
     }
