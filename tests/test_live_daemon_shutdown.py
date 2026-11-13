@@ -100,6 +100,29 @@ class _GateAdapter:
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_quote(self, symbol: str) -> Any:
+        # #125/#141: the entry gate needs a fresh quote near the signal's
+        # entry price (200.0).
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=199.99, ask=200.01, timestamp=datetime.now(timezone.utc)
+        )
+
+    async def get_pip_value(self, symbol: str) -> Any:
+        # #146: entries are sized with a trusted pip value or refused. A
+        # USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="test",
+        )
+
     async def submit_order(self, signal: Any, *, qty: float | None = None) -> str:
         self.submit_calls += 1
         self.writes.append("broker-accepted")
