@@ -19,6 +19,7 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    LiveQuote,
     coerce_positive_live_qty,
     is_unbounded_tp,
     order_not_submitted,
@@ -1212,6 +1213,49 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"newest bar {newest.isoformat()} exceeds {max_age}"
             )
         return frame
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Latest top-of-book quote for the #125 entry-deviation gate.
+
+        Same IEX feed as :meth:`get_market_data`. A missing quote or a missing
+        or non-numeric side raises instead of returning an invented price; the
+        daemon additionally rejects zero, non-finite and crossed quotes.
+        """
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required for an Alpaca quote")
+        if not self._connected or self._historical_data_client is None:
+            raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
+        request = StockLatestQuoteRequest(symbol_or_symbols=[normalized_symbol], feed="iex")
+        response = await asyncio.to_thread(
+            self._historical_data_client.get_stock_latest_quote, request
+        )
+        quote = response.get(normalized_symbol) if isinstance(response, Mapping) else None
+        if quote is None:
+            raise ValueError(f"Alpaca returned no quote for {normalized_symbol}")
+        prices: dict[str, float] = {}
+        for side in ("bid_price", "ask_price"):
+            raw = getattr(quote, side, None)
+            try:
+                if raw is None or isinstance(raw, bool):
+                    raise TypeError(side)
+                prices[side] = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Alpaca quote for {normalized_symbol} has no usable {side}: {raw!r}"
+                ) from exc
+        # The quote's own time, never now(): an after-hours "latest" quote can
+        # be hours old, and the daemon's freshness rule must see that.
+        timestamp = getattr(quote, "timestamp", None)
+        return LiveQuote(
+            bid=prices["bid_price"],
+            ask=prices["ask_price"],
+            timestamp=timestamp if isinstance(timestamp, datetime) else None,
+            source="alpaca_iex_latest_quote",
+            timestamp_source="broker",
+        )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
