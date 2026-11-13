@@ -67,6 +67,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -1167,21 +1168,35 @@ def _mint_signal_idempotency_key(
     producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
     if not producer_stamp:
         return
-    key_material = "|".join(
-        [
-            str(deployment.id),
-            str(signal.symbol).upper(),
-            str(signal.action).lower(),
-            repr(float(signal.entry_price)),
-            repr(signal.stop_loss),
-            repr(signal.take_profit),
-            str(signal.timeframe),
-            str(producer_stamp),
-        ]
-    )
-    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
-        :32
-    ]
+    # The same producer event can be redelivered with its timestamp spelled differently (``Z``
+    # vs ``+00:00``, aware vs naive, another UTC offset). Key on the instant, not the spelling,
+    # without rounding it: distinct instants - even a microsecond apart - keep distinct keys.
+    # Text that is not a time keeps its verbatim form.
+    raw_stamp = str(producer_stamp)
+    canonical_stamp = canonical_utc_timestamp(producer_stamp) or raw_stamp
+
+    def _key(stamp: str) -> str:
+        key_material = "|".join(
+            [
+                str(deployment.id),
+                str(signal.symbol).upper(),
+                str(signal.action).lower(),
+                repr(float(signal.entry_price)),
+                repr(signal.stop_loss),
+                repr(signal.take_profit),
+                str(signal.timeframe),
+                stamp,
+            ]
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:32]
+
+    metadata["idempotency_key"] = _key(canonical_stamp)
+    if canonical_stamp != raw_stamp:
+        # Signals persisted before #127 were keyed on the verbatim spelling. A replay of one of
+        # them right after the upgrade (a restart is exactly when producers replay) must still
+        # find that row instead of placing a second broker order, so the pre-#127 key travels
+        # along as a lookup-only fallback. It is never stored as the row's own key.
+        metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
 def _trade_signal_to_live_signal(
