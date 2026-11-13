@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 import socket
 import ssl
 import struct
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -52,6 +54,28 @@ _PROTO_OA_CTID_TRADER_ACCOUNT_REQ: Any = None
 _PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = None
 
 
+@contextlib.contextmanager
+def _without_installed_reactor():
+    """Import ``ctrader_open_api`` without leaving a Twisted reactor installed.
+
+    The package ``__init__`` imports ``twisted.internet.reactor``, which installs
+    the platform default (epoll) reactor as an import side effect. Discovery only
+    needs the protobuf messages, and a pre-installed epoll reactor makes a later
+    ``CTraderLiveAdapter.connect`` in the same process fail. If no reactor was
+    installed before the import, remove the one the import installed.
+    """
+    had_reactor = "twisted.internet.reactor" in sys.modules
+    try:
+        yield
+    finally:
+        if not had_reactor:
+            for name in ("twisted.internet.reactor", "twisted.internet.epollreactor"):
+                sys.modules.pop(name, None)
+            twisted_internet = sys.modules.get("twisted.internet")
+            if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
+                delattr(twisted_internet, "reactor")
+
+
 def _load_ctrader_protocol() -> None:
     global _OpenApiMessages_pb2
     global _ProtoHeartbeatEvent
@@ -71,23 +95,24 @@ def _load_ctrader_protocol() -> None:
     if _Protobuf is not None:
         return
     try:
-        from ctrader_open_api import Protobuf
-        from ctrader_open_api.messages import OpenApiMessages_pb2
-        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
-            ProtoHeartbeatEvent,
-            ProtoMessage,
-        )
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-            ProtoOAAccountAuthReq,
-            ProtoOAAccountAuthRes,
-            ProtoOAApplicationAuthReq,
-            ProtoOAApplicationAuthRes,
-            ProtoOAErrorRes,
-            ProtoOAGetAccountListByAccessTokenReq,
-            ProtoOAGetAccountListByAccessTokenRes,
-            ProtoOATraderReq,
-            ProtoOATraderRes,
-        )
+        with _without_installed_reactor():
+            from ctrader_open_api import Protobuf
+            from ctrader_open_api.messages import OpenApiMessages_pb2
+            from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
+                ProtoHeartbeatEvent,
+                ProtoMessage,
+            )
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOAAccountAuthReq,
+                ProtoOAAccountAuthRes,
+                ProtoOAApplicationAuthReq,
+                ProtoOAApplicationAuthRes,
+                ProtoOAErrorRes,
+                ProtoOAGetAccountListByAccessTokenReq,
+                ProtoOAGetAccountListByAccessTokenRes,
+                ProtoOATraderReq,
+                ProtoOATraderRes,
+            )
     except ImportError as exc:
         raise CTraderUnavailableError(
             "cTrader account discovery requires the optional ctrader extra."
