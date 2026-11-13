@@ -141,6 +141,19 @@ def money_scale(money_digits: int) -> int:
     return 10**money_digits
 
 
+def commission_cost(signed_cash_flow: float) -> float:
+    """``live_executions.commission`` convention: a charge is a POSITIVE cost.
+
+    Net PnL is ``gross - commission`` everywhere (viewer, ``net_pnl``), so every adapter must
+    store what the fill cost as a positive number and a rebate as a negative one. A broker that
+    reports a signed cash flow (cTrader: ``ProtoOADeal.commission`` is negative for a charge)
+    is converted with this helper. ``0`` stays ``0.0`` (never ``-0.0``).
+    """
+    if not signed_cash_flow or not math.isfinite(signed_cash_flow):
+        return 0.0
+    return -float(signed_cash_flow)
+
+
 @dataclass(frozen=True)
 class ControlOutcome:
     """What a cancel or flatten sweep actually achieved, including what it did not.
