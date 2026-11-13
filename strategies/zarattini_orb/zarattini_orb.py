@@ -1,7 +1,12 @@
 """
-5-minute Opening Range Breakout (Zarattini, Barbon, Aziz, "Can Day Trading
-Really Be Profitable? Evidence of Sustainable Long-Term Profits from Opening
-Range Breakout (ORB) Day Trading Strategies", SSRN 4416622, 2023).
+5-minute Opening Range Breakout, ATR-stop variant (Zarattini, Barbon, Aziz,
+"A Profitable Day Trading Strategy For The U.S. Equity Market", 2024, the
+"Stocks in Play" ORB:
+https://concretumgroup.com/a-profitable-day-trading-strategy-for-the-u-s-equity-market/).
+The earlier QQQ paper (Zarattini & Aziz, SSRN 4416622, 2023) uses a first-candle
+stop and a 10R target instead; this strategy implements the ATR-stop rules.
+NOT implemented: the paper's "stocks in play" selection (top-20 relative
+volume names); this strategy trades one symbol (an index/ETF).
 
 Published rules (5-minute bars, regular session only):
 
@@ -35,7 +40,7 @@ import pandas as pd
 STRATEGY_META = {
     "name": "Zarattini ORB (5 min)",
     "version": "1.0.0",
-    "source_url": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4416622",
+    "source_url": "https://concretumgroup.com/a-profitable-day-trading-strategy-for-the-u-s-equity-market/",
     "parameters": {
         "atr_len": 14,
         "stop_atr_frac": 0.10,
@@ -49,7 +54,7 @@ STRATEGY_META = {
     ),
     "tags": {
         "type": ["breakout", "intraday", "orb"],
-        "source": "ssrn-4416622",
+        "source": "zarattini-barbon-aziz-2024",
         "asset_class": ["equities", "indices"],
         "complexity": "simple",
     },
