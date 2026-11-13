@@ -166,17 +166,22 @@ def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_n
     """The worker mode reaches the helper before anything else touches the database.
 
     On a fresh data dir the tables do not exist yet, so without `init_db()` the first SELECT raises
-    "no such table" - a failure that names the wrong problem. The call still fails, by design: the
-    account row is absent and `live_deployments.account_id` carries a foreign key, so writing the
-    deployment would create a second orphan.
+    "no such table" - a failure that names the wrong problem.
+    The account row is absent too, so the helper registers the demo account instead of failing
+    with a bare FOREIGN KEY error.
     """
-    from sqlalchemy.exc import IntegrityError
-
     database, engine, _data_dir = isolated_db_no_schema
     from scripts.live_smoke import _ensure_ctrader_smoke_deployment
 
-    with pytest.raises(IntegrityError):
-        _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+    deployment_id = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+    assert deployment_id
+
+    account = database.get_live_account("44695443")
+    assert account is not None
+    assert account.broker == "ctrader"
+    assert account.ctid == "44695443"
+    with database.get_session() as session:
+        assert session.get(database.LiveAccountModel, "44695443").is_demo is True
 
     with engine.connect() as connection:
         tables = {
@@ -730,3 +735,24 @@ def test_init_db_refuses_to_adopt_a_parent_of_a_different_account(isolated_db_sa
 
     with pytest.raises(RuntimeError, match="belongs to account"):
         database.init_db()
+
+
+def test_the_smoke_helper_does_not_modify_an_existing_account_row(isolated_db_sandbox) -> None:
+    """An account discovery already registered keeps its name and flags."""
+    database, _engine, _data_dir = isolated_db_sandbox
+    from scripts.live_smoke import _ensure_ctrader_smoke_deployment
+
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="44695443", broker="ctrader", name="Fusion Live", is_demo=False
+            )
+        )
+        session.commit()
+
+    _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="EURUSD")
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False
