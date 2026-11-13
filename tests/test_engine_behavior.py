@@ -326,12 +326,29 @@ class TestOrderTypeSizingSemantics:
             "STOP orders must be sized at fill from the trigger price"
         )
 
-    def test_market_order_without_stop_keeps_documented_fallback_sizing(self):
-        """Stopless MARKET entries are the documented exception: no re-size.
+    def test_market_order_without_stop_sizes_on_the_fill_price(self):
+        """Stopless MARKET entries size on the FILL via the documented fallback.
 
-        Without a stop there is no fill-time risk input, so the creation-time
-        (signal-bar close) estimate stands — pinned here so a future change
-        to that policy has to update this test deliberately.
+        16-D1 documented an exception ("a MARKET order without any stop has no
+        fill-time risk input, so its creation-time estimate stands") and
+        pinned it here. That exception is superseded, for two documented
+        reasons:
+
+        1. the premise is false — a stopless order DOES have a documented
+           fill-time risk input, the fallback stop (`allow_fallback_stop` /
+           `RiskConfig.fallback_stop_pct`, documented in
+           `docs/live-risk-consistency.md`, and in
+           `docs/cross-engine-backtest-contract.md` §4 as "a documented
+           default stop distance ... 2% of entry"), which the risk engine
+           derives from the entry price it is handed — i.e. from the fill.
+        2. keeping it breached a documented cap. The notional cap is
+           `equity * leverage / fill`, but the creation sizing came from the
+           signal bar's close, so any gap between them sized a position
+           beyond the cap (the #189 differential repro: 103.4k notional on a
+           100k equity / 1x cap).
+
+        The class policy above ("MARKET fills at next-bar open → sized from
+        the fill price") therefore holds for every MARKET order.
         """
         frame = _linear_frame(4)
         entries = pd.Series([True] + [False] * 3, index=frame.index)
@@ -344,9 +361,30 @@ class TestOrderTypeSizingSemantics:
 
         assert engine.closed_trades
         trade = engine.closed_trades[0]
-        # Fill happens on bar 1 (open 101); stopless sizing was computed on
-        # bar 0 close (100) → C1 risk sizing: 1000 risk / 2.0 distance = 500.
-        assert trade.quantity == pytest.approx(1000.0 / 2.0, rel=1e-6)
+        # Fill happens on bar 1 (open 101); C1 risk sizing uses the fallback
+        # distance 2% * 101 = 2.02 of the FILL, not 2% of bar 0's close:
+        # 1000 risk / 2.02.
+        assert trade.entry_price == pytest.approx(101.0)
+        assert trade.quantity == pytest.approx(1000.0 / 2.02, rel=1e-6)
+        assert trade.quantity * trade.entry_price <= 100_000.0 * (1.0 + 1e-12)
+
+    def test_market_order_without_stop_sizes_on_the_fill_after_a_gap(self):
+        """Same rule across a gap: the risk distance follows the fill, not the
+        signal close. Signal close 100, fill 120 → 1000 risk / (2% * 120)."""
+        frame = _linear_frame(4)
+        frame.loc[1, ["open", "high", "low", "close"]] = [120.0, 120.5, 119.5, 120.0]
+        entries = pd.Series([True] + [False] * 3, index=frame.index)
+        exits = pd.Series([False] * 4, index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert engine.closed_trades
+        trade = engine.closed_trades[0]
+        assert trade.entry_price == pytest.approx(120.0)
+        assert trade.quantity == pytest.approx(1000.0 / 2.4, rel=1e-6)
 
 
 # ─── Mutation hardening: reporting equity curve ─────────────────────────────

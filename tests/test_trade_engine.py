@@ -128,6 +128,9 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         "stop_trigger_side": "bar_low_high",
         "take_profit_trigger_side": "bar_high_low",
         "same_bar_order": "stop_first",
+        # Owner decision 2026-11-13: the model now also records the exit rules.
+        "protective_gap_fill": "open",
+        "signal_exit_fill": "next_open",
         "intrabar_resolution": None,
         "lower_timeframe_replay": False,
     }
@@ -294,6 +297,10 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     data.loc[11, "high"] = 121.0
     data.loc[11, "low"] = 119.0
     data.loc[11, "close"] = 120.2
+    # Bar 12 opens ABOVE the anchored stop (118) and trades down through it, so
+    # the stop fills at its level. (The synthetic series' own open of 112 would
+    # gap through the stop and, since 2026-11-13, fill at that open.)
+    data.loc[12, "open"] = 119.5
     data.loc[12, "low"] = 118.0
 
     def strategy_fn(df: pd.DataFrame, params: dict):

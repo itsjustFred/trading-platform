@@ -3,9 +3,11 @@
 Kills the survived mutation-testing mutants on the adapter equity-curve
 builders:
 
-- native/pynecore: the curve must replay trades in last_exit_time order,
-  stamp exit times (not entry times), credit FULL pnl per trade, and carry
-  the loaded bar count in ``meta.total_bars``.
+- native/pynecore: the curve is the MARK-TO-MARKET portfolio equity (one
+  observation per bar plus every entry/exit leg time, see
+  ``runner/engines/mtm_equity.py``): chronological, credits FULL pnl per
+  trade exactly at its exit, shows open-position PnL while a trade is open,
+  and carries the loaded bar count in ``meta.total_bars``.
 - trade renumbering must stay deterministic (entry-time sort before ids).
 """
 
@@ -66,21 +68,35 @@ class TestNativeCurveSemantics:
         )
 
         timestamps = [pd.Timestamp(point.time) for point in result.equity_curve]
-        assert timestamps == sorted(timestamps), (
-            "curve timestamps must be non-decreasing (exit-time order), not "
-            "entry order with exit stamps"
-        )
+        assert timestamps == sorted(timestamps), "curve timestamps must be chronological"
+        assert len(set(timestamps)) == len(timestamps)
 
-        exit_times = {str(t.last_exit_time) for t in result.trades}
-        entry_times = {str(t.entry_time) for t in result.trades}
         initial_time = f"{config.start_date}T00:00:00+00:00"
-        assert (
-            set(point.time for point in result.equity_curve)
-            <= exit_times | entry_times | {initial_time}
-        )
         assert result.equity_curve[0].time == initial_time
-        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
-        assert pd.Timestamp(result.equity_curve[1].time) >= first_exit
+        assert result.equity_curve[0].equity == config.initial_capital
+
+        # The SMA fixture holds one position at a time, so at every trade's exit
+        # the mark-to-market equity IS the realized equity: capital plus the PnL
+        # of every trade closed at or before that instant (exit-time crediting).
+        equity_at = {pd.Timestamp(p.time): p.equity for p in result.equity_curve}
+        cumulative = config.initial_capital
+        for trade in sorted(result.trades, key=lambda t: pd.Timestamp(t.last_exit_time)):
+            cumulative += trade.pnl
+            assert equity_at[pd.Timestamp(trade.last_exit_time)] == pytest.approx(
+                round(cumulative, 2)
+            ), "PnL must land at the trade's exit time, not at its entry"
+
+        # While a position is open the curve carries its unrealized PnL: at least
+        # one observation strictly inside a hold differs from the realized balance.
+        assert any(
+            pd.Timestamp(t.entry_time) < ts < pd.Timestamp(t.last_exit_time)
+            and equity != pytest.approx(config.initial_capital + sum(
+                x.pnl for x in result.trades
+                if pd.Timestamp(x.last_exit_time) <= ts
+            ), abs=0.01)
+            for t in result.trades
+            for ts, equity in equity_at.items()
+        ), "an open position must move the reporting equity (mark-to-market)"
 
     def test_meta_total_bars_is_bar_count(self, curve_env):
         config, strategy_path = curve_env
@@ -133,17 +149,17 @@ def generate_signals(df, params):
 
 
 class TestNativeCurveExitOrder:
-    def test_overlapping_trades_replay_in_exit_order(self, tmp_path: Path):
-        # F5: the single-symbol curve credits closed PnL at EXIT time, so
-        # with overlapping trades (entry order A,B vs exit order B,A) the
-        # curve must be stamped B-exit then A-exit — entry order with exit
-        # stamps would run backwards in time.
+    def test_overlapping_trades_mark_to_market(self, tmp_path: Path):
+        # F5 + mark-to-market: with overlapping trades (entry order A,B vs
+        # exit order B,A) PnL is credited at EXIT time, and while A is still
+        # open after B has closed the curve carries A's unrealized PnL.
         (tmp_path / "strategies").mkdir()
         strategy_path = tmp_path / "strategies" / "overlap_curve.py"
         strategy_path.write_text(_OVERLAP_STRATEGY)
         symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "OVL"
         symbol_dir.mkdir(parents=True)
-        _overlap_frame().to_parquet(symbol_dir / "1h.parquet", index=False)
+        frame = _overlap_frame()
+        frame.to_parquet(symbol_dir / "1h.parquet", index=False)
         config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
             strategy_name="overlap_curve",
             symbols=["OVL"],
@@ -156,11 +172,31 @@ class TestNativeCurveExitOrder:
         )
         result = NativeAdapter().run(config, str(strategy_path))
         assert len(result.trades) == 2
-        assert len(result.equity_curve) == 3
-        first_exit = min(pd.Timestamp(t.last_exit_time) for t in result.trades)
-        assert result.equity_curve[0].time == f"{config.start_date}T00:00:00+00:00"
-        assert pd.Timestamp(result.equity_curve[1].time) == first_exit
         stamps = [pd.Timestamp(p.time) for p in result.equity_curve]
         assert stamps == sorted(stamps)
+        assert result.equity_curve[0].time == f"{config.start_date}T00:00:00+00:00"
+
+        by_exit = sorted(result.trades, key=lambda t: pd.Timestamp(t.last_exit_time))
+        first, second = by_exit  # B (near TP) closes first, A on the bar-5 signal
+        assert pd.Timestamp(first.last_exit_time) < pd.Timestamp(second.last_exit_time)
+        assert pd.Timestamp(first.entry_time) > pd.Timestamp(second.entry_time)
+        equity_at = {pd.Timestamp(p.time): p.equity for p in result.equity_curve}
+
+        # At B's exit bar: B realized, A (still open) marked at that bar's close.
+        exit_bar_close = float(
+            frame.loc[frame["timestamp"] == pd.Timestamp(first.last_exit_time), "close"].iloc[0]
+        )
+        expected_mid = (
+            config.initial_capital
+            + first.pnl
+            + (exit_bar_close - second.entry_price) * second.quantity
+        )
+        assert equity_at[pd.Timestamp(first.last_exit_time)] == pytest.approx(
+            round(expected_mid, 2), abs=0.01
+        )
+        # The paper-profit path differs from a realized-only replay at that bar.
+        assert equity_at[pd.Timestamp(first.last_exit_time)] != pytest.approx(
+            config.initial_capital + first.pnl, abs=1.0
+        )
         expected = config.initial_capital + sum(t.pnl for t in result.trades)
         assert result.equity_curve[-1].equity == pytest.approx(round(expected, 2))

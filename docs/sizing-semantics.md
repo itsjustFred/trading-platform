@@ -44,3 +44,29 @@ documented here.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
+
+## Fill prices feeding sizing and PnL (owner decision 2026-11-13)
+
+Sizing is anchored on the price a position actually fills at (§ "entry"). The
+exit side of that rule changed on 2026-11-13 and **supersedes** the earlier
+"stop/TP always fill at the level" and "signal exits fill at the signal bar's
+close" rules in any older text:
+
+- a stop-loss / take-profit fills at its **level on an intrabar touch**, but at
+  the bar's **open** when the bar opens beyond it (gap) — a gapped stop can
+  therefore lose more than the sized risk (`risk_per_trade_pct` bounds the
+  *planned* loss at the stop level, not a gap), exactly as at an MT5/live broker;
+- a signal exit fills at the **next bar's open**, like an entry; a signal on the
+  last bar is closed by the end-of-data close and flagged.
+
+Details and per-engine mapping: `docs/cross-engine-backtest-contract.md` §1,
+§3 and §5.
+
+## Sizing equity vs reporting equity
+
+Sizing draws on **realized cash** (`initial_capital` + closed-trade net PnL;
+`TradeEngine._sizing_equity`): unrealized profit is not spendable and a paper
+drawdown does not shrink new positions. The **reporting** equity curve that
+feeds drawdown / Sharpe / volatility is separate and **mark-to-market** on every
+engine, so an open position's drawdown is reported even though it never changes
+a position size. See `docs/cross-engine-backtest-contract.md` §4b.

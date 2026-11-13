@@ -7,8 +7,9 @@ Covers:
   identical if/elif arms).
 - F6 — ``meta.total_bars`` must be the loaded bar count, not the trade count.
 - F5 — the portfolio equity curve credits closed PnL once per portfolio at
-  EXIT time (realized-PnL semantics), instead of crediting per-symbol
-  compounded equity at ENTRY time.
+  EXIT time (never at entry, never per-symbol compounded), and between entry
+  and exit it carries the open position's unrealized PnL (mark-to-market
+  reporting equity, ``runner/engines/mtm_equity.py``).
 """
 
 from __future__ import annotations
@@ -118,13 +119,34 @@ class TestTotalBarsIsBarCount:
 # ─── F5: portfolio equity curve semantics ───────────────────────────────────
 
 
+def _mark_to_market_oracle(
+    trades: list, frames: dict[str, pd.DataFrame], initial: float, at: pd.Timestamp
+) -> float:
+    """Independent reference: capital + realized net + unrealized at ``at``."""
+    value = initial
+    for trade in trades:
+        if pd.Timestamp(trade.entry_time) > at:
+            continue
+        if pd.Timestamp(trade.last_exit_time) <= at:
+            value += trade.net_pnl if trade.net_pnl is not None else trade.pnl
+            continue
+        closes = frames[trade.symbol].set_index("timestamp")["close"]
+        mark = float(closes.asof(at))
+        sign = 1.0 if trade.direction == "LONG" else -1.0
+        value += sign * (mark - trade.entry_price) * trade.quantity
+    return value
+
+
 class TestPortfolioEquityCurveSemantics:
     def test_curve_credits_pnl_at_exit_not_entry(self, sizing_env):
-        """Every curve point at a trade's ENTRY time must show initial capital.
+        """PnL lands at the trade's EXIT time, never at its entry time.
 
         Regression (F5): the old curve credited PnL at entry_time while the
         simulator credited it on close — the persisted path described an
-        equity trajectory the backtest never traded.
+        equity trajectory the backtest never traded. With the mark-to-market
+        curve the same guarantee reads: before the first exit the curve never
+        carries realized profit, and at every exit it equals capital plus the
+        PnL of everything closed so far (single position at a time here).
         """
         tmp_path, strategy_path = sizing_env
         config = _config(tmp_path)
@@ -132,42 +154,35 @@ class TestPortfolioEquityCurveSemantics:
         assert result.trades, "the fixture must produce trades"
         assert result.equity_curve, "the fixture must produce an equity curve"
 
-        equity_by_time = {point.time: point.equity for point in result.equity_curve}
+        equity_by_time = {pd.Timestamp(p.time): p.equity for p in result.equity_curve}
         initial = config.initial_capital
-        exit_times = {str(trade.last_exit_time) for trade in result.trades}
-        initial_time = f"{config.start_date}T00:00:00+00:00"
-        assert set(equity_by_time) <= exit_times | {initial_time}, (
-            "curve points must be stamped at the initial boundary or exits"
-        )
-        assert equity_by_time[initial_time] == pytest.approx(initial)
-        for trade in result.trades:
-            entry_time = str(trade.entry_time)
-            # Entry timestamps that carry a curve point must still be at
-            # realized-only capital (nothing has closed at entry time).
-            if entry_time in equity_by_time:
-                assert equity_by_time[entry_time] == pytest.approx(initial, rel=1e-9), (
-                    "PnL must be credited at EXIT time; an entry-time point "
-                    "carrying profit describes an equity path that was never traded"
+        assert result.equity_curve[0].time == f"{config.start_date}T00:00:00+00:00"
+        assert result.equity_curve[0].equity == pytest.approx(initial)
+        first_entry = min(pd.Timestamp(t.entry_time) for t in result.trades)
+        for point in result.equity_curve:
+            if pd.Timestamp(point.time) < first_entry:
+                assert point.equity == pytest.approx(initial, rel=1e-9), (
+                    "before the first entry nothing can have been earned"
                 )
+        running = initial
+        for trade in sorted(result.trades, key=lambda t: t.last_exit_time):
+            running += trade.pnl
+            assert equity_by_time[pd.Timestamp(trade.last_exit_time)] == pytest.approx(
+                round(running, 2), rel=1e-9
+            ), "PnL must be credited at EXIT time"
 
-    def test_curve_is_monotone_in_realized_pnl_cumsum(self, sizing_env):
+    def test_curve_matches_independent_mark_to_market_oracle(self, sizing_env):
         tmp_path, strategy_path = sizing_env
         config = _config(tmp_path)
         result = VectorbtAdapter().run(config, str(strategy_path))
-
-        exits = [str(trade.last_exit_time) for trade in result.trades]
-        assert exits == sorted(exits), "curve points must follow exit order"
-        running = config.initial_capital
-        for trade in sorted(result.trades, key=lambda item: item.last_exit_time):
-            running += trade.pnl
-            # Every trade's exit lands exactly on the running realized equity.
-            matching = [
-                point.equity
-                for point in result.equity_curve
-                if point.time == str(trade.last_exit_time)
-            ]
-            assert matching, "each exit time must have an equity point"
-            assert matching[-1] == pytest.approx(round(running, 2), rel=1e-6)
+        frames = {"VSZ": _deterministic_frame()}
+        assert len(result.equity_curve) > len(result.trades) + 1, "one point per bar, not per exit"
+        for point in result.equity_curve[1:]:
+            expected = _mark_to_market_oracle(
+                result.trades, frames, config.initial_capital, pd.Timestamp(point.time)
+            )
+            assert point.equity == pytest.approx(round(expected, 2), abs=0.011)
+        assert result.meta.data["equity_curve_basis"] == "mark_to_market"
 
     def test_curve_timestamps_stay_monotone_with_overlapping_trades(self, tmp_path):
         """Two symbols whose exits interleave must still yield a sorted curve.
@@ -175,7 +190,8 @@ class TestPortfolioEquityCurveSemantics:
         Regression (spec review, F5): the curve used to credit PnL in entry
         order while stamping exit times — with interleaved exits the persisted
         timestamps went backwards, so downstream drawdown/Sharpe consumers
-        read a scrambled path.
+        read a scrambled path. Every point must also equal the independent
+        portfolio mark-to-market (realized + unrealized of every open leg).
         """
         strategy_dir = tmp_path / "strategies"
         strategy_dir.mkdir()
@@ -183,13 +199,11 @@ class TestPortfolioEquityCurveSemantics:
         strategy_path.write_text(STRATEGY)
 
         base = _deterministic_frame()
-        # Symbol A: normal bars. Symbol B: exit pulled a few bars EARLIER than
-        # A's first exit by clipping the slow SMA's window (shorter series →
-        # earlier crossing) — guaranteed exit-time interleave.
-        _write_ohlcv(tmp_path, "VSA", base)
         # Symbol B: last 10 bars truncated, so B's final exit lands before
         # A's — guaranteed exit-time interleave.
-        _write_ohlcv(tmp_path, "VSB", base.iloc[:-10].copy())
+        frames = {"VSA": base, "VSB": base.iloc[:-10].copy()}
+        for symbol, frame in frames.items():
+            _write_ohlcv(tmp_path, symbol, frame)
 
         config = _config(
             tmp_path,
@@ -204,33 +218,17 @@ class TestPortfolioEquityCurveSemantics:
             "equity-curve timestamps must be non-decreasing even when trades "
             "on different symbols exit interleaved"
         )
-        # PnL must be credited in exit order, not entry order: each distinct
-        # exit time shows the cumulative realized PnL of everything closed at
-        # or before it, and the last point equals capital + all PnL.
-        equity_by_time: dict[str, float] = {}
-        for point in result.equity_curve:
-            equity_by_time[point.time] = point.equity  # last write per timestamp
-
-        exits_in_order = sorted(
-            {str(trade.last_exit_time) for trade in result.trades}
-        )
-        cumulative = config.initial_capital
-        trades_by_exit_time: dict[str, list] = {
-            str(t.last_exit_time): [] for t in result.trades
-        }
-        for trade in sorted(result.trades, key=lambda item: item.last_exit_time):
-            trades_by_exit_time[str(trade.last_exit_time)].append(trade)
-        for exit_time in exits_in_order:
-            for trade in trades_by_exit_time[exit_time]:
-                cumulative += trade.pnl
-            assert exit_time in equity_by_time, f"missing curve point at {exit_time}"
-            assert equity_by_time[exit_time] == pytest.approx(
-                round(cumulative, 2), rel=1e-6
+        assert len(set(times)) == len(times)
+        for point in result.equity_curve[1:]:
+            expected = _mark_to_market_oracle(
+                result.trades, frames, config.initial_capital, pd.Timestamp(point.time)
             )
+            assert point.equity == pytest.approx(round(expected, 2), abs=0.011)
+        cumulative = config.initial_capital + sum(t.pnl for t in result.trades)
         final_point = result.equity_curve[-1]
         assert final_point.equity == pytest.approx(round(cumulative, 2), rel=1e-6), (
             "the last curve point must equal capital plus the realized PnL of "
-            "every trade, credited in exit order"
+            "every trade"
         )
 
 
@@ -540,3 +538,75 @@ class TestEntryStopFills:
         )
         result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades == []
+
+
+# ─── inverted SIZING-only stop guard ────────────────────────────────────────
+
+
+def _sizing_stop_env(tmp_path: Path, sizing_stop: float):
+    """Market LONG signalled on bar 5, filled at bar 6's open (100.0), with a
+    sizing-only stop (``sizing_sl_price``) published on the signal bar."""
+    text = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[5] = True
+    exits.iloc[8] = True
+    sizing = pd.Series([float("nan")] * n, index=df.index)
+    sizing.iloc[5] = %r
+    return entries, exits, {
+        "direction": pd.Series(["LONG"] * n, index=df.index),
+        "sizing_sl_price": sizing,
+    }, []
+''' % float(sizing_stop)
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC"),
+            "open": [100.0] * 24,
+            "high": [101.0] * 24,
+            "low": [99.0] * 24,
+            "close": [100.0] * 24,
+            "volume": [1000.0] * 24,
+        }
+    )
+    strategy_dir = tmp_path / "strategies"
+    strategy_dir.mkdir(exist_ok=True)
+    strategy_path = strategy_dir / "vbt_sizing_stop.py"
+    strategy_path.write_text(text)
+    _write_ohlcv(tmp_path, "VSS", frame)
+    config = _config(
+        tmp_path,
+        strategy_name="vbt_sizing_stop",
+        symbols=["VSS"],
+        risk_per_trade_pct=0.01,
+        max_position_exposure_pct=1.0,
+        max_leverage=1.0,
+        parameters={},
+    )
+    return config, strategy_path
+
+
+class TestInvertedSizingStop:
+    def test_valid_sizing_stop_sizes_from_distance(self, tmp_path: Path):
+        config, strategy_path = _sizing_stop_env(tmp_path, 98.0)
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert len(result.trades) == 1
+        # 1% of 100k over a 2.0 distance from the 100.0 fill.
+        assert result.trades[0].quantity == pytest.approx(500.0)
+        assert result.meta.data["inverted_stop_drops"] == 0
+
+    @pytest.mark.parametrize("sizing_stop", [100.0, 101.5])
+    def test_sizing_stop_at_or_above_long_fill_skips_trade(
+        self, tmp_path: Path, sizing_stop: float
+    ):
+        """A LONG sizing stop at/above the fill has no risk distance (e.g.
+        after a gap down): skip and count it, like native does, instead of
+        sizing on abs(entry - stop) or the 2% fallback."""
+        config, strategy_path = _sizing_stop_env(tmp_path, sizing_stop)
+        result = VectorbtAdapter().run(config, str(strategy_path))
+        assert result.trades == []
+        assert result.meta.data["inverted_stop_drops"] == 1

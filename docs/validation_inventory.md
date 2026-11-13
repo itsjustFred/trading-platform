@@ -147,7 +147,8 @@
 |--------|-------------|---------|
 | `total_trades`, `winners`, `losers`, `win_rate` | Trades | Direkt |
 | `profit_factor` | Trades | `gross_profit / gross_loss` |
-| `max_drawdown_pct` | Equity Curve | `_max_drawdown_pct_manual()` |
+| `max_drawdown_pct` | Equity Curve (mark-to-market, per bar) | `_max_drawdown_pct_manual()` |
+| `max_drawdown_realized_pct` (extras) | Trades (net PnL in Exit-Reihenfolge, Balance-Drawdown) | `_realized_max_drawdown_pct()` |
 | `sharpe_ratio` | Equity Curve | QuantStats oder `_sharpe_manual()` |
 | `sortino_ratio` | Equity Curve | QuantStats oder `_sortino_manual()` |
 | `calmar_ratio` | Equity Curve | `_safe_calmar_ratio()` |

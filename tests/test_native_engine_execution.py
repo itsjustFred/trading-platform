@@ -184,7 +184,9 @@ def test_signal_exit_fill_open_uses_bar_open():
     assert result.trades[0].exits[0].price == 102.0
 
 
-def test_signal_exit_fill_close_is_default():
+def test_signal_exit_fill_close_is_explicit_legacy_opt_in():
+    # Superseded default (owner decision 2026-11-13: next_open). "close" stays
+    # available as an explicit opt-in that fills at the SIGNAL bar's close.
     from runner.engine import TradeEngine as _TE
 
     engine = _TE(
@@ -195,6 +197,7 @@ def test_signal_exit_fill_close_is_default():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
+            signal_exit_fill="close",
             parameters={"fees": "zero"},
         ),
         symbol="T",
@@ -459,3 +462,84 @@ def test_explicit_fees_reduce_net_pnl():
     assert trade.fees > 0
     assert trade.fees == pytest.approx(expected_fees)
     assert trade.net_pnl == trade.pnl - trade.fees
+
+
+# ─── no-explicit-stop (fallback) orders are sized on the fill, not the signal ─
+
+
+def _gap_frame(fill_open: float) -> pd.DataFrame:
+    """Signal bar 0 closes at 100.0; the market order fills at bar 1's open."""
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"], utc=True
+            ),
+            "open": [100.0, fill_open, fill_open],
+            "high": [100.5, fill_open + 0.5, fill_open + 0.5],
+            "low": [99.5, fill_open - 0.5, fill_open - 0.5],
+            "close": [100.0, fill_open, fill_open],
+        }
+    )
+
+
+def _no_stop_strategy(df, params):
+    entries = pd.Series([True, False, False], index=df.index)
+    exits = pd.Series([False, False, True], index=df.index)
+    direction = pd.Series(["LONG", None, None], index=df.index, dtype=object)
+    return entries, exits, {"direction": direction}, []
+
+
+def _fallback_engine(risk: float) -> TradeEngine:
+    return TradeEngine(
+        BacktestConfig(
+            strategy_name="test",
+            symbols=["T"],
+            timeframe="1m",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            risk_per_trade_pct=risk,
+            max_leverage=1.0,
+            parameters={"fees": "zero"},
+        ),
+        symbol="T",
+    )
+
+
+@pytest.mark.parametrize("fill_open", [120.0, 85.0])
+def test_fallback_stop_order_is_sized_on_fill_price(fill_open):
+    # 1% risk, 2% fallback stop of the ENTRY (contract section 4): the risk
+    # distance is 0.02 * fill, never 0.02 * the signal bar's close.
+    result = _fallback_engine(0.01).run(_gap_frame(fill_open), _no_stop_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_price == fill_open
+    assert trade.quantity == pytest.approx(1_000.0 / (0.02 * fill_open))
+    assert trade.meta["sizing_stop_loss"] == pytest.approx(fill_open * 0.98)
+
+
+def test_fallback_stop_order_never_breaches_leverage_cap_after_gap_up():
+    # 5% risk wants 5000 / (0.02 * 120) = 2083 units; the 1x leverage cap
+    # allows 100_000 / 120 = 833.33. Sizing on the signal close (100) used to
+    # give 1000 units = 120k notional, i.e. 1.2x on a 1x cap.
+    result = _fallback_engine(0.05).run(_gap_frame(120.0), _no_stop_strategy)
+    trade = result.trades[0]
+    assert trade.quantity == pytest.approx(100_000.0 / 120.0)
+    assert trade.quantity * trade.entry_price <= 100_000.0 * (1 + 1e-12)
+
+
+@pytest.mark.parametrize("explicit_stop", [False, True])
+def test_market_fill_on_unpriced_bar_fails_closed(explicit_stop):
+    # An all-NaN fill bar must not open a position at entry_price=NaN (which
+    # silently turned pnl and every later equity point into NaN); refuse it.
+    frame = _gap_frame(110.0)
+    frame.loc[1, ["open", "high", "low", "close"]] = float("nan")
+
+    def strategy(df, params):
+        entries, exits, indicators, drawings = _no_stop_strategy(df, params)
+        if explicit_stop:
+            indicators["stop_loss"] = pd.Series([95.0, None, None], index=df.index)
+        return entries, exits, indicators, drawings
+
+    with pytest.raises(ValueError, match="not finite"):
+        _fallback_engine(0.01).run(frame, strategy)

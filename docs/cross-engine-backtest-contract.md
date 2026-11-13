@@ -2,7 +2,8 @@
 
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
-`tests/test_engine_contract.py`.
+`tests/test_engine_contract.py`; the 2026-11-13 fill semantics are pinned per
+engine in `tests/test_realistic_fills.py`.
 
 Every engine adapter — `NativeAdapter` (+ `TradeEngine`),
 `VectorbtAdapter`, `PyneCoreAdapter`, `SignalReplayAdapter`, `LeanAdapter` —
@@ -12,6 +13,15 @@ as a silent parity drift between engines.
 
 Decision Records referenced below are from Cleanup 16-A (2026-08-31) and the
 parent Cleanup 16 record.
+
+> **Owner decision 2026-11-13 (realism / parity with MT5 and live brokers)
+> supersedes two earlier fill rules.** (A) A stop-loss/take-profit fills at the
+> *level* only when the bar touches it intrabar; a bar that **opens beyond** the
+> level (a gap) fills at the bar's **open**. (B) A signal exit fills at the
+> **next bar's open**, like an entry — not at the signal bar's close
+> (D4 / A-M1 "Fill-zum-Trigger-Close" is superseded). Wherever the old text
+> below is marked *superseded*, this decision wins. See §1 (Protective exits,
+> Signal exits) and §5.
 
 ## 1. Fills
 
@@ -39,15 +49,34 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price (owner decision 2026-11-13, supersedes "always the level"): the
+  protective **level** on an **intrabar touch** (the bar opens on the safe side
+  and trades through the level later); the bar's **open** when the bar **opens
+  beyond** the level (gap through a stop — the worse price — or through a
+  take-profit in your favour — the price actually available). An open exactly at
+  the level fills at that price either way. The gap is the first event of the
+  bar, so it also beats a later same-bar touch of the other level and needs no
+  intrabar data. The entry bar is never a gap (the position was opened at that
+  very open). Shared primitives: `contract.level_gapped_at_open` /
+  `contract.level_fill_price`. SHORT exits buy the ask, so the native engine
+  adds the spread on top of the open exactly as it does on a level fill. When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
   treat both spellings as the same event class.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
-  the entry bar and enforced through the intrabar walk (§3). Without intrabar
-  data, exits happen on the scheduled signal exit and the levels are recorded
-  in `trade.meta` (`sl_price`, `tp_price`).
+  the entry bar and enforced through the intrabar walk (§3), where the gap rule
+  applies per **sub-bar** (a sub-bar that opens beyond the level fills at its
+  open; the entry bar's first sub-bar is exempt). Without intrabar data, exits
+  happen on the scheduled signal exit and the levels are recorded in
+  `trade.meta` (`sl_price`, `tp_price`) — vectorbt therefore cannot express the
+  gap rule without intrabar data; it does not enforce the levels at all there
+  (pre-existing, documented limitation).
+- Signal replay applies the gap rule in `_check_protective_exit_bar`
+  (bar open beyond the level → fill at the open). PyneCore's own broker
+  emulator fills gaps at the open; the adapter's containment
+  (`_normalize_trade_exits`, §5) restates a level-violating leg to the level, or
+  to the exit bar's open when that bar gapped through the level.
 
 ## 2. End-date boundary
 
@@ -72,12 +101,35 @@ inside the warm-up span is a hard error (`ValueError`), never a silent
 no-gate. Engines agree on the boundary semantics (pinned by cross-engine
 conformance tests).
 
-**Signal exit fill convention (A-M1/D4).** A signal exit (not a protective
-level exit) fills at the **trigger bar's close** by default; the convention
-is one place — `_prepare_next_open_execution_data` keeps the exit leg
-unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
-`close`/`open`) selects `open` to fill at the exit bar's open instead for
-MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
+**Signal exit fill convention (owner decision 2026-11-13; supersedes
+A-M1/D4 "Fill-zum-Trigger-Close").** A signal exit (not a protective level
+exit) fills at the **next bar's open**, exactly like an entry: a signal on bar
+*N* exits at bar *N+1*'s open. `BacktestConfig.signal_exit_fill` is validated to
+`next_open` (default) / `close` / `open`; the last two are explicit legacy
+opt-ins that fill on the *signal bar itself* (its close / its open — `open`
+serves MT5 clock exits whose signal bar *is* the exit minute). The convention is
+implemented once per engine:
+
+- native: the exit signal is parked and executed at the next bar's open inside
+  `_check_stops`, **after** open-gap exits (which keep their stop/target reason)
+  and **before** the bar's intrabar walk and before pending entries fill, so a
+  reversal (exit + entry on one bar) closes the old position and opens the new
+  one at the same open. SHORT exits pay the spread.
+- vectorbt: `_prepare_next_open_execution_data` shifts the exit leg with the
+  entry leg; the intrabar walk for a signal exit ends at the exit bar's open.
+- PyneCore: Pine fills at the next open natively; `_apply_fill_parity` prices a
+  non-level ledger leg at its own (fill) bar's open under `next_open`.
+- Signal replay: external signals — entries and flip/exit-only exits alike — are
+  executed when they arrive at the fill bar's close (§5), so "exits like
+  entries" already holds; there is no separate next-open exit.
+
+**A signal exit on the last bar** has no next bar to fill at. The position is
+closed by the forced **end-of-data** close at that bar's close with reason
+`end_of_data`, and the trade is flagged
+`trade.meta["signal_exit_deferred_to_end_of_data"] = True` (native and vectorbt;
+PyneCore's ledger drops a trade that never closes, signal replay closes
+end-of-data at the last close). Stop/TP exits fill at the level or, on a gap,
+the open (§1).
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
@@ -158,6 +210,18 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
+- **`entry` is the price the order actually fills at**, for every order type
+  (MARKET: the next bar's open; LIMIT/STOP: their trigger price). Pre-fill
+  creation sizing is only a pending-order estimate and must never survive into
+  the position: because the caps are evaluated against the fill price, a
+  quantity derived from the signal bar's close sizes a position *beyond* the
+  cap whenever the next open gaps (repro: 103.4k notional on 100k equity at a
+  1x cap). Native's `_fill_pending_orders` re-sizes at the fill for every
+  order type, the no-explicit-stop fallback included.
+- **The sizing `equity` is realized cash** (`initial_capital +` closed-trade
+  PnL, net of fees — Cleanup 16-D1 F21/D2), never the mark-to-market
+  reporting equity of the curve: an open position's paper profit is not
+  spendable and a paper drawdown must not deflate new sizes.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
@@ -165,8 +229,12 @@ Implementation:
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
-  distance (native/risk engine: `fallback_stop_pct = 2%`; vectorbt: 2% of
-  entry) — the fallback must be visible in the trade meta, not silent.
+  distance — **2% of the fill price** (native/risk engine:
+  `fallback_stop_pct = 2%`, applied to the entry the risk engine is handed;
+  vectorbt: `entry_price * 0.02`) — the fallback must be visible in the trade
+  meta, not silent. It is a real fill-time risk input, so a stopless order is
+  sized from it like any other order (this supersedes the 16-D1 stopless-MARKET
+  exception recorded in `docs/cleanup-16d1-money-path-semantics.md` D4).
 - **Multi-symbol shared equity (D5, A-M4):** per-symbol engines size each
   trade from the full starting capital; on multi-symbol runs the adapters
   replay all trades onto ONE running portfolio equity
@@ -181,6 +249,43 @@ Implementation:
   order against one realized-equity ledger, and the aggregate open notional
   is capped by shared `max_leverage`.
 
+## 4b. Reporting equity curve (mark-to-market)
+
+Drawdown, Sharpe, Sortino, volatility and Calmar are computed from the
+persisted `equity_curve`, so that curve must show the paper PnL of open
+positions. **Every engine persists a mark-to-market (MTM) portfolio curve**
+(`runner/engines/mtm_equity.py`, native / vectorbt / pynecore / signal-replay,
+single- and multi-symbol alike):
+
+- one observation per bar of the traded symbols plus every entry / exit-leg
+  time, starting at `start_date` with the initial capital; the observation at
+  `t` uses the close of the bar stamped `t`;
+- equity = `initial_capital` + realized exit legs (gross) + unrealized PnL of
+  the still-open quantity marked at the last close; fees are recognised when
+  the trade fully closes, so from the final exit on a trade contributes exactly
+  its `net_pnl` and the last point equals `initial_capital + Σ net_pnl`
+  (total return is identical to the old realized-only curve);
+- multi-symbol runs build ONE portfolio curve from the shared-equity-replayed
+  trades; per-symbol paths are never summed;
+- runs of unchanged equity with no open position are thinned to their end
+  points (lossless for the daily resampling every ratio uses);
+- `meta.data["equity_curve_basis"]` is `mark_to_market`
+  (`mark_to_market_partial` + `equity_curve_unmarked_symbols` when a traded
+  symbol had no bars to mark against) or `realized_exit_timed` for artifacts
+  whose PnL cannot be re-derived from bars (MT5-parity trades priced with tick
+  values);
+- `stats.daily_returns` / `meta.data["daily_equity_curve"]` are derived from
+  the same curve (`runner/daily_equity.py`), never from the closed-trade ledger
+  next to an MTM curve.
+
+**Headline vs balance drawdown (MT5 reports both).** `max_drawdown_pct` is the
+*equity* drawdown on the MTM curve. `max_drawdown_realized_pct` (extras) is the
+*balance* drawdown of closed-trade net PnL replayed in exit order; it is always
+shallower than or equal to the headline figure.
+
+**Sizing is unaffected.** The MTM curve is reporting only: sizing keeps
+drawing on realized cash (§4, `TradeEngine._sizing_equity`).
+
 ## 5. Execution-timing models (documented divergence)
 
 Three execution-timing models coexist. They are **documented, per-engine
@@ -188,25 +293,28 @@ behavior**, not a bug to be fixed by silently changing one engine:
 
 | Engine | Model | Meaning |
 |---|---|---|
-| native / vectorbt | next-bar-open | Signal on bar *N* fills at bar *N+1* open; protective exits evaluated per bar (vectorbt: per intrabar sub-bar). |
-| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close; slippage/delay recorded in `trade.meta`. |
+| native / vectorbt | next-bar-open | Signal on bar *N* — entry **and** signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar (vectorbt: per intrabar sub-bar), filling at the level on a touch and at the open on a gap. |
+| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`; protective exits fill at the level on a touch and at the open on a gap. |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a
 level-violating exit leg to the recorded protective level:
 
 - a LONG exit below `sl_price` is restated to `sl_price` with reason
-  `stop_loss` (mirrored for SHORT);
+  `stop_loss` (mirrored for SHORT) — or to the exit bar's **open** when that
+  bar opened beyond `sl_price` (gap, 2026-11-13);
 - a LONG exit above `tp_price` is restated to `tp_price` with reason
-  `take_profit` (mirrored for SHORT);
+  `take_profit` (mirrored for SHORT), likewise to the exit bar's open when that
+  bar gapped through the target;
 - an exit inside the levels is left untouched.
 
 Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
 sizing: non-level exit legs (signal/time exits) are re-priced to the fill
 convention the other engines use — the configured `signal_exit_fill`
-(default `close`: the trigger bar's close; `open`: the next bar's open) —
+(default `next_open`, equal to `open` for the Pine ledger whose legs are
+stamped on the fill bar: that bar's open; legacy `close`: that bar's close) —
 when the recorded Pine price disagrees with that convention. Level exits
-(`stop_loss`/`take_profit`) keep their recorded level. This re-pricing is a
+(`stop_loss`/`take_profit`) keep their recorded price. This re-pricing is a
 documented divergence from the raw Pine ledger, applied so cross-engine
 comparisons measure strategy edge instead of engine artifacts.
 
@@ -256,3 +364,12 @@ intrabar resolution (native + vectorbt), sizing from the actual stop (including
 cap behavior), the canonical stats key set per engine, `total_bars` semantics,
 market-entry fill parity, signal-replay's documented same-bar-close exception,
 and the pynecore restatement containment property.
+
+`tests/test_differential_reference_strategies.py` complements the conformance
+suite with differential tests: three textbook strategies (SMA crossover with
+all-in sizing, Donchian breakout with ATR stop/target and fixed-risk sizing,
+RSI mean reversion with a time exit) are run on the native and vectorbt engines
+and compared trade by trade with small independent reference simulators written
+in the test module (synthetic edge-case series and one real EURUSD 15m slice,
+zero and non-zero costs). Known engine deviations are recorded there as
+`xfail(strict=True)` with the exact location and reproducer.

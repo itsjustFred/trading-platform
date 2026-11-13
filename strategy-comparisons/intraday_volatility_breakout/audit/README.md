@@ -151,3 +151,11 @@ Behoben: die Vergleichsmatrix importiert die Reports jetzt über denselben
 `scripts/analyze_mt5_parity.py` nutzt denselben Weg: Report-Import und
 Session-/Jahres-Bucketing laufen auf der Broker-Serverzeit des jeweiligen
 Symbols statt auf `Europe/Athens`.
+## Hinweis 2026-11-13: neuer Default `signal_exit_fill="next_open"`
+
+Der Owner-Entscheid vom 2026-11-13 lässt Signal-Exits standardmäßig zum **nächsten**
+Bar-Open füllen (wie Entries). Der MT5-Time-Exit füllt aber am ersten Tick der
+Exit-Minute = Open der Signal-Bar selbst (22:55). Die MT5-Parity-Läufe müssen deshalb
+weiterhin `signal_exit_fill='open'` setzen (Config oben, unverändert, ergibt identische
+Ergebnisse); mit dem neuen Default liegen die Time-Exits genau eine Bar (M1: eine Minute)
+zu spät (Exit-Preis-Treffer auf den Audit-Fenstern 6→0 bzw. 3→0).
