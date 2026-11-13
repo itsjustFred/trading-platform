@@ -489,6 +489,35 @@ def _process_symbol(
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
 
+            # Inverted SIZING-only stop guard (mirrors native
+            # `_fill_pending_orders`, which skips a market order whose
+            # sizing stop is on the wrong side of the fill). The protective
+            # inverted-stop guard below only sees the protective stop series;
+            # a sizing-only stop (e.g. ``sizing_sl_price``) left above a LONG
+            # entry by a gap down would otherwise be sized on
+            # abs(entry - stop), i.e. on a risk distance that does not exist.
+            # Skip before sizing so no fantasy risk reaches the equity path.
+            if sizing_stop_series is not None:
+                sizing_stop_value = _resolve_level_value(sizing_stop_series, entry_idx)
+                if sizing_stop_value is not None and (
+                    (direction == "LONG" and sizing_stop_value >= entry_price)
+                    or (direction != "LONG" and sizing_stop_value <= entry_price)
+                ):
+                    inverted_stop_drops += 1
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_sizing_stop"),
+                        "Skipping %s/%s trade at %s: %s sizing stop %.6f is on "
+                        "the wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        sizing_stop_value,
+                        entry_price,
+                        warning_keys=warning_keys,
+                    )
+                    continue
+
             sizing = _size_trade(
                 config=config,
                 equity=equity,
