@@ -30,6 +30,7 @@ class _FakeOrder:
     order_class: str = "simple"
     qty: float = 0.0
     stop_price: float | None = None
+    status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
 
 
@@ -55,7 +56,11 @@ class _FakeTradingClient:
         positions: list[_FakePosition] | None = None,
         close_error: Exception | None = None,
         submit_error: Exception | None = None,
+        cancel_settles: bool = True,
     ) -> None:
+        # Alpaca keeps an accepted cancel in the book as ``pending_cancel`` until
+        # it settles; ``cancel_settles=False`` reproduces that window.
+        self.cancel_settles = cancel_settles
         self.orders = list(orders or [])
         self.positions = list(positions or [])
         self.cancelled: list[str] = []
@@ -72,7 +77,12 @@ class _FakeTradingClient:
 
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancelled.append(order_id)
-        self.orders = [order for order in self.orders if order.id != order_id]
+        if self.cancel_settles:
+            self.orders = [order for order in self.orders if order.id != order_id]
+            return
+        for order in self.orders:
+            if order.id == order_id:
+                order.status = "pending_cancel"
 
     def _reserved_qty(self, symbol: str) -> float:
         position = next((item for item in self.positions if item.symbol == symbol), None)
@@ -116,6 +126,51 @@ def _adapter(client: _FakeTradingClient) -> AlpacaLiveAdapter:
     adapter._connected = True
     adapter._trading_client = client
     return adapter
+
+
+def test_cancel_open_orders_accepts_pending_cancel_as_success() -> None:
+    # Found on paper: a cancel Alpaca accepted was still listed as pending_cancel on
+    # the immediate re-read and came back as failed=(<id>,).
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ()
+    assert outcome.completed == 1
+    assert outcome.complete is True
+
+
+def test_cancel_open_orders_accepts_enum_valued_pending_cancel() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        for order in client.orders:
+            order.status = SimpleNamespace(value="pending_cancel")  # alpaca-py enum shape
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
+
+
+def test_cancel_open_orders_still_reports_a_cancel_the_broker_dropped() -> None:
+    # A cancel that was "accepted" but left the order live (status still new) is a
+    # real failure and must keep being reported.
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+    client.cancel_order_by_id = lambda order_id: client.cancelled.append(order_id)  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ("entry-1",)
+    assert outcome.complete is False
 
 
 def test_cancel_open_orders_leaves_attached_sl_tp_alone() -> None:
