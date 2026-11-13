@@ -43,6 +43,10 @@ uv run python scripts/live_smoke.py --mode alpaca --accounts-env .accounts.env -
 uv run python scripts/live_smoke.py --mode ctrader --accounts-env .accounts.env --reports-dir docs/reports
 ```
 
+The cTrader smoke order is anchored at a live price (the close of the latest M1 trendbar) with a
+real stop-loss and take-profit 0.5 % away. It fails with a clear message when the market is closed
+(no M1 bar in the last 30 minutes) rather than building an order on an invented price.
+
 ## Demo Daemon
 
 Only run after the paper smoke succeeds.

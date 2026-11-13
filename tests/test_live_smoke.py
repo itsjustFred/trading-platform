@@ -224,3 +224,127 @@ def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(monke
             stock_prices={"reference": 200.0, "buy_limit": 201.0},
             extended_hours=False,
         )
+
+
+# --- cTrader smoke order: live quote and real SL/TP (#184 finding 4) -------------------------
+
+
+def _trendbar(minute: int, low: int, delta_close: int) -> SimpleNamespace:
+    return SimpleNamespace(utcTimestampInMinutes=minute, low=low, deltaClose=delta_close)
+
+
+class _FakeQuoteAdapter:
+    ctid_trader_account_id = 123
+
+    def __init__(self, bars: list[SimpleNamespace]) -> None:
+        self.bars = bars
+        self.requests: list[object] = []
+
+    async def _resolve_symbol_id(self, symbol: str) -> int:
+        assert symbol.upper() == "EURUSD"
+        return 1
+
+    async def _send_request(self, request: object, *, timeout_seconds: int = 10) -> object:
+        self.requests.append(request)
+        return SimpleNamespace(trendbar=self.bars)
+
+
+def test_live_reference_price_is_the_close_of_the_latest_m1_bar() -> None:
+    from scripts.live_smoke import _ctrader_live_reference_price
+
+    adapter = _FakeQuoteAdapter(
+        [_trendbar(100, 108_000, 50), _trendbar(102, 108_500, 120), _trendbar(101, 1, 1)]
+    )
+
+    price = asyncio.run(_ctrader_live_reference_price(adapter, "eurusd", timeout_seconds=5))
+
+    assert price == pytest.approx(1.08620)
+    request = adapter.requests[0]
+    assert request.symbolId == 1 and request.ctidTraderAccountId == 123
+    assert request.toTimestamp > request.fromTimestamp
+
+
+def test_live_reference_price_fails_clearly_without_recent_bars() -> None:
+    from scripts.live_smoke import _ctrader_live_reference_price
+
+    with pytest.raises(RuntimeError, match="market closed"):
+        asyncio.run(
+            _ctrader_live_reference_price(_FakeQuoteAdapter([]), "EURUSD", timeout_seconds=5)
+        )
+
+
+@pytest.mark.parametrize("action", ["buy", "sell"])
+def test_smoke_sl_tp_are_on_the_correct_side_and_pass_the_adapter_conversion(action) -> None:
+    """The smoke SL/TP must satisfy the adapter's own guards (right side, non-zero distance)."""
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+    from scripts.live_smoke import _ctrader_smoke_sl_tp
+
+    price = 1.0862
+    stop_loss, take_profit = _ctrader_smoke_sl_tp(price, action)
+    if action == "buy":
+        assert stop_loss < price < take_profit
+    else:
+        assert take_profit < price < stop_loss
+
+    signal = SimpleNamespace(symbol="EURUSD", action=action, theoretical_price=price)
+    stub = SimpleNamespace(_scale_for=lambda _symbol: None)
+    relative_stop, relative_take = CTraderLiveAdapter._resolve_relative_sl_tp(
+        stub, signal, stop_loss, take_profit
+    )
+    assert relative_stop > 0 and relative_take > 0
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0, float("nan"), float("inf")])
+def test_smoke_sl_tp_rejects_an_unusable_price(price) -> None:
+    from scripts.live_smoke import _ctrader_smoke_sl_tp
+
+    with pytest.raises(ValueError):
+        _ctrader_smoke_sl_tp(price, "buy")
+
+
+def test_order_worker_signal_carries_live_price_and_sl_tp(monkeypatch, isolated_db) -> None:
+    """The order worker builds the signal from the fetched quote, not the old 1.0 placeholder."""
+    import scripts.live_smoke as smoke
+
+    database, _engine, _data_dir = isolated_db
+    database.init_db()
+    submitted: dict[str, object] = {}
+
+    class _Adapter(_FakeQuoteAdapter):
+        def __init__(self, **_kwargs: object) -> None:
+            super().__init__([_trendbar(10, 108_500, 120)])
+
+        async def connect(self) -> None:
+            return None
+
+        async def submit_order(self, signal, *, qty=None) -> str:
+            submitted["signal"] = signal
+            raise RuntimeError("stop after submit")
+
+    async def _no_position(*_args, **_kwargs):
+        return None
+
+    import live_runner.ctrader_adapter as ctrader_adapter
+
+    monkeypatch.setattr(ctrader_adapter, "CTraderLiveAdapter", _Adapter)
+    monkeypatch.setattr(ctrader_adapter, "_ensure_asyncio_twisted_reactor", lambda _loop: None)
+    monkeypatch.setattr(smoke, "_find_ctrader_open_position", _no_position)
+    monkeypatch.setattr(smoke, "_ensure_ctrader_smoke_deployment", lambda **_kw: str(uuid.uuid4()))
+    env_file = Path(database.__file__).parent / "does-not-exist.env"
+    monkeypatch.setattr(smoke, "_env_values", lambda _path: {})
+
+    with pytest.raises(RuntimeError, match="stop after submit"):
+        asyncio.run(
+            smoke._ctrader_order_worker(
+                account_id="44695443",
+                accounts_env=env_file,
+                symbol="EURUSD",
+                volume=1000,
+                timeout_seconds=5,
+            )
+        )
+
+    metadata = submitted["signal"].metadata
+    assert submitted["signal"].theoretical_price == pytest.approx(1.0862)
+    assert metadata["entry_price"] == pytest.approx(1.0862)
+    assert metadata["stop_loss"] < 1.0862 < metadata["take_profit"]
