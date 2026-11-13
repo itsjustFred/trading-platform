@@ -20,12 +20,17 @@ Conventions (``docs/cross-engine-backtest-contract.md``, ``docs/sizing-semantics
 -------------------------------------------------------------------------------------
 * A signal on bar N fills at the OPEN of bar N+1; a signal on the last bar never
   fills.
-* Signal exits fill at the trigger bar's CLOSE; open positions are closed at the
-  last bar's close (``end_of_data``).
-* LONG stop triggers when ``low <= stop``, take profit when ``high >= tp``;
-  both fill at the LEVEL (gaps through the level included). A stop and a target
-  touched by the same bar resolve stop-first (no intrabar data). The fill bar
-  itself can be stopped out (A-H1).
+* Signal exits fill at the OPEN of the bar AFTER the signal (owner decision
+  2026-11-13, superseding the old trigger-bar-close rule); a signal on the last
+  bar cannot fill and the position is closed at the last bar's close
+  (``end_of_data``) like any other open position.
+* LONG stop triggers when ``low <= stop``, take profit when ``high >= tp``.
+  Both fill at the LEVEL on an intrabar touch, but at the bar's OPEN when the bar
+  opens beyond the level (gap, 2026-11-13; same for take-profit and for SHORT).
+  A gap is the first event of the bar, so it also wins over a parked signal
+  exit's reason and over the other level. A stop and a target touched by the same
+  bar resolve stop-first (no intrabar data). The fill bar itself can be stopped
+  out (A-H1) but is never a gap (the position was opened at that very open).
 * A protective/sizing stop on the wrong side of the fill price (``stop >= fill``
   for a LONG) skips the trade.
 * Risk sizing: ``qty = equity*risk / |fill - stop|`` capped by the position
@@ -256,6 +261,7 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
     trades: list[RefTrade] = []
     position: _Open | None = None
     pending: int | None = None  # signal bar index of the order waiting to fill
+    exit_pending = False  # a signal exit parked on an earlier bar: fills at this open
 
     def close_position(i: int, price: float, reason: str) -> None:
         nonlocal position, equity
@@ -278,15 +284,25 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
         )
         position = None
 
-    def protective_exit(i: int) -> None:
+    def protective_exit(i: int, *, gap_allowed: bool = True) -> bool:
+        """Close at a touched level; True when it closed the position."""
         if position is None or not cfg.protective:
-            return
+            return False
         stop_hit = position.stop is not None and lo[i] <= position.stop
         tp_hit = position.take_profit is not None and h[i] >= position.take_profit
-        if stop_hit:  # stop-first, also when the target is touched by the same bar
+        stop_gap = gap_allowed and position.stop is not None and o[i] <= position.stop
+        tp_gap = gap_allowed and position.take_profit is not None and o[i] >= position.take_profit
+        if stop_gap:  # opens beyond the stop: fills at the open
+            close_position(i, o[i], "stop_loss")
+        elif tp_gap:  # opens beyond the target: fills at the open
+            close_position(i, o[i], "take_profit")
+        elif stop_hit:  # stop-first, also when the target is touched by the same bar
             close_position(i, position.stop, "stop_loss")
         elif tp_hit:
             close_position(i, position.take_profit, "take_profit")
+        else:
+            return False
+        return True
 
     def size(fill: float, stop: float | None, signal_close: float) -> float:
         risk = min(cfg.risk_pct, NATIVE_RISK_CEILING) if cfg.native_risk_ceiling else cfg.risk_pct
@@ -301,7 +317,18 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
     for i in range(n):
         if not _finite(o[i], h[i], lo[i], c[i]):
             continue  # an unpriced bar cannot be traded on (see test_nan_bar_*)
-        protective_exit(i)
+        # The open comes first: a gap exit, then the parked signal exit, and only
+        # then the rest of the bar (intrabar touches).
+        if position is not None and cfg.protective:
+            gapped = (position.stop is not None and o[i] <= position.stop) or (
+                position.take_profit is not None and o[i] >= position.take_profit
+            )
+            if gapped:
+                protective_exit(i)
+        if exit_pending and position is not None:
+            close_position(i, o[i], "signal")
+        exit_pending = False
+        protective_exit(i, gap_allowed=False)
         if pending is not None and pending < i:
             s = pending
             pending = None
@@ -310,11 +337,11 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
             fill = o[i]
             if sizing_stop is None or sizing_stop < fill:  # wrong-side stop => skip
                 position = _Open(i, fill, size(fill, sizing_stop, c[s]), stop, sig.take_profit[s])
-                protective_exit(i)  # the fill bar can already be stopped out
+                protective_exit(i, gap_allowed=False)  # the fill bar can already be stopped out
         if sig.entries[i] and position is None and pending is None:
             pending = i
-        if sig.exits[i] and position is not None:
-            close_position(i, c[i], "signal")
+        if sig.exits[i]:
+            exit_pending = True
     if position is not None:
         close_position(n - 1, c[n - 1], "end_of_data")
     return trades

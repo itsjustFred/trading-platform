@@ -184,7 +184,9 @@ def test_signal_exit_fill_open_uses_bar_open():
     assert result.trades[0].exits[0].price == 102.0
 
 
-def test_signal_exit_fill_close_is_default():
+def test_signal_exit_fill_close_is_explicit_legacy_opt_in():
+    # Superseded default (owner decision 2026-11-13: next_open). "close" stays
+    # available as an explicit opt-in that fills at the SIGNAL bar's close.
     from runner.engine import TradeEngine as _TE
 
     engine = _TE(
@@ -195,6 +197,7 @@ def test_signal_exit_fill_close_is_default():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
+            signal_exit_fill="close",
             parameters={"fees": "zero"},
         ),
         symbol="T",

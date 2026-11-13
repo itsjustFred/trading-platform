@@ -28,6 +28,16 @@ the price data.
 `self.equity = initial + realized + unrealized` — open positions' paper profit
 compounded into the next entry's quantity, and paper drawdown shrank it.
 
+**Regression found in #190 and re-fixed there:** the 16-D2 structural split
+(`runner/engine.py` → `runner/engine_pkg/`) dropped `_sizing_equity` and
+reverted every sizing call to `self.equity`. The two F21 tests stayed green only
+because creation sizing runs *before* the bar's `_update_equity`, so the
+mark-to-market figure they compared against lagged one bar and happened to be
+realized in that fixture. The fill-time re-size added in #190 removed the lag
+and exposed it. `_sizing_equity` is restored (initialised in `__init__`,
+refreshed in `_close_partial` and `_finalize_position`, and used by
+`_calculate_position_size` / `_current_risk_exposure`).
+
 **Decision:** sizing draws on `_sizing_equity = initial_capital + realized_pnl`
 (realized cash only, updated in `_close_partial`). `self.equity` remains the
 mark-to-market *reporting* equity for the curve. Sizing is therefore
@@ -68,9 +78,22 @@ creation-price estimate forever.
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
 the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their trigger price
 at fill. Quantities across order types are now computed from the same rule:
-quantity = sizing rule evaluated at the fill price. One documented exception:
-a MARKET order **without any stop** has no fill-time risk input, so its
-creation-time estimate (signal-bar close) stands.
+quantity = sizing rule evaluated at the fill price.
+
+**Superseded (#190):** the original record carried one exception — a MARKET
+order **without any stop** kept its creation-time (signal-bar close) estimate
+because it was said to have "no fill-time risk input". That premise is false:
+a stopless order has a documented fill-time risk input, the fallback stop
+(`allow_fallback_stop` / `RiskConfig.fallback_stop_pct`, see
+`docs/live-risk-consistency.md`), which the risk engine derives from the entry
+price it is handed — and `docs/cross-engine-backtest-contract.md` §4 documents
+that fallback as "2% of entry". Keeping the exception also breached the
+documented notional cap: the cap is `equity * leverage / fill`, but the quantity
+came from the signal close, so a gap between them sized a position beyond the
+cap (#189's `gap_up_at_fill` repro: 103.4k notional on a 100k equity / 1x cap;
+vectorbt and the differential reference both cap it). MARKET orders therefore
+re-size at the fill like every other order type, fallback stop included, and
+the fallback stop level recorded in `trade.meta` is anchored to the fill.
 
 **Scope note:** F23 also lists the O(n) intrabar replay
 (`engine.py` `iterrows()` window per bar instead of searchsorted). That is a
@@ -193,6 +216,11 @@ the curve does not — the two paths measure different capital by design, and
 that is the documented distortion. Closing it fully (an MTM-marked replay
 curve) requires the structural replay rework deferred to 16-D2.
 
+> **Superseded (reporting equity is now mark-to-market on every engine).** The
+> replay curve is built with `runner/engines/mtm_equity.py`, so sizing-time and
+> reporting-time equity now measure the same capital. See
+> `docs/cross-engine-backtest-contract.md` §4b.
+
 **Pinned by:** `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`.
 
 ## D10 — vectorbt: max_leverage is an independent cap; sizing semantics (F35, F7)
@@ -222,6 +250,15 @@ over **exit** time, replayed in exit order (documented limitation: not an
 intraday mark-to-market path — per-symbol sizing compounds from shared
 capital and summing those paths would multiply capital by symbol count).
 Pynecore's curve is aligned to exit time for cross-engine comparability.
+
+> **Superseded (D11 curve semantics).** The "realized-only, drawdown/Sharpe
+> describe the realized portfolio" limitation was a defect: a 40 % crash inside
+> one long hold reported `max_drawdown_pct == 0` and real runs under-reported
+> drawdown by roughly 2x. Every engine now persists a mark-to-market portfolio
+> curve (`runner/engines/mtm_equity.py`; one point per bar, fees at the final
+> exit, last point == capital + Σ net PnL, so total return is unchanged). The
+> balance drawdown stays available as `max_drawdown_realized_pct`. Pinned by
+> `tests/test_mtm_equity.py`. See `docs/cross-engine-backtest-contract.md` §4b.
 
 **Pinned by:** `tests/test_vectorbt_sizing_semantics.py::TestTotalBarsIsBarCount`,
 `::TestPortfolioEquityCurveSemantics`.

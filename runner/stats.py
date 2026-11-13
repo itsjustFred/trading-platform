@@ -262,6 +262,12 @@ def compute_stats(
                 return_frequency, return_frequency_reason
             ),
             "duplicate_equity_timestamps": duplicate_timestamp_count,
+            # Balance (closed-trade, realized) drawdown next to the headline
+            # ``max_drawdown_pct``, which is measured on the MARK-TO-MARKET
+            # equity curve (MT5 reports both "balance" and "equity" drawdown).
+            "max_drawdown_realized_pct": _realized_max_drawdown_pct(
+                trades, float(initial_capital)
+            ),
         },
     ).to_dict()
 
@@ -627,6 +633,33 @@ def _max_drawdown_pct_manual(equities: list[float]) -> float:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
+
+def _realized_max_drawdown_pct(trades: list[Trade], initial_capital: float) -> float | None:
+    """Balance (realized) max drawdown as a negative fraction, or None without trades.
+
+    Replays net trade PnL in exit order starting from ``initial_capital`` — the
+    account *balance*, blind to the paper PnL of open positions. The headline
+    ``max_drawdown_pct`` uses the mark-to-market equity curve instead; the
+    realized figure is therefore always ``>=`` it (shallower or equal).
+    """
+    if not trades:
+        return None
+    ordered = sorted(
+        trades,
+        key=lambda t: (
+            pd.to_datetime(t.last_exit_time, utc=True, format="mixed", errors="coerce")
+            if t.last_exit_time
+            else pd.Timestamp.max.tz_localize("UTC"),
+            t.id,
+        ),
+    )
+    balance = float(initial_capital)
+    balances = [balance]
+    for trade in ordered:
+        balance += _net_trade_pnl(trade)
+        balances.append(balance)
+    return round(-_max_drawdown_pct_manual(balances), 6)
 
 
 def _max_drawdown_duration(equities: list[float]) -> int:
