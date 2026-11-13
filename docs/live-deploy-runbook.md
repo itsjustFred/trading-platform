@@ -30,6 +30,19 @@ must still be rotated when an account is retired or reassigned.
 ```bash
 uv sync --all-extras
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env
+```
+
+The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
+(read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db`) to validate those rows
+too. The JSON result gains `db_deployments` with `matched`, `only_in_db` (an error: the daemon
+trades something the YAML preflight never saw), `only_in_yaml` and symbol/timeframe differences
+(warnings).
+
+```bash
+uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-db
+```
+
+```bash
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
