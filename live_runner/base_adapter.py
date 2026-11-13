@@ -168,6 +168,80 @@ class LiveQuote:
     timestamp_source: str = "broker"
 
 
+def validate_live_quote_prices(
+    quote: object, *, symbol: str, label: str = "Broker quote"
+) -> tuple[float, float]:
+    """Validated ``(bid, ask)`` of a broker quote, failing closed (#125, #146).
+
+    One implementation for every layer that turns a broker quote into a number
+    it is willing to gate or size on: the daemon's entry-deviation gate and
+    cTrader's quote->account conversion chain both size real orders from such a
+    quote, and both must refuse the same shapes - a payload that is not a
+    :class:`LiveQuote`, a missing side, a non-numeric side, a non-finite or
+    non-positive side, or a crossed book. Two copies of a safety-value parser
+    drift: one layer gets a fix the other does not, and a quote that sizes an
+    entry is accepted by one and rejected by the other.
+
+    ``label`` names the layer so the refusal still says which one refused.
+    """
+    if not isinstance(quote, LiveQuote):
+        raise ValueError(
+            f"{label} for {symbol}: no usable quote ({type(quote).__name__}); "
+            "refusing to trade on a number the broker did not send."
+        )
+    sides: list[float] = []
+    for name, value in (("bid", quote.bid), ("ask", quote.ask)):
+        if value is None or isinstance(value, bool):
+            raise ValueError(f"{label} for {symbol} is unusable: missing {name} side ({value!r})")
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not numeric ({value!r})"
+            ) from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not positive and finite ({value!r})"
+            )
+        sides.append(price)
+    bid, ask = sides
+    if bid > ask:
+        raise ValueError(f"{label} for {symbol} is crossed: bid={bid!r} > ask={ask!r}")
+    return bid, ask
+
+
+@dataclass(frozen=True)
+class LivePipValue:
+    """What one qty unit of a symbol gains or loses per 1.0 price move (#146).
+
+    ``value`` is the ``pip_value`` the risk engine sizes with: account-currency
+    P&L of ONE adapter qty unit when the price moves by 1.0 (one whole price
+    unit, not one pip), so ``qty = risk_amount / (stop_distance * value)`` and
+    the position's notional is ``qty * price * value``. It is
+    ``units_per_qty * conversion_rate``:
+
+    * ``units_per_qty``: base-asset units one qty unit stands for (cTrader:
+      0.01 lot, e.g. 1,000 EUR for EURUSD; Alpaca: one share).
+    * ``conversion_rate``: account-currency value of one unit of the symbol's
+      quote currency (1.0 when they are the same).
+
+    ``conversion_quotes`` are the live quotes the rate was derived from, one
+    per conversion hop. The daemon checks each one against the deployment's
+    quote-age limit and refuses the entry when one is stale, so a broker that
+    converts must return them. ``source`` names where the figures came from so
+    a persisted signal can be traced back.
+    """
+
+    value: float
+    units_per_qty: float
+    conversion_rate: float
+    quote_asset: str
+    account_asset: str
+    source: str
+    conversion_symbols: tuple[str, ...] = ()
+    conversion_quotes: tuple[LiveQuote, ...] = ()
+
+
 @dataclass(frozen=True)
 class ControlOutcome:
     """What a cancel or flatten sweep actually achieved, including what it did not.
@@ -255,6 +329,18 @@ class BaseLiveAdapter(ABC):
         fails closed rather than submitting an order it could not check.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a live quote")
+
+    async def get_pip_value(self, symbol: str) -> LivePipValue:
+        """Return the account-currency value of one qty unit per 1.0 price move.
+
+        The risk engine divides the risk budget by ``stop_distance * value``,
+        so a wrong value scales the size by the same factor (#146: an implicit
+        1.0 oversized cTrader FX entries ~1000x). It must come from the broker
+        or trusted configuration, never from signal metadata. Raises
+        NotImplementedError when the adapter cannot provide it; the daemon
+        treats that (and any other failure) as "unknown" and refuses the entry.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #

@@ -856,6 +856,15 @@ class _SignalSubmittingAdapter:
     async def get_positions(self):
         return []
 
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
     async def get_quote(self, symbol):
         # #125 entry-deviation gate: a quote at the signal entry passes.
         from live_runner.base_adapter import LiveQuote

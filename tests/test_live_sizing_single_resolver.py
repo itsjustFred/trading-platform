@@ -76,6 +76,15 @@ class _GateAdapter(BaseLiveAdapter):
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
 
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
     async def get_quote(self, symbol: str):
         self.quote_calls.append(symbol)
         if self.quote_error is not None:
@@ -88,6 +97,15 @@ class _QuotelessAdapter(BaseLiveAdapter):
     """An adapter that never implemented quotes (inherits the base default)."""
 
     submitted: list[LiveSignal] = field(default_factory=list)
+
+    async def get_pip_value(self, symbol):
+        # #146: pip value present, so the quote default is what is under test.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
 
     async def connect(self) -> None:
         return None

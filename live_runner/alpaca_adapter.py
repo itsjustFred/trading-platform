@@ -19,6 +19,7 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
     is_unbounded_tp,
@@ -519,6 +520,21 @@ def resolve_alpaca_credentials(
         },
     )
     return _alpaca_block_credentials(blocks[0])
+
+
+#: Crypto quote currencies Alpaca lists besides USD. A slash-less symbol
+#: ending in one of these (``ETHBTC``) is a non-USD pair (#146).
+_NON_USD_CRYPTO_QUOTES = ("USDT", "USDC", "BTC", "ETH")
+
+
+def _alpaca_quote_asset(symbol: str) -> str:
+    """Quote currency of an Alpaca symbol: USD for equities and ``*/USD``."""
+    if "/" in symbol:
+        return symbol.rsplit("/", 1)[1] or "unknown"
+    for quote in _NON_USD_CRYPTO_QUOTES:
+        if len(symbol) > len(quote) + 1 and symbol.endswith(quote):
+            return quote
+    return "USD"
 
 
 class AlpacaLiveAdapter(BaseLiveAdapter):
@@ -1120,6 +1136,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         balance = _to_float(getattr(account, "cash", None), default=0.0)
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
+
+    async def get_pip_value(self, symbol: str) -> LivePipValue:
+        """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
+
+        Alpaca qty is in shares/coins and every supported symbol is quoted in
+        USD, so the value is 1.0 once the account itself is in USD. Refuses
+        (the daemon then refuses the entry) when the account currency is not
+        USD, or the symbol is a pair quoted in anything else (``ETH/BTC``,
+        ``BTC/USDT``): those would need a conversion this adapter does not do.
+        """
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            raise ValueError("symbol is required for an Alpaca pip value")
+        quote_asset = _alpaca_quote_asset(normalized_symbol)
+        if quote_asset != "USD":
+            raise ValueError(
+                f"Alpaca symbol {normalized_symbol} is quoted in {quote_asset}, not USD; "
+                "refusing to size it without a conversion rate."
+            )
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        account = await asyncio.to_thread(self._trading_client.get_account)
+        currency = str(getattr(account, "currency", "") or "").strip().upper()
+        if currency != "USD":
+            raise ValueError(
+                f"Alpaca account currency is {currency or 'unknown'!r}, not USD; "
+                "refusing to size with a 1.0 USD pip value."
+            )
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="alpaca_usd_unit",
+        )
 
     async def get_market_data(
         self,
