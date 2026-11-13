@@ -168,6 +168,48 @@ class LiveQuote:
     timestamp_source: str = "broker"
 
 
+def validate_live_quote_prices(
+    quote: object, *, symbol: str, label: str = "Broker quote"
+) -> tuple[float, float]:
+    """Validated ``(bid, ask)`` of a broker quote, failing closed (#125, #146).
+
+    One implementation for every layer that turns a broker quote into a number
+    it is willing to gate or size on: the daemon's entry-deviation gate and
+    cTrader's quote->account conversion chain both size real orders from such a
+    quote, and both must refuse the same shapes - a payload that is not a
+    :class:`LiveQuote`, a missing side, a non-numeric side, a non-finite or
+    non-positive side, or a crossed book. Two copies of a safety-value parser
+    drift: one layer gets a fix the other does not, and a quote that sizes an
+    entry is accepted by one and rejected by the other.
+
+    ``label`` names the layer so the refusal still says which one refused.
+    """
+    if not isinstance(quote, LiveQuote):
+        raise ValueError(
+            f"{label} for {symbol}: no usable quote ({type(quote).__name__}); "
+            "refusing to trade on a number the broker did not send."
+        )
+    sides: list[float] = []
+    for name, value in (("bid", quote.bid), ("ask", quote.ask)):
+        if value is None or isinstance(value, bool):
+            raise ValueError(f"{label} for {symbol} is unusable: missing {name} side ({value!r})")
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not numeric ({value!r})"
+            ) from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not positive and finite ({value!r})"
+            )
+        sides.append(price)
+    bid, ask = sides
+    if bid > ask:
+        raise ValueError(f"{label} for {symbol} is crossed: bid={bid!r} > ask={ask!r}")
+    return bid, ask
+
+
 @dataclass(frozen=True)
 class LivePipValue:
     """What one qty unit of a symbol gains or loses per 1.0 price move (#146).

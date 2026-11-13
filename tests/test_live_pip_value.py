@@ -844,6 +844,53 @@ def test_exit_only_orders_need_no_pip_value():
     assert qty == pytest.approx(3.0)
 
 
+def test_exit_only_close_ignores_payload_pip_value_keys():
+    # A payload copy of the pip-value record must not reach the adapter on a close:
+    # cTrader's submit-time scale guard would otherwise refuse the close (#146).
+    class _Book(_Adapter):
+        async def get_positions(self) -> list[dict[str, Any]]:
+            return [{"symbol": "AAPL", "qty": 3.0}]
+
+    adapter = _Book(error=AssertionError("must not be called"))
+    deployment = _deployment()
+    signal = LiveSignal(
+        deployment_id=str(deployment.id), symbol="AAPL", action="sell",
+        theoretical_price=100.0, timestamp=datetime.now(timezone.utc),
+        metadata={
+            "exit_only": True,
+            "pip_value": 9.0,
+            "pip_value_units_per_qty": "abc",
+            "pip_value_conversion_rate": 5.0,
+            "bid": 1.0,
+        },
+    )
+
+    prepared, qty = _prepare(adapter, deployment, signal)
+
+    assert qty == pytest.approx(3.0)
+    for key in (*daemon._PIP_VALUE_METADATA_KEYS, *daemon._ENTRY_QUOTE_METADATA_KEYS):
+        assert key not in prepared.metadata
+
+
+@pytest.mark.parametrize(
+    "quote,match",
+    [
+        (None, "no usable quote"),
+        (LiveQuote(bid=None, ask=1.0), "missing bid"),
+        (LiveQuote(bid=1.0, ask="x"), "not numeric"),
+        (LiveQuote(bid=float("nan"), ask=1.0), "positive and finite"),
+        (LiveQuote(bid=0.0, ask=1.0), "positive and finite"),
+        (LiveQuote(bid=2.0, ask=1.0), "crossed"),
+    ],
+)
+def test_entry_gate_and_conversion_chain_refuse_the_same_quotes(quote, match):
+    # One validator behind both layers: a quote one refuses, the other refuses too.
+    with pytest.raises(ValueError, match=match):
+        daemon._validated_quote_prices(quote, symbol="X")
+    with pytest.raises(ValueError, match=match):
+        ctrader._conversion_quote_prices(quote, symbol="X")
+
+
 # ── Alpaca ────────────────────────────────────────────────────────────────────
 
 

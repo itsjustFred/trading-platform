@@ -27,6 +27,7 @@ from live_runner.base_adapter import (
     coerce_positive_live_qty,
     is_order_not_submitted,
     is_unbounded_tp,
+    validate_live_quote_prices,
 )
 from live_runner.credential_env import (
     accounts_env_mtime,
@@ -934,27 +935,13 @@ def _quote_time_rule(
 
 
 def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float]:
-    if not isinstance(quote, LiveQuote):
-        raise ValueError(
-            f"Broker returned no usable quote for {symbol} ({type(quote).__name__}); "
-            "refusing a live entry the deviation gate cannot check."
-        )
-    try:
-        bid = _coerce_live_float(quote.bid, field_name="quote bid")
-        ask = _coerce_live_float(quote.ask, field_name="quote ask")
-    except ValueError as exc:
-        raise ValueError(f"Broker quote for {symbol} is unusable: {exc}") from exc
-    if bid <= 0 or ask <= 0:
-        raise ValueError(
-            f"Broker quote for {symbol} is unusable: bid={bid!r}, ask={ask!r} "
-            "(both sides must be > 0)."
-        )
-    if bid > ask:
-        raise ValueError(
-            f"Broker quote for {symbol} is crossed: bid={bid!r} > ask={ask!r}; "
-            "refusing to gate on it."
-        )
-    return bid, ask
+    """The entry gate's quote check (#125).
+
+    The rules live in :func:`~live_runner.base_adapter.validate_live_quote_prices`
+    because cTrader's conversion chain (#146) validates the very same shape to
+    size an entry from it; only the wording is this layer's.
+    """
+    return validate_live_quote_prices(quote, symbol=symbol, label="Broker quote")
 
 
 # Upper bound for one quote fetch of the entry-deviation gate (#125). Above the
@@ -1327,6 +1314,15 @@ async def _metadata_for_exit_only_order(
         "position_ids",
         "position_count",
     ):
+        metadata.pop(key, None)
+    # A close is sized from the broker book, so neither the entry gate's nor
+    # the pip value's record can describe it. Both are dropped here for the
+    # same reason the entry path drops them: a payload value under one of these
+    # names may never survive to persistence or reach the adapter. Leaving them
+    # would let an untrusted payload wedge the close - cTrader's submit-time
+    # scale guard reads pip_value_units_per_qty and refuses the order when it
+    # does not match the symbol's current scale (#146, #125).
+    for key in (*_ENTRY_QUOTE_METADATA_KEYS, *_PIP_VALUE_METADATA_KEYS):
         metadata.pop(key, None)
     metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)

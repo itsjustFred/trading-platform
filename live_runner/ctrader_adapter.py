@@ -27,6 +27,7 @@ from live_runner.base_adapter import (
     money_digits_from_trader,
     money_scale,
     order_not_submitted,
+    validate_live_quote_prices,
 )
 from live_runner.credential_env import resolve_env_value
 from shared.database import (
@@ -417,31 +418,12 @@ def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
 
 
 def _conversion_quote_prices(quote: Any, *, symbol: str) -> tuple[float, float]:
-    """Validated (bid, ask) of a conversion-rate quote, failing closed (#146)."""
-    if not isinstance(quote, LiveQuote):
-        raise ValueError(f"cTrader returned no usable conversion quote for {symbol}")
-    prices: list[float] = []
-    for side in (quote.bid, quote.ask):
-        if side is None or isinstance(side, bool):
-            raise ValueError(f"cTrader conversion quote for {symbol} has a missing side")
-        try:
-            price = float(side)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"cTrader conversion quote for {symbol} is not numeric: {side!r}"
-            ) from exc
-        if not math.isfinite(price) or price <= 0:
-            raise ValueError(
-                f"cTrader conversion quote for {symbol} is not positive and finite: "
-                f"bid={quote.bid!r} ask={quote.ask!r}"
-            )
-        prices.append(price)
-    bid, ask = prices
-    if bid > ask:
-        raise ValueError(
-            f"cTrader conversion quote for {symbol} is crossed: bid={bid!r} > ask={ask!r}"
-        )
-    return bid, ask
+    """Validated (bid, ask) of a conversion-rate quote, failing closed (#146).
+
+    The rules are shared with the daemon's entry gate
+    (:func:`live_runner.base_adapter.validate_live_quote_prices`); only the label is ours.
+    """
+    return validate_live_quote_prices(quote, symbol=symbol, label="cTrader conversion quote")
 
 
 def _deal_id_or_none(deal: Any | None) -> int | None:
