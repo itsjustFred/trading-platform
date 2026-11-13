@@ -148,5 +148,6 @@ Sommer und ab 2024-04 in den US-only-DST-Wochen falsch (1 h, betroffen sind
 Behoben: die Vergleichsmatrix importiert die Reports jetzt über denselben
 `broker_clock` (`dukascopy_mt5_forex` / `dukascopy_mt5_index`), den auch
 `scripts/regenerate_mt5_parity_artifacts.py` für die Platform-Runs nutzt.
-Offen: `scripts/analyze_mt5_parity.py` (`MT5_SOURCE_TIMEZONE`) liest weiter
-`Europe/Athens`.
+`scripts/analyze_mt5_parity.py` nutzt denselben Weg: Report-Import und
+Session-/Jahres-Bucketing laufen auf der Broker-Serverzeit des jeweiligen
+Symbols statt auf `Europe/Athens`.
