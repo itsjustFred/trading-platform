@@ -102,11 +102,16 @@ def download_prices(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download adjusted daily close and open prices from yfinance.
 
-    A-M6: history is loaded from ``history_start`` (default: the QC data
-    start 2015-08-04) instead of the backtest ``start``, so the SMA(200)
-    ready-gate counts its 200 bars from the same origin LEAN does. Without
-    this the gate goes ready ~100 trading days late on histories that start
-    at the backtest start (the Brexit window is affected).
+    A-M6: the download starts ``HISTORY_LOOKBACK_MARGIN_DAYS`` (200 calendar
+    days) BEFORE ``history_start`` — ``price_history_start`` returns 2015-01-16
+    for the default (QC data start 2015-08-04, backtest start 2016-01-01) —
+    because QC's ``History(symbol, 130, Daily)`` is not bounded by the
+    algorithm's data start and still reaches back into 2015-06 at the first
+    rebalance.  Only the SMA(200) ready-gate counts its bars from
+    ``history_start`` itself; the covariance/correlation lookback (120 returns)
+    must be FULL at the first rebalance, which is what the margin buys.
+    Starting the download at ``history_start`` instead leaves the first
+    covariance window short (~105 of 120 returns).
     """
     effective_start = price_history_start(start, history_start)
     data = yf.download(TICKERS, start=effective_start, end=end, auto_adjust=True, progress=False)
@@ -258,6 +263,13 @@ def weekly_correlation_regimes(returns: pd.DataFrame) -> dict[pd.Timestamp, str]
         if loc < 31:
             # Fewer observations than the 30-day recent window plus one: the correlation
             # is undefined, and QC's History() always supplies a full window.
+            # Logged so the missing state update is visible rather than silent.
+            logger.debug(
+                "Weekly correlation regime for %s skipped: %d return bars precede it "
+                "(need 31); the previous regime stays active",
+                regime_date.date(),
+                loc,
+            )
             continue
         hist_start = max(0, loc - 120)
         ret_matrix = returns.iloc[hist_start:loc].T.values
@@ -290,6 +302,48 @@ def apply_tail_risk_hedge(weights: dict[str, float]) -> dict[str, float]:
         elif ticker == "GLD":
             hedged[ticker] *= 1.5
     return hedged
+
+
+def compounded_growth(
+    returns: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp
+) -> dict[str, float]:
+    """Compound the return rows between two bars (``start_date`` exclusive, ``end_date`` inclusive).
+
+    A-M9: there must be exactly ONE mark-to-market implementation.  The
+    rebalance-time value (``advance_portfolio_value``) feeds the 2% drifted-weight
+    trade gate, the order sizing and the attribution PnL, while
+    ``_simulate_portfolio_value`` compounds the same returns into the published
+    equity curve.  Deriving the drift from raw price ratios instead would walk a
+    different set of bars: ``prices.pct_change().dropna()`` deletes a bar whenever
+    ANY ticker has a missing close (``download_prices`` only drops all-NaN rows and
+    ``_load_local_prices`` unions unaligned per-ticker series), so a raw ratio
+    silently includes moves the curve drops and the two paths disagree.
+
+    Refuses loudly (``ValueError``) on a non-finite factor: a missing close inside
+    the interval would otherwise poison every downstream PnL and size with NaN and
+    still be serialised into the artifact.
+    """
+    if start_date not in returns.index:
+        raise ValueError(
+            f"growth window start {start_date.date()} is not a return bar of the price history"
+        )
+    if end_date not in returns.index:
+        raise ValueError(
+            f"growth window end {end_date.date()} is not a return bar of the price history"
+        )
+    window = returns.loc[(returns.index > start_date) & (returns.index <= end_date)]
+    growth: dict[str, float] = {}
+    for ticker in returns.columns:
+        values = window[ticker].to_numpy(dtype=float)
+        factor = float(np.prod(1.0 + values))
+        if not np.isfinite(factor) or factor <= 0.0:
+            raise ValueError(
+                f"non-finite compounded growth for {ticker} between "
+                f"{start_date.date()} and {end_date.date()}: the price history has a "
+                "missing/invalid close inside the rebalance interval"
+            )
+        growth[ticker] = factor
+    return growth
 
 
 def _simulate_portfolio_value(
@@ -434,8 +488,10 @@ def run_backtest(
 ) -> dict[str, Any]:
     """Run the risk parity backtest and return result dict."""
     if prices is None:
-        # A-M6: download from history_start (default QC data start) so the
-        # SMA(200) IsReady gate counts from the LEAN origin.
+        # A-M6: the download starts ``history_start`` minus
+        # HISTORY_LOOKBACK_MARGIN_DAYS (price_history_start), so the SMA(200)
+        # IsReady gate counts from the LEAN origin AND the 120-return covariance
+        # window is already full at the first rebalance.
         prices, open_prices = download_prices(start_date, end_date, history_start=history_start)
     elif open_prices is None:
         open_prices = prices
@@ -494,10 +550,7 @@ def run_backtest(
         Returns the drifted weights; updates ``portfolio_value_at_rebalance``.
         """
         nonlocal portfolio_value_at_rebalance, last_rebalance_value_date
-        growth = {
-            t: float(prices[t].loc[rebalance_date] / prices[t].loc[last_rebalance_value_date])
-            for t in TICKERS
-        }
+        growth = compounded_growth(returns, last_rebalance_value_date, rebalance_date)
         grown = {t: current_weights[t] * growth[t] for t in TICKERS}
         cash_weight = 1.0 - sum(current_weights.values())
         total = cash_weight + sum(grown.values())
@@ -516,6 +569,15 @@ def run_backtest(
         return float(prices.at[date, ticker])
 
     for i, reb_date in enumerate(rebalance_dates):
+        if reb_date not in returns.index or returns.index.get_loc(reb_date) < 1:
+            # No completed bar before the rebalance: nothing to decide on. Skip BEFORE the
+            # mark-to-market advances so no state is mutated, and make the skip visible.
+            logger.warning(
+                "Rebalance %s skipped: no completed return bar precedes it; the portfolio "
+                "stays in cash until the next rebalance",
+                reb_date.date(),
+            )
+            continue
         interval_start_portfolio_value = portfolio_value_at_rebalance
         drifted_weights = advance_portfolio_value(reb_date)
         current_portfolio_value = portfolio_value_at_rebalance
@@ -524,10 +586,16 @@ def run_backtest(
         # at ``reb_date``'s close. The decision window therefore ends before ``reb_date``'s own
         # return; using it would be a one-day look-ahead (it flips the hedge in 2020-03/2022-03).
         loc = returns.index.get_loc(reb_date)
-        if loc < 1:
-            continue  # no completed bar before the rebalance: nothing to decide on
         hist_start = max(0, loc - lookback_corr)
         ret_matrix = returns.iloc[hist_start:loc].T.values
+        if ret_matrix.shape[1] < lookback_corr:
+            logger.warning(
+                "Rebalance %s: covariance window has %d of %d return observations "
+                "(short price history); weights are estimated on a thin window",
+                reb_date.date(),
+                ret_matrix.shape[1],
+                lookback_corr,
+            )
 
         cov = calculate_covariance(ret_matrix)
         weights = calculate_risk_parity_weights(cov, min_weight, max_weight, TICKERS)
@@ -577,6 +645,7 @@ def run_backtest(
                     "hedge_active": hedge_active,
                     "universe": list(TICKERS),
                     "covariance_lookback_days": lookback_corr,
+                    "covariance_observations": int(ret_matrix.shape[1]),
                     "target_volatility": target_vol,
                     "max_leverage": max_leverage,
                     "min_weight": min_weight,

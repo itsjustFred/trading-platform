@@ -50,8 +50,10 @@ Platform conventions that differ from the paper
   This platform fills an ENTRY on the next bar's open (contract §1,
   ``market_order_timing="next_bar_open"``), so an entry is executed one
   bar after the month-end signal, at the open of the first bar of the
-  following month. EXITS fill at the trigger bar's close
-  (``signal_exit_fill="close"`` default), which is the paper's fill.
+  following month. EXITS follow ``signal_exit_fill``: the platform default is
+  ``next_open`` (owner decision 2026-11-13: signal exits fill at the next bar's
+  open, like entries); the paper's close fill is reproduced by running with
+  ``signal_exit_fill="close"`` explicitly.
 - The paper's series is a total-return series. Run this strategy on a
   dividend-adjusted (total-return) dataset to reproduce the paper; on a
   price-only dataset the buy-and-hold drag of the missing dividend yield
@@ -167,7 +169,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 # Entry fills on the NEXT bar's open (platform contract).
                 entries.iloc[i] = True
             elif not in_position and previous_position:
-                # Signal exit fills at this bar's CLOSE (signal_exit_fill="close").
+                # Signal exit: fills at the NEXT bar's open by default
+                # (signal_exit_fill="next_open"); the paper's same-bar close
+                # fill needs signal_exit_fill="close".
                 exits.iloc[i] = True
                 exit_reason.iloc[i] = "sma_timing_below"
                 sma_at_exit.iloc[i] = float(sma_at_bar.iloc[i])

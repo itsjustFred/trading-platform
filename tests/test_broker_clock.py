@@ -266,6 +266,79 @@ def test_offset_accepts_any_timestamp_resolution():
         assert DUKASCOPY_MT5_INDEX.offset_hours(index).tolist() == [2.0, 3.0], unit
 
 
+# ---------------------------------------------------------------------------
+# to_utc: reading a time the broker printed on its own clock
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("clock", "server_time", "expected_utc"),
+    [
+        # Legacy history: forex follows Athens, index CFDs sit on a fixed UTC+2
+        # (so a July timestamp is one hour earlier than Athens would read it).
+        (DUKASCOPY_MT5_FOREX, "2019-07-10 17:00", "2019-07-10 14:00"),
+        (DUKASCOPY_MT5_INDEX, "2019-07-16 18:00", "2019-07-16 16:00"),
+        (DUKASCOPY_MT5_INDEX, "2018-03-29 17:15", "2018-03-29 15:15"),
+        # Transition: fixed UTC+2 for every symbol although the EU is on DST.
+        (DUKASCOPY_MT5_FOREX, "2024-04-01 17:45", "2024-04-01 15:45"),
+        (DUKASCOPY_MT5_INDEX, "2024-04-01 17:15", "2024-04-01 15:15"),
+        # Current history: New York close, so UTC+3 in the US-only DST weeks
+        # (between the US and the EU spring switch, and the EU/US autumn gap).
+        (DUKASCOPY_MT5_INDEX, "2025-03-12 17:45", "2025-03-12 14:45"),
+        (DUKASCOPY_MT5_INDEX, "2026-03-20 17:00", "2026-03-20 14:00"),
+        (DUKASCOPY_MT5_FOREX, "2025-03-13 17:15", "2025-03-13 14:15"),
+        (DUKASCOPY_MT5_INDEX, "2024-10-30 18:00", "2024-10-30 15:00"),
+        # Autumn 2024 switched one week after the US rule: still UTC+3.
+        (DUKASCOPY_MT5_INDEX, "2024-11-05 18:00", "2024-11-05 15:00"),
+        (DUKASCOPY_MT5_FOREX, "2024-11-01 17:45", "2024-11-01 14:45"),
+        # Plain winter time in the current epoch.
+        (DUKASCOPY_MT5_INDEX, "2025-01-15 17:00", "2025-01-15 15:00"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else getattr(value, "name", str(value)),
+)
+def test_to_utc_reads_every_epoch(clock, server_time, expected_utc):
+    out = clock.to_utc([pd.Timestamp(server_time)])
+    assert out[0] == pd.Timestamp(expected_utc, tz="UTC")
+
+
+@pytest.mark.parametrize(
+    "clock", [NY_CLOSE, DUKASCOPY_MT5_FOREX, DUKASCOPY_MT5_INDEX], ids=lambda c: c.name
+)
+def test_to_utc_is_the_right_inverse_of_to_server_time(clock):
+    """Every wall time the clock can show maps back to itself, hourly 2018-2026.
+
+    This walks every DST switch (US and EU) and every segment boundary of the
+    empirical Dukascopy clocks, including the repeated autumn hour.
+    """
+    utc = pd.date_range("2018-01-01", "2026-06-30", freq="h", tz="UTC")
+    server = clock.to_server_time(utc)
+    assert clock.to_server_time(clock.to_utc(server)).equals(server)
+
+
+def test_to_utc_rejects_a_server_time_the_clock_skipped():
+    # 2024-04-06 00:00 UTC the clock jumps UTC+2 -> UTC+3, so the broker never
+    # shows 02:00-03:00 that morning; reading such a time would be a guess.
+    with pytest.raises(ValueError, match="never shows the server wall time"):
+        DUKASCOPY_MT5_INDEX.to_utc([pd.Timestamp("2024-04-06 02:30")])
+
+
+def test_to_utc_returns_the_first_occurrence_of_a_repeated_hour():
+    # 2024-11-10 07:00 UTC the clock steps back UTC+3 -> UTC+2, so 02:00-03:00
+    # happens twice; the first occurrence is the one before the step back.
+    out = DUKASCOPY_MT5_INDEX.to_utc([pd.Timestamp("2024-11-10 02:30")])
+    assert out[0] == pd.Timestamp("2024-11-09 23:30", tz="UTC")
+
+
+def test_to_utc_returns_utc_aware_times_and_keeps_nat():
+    out = DUKASCOPY_MT5_INDEX.to_utc(pd.Series(["2025-07-01 16:30", None]))
+    assert str(out.tz) == "UTC"
+    assert out[0] == pd.Timestamp("2025-07-01 13:30", tz="UTC")
+    assert pd.isna(out[1])
+
+
+def test_to_utc_requires_naive_server_times():
+    with pytest.raises(ValueError, match="pass naive timestamps"):
+        DUKASCOPY_MT5_INDEX.to_utc(pd.DatetimeIndex(["2025-07-01 16:30"], tz="UTC"))
+
+
 def test_resolve_broker_clock():
     assert resolve_broker_clock("") is None
     assert resolve_broker_clock(None) is None

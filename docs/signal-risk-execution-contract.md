@@ -53,6 +53,17 @@ Canonical fields:
 | `take_profit_prices` | Optional ordered target levels. |
 | `metadata` | Indicator values and source-specific diagnostics. |
 
+Fill timing for exits (owner decision 2026-11-13, supersedes any earlier
+"signal exits fill at the trigger bar's close" / "protective exits always fill at
+the level" reading of the fields below): a signal exit uses `order_timing =
+next_bar_open` like an entry, so an `exits` row on bar *N* fills at bar *N+1*'s
+open (a last-bar exit is closed by the end-of-data close and flagged
+`signal_exit_deferred_to_end_of_data`). A protective stop/target fills at its
+level on an intrabar touch and at the bar's open when the bar opens beyond it.
+`same_bar_close` remains valid only as an explicit legacy opt-in
+(`signal_exit_fill="close"`) and for signal replay, whose external signals are
+acted on at arrival. See `docs/cross-engine-backtest-contract.md` §1.
+
 Rules:
 
 - `signal_id` must be unique within the strategy run and stable across replay
@@ -126,7 +137,7 @@ Adapter context supplies required fields that legacy tuples do not contain:
 | `execution_symbol` | Broker/data symbol context when different, otherwise omitted. |
 | `timeframe` | Dataframe or run configuration timeframe. |
 | `timestamp` | Index timestamp of the true `entries` or `exits` row. |
-| `order_timing` | Adapter default, currently explicit configuration such as `next_bar_open` or `same_bar_close`. |
+| `order_timing` | Adapter default, currently explicit configuration such as `next_bar_open` (default for entries **and** signal exits since 2026-11-13) or `same_bar_close` (legacy opt-in). |
 | `order_type` | Adapter default, usually `market` for legacy entry series. |
 | `entry_reference_price` | Row close or explicitly configured reference column used by the legacy strategy. |
 
