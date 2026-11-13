@@ -21,6 +21,7 @@ from scripts.run_risk_parity_backtest import (
     ASSETS,
     TICKERS,
     _simulate_portfolio_value,
+    compounded_growth,
     adjust_for_regime,
     apply_tail_risk_hedge,
     apply_volatility_scaling,
@@ -151,7 +152,8 @@ def test_weekly_correlation_regimes_returns_scheduled_state():
 
 
 def test_run_backtest_skips_small_rebalance_changes_and_fills_material_changes_at_close(monkeypatch):
-    dates = pd.bdate_range("2023-12-29", "2024-03-15")
+    # Two completed bars precede the first rebalance: decisions use data up to the previous close.
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
     dates = dates[dates != pd.Timestamp("2024-01-01")]
     close_prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
     open_prices = close_prices + 1.0
@@ -393,7 +395,11 @@ def test_pdf_gate_bounds_checked_in_reference_stats():
 
 
 def test_download_prices_loads_history_from_qc_start(monkeypatch):
-    """A-M6: downloads start at the QC data start, not the backtest start."""
+    """A-M6: downloads start before the QC data start, not at the backtest start.
+
+    QC's History() is unbounded by the algorithm data start, so a 200-calendar-day
+    lookback margin (130 bars) precedes 2015-08-04 -> 2015-01-16.
+    """
     import scripts.run_risk_parity_backtest as risk_parity
 
     seen: dict[str, str] = {}
@@ -406,7 +412,7 @@ def test_download_prices_loads_history_from_qc_start(monkeypatch):
 
     monkeypatch.setattr(risk_parity.yf, "download", fake_download)
     risk_parity.download_prices("2016-01-01", "2016-06-01")
-    assert seen["start"] == "2015-08-04"
+    assert seen["start"] == "2015-01-16"
 
 
 def test_non_lean_sortino_uses_full_sample_downside():
@@ -429,3 +435,250 @@ def test_non_lean_sortino_uses_full_sample_downside():
     assert plain["stats"]["sortino_ratio"] > 0.0
     lean = run_backtest(**kwargs, lean_statistics=True, risk_free_rate=0.025)
     assert lean["stats"]["sortino_ratio"] > 0.0
+
+
+# --- QuantConnect parity regressions (Sleepy Tan Coyote trade-by-trade comparison) ---
+
+
+def _mock_flat_pipeline(monkeypatch, weights_fn):
+    """Neutralise covariance/solver/regime/hedge so only timing + accounting remain."""
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    monkeypatch.setattr(risk_parity, "calculate_covariance", lambda *a, **k: np.eye(len(TICKERS)))
+    monkeypatch.setattr(risk_parity, "calculate_risk_parity_weights", lambda *a, **k: weights_fn())
+    monkeypatch.setattr(risk_parity, "adjust_for_regime", lambda weights, regime: dict(weights))
+    monkeypatch.setattr(
+        risk_parity,
+        "apply_volatility_scaling",
+        lambda weights, cov, target_vol, max_leverage, max_weight, tickers: dict(weights),
+    )
+    monkeypatch.setattr(risk_parity, "apply_tail_risk_hedge", lambda weights: dict(weights))
+    monkeypatch.setattr(risk_parity, "weekly_correlation_regimes", lambda returns: {})
+
+
+def _first_rebalance_after(dates, warm_up_days):
+    month_starts = pd.date_range(dates[0], dates[-1], freq="MS")
+    month_starts = month_starts[month_starts > dates[warm_up_days]]
+    return next(d for d in dates if d >= month_starts[0])
+
+
+@pytest.mark.parametrize(
+    ("crash_offset", "expected_hedge"),
+    [
+        (0, False),  # SPY crashes ON the rebalance day: QC's 10:00 decision cannot see it
+        (-1, True),  # SPY crashed the session BEFORE: visible at 10:00, hedge must fire
+    ],
+)
+def test_hedge_decision_uses_previous_close_not_rebalance_day_close(
+    monkeypatch, crash_offset, expected_hedge
+):
+    """QC runs Rebalance at 10:00 on daily data: SPY price/SMA200 are the PREVIOUS close.
+
+    Hand computation (constant 100, one SPY bar crashed to 50 inside the 200-bar window):
+    SMA200 = (199 * 100 + 50) / 200 = 99.75 and 50 < 0.98 * 99.75 = 97.755, so the hedge
+    fires iff the crash bar is the last completed bar before the rebalance day.
+    """
+    dates = pd.bdate_range("2015-08-04", periods=330)
+    warm_up_days = 215
+    reb = _first_rebalance_after(dates, warm_up_days)
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[dates[dates.get_loc(reb) + crash_offset], "SPY"] = 50.0
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=warm_up_days,
+    )
+
+    first = result["portfolio_target_signals"][0]
+    assert first["timestamp"] == reb.strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert first["metadata"]["hedge_active"] is expected_hedge
+
+
+def test_weekly_regime_window_ends_before_the_regime_date():
+    """QC's 09:45 regime callback sees data up to the previous close only."""
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2024-01-02", periods=200)
+    returns = pd.DataFrame(rng.normal(0, 0.01, (200, len(TICKERS))), index=dates, columns=TICKERS)
+
+    regimes = weekly_correlation_regimes(returns)
+
+    assert regimes
+    for regime_date, regime in regimes.items():
+        loc = returns.index.get_loc(regime_date)
+        expected = detect_correlation_regime(returns.iloc[max(0, loc - 120) : loc].T.values)
+        assert regime == expected
+
+
+def test_rebalancing_starts_at_start_date_when_history_precedes_it(monkeypatch):
+    """QC's SetWarmUp period precedes SetStartDate: first order on the first session of 2016.
+
+    Counting ``warm_up_days`` bars from the first history row (2015-08-04) instead skipped
+    the 2016-01/02/03 rebalances (first rebalance 2016-04-01 in the audit). The equity
+    curve starts at the last bar before the start date with the initial cash.
+    """
+    dates = pd.bdate_range("2015-08-04", "2016-03-15")
+    dates = dates[dates != pd.Timestamp("2016-01-01")]  # market holiday
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date="2016-01-01",
+        end_date="2016-03-15",
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=150,
+    )
+
+    assert [s["timestamp"][:10] for s in result["portfolio_target_signals"]] == [
+        "2016-01-04",
+        "2016-02-01",
+        "2016-03-01",
+    ]
+    curve = result["portfolio_value"]
+    assert curve.index[0] == pd.Timestamp("2015-12-31")
+    assert float(curve.iloc[0]) == pytest.approx(1_000_000.0)
+
+
+def test_trade_gate_uses_drifted_holding_weight(monkeypatch):
+    """QC gates on HoldingsValue / TotalPortfolioValue, which drifts with prices.
+
+    Hand computation: 11 legs at 1/11. SPY +25% -> SPY value 1.25/11, portfolio
+    1 + 0.25/11 = 11.25/11, drifted SPY weight = 1.25 / 11.25 = 1/9. Back to the 1/11 target
+    the delta is 1/11 - 1/9 = -2/99 = -0.0202 (> 2% gate, so SPY is sold) while every other
+    leg drifted to 1/11.25 = 0.0889 (delta +0.0020, kept). Comparing against the stale
+    last-target weight would see delta 0 for all legs and never trade.
+    """
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[dates >= pd.Timestamp("2024-01-16"), "SPY"] = 125.0
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    by_day: dict[str, list[dict]] = {}
+    for trade in result["trades"]:
+        by_day.setdefault(trade["exit_time"][:10], []).append(trade)
+    assert len(by_day["2024-01-02"]) == len(TICKERS)
+    assert [t["symbol"] for t in by_day["2024-02-01"]] == ["SPY"]
+    spy = by_day["2024-02-01"][0]
+    assert spy["meta"]["previous_weight"] == pytest.approx(1 / 9, abs=1e-7)
+    assert spy["meta"]["delta_weight"] == pytest.approx(-2 / 99, abs=1e-7)
+    # March: the other legs sit at 1/11.25 (+0.20% off target, inside the gate), SPY is on target.
+    assert "2024-03-01" not in by_day
+
+
+def test_portfolio_value_is_buy_and_hold_between_rebalances():
+    """Hand computation: 50% SPY, then SPY x1.25 and x0.8 (net 1.0).
+
+    Buy-and-hold: 1 + 0.5 * (1.25 * 0.8 - 1) = 1.0 exactly. A daily-reset constant mix would
+    give (1 + 0.5 * 0.25) * (1 - 0.5 * 0.2) = 1.0125.
+    """
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    returns = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    returns["SPY"] = [0.0, 0.25, -0.2, 0.0]
+    schedule = {dates[0]: {t: (0.5 if t == "SPY" else 0.0) for t in TICKERS}}
+
+    value = _simulate_portfolio_value(returns, 100_000.0, schedule)
+
+    assert float(value.iloc[1]) == pytest.approx(112_500.0)  # 50k cash + 50k * 1.25
+    assert float(value.iloc[-1]) == pytest.approx(100_000.0)
+
+
+def test_checked_in_reference_stays_within_lean_ground_truth():
+    """Parity pin vs the QuantConnect run "Sleepy Tan Coyote" (LEAN ground truth).
+
+    The regenerated reimplementation (yfinance adjusted prices, 2026-11-13) measured
+    return 0.9296 vs 0.9378, CAGR 7.58% vs 7.62%, max DD 17.85% vs 17.70%, Sharpe 0.351 vs
+    0.372, vol 8.76% vs 8.7%. The tolerances are the measured gap plus headroom and are tight
+    enough that any of the fixed defects (1-day look-ahead: return 0.73, DD 25%; stale gate:
+    Sharpe 0.35; skipped first 3 rebalances) fails it. The residual is explained by data and
+    modelling differences: no fee model (QC $2,698), fractional shares, QC sizing MOC orders
+    at the previous close, and adjusted-price vendor differences.
+    """
+    import json
+
+    ref_path = (
+        Path(__file__).parent.parent.parent
+        / "strategy-comparisons"
+        / "risk_parity"
+        / "risk_parity_reference.json"
+    )
+    reference = json.loads(ref_path.read_text(encoding="utf-8"))
+    truth = reference["raw_metadata"]["lean_ground_truth"]
+    stats = reference["stats"]
+    assert abs(stats["total_return"] - truth["total_return"]) <= 0.03
+    assert abs(stats["cagr"] - truth["cagr"]) <= 0.003
+    assert abs(abs(stats["max_drawdown"]) - abs(truth["max_drawdown"])) <= 0.005
+    assert abs(stats["sharpe_ratio"] - truth["sharpe_ratio"]) <= 0.03
+    assert abs(stats["annualized_volatility"] - 0.087) <= 0.003
+
+
+def _flat_prices(start: str, end: str, drop: str | None = None) -> pd.DataFrame:
+    dates = pd.bdate_range(start, end)
+    if drop:
+        dates = dates[dates != pd.Timestamp(drop)]
+    rng = np.random.default_rng(7)
+    steps = 1.0 + rng.normal(0.0003, 0.01, size=(len(dates), len(TICKERS)))
+    return pd.DataFrame(100.0 * np.cumprod(steps, axis=0), index=dates, columns=TICKERS)
+
+
+def test_compounded_growth_matches_the_simulated_curve():
+    """A-M9: the rebalance mark-to-market and the equity curve share one compounding."""
+    prices = _flat_prices("2024-01-01", "2024-03-29")
+    returns = prices.pct_change().dropna()
+    start, end = returns.index[3], returns.index[40]
+    growth = compounded_growth(returns, start, end)
+    weights = {t: 1.0 / len(TICKERS) for t in TICKERS}
+    sim = _simulate_portfolio_value(returns, 1000.0, {start: weights})
+    expected = sim.loc[end] / sim.loc[start]
+    got = sum(weights[t] * growth[t] for t in TICKERS)
+    assert got == pytest.approx(expected, rel=1e-12)
+
+
+def test_compounded_growth_refuses_non_finite_returns():
+    prices = _flat_prices("2024-01-01", "2024-02-29")
+    returns = prices.pct_change().dropna()
+    returns.iloc[5, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite compounded growth"):
+        compounded_growth(returns, returns.index[2], returns.index[10])
+
+
+def test_compounded_growth_refuses_unknown_bar():
+    returns = _flat_prices("2024-01-01", "2024-02-29").pct_change().dropna()
+    with pytest.raises(ValueError, match="not a return bar"):
+        compounded_growth(returns, pd.Timestamp("2023-12-01"), returns.index[3])
+
+
+def test_rebalance_without_completed_bar_is_skipped_visibly(caplog):
+    prices = _flat_prices("2024-01-31", "2024-03-15")  # first return bar is 2024-02-01
+    with caplog.at_level("WARNING"):
+        result = run_backtest(
+            start_date="2024-01-31",
+            end_date="2024-03-15",
+            prices=prices,
+            warm_up_days=0,
+        )
+    assert any("no completed return bar" in r.message for r in caplog.records)
+    assert result["portfolio_target_signals"][0]["timestamp"] != "2024-02-01T00:00:00Z"
+
+
+def test_short_covariance_window_is_logged_and_recorded(caplog):
+    prices = _flat_prices("2023-10-02", "2024-03-15")
+    with caplog.at_level("WARNING"):
+        result = run_backtest(
+            start_date="2024-01-01", end_date="2024-03-15", prices=prices, warm_up_days=0
+        )
+    first = result["portfolio_target_signals"][0]["metadata"]
+    assert first["covariance_observations"] < first["covariance_lookback_days"]
+    assert any("covariance window" in r.message for r in caplog.records)

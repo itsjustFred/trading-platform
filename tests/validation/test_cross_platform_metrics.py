@@ -42,7 +42,7 @@ def test_cross_platform_matrix_includes_reference_metrics():
     # (A-H3/A-L3/A-L4: calendar-day returns, risk-free-rate subtraction —
     # see the raw_metadata note in risk_parity_reference.json); this pins
     # the regenerated value, not the pre-A-M6 0.544687.
-    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.213296
+    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.350569
     assert rows["risk_parity_quantconnect"]["platform_path"].endswith(
         "data/backtests/risk_parity_quantconnect_reimplementation.json"
     )
