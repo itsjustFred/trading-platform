@@ -208,6 +208,17 @@ jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
 gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
 Orders (simple) bleiben unverändert.
 
+## Commission-Vorzeichen (#184 Finding 14)
+
+`live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**
+(Gebühr = positiv, Rebate = negativ, bekannt-null = `0.0`). Net-PnL ist überall
+`gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
+Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
+als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
+`base_adapter.commission_cost` negiert; Alpaca speichert `abs(commission)`.
+Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) tragen noch das rohe
+negative Vorzeichen und werden nicht automatisch migriert.
+
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:

@@ -2322,6 +2322,39 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
     assert saved[0][1] == 3500.0
 
 
+@pytest.mark.parametrize("reported", ["-0.75", "0.75"])
+def test_alpaca_commission_is_stored_as_a_positive_cost(monkeypatch, reported):
+    """`live_executions.commission` is a positive cost for every broker (net = gross - fee)."""
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    saved: list[LiveExecution] = []
+
+    def _capture(execution: LiveExecution, cumulative_qty: float) -> float:
+        saved.append(execution)
+        return execution.filled_qty
+
+    monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
+    update = SimpleNamespace(
+        event="fill",
+        qty="1",
+        price="50.0",
+        timestamp=datetime.now(timezone.utc),
+        execution_id=f"exec-fee-{reported}",
+        commission=reported,
+        order=SimpleNamespace(
+            client_order_id=str(uuid4()),
+            id=_alpaca_order_id("fee"),
+            filled_qty="1",
+            filled_avg_price="50.0",
+        ),
+    )
+
+    asyncio.run(adapter._on_trade_update(update))
+
+    assert [e.commission for e in saved] == [0.75]
+
+
 @pytest.mark.parametrize("broker_order_id", [None, "", "   ", 0, "0", False])
 def test_alpaca_stream_rejects_missing_or_nonpositive_order_id(
     monkeypatch, broker_order_id
