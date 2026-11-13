@@ -23,6 +23,7 @@ cents).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -215,6 +216,31 @@ def test_eurusd_on_a_usd_account_is_sized_to_the_risk_amount():
     # No conversion needed: no conversion request, only the gate's quote.
     assert fixture.conversion_requests == []
     assert fixture.quote_calls == ["EURUSD"]
+
+
+def test_volume_step_floors_the_pip_value_corrected_volume():
+    # Combination of the pip-value fix (#146) and the broker volume step (#146
+    # demo repro): the step must be applied to the volume derived from the
+    # *corrected* qty, never to a volume sized with pip value 1.0.
+    # pip value 1000 -> qty = 100 USD / (0.0030 * 1000) = 33.333...
+    # raw volume = round(33.333 * 100,000) = 3,333,333; EURUSD demo step is
+    # 100,000 -> floored to 3,300,000 (33,000 EUR). Loss at SL =
+    # 33,000 * 0.0030 = 99.00 USD <= the 100 USD budget (never above it).
+    fixture = _CTrader({"EURUSD": _quote(1.10000)})
+    scale = fixture.adapter._symbol_props["EURUSD"]
+    fixture.adapter._symbol_props["EURUSD"] = dataclasses.replace(scale, step_volume=100_000)
+    deployment = _deployment()
+    signal = _signal(deployment, "EURUSD", entry=1.10000, stop=1.09700, take=1.10600)
+
+    prepared, qty = _prepare(fixture.adapter, deployment, signal)
+
+    assert qty == pytest.approx(100.0 / (0.0030 * 1000.0))
+    volume = fixture.adapter._resolve_order_volume(prepared)
+    assert volume == 3_300_000
+    assert volume % 100_000 == 0
+    loss = _loss_at_stop(volume, 1.10000, 1.09700, 1.0)
+    assert loss == pytest.approx(99.0)
+    assert loss <= RISK_USD
 
 
 def test_usdjpy_converts_the_jpy_pnl_into_usd():

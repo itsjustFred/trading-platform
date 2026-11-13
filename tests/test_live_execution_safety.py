@@ -4904,3 +4904,103 @@ def test_alpaca_bracket_level_on_wrong_side_is_refused_before_persistence(
 
     assert submitted == []
     assert saved == []
+
+
+# ── cTrader volume step: risk-sized volume must land on the broker grid ───────
+
+
+def _load_eurusd_demo_props(adapter, *, step_volume: int | None) -> None:
+    """Load EURUSD props as the cTrader demo reports them (2026-11-13).
+
+    lotSize 10_000_000 and minVolume/stepVolume 100_000 are broker volume units
+    (cents of the base currency): one lot is 100_000 EUR, the minimum and the
+    grid are 1_000 EUR.
+    """
+    protobuf = pytest.importorskip("ctrader_open_api.messages.OpenApiMessages_pb2")
+    model = pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+    response = protobuf.ProtoOASymbolByIdRes()
+    symbol = model.ProtoOASymbol()
+    symbol.symbolId = 1
+    symbol.digits = 5
+    symbol.pipPosition = 4
+    symbol.lotSize = 10_000_000
+    symbol.minVolume = 100_000
+    if step_volume is not None:
+        symbol.stepVolume = step_volume
+    response.symbol.append(symbol)
+
+    async def _send_request(_request, *, timeout_seconds=15):
+        return response
+
+    adapter._send_request_with_refresh_retry = _send_request
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 1}))
+
+
+def test_ctrader_broker_step_volume_is_cached() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    scale = adapter._scale_for("EURUSD")
+    assert scale.source == "broker"
+    assert scale.step_volume == 100_000
+
+
+@pytest.mark.parametrize(
+    ("qty", "expected_volume"),
+    [
+        # Demo repro: qty 18.088... sized to volume 1_808_803, which cTrader
+        # rejected with TRADING_BAD_VOLUME ("must be multiple of volume step").
+        (18.08803, 1_800_000),
+        (1.0499, 100_000),
+        (1.9999, 100_000),
+        (2.0, 200_000),
+    ],
+)
+def test_ctrader_order_volume_is_floored_to_broker_step(
+    qty: float, expected_volume: int
+) -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    volume = adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": qty}))
+
+    assert volume == expected_volume
+    assert volume % 100_000 == 0
+    # Never rounded up past the risk-sized volume.
+    assert volume <= qty * adapter._scale_for("EURUSD").volume_per_qty
+
+
+def test_ctrader_volume_floored_below_minimum_is_refused_not_upsized() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    signal = _ctrader_signal("EURUSD", {"qty": 0.9994})
+    with pytest.raises(ValueError, match="below the broker minimum"):
+        adapter._resolve_order_volume(signal)
+
+
+def test_ctrader_new_order_request_volume_is_on_broker_step() -> None:
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.10504,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.4, "stop_loss": 1.10304, "take_profit": 1.10904},
+    )
+
+    request = adapter._build_new_order_request(signal, symbol_id=1)
+
+    assert request.volume == 100_000
+
+
+def test_ctrader_missing_step_volume_keeps_unrounded_volume() -> None:
+    """No broker grid and no fallback grid: the volume is not altered."""
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=None)
+
+    assert adapter._scale_for("EURUSD").step_volume == 1
+    assert adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": 1.23456})) == 123_456
