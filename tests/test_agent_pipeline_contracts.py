@@ -83,9 +83,19 @@ STAGES = {
 # The documented verdict -> status map, per stage. INCOMPLETE is the "the run produced no
 # verdict" outcome and is always an `error`, never a `failure`.
 VERDICT_STATUS = {
-    "code-review": {"PASS": "success", "BLOCK": "failure", "CHANGES-REQUESTED": "failure", "INCOMPLETE": "error"},
+    "code-review": {
+        "PASS": "success",
+        "BLOCK": "failure",
+        "CHANGES-REQUESTED": "failure",
+        "INCOMPLETE": "error",
+    },
     "mutation-testing": {"PASS": "success", "GAPS": "failure", "INCOMPLETE": "error"},
-    "pre-mortem": {"PASS": "success", "BLOCK": "failure", "CHANGES-REQUESTED": "failure", "INCOMPLETE": "error"},
+    "pre-mortem": {
+        "PASS": "success",
+        "BLOCK": "failure",
+        "CHANGES-REQUESTED": "failure",
+        "INCOMPLETE": "error",
+    },
 }
 
 # The chain: which workflow each stage dispatches on PASS. The last stage dispatches nothing;
@@ -151,12 +161,16 @@ def test_every_agent_workflow_parses_and_declares_its_chain_jobs() -> None:
     for name in AGENT_WORKFLOWS:
         data = _load(name)
         jobs = data.get("jobs")
-        assert isinstance(jobs, dict) and "resolve" in jobs and "post" in jobs, f"{name}: {list(jobs)}"
+        assert isinstance(jobs, dict), f"{name}: jobs is not a mapping"
+        assert "resolve" in jobs, f"{name}: no resolve job in {list(jobs)}"
+        assert "post" in jobs, f"{name}: no post job in {list(jobs)}"
         triggers = _triggers(data)
         assert "pull_request" in triggers or "workflow_dispatch" in triggers, f"{name}: no trigger"
         assert "pr_number" in triggers["workflow_dispatch"]["inputs"], f"{name}: no pr_number input"
         assert isinstance(_agent_job(data)[1], dict), f"{name}: no agent job"
-        assert "verdict" in _agent_job(data)[1].get("outputs", {}), f"{name}: agent job publishes no verdict"
+        assert "verdict" in _agent_job(data)[1].get("outputs", {}), (
+            f"{name}: agent job publishes no verdict"
+        )
 
 
 def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
@@ -167,13 +181,15 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
         verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
         assert verdicts_line, f"{stage}: the skill documents no verdict line"
         documented = set(re.findall(r"`([A-Z-]+)`", verdicts_line.group(0)))
-        assert documented == set(mapping), f"{stage}: skill verdicts {sorted(documented)} != map {sorted(mapping)}"
+        assert documented == set(mapping), (
+            f"{stage}: skill verdicts {sorted(documented)} != map {sorted(mapping)}"
+        )
 
         data = _load(STAGES[stage][0])
         post = data["jobs"]["post"]
         body = _run(_find_step(post, STAGES[stage][5]))
         case = re.search(r'case "\$VERDICT" in(.*?)\n\s*esac', body, re.S)
-        assert case, f"{stage}: post job has no `case \"$VERDICT\"` map"
+        assert case, f'{stage}: post job has no `case "$VERDICT"` map'
         pairs = {}
         for arm, state in re.findall(r"^\s*([A-Z|-]+)\)\s*state=(\w+)\s*;;", case.group(1), re.M):
             for verdict in arm.split("|"):
@@ -181,7 +197,9 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
         assert pairs, f"{stage}: parsed no verdict arms from {case.group(1)!r}"
         # The map is total: the catch-all is `error`, and INCOMPLETE reaches it (explicitly or
         # through the catch-all), so a verdict the agent produced can never go unplaced.
-        assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), f"{stage}: the map is not total"
+        assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), (
+            f"{stage}: the map is not total"
+        )
         assert pairs.get("INCOMPLETE", "error") == "error", f"{stage}: INCOMPLETE is not an error"
         explicit = {v: s for v, s in mapping.items() if v != "INCOMPLETE"}
         assert pairs == explicit, f"{stage}: arms {pairs} != documented {explicit}"
@@ -196,7 +214,9 @@ def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
         m = re.search(r"sed -nE 's/\^Verdict:\[\[:space:\]\]\*\((.*?)\)", _all_run_bodies(data))
         assert m, f"{stage}: no verdict regex"
         accepted = set(m.group(1).split("|"))
-        assert accepted == set(mapping), f"{stage}: regex accepts {sorted(accepted)}, map has {sorted(mapping)}"
+        assert accepted == set(mapping), (
+            f"{stage}: regex accepts {sorted(accepted)}, map has {sorted(mapping)}"
+        )
 
 
 def test_contexts_markers_and_titles_follow_the_stage_convention() -> None:
@@ -242,13 +262,16 @@ def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem() -> None
         permissions = post.get("permissions", {})
         if target is None:
             assert not dispatched, f"{stage}: dispatches {sorted(dispatched)} but is the last stage"
-            assert "actions" not in permissions, f"{stage}: holds actions: write but dispatches nothing"
+            assert "actions" not in permissions, (
+                f"{stage}: holds actions: write but dispatches nothing"
+            )
             continue
-        assert dispatched == {target}, f"{stage}: dispatches {sorted(dispatched)}, want exactly {{{target}}}"
-        assert permissions.get("actions") == "write", f"{stage}: dispatches without actions: write"
-        assert "-f pr_number=" in bodies and "-f head_sha=" in bodies, (
-            f"{stage}: dispatch does not pass the PR number and the head SHA"
+        assert dispatched == {target}, (
+            f"{stage}: dispatches {sorted(dispatched)}, want exactly {{{target}}}"
         )
+        assert permissions.get("actions") == "write", f"{stage}: dispatches without actions: write"
+        assert "-f pr_number=" in bodies, f"{stage}: dispatch does not pass the PR number"
+        assert "-f head_sha=" in bodies, f"{stage}: dispatch does not pass the head SHA"
 
 
 def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
@@ -266,7 +289,12 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
         MUTATION: (("pr-mutation", "<agent>"), ("mutation", "<stage>")),
         PREMORTEM: (("pr-premortem", "<agent>"), ("premortem", "<stage>")),
     }
-    guard_tags = ("**Summary:", "git status --porcelain", "not updating the comment", "grep -v '^[[:space:]]*$'")
+    guard_tags = (
+        "**Summary:",
+        "git status --porcelain",
+        "not updating the comment",
+        "grep -v '^[[:space:]]*$'",
+    )
 
     def guards(name: str) -> list[str]:
         data = _load(name)
@@ -289,6 +317,31 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
         assert not missing, f"{other} is missing the shared guard lines:\n" + "\n".join(missing)
 
 
+def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
+    """Every `npm install` in the agent jobs passes `--ignore-scripts`, so no dependency's
+    install hook runs on the runner; @opencode/cli's own postinstall (it links the platform
+    binary) is then run by name. SonarCloud rates a plain `npm install` a security issue, and
+    that one rule was what kept the quality gate red on every agent workflow PR."""
+    for name in AGENT_WORKFLOWS:
+        _job_name, job = _agent_job(_load(name))
+        body = _run(_find_step(job, r"^Install opencode$"))
+        installs = [line for line in body.splitlines() if "npm install" in line]
+        assert installs, f"{name}: the install step runs no npm install"
+        for line in installs:
+            assert "--ignore-scripts" in line, f"{name}: npm install without --ignore-scripts"
+        assert "node ./postinstall.mjs" in body, f"{name}: opencode's postinstall is not run"
+
+
+def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
+    """A manual dispatch names no head_sha. Once "Mark running" has written `pending`, the
+    reporter must still have a SHA to clear, so it falls back to the resolved head."""
+    for name in (MUTATION, PREMORTEM):
+        step = _find_step(_load(name)["jobs"]["resolve"], r"^Report resolve failure")
+        sha = str(step.get("env", {}).get("HEAD_SHA", ""))
+        assert "inputs.head_sha" in sha, f"{name}: reporter ignores the dispatch input"
+        assert "steps.pr.outputs.head" in sha, f"{name}: reporter has no resolved-head fallback"
+
+
 def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:
     """Without `set -euo pipefail` an unreachable base commit would not abort the step: the
     selection would fall through to the PR's own copy of the skill, letting a PR weaken its
@@ -299,7 +352,9 @@ def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:
         step = _find_step(job, r"^Select skill revision$")
         body = _run(step)
         assert "set -euo pipefail" in body, f"{name}: skill selection is not strict"
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, f"{name}: no hard base-commit check"
+        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
+            f"{name}: no hard base-commit check"
+        )
 
 
 def test_every_stop_path_clears_the_pre_mortem_status() -> None:
@@ -321,11 +376,16 @@ def test_every_stop_path_clears_the_pre_mortem_status() -> None:
     """
     for name in AGENT_WORKFLOWS:
         data = _load(name)
-        own = "PREMORTEM_CONTEXT" if name == PREMORTEM else (
-            "MUTATION_CONTEXT" if name == MUTATION else "REVIEW_CONTEXT"
+        own = (
+            "PREMORTEM_CONTEXT"
+            if name == PREMORTEM
+            else ("MUTATION_CONTEXT" if name == MUTATION else "REVIEW_CONTEXT")
         )
         resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
-        for job, patterns in ((resolve, (r"^Report resolve failure",)), (post, (r"^Report failed .* run$", r"^Report post failure$"))):
+        for job, patterns in (
+            (resolve, (r"^Report resolve failure",)),
+            (post, (r"^Report failed .* run$", r"^Report post failure$")),
+        ):
             for pattern in patterns:
                 step = _find_step(job, pattern)
                 body = _run(step)
@@ -337,7 +397,10 @@ def test_every_stop_path_clears_the_pre_mortem_status() -> None:
                 if "state=error" not in body and "state=pending" not in body:
                     continue
                 contexts = set(re.findall(r"[A-Z][A-Z_]*_CONTEXT", body))
-                assert contexts, f"{name}/{job_name}/{step.get('name')}: writes a status with no context variable"
+                assert contexts, (
+                    f"{name}/{job_name}/{step.get('name')}: "
+                    "writes a status with no context variable"
+                )
                 if "state=error" in body or len(contexts) > 1:
                     assert "PREMORTEM_CONTEXT" in contexts, (
                         f"{name}/{job_name}/{step.get('name')}: stops the chain for "
@@ -365,7 +428,8 @@ def test_the_cancel_step_covers_both_downstream_workflows() -> None:
     body = _run(cancel)
     for target in (MUTATION, PREMORTEM):
         assert target in body, f"the cancel step does not cover {target}"
-    assert cancel.get("if") and "pull_request" in cancel["if"], "the cancel step must only run on a push"
+    assert cancel.get("if"), "the cancel step must only run on a push"
+    assert "pull_request" in cancel["if"], "the cancel step must only run on a push"
 
 
 def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
@@ -374,9 +438,15 @@ def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
     for name in AGENT_WORKFLOWS:
         _job_name, job = _agent_job(_load(name))
         permissions = job.get("permissions", {})
-        assert permissions == {"contents": "read"}, f"{name}: agent job permissions are {permissions}"
-        checkout = next(s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/checkout"))
-        assert checkout["with"].get("persist-credentials") is False, f"{name}: checkout keeps credentials"
+        assert permissions == {"contents": "read"}, (
+            f"{name}: agent job permissions are {permissions}"
+        )
+        checkout = next(
+            s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/checkout")
+        )
+        assert checkout["with"].get("persist-credentials") is False, (
+            f"{name}: checkout keeps credentials"
+        )
         bodies = _job_bodies([job])
         assert 'git rev-parse HEAD)" != "$HEAD_SHA"' in bodies, f"{name}: no HEAD-unchanged guard"
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
@@ -392,7 +462,9 @@ def _premortem_verdict(output: str, tmp_path) -> str:
     script = f'out="{out.as_posix()}"\n{match.group(0)}\nprintf "%s" "$verdict"\n'
     result = subprocess.run(
         [shutil.which("bash") or "bash", "-c", script],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return result.stdout
 
@@ -403,8 +475,11 @@ def _premortem_verdict(output: str, tmp_path) -> str:
     [
         # The note on its own line after the verdict (seen on a real run, which then
         # refused to post a valid CHANGES-REQUESTED result).
-        ("**Summary:** x\n\n**Verdict: CHANGES-REQUESTED** — harden.\nHuman sign-off required.\n",
-         "CHANGES-REQUESTED"),
+        (
+            "**Summary:** x\n\n**Verdict: CHANGES-REQUESTED** — harden.\n"
+            "Human sign-off required.\n",
+            "CHANGES-REQUESTED",
+        ),
         ("**Summary:** x\n**Verdict: PASS** — advisory. Human sign-off required.\n", "PASS"),
         # Anything else after the verdict still invalidates it.
         ("**Summary:** x\n**Verdict: PASS** — ok\ntrailing chatter\n", ""),

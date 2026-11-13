@@ -297,11 +297,13 @@ jobs:
         with:
           node-version: 22
 
-      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
-      # the platform binary. The job holds no token, so the exposure is bounded.
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
       - name: Install opencode
         run: |
-          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
           opencode --version
 
       # Review rules: the base branch's skill if it has one. Otherwise (only

@@ -158,13 +158,16 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ inputs.head_sha }}
+          # The dispatch input first; a manual dispatch without head_sha falls
+          # back to the resolved head, which exists once "Mark running" ran.
+          HEAD_SHA: ${{ inputs.head_sha || steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          # A manual dispatch without head_sha names no SHA; the run log is the
-          # only signal, and the next push or dispatch re-resolves the state.
+          # Only a manual dispatch without head_sha whose first step failed (before
+          # the head was resolved and before "Mark running") gets here with no SHA;
+          # this run then marked nothing pending, and the run log is the signal.
           if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::No head SHA was named in the dispatch input; a pending stage status can only be cleared by the next push or dispatch."
+            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
             exit 0
           fi
           state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
@@ -206,11 +209,13 @@ jobs:
         with:
           node-version: 22
 
-      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
-      # the platform binary. The job holds no token, so the exposure is bounded.
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
       - name: Install opencode
         run: |
-          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
