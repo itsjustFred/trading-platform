@@ -315,6 +315,7 @@ jobs:
       # same commit.
       - name: Select skill revision
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/review"
           skill="$RUNNER_TEMP/review/skill.md"
           git cat-file -e "${BASE_SHA}^{commit}"
