@@ -54,3 +54,22 @@ def clock_exit_signal_mask(
     otherwise. ``bar_minutes`` of 0 degenerates to the plain ``>=`` test.
     """
     return (minute_of_day + float(bar_minutes)) >= float(exit_minute)
+
+
+def modal_bar_minutes_by_group(
+    utc_times: pd.DatetimeIndex | pd.Series,
+    groups: np.ndarray | pd.Series,
+) -> np.ndarray:
+    """Per-bar nominal spacing in minutes, taken within each group (e.g. a session day).
+
+    For frames that mix bar sizes (a daily stub bar next to an intraday day) the
+    global modal spacing would be wrong for part of the frame; the spacing inside
+    the bar's own group is not. Groups with fewer than two bars get 0.0.
+    """
+    times = pd.DatetimeIndex(pd.to_datetime(utc_times, utc=True, errors="coerce"))
+    keys = np.asarray(groups)
+    out = np.zeros(len(times), dtype=float)
+    frame = pd.DataFrame({"pos": np.arange(len(times)), "key": keys, "t": times})
+    for _, part in frame.dropna(subset=["t"]).groupby("key", sort=False):
+        out[part["pos"].to_numpy()] = modal_bar_minutes(pd.DatetimeIndex(part["t"]))
+    return out
