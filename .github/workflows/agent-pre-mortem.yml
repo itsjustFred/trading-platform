@@ -158,9 +158,9 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The dispatch input first; a manual dispatch without head_sha falls
-          # back to the resolved head, which exists once "Mark running" ran.
-          HEAD_SHA: ${{ inputs.head_sha || steps.pr.outputs.head }}
+          # The resolved head (the commit "Mark running" marked) first; the
+          # dispatch input when the first step failed before writing `head`.
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
         run: |
           set -euo pipefail
           # Only a manual dispatch without head_sha whose first step failed (before
@@ -443,4 +443,32 @@ jobs:
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
               -f description="Post step failed; see the run log" > /dev/null
+          fi
+
+  # A cancelled run (a hand-cancel, or a newer dispatch for the same PR through
+  # the concurrency group) skips every reporter above, which would leave the
+  # stage `pending` with no signal. This job runs only on cancellation and
+  # turns a still-pending status of the analysed commit into an error. A newer
+  # run that already wrote its final status is not touched (pending only).
+  report-cancelled:
+    needs: [resolve, premortem, post]
+    if: ${{ cancelled() && needs.resolve.outputs.head != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled pre-mortem run
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
           fi

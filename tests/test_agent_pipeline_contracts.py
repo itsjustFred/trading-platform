@@ -259,6 +259,17 @@ def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem() -> None
         post = data["jobs"]["post"]
         bodies = _job_bodies([data["jobs"]["post"]])
         dispatched = set(re.findall(r"gh workflow run (agent-[\w-]+\.yml)", bodies))
+        # Every executed dispatch, in any job (echoed override hints excluded), must be one the
+        # post job makes: a dispatch moved elsewhere would slip past the edge check below.
+        executed = {
+            m
+            for line in _all_run_bodies(data).splitlines()
+            if "gh workflow run" in line and "echo" not in line
+            for m in re.findall(r"gh workflow run (agent-[\w-]+\.yml)", line)
+        }
+        assert executed == dispatched, (
+            f"{stage}: dispatches {sorted(executed - dispatched)} outside the post job"
+        )
         permissions = post.get("permissions", {})
         if target is None:
             assert not dispatched, f"{stage}: dispatches {sorted(dispatched)} but is the last stage"
@@ -315,6 +326,14 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
         other_guards = guards(other)
         missing = [g for g in review_guards if g not in other_guards]
         assert not missing, f"{other} is missing the shared guard lines:\n" + "\n".join(missing)
+        # Both directions: a guard line added to one copy only is a fork as well. A stage's own
+        # canned result (mutation testing's "nothing to mutate" summary) is output, not a guard.
+        extra = [
+            g
+            for g in other_guards
+            if g not in review_guards and not g.startswith('echo "**Summary:**')
+        ]
+        assert not extra, f"{other} has guard lines the review copy lacks:\n" + "\n".join(extra)
 
 
 def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
@@ -333,16 +352,49 @@ def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
 
 
 def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
-    """Every stage's resolve reporter prefers the dispatch input and falls back to the resolved
-    head: a manual dispatch may name no head_sha, and a first-step failure writes no `head`,
-    yet a push may already have marked the stages pending. No copy may skip the reporter on an
+    """Every stage's resolve reporter clears the resolved head (the commit its own pending mark
+    went to) and falls back to the dispatch input: a first-step failure writes no `head`, yet a
+    push may already have marked the stages pending. No copy may skip the reporter on an
     empty step output (the review copy once did, stranding all three statuses)."""
     for name in AGENT_WORKFLOWS:
         step = _find_step(_load(name)["jobs"]["resolve"], r"^Report resolve failure")
         sha = str(step.get("env", {}).get("HEAD_SHA", ""))
-        assert "inputs.head_sha" in sha, f"{name}: reporter ignores the dispatch input"
-        assert "steps.pr.outputs.head" in sha, f"{name}: reporter has no resolved-head fallback"
+        assert "steps.pr.outputs.head || inputs.head_sha" in sha, (
+            f"{name}: reporter must prefer the resolved head and fall back to the input: {sha}"
+        )
         assert step.get("if") == "failure()", f"{name}: reporter is skipped on {step.get('if')!r}"
+
+
+def test_every_dispatch_refuses_a_head_that_moved_past_its_sha() -> None:
+    """A dispatch that names head_sha is about that commit. The review override skips the
+    SonarCloud gate, so once the head moves it must refuse instead of reviewing a commit
+    nobody justified; the chained stages stop as superseded. Each copy compares the
+    resolved head with the input before doing anything else."""
+    for name in AGENT_WORKFLOWS:
+        body = _run(_find_step(_load(name)["jobs"]["resolve"], r"^Resolve PR$"))
+        assert "INPUT_SHA" in body, f"{name}: the resolve step ignores the head_sha input"
+        assert '!= "$INPUT_SHA"' in body, f"{name}: no head-moved check against head_sha"
+
+
+def test_a_cancelled_run_clears_its_pending_stage() -> None:
+    """A cancelled run skips every failure() reporter and the post job, so without a dedicated
+    job a hand-cancel or a superseding dispatch strands the stage `pending` on the head. The
+    mutation and pre-mortem stages, which mark themselves running, each own a job that runs
+    only on cancellation and turns their (and every later) still-pending context into an
+    error."""
+    owed = {MUTATION: ("MUTATION_CONTEXT", "PREMORTEM_CONTEXT"), PREMORTEM: ("PREMORTEM_CONTEXT",)}
+    for name, contexts in owed.items():
+        jobs = _load(name)["jobs"]
+        job = jobs.get("report-cancelled")
+        assert job is not None, f"{name}: no report-cancelled job"
+        assert "cancelled()" in str(job.get("if", "")), f"{name}: report-cancelled is not gated"
+        needs = job.get("needs", [])
+        assert "post" in needs, f"{name}: report-cancelled does not wait for the post job"
+        body = _job_bodies([job])
+        assert "state=error" in body, f"{name}: report-cancelled writes no error"
+        assert '= "pending"' in body, f"{name}: report-cancelled overwrites final statuses"
+        for ctx in contexts:
+            assert ctx in body, f"{name}: report-cancelled does not clear {ctx}"
 
 
 def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:
