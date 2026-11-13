@@ -593,14 +593,218 @@ def test_regime_filter_blocks_when_condition_not_met():
 # ---------------------------------------------------------------------------
 # Exit coverage
 # ---------------------------------------------------------------------------
-def test_exit_time_and_eod_present():
-    mod = _load_module()
-    df = _make_df(200)
+def _flat_session_frame(
+    days: list[str],
+    freq: str,
+    *,
+    start: str = "00:00",
+    end: str = "23:59",
+    drop: list[str] | None = None,
+) -> pd.DataFrame:
+    """Flat bars (UTC == server time under the default params) on the given days."""
+    parts = [
+        pd.date_range(f"{day} {start}", f"{day} {end}", freq=freq) for day in days
+    ]
+    stamps = parts[0].append(parts[1:]) if len(parts) > 1 else parts[0]
+    if drop:
+        stamps = stamps.difference(pd.DatetimeIndex(pd.to_datetime(drop)))
+    return pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 100.0,
+        }
+    )
+
+
+def _exit_params(mod, **overrides):
     params = mod.STRATEGY_META["parameters"].copy()
-    _, exits, _, _ = mod.generate_signals(df, params)
-    assert exits.any(), "Expected at least some exit signals"
-    # Last bar should always be an exit (EOD safety net)
-    assert exits.iloc[-1], "Expected last bar to be an exit (EOD safety)"
+    params.update({"exit_time": "22:55", "session_timezone": "", "broker_clock": "", **overrides})
+    return params
+
+
+def _signal_times(df: pd.DataFrame, exits: pd.Series) -> list[str]:
+    return [t.strftime("%H:%M") for t in df.loc[exits[exits].index, "timestamp"]]
+
+
+@pytest.mark.parametrize(
+    ("freq", "first_signal_bar"),
+    [
+        # The next-open fill must land on the first bar OPEN at/after 22:55, i.e. the
+        # signal is raised on the first bar whose end reaches 22:55 ...
+        ("1min", "22:54"),  # ... M1: fills 22:55, MT5's first tick.
+        ("15min", "22:45"),  # M15: the bar holding 22:55 -> fills 23:00.
+        ("1h", "22:00"),  # H1: the bar holding 22:55 -> fills 23:00.
+    ],
+)
+def test_time_exit_signal_precedes_the_exit_bar_open(freq, first_signal_bar):
+    mod = _load_module()
+    df = _flat_session_frame(["2024-01-02"], freq)
+    _, exits, indicators, _ = mod.generate_signals(df, _exit_params(mod))
+
+    times = _signal_times(df, exits)
+    assert times[0] == first_signal_bar
+    # once raised it stays raised on every later bar (an exit that was missed is retried)
+    assert exits.loc[exits.idxmax() :].all()
+    assert indicators["exit_reason"].loc[exits.idxmax()] == "time_exit"
+
+
+def test_time_exit_on_a_bar_aligned_exit_time_signals_the_bar_before():
+    mod = _load_module()
+    df = _flat_session_frame(["2024-01-02"], "15min")
+    _, exits, _, _ = mod.generate_signals(df, _exit_params(mod, exit_time="23:00"))
+    assert _signal_times(df, exits)[0] == "22:45"
+
+
+def test_time_exit_with_the_bar_before_exit_time_missing_signals_the_first_later_bar():
+    mod = _load_module()
+    # 22:54 is missing: nothing at 22:53 (its bar ends 22:54) can know that, so the signal
+    # comes on 22:55 and the next-open fill is one bar later than MT5's first tick.
+    df = _flat_session_frame(["2024-01-02"], "1min", drop=["2024-01-02 22:54"])
+    _, exits, _, _ = mod.generate_signals(df, _exit_params(mod))
+    assert _signal_times(df, exits)[0] == "22:55"
+
+
+def test_time_exit_with_the_exit_minute_bar_missing_still_signals_the_bar_before():
+    mod = _load_module()
+    df = _flat_session_frame(["2024-01-02"], "1min", drop=["2024-01-02 22:55"])
+    _, exits, _, _ = mod.generate_signals(df, _exit_params(mod))
+    assert _signal_times(df, exits)[0] == "22:54"
+
+
+def test_gaps_do_not_change_the_inferred_bar_length():
+    mod = _load_module()
+    # weekend + a long intraday hole: the modal M1 step still wins the vote
+    df = _flat_session_frame(
+        ["2024-01-05", "2024-01-08"],
+        "1min",
+        drop=[str(t) for t in pd.date_range("2024-01-05 10:00", "2024-01-05 14:00", freq="1min")],
+    )
+    _, exits, _, _ = mod.generate_signals(df, _exit_params(mod))
+    day = pd.to_datetime(df["timestamp"]).dt.date.astype(str)
+    for d in ("2024-01-05", "2024-01-08"):
+        late = day == d
+        late &= pd.to_datetime(df["timestamp"]).dt.hour >= 12  # skip the stale-day signal
+        assert _signal_times(df[late], exits[late])[0] == "22:54"
+
+
+def test_session_that_closes_early_signals_on_the_first_bar_of_the_next_day_not_the_last_one():
+    mod = _load_module()
+    early = _flat_session_frame(["2024-01-02"], "1min", end="20:00")
+    nxt = _flat_session_frame(["2024-01-03"], "1min", end="23:59")
+    df = pd.concat([early, nxt], ignore_index=True)
+    _, exits, indicators, _ = mod.generate_signals(df, _exit_params(mod))
+
+    first_next_day = df.index[df["timestamp"] == pd.Timestamp("2024-01-03 00:00")][0]
+    last_early_bar = df.index[df["timestamp"] == pd.Timestamp("2024-01-02 20:00")][0]
+    # the early session end is only knowable once the next day starts: no signal on 20:00
+    assert not exits.loc[: first_next_day - 1].any()
+    assert not exits.iloc[last_early_bar]
+    assert exits.iloc[first_next_day]
+    assert indicators["exit_reason"].iloc[first_next_day] == "end_of_day"
+    # ... and not on the very first bar of the data, which is not provably a new day
+    assert not exits.iloc[0]
+
+
+def test_weekend_gap_signals_on_the_first_bar_of_the_next_trading_day():
+    mod = _load_module()
+    fri = _flat_session_frame(["2024-01-05"], "1min", end="21:00")
+    mon = _flat_session_frame(["2024-01-08"], "1min", end="03:00")
+    df = pd.concat([fri, mon], ignore_index=True)
+    _, exits, _, _ = mod.generate_signals(df, _exit_params(mod))
+    signalled = df.loc[exits[exits].index, "timestamp"]
+    assert signalled.tolist() == [pd.Timestamp("2024-01-08 00:00")]
+
+
+@pytest.mark.parametrize("freq", ["1min", "15min", "1h"])
+def test_exit_signals_never_depend_on_later_bars(freq):
+    """Signals on a prefix of the frame equal the same prefix of the full-frame signals."""
+    mod = _load_module()
+    early = _flat_session_frame(
+        ["2024-01-02"], freq, drop=["2024-01-02 22:54", "2024-01-02 22:30"]
+    )
+    cut = _flat_session_frame(["2024-01-03"], freq, end="19:45")
+    full = pd.concat(
+        [early, cut, _flat_session_frame(["2024-01-04", "2024-01-05"], freq)],
+        ignore_index=True,
+    )
+    params = _exit_params(mod)
+    _, full_exits, _, _ = mod.generate_signals(full, params)
+
+    # every cut point from a few bars in (the frame needs >=2 bars to tell its spacing)
+    for n in range(3, len(full) + 1, max(1, len(full) // 97)):
+        _, prefix_exits, _, _ = mod.generate_signals(full.iloc[:n].copy(), params)
+        assert prefix_exits.tolist() == full_exits.iloc[:n].tolist(), f"look-ahead at bar {n}"
+
+
+def _run_engine(frame, mod, params, signal_exit_fill):
+    from runner.engine import TradeEngine
+    from runner.engines.base import BacktestConfig
+
+    def strategy_fn(df, _params):
+        return mod.generate_signals(df, params)
+
+    config = BacktestConfig(
+        strategy_name="ivb-exit-fill",
+        symbols=["T"],
+        timeframe="1m",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000.0,
+        risk_per_trade_pct=0.01,
+        max_leverage=100.0,
+        modeling_resolution="main_timeframe",
+        signal_exit_fill=signal_exit_fill,
+        parameters={"fees": "zero"},
+    )
+    return TradeEngine(config, symbol="T").run(frame, strategy_fn)
+
+
+def _breakout_trade_exit(freq: str, signal_exit_fill: str):
+    mod = _load_module()
+    df = _two_day_breakout_df(direction="up")
+    if freq != "1min":
+        df = (
+            df.set_index("timestamp")
+            .resample(freq)
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .reset_index()
+        )
+    # the open ramps with the bar; make it distinguishable per bar so the fill is provable
+    df["open"] = df["open"] + np.arange(len(df)) * 1e-7
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update(
+        {
+            "use_candle_close": False,
+            "entry_time": "16:30",
+            "max_entry_time": "18:00",
+            "exit_time": "22:55",
+            "atr_regime_factor": 2.0,
+            "atr_period": 1,
+            "atr_long_period": 1,
+            "session_timezone": "",
+            "broker_clock": "",
+        }
+    )
+    result = _run_engine(df, mod, params, signal_exit_fill)
+    trades = [t for t in result.trades if t.exits and t.exits[-1].reason != "end_of_data"]
+    assert trades, "the synthetic breakout must produce a time-exit trade"
+    trade = trades[0]
+    exit_ = trade.exits[-1]
+    open_at = df.set_index("timestamp")["open"]
+    return pd.Timestamp(exit_.time).tz_convert("UTC"), exit_.price, open_at
+
+
+@pytest.mark.parametrize(
+    ("freq", "expected_fill"),
+    [("1min", "2024-01-02 22:55"), ("15min", "2024-01-02 23:00"), ("1h", "2024-01-02 23:00")],
+)
+def test_default_next_open_fill_lands_on_mt5s_first_tick_at_or_after_exit_time(freq, expected_fill):
+    exit_time, exit_price, open_at = _breakout_trade_exit(freq, "next_open")
+    assert exit_time == pd.Timestamp(expected_fill, tz="UTC")
+    assert exit_price == pytest.approx(float(open_at.loc[pd.Timestamp(expected_fill)]))
 
 
 # ---------------------------------------------------------------------------
