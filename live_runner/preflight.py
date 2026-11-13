@@ -15,7 +15,7 @@ from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
-from shared.logging import get_logger
+from shared.logging import get_logger, route_console_logs_to_stderr
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
 logger = get_logger("live-runner")
@@ -415,6 +415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # stdout carries exactly one JSON result document; log lines go to stderr.
+    route_console_logs_to_stderr()
     result = run_live_preflight(
         args.config,
         accounts_env_path=args.accounts_env,

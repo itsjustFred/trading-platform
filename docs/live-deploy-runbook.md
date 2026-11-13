@@ -33,6 +33,8 @@ uv run python -m live_runner.preflight --config live_deployments.yaml --accounts
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
+The preflight prints exactly one JSON document on stdout (parseable with `jq`); its log lines go to stderr.
+
 ## Paper Broker Smoke
 
 For Alpaca smoke, first verify every Alpaca account resolves with `paper=True`.

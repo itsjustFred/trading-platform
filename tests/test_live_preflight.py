@@ -367,3 +367,47 @@ def test_live_preflight_threads_accounts_env_path_to_ctrader_adapter(
     # The default .accounts.env must be untouched.
     default_after = default_path.read_text(encoding="utf-8") if default_path.exists() else None
     assert default_after == default_before
+
+
+# ─── stdout is exactly one JSON document (#184 finding 8) ───────────────────────
+
+
+def test_preflight_cli_stdout_is_a_single_json_document(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    import live_runner.preflight as preflight
+
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+        """,
+    )
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("", encoding="utf-8")
+
+    # Build the console handler the way a fresh process does: bound to the stdout
+    # in effect when the logger is created (here pytest's capture).
+    from shared import logging as shared_logging
+
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-stdout-test"))
+
+    rc = preflight.main(["--config", str(config_path), "--accounts-env", str(accounts_env)])
+
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)  # raises if any log line is interleaved
+    assert document["config_path"] == str(config_path)
+    assert rc == 1  # no credentials for the alpaca account
+    assert "Running live preflight" in captured.err
