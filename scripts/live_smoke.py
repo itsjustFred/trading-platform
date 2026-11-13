@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import subprocess
 import sys
@@ -452,6 +453,68 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
         return deployment_id
 
 
+#: cTrader reports trendbar prices as integers in 1/100000 of a price unit.
+_CTRADER_TRENDBAR_PRICE_DIVISOR = 100_000
+#: SL/TP distance of the cTrader smoke order, as a fraction of the live price. Wide enough to clear
+#: the broker's minimum stop distance on FX and metals, and the position is closed within seconds.
+_CTRADER_SMOKE_SL_TP_FRACTION = 0.005
+#: How far back to look for the latest M1 bar; a fresh bar older than this means the market is shut.
+_CTRADER_SMOKE_QUOTE_LOOKBACK_MINUTES = 30
+
+
+def _ctrader_smoke_sl_tp(price: float, action: str) -> tuple[float, float]:
+    """Real stop-loss and take-profit prices around a live ``price``.
+
+    The adapter refuses an order without both, and refuses SL/TP anchored at a made-up price, so
+    the smoke anchors them at a quote it just fetched.
+    """
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"Cannot derive smoke SL/TP from price {price!r}.")
+    distance = price * _CTRADER_SMOKE_SL_TP_FRACTION
+    if action == "buy":
+        return round(price - distance, 5), round(price + distance, 5)
+    if action == "sell":
+        return round(price + distance, 5), round(price - distance, 5)
+    raise ValueError(f"Unsupported smoke action: {action!r}")
+
+
+async def _ctrader_live_reference_price(
+    adapter: Any, symbol: str, *, timeout_seconds: int
+) -> float:
+    """The close of the latest M1 trendbar for ``symbol``, as a real price.
+
+    Fails with a clear message when there is no recent bar (market closed) instead of letting the
+    order be built on an invented price.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsReq
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrendbarPeriod
+
+    symbol_id = await adapter._resolve_symbol_id(symbol)
+    now_ms = int(time.time() * 1000)
+    request = ProtoOAGetTrendbarsReq()
+    request.ctidTraderAccountId = adapter.ctid_trader_account_id
+    request.symbolId = int(symbol_id)
+    request.period = ProtoOATrendbarPeriod.M1
+    request.fromTimestamp = now_ms - _CTRADER_SMOKE_QUOTE_LOOKBACK_MINUTES * 60_000
+    request.toTimestamp = now_ms
+    response = await asyncio.wait_for(
+        adapter._send_request(request, timeout_seconds=timeout_seconds),
+        timeout=timeout_seconds + 5,
+    )
+    bars = list(getattr(response, "trendbar", []) or [])
+    if not bars:
+        raise RuntimeError(
+            f"No M1 bar for {symbol.upper()} in the last "
+            f"{_CTRADER_SMOKE_QUOTE_LOOKBACK_MINUTES} minutes (market closed?); "
+            "refusing to build the smoke order on an invented price."
+        )
+    latest = max(bars, key=lambda bar: int(getattr(bar, "utcTimestampInMinutes", 0)))
+    close = (int(latest.low) + int(latest.deltaClose)) / _CTRADER_TRENDBAR_PRICE_DIVISOR
+    if close <= 0:
+        raise RuntimeError(f"Invalid M1 close {close!r} for {symbol.upper()}.")
+    return close
+
+
 async def _ctrader_order_worker(
     *,
     account_id: str,
@@ -483,18 +546,24 @@ async def _ctrader_order_worker(
     smoke_deployment_id = _ensure_ctrader_smoke_deployment(
         account_id=account_id, symbol=symbol
     )
+    reference_price = await _ctrader_live_reference_price(
+        adapter, symbol, timeout_seconds=timeout_seconds
+    )
+    stop_loss, take_profit = _ctrader_smoke_sl_tp(reference_price, "buy")
     signal = LiveSignal(
         deployment_id=smoke_deployment_id,
         symbol=symbol.upper(),
         action="buy",
-        theoretical_price=1.0,
+        theoretical_price=reference_price,
         timestamp=datetime.now(timezone.utc),
         metadata={
             # Unit contract: metadata 'qty' is in qty units (broker volume / 1000);
             # raw broker-unit keys ('ctrader_volume') are no longer read by the
             # adapter (Cleanup 15-D, B-7).
             "qty": float(volume) / 1000.0,
-            "entry_price": 1.0,
+            "entry_price": reference_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
             "timeframe": "1m",
         },
     )
@@ -516,7 +585,9 @@ async def _ctrader_order_worker(
     close_req.ctidTraderAccountId = adapter.ctid_trader_account_id
     close_req.positionId = int(opened_position["position_id"])
     close_req.volume = int(opened_position["volume"])
-    close_res = await asyncio.wait_for(adapter._send_request(close_req, timeout_seconds=20), timeout=25)
+    close_res = await asyncio.wait_for(
+        adapter._send_request(close_req, timeout_seconds=20), timeout=25
+    )
     remaining_position = await _wait_for_ctrader_position(
         adapter,
         symbol=symbol,
@@ -582,19 +653,24 @@ async def _ctrader_strategy_e2e_worker(
             "max_positions": 20,
         },
     )
+    reference_price = await _ctrader_live_reference_price(
+        adapter, symbol, timeout_seconds=timeout_seconds
+    )
+    stop_loss, take_profit = _ctrader_smoke_sl_tp(reference_price, "buy")
     signal = LiveSignal(
         deployment_id=str(deployment.id),
         symbol=symbol,
         action="buy",
-        theoretical_price=1.0,
+        theoretical_price=reference_price,
         timestamp=datetime.now(timezone.utc),
         metadata={
             # Unit contract: qty is in qty units (broker volume / 1000), i.e.
             # 100000 broker volume == 100.0 qty. The adapter no longer reads
             # raw broker-unit metadata keys (Cleanup 15-D, B-7).
             "qty": 100.0,
-            "entry_price": 1.0,
-            "stop_loss": 0.99,
+            "entry_price": reference_price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
             "timeframe": deployment.timeframe,
         },
     )
