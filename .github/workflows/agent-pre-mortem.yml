@@ -307,7 +307,12 @@ jobs:
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count), and it must be one of
           # the four the skill allows.
-          last=$(grep -v '^[[:space:]]*$' "$out" | tail -n 1)
+          # A sign-off note the model put on its own line after the verdict (the
+          # skill asks for it on the verdict line) is tolerated: it is skipped
+          # when looking for the verdict, and stays in the posted comment.
+          last=$(grep -v '^[[:space:]]*$' "$out" \
+            | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
+            | tail -n 1)
           verdict=$(printf '%s\n' "$last" | tr -d '*' \
             | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
           if [ -z "$verdict" ]; then

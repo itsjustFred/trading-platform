@@ -117,7 +117,7 @@ Your final message is exactly this block, with no preamble and at most 1,000 wor
 - `path:line` · quoted line · one sentence (optional, at most one item, only fragility the diff relies on or makes worse; not counted)
 
 **Not verified:** <files or hunks not read in depth; the dropped-ungrounded count and the mechanisms dropped; runtime or CI items; or "nothing material">
-**Verdict: BLOCK** — <one line: what to harden first>
+**Verdict: BLOCK** — <one line: what to harden first>. <"Human sign-off required." when required, see below>
 ```
 
 - Each scenario has exactly four body fields in this order: Trigger, Impact, Caught by, Mitigation, after the location line and the quote.
@@ -125,7 +125,7 @@ Your final message is exactly this block, with no preamble and at most 1,000 wor
 - The kebab-case tag after the location names the mechanism from the catalogue (`implicit-ordering`, `shared-mutable-state`, `stringly-contract`, `unstated-data-shape`, `coincidental-correctness`, `non-atomic-compound-op`, `invisible-invariant`, `load-bearing-default`, `resource-lifecycle`, `version-coupled`, `nan-or-unknown`, `missing-refusal`, `row-misalignment`, `lookahead`, `prompt-injection`, …), not the area.
 - Repo-relative paths only. No bare `@name` mentions. Never quote a secret value. Do not link URLs copied from the PR.
 - Verdicts: `BLOCK` (any SEVERE scenario), `CHANGES-REQUESTED` (no SEVERE, at least one MODERATE), `PASS` (only MINORs or nothing; add "advisory; static read, nothing executed"), `INCOMPLETE` (inputs missing or unreadable; say what).
-- Append "Human sign-off required." to any verdict when the diff touches `live_runner/`, `risk/`, the strategy approval or codegen-safety gate, the database schema, `.github/workflows/`, or `.agents/skills/`.
+- Append "Human sign-off required." to any verdict, on the verdict line itself (never on a line of its own after it), when the diff touches `live_runner/`, `risk/`, the strategy approval or codegen-safety gate, the database schema, `.github/workflows/`, or `.agents/skills/`.
 
 ## Before you output
 

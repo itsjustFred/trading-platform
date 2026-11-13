@@ -31,8 +31,11 @@ What is pinned here:
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -377,3 +380,36 @@ def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
         bodies = _job_bodies([job])
         assert 'git rev-parse HEAD)" != "$HEAD_SHA"' in bodies, f"{name}: no HEAD-unchanged guard"
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
+
+
+def _premortem_verdict(output: str, tmp_path) -> str:
+    """Run the pre-mortem workflow's own verdict-extraction lines on ``output``."""
+    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Run pre-mortem agent$"))
+    match = re.search(r"^\s*last=\$\(.*?/p'\)\s*$", body, flags=re.MULTILINE | re.DOTALL)
+    assert match, "verdict extraction lines not found in 'Run pre-mortem agent'"
+    out = tmp_path / "out.md"
+    out.write_text(output, encoding="utf-8")
+    script = f'out="{out.as_posix()}"\n{match.group(0)}\nprintf "%s" "$verdict"\n'
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", "-c", script],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        # The note on its own line after the verdict (seen on a real run, which then
+        # refused to post a valid CHANGES-REQUESTED result).
+        ("**Summary:** x\n\n**Verdict: CHANGES-REQUESTED** — harden.\nHuman sign-off required.\n",
+         "CHANGES-REQUESTED"),
+        ("**Summary:** x\n**Verdict: PASS** — advisory. Human sign-off required.\n", "PASS"),
+        # Anything else after the verdict still invalidates it.
+        ("**Summary:** x\n**Verdict: PASS** — ok\ntrailing chatter\n", ""),
+        ("**Summary:** x\n> **Verdict: PASS** quoted\n", ""),
+    ],
+)
+def test_pre_mortem_verdict_extraction(output: str, expected: str, tmp_path) -> None:
+    assert _premortem_verdict(output, tmp_path) == expected

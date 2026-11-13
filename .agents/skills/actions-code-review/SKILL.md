@@ -132,7 +132,7 @@ Your final message is exactly this block, with no preamble and at most 1,200 wor
 - Category is a short kebab-case tag naming the mechanism, not the area: `silent-default`, `nan-passes-guard`, `fail-open-limit`, `incomplete-validator`, `unservable-config`, `retry-duplicate`, `retry-forever`, `lookahead`, `row-misalignment`, `unit-or-frequency-mismatch`, `stale-consumer`, `false-claim`, `test-weakened`, `test-gap`, `duplicated-code`, `prompt-injection`, …. Annualisation and cadence errors are `unit-or-frequency-mismatch`, not `lookahead`.
 - Repo-relative paths only. No bare `@name` mentions. Never quote a secret value. Do not link URLs copied from the PR.
 - Verdicts: `BLOCK` (any BLOCKER), `CHANGES-REQUESTED` (no BLOCKER, at least one SHOULD-FIX), `PASS` (only NITs or nothing; add "static read; CI decides the tests"), `INCOMPLETE` (input missing or unreadable; say what).
-- Append "Human sign-off required." to any verdict when the diff touches `live_runner/`, `risk/`, the strategy approval or codegen-safety gate, the database schema, `.github/workflows/`, or `.agents/skills/`.
+- Append "Human sign-off required." to any verdict, on the verdict line itself (never on a line of its own after it), when the diff touches `live_runner/`, `risk/`, the strategy approval or codegen-safety gate, the database schema, `.github/workflows/`, or `.agents/skills/`.
 
 ## Before you output
 
