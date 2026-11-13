@@ -4849,3 +4849,29 @@ def test_alpaca_whole_share_on_grid_entry_is_unchanged(monkeypatch):
     assert float(request.qty) == 7.0
     assert float(request.stop_loss.stop_price) == 347.75
     assert float(request.take_profit.limit_price) == 369.04
+
+
+@pytest.mark.parametrize(
+    ("action", "stop", "take"),
+    [
+        ("buy", 98.0, 95.0),  # take profit below a buy's entry
+        ("buy", 101.0, 110.0),  # stop above a buy's entry
+        ("sell", 102.0, 105.0),  # take profit above a sell's entry
+        ("sell", 99.0, 95.0),  # stop below a sell's entry
+        ("buy", 98.0, 100.0),  # take profit exactly at the entry
+    ],
+)
+def test_alpaca_bracket_level_on_wrong_side_is_refused_before_persistence(
+    monkeypatch, action, stop, take
+):
+    # A wrong-side leg is an instantly marketable order (or a broker 422 after the
+    # signal row was saved, which wedges redelivery); refuse it before either.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry(action, 100.0, stop, take)
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="wrong side of the entry"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []

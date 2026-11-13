@@ -66,7 +66,19 @@ def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> fl
 def _round_bracket_levels_in_place(
     metadata: dict[str, Any], *, entry_price: float, signal: LiveSignal
 ) -> None:
-    """Rewrite every SL/TP alias in *metadata* onto Alpaca's tick, toward the entry."""
+    """Rewrite every SL/TP alias in *metadata* onto Alpaca's tick, toward the entry.
+
+    A level on the wrong side of the entry is refused here, before persistence,
+    mirroring the cTrader adapter's ``stop_outward``/``take_outward`` guard: a
+    buy's take profit below the entry is an instantly marketable sell limit that
+    would flatten the position at once, and sizing only checks the stop side.
+    """
+    if signal.action not in {"buy", "sell"}:
+        raise ValueError(
+            f"Unsupported action {signal.action!r} for a bracket entry "
+            f"(signal_id={signal.id})."
+        )
+    buy = signal.action == "buy"
     for canonical_key, keys in (
         ("stop_loss", _SL_METADATA_KEYS),
         ("take_profit", _TP_METADATA_KEYS),
@@ -75,6 +87,16 @@ def _round_bracket_levels_in_place(
         if level is None or not math.isfinite(level) or level <= 0:
             # Missing/invalid levels are refused by _resolve_broker_sl_tp.
             continue
+        is_stop = canonical_key == "stop_loss"
+        # Distance from the entry in the direction the leg must lie: below the
+        # entry for a buy's stop and a sell's take profit, above otherwise.
+        outward = (entry_price - level) if (buy == is_stop) else (level - entry_price)
+        if outward <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for a {signal.action} of {signal.symbol} is "
+                f"on the wrong side of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
         rounded = _round_bracket_price_toward_entry(level, entry_price=entry_price)
         if (rounded - entry_price) * (level - entry_price) <= 0:
             raise ValueError(
