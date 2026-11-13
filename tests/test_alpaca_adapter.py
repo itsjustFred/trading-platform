@@ -593,3 +593,77 @@ def test_broker_write_failure_is_not_marked_as_not_submitted(
     # The broker may have accepted the order before the connection died, so the
     # caller must treat the outcome as unknown and keep its lease.
     assert is_order_not_submitted(raised.value) is False
+
+
+# ─── #121 review: what an exit needs to know before it is sized ──────────────
+
+
+def test_working_order_ids_lists_broker_and_client_order_ids() -> None:
+    """A previous exit is matched by its broker id, or by its client order id
+    (the signal id) when the broker id was never persisted."""
+    client = _FakeTradingClient(
+        orders=[
+            SimpleNamespace(
+                id="o-1", client_order_id="sig-1", symbol="AAPL", side="sell", legs=[]
+            ),
+            _FakeOrder("o-2", "MSFT", "buy"),
+        ]
+    )
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"o-1", "sig-1", "o-2"} <= set(ids)
+
+
+def test_working_order_ids_fails_closed_without_an_order_listing() -> None:
+    client = SimpleNamespace()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_adapter(client).working_order_ids())
+
+
+def test_alpaca_position_qty_tolerance_is_below_one_fractional_share_step() -> None:
+    """Alpaca quantities have up to 9 decimals: half a step, never a whole one."""
+    tolerance = _adapter(_FakeTradingClient()).position_qty_tolerance("AAPL")
+
+    assert 0.0 < tolerance < 1e-9
+
+
+# ─── #121 review concern 6: exit quantities round down to 9 decimals ─────────
+
+
+def _exit_signal(qty: float) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only", "qty": qty},
+    )
+
+
+def test_alpaca_exit_qty_rounds_down_to_nine_decimals() -> None:
+    """1/3 of a 0.5-share position: 0.1666... closes 0.166666666, never ...667."""
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    qty = asyncio.run(adapter._require_exit_position(_exit_signal(0.5 / 3), 0.5 / 3))
+
+    assert qty == pytest.approx(0.166666666, abs=1e-15)
+    assert qty <= 0.5 / 3
+
+
+def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
+    from live_runner.exit_signals import ExitBelowStepError
+
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    with pytest.raises(ExitBelowStepError) as excinfo:
+        asyncio.run(adapter._require_exit_position(_exit_signal(4e-10), 4e-10))
+    assert excinfo.value.requested_qty == pytest.approx(4e-10)
+    assert excinfo.value.qty_step == pytest.approx(1e-9)
+
+
+def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
+    adapter = _adapter(_FakeTradingClient())
+    assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)

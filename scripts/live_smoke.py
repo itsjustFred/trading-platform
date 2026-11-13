@@ -1257,7 +1257,13 @@ def _stockkit_deployment_and_signal(
         signal_source_type="discord",
         signal_source="discord",
         signal_source_id=route.upper(),
-        signal_config={"service_name": route, "channel_id": str(message.channel.id)},
+        # Explicitly marked as StockKit (#121): an unknown route then fails closed
+        # instead of silently skipping the broker-account check.
+        signal_config={
+            "service_name": route,
+            "channel_id": str(message.channel.id),
+            "stockkit_route": route,
+        },
         settings={
             "max_risk_per_trade": 0.00004,
             "max_total_exposure": 0.00008,

@@ -50,6 +50,15 @@ pro Bot.
 - **Status:** Kein Processor — Discord-Quelle/Server (siehe Registry-Hinweis)
 - **Routing:** `live_runner/stockkit_routing.py` mappt die Discord-Bots
   (`nitro`, `ramjet`, `rocketfuel`) auf ihre Alpaca-Accounts
+- **Explizite Markierung (#121):** Ein StockKit-Deployment setzt
+  `signal_config.stockkit_route` (z. B. `rocketfuel`). Ist der Wert unbekannt,
+  leer oder kein String (etwa `rocketfuel_shortsonly`, `nitro_v2`), oder
+  widerspricht er der aus dem Bot-Namen abgeleiteten Route, wird das Deployment
+  beim Anlegen abgelehnt und beim Dispatch blockiert; der zugehörige
+  Discord-Service wird auf `FAILED` gesetzt (ein vom Operator gesetztes
+  `PAUSED`/`STOPPED` bleibt). Ohne Markierung ist es ein normaler Discord-Bot;
+  ein Bot-Name, der ein bekannter Alias ist, wird aber weiterhin gegen seinen
+  Account geprüft.
 
 ## Health-Check Status
 
@@ -122,6 +131,95 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nie überschrieben; ein normaler Teardown schreibt kein `FAILED`.
 - Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
   verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
+  Ein Komma nach dem Preis (`@ 100, stop $95`) gehört nicht zum Preis.
+
+### Exit-, Report- und Bedingungsnachrichten, Preis-Level (#121)
+
+Keine Nachricht, die einen Exit, einen Gewinnmitnahme-Bericht oder eine
+Bedingung nennt, erzeugt eine neue Entry-Order.
+
+- **Preis-Level:** Entry ist ein `Price:`-Label, sonst der erste `@`/`at`-Preis,
+  sonst der erste `$`-Preis. `target`/`TP`/`take profit`/`PT` wird Take-Profit,
+  `stop`/`SL`/`stop loss` Stop-Loss; diese Klauseln werden vor jeder anderen
+  Extraktion entfernt, können also nie Entry sein. Zwei verschiedene Werte für
+  dasselbe Level, ein fehlerhafter Level-Preis oder ein Level auf der falschen
+  Seite des Entrys → Nachricht verworfen. `at` nach einem Indikator (`RSI at 28`)
+  ist kein Preis.
+- **Reports** (`Took profit on …`, `stopped out`, `target hit`, `Closed …`,
+  `Exited …`) und **Bedingungen/Absicherungen** (`wait`, `if`, `once`, `when`,
+  `watch for`, `looking for`, `potential`, `before you buy` …) werden verworfen
+  und geloggt.
+- **Exit/Close** (`Exit long AAPL @ 100`, `Closing long AAPL at $100`,
+  `Close short TSLA @ 50`) wird ein Exit-only-Signal
+  (`metadata.signal_intent = "exit"`, `exit_fraction`, optional
+  `exit_position_side`). Die Close-Seite kommt aus der Position, nie aus der
+  Nachricht; ein Exit trägt kein SL/TP und läuft nicht durch den
+  Entry-Signal-Processor. Ein Exit braucht genau einen Ticker und einen Preis.
+  Ohne Preis (`Trim half AAPL`) wird er verworfen und auf `WARNING` geloggt
+  (`exit without a price`), weil ein Signal einen positiven Preis braucht.
+- **Exit ohne eindeutigen Ticker:** Ein Exit-Befehl, der eine Seite nennt
+  (`Exit long …`, `Close the short …`) oder dessen Objekt wie ein Ticker
+  geschrieben ist (Großbuchstaben, `$`, `**`), aus dem sich aber kein Exit
+  parsen lässt, wird verworfen (`WARNING`) und erreicht nie den Entry-Parser.
+  Ein nacktes `ON`, `IT`, `A`, `SO` ist ein englisches Wort, kein Ticker:
+  `Exit long ON @ 50` wird verworfen (früher BUY ON), `Exit long $ON @ 50` ist
+  ein Exit auf ON. Kleingeschriebene Prosa (`exit on close below 95`) in einem
+  Entry bleibt erlaubt.
+- **Teil-Exits** (`Trim half`, `Took partials 1/3`, `Sell 25%`, `Scale out 50%`)
+  schließen genau diesen Anteil. Ohne quantifizierbaren Anteil (`Took partials`,
+  `Trim AAPL`), mit zwei verschiedenen Anteilen oder einem Anteil außerhalb
+  (0, 1] → verworfen, nie geraten. Ein Voll-Exit mit Größenangabe ist mehrdeutig
+  und wird verworfen.
+- **Sizing im Daemon** (`live_runner/exit_signals.py`): geschlossen wird nur die
+  *eigene* Menge des Deployments, d. h. die Netto-Fills seiner Signale für das
+  Symbol (Ledger), gedeckelt auf die Broker-Position, mal Anteil; ganzzahlige
+  Positionen werden abgerundet, ein Teil-Exit, der auf 0 fällt, wird abgelehnt.
+  Keine Position → ignoriert, `INFO`; keine eigene Menge, aber eine
+  Broker-Position (gehört jemand anderem oder das Ledger hat einen Fill
+  verpasst) → ignoriert, `WARNING` mit `broker_qty` (`Exit signal ignored`).
+  Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht genannte Seite →
+  abgelehnt.
+- **Exit-Mengen werden nie aufgerundet:** Jeder Exit (Teil- und Voll-Exit) wird
+  auf den Mengenschritt des Instruments **ab**gerundet (`exit_qty_step` des
+  Adapters: cTrader `stepVolume` aus den Symbol-Properties, unbekannt → eine
+  Broker-Volumeneinheit; Alpaca 1e-9), im Daemon vor dem Persistieren und im
+  Adapter noch einmal (cTrader-Volumen per Floor statt `round()`). Ein Exit
+  schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
+  er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
+  und `qty_step`. Entries runden wie bisher.
+- **Ledger-Abgleich vor jedem Exit:** Die Ledger aller Deployments auf demselben
+  Account und Symbol (jeder Status, `get_account_net_filled_qty_by_deployment`)
+  müssen vorzeichenrichtig summiert der Broker-Position entsprechen, innerhalb
+  der Mengenpräzision des Instruments (`position_qty_tolerance` des Adapters:
+  cTrader eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt → strikt
+  1e-9). Sonst wird der Exit abgelehnt und auf `ERROR` geloggt, mit allen
+  Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`) und
+  `broker_qty`. Grund: Broker-seitige Schließungen (SL/TP-Legs, cTrader-SL/TP,
+  Flatten, manuelles Schließen) landen nicht im Ledger; ohne Abgleich könnte ein
+  Exit auf einem genetteten Account die Anteile eines anderen Deployments
+  schließen. Fills von Bracket-Legs gegen das Parent-Signal zu buchen ist die
+  eigentliche Lösung und ein eigenes Issue; bis dahin muss nach so einer
+  Schließung das Ledger abgeglichen werden, bevor Exits wieder laufen.
+- **Ein Exit nach dem anderen:** Solange ein früherer Exit desselben
+  Deployments und Symbols beim Broker noch arbeitet (nicht voll gefüllt und in
+  den offenen Orders des Brokers, per Broker- oder Client-Order-ID), wird ein
+  neuer Exit abgelehnt (`WARNING`, nicht gequeued). Kann der Adapter seine
+  offenen Orders nicht auflisten, gilt das als „nicht bewiesen beendet“ → ebenfalls
+  abgelehnt.
+- **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein
+  Momentum-Reversal (RocketFuel long-only) auf einem Deployment ohne Shorts ist
+  ein Voll-Exit und wird nach derselben Regel gesized (Anteil 1, Seite aus der
+  eigenen Position, ein eigener Short wird zurückgekauft). Der Anteil eines
+  anderen Deployments an derselben genetteten Broker-Position bleibt offen; ohne
+  eigene Menge → ignoriert und geloggt. Auf einem Long+Short-Deployment bleibt
+  ein einfaches `SELL` ein Short-Entry.
+- **Abgelehnte Exits loggen auf `ERROR`:** Ein Exit, der vor dem Senden
+  abgelehnt wird (z. B. eigene Seite ≠ Broker-Seite), vom Adapter vor dem
+  Broker-Request abgelehnt wird (z. B. Mindestvolumen) oder dessen Broker-Antwort
+  ein Fehler ist, lässt die Position offen und wird auf `ERROR` geloggt
+  (`Exit signal refused …` bzw. `… unknown outcome`, mit `"exit": true`). Ein
+  abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ ist `INFO` bzw.
+  `WARNING` (siehe oben), ein noch laufender früherer Exit `WARNING`.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.

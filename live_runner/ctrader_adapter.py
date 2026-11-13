@@ -27,6 +27,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -172,6 +173,9 @@ class SymbolScale:
     metadata; relative SL/TP always uses the fixed protocol divisor.
     ``min_volume``: broker minimum order volume (fail-closed floor).
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
+    ``step_volume``: broker volume increment (``stepVolume``). Exits round DOWN
+    to it (#121 review). Unknown means one broker volume unit, so a full close of
+    the real position volume is never cut short.
     """
 
     volume_per_qty: float
@@ -179,6 +183,7 @@ class SymbolScale:
     min_volume: int
     lot_size: float
     source: str = "fallback"
+    step_volume: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -285,6 +290,7 @@ def _symbol_scale_from_broker_props(
     lot_size: float | None,
     min_volume: int | None,
     fallback: SymbolScale | None,
+    step_volume: Any = None,
 ) -> SymbolScale | None:
     """Build a broker-authoritative scale, using a fallback only when available."""
     try:
@@ -307,12 +313,21 @@ def _symbol_scale_from_broker_props(
         minimum = fallback.min_volume if fallback is not None else None
     if digit_count is None or lots is None or minimum is None:
         return None
+    try:
+        step = int(step_volume) if step_volume is not None else None
+    except (TypeError, ValueError):
+        step = None
+    if step is None or isinstance(step_volume, bool) or step <= 0:
+        # Protobuf reports an unset optional as 0. One unit never cuts a full
+        # close short; a wrong partial is the broker's to reject, never upsized.
+        step = 1
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
         min_volume=minimum,
         lot_size=lots,
         source="broker",
+        step_volume=step,
     )
 
 
@@ -1296,6 +1311,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 lot_size=getattr(detail, "lotSize", None),
                 min_volume=getattr(detail, "minVolume", None),
                 fallback=fallback,
+                step_volume=getattr(detail, "stepVolume", None),
             )
             if scale is not None:
                 self._symbol_props[name] = scale
@@ -1309,6 +1325,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if hasattr(payload, "orderId") and int(getattr(payload, "orderId", 0)) > 0:
             return int(payload.orderId)
         return None
+
+    def exit_qty_step(self, symbol: str) -> float:
+        """The symbol's volume step in qty units: what an exit is floored to."""
+        scale = self._scale_for(symbol)
+        return float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
+
+    @staticmethod
+    def _exit_volume(symbol: str, qty: float, scale: SymbolScale) -> int:
+        """An exit's broker volume, rounded DOWN to the step (#121 review).
+
+        ``round()`` (the entry conversion) could close up to half a volume unit
+        more than the fraction asked for. Raises :class:`ExitBelowStepError`
+        when less than one step remains.
+        """
+        step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
+        floored_qty = round_exit_qty_down(qty, step_qty)
+        if floored_qty <= 0.0:
+            raise ExitBelowStepError(
+                f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "
+                f"the volume step ({step_qty:g} qty = {scale.step_volume} volume units).",
+                requested_qty=qty,
+                qty_step=step_qty,
+            )
+        # A whole number of steps: round() only removes float noise here.
+        return int(round(floored_qty * float(scale.volume_per_qty)))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""
@@ -1333,7 +1374,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Signal has no positive quantity ('qty'); refusing to "
                 "submit an order with a default size."
             ) from exc
-        volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+        if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
+            volume = self._exit_volume(signal.symbol, qty, scale)
+        else:
+            volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
         if volume < scale.min_volume:
             raise ValueError(
                 f"Risk-sized volume {volume} for {signal.symbol} is below "
@@ -2615,6 +2659,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
+
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working order: order ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). "Working" is :meth:`_is_working_order`, which reads a
+        status it cannot interpret as working - the direction that defers an
+        exit rather than sizing it off a ledger that may lack fills.
+        """
+        reconcile_res = await self._reconcile_state()
+        ids: set[str] = set()
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is not None:
+                ids.add(str(order_id))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            if client_order_id:
+                ids.add(client_order_id)
+        return ids
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of one broker volume unit, in qty units, for ``symbol``.
+
+        Positions and fills are whole broker volume units converted by the
+        symbol's ``volume_per_qty``, so anything closer than half a unit is the
+        same position. Raises like :meth:`_scale_for` for an unknown symbol; the
+        caller then falls back to the strict default.
+        """
+        return 0.5 / float(self._scale_for(symbol).volume_per_qty)
 
     async def cancel_open_orders(self) -> ControlOutcome:
         """Cancel every working *detached* order for this cTrader account.

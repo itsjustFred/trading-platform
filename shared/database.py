@@ -2508,6 +2508,176 @@ def get_live_signal_filled_qty(signal_id: str) -> float:
     return float(filled_qty or 0.0)
 
 
+def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
+    """The deployment's own signed net filled quantity for ``symbol`` (#121).
+
+    This is the ledger an exit signal closes against: buy fills count positive,
+    sell fills negative, summed over every signal *this* deployment persisted for
+    the symbol. Another deployment's fills on the same (netted) broker position
+    are not included, so an exit closes only this deployment's share.
+
+    Only fills attributed to one of the deployment's own signals are counted.
+    Fills of broker-side child orders that are not persisted against a signal
+    (for example a bracket's SL/TP leg) are not in the ledger; callers cap the
+    result at the broker position for that reason.
+
+    Fails closed on a stored action other than buy/sell rather than guessing its
+    sign.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for the ledger quantity")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.action)
+        ).all()
+    net = 0.0
+    for action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            net += quantity
+        elif normalized_action == "sell":
+            net -= quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+    return net
+
+
+def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
+    """Every deployment's signed net filled quantity for ``symbol`` on one account.
+
+    The ledger of each deployment whose ``account_id`` is ``account_id``, whatever
+    its status (a stopped deployment's holdings are still at the broker), as in
+    :func:`get_live_deployment_net_filled_qty`. Deployments without fills for the
+    symbol are absent. An exit compares the sum with the broker position before
+    trusting any one deployment's share of it (#121).
+
+    Fails closed on a stored action other than buy/sell.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for the account ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.deployment_id, LiveSignalModel.action)
+        ).all()
+    ledgers: dict[str, float] = {}
+    for deployment_id, action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            signed = quantity
+        elif normalized_action == "sell":
+            signed = -quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+        key = str(deployment_id)
+        ledgers[key] = ledgers.get(key, 0.0) + signed
+    return ledgers
+
+
+#: A filled quantity this close to the requested one counts as fully filled.
+_EXIT_FILL_TOLERANCE = 1e-9
+
+
+def list_live_deployment_unfilled_exit_orders(
+    deployment_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """This deployment's exit orders for ``symbol`` not known to be fully filled.
+
+    An exit order is a persisted signal whose metadata carries
+    ``risk_sizing_mode == "exit_only"``. It is listed unless its persisted fills
+    reach the quantity it asked for; one without a readable requested quantity
+    is listed too, because it cannot be shown to be done. Whether a listed order
+    is still *working* is the broker's to say - a cancelled or rejected one is
+    listed here as well (#121).
+
+    Each row: ``signal_id``, ``broker_order_id`` (may be empty), ``requested_qty``
+    (``None`` when unreadable) and ``filled_qty``.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for pending exits")
+    init_db()
+    with get_session() as session:
+        # Two queries rather than one grouped join: grouping by a JSON column is
+        # not portable across database dialects.
+        signals = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+            )
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        ).all()
+        fills = dict(
+            session.exec(
+                select(
+                    LiveExecutionModel.signal_id,
+                    func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+                )
+                .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+                .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+                .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+                .group_by(LiveExecutionModel.signal_id)
+            ).all()
+        )
+    pending: list[dict[str, Any]] = []
+    for signal_id, broker_order_id, metadata in signals:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        # Same value as live_runner.base_adapter.EXIT_ONLY_RISK_SIZING_MODE.
+        if str(metadata.get("risk_sizing_mode") or "") != "exit_only":
+            continue
+        filled_qty = float(fills.get(signal_id) or 0.0)
+        requested_qty: float | None
+        try:
+            requested_qty = abs(float(metadata.get("explicit_qty", metadata.get("qty"))))
+        except (TypeError, ValueError):
+            requested_qty = None
+        if requested_qty is not None and not math.isfinite(requested_qty):
+            requested_qty = None
+        if requested_qty is not None and filled_qty >= requested_qty - _EXIT_FILL_TOLERANCE:
+            continue
+        pending.append(
+            {
+                "signal_id": str(signal_id),
+                "broker_order_id": str(broker_order_id or ""),
+                "requested_qty": requested_qty,
+                "filled_qty": filled_qty,
+            }
+        )
+    return pending
+
+
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
     """Persist the broker order id on a signal right after submission (crash recovery)."""
     normalized_signal_id = str(signal_id or "").strip()
