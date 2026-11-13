@@ -7,7 +7,8 @@ small gzip CSV fixtures to ``tests/parity/fixtures/published``.
 Total-return handling: ``SPY``/``EFA``/``AGG``/``BIL``/``VEU`` fixtures hold
 DIVIDEND-ADJUSTED prices (``Adj Close`` scale factor applied to open/high/low/
 close, a total-return series).  ``GSPC`` (S&P 500 price index, 1928-) and
-``SP500TR`` (S&P 500 total return index, 1988-) are index levels.
+``SP500TR`` (S&P 500 total return index, 1988-) are index levels; ``IRX`` is the
+13-week T-bill yield in percent (used only by the report's cash-leg estimate).
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ SPECS = {
     "BIL": ("BIL", "2007-01-01", False),
     "GSPC": ("^GSPC", "1928-01-01", False),
     "SP500TR": ("^SP500TR", "1988-01-01", False),
+    "IRX": ("^IRX", "1960-01-01", False),  # 13-week T-bill yield, percent (report only)
 }
 END = "2025-12-31"
 
@@ -44,7 +46,7 @@ def build(name: str, ticker: str, start: str, ohlc: bool, data_dir: Path) -> pd.
     full = full.rename(columns={"date": "timestamp"})
     full["timestamp"] = pd.to_datetime(full["timestamp"], utc=True)
     full.to_parquet(target / "1d.parquet", index=False)
-    factor = (raw["Adj Close"] / raw["Close"]) if "Adj Close" in raw and name not in ("GSPC", "SP500TR") else 1.0
+    factor = (raw["Adj Close"] / raw["Close"]) if "Adj Close" in raw and name not in ("GSPC", "SP500TR", "IRX") else 1.0
     out = pd.DataFrame({"timestamp": raw.index.strftime("%Y-%m-%d")})
     if ohlc:
         for col in ("Open", "High", "Low", "Close"):
