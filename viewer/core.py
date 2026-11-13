@@ -1978,6 +1978,7 @@ def _dolthub_pull():
         try:
             subprocess.run(
                 ["dolt", "pull"],
+                check=False,
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
@@ -3242,11 +3243,11 @@ def _start_dukascopy_task(
                     base_completed = completed_items + failed_items
 
                     def report_progress(pct: float, message: str) -> None:
-                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0  # noqa: B023 - progress callback only runs inside this iteration's download
                         _update_task_progress(
                             task_id,
                             percent=overall,
-                            current=f"{item_label}: {message}",
+                            current=f"{item_label}: {message}",  # noqa: B023 - progress callback only runs inside this iteration's download
                             total=total,
                         )
 
@@ -3666,11 +3667,11 @@ def _start_jforex_task(
                     base_completed = completed_items + failed_items
 
                     def report_progress(pct: float, message: str) -> None:
-                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0  # noqa: B023 - progress callback only runs inside this iteration's download
                         _update_task_progress(
                             task_id,
                             percent=overall,
-                            current=f"{item_label}: {message}",
+                            current=f"{item_label}: {message}",  # noqa: B023 - progress callback only runs inside this iteration's download
                             total=total,
                         )
 

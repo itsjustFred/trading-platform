@@ -10550,13 +10550,13 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 # collects the exit status after EOF (or after the kill).
                 try:
                     returncode = proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
                     if proc.poll() is None:
                         watchdog_timed_out.set()
                         _kill_process_group(proc)
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
-                    )
+                    ) from exc
                 if watchdog_timed_out.is_set():
                     # The watchdog killed the child, so its returncode is the
                     # signal that terminated it (-9), not a real exit status.

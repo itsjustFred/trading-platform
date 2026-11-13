@@ -82,7 +82,7 @@ def _ny_dates(df: pd.DataFrame):
     return ts_ny.dt.date.to_numpy(), ts_ny
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     channel_length = int(params.get("channel_length", params.get("Length", 5)))
     ema_period = int(params.get("ema_period", params.get("EmaPeriod", 200)))

@@ -206,6 +206,6 @@ def _parse_datetime(date_str: str, time_str: str) -> str:
         # One retry for date-only values (midnight UTC, documented).
         try:
             dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-        except ValueError:
-            raise ValueError(f"unparsable stockkit datetime: {date_str!r} {time_str!r}")
+        except ValueError as exc:
+            raise ValueError(f"unparsable stockkit datetime: {date_str!r} {time_str!r}") from exc
     return dt.replace(tzinfo=timezone.utc).isoformat()

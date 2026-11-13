@@ -70,7 +70,7 @@ def _parse_minutes(value: str) -> int:
     return int(hour) * 60 + int(minute)
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     atr_period = int(
         params.get("daily_atr_period", params.get("atr_period", params.get("DailyATRMulti", 5)))

@@ -2980,7 +2980,7 @@ async def _poll_balances(
         async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
             try:
                 await asyncio.wait_for(
-                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),  # noqa: B023 - _poll_one is gathered and awaited within this loop iteration
                     timeout=BALANCE_POLL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:

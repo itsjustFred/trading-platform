@@ -24,11 +24,11 @@ class RiskEngine:
         if atr is not None:
             try:
                 atr_value = float(atr)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"ATR value {atr!r} is not a number; refusing to size "
                     "on an uninterpretable stop distance."
-                )
+                ) from exc
             if not math.isfinite(atr_value) or atr_value <= 0:
                 raise ValueError(
                     f"ATR value {atr!r} is not finite and positive; refusing "

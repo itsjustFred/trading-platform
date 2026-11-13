@@ -47,7 +47,7 @@ STRATEGY_META = {
 }
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     lookback = int(params.get("lookback", 60))
     entry_zscore = float(params.get("entry_zscore", 2.0))
