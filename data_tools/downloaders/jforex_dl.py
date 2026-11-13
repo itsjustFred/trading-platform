@@ -26,7 +26,6 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -432,7 +431,7 @@ def _discover_jars(root: Path) -> list[Path]:
     return [Path(entry) for entry in _dedupe_preserving_order(str(jar) for jar in jars)]
 
 
-def _dedupe_preserving_order(entries: Iterable[str]) -> list[str]:
+def _dedupe_preserving_order(entries: list[str]) -> list[str]:
     """First-occurrence dedupe used for JAR URL and JAR path collections."""
     deduped: list[str] = []
     seen: set[str] = set()
@@ -866,9 +865,7 @@ def prewarm_jvm() -> None:
     """Start JVM and validate core JForex SDK imports once at app startup."""
     _ensure_jvm_started()
     try:
-        # `ignore_missing_imports` already covers the unreachable JForex stubs,
-        # so a blanket `type: ignore` here only hid the ones that matter.
-        from com.dukascopy.api import Instrument
+        from com.dukascopy.api import Instrument  # type: ignore
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"JForex SDK import failed for prewarm: {exc}") from exc
     if Instrument is None:

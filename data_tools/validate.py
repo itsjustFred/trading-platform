@@ -326,23 +326,14 @@ def _gap_classification(
     session_value = session
     if session_value is None and isinstance(calendar, Mapping):
         session_value = calendar.get("session", calendar.get("trading_session"))
-    resolved_session: tuple[int, int] | None
-    window = _session_window(session_value)
-    if window is MALFORMED_SESSION:
-    if resolve_from_calendar is MALFORMED_SESSION:
+    resolved_session = _session_window(session_value)
+    if resolved_session is MALFORMED_SESSION:
         # Preserved deliberately: a malformed session still behaves as no session, so every gap
         # classification is unchanged and the mislabelling pin stays valid. What is new is that the
         # substitution below is no longer silent - and for equity-like assets it *is* a
         # substitution, because an observed window is used in its place.
         _warn_malformed_session_once(session_value, normalized_asset_class)
-        # Documented: a malformed session is treated as *no* session here, which is
-        # what the classification did before the warning existed. The warning is the
-        # only new behaviour, and the mislabelling pin is what keeps that true.
         resolved_session = None
-    else:
-        # `_session_window` has two non-configured returns: the malformed sentinel
-        # (handled above) and `None` when no session was configured.
-        resolved_session = window
     if resolved_session is None and normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES:
         resolved_session = observed_session
     holiday_value = holidays
@@ -355,12 +346,7 @@ def _gap_classification(
         include_nyse=normalized_asset_class in _EQUITY_LIKE_ASSET_CLASSES,
     )
 
-    # `MALFORMED_SESSION` is replaced by None above, so what reaches the
-    # intraday branch is a real `(start_minutes, end_minutes)` window. The
-    # isinstance test is the narrowing mypy cannot do across the two
-    # reassignments, and it is free: it is true exactly where the old
-    # `is not None` was.
-    if intraday and isinstance(resolved_session, tuple):
+    if intraday and resolved_session is not None:
         if _session_overlap(
             start,
             end,

@@ -474,13 +474,9 @@ async def _fetch_one(
 
 async def download_bi5_files(
     urls: list[tuple[datetime, str]],
-    *,
-    # Keyword-only: these two were positional-or-keyword, and a call
-    # site that already passed them positionally also passed
-    # `batch_size=` by keyword, which is a TypeError at runtime rather
-    # than anything review would catch.
     batch_size: int = 10,
     max_retries: int = 3,
+    *,
     pipeline_batches: int = 1,
     pause_ms: int = 1000,
     report_progress: Callable[[float, str], None] | None = None,
@@ -492,10 +488,8 @@ async def download_bi5_files(
     """Download .bi5 files asynchronously in controllable batches.
 
     ``batch_size`` is the number of files fetched per batch window and
-    ``max_retries`` the per-file retry count. Both are keyword-only: a call
-    site once passed one positionally and the other by keyword. The signature
-    now makes that impossible instead of raising TypeError at runtime.
-    ``pipeline_batches`` multiplies the
+    ``max_retries`` the per-file retry count; both are positional-compatible
+    so call sites cannot pass them twice. ``pipeline_batches`` multiplies the
     in-flight window (``batch_size * pipeline_batches``).
     """
     import aiohttp
@@ -866,8 +860,9 @@ async def _download_minute_side_dataframe(
     )
     bi5_results = await download_bi5_files(
         urls,
-        batch_size=batch_size,
-        max_retries=max_retries,
+        batch_size,
+        max_retries,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=report_progress,
         progress_unit=target_unit,
@@ -969,8 +964,9 @@ async def _download_and_assemble_merged_ticks(
     )
     bi5_results = await download_bi5_files(
         urls,
-        batch_size=batch_size,
-        max_retries=max_retries,
+        batch_size,
+        max_retries,
+        pipeline_batches=pipeline_batches,
         pause_ms=pause_ms,
         report_progress=report_progress,
         progress_unit="files",
@@ -1194,8 +1190,9 @@ class DukascopyNativeDownloader(Downloader):
                 )
                 bi5_results = await download_bi5_files(
                     urls,
-                    batch_size=batch_size,
-                    max_retries=max_retries,
+                    batch_size,
+                    max_retries,
+                    pipeline_batches=pipeline_batches,
                     pause_ms=pause_ms,
                     report_progress=(
                         (lambda pct, msg: _report_progress(report_progress, pct * 0.9, msg))
@@ -1419,8 +1416,9 @@ class DukascopyNativeDownloader(Downloader):
         )
         bi5_results = await download_bi5_files(
             urls,
+            options.batch_size,
+            options.max_retries,
             batch_size=options.batch_size,
-            max_retries=options.max_retries,
             pipeline_batches=options.pipeline_batches,
             pause_ms=options.pause_ms,
             report_progress=(

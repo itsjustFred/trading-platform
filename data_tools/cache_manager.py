@@ -60,9 +60,7 @@ def _cache_key(data_dir: Path | str | None, include_validation: bool) -> CacheKe
 
 def _safe_int(value: object) -> int:
     try:
-        # `int` is overloaded and an `object` argument matches none of the
-        # overloads, so mypy reports call-overload rather than arg-type.
-        return int(value)  # type: ignore[call-overload]
+        return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0
 
@@ -230,16 +228,14 @@ def _catalog_matches_disk(payload: dict[str, Any], data_dir: Path) -> bool:
 
     actual_paths: set[str] = set()
     if ohlcv_root.exists():
-        # `path` above is a catalog *key* (a str); the loop below walks `Path`s.
-        # One name for both is how a key ends up passed where a file is expected.
-        for parquet_file in ohlcv_root.rglob("*.parquet"):
+        for path in ohlcv_root.rglob("*.parquet"):
             try:
-                ensure_dataset_path_within(ohlcv_root, parquet_file)
+                ensure_dataset_path_within(ohlcv_root, path)
             except ValueError:
                 continue
-            if parse_ohlcv_path(parquet_file, ohlcv_root) is None or not parquet_file.is_file():
+            if parse_ohlcv_path(path, ohlcv_root) is None or not path.is_file():
                 continue
-            actual_paths.add(str(parquet_file.resolve(strict=False)))
+            actual_paths.add(str(path.resolve(strict=False)))
     return actual_paths == expected_paths
 
 

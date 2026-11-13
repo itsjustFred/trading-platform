@@ -377,18 +377,6 @@ def _coverage_window_from_env(env_value: str | None, default: str) -> str:
     return parsed.date().isoformat()
 
 
-#: Vendor coverage windows, in ISO date form.
-#:
-#: Declared at module level rather than only inside `reload_coverage_windows()`:
-#: a `global` assignment creates the name at runtime, so the function bound it
-#: and every reader below resolved it only because the function happens to be
-#: called at import. Declaring them keeps the name in scope for a reader and for
-#: a checker, and the import-time call below still overwrites both from the
-#: environment, so nothing observable changes.
-HF_INTRADAY_COVERAGE_END: str = DEFAULT_HF_INTRADAY_COVERAGE_END
-ALPACA_INTRADAY_START: str = DEFAULT_ALPACA_INTRADAY_START
-
-
 def reload_coverage_windows() -> tuple[str, str]:
     """(Re)load the vendor coverage windows from the environment.
 
@@ -1363,10 +1351,7 @@ def _gap_is_market_closure(
     try:
         start_date = date.fromisoformat(raw_start)
         end_date = date.fromisoformat(raw_end)
-        # `gap` is an untyped dict from the parquet summary, so the value is an
-        # `object` to the checker; a non-numeric one raises and is caught two
-        # lines below, which is the intended refusal path.
-        gap_seconds = float(gap["gap_seconds"])  # type: ignore[arg-type]
+        gap_seconds = float(gap["gap_seconds"])
         start_date, end_date = _session_dates_of_gap(
             gap, timeframe, start_date, end_date
         )
@@ -1480,9 +1465,7 @@ def analyze_ohlcv_coverage(data_root: Path, requirement: DataRequirement) -> dic
         [
             gap
             for gap in gaps
-            # Same untyped-dict read as in `_gap_is_market_closure`: a
-            # non-numeric value raises here rather than in a silent branch.
-            if float(gap.get("gap_days", 0)) > fail_threshold  # type: ignore[arg-type]
+            if float(gap.get("gap_days", 0)) > fail_threshold
             and not _gap_is_market_closure(
                 gap,
                 timeframe=requirement.timeframe,
