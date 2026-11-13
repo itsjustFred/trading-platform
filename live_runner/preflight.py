@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -380,8 +381,17 @@ def run_live_preflight(
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
+    env_values = dict(env) if env is not None else _load_env_file(accounts_env)
+    # ${VAR} references in the YAML resolve exactly like credentials: the accounts
+    # env file first, the process environment only for keys the file does not
+    # define. An explicit ``env`` mapping is used as-is (hermetic callers).
+    expansion_env: Mapping[str, str] = (
+        env_values if env is not None else {**os.environ, **env_values}
+    )
     try:
-        accounts, deployments = parse_live_deployments_config(config)
+        accounts, deployments = parse_live_deployments_config(
+            config, env_values=expansion_env
+        )
     except ValueError as exc:
         # B3: invalid account definitions (e.g. non-routable ctrader ids)
         # report as a failed preflight, never as an unhandled crash.
@@ -406,7 +416,6 @@ def run_live_preflight(
             }
         },
     )
-    env_values = dict(env) if env is not None else _load_env_file(accounts_env)
 
     with _connectivity_event_loop(check_connectivity) as loop:
         account_results = [
