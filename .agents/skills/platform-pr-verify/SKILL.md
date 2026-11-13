@@ -43,8 +43,8 @@ If a stage is red but every remaining finding is irrelevant (false positive, out
 
 1. Post one PR comment headed `Pipeline override: <stage>` for the head commit. Give each finding its own line with the reason it does not apply. A blanket "findings irrelevant" is not enough; a human reads these reasons before merging.
 2. Dispatch the next stage:
-   - SonarCloud red -> `gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N>` (a manual run skips the SonarCloud gate).
-   - Code Review red -> `gh workflow run agent-mutation-testing.yml --ref <pr-branch> -f pr_number=<N>`.
+   - SonarCloud red -> `gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>` (a manual run skips the SonarCloud gate).
+   - Code Review red -> `gh workflow run agent-mutation-testing.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>`.
    - Mutation Testing red -> `gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>`.
    - Pre-Mortem red -> go on to the CodeRabbit CLI.
 

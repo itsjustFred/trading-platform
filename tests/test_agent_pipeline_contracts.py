@@ -333,13 +333,16 @@ def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
 
 
 def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
-    """A manual dispatch names no head_sha. Once "Mark running" has written `pending`, the
-    reporter must still have a SHA to clear, so it falls back to the resolved head."""
-    for name in (MUTATION, PREMORTEM):
+    """Every stage's resolve reporter prefers the dispatch input and falls back to the resolved
+    head: a manual dispatch may name no head_sha, and a first-step failure writes no `head`,
+    yet a push may already have marked the stages pending. No copy may skip the reporter on an
+    empty step output (the review copy once did, stranding all three statuses)."""
+    for name in AGENT_WORKFLOWS:
         step = _find_step(_load(name)["jobs"]["resolve"], r"^Report resolve failure")
         sha = str(step.get("env", {}).get("HEAD_SHA", ""))
         assert "inputs.head_sha" in sha, f"{name}: reporter ignores the dispatch input"
         assert "steps.pr.outputs.head" in sha, f"{name}: reporter has no resolved-head fallback"
+        assert step.get("if") == "failure()", f"{name}: reporter is skipped on {step.get('if')!r}"
 
 
 def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:

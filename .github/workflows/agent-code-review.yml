@@ -29,7 +29,9 @@ name: Agent Code Review
 # Override (red stage, findings judged irrelevant): justify each finding in a PR
 # comment, then dispatch the next stage by hand. A manual dispatch of this
 # workflow skips the SonarCloud gate:
-#   gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N>
+#   gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# head_sha is optional and only tells the resolve-failure reporter which commit's
+# pending statuses to clear if the run fails before it has resolved the PR.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN.
@@ -61,6 +63,10 @@ on:
         description: Number of the open PR to review (skips the SonarCloud gate)
         required: true
         type: number
+      head_sha:
+        description: Head commit the override is for; lets a run that fails before resolving the PR still clear the stage statuses (optional)
+        required: false
+        type: string
 
 concurrency:
   group: agent-code-review-${{ github.event.pull_request.number || inputs.pr_number }}
@@ -173,13 +179,22 @@ jobs:
 
       # After "Mark stages pending" a failure here (cancel query, artifact
       # upload) would leave all three stages `pending` with every later job skipped.
+      # The SHA comes from the dispatch input first and the resolved head second,
+      # so a manual dispatch that names head_sha is cleared even when its first
+      # step fails before `head` is written.
       - name: Report resolve failure
-        if: failure() && steps.pr.outputs.head != ''
+        if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          HEAD_SHA: ${{ inputs.head_sha || steps.pr.outputs.head }}
         run: |
           set -euo pipefail
+          # Only a manual dispatch without head_sha whose first step failed gets
+          # here with no SHA; the run log is then the only signal.
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
+            exit 0
+          fi
           for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
@@ -244,7 +259,7 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
-          echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER}"
+          echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER} -f head_sha=${HEAD_SHA}"
 
       # Without this, a step failure here (e.g. an API error under `set -e`)
       # leaves the stages `pending` forever: `review` is skipped and `post`
