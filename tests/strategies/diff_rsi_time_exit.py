@@ -21,8 +21,8 @@ STRATEGY_META = {
     "tags": {"type": ["mean_reversion", "rsi", "time_exit"]},
 }
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
 
 def generate_signals(df, params):

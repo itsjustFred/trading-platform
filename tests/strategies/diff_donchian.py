@@ -26,8 +26,8 @@ STRATEGY_META = {
     "tags": {"type": ["breakout", "donchian"]},
 }
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 
 
 def generate_signals(df, params):
@@ -41,9 +41,9 @@ def generate_signals(df, params):
     upper = high.rolling(entry_len).max().shift(1)
     lower = low.rolling(exit_len).min().shift(1)
     prev_close = close.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1, skipna=False)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
+        axis=1, skipna=False
+    )
     tr.iloc[0] = high.iloc[0] - low.iloc[0]
     atr = tr.rolling(atr_len).mean()
 
