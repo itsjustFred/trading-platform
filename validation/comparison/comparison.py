@@ -259,7 +259,8 @@ class TradeComparator:
             if isinstance(nested, dict):
                 sources.append(nested)
 
-        legacy_keys = tuple(keys) + (
+        legacy_keys = (
+            *keys,
             "final_stop_loss",
             "final_take_profit",
             "signal_stop_loss",

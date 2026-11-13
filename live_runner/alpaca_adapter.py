@@ -1257,7 +1257,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return ControlOutcome(
                 completed=completed,
                 unidentified=tuple(unidentified),
-                failed=tuple(failed) + (f"verify:{exc}",),
+                failed=(*failed, f"verify:{exc}"),
             )
         still_working = {
             _control_order_id(_order_attr(order, "id"))

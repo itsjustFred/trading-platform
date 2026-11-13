@@ -387,38 +387,38 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
         ts_all = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         long_mask = entries & (direction == "LONG")
         short_mask = entries & (direction == "SHORT")
-        for ts in ts_all.loc[long_mask].dropna().iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Long",
-                }
-            )
-        for ts in ts_all.loc[short_mask].dropna().iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#f97316",
-                    "text": "Short",
-                }
-            )
-        for ts in ts_all.loc[exits].dropna().iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": "Long",
+            }
+            for ts in ts_all.loc[long_mask].dropna().iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#f97316",
+                "text": "Short",
+            }
+            for ts in ts_all.loc[short_mask].dropna().iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "Exit",
+            }
+            for ts in ts_all.loc[exits].dropna().iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

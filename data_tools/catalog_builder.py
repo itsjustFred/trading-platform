@@ -933,16 +933,16 @@ def scan_universes(data_dir: Path) -> list[dict]:
     if not uni_dir.exists():
         return entries
 
-    for f in sorted(uni_dir.iterdir()):
-        if f.is_file():
-            entries.append(
-                {
-                    "name": f.stem,
-                    "path": str(f),
-                    "format": f.suffix.lstrip("."),
-                    "size_bytes": f.stat().st_size,
-                }
-            )
+    entries.extend(
+        {
+            "name": entry.stem,
+            "path": str(entry),
+            "format": entry.suffix.lstrip("."),
+            "size_bytes": entry.stat().st_size,
+        }
+        for entry in sorted(uni_dir.iterdir())
+        if entry.is_file()
+    )
     return entries
 
 

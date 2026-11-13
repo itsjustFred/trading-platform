@@ -19,7 +19,7 @@ def _is_crypto_symbol(symbol: str) -> bool:
     normalized = str(symbol or "").strip().upper()
     if not normalized:
         return False
-    return "/" in normalized or normalized.endswith("USD") and "-" in normalized
+    return "/" in normalized or (normalized.endswith("USD") and "-" in normalized)
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:

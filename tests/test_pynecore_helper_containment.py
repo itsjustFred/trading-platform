@@ -85,7 +85,7 @@ def test_helper_rejects_every_alias_of_a_multi_alias_import():
         "import os, numpy\n",
         "import pandas as pd, socket\n",
     ):
-        with pytest.raises(RuntimeError, match="'os'|'socket'"):
+        with pytest.raises(RuntimeError, match=r"'os'|'socket'"):
             _compile_helper_namespace(Path('demo_context.py'), source, strict_structure=True)
 
 

@@ -413,12 +413,12 @@ class TestOrphanOutDeal:
     @staticmethod
     def _deals(rows: list[list[Any]]) -> pd.DataFrame:
         return pd.DataFrame(
-            [["Trades"] + [None] * 11]
-            + [
+            [
+                ["Trades", *([None] * 11)],
                 ["Zeit", "Trade", "Symbol", "Typ", "Richtung", "Volumen", "Preis", "Auftrag",
-                 "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"]
+                 "Kommission", "Swap", "Gewinn", "Kontostand", "Kommentar"],
+                *rows,
             ]
-            + rows
         )
 
     def test_leading_orphan_out_is_not_merged_into_next_position(self, tmp_path: Path):

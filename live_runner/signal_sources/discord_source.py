@@ -756,7 +756,7 @@ class _DiscordMessageAdapter:
     fabricated one.
     """
 
-    __slots__ = ("content", "id", "created_at", "channel", "author")
+    __slots__ = ("author", "channel", "content", "created_at", "id")
 
     def __init__(self, message: dict[str, Any]) -> None:
         self.content = str(message.get("content") or "")

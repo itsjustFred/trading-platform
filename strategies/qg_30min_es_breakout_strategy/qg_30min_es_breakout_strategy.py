@@ -227,38 +227,38 @@ def generate_signals(df: pd.DataFrame, params: dict):
         short_times = timestamps_utc.loc[entries & (direction == "SHORT")].dropna()
         exit_times = timestamps_utc.loc[exits].dropna()
 
-        for ts in long_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "triangleUp",
-                    "color": "#22c55e",
-                    "text": "Long Signal",
-                }
-            )
-        for ts in short_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "triangleDown",
-                    "color": "#ef4444",
-                    "text": "Short Signal",
-                }
-            )
-        for ts in exit_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#f59e0b",
-                    "text": "Exit",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "triangleUp",
+                "color": "#22c55e",
+                "text": "Long Signal",
+            }
+            for ts in long_times.iloc[:200]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "triangleDown",
+                "color": "#ef4444",
+                "text": "Short Signal",
+            }
+            for ts in short_times.iloc[:200]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#f59e0b",
+                "text": "Exit",
+            }
+            for ts in exit_times.iloc[:200]
+        )
 
     return entries, exits, indicators_dict, drawings

@@ -123,18 +123,16 @@ def test_the_model_declares_every_default_production_has(model_built_db: Path) -
     tables |= {table for table, _ in MUST_NOT_HAVE_A_DEFAULT}
     mine = _defaults_from(model_built_db, tables)
 
-    model_lacks, model_added = [], []
-    for key, expected in PRODUCTION_DEFAULTS.items():
-        if mine.get(key) != expected:
-            model_lacks.append(
-                f"{key[0]}.{key[1]}: model={mine.get(key)!r} production={expected!r}"
-            )
-
-    for key in MUST_NOT_HAVE_A_DEFAULT:
-        if mine.get(key) is not None:
-            model_added.append(
-                f"{key[0]}.{key[1]}: model now has default {mine.get(key)!r}, production has none"
-            )
+    model_lacks = [
+        f"{key[0]}.{key[1]}: model={mine.get(key)!r} production={expected!r}"
+        for key, expected in PRODUCTION_DEFAULTS.items()
+        if mine.get(key) != expected
+    ]
+    model_added = [
+        f"{key[0]}.{key[1]}: model now has default {mine.get(key)!r}, production has none"
+        for key in MUST_NOT_HAVE_A_DEFAULT
+        if mine.get(key) is not None
+    ]
     assert not model_added, (
         "these columns gained a database default the model invented, so a fresh install now "
         f"diverges from production in the opposite direction: {model_added}"

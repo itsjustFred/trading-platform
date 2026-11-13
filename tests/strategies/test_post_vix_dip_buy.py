@@ -126,7 +126,7 @@ class TestPanicFixtureProducesTrades:
         )
         closes = [110.0, 110.1, 110.5, 110.6, 110.7, 110.8, 110.9,
                   111.0, 111.1, 111.2, 111.3, 111.4, 111.5]
-        for ts, c in zip(ny, closes):
+        for ts, c in zip(ny, closes, strict=True):
             if ts.hour == 9:
                 o, h, low = 110.0, 110.2, 109.8
             else:
@@ -207,8 +207,7 @@ class TestBullFilterNoLookahead:
         stamps = pd.date_range("2024-01-01", periods=205, freq="D", tz="UTC")
         rows = []
         for day in stamps:
-            for ts in pd.date_range(day, periods=8, freq="h", tz="UTC"):
-                rows.append((ts, 100.0))
+            rows.extend((ts, 100.0) for ts in pd.date_range(day, periods=8, freq="h", tz="UTC"))
         # Spike only the final bar: the day's FINAL close jumps to 200.
         rows[-1] = (rows[-1][0], 200.0)
         frame = pd.DataFrame(rows, columns=["timestamp", "close"])
@@ -267,7 +266,7 @@ class TestBullFilterNoLookahead:
             (101.4, 101.6, 101.2, 101.4),
             (101.4, 101.6, 101.2, 101.4),
         ]
-        for ts, (o, h, low, c) in zip(ny, bars):
+        for ts, (o, h, low, c) in zip(ny, bars, strict=True):
             rows.append((ts.tz_convert("UTC"), o, h, low, c, 1000.0))
         df = pd.DataFrame(
             rows, columns=["timestamp", "open", "high", "low", "close", "volume"]

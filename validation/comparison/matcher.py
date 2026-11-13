@@ -219,8 +219,6 @@ class TradeMatcher:
             else:
                 missing.append(ref["trade"])
 
-        for act in act_data:
-            if not act["matched"]:
-                extra.append(act["trade"])
+        extra.extend(act["trade"] for act in act_data if not act["matched"])
 
         return MatchResult(matched=matched, missing=missing, extra=extra)

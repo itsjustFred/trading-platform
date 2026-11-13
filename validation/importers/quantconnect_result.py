@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping
@@ -203,7 +204,10 @@ def _canonical_time(value: Any) -> str:
             "%m/%d/%Y %I:%M:%S %p",
         ):
             try:
-                parsed = datetime.strptime(text, fmt)
+                # The export carries no zone in the string itself; the
+                # default is stamped explicitly below, so a `%z` in the
+                # format would reject the strings it is there to match.
+                parsed = datetime.strptime(text, fmt)  # noqa: DTZ007
                 break
             except ValueError:
                 continue
@@ -255,7 +259,7 @@ def _resolve_reference_timeframe(normalized_trades: list, explicit: Any = None) 
     stamps.sort()
     gaps = [
         (later - earlier).total_seconds() / 60.0
-        for earlier, later in zip(stamps, stamps[1:])
+        for earlier, later in pairwise(stamps)
         if (later - earlier).total_seconds() > 0
     ]
     if not gaps:

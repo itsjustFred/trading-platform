@@ -569,7 +569,7 @@ class TestIssueC1FallbackGuards:
 
     @pytest.mark.parametrize("bad_atr", [float("nan"), float("inf"), -1.5, 0.0, "nonsense"])
     def test_non_finite_atr_rejected(self, bad_atr) -> None:
-        with pytest.raises(ValueError, match="[Aa][Tt][Rr]"):
+        with pytest.raises(ValueError, match=r"[Aa][Tt][Rr]"):
             self._engine().calculate_position_size(
                 signal=self._signal(atr=bad_atr),
                 account_balance=10000.0,

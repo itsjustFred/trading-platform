@@ -86,7 +86,7 @@ def test_dataset_path_rejects_symlink_escape(tmp_path: Path) -> None:
     outside.mkdir()
     (root / "linked").symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="symlink|escapes"):
+    with pytest.raises(ValueError, match=r"symlink|escapes"):
         build_dataset_path(root, "linked", "AAPL", "1m.parquet")
 
 

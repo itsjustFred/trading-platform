@@ -62,7 +62,7 @@ def test_engine_timestamps_share_one_formatter():
     points = build_indicator_series({"sma": series}, data)
     assert points, "indicator series unexpectedly empty"
     indicator_points = points[0].data
-    for point, expected_raw in zip(indicator_points, data["timestamp"]):
+    for point, expected_raw in zip(indicator_points, data["timestamp"], strict=True):
         assert point["time"] == engine_time.to_iso_utc(expected_raw)
 
 
@@ -84,9 +84,11 @@ def test_engine_shim_exposes_package_public_surface():
                 for name, obj in vars(module).items()
                 if not name.startswith("_") and inspect.getmodule(obj) is module
             ]
-        for name in public:
-            if not hasattr(engine_shim, name):
-                missing.append(f"runner.engine_pkg.{module_info.name}.{name}")
+        missing.extend(
+            f"runner.engine_pkg.{module_info.name}.{name}"
+            for name in public
+            if not hasattr(engine_shim, name)
+        )
     assert not missing, (
         "runner.engine shim is missing public names from the engine package "
         f"(add them to the shim's re-exports): {missing}"

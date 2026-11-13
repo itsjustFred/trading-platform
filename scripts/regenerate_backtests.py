@@ -192,7 +192,7 @@ def _select_symbol_timeframe(
         if not timeframe_map:
             continue
         for timeframe in TIMEFRAME_PRIORITY:
-            if timeframe in timeframe_map and timeframe_map[timeframe]:
+            if timeframe_map.get(timeframe):
                 return symbol, timeframe, timeframe_map[timeframe][0]
         first_timeframe = min(timeframe_map)
         return symbol, first_timeframe, timeframe_map[first_timeframe][0]
@@ -371,7 +371,7 @@ def _read_table_rows(source: sqlite3.Connection, tables: Iterable[str]) -> dict[
         try:
             cursor = source.execute(f'SELECT * FROM "{table}"')
             columns = [description[0] for description in cursor.description]
-            rows[table] = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            rows[table] = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             rows[table] = []
     return rows

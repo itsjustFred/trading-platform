@@ -347,7 +347,7 @@ class TestEveryBarsTimestampIsItsIntervalStart:
         # through a marker range - a range is meaningless across a month boundary, where one
         # Mon-Sun week legitimately holds markers 26..31 and 1.
         stamps = pd.to_datetime(result["timestamp"])
-        for stamp, volume in zip(stamps, result["volume"]):
+        for stamp, volume in zip(stamps, result["volume"], strict=True):
             monday = stamp
             days_in_bucket = int(
                 (

@@ -1384,7 +1384,7 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
 
     sampled.append(float(values[-1]))
     if len(sampled) > normalized_limit:
-        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+        sampled = [*sampled[: normalized_limit - 1], float(values[-1])]
     return sampled
 
 
@@ -1854,7 +1854,11 @@ def _signature_default_params(gen_sig_func: ast.FunctionDef) -> dict:
         if val is not None:
             kwargs_params[name] = val
     # also check kwonly args
-    for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
+    # `ast` pads `kw_defaults` with `None` for keyword-only arguments that have
+    # no default, so the two lists are the same length for any signature the
+    # parser can produce; `strict=True` makes a parser change visible here
+    # rather than silently mislabelling a default.
+    for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults, strict=True):
         if default_node is None:
             continue
         val = _constant_value(default_node)

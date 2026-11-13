@@ -236,7 +236,9 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
 
         from live_runner.signal_sources.execution_timing import _parse_signal_timestamp
 
-        naive = datetime(2026, 7, 15, 10, 0, 0)
+        # Deliberately naive: the datetime branch under test is what a broker
+        # sends when it sends local time, so the fixture has to stay naive.
+        naive = datetime(2026, 7, 15, 10, 0, 0)  # noqa: DTZ001
         parsed = _parse_signal_timestamp(naive)
         assert parsed is not None
         assert parsed.tzinfo is not None, "a naive datetime was returned naive"

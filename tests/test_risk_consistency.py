@@ -1,5 +1,5 @@
 """Tests for risk consistency between backtest and live engines."""
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -54,7 +54,7 @@ def test_risk_engine_and_live_size_match_for_valid_signals(
         symbol="EURUSD",
         action=action,
         theoretical_price=entry_price,
-        timestamp=datetime.now(),
+        timestamp=datetime.now(timezone.utc),
         metadata={
             "entry_price": entry_price,
             "stop_loss": stop_loss,
@@ -96,7 +96,7 @@ def test_live_size_rejects_wrong_stop_direction() -> None:
         symbol="EURUSD",
         action="buy",
         theoretical_price=100.0,
-        timestamp=datetime.now(),
+        timestamp=datetime.now(timezone.utc),
         metadata={
             "enforce_stop_direction": True,
             "entry_price": 100.0,

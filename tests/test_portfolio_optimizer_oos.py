@@ -293,7 +293,7 @@ def test_split_equity_curves_single_curve() -> None:
     curve = [StrategyEquityPoint(time=base_ts + i * seconds_per_month, equity=100.0 + i)
              for i in range(12)]
 
-    train_curves, test_curves = _split_equity_curves_by_time(
+    _train_curves, test_curves = _split_equity_curves_by_time(
         [curve], train_months=None, test_months=3
     )
 
@@ -308,7 +308,7 @@ def test_split_equity_curves_zero_test_months() -> None:
         [StrategyEquityPoint(time=1, equity=100.0)],
         [StrategyEquityPoint(time=2, equity=100.0)],
     ]
-    train, test = _split_equity_curves_by_time(curves, train_months=12, test_months=0)
+    _train, test = _split_equity_curves_by_time(curves, train_months=12, test_months=0)
     assert len(test) == 0
 
 
@@ -619,7 +619,7 @@ def test_load_strategy_equity_reads_sqlite_first(isolated_db_sandbox) -> None:
     import runner.portfolio_optimizer as po_module
     import shared.database as database
 
-    _database_module, engine, _data_dir = isolated_db_sandbox
+    _database_module, _engine, _data_dir = isolated_db_sandbox
 
     database.save_result_to_sqlite(
         BacktestResult(

@@ -3760,7 +3760,11 @@ async def _connect_active_accounts(
         ),
         return_exceptions=True,
     )
-    for account_id, result in zip(sorted(account_ids), results):
+    # `results` is one entry per `account_ids` element: `asyncio.gather`
+    # returns one result per awaitable it was given, in order. `strict=True`
+    # turns "the two got out of step" into an error instead of into weights
+    # read off the wrong account.
+    for account_id, result in zip(sorted(account_ids), results, strict=True):
         if isinstance(result, asyncio.CancelledError):
             raise result
         if isinstance(result, BaseException):

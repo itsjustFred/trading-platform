@@ -44,8 +44,8 @@ def test_run_strategy_grid_persists_to_sqlite(monkeypatch, tmp_path, isolated_db
     """
     scipy_module = types.ModuleType("scipy")
     scipy_stats_module = types.ModuleType("scipy.stats")
-    setattr(scipy_stats_module, "norm", lambda *args, **kwargs: 0.5)
-    setattr(scipy_stats_module, "ttest_1samp", lambda *args, **kwargs: None)
+    scipy_stats_module.norm = lambda *args, **kwargs: 0.5
+    scipy_stats_module.ttest_1samp = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "scipy", scipy_module)
     monkeypatch.setitem(sys.modules, "scipy.stats", scipy_stats_module)
     import runner.grid_tester as grid_tester_module

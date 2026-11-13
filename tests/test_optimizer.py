@@ -554,7 +554,7 @@ def test_run_optimization_rejects_legacy_base_before_study(monkeypatch, tmp_path
         _forbid_call("study must not be created for a legacy artifact"),
     )
 
-    with pytest.raises(ValueError, match="legacy artifact.*risk_per_trade_pct"):
+    with pytest.raises(ValueError, match=r"legacy artifact.*risk_per_trade_pct"):
         optimizer_module.run_optimization(
             optimizer_module.OptimizationConfig(
                 base_backtest_id="legacy-demo",

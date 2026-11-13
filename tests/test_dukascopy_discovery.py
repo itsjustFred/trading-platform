@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -210,5 +210,7 @@ def test_probe_csv_validity_and_current_period_probes_are_supported(tmp_path: Pa
     )
 
     assert _is_valid_probe_csv(csv_path)
-    assert _year_probe_date(date.today().year) <= date.today()
-    assert _month_probe_date(date.today().year, date.today().month) <= date.today()
+    # UTC, matching the clock the probe dates are computed from.
+    utc_today = datetime.now(UTC).date()
+    assert _year_probe_date(utc_today.year) <= utc_today
+    assert _month_probe_date(utc_today.year, utc_today.month) <= utc_today

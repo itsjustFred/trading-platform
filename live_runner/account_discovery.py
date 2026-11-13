@@ -172,15 +172,15 @@ def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     with, so is_demo can never contradict the actual trading mode.
     """
     indexed: list[dict[str, Any]] = []
-    for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
-        indexed.append(
-            {
-                "key": str(block.get("source_index", "")),
-                "api_key": str(block["api_key"]),
-                "secret_key": str(block["secret_key"]),
-                "paper": bool(block["paper"]),
-            }
-        )
+    indexed.extend(
+        {
+            "key": str(block.get("source_index", "")),
+            "api_key": str(block["api_key"]),
+            "secret_key": str(block["secret_key"]),
+            "paper": bool(block["paper"]),
+        }
+        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env))
+    )
 
     if indexed:
         return indexed
@@ -315,9 +315,7 @@ def _ctrader_message_name_sources(message: Any) -> list[Any]:
         if isinstance(nested, (str, bytes, bytearray)):
             continue
         try:
-            for item in nested:
-                if item is not None:
-                    sources.append(item)
+            sources.extend(item for item in nested if item is not None)
         except TypeError:
             sources.append(nested)
     return sources

@@ -103,8 +103,7 @@ def _two_day_frame() -> pd.DataFrame:
     rows = []
     for day in ("2024-01-02", "2024-01-03"):
         base = pd.Timestamp(day + " 09:30", tz="America/New_York")
-        for k in range(14):
-            rows.append((base + pd.Timedelta(minutes=30 * k)).tz_convert("UTC"))
+        rows.extend((base + pd.Timedelta(minutes=30 * k)).tz_convert("UTC") for k in range(14))
     stamps = pd.DatetimeIndex(rows)
     n = len(stamps)
     close = [100.0] * n

@@ -321,7 +321,7 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     qty_value = coerce_positive_live_qty(qty)
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
-    volume = int(round(qty_value * float(volume_per_qty)))
+    volume = round(qty_value * float(volume_per_qty))
     if volume <= 0:
         raise ValueError(
             "Signal has no positive quantity ('qty'); "
@@ -2256,7 +2256,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             raise ValueError("cTrader close position id must be positive integer.")
         volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = int(round(volume_value))
+        broker_volume = round(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader close volume must be a positive integer.")
         request = self._ProtoOAClosePositionReq()
@@ -2349,7 +2349,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             # Distance is signed by direction at the protocol level; the value
             # sent is always the positive magnitude in 1/scale price units.
-            return int(round(raw))
+            return round(raw)
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
