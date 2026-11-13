@@ -44,6 +44,8 @@ class LivePreflightResult:
     accounts: list[LivePreflightAccountResult]
     deployment_errors: list[str] = field(default_factory=list)
     deployment_warnings: list[str] = field(default_factory=list)
+    #: Read-only check of the ACTIVE DB deployments the daemon trades (None when not requested).
+    db_deployments: dict[str, Any] | None = None
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -339,6 +341,8 @@ def run_live_preflight(
     accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
+    check_db: bool = False,
+    db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
@@ -381,7 +385,17 @@ def run_live_preflight(
     ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
 
-    ok = all(result.ok for result in account_results) and not deployment_errors
+    db_report: dict[str, Any] | None = None
+    if check_db:
+        from live_runner.preflight_db import run_db_preflight
+
+        db_report = asdict(run_db_preflight(deployments, db_path=db_path))
+
+    ok = (
+        all(result.ok for result in account_results)
+        and not deployment_errors
+        and not (db_report and db_report["errors"])
+    )
     return LivePreflightResult(
         ok=ok,
         config_path=str(config),
@@ -389,6 +403,7 @@ def run_live_preflight(
         accounts=account_results,
         deployment_errors=deployment_errors,
         deployment_warnings=deployment_warnings,
+        db_deployments=db_report,
     )
 
 
@@ -413,12 +428,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Connect to brokers and read balance/positions without placing orders.",
     )
+    parser.add_argument(
+        "--check-db",
+        action="store_true",
+        help=(
+            "Also validate the ACTIVE deployments in the daemon's database (read-only) and "
+            "report how they differ from the YAML."
+        ),
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="SQLite file for --check-db (default: DATABASE_URL or DATA_DIR/backtests.db).",
+    )
     args = parser.parse_args(argv)
 
     result = run_live_preflight(
         args.config,
         accounts_env_path=args.accounts_env,
         check_connectivity=args.check_connectivity,
+        check_db=args.check_db,
+        db_path=args.db_path,
     )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1
