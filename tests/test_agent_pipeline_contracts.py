@@ -135,7 +135,11 @@ def _agent_job(data: dict) -> tuple[str, dict]:
 
 
 def _all_run_bodies(data: dict) -> str:
-    return "\n".join(_run(s) for job in data["jobs"].values() for s in _steps(job))
+    return _job_bodies(data["jobs"].values())
+
+
+def _job_bodies(jobs) -> str:
+    return "\n".join(_run(s) for job in jobs for s in _steps(job))
 
 
 def test_every_agent_workflow_parses_and_declares_its_chain_jobs() -> None:
@@ -209,14 +213,17 @@ def test_contexts_markers_and_titles_follow_the_stage_convention() -> None:
         for var in re.findall(r'-f context="\$([A-Z_]+)"', bodies):
             assert var in env, f"{stage}: writes context from undeclared variable ${var}"
         poster = _find_step(data["jobs"]["post"], poster_step)
-        assert marker in _run(poster), f"{stage}: poster does not carry its own marker"
+        poster_body = _run(poster)
         others = [s[2] for key, s in STAGES.items() if key != stage]
-        assert marker not in _run(poster).replace(marker, ""), f"{stage}: poster carries another marker"
+        assert marker in poster_body, f"{stage}: poster does not carry its own marker"
+        assert not any(other in poster_body for other in others), (
+            f"{stage}: poster references another stage's marker"
+        )
         assert not any(m in bodies.split(marker)[0] for m in others if m != marker), (
             f"{stage}: body references another stage's marker"
         )
         _job_name, job = _agent_job(data)
-        assert title in _run_body_of_all(job), f"{stage}: comment title {title!r} unset"
+        assert title in _job_bodies([job]), f"{stage}: comment title {title!r} unset"
 
 
 def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem() -> None:
@@ -227,7 +234,7 @@ def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem() -> None
     for stage, target in DISPATCHES.items():
         data = _load(STAGES[stage][0])
         post = data["jobs"]["post"]
-        bodies = _all_run_bodies({"jobs": {"post": post}})
+        bodies = _job_bodies([data["jobs"]["post"]])
         dispatched = set(re.findall(r"gh workflow run (agent-[\w-]+\.yml)", bodies))
         permissions = post.get("permissions", {})
         if target is None:
@@ -344,10 +351,6 @@ def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
         assert permissions == {"contents": "read"}, f"{name}: agent job permissions are {permissions}"
         checkout = next(s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/checkout"))
         assert checkout["with"].get("persist-credentials") is False, f"{name}: checkout keeps credentials"
-        bodies = _run_body_of_all(job)
+        bodies = _job_bodies([job])
         assert 'git rev-parse HEAD)" != "$HEAD_SHA"' in bodies, f"{name}: no HEAD-unchanged guard"
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
-
-
-def _run_body_of_all(job: dict) -> str:
-    return "\n".join(_run(s) for s in _steps(job))
