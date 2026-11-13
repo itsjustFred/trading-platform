@@ -63,6 +63,31 @@ def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> fl
     return float(value.quantize(tick, rounding=rounding))
 
 
+def _round_bracket_levels_in_place(
+    metadata: dict[str, Any], *, entry_price: float, signal: LiveSignal
+) -> None:
+    """Rewrite every SL/TP alias in *metadata* onto Alpaca's tick, toward the entry."""
+    for canonical_key, keys in (
+        ("stop_loss", _SL_METADATA_KEYS),
+        ("take_profit", _TP_METADATA_KEYS),
+    ):
+        level = _resolve_optional_float(metadata, keys)
+        if level is None or not math.isfinite(level) or level <= 0:
+            # Missing/invalid levels are refused by _resolve_broker_sl_tp.
+            continue
+        rounded = _round_bracket_price_toward_entry(level, entry_price=entry_price)
+        if (rounded - entry_price) * (level - entry_price) <= 0:
+            raise ValueError(
+                f"{canonical_key} {level!r} for {signal.symbol} is within one tick "
+                f"of the entry {entry_price!r}; refusing to submit "
+                f"(signal_id={signal.id})."
+            )
+        for key in keys:
+            if key in metadata:
+                metadata[key] = rounded
+        metadata[canonical_key] = rounded
+
+
 def _floor_to_whole_shares(qty: float) -> float:
     """Alpaca accepts fractional quantities only for simple orders.
 
@@ -829,25 +854,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        for canonical_key, keys in (
-            ("stop_loss", _SL_METADATA_KEYS),
-            ("take_profit", _TP_METADATA_KEYS),
-        ):
-            level = _resolve_optional_float(metadata, keys)
-            if level is None or not math.isfinite(level) or level <= 0:
-                # Missing/invalid levels are refused by _resolve_broker_sl_tp.
-                continue
-            rounded = _round_bracket_price_toward_entry(level, entry_price=entry_price)
-            if (rounded - entry_price) * (level - entry_price) <= 0:
-                raise ValueError(
-                    f"{canonical_key} {level!r} for {signal.symbol} is within one tick "
-                    f"of the entry {entry_price!r}; refusing to submit "
-                    f"(signal_id={signal.id})."
-                )
-            for key in keys:
-                if key in metadata:
-                    metadata[key] = rounded
-            metadata[canonical_key] = rounded
+        _round_bracket_levels_in_place(metadata, entry_price=entry_price, signal=signal)
         return signal.model_copy(update={"metadata": metadata}), whole_qty
 
     def _build_order_request(

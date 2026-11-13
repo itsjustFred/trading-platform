@@ -4819,8 +4819,9 @@ def test_alpaca_bracket_entry_below_one_share_is_refused_before_persistence(monk
     adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
     signal = _alpaca_entry("buy", 354.85, 347.75, 369.04)
 
+    submission = adapter.submit_order(signal, qty=0.7)
     with pytest.raises(ValueError, match="below one whole share"):
-        asyncio.run(adapter.submit_order(signal, qty=0.7))
+        asyncio.run(submission)
 
     assert submitted == []
     assert saved == []
@@ -4830,8 +4831,9 @@ def test_alpaca_bracket_level_within_one_tick_of_entry_is_refused(monkeypatch):
     adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
     signal = _alpaca_entry("buy", 100.0, 99.996, 110.0)
 
+    submission = adapter.submit_order(signal, qty=5.0)
     with pytest.raises(ValueError, match="within one tick"):
-        asyncio.run(adapter.submit_order(signal, qty=5.0))
+        asyncio.run(submission)
 
     assert submitted == []
     assert saved == []
