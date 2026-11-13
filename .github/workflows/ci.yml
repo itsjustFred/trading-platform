@@ -107,7 +107,14 @@ jobs:
       ACTIONLINT_VERSION: "1.7.12"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # go install verifies the module against the Go checksum database, so
+      # nothing is downloaded and executed unverified.
       - name: Install actionlint
-        run: bash <(curl -sSfL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+        run: go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
       - name: Lint workflows
-        run: ./actionlint -color -ignore 'SC2016'
+        run: |
+          "$(go env GOPATH)/bin/actionlint" -color -ignore 'SC2016'
