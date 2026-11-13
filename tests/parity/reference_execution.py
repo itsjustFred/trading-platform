@@ -198,6 +198,7 @@ class ReferenceSimulator:
         self.trades: list[RefTrade] = []
         self.skipped: list[str] = []
         self.curve: list[float] = []
+        self.realized_curve: list[float] = []
         self._bars: list[Bar] = []
 
     # -- sizing --------------------------------------------------------------
@@ -318,7 +319,10 @@ class ReferenceSimulator:
         bar = self._bars[i]
         if only_new and position.entry_index != i:
             return
-        stop_hit = position.stop is not None and bar.low <= position.stop
+        if position.direction == "LONG":
+            stop_hit = position.stop is not None and bar.low <= position.stop
+        else:
+            stop_hit = position.stop is not None and bar.high >= position.stop
         tp_hit = (
             position.take_profit is not None
             and (
@@ -433,6 +437,7 @@ class ReferenceSimulator:
     def run(self, bars: Sequence[Bar], sig: Signals) -> list[RefTrade]:
         self._bars = list(bars)
         self.curve: list[float] = []
+        self.realized_curve = []
         n = len(self._bars)
         for i in range(n):
             bar = self._bars[i]
@@ -467,6 +472,7 @@ class ReferenceSimulator:
 
             # 6) reported equity: realized cash + unrealized mark-to-market
             self.curve.append(_round(self._reported_equity(bar), 2))
+            self.realized_curve.append(_round(self.realized, 2))
 
         if self.positions:
             last = self._bars[-1]
@@ -477,9 +483,19 @@ class ReferenceSimulator:
             # the engine re-prices the final bar with the position closed, so
             # the last curve point reports realized cash only
             self.curve[-1] = _round(self.realized, 2)
+            self.realized_curve[-1] = _round(self.realized, 2)
         return self.trades
 
     # -- reporting -----------------------------------------------------------
+
+    @property
+    def curve_by_time(self) -> dict[str, float]:
+        return {bar.time: value for bar, value in zip(self._bars, self.curve)}
+
+    @property
+    def realized_by_time(self) -> dict[str, float]:
+        """Realized cash at the end of each bar (the engine's published curve basis)."""
+        return {bar.time: value for bar, value in zip(self._bars, self.realized_curve)}
 
     @property
     def realized_equity(self) -> float:
