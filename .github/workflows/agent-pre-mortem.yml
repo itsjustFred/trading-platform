@@ -120,6 +120,15 @@ jobs:
           if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
             echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
             echo "current=false" >> "$GITHUB_OUTPUT"
+            # Close what the push marked on the superseded commit, so its stage
+            # status ends terminal instead of pending (only if still pending).
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${INPUT_SHA}" \
+                -f state=error -f context="$PREMORTEM_CONTEXT" \
+                -f description="Superseded: the PR head moved on" > /dev/null
+            fi
             exit 0
           fi
           echo "current=true" >> "$GITHUB_OUTPUT"
@@ -452,14 +461,15 @@ jobs:
   # run that already wrote its final status is not touched (pending only).
   report-cancelled:
     needs: [resolve, premortem, post]
-    if: ${{ cancelled() && needs.resolve.outputs.head != '' }}
+    if: ${{ cancelled() && (needs.resolve.outputs.head != '' || inputs.head_sha != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       statuses: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      # A run cancelled before resolve wrote `head` still names its commit.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled pre-mortem run

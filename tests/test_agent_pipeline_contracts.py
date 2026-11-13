@@ -20,7 +20,8 @@ What is pinned here:
 - contexts, comment markers and comment titles follow the stage convention, and a marker is
   used by exactly one workflow, so comments never overwrite each other;
 - the dispatch edges are exactly review -> mutation -> pre-mortem -> (nothing), and only a
-  workflow that dispatches holds `actions: write`;
+  dispatching post job holds `actions: write` (the review resolve job also holds it, to cancel
+  superseded downstream runs);
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
   extraction, tree-clean check, head-moved comment guard, strict skill selection) stay
   identical modulo the names each copy substitutes;
@@ -252,8 +253,9 @@ def test_contexts_markers_and_titles_follow_the_stage_convention() -> None:
 def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem() -> None:
     """The chain is the contract: a stage that dispatches nothing on PASS ends the pipeline
     silently, and a stage that dispatches the wrong workflow runs the wrong rules on the code.
-    Only a stage that dispatches may hold `actions: write`; the last stage must not, because
-    `gh workflow run` is the one write that token buys."""
+    Only a post job that dispatches may hold `actions: write`; the last stage's must not,
+    because `gh workflow run` is the one write that token buys there. (The review resolve job
+    holds it separately, to cancel superseded downstream runs; that is not pinned here.)"""
     for stage, target in DISPATCHES.items():
         data = _load(STAGES[stage][0])
         post = data["jobs"]["post"]
@@ -398,6 +400,27 @@ def test_a_cancelled_run_clears_its_pending_stage() -> None:
         assert '= "pending"' in body, f"{name}: report-cancelled overwrites final statuses"
         for ctx in contexts:
             assert ctx in body, f"{name}: report-cancelled does not clear {ctx}"
+
+
+def test_a_superseded_or_early_cancelled_run_still_closes_its_status() -> None:
+    """Two exits skip every reporter: a chained run that finds the head has moved (it exits 0,
+    deliberately green), and a run cancelled before resolve wrote `head`. In both the push has
+    already marked the analysed commit pending, so the superseded branch closes it itself and
+    the cancellation job falls back to the commit named by the dispatch."""
+    for name in (MUTATION, PREMORTEM):
+        data = _load(name)
+        body = _run(_find_step(data["jobs"]["resolve"], r"^Resolve PR$"))
+        superseded = body[body.index("superseded, nothing to do") :]
+        superseded = superseded[: superseded.index("exit 0")]
+        assert "state=error" in superseded, f"{name}: the superseded exit leaves its status"
+        assert "PREMORTEM_CONTEXT" in superseded, f"{name}: superseded exit skips pre-mortem"
+    for name in AGENT_WORKFLOWS:
+        job = _load(name)["jobs"]["report-cancelled"]
+        sha = str(job.get("env", {}).get("HEAD_SHA", ""))
+        assert "inputs.head_sha" in sha, f"{name}: report-cancelled has no dispatch-SHA fallback"
+        assert "inputs.head_sha" in str(job.get("if", "")), (
+            f"{name}: report-cancelled is skipped when resolve wrote no head"
+        )
 
 
 def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:

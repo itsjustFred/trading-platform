@@ -598,14 +598,15 @@ jobs:
   # a final status is not touched (pending only).
   report-cancelled:
     needs: [resolve, sonar-gate, review, post]
-    if: ${{ cancelled() && needs.resolve.outputs.head != '' }}
+    if: ${{ cancelled() && (needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       statuses: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      # A run cancelled before resolve wrote `head` still names its commit.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled review run
