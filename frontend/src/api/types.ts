@@ -425,6 +425,9 @@ export interface BacktestStats {
   expectancy: number;
   psr?: number | null;
   p_value?: number | null;
+  // #132: equity reached zero; return ratios above are null by definition.
+  ruined?: boolean;
+  ruin_time?: string | null;
   [key: string]: unknown;
 }
 

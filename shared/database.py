@@ -4388,6 +4388,9 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
+        # #132: a ruined run has undefined return metrics; consumers that rank
+        # backtests (live deployment selection) must be able to exclude it.
+        "ruined": stats.get("ruined") is True,
         "created_at": str(backtest.created_at or ""),
         "tags": tags,
     }

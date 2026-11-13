@@ -37,6 +37,10 @@ def score_backtest_for_live(row: dict[str, Any]) -> float:
     PSR already 0..1, drawdown penalty 0..1) so no single raw scale
     dominates the way unnormalized CAGR did.
     """
+    if row.get("ruined") is True:
+        # #132: equity hit zero, so Sharpe/PSR are undefined (null). Reading
+        # them as 0.0 would still let a blown-up run be ranked; never deploy it.
+        return float("-inf")
     sharpe = _metric(row, "sharpe_ratio")
     cagr = min(max(_metric(row, "cagr"), -1.0), 1.0)
     psr = min(max(_metric(row, "psr"), 0.0), 1.0)

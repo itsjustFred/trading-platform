@@ -314,6 +314,17 @@ this code (older persisted artifacts keep their original numbers):
   assumption that they were daily, which overstates hourly bars and understates
   weekly ones with nothing in the payload to say so. Declaring the ratios
   undefined is the only answer that does not publish a guessed number.
+- **Ruin (#132).** The equity curve is cut at the FIRST point (in time order,
+  inclusive) whose equity is `<= 0`: `ruined` is `true` and `ruin_time` is that
+  point's `time` string as given. `total_return`, max drawdown, CAGR, Calmar
+  and drawdown duration are computed from the truncated curve, so a later
+  "recovery" cannot rescue them. `sharpe_ratio`, `sortino_ratio`, `psr` and
+  `p_value` are published as `null` (not `0.0`) and listed in
+  `undefined_metrics`: a series that ends in ruin has no meaningful risk-adjusted
+  ratio, and the old behaviour (dropping returns after the zero) published the
+  ratios of the pre-ruin subset. Non-ruined runs carry `ruined: false`,
+  `ruin_time: null`. Optimizer trials whose target metric is `null` get the
+  no-trade penalty and can never be selected as best.
 - A *reconciling* engine curve is compacted to one point per **calendar** day,
   not per observed day. A curve that observed only 01-05, 01-08 and 01-09
   produced three returns for an eight-day window, so a multi-day move was
