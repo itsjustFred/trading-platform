@@ -100,11 +100,44 @@ def test_module_loads():
     assert hasattr(mod, "generate_signals")
 
 
-def test_mt5_atr_uses_sma_seed_then_wilder_recurrence():
+def test_mt5_atr_is_a_simple_moving_average_of_true_range():
+    # MT5's built-in iATR is SMA(TR, period) (running sum / period), not Wilder.
+    # Hand-computed: TR = 1, 2, 3, 4, 5, 10, 7 with period 5.
     mod = _load_module()
     true_range = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 7.0])
 
-    atr_full = mod._mt5_atr(true_range, period=5)
+    atr = mod._mt5_atr(true_range, period=5)
+
+    assert atr.iloc[:4].isna().all()
+    assert atr.iloc[4] == pytest.approx(15.0 / 5)  # 1+2+3+4+5
+    assert atr.iloc[5] == pytest.approx(24.0 / 5)  # 2+3+4+5+10
+    assert atr.iloc[6] == pytest.approx(29.0 / 5)  # 3+4+5+10+7
+    # Wilder would give 4.4 and 4.92 here - the value the EA logs is the SMA.
+    assert atr.iloc[5] != pytest.approx(((3.0 * 4) + 10.0) / 5)
+
+
+def test_mt5_atr_matches_an_ea_logged_daily_atr():
+    # Real reference day: the Dukascopy-demo tester log (EURUSD H1 run) prints
+    # "2025.06.09 16:30:00 Levels calculated | ... | Stop: 0.0022519999999999966",
+    # so the EA's iATR(D1, 5) at shift 1 was 4 * Stop = 0.009008. The five D1 bars
+    # before it (2025-06-02..06, server clock) have true ranges 0.01063, 0.00905,
+    # 0.00776, 0.00903, 0.00857 - their plain mean is exactly that value.
+    mod = _load_module()
+    true_range = pd.Series([0.00617, 0.01740, 0.00774, 0.01063, 0.00905, 0.00776, 0.00903, 0.00857])
+    logged_atr = 4 * 0.0022519999999999966
+
+    sma = mod._mt5_atr(true_range, period=5)
+    wilder = mod._wilder_atr(true_range, period=5)
+
+    assert sma.iloc[-1] == pytest.approx(logged_atr, rel=1e-12)
+    assert abs(wilder.iloc[-1] - logged_atr) / logged_atr > 0.01
+
+
+def test_wilder_atr_uses_sma_seed_then_wilder_recurrence():
+    mod = _load_module()
+    true_range = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 7.0])
+
+    atr_full = mod._wilder_atr(true_range, period=5)
     assert atr_full.iloc[:4].isna().all()
 
     atr = atr_full.dropna()
@@ -116,11 +149,12 @@ def test_mt5_atr_uses_sma_seed_then_wilder_recurrence():
     assert atr.iloc[2] == pytest.approx(((first_update * 4) + true_range.iloc[6]) / 5)
 
 
-def test_mt5_atr_short_input_stays_nan_until_sma_seed_is_available():
+@pytest.mark.parametrize("atr_name", ["_mt5_atr", "_wilder_atr"])
+def test_atr_short_input_stays_nan_until_a_full_window_is_available(atr_name):
     mod = _load_module()
     true_range = pd.Series([1.0, 2.0, 3.0, 4.0], name="true_range")
 
-    atr = mod._mt5_atr(true_range, period=5)
+    atr = getattr(mod, atr_name)(true_range, period=5)
 
     assert atr.isna().all()
     assert atr.index.equals(true_range.index)
@@ -136,14 +170,27 @@ def test_mt5_atr_skips_nan_gaps_without_emitting_an_atr_for_the_gap():
     assert atr.iloc[:3].isna().all()
     assert atr.iloc[3] == pytest.approx(2.0)
     assert np.isnan(atr.iloc[4])
+    assert atr.iloc[5] == pytest.approx((2.0 + 3.0 + 6.0) / 3)
+
+
+def test_wilder_atr_skips_nan_gaps_without_emitting_an_atr_for_the_gap():
+    mod = _load_module()
+    true_range = pd.Series([np.nan, 1.0, 2.0, 3.0, np.nan, 6.0])
+
+    atr = mod._wilder_atr(true_range, period=3)
+
+    assert atr.iloc[:3].isna().all()
+    assert atr.iloc[3] == pytest.approx(2.0)
+    assert np.isnan(atr.iloc[4])
     assert atr.iloc[5] == pytest.approx(((2.0 * 2) + 6.0) / 3)
 
 
-def test_mt5_atr_period_one_preserves_values_and_nan_gaps():
+@pytest.mark.parametrize("atr_name", ["_mt5_atr", "_wilder_atr"])
+def test_atr_period_one_preserves_values_and_nan_gaps(atr_name):
     mod = _load_module()
     true_range = pd.Series([1.0, np.nan, "3.5"], name="true_range")
 
-    atr = mod._mt5_atr(true_range, period=1)
+    atr = getattr(mod, atr_name)(true_range, period=1)
 
     expected = pd.Series([1.0, np.nan, 3.5], name="true_range")
     pd.testing.assert_series_equal(atr, expected)
@@ -173,6 +220,10 @@ def test_default_parameters_present():
         "exit_time": "22:55",
         "session_timezone": "",
         "session_timezone_offset_hours": 0,
+        "atr_smoothing": "sma",
+        "broker_clock": "",
+        "daily_weekend_bars": "auto",
+        "daily_skip_filler_bars": True,
     }
     for key, val in expected.items():
         assert params.get(key) == val, f"param {key} expected {val}, got {params.get(key)}"
@@ -729,3 +780,283 @@ def test_fixed_utc_offset_is_supported_when_timezone_is_blank():
     assert zone.utcoffset(None) == timedelta(hours=2)
     with pytest.raises(ValueError, match="cannot be combined"):
         mod._resolve_session_zone("Europe/Athens", 2)
+
+
+# ---------------------------------------------------------------------------
+# MT5 daily-ATR semantics: smoothing, trading-day D1 bars, broker clock
+# ---------------------------------------------------------------------------
+def _one_bar_per_day(rows):
+    """rows: (utc timestamp, open, high, low, close) -> one bar per row."""
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime([r[0] for r in rows], utc=True),
+            "open": [r[1] for r in rows],
+            "high": [r[2] for r in rows],
+            "low": [r[3] for r in rows],
+            "close": [r[4] for r in rows],
+        }
+    )
+
+
+def _atr_params(**overrides):
+    mod = _load_module()
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update({"atr_period": 2, "atr_long_period": 2, "use_candle_close": False})
+    params.update(overrides)
+    return mod, params
+
+
+# Thu, Fri, a stray Saturday filler print, Mon, Tue (UTC, session clock = UTC).
+_WEEKEND_ROWS = [
+    ("2024-01-04 12:00", 100.0, 102.0, 98.0, 100.0),  # TR 4 (first bar: high-low)
+    ("2024-01-05 12:00", 100.0, 105.0, 99.0, 104.0),  # TR max(6, 5, 1) = 6
+    ("2024-01-06 12:00", 104.5, 104.5, 104.5, 104.5),  # Sat: TR 0.5 vs Fri close
+    ("2024-01-08 12:00", 104.0, 106.0, 102.0, 103.0),  # Mon: TR 4 (prev close 104 or 104.5)
+    ("2024-01-09 12:00", 103.0, 104.0, 102.0, 103.0),
+]
+
+
+def test_daily_atr_drops_weekend_rows_by_default():
+    mod, params = _atr_params()
+    df = _one_bar_per_day(_WEEKEND_ROWS)
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    # Tuesday uses ATR(2) of the last two *trading-day* D1 bars: (Fri 6 + Mon 4) / 2.
+    assert indicators["daily_atr"].iloc[4] == pytest.approx(5.0)
+    # Monday uses (Thu 4 + Fri 6) / 2 - the Saturday row never takes a window slot.
+    assert indicators["daily_atr"].iloc[3] == pytest.approx(5.0)
+
+
+def test_daily_atr_keeps_weekend_rows_only_when_asked():
+    mod, params = _atr_params(daily_weekend_bars="keep")
+    df = _one_bar_per_day(_WEEKEND_ROWS)
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    # (Sat 0.5 + Mon max(4, 1.5, 2.5) = 4) / 2 and (Fri 6 + Sat 0.5) / 2.
+    assert indicators["daily_atr"].iloc[4] == pytest.approx(2.25)
+    assert indicators["daily_atr"].iloc[3] == pytest.approx(3.25)
+
+
+def test_atr_smoothing_is_selectable_and_defaults_to_mt5_sma():
+    rows = [
+        ("2024-01-01 12:00", 100.0, 101.0, 100.0, 100.0),  # TR 1
+        ("2024-01-02 12:00", 100.0, 102.0, 100.0, 100.0),  # TR 2
+        ("2024-01-03 12:00", 100.0, 103.0, 100.0, 100.0),  # TR 3
+        ("2024-01-04 12:00", 100.0, 110.0, 100.0, 100.0),  # TR 10
+        ("2024-01-05 12:00", 100.0, 100.0, 100.0, 100.0),
+    ]
+    df = _one_bar_per_day(rows)
+
+    mod, sma_params = _atr_params(atr_period=3)
+    _, _, sma, _ = mod.generate_signals(df, sma_params)
+    _, wilder_params = _atr_params(atr_period=3, atr_smoothing="wilder")
+    _, _, wilder, _ = mod.generate_signals(df, wilder_params)
+
+    # Friday sees the ATR through Thursday: SMA (2+3+10)/3, Wilder (2*2+10)/3.
+    assert sma["daily_atr"].iloc[4] == pytest.approx(5.0)
+    assert wilder["daily_atr"].iloc[4] == pytest.approx(14.0 / 3)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"atr_smoothing": "ema"}, "atr_smoothing must be one of"),
+        ({"daily_weekend_bars": "sometimes"}, "daily_weekend_bars must be one of"),
+        ({"broker_clock": "Europe/Athens"}, "Unknown broker_clock"),
+        ({"broker_clock": "ny_close", "session_timezone": "Europe/Athens"}, "cannot be combined"),
+        ({"broker_clock": "ny_close", "session_timezone_offset_hours": 2}, "cannot be combined"),
+    ],
+)
+def test_invalid_mt5_daily_settings_fail_closed(overrides, message):
+    mod, params = _atr_params(**overrides)
+    with pytest.raises(ValueError, match=message):
+        mod.generate_signals(_one_bar_per_day(_WEEKEND_ROWS), params)
+
+
+def test_native_daily_ohlcv_is_refused_with_a_broker_clock():
+    mod, params = _atr_params(broker_clock="ny_close")
+    params["daily_ohlcv"] = _one_bar_per_day(_WEEKEND_ROWS)
+    with pytest.raises(ValueError, match="daily_ohlcv cannot be combined with broker_clock"):
+        mod.generate_signals(_one_bar_per_day(_WEEKEND_ROWS), params)
+
+
+@pytest.mark.parametrize(
+    ("day", "entry_utc"),
+    [
+        ("2023-07-05", "14:30"),  # legacy index history: fixed UTC+2 in summer
+        ("2024-04-03", "14:30"),  # transition: still UTC+2 although DST began
+        ("2024-11-06", "13:30"),  # autumn-2024 switch came a week late: UTC+3
+        ("2025-03-12", "13:30"),  # New York close: UTC+3 from the US switch
+        ("2025-11-05", "14:30"),  # New York close: back to UTC+2
+    ],
+)
+def test_broker_clock_places_entry_time_on_the_broker_server_clock(day, entry_utc):
+    mod = _load_module()
+    idx = pd.date_range(f"{day} 12:00", f"{day} 16:00", freq="1min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": np.arange(len(idx), dtype=float),
+            "high": np.arange(len(idx), dtype=float) + 0.5,
+            "low": np.arange(len(idx), dtype=float) - 0.5,
+            "close": np.arange(len(idx), dtype=float),
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params.update({"broker_clock": "dukascopy_mt5_index", "use_candle_close": False})
+
+    _, _, indicators, _ = mod.generate_signals(df, params)
+
+    entry_bar = df["timestamp"] == pd.Timestamp(f"{day} {entry_utc}", tz="UTC")
+    expected = df.loc[entry_bar, "open"].iloc[0]
+    assert indicators["entry_open"].iloc[0] == expected
+
+
+def _sunday_evening_rows(sunday: str):
+    friday = (pd.Timestamp(sunday) - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    monday = (pd.Timestamp(sunday) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    tuesday = (pd.Timestamp(sunday) + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    return [
+        (f"{friday} 12:00", 100.0, 105.0, 99.0, 104.0),
+        (f"{sunday} 21:30", 104.5, 104.5, 104.5, 104.5),  # 23:30 Sunday on a UTC+2 clock
+        (f"{monday} 12:00", 104.0, 106.0, 102.0, 103.0),
+        (f"{tuesday} 12:00", 103.0, 104.0, 102.0, 103.0),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sunday", "listed"),
+    [("2019-03-10", False), ("2024-03-10", True)],
+)
+def test_broker_clock_weekend_bars_follow_the_broker_history(sunday, listed):
+    df = _one_bar_per_day(_sunday_evening_rows(sunday))
+    common = {"broker_clock": "dukascopy_mt5_forex", "atr_period": 1, "atr_long_period": 1}
+    mod, auto = _atr_params(**common)
+    _, keep = _atr_params(**common, daily_weekend_bars="keep")
+    _, drop = _atr_params(**common, daily_weekend_bars="drop")
+
+    atr = {name: mod.generate_signals(df, p)[2]["daily_atr"].iloc[3] for name, p in
+           (("auto", auto), ("keep", keep), ("drop", drop))}
+
+    # Tuesday's ATR(1) is Monday's TR; Monday's previous close is Friday's (104) when
+    # the Sunday bar is absent and the Sunday print (104.5) when the broker lists it.
+    assert atr["drop"] == pytest.approx(4.0)
+    assert atr["keep"] == pytest.approx(4.0)  # max(4, 1.5, 2.5)
+    # Monday itself: the previous D1 bar is Sunday (TR 0.5) only if it is listed.
+    monday_auto = mod.generate_signals(df, auto)[2]["daily_atr"].iloc[2]
+    assert monday_auto == pytest.approx(0.5 if listed else 6.0)
+
+
+def test_broker_clock_refuses_bars_inside_a_fall_back_overlap():
+    mod = _load_module()
+    # ny_close falls back at 2025-11-02 06:00 UTC (09:00 -> 08:00 server).
+    idx = pd.date_range("2025-11-02 05:30", "2025-11-02 06:30", freq="10min", tz="UTC")
+    df = pd.DataFrame({"timestamp": idx, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0})
+    params = mod.STRATEGY_META["parameters"].copy()
+    params["broker_clock"] = "ny_close"
+    with pytest.raises(ValueError, match="non-monotonic server clock"):
+        mod.generate_signals(df, params)
+
+
+def _with_volume(df, volumes):
+    out = df.copy()
+    out["volume"] = volumes
+    return out
+
+
+def test_flat_zero_volume_filler_bars_do_not_form_d1_bars():
+    # A holiday padded with flat zero-volume filler (Wed) between two trading days.
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),  # TR 4
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),  # TR 6
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),  # filler: TR would be 0
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),  # TR 4
+        ("2024-12-27 12:00", 103.0, 104.0, 102.0, 103.0),
+    ]
+    df = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, 0.0, 5.0, 5.0])
+    mod, params = _atr_params()
+    _, _, skipped, _ = mod.generate_signals(df, params)
+    _, kept_params = _atr_params(daily_skip_filler_bars=False)
+    _, _, kept, _ = mod.generate_signals(df, kept_params)
+
+    # Friday: ATR(2) of the last two traded D1 bars, (6 + 4) / 2 - versus (0 + 4) / 2.
+    assert skipped["daily_atr"].iloc[4] == pytest.approx(5.0)
+    assert kept["daily_atr"].iloc[4] == pytest.approx(2.0)
+
+
+def test_filler_needs_both_zero_volume_and_a_flat_bar():
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),  # flat but traded (volume 1)
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),
+        ("2024-12-27 12:00", 103.0, 104.0, 102.0, 103.0),
+    ]
+    mod, params = _atr_params()
+    traded_flat = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, 1.0, 5.0, 5.0])
+    no_volume_column = _one_bar_per_day(rows)
+
+    for df in (traded_flat, no_volume_column):
+        _, _, indicators, _ = mod.generate_signals(df, params)
+        assert indicators["daily_atr"].iloc[4] == pytest.approx(2.0)  # (TR 0 + TR 4) / 2
+
+
+def test_broker_clock_overlap_check_ignores_weekend_filler_bars():
+    mod = _load_module()
+    # Filler bars straddling the 2025-11-02 06:00 UTC New York fall-back (a Sunday),
+    # then real bars on Monday.
+    filler = pd.date_range("2025-11-02 05:30", "2025-11-02 06:30", freq="10min", tz="UTC")
+    real = pd.date_range("2025-11-03 13:00", "2025-11-03 15:00", freq="1min", tz="UTC")
+    idx = filler.append(real)
+    df = pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": 1.0,
+            "high": np.where(idx.isin(real), 1.001, 1.0),
+            "low": 1.0,
+            "close": 1.0,
+            "volume": np.where(idx.isin(real), 3.0, 0.0),
+        }
+    )
+    params = mod.STRATEGY_META["parameters"].copy()
+    params["broker_clock"] = "ny_close"
+
+    entries, _, _, _ = mod.generate_signals(df, params)
+    assert len(entries) == len(df)
+
+
+@pytest.mark.parametrize("unknown", [np.nan, "n/a", np.inf, -np.inf])
+def test_non_finite_volume_is_unknown_not_filler_and_warns(unknown, caplog):
+    # A flat bar whose volume is non-finite cannot be told apart from a real one-tick
+    # minute, so it is kept like a bar of a feed without a volume column (ATR(2) on
+    # Friday = (TR 0 + TR 4) / 2 = 2.0) - and the run says so instead of silently
+    # letting the filler skip do nothing.
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),
+        ("2024-12-27 12:00", 103.0, 104.0, 102.0, 103.0),
+    ]
+    df = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, unknown, 5.0, 5.0])
+    mod, params = _atr_params()
+    with caplog.at_level("WARNING"):
+        _, _, indicators, _ = mod.generate_signals(df, params)
+    assert indicators["daily_atr"].iloc[4] == pytest.approx(2.0)
+    assert "non-finite volume" in caplog.text
+
+
+def test_finite_volume_feed_does_not_warn(caplog):
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),
+    ]
+    df = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, 0.0, 5.0])
+    mod, params = _atr_params()
+    with caplog.at_level("WARNING"):
+        mod.generate_signals(df, params)
+    assert "non-finite volume" not in caplog.text

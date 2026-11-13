@@ -11,9 +11,9 @@ the minimum evidence required before MT5, QuantConnect/LEAN, or future broker
 exports can be used to justify changes in signal, risk, execution, or reporting
 behavior.
 
-The current parity baseline already imports MT5 XLSX reports with
-`source_timezone="Europe/Athens"` and keeps comparison-matrix metrics based on
-the XLSX header stats. This document does not change those semantics. It defines
+The current parity baseline already imports MT5 XLSX reports on the broker's
+server clock (`shared/broker_clock.py`) and keeps comparison-matrix metrics based
+on the XLSX header stats. This document does not change those semantics. It defines
 the next artifact shapes needed to diagnose remaining differences such as
 intraday stop paths, bid/ask fill side, lower-timeframe replay, Sharpe
 conventions, and QuantConnect rebalance fills.
@@ -42,7 +42,7 @@ Current importer behavior:
 | Header statistics | Matrix reference metrics such as trade count, win rate, net profit, Sharpe. |
 | Orders table | Entry order stop-loss and take-profit levels keyed by order id. |
 | Trades table | Paired entry/exit trades, prices, volume, PnL, swap, commission, comments. |
-| `source_timezone` | Report-local timestamp timezone, currently `Europe/Athens` for parity cases. |
+| `broker_clock` | Report timestamp clock: a named broker server clock (`dukascopy_mt5_forex`, `dukascopy_mt5_index`, ...) that maps server wall time to UTC through its historical offset segments. Replaces a fixed `source_timezone` for MT5 reports. |
 
 Rules:
 
@@ -181,7 +181,8 @@ Every importer should populate `raw_metadata` with at least:
 |---|---|
 | `source_framework` | External framework, e.g. `mt5_xlsx`, `mt5_html`, `quantconnect`. |
 | `source_path` | Source path or stable artifact identifier. |
-| `source_timezone` | Original timestamp timezone or `UTC` when truly UTC. |
+| `source_timezone` | Original timestamp timezone or `UTC` when truly UTC; `null` when the times are broker server wall time and no civil zone applies. |
+| `broker_clock` | Named broker server clock the timestamps were read on, or `null` when a civil timezone applies. |
 | `timestamp_conversion` | Description of local-to-UTC conversion. |
 | `metric_basis` | `header`, `trades`, `equity_curve`, `attribution`, or mixed details. |
 | `schema_version` | Contract version used by the importer. |

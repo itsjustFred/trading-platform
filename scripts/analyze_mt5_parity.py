@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Continuable MT5 parity diagnostics for IntradayVolatilityBreakout."""
+"""Continuable MT5 parity diagnostics for IntradayVolatilityBreakout.
+
+MT5 reports print trade times on the broker's server clock (``TimeCurrent()``),
+and that clock changed its UTC offset several times over the 2018-2026 span
+(see ``shared/broker_clock.py``). Every report is therefore read through the
+same per-symbol broker clock the platform run used, and session/day bucketing
+uses that server wall time - the basis the EA's ``16:30`` entry time and the D1
+bars behind its ATR are defined on - rather than a fixed civil zone.
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,9 +18,33 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of reading another tree's clock profiles. See
+# tests/test_script_import_origin.py; run as:
+#     python -m scripts.analyze_mt5_parity
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("analyze_mt5_parity")
+# --- end import-origin guard ---
+# The guard module performs `import shared` itself, so this line is no longer read at run time - it
+# is the anchor `tests/test_script_import_origin.py` scans for when it builds the roster of scripts
+# that must carry the guard. Kept deliberately, and silenced rather than removed: dropping it would
+# take this script off the roster and out of the gate that keeps the guard alive.
+import shared  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,12 +57,10 @@ from scripts.regenerate_mt5_parity_artifacts import (
     _load_ohlcv,
     _opposite_side_series,
 )
+from shared.broker_clock import BrokerClock, resolve_broker_clock
 from strategies.intraday_volatility_breakout.intraday_volatility_breakout import generate_signals
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.reference import resolve_initial_capital
-
-MT5_SOURCE_TIMEZONE = "Europe/Athens"
-SESSION_TIMEZONE = ZoneInfo("Europe/Athens")
 
 
 @dataclass(frozen=True)
@@ -53,6 +83,35 @@ def _case_by_label() -> dict[str, dict[str, Any]]:
 
 def _platform_path(label: str) -> Path:
     return Path(_case_by_label()[label]["output"])
+
+
+def _broker_clock(label: str) -> BrokerClock:
+    """The broker server clock the MT5 report for ``label`` was produced on.
+
+    Taken from the comparison case, the same place the platform run takes it
+    from, so the report and the platform artifact cannot be read on different
+    clocks.
+    """
+    cases = _case_by_label()
+    try:
+        case = cases[label]
+    except KeyError:
+        raise ValueError(
+            f"{label!r} has no comparison case, so its report has no broker clock; "
+            f"known: {', '.join(sorted(cases))}"
+        ) from None
+    clock = resolve_broker_clock(case.get("broker_clock"))
+    if clock is None:
+        raise ValueError(
+            f"comparison case {label!r} names no broker_clock, so the server wall "
+            "times its MT5 report prints cannot be resolved"
+        )
+    return clock
+
+
+def _load_reference(label: str, path: Path) -> Any:
+    """Read an MT5 report on the broker clock its comparison case ran on."""
+    return MT5XLSXImporter().load(path, broker_clock=_broker_clock(label))
 
 
 def _load_platform(path: Path) -> dict[str, Any]:
@@ -168,18 +227,29 @@ def _entry_timestamp(trade: Any) -> pd.Timestamp:
     return _utc_timestamp(trade.entry_time)
 
 
-def _session_minute_label(timestamp: pd.Timestamp) -> str:
-    session_timestamp = timestamp.tz_convert(SESSION_TIMEZONE)
+def _server_time(timestamp: pd.Timestamp, clock: BrokerClock) -> pd.Timestamp:
+    """Broker server wall time for a UTC instant (naive, as MT5 prints it)."""
+    return pd.Timestamp(clock.to_server_time(pd.DatetimeIndex([timestamp]))[0])
+
+
+def _session_minute_label(timestamp: pd.Timestamp, clock: BrokerClock) -> str:
+    session_timestamp = _server_time(timestamp, clock)
     return f"{session_timestamp.hour:02d}:{session_timestamp.minute:02d}"
 
 
-def _top_session_minutes(trades: list[Any], limit: int) -> list[tuple[str, int]]:
-    counts = Counter(_session_minute_label(_entry_timestamp(trade)) for trade in trades)
+def _top_session_minutes(
+    trades: list[Any],
+    limit: int,
+    clock: BrokerClock,
+) -> list[tuple[str, int]]:
+    counts = Counter(
+        _session_minute_label(_entry_timestamp(trade), clock) for trade in trades
+    )
     return counts.most_common(limit)
 
 
-def _year_counts(trades: list[Any]) -> dict[int, int]:
-    counts = Counter(_entry_timestamp(trade).year for trade in trades)
+def _year_counts(trades: list[Any], clock: BrokerClock) -> dict[int, int]:
+    counts = Counter(_server_time(_entry_timestamp(trade), clock).year for trade in trades)
     return dict(sorted(counts.items()))
 
 
@@ -355,9 +425,8 @@ def _local_stop_touch_counts(
 
 
 def summary(args: argparse.Namespace) -> None:
-    importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        ref = _load_reference(label, mt5_path)
         platform = _load_platform(_platform_path(label))
         mt5_pnl = float(ref.stats.get("total_pnl") or 0.0)
         platform_pnl = float(platform.get("stats", {}).get("total_pnl") or 0.0)
@@ -376,9 +445,8 @@ def summary(args: argparse.Namespace) -> None:
 
 
 def entry_minutes(args: argparse.Namespace) -> None:
-    importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        ref = _load_reference(label, mt5_path)
         times = pd.to_datetime([trade.entry_time for trade in ref.trades], utc=True, errors="coerce")
         minutes = pd.Series(times.hour * 60 + times.minute)
         print(f"\n{label} entry minutes")
@@ -386,11 +454,10 @@ def entry_minutes(args: argparse.Namespace) -> None:
 
 
 def stop_atr(args: argparse.Namespace) -> None:
-    importer = MT5XLSXImporter()
     cases = _case_by_label()
     params = resolve_strategy_parameters(STRATEGY_PATH, {"session_timezone_offset_hours": args.session_offset})
     for label, mt5_path in MT5_REPORTS.items():
-        ref = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        ref = _load_reference(label, mt5_path)
         case = cases[label]
         df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         _, _, indicators, _ = generate_signals(df, params)
@@ -463,7 +530,6 @@ def signal_counts(args: argparse.Namespace) -> None:
 
 def data_quality(args: argparse.Namespace) -> None:
     cases = _case_by_label()
-    importer = MT5XLSXImporter()
     for label, case in cases.items():
         df = _load_ohlcv(args.data_dir, case["execution_symbol"], case["execution_timeframe"], case["start"], case["end"])
         ohlc_cols = ["open", "high", "low", "close"]
@@ -471,7 +537,7 @@ def data_quality(args: argparse.Namespace) -> None:
         print("time", df["timestamp"].min(), df["timestamp"].max())
         for col in ohlc_cols:
             print(col, "nan", int(pd.to_numeric(df[col], errors="coerce").isna().sum()))
-        ref = importer.load(MT5_REPORTS[label], source_timezone=MT5_SOURCE_TIMEZONE)
+        ref = _load_reference(label, MT5_REPORTS[label])
         times = pd.to_datetime([trade.entry_time for trade in ref.trades], utc=True, errors="coerce")
         ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         ts_index = pd.Series(df.index, index=ts)
@@ -502,10 +568,9 @@ def data_quality(args: argparse.Namespace) -> None:
 
 def matched_stop_path(args: argparse.Namespace) -> None:
     cases = _case_by_label()
-    importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
         case = cases[label]
-        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        reference = _load_reference(label, mt5_path)
         platform = _load_platform(_platform_path(label))
         platform_trades = list(platform.get("trades", []))
         matches = _match_by_entry_and_direction(reference.trades, platform_trades)
@@ -578,9 +643,8 @@ def matched_stop_path(args: argparse.Namespace) -> None:
 
 
 def sharpe_conventions(args: argparse.Namespace) -> None:
-    importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        reference = _load_reference(label, mt5_path)
         report_sharpe = float(reference.stats.get("sharpe_ratio") or 0.0)
         candidates = _sharpe_convention_candidates(reference)
         print(f"\n{label}")
@@ -596,9 +660,9 @@ def sharpe_conventions(args: argparse.Namespace) -> None:
 
 
 def unmatched_entries(args: argparse.Namespace) -> None:
-    importer = MT5XLSXImporter()
     for label, mt5_path in MT5_REPORTS.items():
-        reference = importer.load(mt5_path, source_timezone=MT5_SOURCE_TIMEZONE)
+        reference = _load_reference(label, mt5_path)
+        clock = _broker_clock(label)
         platform = _load_platform(_platform_path(label))
         platform_trades = list(platform.get("trades", []))
         matches, unmatched_reference, unmatched_platform = _split_by_entry_and_direction(
@@ -620,15 +684,15 @@ def unmatched_entries(args: argparse.Namespace) -> None:
         )
         print(f"unmatched_mt5_directions={_direction_counts(unmatched_reference)}")
         print(f"unmatched_platform_directions={_direction_counts(unmatched_platform)}")
-        print(f"unmatched_mt5_years={_year_counts(unmatched_reference)}")
-        print(f"unmatched_platform_years={_year_counts(unmatched_platform)}")
+        print(f"unmatched_mt5_years={_year_counts(unmatched_reference, clock)}")
+        print(f"unmatched_platform_years={_year_counts(unmatched_platform, clock)}")
         print(
             "unmatched_mt5_session_minutes="
-            f"{_top_session_minutes(unmatched_reference, args.top)}"
+            f"{_top_session_minutes(unmatched_reference, args.top, clock)}"
         )
         print(
             "unmatched_platform_session_minutes="
-            f"{_top_session_minutes(unmatched_platform, args.top)}"
+            f"{_top_session_minutes(unmatched_platform, args.top, clock)}"
         )
 
 

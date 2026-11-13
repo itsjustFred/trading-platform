@@ -1,7 +1,12 @@
+from pathlib import Path
+
 import pytest
 
 from scripts.analyze_mt5_parity import (
+    MT5_REPORTS,
+    _broker_clock,
     _direction_counts,
+    _load_reference,
     _match_by_entry_and_direction,
     _mt5_exit_reason,
     _platform_exit_reason,
@@ -12,8 +17,11 @@ from scripts.analyze_mt5_parity import (
     _top_session_minutes,
     _trade_return_frame,
     _utc_timestamp,
+    _year_counts,
 )
+from shared.broker_clock import BROKER_CLOCKS, DUKASCOPY_MT5_FOREX, DUKASCOPY_MT5_INDEX
 from shared.models import Trade, TradeExit
+from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 
 def _trade(
@@ -116,14 +124,74 @@ def test_split_by_entry_and_direction_preserves_unmatched_and_direction_conflict
     assert _direction_counts(unmatched_platform) == {"LONG": 1}
 
 
-def test_top_session_minutes_uses_athens_local_time():
+def test_top_session_minutes_uses_broker_server_time_not_athens():
+    # 2025-03-17..19: the US is on DST while the EU is not, so the index clock is
+    # UTC+3 where Europe/Athens is still UTC+2. A fixed-Athens reading prints
+    # 16:45/17:00 here, i.e. one hour off the server clock the EA traded on.
     trades = [
-        _trade(entry_time="2024-01-01T14:45:00Z"),
-        _trade(entry_time="2024-01-02T14:45:00Z"),
-        _trade(entry_time="2024-01-03T15:00:00Z"),
+        _trade(entry_time="2025-03-17T14:45:00Z"),
+        _trade(entry_time="2025-03-18T14:45:00Z"),
+        _trade(entry_time="2025-03-19T15:00:00Z"),
     ]
 
-    assert _top_session_minutes(trades, 2) == [("16:45", 2), ("17:00", 1)]
+    assert _top_session_minutes(trades, 2, DUKASCOPY_MT5_INDEX) == [("17:45", 2), ("18:00", 1)]
+
+
+def test_top_session_minutes_keeps_the_legacy_fixed_offset_for_indices():
+    # 2021-07-01 is in the legacy history: index CFDs ran on a fixed UTC+2 while
+    # forex ran on Europe/Athens (UTC+3 that day). The two symbols differ by an hour
+    # on the same UTC instant, which a single shared zone cannot express.
+    trades = [_trade(entry_time="2021-07-01T14:45:00Z")]
+
+    assert _top_session_minutes(trades, 1, DUKASCOPY_MT5_INDEX) == [("16:45", 1)]
+    assert _top_session_minutes(trades, 1, DUKASCOPY_MT5_FOREX) == [("17:45", 1)]
+
+
+def test_year_counts_buckets_on_the_server_calendar():
+    # 2018-12-31 23:30 UTC is already 2019-01-01 01:30 on the legacy index clock,
+    # and the report prints the server date, so both trades belong to 2019.
+    trades = [
+        _trade(entry_time="2018-12-31T23:30:00Z"),
+        _trade(entry_time="2019-06-03T10:00:00Z"),
+    ]
+
+    assert _year_counts(trades, DUKASCOPY_MT5_INDEX) == {2019: 2}
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_clock"),
+    [
+        ("EURUSD_H1", "dukascopy_mt5_forex"),
+        ("NAS100_M15", "dukascopy_mt5_index"),
+        ("SP500_M1", "dukascopy_mt5_index"),
+    ],
+)
+def test_broker_clock_is_the_one_the_platform_run_used(label, expected_clock):
+    assert _broker_clock(label) is BROKER_CLOCKS[expected_clock]
+
+
+def test_every_report_has_a_broker_clock():
+    assert set(MT5_REPORTS) == {"EURUSD_H1", "NAS100_M15", "SP500_M1"}
+    for label in MT5_REPORTS:
+        assert _broker_clock(label).name.startswith("dukascopy_mt5_")
+
+
+def test_broker_clock_rejects_a_label_without_a_comparison_case():
+    with pytest.raises(ValueError, match="no comparison case"):
+        _broker_clock("GBPUSD_H1")
+
+
+def test_load_reference_reads_the_report_on_the_case_broker_clock(monkeypatch):
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    def fake_load(self, path, **kwargs):
+        calls.append((path, kwargs))
+        return "reference"
+
+    monkeypatch.setattr(MT5XLSXImporter, "load", fake_load)
+
+    assert _load_reference("NAS100_M15", Path("NAS100_M15.xlsx")) == "reference"
+    assert calls == [(Path("NAS100_M15.xlsx"), {"broker_clock": DUKASCOPY_MT5_INDEX})]
 
 
 def test_exit_reason_helpers_classify_stop_and_platform_signal():
