@@ -4795,8 +4795,9 @@ def test_ctrader_volume_floored_below_minimum_is_refused_not_upsized() -> None:
     _module, adapter = _make_ctrader_adapter()
     _load_eurusd_demo_props(adapter, step_volume=100_000)
 
+    signal = _ctrader_signal("EURUSD", {"qty": 0.9994})
     with pytest.raises(ValueError, match="below the broker minimum"):
-        adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": 0.9994}))
+        adapter._resolve_order_volume(signal)
 
 
 def test_ctrader_new_order_request_volume_is_on_broker_step() -> None:

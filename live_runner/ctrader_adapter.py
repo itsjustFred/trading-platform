@@ -283,6 +283,24 @@ def _fallback_symbol_scale(symbol: str) -> SymbolScale:
     )
 
 
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_field(fallback: SymbolScale | None, name: str, default: Any = None) -> Any:
+    return getattr(fallback, name) if fallback is not None else default
+
+
 def _symbol_scale_from_broker_props(
     *,
     digits: int | None,
@@ -292,32 +310,20 @@ def _symbol_scale_from_broker_props(
     step_volume: int | None = None,
 ) -> SymbolScale | None:
     """Build a broker-authoritative scale, using a fallback only when available."""
-    try:
-        digit_count = int(digits) if digits is not None else None
-    except (TypeError, ValueError):
-        digit_count = None
+    digit_count = _optional_int(digits)
     if digit_count is None or not 0 <= digit_count <= 10:
-        digit_count = fallback.price_digits if fallback is not None else None
-    try:
-        lots = float(lot_size) if lot_size is not None else None
-    except (TypeError, ValueError):
-        lots = None
+        digit_count = _fallback_field(fallback, "price_digits")
+    lots = _optional_float(lot_size)
     if lots is None or not math.isfinite(lots) or lots <= 0:
-        lots = fallback.lot_size if fallback is not None else None
-    try:
-        minimum = int(min_volume) if min_volume is not None else None
-    except (TypeError, ValueError):
-        minimum = None
+        lots = _fallback_field(fallback, "lot_size")
+    minimum = _optional_int(min_volume)
     if minimum is None or minimum <= 0:
-        minimum = fallback.min_volume if fallback is not None else None
+        minimum = _fallback_field(fallback, "min_volume")
     if digit_count is None or lots is None or minimum is None:
         return None
-    try:
-        step = int(step_volume) if step_volume is not None else None
-    except (TypeError, ValueError):
-        step = None
+    step = _optional_int(step_volume)
     if step is None or step <= 0:
-        step = fallback.step_volume if fallback is not None else 1
+        step = _fallback_field(fallback, "step_volume", 1)
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
