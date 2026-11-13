@@ -139,11 +139,15 @@ Fenster mit Wochenend-Zeilen verseucht ist) – erst zusammen wird der ATR exakt
   −3,2k aus 10 Trades mit anderem Exit-Typ SL↔Time, Real-Ticks vs. M1);
   NAS100 −8,4k = Waisen −5,6k + gematchte −2,8k; EURUSD −0,7k.
 
-### Gleicher Bug außerhalb dieser Strategie (nicht geändert)
+### Gleicher Bug außerhalb dieser Strategie
 
-`validation/statistics/cross_platform.py` (`MT5_REPORT_SOURCE_TIMEZONE`),
-`scripts/analyze_mt5_parity.py` und `docs/reference-artifact-contract.md`
-lesen die MT5-XLSX-Zeiten als `Europe/Athens`. Für diese Broker-Historie ist
-das 2018–2023 für Indizes im Sommer und ab 2024-04 in den US-only-DST-Wochen
-falsch (1 h). Betrifft Zeitstempel/Tagesgrenzen der Vergleichsmatrix, nicht die
-Trade-Anzahl; Follow-up.
+`validation/statistics/cross_platform.py` las die MT5-XLSX-Zeiten als
+`Europe/Athens`; für diese Broker-Historie ist das 2018–2023 für Indizes im
+Sommer und ab 2024-04 in den US-only-DST-Wochen falsch (1 h, betroffen sind
+389/1024 SP500-, 392/1194 NAS100- und 18/984 EURUSD-Zeitstempel der Reports).
+Behoben: die Vergleichsmatrix importiert die Reports jetzt über denselben
+`broker_clock` (`dukascopy_mt5_forex` / `dukascopy_mt5_index`), den auch
+`scripts/regenerate_mt5_parity_artifacts.py` für die Platform-Runs nutzt.
+`scripts/analyze_mt5_parity.py` nutzt denselben Weg: Report-Import und
+Session-/Jahres-Bucketing laufen auf der Broker-Serverzeit des jeweiligen
+Symbols statt auf `Europe/Athens`.
