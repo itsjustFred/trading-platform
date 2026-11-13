@@ -1,7 +1,7 @@
 name: Agent Code Review
 
 # Stage 2 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> CodeRabbit
+#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> Agent Pre-Mortem -> CodeRabbit
 #
 # On every push to a PR it waits for the SonarCloud check of the head commit.
 # Only if SonarCloud is green does it run the `.agents/skills/actions-code-review`
@@ -22,6 +22,8 @@ name: Agent Code Review
 #                           error:   INCOMPLETE, the agent run failed, or not run
 #                                    because SonarCloud is not green
 #   agent/mutation-testing  pending: waiting for agent/code-review (on push)
+#                           error:   not run because agent/code-review is not PASS
+#   agent/pre-mortem        pending: waiting for agent/mutation-testing (on push)
 #                           error:   not run because agent/code-review is not PASS
 #
 # Override (red stage, findings judged irrelevant): justify each finding in a PR
@@ -72,6 +74,7 @@ env:
   SONAR_CHECK: SonarCloud Code Analysis
   REVIEW_CONTEXT: agent/code-review
   MUTATION_CONTEXT: agent/mutation-testing
+  PREMORTEM_CONTEXT: agent/pre-mortem
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
@@ -135,10 +138,14 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=pending -f context="$MUTATION_CONTEXT" \
             -f description="Waiting for ${REVIEW_CONTEXT}" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$PREMORTEM_CONTEXT" \
+            -f description="Waiting for ${MUTATION_CONTEXT}" > /dev/null
 
-      # Mutation runs are dispatched with run-name "... PR #<n> @ <sha>". A new
-      # push makes those of older commits worthless; stop them to save minutes.
-      - name: Cancel mutation runs of older commits
+      # The downstream stage runs are dispatched with run-name
+      # "... PR #<n> @ <sha>". A new push makes those of older commits
+      # worthless; stop them to save minutes.
+      - name: Cancel downstream stage runs of older commits
         if: steps.pr.outputs.same_repo == 'true' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -146,12 +153,14 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          for state in queued in_progress; do
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/agent-mutation-testing.yml/runs?status=${state}&per_page=100" \
-              --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
-              2>/dev/null || true
+          for wf in agent-mutation-testing.yml agent-pre-mortem.yml; do
+            for state in queued in_progress; do
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=${state}&per_page=100" \
+                --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
+                2>/dev/null || true
+            done
           done | while read -r id; do
-            echo "Cancelling superseded mutation run ${id}"
+            echo "Cancelling superseded stage run ${id}"
             gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/cancel" > /dev/null || true
           done
 
@@ -162,7 +171,7 @@ jobs:
           retention-days: 1
 
       # After "Mark stages pending" a failure here (cancel query, artifact
-      # upload) would leave both stages `pending` with every later job skipped.
+      # upload) would leave all three stages `pending` with every later job skipped.
       - name: Report resolve failure
         if: failure() && steps.pr.outputs.head != ''
         env:
@@ -170,7 +179,7 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -231,10 +240,13 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
           echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER}"
 
       # Without this, a step failure here (e.g. an API error under `set -e`)
-      # leaves both stages `pending` forever: `review` is skipped and `post`
+      # leaves the stages `pending` forever: `review` is skipped and `post`
       # only runs for a finished review.
       - name: Report gate failure
         if: failure()
@@ -248,6 +260,9 @@ jobs:
             -f description="SonarCloud gate failed; see the run log" > /dev/null
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Not run: SonarCloud gate failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: SonarCloud gate failed" > /dev/null
 
   review:
@@ -293,9 +308,10 @@ jobs:
       # workflow runs from, then the PR's own copy. If none of the three
       # exists, the job stops.
       #
-      # Duplicated by hand in agent-mutation-testing.yml: skill selection,
-      # agent config, verdict parse, tree-clean check and comment poster. A
-      # change to one copy must land in the other in the same commit.
+      # Duplicated by hand in agent-mutation-testing.yml and agent-pre-mortem.yml:
+      # skill selection, agent config, verdict parse, tree-clean check and
+      # comment poster. A change to one copy must land in the others in the
+      # same commit.
       - name: Select skill revision
         run: |
           mkdir -p "$RUNNER_TEMP/review"
@@ -457,6 +473,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.review.result == 'success'
@@ -505,13 +524,19 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$MUTATION_CONTEXT" \
                 -f description="Not run: dispatch of mutation testing failed" > /dev/null
-              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} to error."
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$PREMORTEM_CONTEXT" \
+                -f description="Not run: dispatch of mutation testing failed" > /dev/null
+              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} and ${PREMORTEM_CONTEXT} to error."
               exit 1
             fi
             echo "Dispatched mutation testing for ${HEAD_SHA}."
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
               -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
 
@@ -524,7 +549,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
