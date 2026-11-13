@@ -3,6 +3,7 @@
 ## Quelle
 - Original: `Intraday Channel Breakout nt8.txt` (NQ 5 min US Equities RTH, bi-direktional mit EMA-Filter, Gap-Filter, Trailing-ATR-Stop)
 - Discord: `https://discord.com/channels/1230977283888648315/1383712509831155782/1388096847498707044`
+- Version: 1.2.0 (Session-Close eine Bar frueher fuer Next-Open-Fills; keine Market-Close-exit_price)
 - Konvertiert: 2026-03-08, source-faithful Fix: 2026-09-09
 
 ## Kernlogik
@@ -22,7 +23,7 @@ Prioritaet pro Bar: Stop zuerst, dann Channel-Exit, dann EMA-Exit, dann Session-
 1. ATR-Trailing-Stop (default): Long `close <= trail`, Short `close >= trail` (Close-basiert wie im Original), `trail = close -/+ ATR(14)*2.0`, nur engend.
 2. Channel-Exit (default AN): Gegenseiten-Stop — Long bei `low <= lower_channel[-1]`, Short bei `high >= upper_channel[-1]`, Fill am Channel-Level.
 3. EMA-Exit (Opt-in, default AUS): Long bei `close < EMA`, Short bei `close > EMA`.
-4. Session-Close (default AN): Flatten an der letzten Bar jedes NY-Tages (keine Overnight-Positionen; `IsExitOnSessionCloseStrategy`, 30 s).
+4. Session-Close (default AN): flat zur letzten Bar jedes NY-Tages (keine Overnight-Positionen; `IsExitOnSessionCloseStrategy`, 30 s). Signal-Exits fuellen am naechsten Bar-Open (`next_open`); das Signal geht deshalb auf der **vorletzten** Bar der Session raus (Session-Ende = haeufigste Zeit der letzten Bar je NY-Tag, plus Bar-Abstand; kein Blick auf spaetere Bars) und fuellt am Open der letzten Bar. Ab dieser Bar gibt es keine neuen Entries. Endet ein Tag frueher (Halbtag/Datenluecke), flattet die erste Bar der naechsten Session (eine Bar spaeter, nie uebersprungen). Market-Exits (Trailing, EMA, Session-Close) tragen seit v1.2.0 keinen `exit_price=close` mehr.
 5. Fix-$ Stop (Opt-in, default AUS, `$100`): ersetzt das ATR-Trailing; Long bei `low <= entry - amount`, Short bei `high >= entry + amount`.
 
 ### Stop-Loss
