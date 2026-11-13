@@ -32,9 +32,12 @@ Execution semantics
 -------------------
 * Entry fills at the next bar's open in both frameworks.
 * The stop and the target are the only exits, so every exit is a protective
-  fill: both frameworks fill at the level itself (the fixture generator refuses
-  a data set on which any bar opens through a level, which is the one case where
-  backtesting.py's realistic market/limit fill would differ).
+  fill: both frameworks fill at the level on an intrabar touch and at the bar's
+  OPEN when it opens beyond the level (platform rule #208 A, backtesting.py's
+  ``min(open, stop)`` / ``max(open, target)``); the fixture contains such gaps.
+  One exception: an entry whose own stop is already breached by the entry bar's
+  open is refused by the platform; backtesting.py enters and stops out at that
+  open (zero-PnL round trip, documented difference D5).
 * Same-bar stop-and-target resolves stop-first in both (backtesting.py inserts
   the stop order ahead of the target in its queue; the platform's contract
   declares stop-first).

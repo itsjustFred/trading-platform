@@ -15,7 +15,7 @@ What this port adds over :mod:`ref_bracket_long`
 * the **short** side of the bracket: the stop sits *above* the entry and the
   target below it (the ordering backtesting.py's ``Strategy.sell`` requires),
 * SHORT protective fills in the platform engine (stop triggers when
-  ``high >= stop``, target when ``low <= target``; both fill at the level),
+  ``high >= stop``, target when ``low <= target``; both fill at the level, or at the bar open when it opens beyond it),
 * SHORT signal-accounting: PnL is ``(entry - exit) * quantity``.
 
 Rules (identical to the original)

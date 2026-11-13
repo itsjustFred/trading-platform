@@ -24,12 +24,15 @@ What it does
 1. builds the deterministic fixture OHLCV (seeded synthetic daily bars),
 2. runs each reference strategy on it (``FractionalBacktest`` so sizes are
    fractional shares) and records the trade list,
-3. **refuses to write** unless the fixture keeps the comparison clean:
-   no stop/target is ever gapped through, the reference's "one position at a
-   time" gate never binds (so the platform's stateless port is equivalent), and
-   no trade is still open at the end of the data.
+3. **refuses to write** unless the fixture keeps the comparison clean: the
+   reference's "one position at a time" gate never binds (so the platform's
+   stateless port is equivalent) and no trade is still open at the end of the
+   data (the forced close differs: reference last open, platform last close).
+   Stops/targets that the exit bar opens through are NOT refused any more: both
+   frameworks fill them at the open (platform rule #208 A), they are recorded in
+   the manifest (``gap_through_exits``) and compared exactly.
 
-Those three invariants are what separates a *semantic* difference (documented in
+Those invariants separate a *semantic* difference (documented in
 ``docs/reports/parity-reference-libraries.md``) from an *engine bug*; a fixture
 that broke one of them would silently turn a real defect into an accepted
 difference, so the generator fails loudly instead.
@@ -92,7 +95,8 @@ def make_ohlcv(bars: int = BARS, seed: int = SEED) -> pd.DataFrame:
     """Deterministic daily OHLCV: alternating regime drift, overnight gap, wicks.
 
     Open = previous close times an overnight gap, high/low straddle the body.
-    Every generated bar keeps ``low <= open, close <= high`` so the series is a
+    Overnight gaps are mostly small, with a fat tail of larger jumps so that some stops and
+    targets are opened through.  Every generated bar keeps ``low <= open, close <= high`` so the series is a
     legal OHLC frame on every engine.
     """
     rng = np.random.default_rng(seed)
@@ -100,6 +104,10 @@ def make_ohlcv(bars: int = BARS, seed: int = SEED) -> pd.DataFrame:
     drift = np.array([0.0009 if (i // 90) % 2 == 0 else -0.0007 for i in range(bars)])
     returns = drift + rng.normal(0.0, 0.0095, bars)
     gaps = rng.normal(0.0, 0.0020, bars)
+    # occasional news-sized overnight gaps (~8 % of bars, sigma 2.5 %): some of them open
+    # beyond a stop or a target, which is the gap-fill rule the parity run must exercise.
+    jump = rng.random(bars) < 0.08
+    gaps = gaps + np.where(jump, rng.normal(0.0, 0.025, bars), 0.0)
     wick_up = np.abs(rng.normal(0.0, 0.0035, bars))
     wick_dn = np.abs(rng.normal(0.0, 0.0035, bars))
 
@@ -144,15 +152,15 @@ def _bar_at(frame: pd.DataFrame, timestamp: pd.Timestamp) -> pd.Series:
 
 
 def protective_gap_throughs(frame: pd.DataFrame, trades: pd.DataFrame) -> list[str]:
-    """Report exits whose reference fill beat or lost to the level by a gap.
+    """Protective exits whose bar OPENED through the level (stop gapped down / target gapped up).
 
-    backtesting.py fills a contingent stop as ``min(open, level)`` and a
-    contingent target as ``max(open, level)``; the platform fills both at the
-    level itself (docs/cross-engine-backtest-contract.md section 1). Whenever
-    the exit bar *opens through* the level the two frameworks disagree by more
-    than a convention, so such trades are not usable for a parity fixture.
+    backtesting.py fills a contingent stop as ``min(open, level)`` and a contingent target as
+    ``max(open, level)`` (``Backtest._process_orders``), i.e. at the OPEN when the bar opens
+    beyond the level and at the level on an intrabar touch.  The platform adopted the same rule
+    on 2026-11-13 (#208 A), so these trades are now part of the exact comparison instead of being
+    refused; they are listed so the manifest can prove the fixture exercises both fill rules.
     """
-    problems = []
+    through = []
     for _, trade in trades.iterrows():
         if trade["exit_kind"] == "end_of_data":
             continue
@@ -162,15 +170,12 @@ def protective_gap_throughs(frame: pd.DataFrame, trades: pd.DataFrame) -> list[s
         open_price = float(bar["open"])
         level = float(trade[level_key])
         if trade["side"] == "LONG":
-            through = open_price < level if stop_side else open_price > level
+            opened_through = open_price < level if stop_side else open_price > level
         else:
-            through = open_price > level if stop_side else open_price < level
-        if through:
-            problems.append(
-                f"trade {int(trade['trade'])} ({trade['side']} {trade['exit_kind']}): "
-                f"exit bar {trade['exit_time']} opens {open_price:.4f} through level {level:.4f}"
-            )
-    return problems
+            opened_through = open_price > level if stop_side else open_price < level
+        if opened_through:
+            through.append(f"{int(trade['trade'])}:{trade['exit_kind']}")
+    return through
 
 
 def trades_open_at_end(trades: pd.DataFrame) -> list[str]:
@@ -309,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         strategy = strategies[strategy_name]
         commission = _commission_for(commission_name)
         trades, final_equity = run_reference(strategy, frame, commission=commission)
-        problems = protective_gap_throughs(frame, trades) + trades_open_at_end(trades)
+        gap_exits = protective_gap_throughs(frame, trades)
+        problems = trades_open_at_end(trades)
         problems.append(gate_bound(frame, strategy, commission))
         problems = [p for p in problems if p]
         summary.append((slug, strategy_name, commission, len(trades), final_equity, problems))
@@ -323,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                 str(kind): int(count)
                 for kind, count in trades["exit_kind"].value_counts().items()
             },
+            "gap_through_exits": gap_exits,
             "invariant_violations": list(problems),
         }
         if not args.no_write and not problems:
