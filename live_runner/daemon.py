@@ -22,6 +22,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
     is_order_not_submitted,
@@ -759,9 +760,11 @@ def size_live_signal_for_submission(
     descriptors (levels, ATR, timeframe) are read from the untrusted payload.
 
     Args:
-        pip_value: Trusted per-symbol pip value from the caller (config or
-            broker). Never read from signal metadata; ``None`` means the
-            RiskEngine unit contract of 1.0 account-currency unit per pip.
+        pip_value: Trusted account-currency P&L of one qty unit per 1.0 price
+            move (#146), from the broker or the caller. Never read from signal
+            metadata. ``None`` means 1.0, which is only right for a USD-quoted
+            share/coin in a USD account; :func:`prepare_order_with_risk`, the
+            only production caller, always passes a broker-resolved value.
         current_positions: Open-position count from the broker. ``None`` when
             the broker cannot report positions; the payload's
             ``current_positions`` is never used in its place.
@@ -1092,6 +1095,135 @@ async def _check_entry_deviation(
     return record
 
 
+# Upper bound for resolving one pip value (#146): the account and asset lookups
+# plus up to MAX_CONVERSION_HOPS conversion quotes, each bounded by the adapter.
+PIP_VALUE_FETCH_TIMEOUT_SECONDS = 60.0
+
+#: Metadata keys the pip-value resolution writes. Always all of them, so a
+#: payload value under one of these names can never survive to persistence
+#: or reach the adapter (cTrader reads ``pip_value_units_per_qty``).
+_PIP_VALUE_METADATA_KEYS = (
+    "pip_value",
+    "pip_value_source",
+    "pip_value_units_per_qty",
+    "pip_value_conversion_rate",
+    "pip_value_quote_asset",
+    "pip_value_account_asset",
+    "pip_value_conversion_symbols",
+    "pip_value_conversion_quote_times",
+    "pip_value_conversion_quote_ages_seconds",
+)
+
+
+def _pip_value_record(pip_value: float, *, source: str) -> dict[str, object]:
+    record: dict[str, object] = dict.fromkeys(_PIP_VALUE_METADATA_KEYS)
+    record["pip_value"] = float(pip_value)
+    record["pip_value_source"] = source
+    return record
+
+
+async def _resolve_live_pip_value(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+) -> tuple[float, dict[str, object]]:
+    """The broker's pip value for a live entry, failing closed (#146).
+
+    The value is the account-currency P&L of one adapter qty unit per 1.0
+    price move (:class:`~live_runner.base_adapter.LivePipValue`). It never
+    comes from signal metadata. With an implicit 1.0, cTrader FX entries were
+    sized ~1000x too large (a 0.036 USD budget became a 36.18 USD loss at the
+    stop on the demo).
+
+    Refuses the entry, with a logged reason, when the adapter cannot provide
+    one, the call fails or times out, the value is not finite and positive, or
+    a conversion quote it was derived from is missing a time, in the future or
+    older than the deployment's ``max_entry_quote_age_seconds`` (the same
+    freshness rule as the entry gate). Returns the value and the record to
+    persist on the signal.
+    """
+    log_data: dict[str, object] = {
+        "deployment_id": str(deployment.id),
+        "account_id": deployment.account_id,
+        "symbol": signal.symbol,
+    }
+
+    def _refuse(reason: str) -> ValueError:
+        logger.warning(
+            "Pip value unavailable; refusing the entry (sizing fails closed)",
+            extra={"data": {**log_data, "reason": reason}},
+        )
+        return ValueError(
+            f"Refusing live entry for {signal.symbol}: no trusted pip value in account "
+            f"currency ({reason})."
+        )
+
+    get_pip_value = getattr(adapter, "get_pip_value", None)
+    try:
+        if not callable(get_pip_value):
+            raise NotImplementedError(f"{type(adapter).__name__} has no get_pip_value")
+        resolved = await asyncio.wait_for(
+            get_pip_value(signal.symbol), timeout=PIP_VALUE_FETCH_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        raise _refuse(f"{type(exc).__name__}: {exc}") from exc
+    if not isinstance(resolved, LivePipValue):
+        raise _refuse(f"adapter returned {type(resolved).__name__}, not LivePipValue")
+    try:
+        value = _coerce_live_float(resolved.value, field_name="pip value")
+        units_per_qty = _coerce_live_float(resolved.units_per_qty, field_name="units per qty")
+        rate = _coerce_live_float(resolved.conversion_rate, field_name="conversion rate")
+    except ValueError as exc:
+        raise _refuse(str(exc)) from exc
+    if value <= 0 or units_per_qty <= 0 or rate <= 0:
+        raise _refuse(
+            f"pip value {value!r}, units per qty {units_per_qty!r} and conversion rate "
+            f"{rate!r} must all be > 0"
+        )
+    if not math.isclose(value, units_per_qty * rate, rel_tol=1e-9, abs_tol=0.0):
+        raise _refuse(
+            f"pip value {value!r} != units per qty {units_per_qty!r} * conversion rate {rate!r}"
+        )
+    if rate != 1.0 and not resolved.conversion_quotes:
+        raise _refuse(f"conversion rate {rate!r} came without the quotes it was derived from")
+    max_age = entry_gate_settings(deployment.settings).max_quote_age_seconds
+    now = _utc_now()
+    quote_times: list[str] = []
+    quote_ages: list[float | None] = []
+    for index, quote in enumerate(resolved.conversion_quotes):
+        hop = (
+            resolved.conversion_symbols[index]
+            if index < len(resolved.conversion_symbols)
+            else f"hop {index}"
+        )
+        quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
+        rule, age = _quote_time_rule(quote_time, now=now, max_age_seconds=max_age)
+        if rule is not None:
+            raise _refuse(
+                f"conversion quote {hop} rejected ({rule}): time {quote_time!r}, "
+                f"age {age!r}s, limit {max_age}s"
+            )
+        quote_times.append(quote_time.isoformat() if isinstance(quote_time, datetime) else "")
+        quote_ages.append(age)
+    record = _pip_value_record(value, source=str(resolved.source or type(adapter).__name__))
+    record.update(
+        {
+            "pip_value_units_per_qty": units_per_qty,
+            "pip_value_conversion_rate": rate,
+            "pip_value_quote_asset": str(resolved.quote_asset),
+            "pip_value_account_asset": str(resolved.account_asset),
+            "pip_value_conversion_symbols": list(resolved.conversion_symbols),
+            "pip_value_conversion_quote_times": quote_times,
+            "pip_value_conversion_quote_ages_seconds": quote_ages,
+        }
+    )
+    logger.info(
+        "Resolved live pip value",
+        extra={"data": {**log_data, **record}},
+    )
+    return value, record
+
+
 def _resolve_exit_only_target_qty(
     positions: Iterable[Mapping[str, object]],
     symbol: str,
@@ -1294,8 +1426,11 @@ async def prepare_order_with_risk(
     balance) because sizing has to see broker truth, and, for entries, the
     live quote for the entry-deviation gate (#125), which may reject.
 
-    ``pip_value`` is the trusted per-symbol pip value (config or broker); a
-    ``pip_value`` in signal metadata is never read.
+    ``pip_value`` is a trusted per-symbol pip value from the caller (#146:
+    account-currency P&L of one qty unit per 1.0 price move). When it is
+    ``None`` (production) the adapter's :meth:`get_pip_value` supplies it from
+    broker data, and an entry whose pip value cannot be determined is refused.
+    A ``pip_value`` in signal metadata is never read.
     """
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
@@ -1318,12 +1453,17 @@ async def prepare_order_with_risk(
         adapter, deployment
     )
     resolved_balance = await _resolve_account_balance(adapter, account_balance)
+    if pip_value is None:
+        resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
+    else:
+        resolved_pip = _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+        pip_metadata = _pip_value_record(resolved_pip, source="caller")
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,
         account_balance=resolved_balance,
         current_exposure=max(float(current_exposure), broker_exposure),
-        pip_value=pip_value,
+        pip_value=resolved_pip,
         current_positions=open_positions_count,
     )
     try:
@@ -1415,7 +1555,7 @@ async def prepare_order_with_risk(
         metadata["take_profit"] = float(take_profit)
     else:
         metadata.pop("take_profit", None)
-    for key in _ENTRY_QUOTE_METADATA_KEYS:
+    for key in (*_ENTRY_QUOTE_METADATA_KEYS, *_PIP_VALUE_METADATA_KEYS):
         metadata.pop(key, None)
     # Overlay the resolved SL/TP onto the SIZED metadata. The sized values for
     # qty/explicit_qty/risk_* must win: letting incoming metadata re-override
@@ -1442,9 +1582,10 @@ async def prepare_order_with_risk(
         for key, value in {**sized_metadata, **preserved_metadata}.items()
         if key not in {"volume", "ctrader_volume"}
     }
-    # The gate's figures are written last: a payload value under one of these
-    # keys can neither shadow nor survive them.
+    # The gate's and the pip value's figures are written last: a payload value
+    # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
+    final_metadata.update(pip_metadata)
     # theoretical_price carries the resolved entry so an adapter that places
     # SL/TP as distances from it (cTrader) uses the distance that was sized.
     sized_signal = sized_signal.model_copy(
