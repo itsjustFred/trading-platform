@@ -34,7 +34,7 @@ MAX_TOTAL_EXPOSURE = 0.05
 @dataclass
 class EngineRun:
     trades: list[RefTrade]
-    curve: list[float]
+    curve: list[tuple[str, float]]
     warnings: list[str]
     run_summary: dict
 
@@ -146,7 +146,7 @@ def run_engine(
     ]
     return EngineRun(
         trades=sorted(trades, key=lambda item: item.entry_time),
-        curve=[point.equity for point in result.equity_curve],
+        curve=[(_iso(point.time), float(point.equity)) for point in result.equity_curve],
         warnings=warnings,
         run_summary={},
     )
