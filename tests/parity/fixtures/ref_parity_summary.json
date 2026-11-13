@@ -1,0 +1,64 @@
+{
+  "bars": 2400,
+  "bars_generated": 2400,
+  "cash": 10000.0,
+  "data_fixture": "ref_parity_daily.csv",
+  "fractional_unit": 1e-08,
+  "generator": "scripts/reference_parity/generate_reference_parity_fixtures.py",
+  "library": "backtesting.py 0.6.6",
+  "license": "AGPL-3.0 (reference library; only its numeric output is committed)",
+  "runs": {
+    "bracket_long": {
+      "commission": 0.0,
+      "exit_kinds": {
+        "stop_loss": 16,
+        "take_profit": 14
+      },
+      "final_equity": 11395.00034172138,
+      "invariant_violations": [],
+      "library_strategy": "BracketLong",
+      "size_fraction": 0.5,
+      "trades": 30
+    },
+    "bracket_short": {
+      "commission": 0.0,
+      "exit_kinds": {
+        "stop_loss": 23,
+        "take_profit": 7
+      },
+      "final_equity": 8481.547448381636,
+      "invariant_violations": [],
+      "library_strategy": "BracketShort",
+      "size_fraction": 0.5,
+      "trades": 30
+    },
+    "smacross_all_in": {
+      "commission": 0.002,
+      "exit_kinds": {
+        "signal": 64
+      },
+      "final_equity": 10089.80899902844,
+      "invariant_violations": [],
+      "library_strategy": "SmaCross",
+      "size_fraction": 1.0,
+      "trades": 64
+    },
+    "smacross_zero_fee": {
+      "commission": 0.0,
+      "exit_kinds": {
+        "signal": 64
+      },
+      "final_equity": 13033.542748069241,
+      "invariant_violations": [],
+      "library_strategy": "SmaCross",
+      "size_fraction": 1.0,
+      "trades": 64
+    }
+  },
+  "seed": 20240617,
+  "size_fractions": {
+    "BracketLong": 0.5,
+    "BracketShort": 0.5,
+    "SmaCross": 1.0
+  }
+}
