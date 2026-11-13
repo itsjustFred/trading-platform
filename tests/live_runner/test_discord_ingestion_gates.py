@@ -231,68 +231,63 @@ def test_no_symbol_at_all_is_rejected() -> None:
 
 
 def test_burst_of_35_messages_all_reach_the_queue() -> None:
-    """With POLL_LIMIT=20 a >20-message burst used to lose every message older
-    than the newest page: the old code replaced _seen_ids per poll AND the
-    monotonic cursor filter dropped any fetched id at/below it — so the 15
-    oldest messages of a 35-message burst were silently dropped on the second
-    poll. Both must not happen: the seen-set is cumulative and only the
-    seen-set dedupes emits."""
+    """A >POLL_LIMIT burst drains completely, oldest message included.
+
+    The old code paginated backwards and lost anything older than the page
+    window. Forward pagination from the cursor emits the whole burst in order,
+    deduped by the cumulative seen-set."""
     source = _source()
     ids = [str(100000000000000000 + index) for index in range(35)]
-    newest_first = list(reversed(ids))
-    pages: dict[str, int] = {"n": 0}
+    # Cursor just below the burst, so the drain is a pure forward backfill.
+    source._last_seen_message_ids["channel-1"] = "99999999999999999"
 
-    async def _fetch(_channel_id):
-        # Discord returns newest-first, at most POLL_LIMIT per page: page 0 is
-        # the 20 newest messages, page 1 the next-older 15.
-        page = pages["n"]
-        pages["n"] += 1
-        start = 20 * page
-        end = min(len(ids), 20 * (page + 1))
+    def _row(message_id: str) -> dict[str, object]:
+        return {
+            "id": message_id,
+            "channel_id": "channel-1",
+            "timestamp": "2026-09-01T12:00:00Z",
+            "content": "RAM JET BUY AAPL @ 100.05",
+            "author": {"id": "bot-1", "bot": True},
+        }
+
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        # Discord returns the messages immediately after `after`, newest-first.
+        anchor = int(after or 0)
         return [
-            {
-                "id": newest_first[index],
-                "channel_id": "channel-1",
-                "timestamp": "2026-09-01T12:00:00Z",
-                "content": f"RAM JET BUY AAPL @ 100.0{index % 10}",
-                "author": {"id": "bot-1", "bot": True},
-            }
-            for index in range(start, end)
+            _row(message_id)
+            for message_id in reversed([i for i in ids if int(i) > anchor][:20])
         ]
 
     source._fetch_messages = _fetch
 
     import asyncio
 
-    async def _run() -> int:
+    async def _run() -> list[str]:
         await source._poll_once("channel-1")
         await source._poll_once("channel-1")
-        return source._queue.qsize()
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        return [item.metadata["discord_message_id"] for item in queued]
 
-    assert asyncio.run(_run()) == 35
+    assert asyncio.run(_run()) == ids
 
 
-def test_gap_detection_warns_with_channel_and_count(caplog) -> None:
-    """The proposed surfacing contract: when the fetched page does not connect
-    to the last seen message (a gap), log a warning naming the channel and the
-    boundary ids. Discord snowflake ids are not contiguous, so the log reports
-    the boundary rather than an invented message count."""
+def test_backfill_beyond_the_page_bound_warns_and_defers() -> None:
+    """A gap larger than the per-poll bound is carried over, not dropped.
+
+    Forward pagination never skips a message, but the page bound can stop
+    before the newest one. That deferral is logged with the cursor and the
+    newest id actually fetched, so a long drain stays visible in ops."""
     import asyncio
 
     source = _source()
-    source._last_seen_message_ids["channel-1"] = "100000000000000100"
+    source._last_seen_message_ids["channel-1"] = "0"
+    burst = [_burst_message(index) for index in range(1, 121)]  # ids 1001..1120
 
-    async def _fetch(_channel_id):
-        # Newest message jumps far beyond the last seen id: history skipped.
-        return [
-            {
-                "id": "100000000000000200",
-                "channel_id": "channel-1",
-                "timestamp": "2026-09-01T12:00:00Z",
-                "content": "RAM JET BUY AAPL @ 100.00",
-                "author": {"id": "bot-1", "bot": True},
-            }
-        ]
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        anchor = int(after or 0)
+        return list(
+            reversed([m for m in burst if int(m["id"]) > anchor][:ds.POLL_LIMIT])
+        )
 
     source._fetch_messages = _fetch
     records: list[logging.LogRecord] = []
@@ -309,29 +304,28 @@ def test_gap_detection_warns_with_channel_and_count(caplog) -> None:
     finally:
         source_logger.removeHandler(capture)
 
-    gap_records = [
-        record
-        for record in records
-        if "gap" in record.getMessage().lower() or "drop" in record.getMessage().lower()
+    deferred_records = [
+        record for record in records if "backfill" in record.getMessage().lower()
     ]
-    assert gap_records, "a detected burst gap must be logged, not silent"
-    data = getattr(gap_records[0], "data", {})
+    assert deferred_records, "a bound-deferred backfill must be logged, not silent"
+    data = getattr(deferred_records[0], "data", {})
     assert data.get("channel_id") == "channel-1"
-    assert data.get("last_seen_message_id") == "100000000000000100"
-    assert data.get("oldest_fetched_message_id") == "100000000000000200"
+    assert data.get("last_seen_message_id") == "0"
+    assert data.get("newest_fetched_message_id") == "1100"
+    assert data.get("pages_fetched") == ds.MAX_BACKFILL_PAGES
 
 
-def test_no_gap_warning_on_contiguous_page() -> None:
+def test_no_deferred_warning_on_a_short_contiguous_page() -> None:
     import asyncio
 
     source = _source()
-    # The page reaches back to the last seen id: nothing was skipped.
+    # A short page means the newest message was reached: nothing is deferred.
     source._last_seen_message_ids["channel-1"] = "100000000000000100"
 
-    async def _fetch(_channel_id):
+    async def _fetch(_channel_id, *, after=None, **kwargs):
         return [
             {
-                "id": "100000000000000100",
+                "id": "100000000000000101",
                 "channel_id": "channel-1",
                 "timestamp": "2026-09-01T12:00:00Z",
                 "content": "RAM JET BUY AAPL @ 100.00",
@@ -357,7 +351,8 @@ def test_no_gap_warning_on_contiguous_page() -> None:
     assert not [
         record
         for record in records
-        if "gap" in record.getMessage().lower() or "drop" in record.getMessage().lower()
+        if "backfill" in record.getMessage().lower()
+        or "gap" in record.getMessage().lower()
     ]
 
 
@@ -384,9 +379,9 @@ def test_seen_set_is_not_pruned_against_the_poll_cursor() -> None:
             "author": {"id": "bot-1", "bot": True},
         }
 
-    async def _fetch(_channel_id):
-        # A quiet channel: Discord keeps serving the live window (newest
-        # first), including messages already seen.
+    async def _fetch(_channel_id, **kwargs):
+        # A repeat page still hands back the boundary message that is already
+        # seen; the seen-set, not the cursor, must absorb it.
         return [_message("100000000000000060"), _message("100000000000000050")]
 
     source._fetch_messages = _fetch
@@ -1170,26 +1165,28 @@ def _burst_message(i: int) -> dict:
 
 class TestIssueB2Backfill:
     def test_burst_beyond_poll_limit_backfills(self) -> None:
-        """Bursts > POLL_LIMIT paginate backwards instead of losing exits."""
+        """Bursts > POLL_LIMIT paginate forward instead of losing exits."""
         import asyncio
 
         source = _source(trusted_author_ids={"bot-1"})
-        newest = [_burst_message(i) for i in range(20, 0, -1)]  # ids 1020..1001
-        older = [_burst_message(i) for i in range(0, -5, -1)]  # ids 1000..996
+        burst = [_burst_message(i) for i in range(1, 26)]  # ids 1001..1025
         calls: list[dict] = []
 
         async def _fetch(_channel_id, **kwargs):
             calls.append(kwargs)
-            if not kwargs.get("before"):
-                return newest
-            assert kwargs["before"] == "1001"
-            return older
+            anchor = int(kwargs.get("after") or 0)
+            # Newest-first page of the messages immediately after the anchor.
+            return list(
+                reversed([m for m in burst if int(m["id"]) > anchor][:ds.POLL_LIMIT])
+            )
 
         source._fetch_messages = _fetch
-        source._last_seen_message_ids["channel-1"] = "990"
+        source._last_seen_message_ids["channel-1"] = "0"
         asyncio.run(source._poll_once("channel-1"))
 
-        assert any(call.get("before") == "1001" for call in calls)
+        assert calls[0] == {"after": "0"}
+        # The second page resumes from the newest id of the first (full) page.
+        assert any(call.get("after") == "1020" for call in calls)
         assert source._queue.qsize() == 25
 
     def test_short_page_does_not_backfill(self) -> None:
@@ -1206,7 +1203,104 @@ class TestIssueB2Backfill:
         source._fetch_messages = _fetch
         source._last_seen_message_ids["channel-1"] = "1000"
         asyncio.run(source._poll_once("channel-1"))
-        assert calls == [{}]
+        assert calls == [{"after": "1000"}]
+
+    def test_quiet_poll_costs_exactly_one_request(self) -> None:
+        """A poll with no new messages must not fan out into extra fetches."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        calls: list[dict] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            return []
+
+        source._fetch_messages = _fetch
+        source._last_seen_message_ids["channel-1"] = "1000"
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert calls == [{"after": "1000"}]
+        assert source._queue.empty()
+        assert source._last_seen_message_ids["channel-1"] == "1000"
+
+    def test_gap_larger_than_120_drains_in_order_without_duplicates(self) -> None:
+        """A gap bigger than the per-poll bound closes across polls, exactly once."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "0"
+        total = 145
+        burst = [_burst_message(i) for i in range(1, total + 1)]  # ids 1001..1145
+        calls: list[str | None] = []
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls.append(after)
+            anchor = int(after or 0)
+            return list(
+                reversed([m for m in burst if int(m["id"]) > anchor][:ds.POLL_LIMIT])
+            )
+
+        source._fetch_messages = _fetch
+
+        async def _first_poll() -> None:
+            await source._poll_once("channel-1")
+
+        asyncio.run(_first_poll())
+        # One poll is capped at MAX_BACKFILL_PAGES pages; the cursor stops at
+        # the newest message actually emitted, never past the unfetched 45.
+        assert source._queue.qsize() == ds.MAX_BACKFILL_PAGES * ds.POLL_LIMIT
+        assert source._last_seen_message_ids["channel-1"] == "1100"
+
+        async def _drain() -> list[str]:
+            while True:
+                before = source._queue.qsize()
+                await source._poll_once("channel-1")
+                if source._queue.qsize() == before:
+                    break
+            queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+            return [item.metadata["discord_message_id"] for item in queued]
+
+        ids = asyncio.run(_drain())
+        expected = [str(1000 + index) for index in range(1, total + 1)]
+        assert ids == expected, "the whole gap must be emitted in chronological order"
+        assert len(set(ids)) == total, "no message may be emitted twice"
+        assert len(calls) > ds.MAX_BACKFILL_PAGES, "the gap must have spanned polls"
+
+    def test_429_mid_backfill_does_not_lose_the_remainder(self) -> None:
+        """A rate limit between pages keeps the emitted prefix and resumes later."""
+        import asyncio
+
+        from live_runner.signal_sources.discord_source import DiscordRateLimitError
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "0"
+        total = 45
+        burst = [_burst_message(i) for i in range(1, total + 1)]  # ids 1001..1045
+        calls = {"n": 0}
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise DiscordRateLimitError("channel-1", 5.0)
+            anchor = int(after or 0)
+            return list(
+                reversed([m for m in burst if int(m["id"]) > anchor][:ds.POLL_LIMIT])
+            )
+
+        source._fetch_messages = _fetch
+        with pytest.raises(DiscordRateLimitError):
+            asyncio.run(source._poll_once("channel-1"))
+
+        # The first two pages were emitted; the cursor points at the newest of
+        # them, not at the never-fetched newest message.
+        assert source._queue.qsize() == 40
+        assert source._last_seen_message_ids["channel-1"] == "1040"
+
+        asyncio.run(source._poll_once("channel-1"))
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == [str(1000 + index) for index in range(1, total + 1)]
 
     def test_poison_message_id_does_not_crash_cursor(self) -> None:
         """A non-numeric newest id must not raise out of the cursor update."""
@@ -1223,6 +1317,158 @@ class TestIssueB2Backfill:
         # Cursor keeps the last orderable value; the poison message still
         # flowed through the seen-set exactly once.
         assert source._last_seen_message_ids["channel-1"] == "1000"
+
+    def test_poison_id_on_a_full_page_does_not_stall_the_channel(self) -> None:
+        """A malformed newest id must not pin the cursor behind a full page.
+
+        Anchoring the cursor on the first row of the page would refuse the
+        non-numeric id, leave the cursor where it was and re-request the very
+        same full page on every poll: every later message would be lost.
+        """
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        total = ds.POLL_LIMIT + 5
+        burst = [_burst_message(i) for i in range(1, total + 1)]  # ids 1001..
+        poison = {**_burst_message(999), "id": "not-a-snowflake"}
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            anchor = int(after or 0)
+            rows = [m for m in burst if int(m["id"]) > anchor][: ds.POLL_LIMIT - 1]
+            if anchor == 1000:
+                # First page is full and its newest row is the poison message.
+                return [poison, *reversed(rows)]
+            return list(reversed(rows))
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        numeric = [value for value in ids if value != "not-a-snowflake"]
+        assert numeric == [str(1000 + index) for index in range(1, total + 1)]
+        assert source._last_seen_message_ids["channel-1"] == str(1000 + total)
+
+    def test_page_that_does_not_pass_the_cursor_stops_after_one_request(self) -> None:
+        """A server that ignores `after` must not be re-requested page after page."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        cursor = str(1000 + ds.POLL_LIMIT)
+        source._last_seen_message_ids["channel-1"] = cursor
+        stale = [_burst_message(i) for i in range(ds.POLL_LIMIT, 0, -1)]  # newest == cursor
+        calls: list[str | None] = []
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls.append(after)
+            return list(stale)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert calls == [cursor]
+        assert source._last_seen_message_ids["channel-1"] == cursor
+
+    def test_first_poll_without_cursor_emits_in_order_and_seeds_the_cursor(self) -> None:
+        """Without a cursor the newest page is read once, oldest first."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        page = [_burst_message(i) for i in range(5, 0, -1)]  # newest-first
+        calls: list[dict[str, object]] = []
+
+        async def _fetch(_channel_id, **kwargs):
+            calls.append(kwargs)
+            return list(page)
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1001", "1002", "1003", "1004", "1005"]
+        assert calls == [{}], "no cursor means no `after` and exactly one request"
+        assert source._last_seen_message_ids["channel-1"] == "1005"
+
+    def test_gap_spanning_three_polls_is_drained_completely(self) -> None:
+        """The seen-set retention must not interfere with a drain over several polls."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        per_poll = ds.MAX_BACKFILL_PAGES * ds.POLL_LIMIT
+        total = 2 * per_poll + 30
+        assert total > ds.SEEN_ID_RETENTION
+        burst = [_burst_message(i) for i in range(1, total + 1)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            anchor = int(after or 0)
+            return list(
+                reversed([m for m in burst if int(m["id"]) > anchor][: ds.POLL_LIMIT])
+            )
+
+        source._fetch_messages = _fetch
+        emitted_per_poll: list[int] = []
+
+        async def _three_polls() -> None:
+            for _ in range(3):
+                before = source._queue.qsize()
+                await source._poll_once("channel-1")
+                emitted_per_poll.append(source._queue.qsize() - before)
+
+        asyncio.run(_three_polls())
+
+        assert emitted_per_poll == [per_poll, per_poll, 30]
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == [str(1000 + index) for index in range(1, total + 1)]
+
+    def test_non_emitting_poll_advances_the_cursor_without_queueing(self) -> None:
+        """`emit=False` walks the same pages but queues nothing."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        burst = [_burst_message(i) for i in range(1, 8)]
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            anchor = int(after or 0)
+            return list(reversed([m for m in burst if int(m["id"]) > anchor]))
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1", emit=False))
+        assert source._queue.empty()
+        assert source._last_seen_message_ids["channel-1"] == "1007"
+
+        # The skipped messages stay skipped: a later emitting poll sees nothing new.
+        asyncio.run(source._poll_once("channel-1"))
+        assert source._queue.empty()
+
+    def test_page_order_does_not_decide_emission_order_or_cursor(self) -> None:
+        """An oldest-first page still emits chronologically and anchors on the newest id."""
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        total = ds.POLL_LIMIT + 7
+        burst = [_burst_message(i) for i in range(1, total + 1)]
+        calls: list[str | None] = []
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            calls.append(after)
+            anchor = int(after or 0)
+            # Oldest-first: the opposite of what Discord documents.
+            return [m for m in burst if int(m["id"]) > anchor][: ds.POLL_LIMIT]
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == [str(1000 + index) for index in range(1, total + 1)]
+        assert calls == ["1000", str(1000 + ds.POLL_LIMIT)]
+        assert source._last_seen_message_ids["channel-1"] == str(1000 + total)
 
     def test_channel_forbidden_skips_channel_not_source(self) -> None:
         """403 skips one channel; other channels still poll."""
@@ -3951,7 +4197,7 @@ def test_poll_emits_messages_in_chronological_order() -> None:
     import asyncio
 
     source = _source(trusted_author_ids={"bot-1"})
-    # A cursor below every fetched id forces the backfill branch, so the poll
+    # A cursor below the burst forces the forward backfill branch, so the poll
     # actually builds two pages.
     source._last_seen_message_ids["channel-1"] = "100000000000000050"
 
@@ -3964,26 +4210,25 @@ def test_poll_emits_messages_in_chronological_order() -> None:
             "author": {"id": "bot-1", "bot": True},
         }
 
-    newest_page = [_row(100000000000000119 - index) for index in range(20)]
-    older_page = [_row(100000000000000099 - index) for index in range(3)]
+    burst_ids = [100000000000000051 + index for index in range(30)]
 
-    async def _fetch(_channel_id, before=None):
-        if before is None:
-            return newest_page
-        if before == "100000000000000100":
-            return older_page
-        return []
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        anchor = int(after or 0)
+        return [
+            _row(message_id)
+            for message_id in reversed([i for i in burst_ids if i > anchor][:20])
+        ]
 
     source._fetch_messages = _fetch
     asyncio.run(source._poll_once("channel-1"))
 
-    queued = [source._queue.get_nowait() for _ in range(23)]
+    queued = [source._queue.get_nowait() for _ in range(30)]
     ids = [item.metadata["discord_message_id"] for item in queued]
-    assert ids[0] == "100000000000000097"
+    assert ids[0] == "100000000000000051"
     assert ids[:3] == [
-        "100000000000000097",
-        "100000000000000098",
-        "100000000000000099",
+        "100000000000000051",
+        "100000000000000052",
+        "100000000000000053",
     ]
     assert ids == sorted(ids), f"burst was not emitted oldest-first: {ids[:5]}..."
 
@@ -4000,9 +4245,8 @@ def test_the_poll_cursor_never_moves_backwards() -> None:
     source = _source(trusted_author_ids={"bot-1"})
     source._last_seen_message_ids["channel-1"] = "100000000000000200"
 
-    async def _fetch(_channel_id, before=None):
-        if before is not None:
-            return []
+    async def _fetch(_channel_id, *, after=None, **kwargs):
+        # A malformed response that hands back an older id must not rewind.
         return [
             {
                 "id": "100000000000000150",
