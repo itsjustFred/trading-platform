@@ -248,12 +248,13 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
     true mechanically instead of by memory.
 
     The per-copy substitutions below are the documented ones (the temp directory, the agent
-    id). Anything else that differs is a fork of the gate.
+    id), applied agent-id first so "pr-review" cannot be eaten by the shorter "review".
+    Anything else that differs is a fork of the gate.
     """
     substitutions = {
-        REVIEW: ("review", "pr-review"),
-        MUTATION: ("mutation", "pr-mutation"),
-        PREMORTEM: ("premortem", "pr-premortem"),
+        REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),
+        MUTATION: (("pr-mutation", "<agent>"), ("mutation", "<stage>")),
+        PREMORTEM: (("pr-premortem", "<agent>"), ("premortem", "<stage>")),
     }
     guard_tags = ("**Summary:", "git status --porcelain", "not updating the comment", "grep -v '^[[:space:]]*$'")
 
@@ -265,7 +266,7 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
                 for line in _run(step).splitlines():
                     if any(tag in line for tag in guard_tags):
                         line = line.strip()
-                        for old, new in ((substitutions[name][0], "<stage>"), (substitutions[name][1], "<agent>")):
+                        for old, new in substitutions[name]:
                             line = line.replace(old, new)
                         out.append(line)
         return out
@@ -289,6 +290,49 @@ def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:
         body = _run(step)
         assert "set -euo pipefail" in body, f"{name}: skill selection is not strict"
         assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, f"{name}: no hard base-commit check"
+
+
+def test_every_stop_path_clears_the_pre_mortem_status() -> None:
+    """The bookkeeping this PR adds is what keeps the last stage from stranding `pending`.
+
+    The review workflow marks all three stages pending on push, and every path that stops the
+    chain early - SonarCloud red, the SonarCloud gate step itself failing, the review run
+    failing, a verdict that is not PASS, a failed dispatch, a failed post step - must set
+    `agent/pre-mortem` to error exactly as it does for the stage that stopped. The mutation
+    workflow owes the same on its own stop paths. Deleting one of those blocks leaves the
+    status `pending` on the head SHA with no error anywhere, which is the failure the chain
+    branch's last four commits existed to close; until this test, nothing noticed a deletion.
+
+    The stage's own starting mark (mutation's "Mark running") is the one single-context
+    pending write and is deliberately exempt: it marks the stage that is starting, not a
+    chain that is stopping.
+    """
+    for name in (REVIEW, MUTATION):
+        data = _load(name)
+        for job_name, job in data["jobs"].items():
+            for step in _steps(job):
+                body = _run(step)
+                if "state=error" not in body and "state=pending" not in body:
+                    continue
+                contexts = set(re.findall(r"[A-Z][A-Z_]*_CONTEXT", body))
+                assert contexts, f"{name}/{job_name}/{step.get('name')}: writes a status with no context variable"
+                if "state=error" in body or len(contexts) > 1:
+                    assert "PREMORTEM_CONTEXT" in contexts, (
+                        f"{name}/{job_name}/{step.get('name')}: stops the chain for "
+                        f"{sorted(contexts)} without clearing PREMORTEM_CONTEXT"
+                    )
+
+
+def test_the_cancel_step_covers_both_downstream_workflows() -> None:
+    """A new push makes the downstream runs of older commits worthless; cancelling only the
+    mutation runs would leave pre-mortem runs (of a stale SHA) to spend the same minutes."""
+    data = _load(REVIEW)
+    resolve = data["jobs"]["resolve"]
+    cancel = _find_step(resolve, r"^Cancel")
+    body = _run(cancel)
+    for target in (MUTATION, PREMORTEM):
+        assert target in body, f"the cancel step does not cover {target}"
+    assert cancel.get("if") and "pull_request" in cancel["if"], "the cancel step must only run on a push"
 
 
 def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
