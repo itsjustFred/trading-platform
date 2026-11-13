@@ -358,3 +358,16 @@ def test_bug4_searchsorted_uses_last_known_rate():
     )
     value = _price_unit_value("USATECH.IDX", "2024-01-01T00:02:00Z", conversion, account_currency="EUR")
     assert value == 1.0 / 1.10
+
+
+def test_comparison_cases_run_on_the_broker_clock_without_utc_day_d1_files():
+    from shared.broker_clock import resolve_broker_clock
+
+    by_label = {c["label"]: c for c in COMPARISON_CASES}
+    assert by_label["EURUSD_H1"]["broker_clock"] == "dukascopy_mt5_forex"
+    assert by_label["NAS100_M15"]["broker_clock"] == "dukascopy_mt5_index"
+    assert by_label["SP500_M1"]["broker_clock"] == "dukascopy_mt5_index"
+    for case in COMPARISON_CASES:
+        assert resolve_broker_clock(case["broker_clock"]) is not None
+        # UTC-day D1 files have other day boundaries than the broker's server-clock D1 bars.
+        assert not case.get("use_native_daily_ohlcv")
