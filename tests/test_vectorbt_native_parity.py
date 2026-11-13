@@ -368,9 +368,15 @@ class TestExplicitColumnRoles:
             },
             index=index,
         )
-        exec_default, _ = _prepare_next_open_execution_data(signals, {})
-        # Legacy guess: exit_* stays unshifted.
+        # Legacy same-bar exit leg ("close"): the exit_* name guess stays
+        # unshifted. (Owner decision 2026-11-13: the default is next_open, where
+        # exit-role columns shift like the entry leg.)
+        exec_default, _ = _prepare_next_open_execution_data(
+            signals, {}, signal_exit_fill="close"
+        )
         assert exec_default["exit_signal"].tolist()[1:2] == [11.0]
+        exec_next_open, _ = _prepare_next_open_execution_data(signals, {})
+        assert exec_next_open["exit_signal"].tolist()[1:2] == [10.0]
         exec_declared, _ = _prepare_next_open_execution_data(
             signals, {}, {"exit_signal": "entry"}
         )

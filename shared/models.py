@@ -578,7 +578,10 @@ class BacktestMeta:
     max_position_exposure_pct: float | None = None
     max_leverage: float | None = None
     modeling_resolution: str = "main_timeframe"
-    signal_exit_fill: str = "close"
+    # Owner decision 2026-11-13: signal exits fill at the next bar's open. The
+    # persisted key is ALWAYS written (see to_dict) because records without it
+    # predate that decision and were produced under the legacy "close" fill.
+    signal_exit_fill: str = "next_open"
     allow_fallback_stop: bool = True
     reject_missing_stop: bool = False
     require_explicit_column_roles: bool = False
@@ -621,8 +624,7 @@ class BacktestMeta:
                 d[name] = value
         if self.modeling_resolution != "main_timeframe":
             d["modeling_resolution"] = self.modeling_resolution
-        if self.signal_exit_fill != "close":
-            d["signal_exit_fill"] = self.signal_exit_fill
+        d["signal_exit_fill"] = self.signal_exit_fill
         if not self.allow_fallback_stop:
             d["allow_fallback_stop"] = False
         if self.reject_missing_stop:
@@ -655,6 +657,7 @@ class BacktestMeta:
             max_position_exposure_pct=d.get("max_position_exposure_pct"),
             max_leverage=d.get("max_leverage"),
             modeling_resolution=d.get("modeling_resolution", "main_timeframe"),
+            # Missing key = record from before the 2026-11-13 next-open decision.
             signal_exit_fill=d.get("signal_exit_fill", "close"),
             allow_fallback_stop=d.get("allow_fallback_stop", True),
             reject_missing_stop=d.get("reject_missing_stop", False),

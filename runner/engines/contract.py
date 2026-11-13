@@ -354,6 +354,62 @@ def resolve_same_bar_exit(
     return None
 
 
+#: Accepted ``BacktestConfig.signal_exit_fill`` spellings.
+#:
+#: ``next_open`` (default, owner decision 2026-11-13): a signal exit produced on
+#: bar *N* fills at bar *N+1*'s open — exactly like market entries.
+#: ``close`` / ``open`` are explicit legacy opt-ins that fill on the SIGNAL bar
+#: itself (its close / its open); ``open`` exists for MT5 clock exits whose
+#: signal bar IS the exit minute.
+SIGNAL_EXIT_FILL_NEXT_OPEN = "next_open"
+SIGNAL_EXIT_FILL_VALUES = frozenset({SIGNAL_EXIT_FILL_NEXT_OPEN, "close", "open"})
+
+
+def level_gapped_at_open(
+    *,
+    direction: str,
+    kind: str,
+    level: float,
+    bar_open: float,
+) -> bool:
+    """True when a bar OPENS already beyond a protective level.
+
+    Owner decision 2026-11-13 (realism / MT5 + live-broker parity): a gap
+    through a stop-loss or take-profit fills at the bar's **open** — the
+    price actually available — never at the level the market skipped.
+
+    ``kind`` is ``"stop"`` or ``"tp"``. LONG stop: ``open <= level``; LONG
+    take-profit: ``open >= level``; SHORT mirrored. An open exactly AT the
+    level counts as a gap (the fill price is the same either way).
+    """
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError(f"direction must be 'LONG' or 'SHORT', got {direction!r}")
+    if kind not in ("stop", "tp"):
+        raise ValueError(f"kind must be 'stop' or 'tp', got {kind!r}")
+    adverse_side_is_below = (direction == "LONG") == (kind == "stop")
+    if adverse_side_is_below:
+        return bar_open <= level
+    return bar_open >= level
+
+
+def level_fill_price(
+    *,
+    direction: str,
+    kind: str,
+    level: float,
+    bar_open: float,
+) -> float:
+    """Fill price of a protective level on a bar: the open on a gap, else the level.
+
+    Intrabar touches (the bar opens on the safe side and trades through the
+    level later) keep filling at the level; a bar that opens beyond the level
+    fills at its open. See :func:`level_gapped_at_open`.
+    """
+    if level_gapped_at_open(direction=direction, kind=kind, level=level, bar_open=bar_open):
+        return float(bar_open)
+    return float(level)
+
+
 def flag_missing_intrabar(
     *,
     intrabar_resolution: str | None,

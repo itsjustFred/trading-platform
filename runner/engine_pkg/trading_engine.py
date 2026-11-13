@@ -30,7 +30,12 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
-from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
+from runner.engines.contract import (
+    SIGNAL_EXIT_FILL_NEXT_OPEN,
+    flag_missing_intrabar,
+    level_gapped_at_open,
+    resolve_same_bar_exit,
+)
 from runner.fees import resolve_fee_model
 from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
 
@@ -74,6 +79,17 @@ class TradeEngine:
         self._sizing_equity = float(config.initial_capital)
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
+        # Owner decision 2026-11-13: signal exits fill at the NEXT bar's open
+        # (``signal_exit_fill="next_open"``, default). The exit signal of bar N
+        # is parked here and executed at the open of bar N+1, before that bar's
+        # intrabar stop/target walk (the open precedes everything else in the
+        # bar) and before pending entry orders fill (so a reversal's exit leg
+        # closes the OLD position, never the position the same open creates).
+        self._pending_signal_exit = False
+        self._signal_exit_next_open = (
+            str(getattr(config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
+            == SIGNAL_EXIT_FILL_NEXT_OPEN
+        )
         self._intrabar = self._prepare_intrabar(intrabar_data)
         self._progress_callback = progress_callback
         self._progress_start = float(progress_start)
@@ -813,21 +829,25 @@ class TradeEngine:
         self.closed_trades.append(trade)
 
     def _close_position(self, row: pd.Series, i: int, reason: str) -> None:
+        """Close every open position on THIS bar (legacy signal exits, end of data).
+
+        Under the default ``signal_exit_fill="next_open"`` (owner decision
+        2026-11-13) signal exits never come through here: they are parked in
+        ``_pending_signal_exit`` and filled at the next bar's open by
+        ``_check_stops``. This method serves
+
+        - the forced ``end_of_data`` close, always at the last bar's close
+          under ``next_open`` (there is no next bar);
+        - the explicit legacy opt-ins ``signal_exit_fill="close"`` (the signal
+          bar's close) and ``"open"`` (the signal bar's open - MT5 clock exits
+          whose signal bar IS the exit minute; closing a SHORT buys the ask,
+          open + spread, verified tick-for-tick on MT5 22:55 time exits).
+        """
         if not self.positions:
             return
 
-        # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close
-        # for signal exits — the exit fills at the trigger bar's close by
-        # default, exactly like the vectorbt adapter (which keeps its exit
-        # leg unshifted). signal_exit_fill="open" stays as an MT5-parity
-        # opt-in (first tick inside the exit minute ~= bar open).
-        # Closing a SHORT buys the ask (open + spread); closing a LONG
-        # sells the bid. Verified tick-for-tick: MT5 long time-exits ==
-        # 22:55 bar open, short time-exits == 22:55 bar open + spread.
-        fill_at_open = (
-            str(getattr(self.config, "signal_exit_fill", "close")).lower()
-            == "open"
-        )
+        mode = str(getattr(self.config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
+        fill_at_open = mode == "open"
         spread = self._bar_spread(row) if fill_at_open else 0.0
         base_exit = float(row["open"]) if fill_at_open else float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
@@ -1015,6 +1035,66 @@ class TradeEngine:
         position.mfe = max(position.mfe, favorable)
         position.mae = min(position.mae, adverse)
 
+    def _trigger_open(self, position: Position, row: pd.Series) -> float:
+        """The bar open on the side the position's exits trigger on.
+
+        LONG exits trigger on the bid (the bar's own open). SHORT exits trigger
+        on the ask, which is the bid open plus the spread when ``ask_ohlc`` is
+        enabled and the bid open otherwise (same convention as ``_ask_bar``).
+        """
+        bar_open = float(row["open"])
+        if position.direction != "LONG" and bool(
+            self.config.parameters.get("ask_ohlc", False)
+        ):
+            return bar_open + self._bar_spread(row)
+        return bar_open
+
+    def _level_fill_price(
+        self,
+        position: Position,
+        row: pd.Series,
+        *,
+        kind: str,
+        level: float,
+        allow_gap: bool,
+    ) -> float:
+        """Fill price (spread included) of a protective level on this bar.
+
+        Owner decision 2026-11-13 (supersedes the old "stop/TP always fill at
+        the level" rule): a bar that OPENS beyond the level fills at its open
+        - the price actually available - instead of the level the market
+        skipped. Intrabar touches (the bar opens on the safe side) keep filling
+        at the level. SHORT exits buy the ask, so they carry the spread either
+        way (A-H7). ``allow_gap`` is False on the entry bar: the position was
+        opened at that very open, so it cannot have been gapped through.
+        """
+        spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
+        if allow_gap and level_gapped_at_open(
+            direction=position.direction,
+            kind=kind,
+            level=float(level),
+            bar_open=self._trigger_open(position, row),
+        ):
+            return float(row["open"]) + spread
+        return float(level) + spread
+
+    def _close_at_open_for_signal(
+        self, position: Position, row: pd.Series, time_iso: str, i: int
+    ) -> None:
+        """Execute a parked signal exit at this bar's open (next-open fill)."""
+        spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
+        fill = float(row["open"]) + spread
+        # The position is out at the open: nothing later in the bar belongs to it.
+        self._record_bar_excursion(position, row, favorable_cap=fill, adverse_cap=fill)
+        self._close_partial(
+            position,
+            price=fill,
+            qty=position.remaining_qty,
+            time_iso=time_iso,
+            reason="signal",
+        )
+        self._finalize_position(position, i)
+
     def _check_stops(
         self,
         row: pd.Series,
@@ -1037,6 +1117,11 @@ class TradeEngine:
 
         remaining_positions: list[Position] = []
         ask_high, ask_low = self._ask_bar(row)
+        # The entry-bar re-check (``only_entry_index``) covers positions opened
+        # at this bar's open: they can neither gap through their own fresh levels
+        # nor receive a signal exit parked before they existed.
+        allow_gap = only_entry_index is None
+        signal_pending = self._pending_signal_exit and allow_gap
         for position in self.positions:
             if only_entry_index is not None and position.entry_index != only_entry_index:
                 remaining_positions.append(position)
@@ -1059,8 +1144,54 @@ class TradeEngine:
                 tp_hit = any(short_low <= float(level["price"]) for level in pending_tp)
 
             first_tp_price = float(pending_tp[0]["price"]) if pending_tp else None
+
+            # Owner decision 2026-11-13 (A): a bar that OPENS beyond a protective
+            # level gaps through it. The open is the first event of the bar, so
+            # the gap exit wins over anything later in the bar (no same-bar
+            # ambiguity, no intrabar data needed) and fills at the OPEN. Not on
+            # the entry bar itself: that position was opened at this very open.
+            trigger_open = self._trigger_open(position, row)
+            gap_stop = (
+                allow_gap
+                and position.stop_loss is not None
+                and level_gapped_at_open(
+                    direction=position.direction,
+                    kind="stop",
+                    level=float(position.stop_loss),
+                    bar_open=trigger_open,
+                )
+            )
+            gap_tp_levels = [
+                level
+                for level in pending_tp
+                if allow_gap
+                and level_gapped_at_open(
+                    direction=position.direction,
+                    kind="tp",
+                    level=float(level["price"]),
+                    bar_open=trigger_open,
+                )
+            ]
+            if gap_stop:
+                stop_hit = True
+            if gap_tp_levels:
+                tp_hit = True
+
+            # B: a parked signal exit fills at this open - unless the open
+            # already gapped through a protective level (that exit is the same
+            # price but keeps its stop/target reason).
+            if signal_pending and not gap_stop and not gap_tp_levels:
+                self._close_at_open_for_signal(position, row, time_iso, i)
+                if position.remaining_qty > 1e-9:
+                    remaining_positions.append(position)
+                continue
+
             first_event = None
-            if stop_hit and tp_hit:
+            if gap_stop:
+                first_event = "stop"
+            elif gap_tp_levels:
+                first_event = "tp"
+            elif stop_hit and tp_hit:
                 if self._execution_model.intrabar_resolution is not None:
                     first_event = self._intrabar_first_trigger(
                         position,
@@ -1096,13 +1227,26 @@ class TradeEngine:
             excursion_favorable_cap: float | None = None
             excursion_adverse_cap: float | None = None
             if first_event == "stop" and position.stop_loss is not None:
-                excursion_adverse_cap = float(position.stop_loss)
-                if position.direction != "LONG":
-                    excursion_adverse_cap += self._bar_spread(row)
+                excursion_adverse_cap = self._level_fill_price(
+                    position,
+                    row,
+                    kind="stop",
+                    level=float(position.stop_loss),
+                    allow_gap=allow_gap,
+                )
+                if gap_stop:
+                    # Exit at the open: the rest of the bar never belonged to
+                    # the position, on either side.
+                    excursion_favorable_cap = excursion_adverse_cap
             elif first_event == "tp":
-                spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
                 reached = [
-                    float(level["price"])
+                    self._level_fill_price(
+                        position,
+                        row,
+                        kind="tp",
+                        level=float(level["price"]),
+                        allow_gap=allow_gap,
+                    )
                     for level in pending_tp
                     if (
                         bar_high >= float(level["price"])
@@ -1114,7 +1258,7 @@ class TradeEngine:
                     furthest = (
                         max(reached) if position.direction == "LONG" else min(reached)
                     )
-                    excursion_favorable_cap = furthest + spread
+                    excursion_favorable_cap = furthest
                 # A ladder that does not close the whole position leaves a
                 # remainder, and the loop below stops it out. That part of the
                 # position exited at the stop, so the adverse side is capped too.
@@ -1122,9 +1266,13 @@ class TradeEngine:
                 # gating the whole block on one made a take-profit with no stop
                 # configured record the full bar.
                 if stop_hit and position.stop_loss is not None:
-                    excursion_adverse_cap = float(position.stop_loss)
-                    if position.direction != "LONG":
-                        excursion_adverse_cap += self._bar_spread(row)
+                    excursion_adverse_cap = self._level_fill_price(
+                        position,
+                        row,
+                        kind="stop",
+                        level=float(position.stop_loss),
+                        allow_gap=allow_gap,
+                    )
             self._record_bar_excursion(
                 position,
                 row,
@@ -1133,16 +1281,18 @@ class TradeEngine:
             )
 
             if first_event == "stop" and position.stop_loss is not None:
-                # D4 (Phase 3, A-M1 exit convention): the unified convention
-                # is Fill-zum-Trigger-Close for SIGNAL exits; stop/TP legs
-                # keep LEVEL fills (the stop distance is the sizing risk
-                # unit — re-pricing stops to the close would silently void
-                # the risk model). A-H7: SHORT stop fills buy the ask, so
-                # they carry the spread like entries and signal exits do;
-                # LONG stops sell the bid (level as-is).
-                stop_fill = float(position.stop_loss)
-                if position.direction != "LONG":
-                    stop_fill += self._bar_spread(row)
+                # Intrabar touches fill at the LEVEL (the stop distance is the
+                # sizing risk unit); a bar that opens beyond the level fills at
+                # its OPEN (owner decision 2026-11-13, see _level_fill_price).
+                # A-H7: SHORT stop fills buy the ask, so they carry the spread
+                # like entries and signal exits do; LONG stops sell the bid.
+                stop_fill = self._level_fill_price(
+                    position,
+                    row,
+                    kind="stop",
+                    level=float(position.stop_loss),
+                    allow_gap=allow_gap,
+                )
                 self._close_partial(
                     position,
                     price=stop_fill,
@@ -1154,7 +1304,6 @@ class TradeEngine:
                 # A-H7: SHORT TP fills buy the ask (level + spread), LONG TP
                 # fills sell the bid (level as-is) — same side convention as
                 # stop fills, entries and signal exits.
-                tp_spread = self._bar_spread(row) if position.direction != "LONG" else 0.0
                 for level in pending_tp:
                     trigger_price = float(level["price"])
                     if position.direction == "LONG":
@@ -1171,7 +1320,13 @@ class TradeEngine:
 
                     self._close_partial(
                         position,
-                        price=trigger_price + tp_spread,
+                        price=self._level_fill_price(
+                            position,
+                            row,
+                            kind="tp",
+                            level=trigger_price,
+                            allow_gap=allow_gap,
+                        ),
                         qty=qty,
                         time_iso=time_iso,
                         reason=str(level.get("name") or "take_profit"),
@@ -1182,9 +1337,13 @@ class TradeEngine:
                         break
 
                 if position.remaining_qty > 1e-9 and stop_hit and position.stop_loss is not None:
-                    trailing_fill = float(position.stop_loss)
-                    if position.direction != "LONG":
-                        trailing_fill += self._bar_spread(row)
+                    trailing_fill = self._level_fill_price(
+                        position,
+                        row,
+                        kind="stop",
+                        level=float(position.stop_loss),
+                        allow_gap=allow_gap,
+                    )
                     self._close_partial(
                         position,
                         price=trailing_fill,
@@ -1192,6 +1351,10 @@ class TradeEngine:
                         time_iso=time_iso,
                         reason="stop_loss",
                     )
+                if position.remaining_qty > 1e-9 and signal_pending:
+                    # A gapped target left a remainder and the parked signal exit
+                    # claims it at the same open.
+                    self._close_at_open_for_signal(position, row, time_iso, i)
 
             self._finalize_position(position, i)
             if position.remaining_qty > 1e-9:
@@ -1358,6 +1521,8 @@ class TradeEngine:
             merged_row = row.combine_first(signal_row)
 
             self._check_stops(row, i, next_time)
+            # The parked signal exit (if any) was consumed at this bar's open.
+            self._pending_signal_exit = False
             self._fill_pending_orders(row, i)
             # A-H1: the fill bar itself can trade through the fresh stop/TP.
             # Positions opened above fill at this bar's open and were never
@@ -1375,7 +1540,13 @@ class TradeEngine:
                 self._create_order(merged_row, i, direction)
 
             if bool(exits.iloc[i]):
-                self._close_position(row, i, reason="signal")
+                if self._signal_exit_next_open:
+                    # Fills at the NEXT bar's open (see _check_stops). On the
+                    # last bar there is no next bar: the end-of-data close
+                    # below takes the position and flags the trade.
+                    self._pending_signal_exit = True
+                else:
+                    self._close_position(row, i, reason="signal")
 
             self._update_equity(row, i)
 
@@ -1391,6 +1562,13 @@ class TradeEngine:
 
         if self.positions:
             last_row = frame.iloc[-1]
+            if self._pending_signal_exit:
+                # A signal exit on the last bar cannot fill at a next open that
+                # does not exist. Documented behaviour: the forced end-of-data
+                # close (at the last close) takes the position and the trade is
+                # flagged so the deferred signal stays auditable.
+                for position in self.positions:
+                    position.meta["signal_exit_deferred_to_end_of_data"] = True
             self._close_position(last_row, total_bars - 1, reason="end_of_data")
             self._update_equity(last_row, total_bars - 1)
 

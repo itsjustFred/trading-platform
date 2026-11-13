@@ -1291,7 +1291,7 @@ def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
         "max_position_exposure_pct": value("max_position_exposure_pct"),
         "max_leverage": value("max_leverage"),
         "modeling_resolution": value("modeling_resolution", "open_close"),
-        "signal_exit_fill": value("signal_exit_fill", "close"),
+        "signal_exit_fill": value("signal_exit_fill", "next_open"),
         "allow_fallback_stop": value("allow_fallback_stop", True),
         "reject_missing_stop": value("reject_missing_stop", False),
         "require_explicit_column_roles": value("require_explicit_column_roles", False),

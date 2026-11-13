@@ -162,6 +162,14 @@ class SignalReplayAdapter:
     handling); bars with NaN OHLC are dropped loudly (count-logged, never
     silently skipped); protective exits settle across ALL open positions per
     signal, not just the signaled symbol.
+
+    Owner decision 2026-11-13 in this engine: (A) a protective exit whose bar
+    OPENS beyond the stop/target fills at that open, intrabar touches at the
+    level. (B) "Signal exits fill like entries" holds trivially: external
+    signals (entries and flip/exit-only exits alike) are executed when they
+    arrive, at the fill bar's close - the documented replay model - so there is
+    no separate next-open exit rule to apply. The end-of-data close of a
+    still-open position fills at the last bar's close.
     """
 
     def __init__(
@@ -429,16 +437,30 @@ class SignalReplayAdapter:
         if event is None:
             self._apply_trailing_stop(position, bar)
             return None
+        # Owner decision 2026-11-13: a bar that OPENS beyond the level gapped
+        # through it and fills at its OPEN (the price actually available), not at
+        # the skipped level. Intrabar touches keep filling at the level.
+        bar_open = float(bar["open"])
         if event == "stop":
             exit_price = (
-                float(position.stop_loss)
+                contract.level_fill_price(
+                    direction=position.direction,
+                    kind="stop",
+                    level=float(position.stop_loss),
+                    bar_open=bar_open,
+                )
                 if position.stop_loss is not None
                 else float(bar["close"])
             )
             reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
         else:
             exit_price = (
-                float(position.take_profit)
+                contract.level_fill_price(
+                    direction=position.direction,
+                    kind="tp",
+                    level=float(position.take_profit),
+                    bar_open=bar_open,
+                )
                 if position.take_profit is not None
                 else float(bar["close"])
             )
