@@ -45,7 +45,7 @@ If a stage is red but every remaining finding is irrelevant (false positive, out
 2. Dispatch the next stage:
    - SonarCloud red -> `gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N>` (a manual run skips the SonarCloud gate).
    - Code Review red -> `gh workflow run agent-mutation-testing.yml --ref <pr-branch> -f pr_number=<N>`.
-   - Mutation Testing red -> `gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N>`.
+   - Mutation Testing red -> `gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>`.
    - Pre-Mortem red -> go on to the CodeRabbit CLI.
 
 An override applies to the commit it was written for. After a new push, judge the new results again.

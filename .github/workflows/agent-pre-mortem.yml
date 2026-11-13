@@ -35,9 +35,11 @@ run-name: "Agent Pre-Mortem PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha ||
 # job, alone of the three, needs no `actions: write`.
 #
 # Override (mutation testing red, findings judged irrelevant): justify each
-# finding in a PR comment, then dispatch by hand (head_sha defaults to the
-# current head):
-#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N>
+# finding in a PR comment, then dispatch by hand. Pass the head SHA as well as the
+# PR number: the resolve-failure reporter clears a pending status for the SHA it
+# is given, and without it a failed run can only warn (head_sha still defaults
+# to the current head):
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 #
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN of the jobs that run no

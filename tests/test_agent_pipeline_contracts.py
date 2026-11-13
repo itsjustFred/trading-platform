@@ -306,16 +306,28 @@ def test_every_stop_path_clears_the_pre_mortem_status() -> None:
     chain early - SonarCloud red, the SonarCloud gate step itself failing, the review run
     failing, a verdict that is not PASS, a failed dispatch, a failed post step - must set
     `agent/pre-mortem` to error exactly as it does for the stage that stopped. The mutation
-    workflow owes the same on its own stop paths. Deleting one of those blocks leaves the
-    status `pending` on the head SHA with no error anywhere, which is the failure the chain
-    branch's last four commits existed to close; until this test, nothing noticed a deletion.
+    workflow owes the same on its own stop paths, and the pre-mortem workflow owes it for its
+    own status, so deleting any of the reporter steps (or one context out of them) would leave
+    the status `pending` on the head SHA with no error anywhere - the failure the chain
+    branch's last four commits existed to close. The reporters must therefore *exist*, by
+    name, in the resolve and post jobs, and write their stage's context as an error.
 
-    The stage's own starting mark (mutation's "Mark running") is the one single-context
-    pending write and is deliberately exempt: it marks the stage that is starting, not a
-    chain that is stopping.
+    The stage's own starting mark (mutation's and the pre-mortem's "Mark running") is the one
+    single-context pending write and is deliberately exempt: it marks the stage that is
+    starting, not a chain that is stopping.
     """
-    for name in (REVIEW, MUTATION):
+    for name in AGENT_WORKFLOWS:
         data = _load(name)
+        own = "PREMORTEM_CONTEXT" if name == PREMORTEM else (
+            "MUTATION_CONTEXT" if name == MUTATION else "REVIEW_CONTEXT"
+        )
+        resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
+        for job, patterns in ((resolve, (r"^Report resolve failure",)), (post, (r"^Report failed .* run$", r"^Report post failure$"))):
+            for pattern in patterns:
+                step = _find_step(job, pattern)
+                body = _run(step)
+                assert own in body, f"{name}: {step.get('name')!r} does not clear {own}"
+                assert "state=error" in body, f"{name}: {step.get('name')!r} writes no error status"
         for job_name, job in data["jobs"].items():
             for step in _steps(job):
                 body = _run(step)
@@ -328,6 +340,17 @@ def test_every_stop_path_clears_the_pre_mortem_status() -> None:
                         f"{name}/{job_name}/{step.get('name')}: stops the chain for "
                         f"{sorted(contexts)} without clearing PREMORTEM_CONTEXT"
                     )
+
+
+def test_the_push_marks_every_stage_pending_before_the_chain_starts() -> None:
+    """On a push the review stage marks the whole chain pending, so the PR shows the pipeline
+    as queued behind stage 1 from the first commit; a stage missing from that mark never shows
+    a result at all until it runs."""
+    data = _load(REVIEW)
+    mark = _find_step(data["jobs"]["resolve"], r"^Mark stages pending$")
+    body = _run(mark)
+    for context in ("REVIEW_CONTEXT", "MUTATION_CONTEXT", "PREMORTEM_CONTEXT"):
+        assert context in body, f"Mark stages pending does not mark {context}"
 
 
 def test_the_cancel_step_covers_both_downstream_workflows() -> None:
