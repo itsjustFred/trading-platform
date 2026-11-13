@@ -1,0 +1,484 @@
+name: Agent Pre-Mortem
+# Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
+# the PR number and SHA from display_title (see agent-mutation-testing.yml for
+# what that broke: the superseded-run cancel in agent-code-review.yml).
+run-name: "Agent Pre-Mortem PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
+
+# Stage 4 of the PR verification pipeline (see the `platform-pr-verify` skill):
+#   SonarCloud -> Agent Code Review -> Agent Mutation Testing -> Agent Pre-Mortem (this) -> CodeRabbit
+#
+# Position. On main the pipeline was run by hand in the order SonarCloud ->
+# mutation testing -> pre-mortem -> code review -> CodeRabbit. The chain branch
+# reordered the automated stages: the read-only code review runs first (cheap,
+# and it blocks before the expensive mutation run), mutation testing second,
+# and the pre-mortem takes the slot behind them, as the last agent stage before
+# the CodeRabbit CLI. That keeps mutation testing ahead of the pre-mortem (the
+# relative order those two had on main), leaves the hardened review ->
+# mutation dispatch untouched, and puts the most speculative stage last: its
+# findings are the ones a human weighs after every blocking gate has passed,
+# next to CodeRabbit's.
+#
+# It has no pull_request trigger. `agent-mutation-testing.yml` dispatches it
+# with the PR head SHA when the mutation verdict is PASS. The run-name carries
+# the PR number and SHA, so a later push can cancel runs of older commits (the
+# review workflow's cancel step covers both downstream workflows). A run whose
+# SHA is no longer the PR head stops without doing anything.
+#
+# It runs the `.agents/skills/actions-pre-mortem` skill as the system prompt of
+# a read-only opencode agent, posts (and on later runs updates) one PR comment,
+# and sets the commit status `agent/pre-mortem` on the analysed SHA:
+#   pending: running · success: PASS · failure: BLOCK or CHANGES-REQUESTED
+#   error:   INCOMPLETE or the run failed
+#
+# It is the last stage of the chain: the CodeRabbit CLI is run by hand after
+# it, so on PASS this workflow dispatches nothing. That is also why the post
+# job, alone of the three, needs no `actions: write`.
+#
+# Override (mutation testing red, findings judged irrelevant): justify each
+# finding in a PR comment, then dispatch by hand. Pass the head SHA as well as the
+# PR number: the resolve-failure reporter clears a pending status for the SHA it
+# is given, and without it a failed run can only warn (head_sha still defaults
+# to the current head):
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+#
+# opencode's free Zen models need no login and no API key, so this workflow
+# holds no secret besides the default GITHUB_TOKEN of the jobs that run no
+# repo code.
+#
+# Trust model:
+# - The rules (the skill) are read from the base branch, so a PR cannot weaken
+#   its own run. Only while the base has no skill yet is another copy used, and
+#   the prompt says so.
+# - Like the code review and unlike the mutation testing, this job runs no repo
+#   code: it reads the diff and its blast radius and writes scenarios. The
+#   agent's edit tool and .env reads are denied, but it has a shell, so those
+#   denies are a hint, not a boundary. The real guards: the job holds no token
+#   or secret, and the run fails if HEAD moved or the tree is dirty.
+# - The workflow file runs from the dispatched ref (the PR branch), like the
+#   PR's copy on pull_request. Accepted for the same reason as in the review
+#   workflow. Fork PRs are skipped.
+#
+# Configuration (Settings -> Secrets and variables -> Actions -> Variables):
+#   PREMORTEM_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   PREMORTEM_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR to pre-mortem
+        required: true
+        type: number
+      head_sha:
+        description: Commit to analyse; the run stops if it is no longer the PR head (default the current head)
+        required: false
+        type: string
+
+concurrency:
+  group: agent-pre-mortem-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  OPENCODE_VERSION: "2.2.7"
+  MODEL: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
+  VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
+  SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
+  PREMORTEM_CONTEXT: agent/pre-mortem
+
+jobs:
+  # Resolves the PR and writes its metadata (title and body via jq, never via
+  # ${{ }} interpolation into a shell script). Marks the stage running and
+  # stops when the analysed SHA is no longer the PR head.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+      current: ${{ steps.pr.outputs.current }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+          if [ "$(jq -r .state pr.json)" != "open" ]; then
+            echo "::error::PR #${INPUT_PR} is not open."
+            exit 1
+          fi
+          # The SHA the mutation stage passed must still be the head; otherwise
+          # a newer push has its own pipeline run and this one has nothing to do.
+          if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+            echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            # Close what the push marked on the superseded commit, so its stage
+            # status ends terminal instead of pending (only if still pending).
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${INPUT_SHA}" \
+                -f state=error -f context="$PREMORTEM_CONTEXT" \
+                -f description="Superseded: the PR head moved on" > /dev/null
+            fi
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=$(jq -r .head.sha pr.json)"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mark running
+        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$PREMORTEM_CONTEXT" -f description="Running" \
+            -f target_url="$RUN_URL" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        if: steps.pr.outputs.current == 'true'
+        with:
+          name: agent-pre-mortem-meta
+          path: meta.json
+          retention-days: 1
+
+      # After "Mark running" a failure here (artifact upload) would leave the
+      # stage `pending` with every later job skipped. The reporter clears the
+      # resolved head and falls back to the dispatch input: a failure of the first
+      # step (before `head` is written) must still leave it a SHA to clear, or the
+      # pending status never reaches an error.
+      - name: Report resolve failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The resolved head (the commit "Mark running" marked) first; the
+          # dispatch input when the first step failed before writing `head`.
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # Only a manual dispatch without head_sha whose first step failed (before
+          # the head was resolved and before "Mark running") gets here with no SHA;
+          # this run then marked nothing pending, and the run log is the signal.
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
+            exit 0
+          fi
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Resolve step failed; see the run log" > /dev/null
+          fi
+
+  premortem:
+    needs: resolve
+    # Fork PRs are not pre-mortemed.
+    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    # The skill stops starting new scenarios at about 20 minutes of work.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-pre-mortem-meta
+          path: ${{ runner.temp }}/premortem
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
+      - name: Install opencode
+        run: |
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
+          opencode --version
+
+      # Rules: the base branch's skill if it has one. Otherwise (only while the
+      # skill is not merged yet) the copy from the commit this workflow runs
+      # from, then the PR's own copy.
+      #
+      # Duplicated by hand in agent-code-review.yml and agent-mutation-testing.yml:
+      # skill selection, agent config, verdict parse, tree-clean check and
+      # comment poster. A change to one copy must land in the others in the
+      # same commit.
+      - name: Select skill revision
+        run: |
+          set -euo pipefail
+          skill="$RUNNER_TEMP/premortem/skill.md"
+          # Refuse when the base commit is unreachable, as the review workflow
+          # does: falling through would run rules the PR may have weakened.
+          git cat-file -e "${BASE_SHA}^{commit}"
+          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
+            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
+          elif [ -f "$SKILL_PATH" ]; then
+            cp "$SKILL_PATH" "$skill"
+            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          else
+            echo "::error::No pre-mortem skill found at base, workflow ref or PR head."
+            exit 1
+          fi
+
+      # The agent lives in the global config, not in the checkout. Its system
+      # prompt is the skill body (the skill's own frontmatter is dropped). It is
+      # read-only, like the review agent; .env reads stay denied.
+      - name: Configure pre-mortem agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only automated PR pre-mortem (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*", effect: allow }\n'
+            printf '  - { action: glob, resource: "*", effect: allow }\n'
+            printf '  - { action: grep, resource: "*", effect: allow }\n'
+            printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
+            printf '  - { action: edit, resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
+            printf -- '---\n'
+            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/premortem/skill.md"
+          } > "$conf/agents/pr-premortem.md"
+          # The system prompt must not be empty (e.g. a skill without frontmatter).
+          if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/pr-premortem.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
+            echo "::error::Pre-mortem agent has an empty system prompt."
+            exit 1
+          fi
+          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
+            | jq -e '.[] | select(.id == "pr-premortem") | .model' > /dev/null
+
+      - name: Run pre-mortem agent
+        id: run
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/premortem/comment.md"
+          # Captured through a variable, never a file the agent can reach: it
+          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
+          # in $out.raw would otherwise be posted as the verdict.
+          if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
+            "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}."); then
+            printf '%s\n' "$raw" > "$out.raw"
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
+          # opencode prints every assistant message; keep only the final comment,
+          # which starts at the last "**Summary:**" line. Drop a closing code
+          # fence the model may have wrapped around it.
+          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
+          if [ -z "$start" ]; then
+            echo "::error::Pre-mortem output has no summary line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+          # The verdict must be the last non-empty line (a verdict quoted from the
+          # diff elsewhere in the output does not count), and it must be one of
+          # the four the skill allows.
+          # A sign-off note the model put on its own line after the verdict (the
+          # skill asks for it on the verdict line) is tolerated: it is skipped
+          # when looking for the verdict, and stays in the posted comment.
+          last=$(grep -v '^[[:space:]]*$' "$out" \
+            | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
+            | tail -n 1)
+          verdict=$(printf '%s\n' "$last" | tr -d '*' \
+            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
+          if [ -z "$verdict" ]; then
+            echo "::error::Pre-mortem output does not end with a valid verdict line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The pre-mortem agent modified the checkout; not posting."
+            git status --porcelain
+            exit 1
+          fi
+          # A file, not $GITHUB_OUTPUT: the agent shares this step's
+          # environment and could otherwise append its own verdict.
+          printf '%s\n' "$verdict" > "$RUNNER_TEMP/premortem/verdict.txt"
+          # Footer: the model, its variant and the skill the rules came from
+          # (the skill directory's name, not its path), so a reader can map the
+          # verdict to the rules that produced it.
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          printf '\n\n---\n_Automated pre-mortem using %s with `%s` skill_\n' \
+            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          # Title first, so the comment is recognisable among the other bots'.
+          { printf '# Pre-Mortem Action\n\n'; cat "$out"; } > "$out.titled"
+          mv "$out.titled" "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      # A separate step, so the verdict reaches $GITHUB_OUTPUT from a file the
+      # agent never had this step's env file to append to.
+      - name: Read verdict
+        id: verdict
+        run: |
+          set -euo pipefail
+          echo "verdict=$(cat "$RUNNER_TEMP/premortem/verdict.txt")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-pre-mortem
+          path: ${{ runner.temp }}/premortem/comment.md
+          retention-days: 14
+
+  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # failed pre-mortem run as `error`. No dispatch: this is the last stage of
+  # the chain, and the CodeRabbit CLI after it is run by hand.
+  post:
+    needs: [resolve, premortem]
+    if: ${{ !cancelled() && (needs.premortem.result == 'success' || needs.premortem.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Verified on PR #178 for the review workflow's identical steps:
+    # pull-requests: write is enough for the issues/{n}/comments endpoints on a
+    # pull request; issues: write is not needed. No actions: write: this stage
+    # dispatches nothing.
+    permissions:
+      pull-requests: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      VERDICT: ${{ needs.premortem.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report failed pre-mortem run
+        if: needs.premortem.result == 'failure'
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Pre-mortem run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+
+      - uses: actions/download-artifact@v4
+        if: needs.premortem.result == 'success'
+        with:
+          name: agent-pre-mortem
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only. A result for a commit that is no longer the PR
+      # head does not overwrite the comment (its status still lands on its SHA).
+      - name: Post or update pre-mortem comment
+        if: needs.premortem.result == 'success'
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
+          marker='<!-- actions-pre-mortem -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
+
+      - name: Set status
+        if: needs.premortem.result == 'success'
+        run: |
+          set -euo pipefail
+          case "$VERDICT" in
+            PASS) state=success ;;
+            BLOCK|CHANGES-REQUESTED) state=failure ;;
+            *) state=error ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$PREMORTEM_CONTEXT" \
+            -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+
+      # A failure above (artifact download, comment POST/PATCH, status write)
+      # would otherwise leave the stage `pending` on this SHA forever. Only a
+      # still-pending context is touched, so a terminal verdict stands.
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Post step failed; see the run log" > /dev/null
+          fi
+
+  # A cancelled run (a hand-cancel, or a newer dispatch for the same PR through
+  # the concurrency group) skips every reporter above, which would leave the
+  # stage `pending` with no signal. This job runs only on cancellation and
+  # turns a still-pending status of the analysed commit into an error. A newer
+  # run that already wrote its final status is not touched (pending only).
+  report-cancelled:
+    needs: [resolve, premortem, post]
+    if: ${{ cancelled() && (needs.resolve.outputs.head != '' || inputs.head_sha != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A run cancelled before resolve wrote `head` still names its commit.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled pre-mortem run
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+          fi

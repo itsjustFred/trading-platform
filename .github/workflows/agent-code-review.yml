@@ -1,7 +1,7 @@
 name: Agent Code Review
 
 # Stage 2 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> CodeRabbit
+#   SonarCloud -> Agent Code Review (this) -> Agent Mutation Testing -> Agent Pre-Mortem -> CodeRabbit
 #
 # On every push to a PR it waits for the SonarCloud check of the head commit.
 # Only if SonarCloud is green does it run the `.agents/skills/actions-code-review`
@@ -23,11 +23,15 @@ name: Agent Code Review
 #                                    because SonarCloud is not green
 #   agent/mutation-testing  pending: waiting for agent/code-review (on push)
 #                           error:   not run because agent/code-review is not PASS
+#   agent/pre-mortem        pending: waiting for agent/mutation-testing (on push)
+#                           error:   not run because agent/code-review is not PASS
 #
 # Override (red stage, findings judged irrelevant): justify each finding in a PR
 # comment, then dispatch the next stage by hand. A manual dispatch of this
 # workflow skips the SonarCloud gate:
-#   gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N>
+#   gh workflow run agent-code-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# head_sha is optional and only tells the resolve-failure reporter which commit's
+# pending statuses to clear if the run fails before it has resolved the PR.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN.
@@ -59,6 +63,10 @@ on:
         description: Number of the open PR to review (skips the SonarCloud gate)
         required: true
         type: number
+      head_sha:
+        description: Head commit the override is for; lets a run that fails before resolving the PR still clear the stage statuses (optional)
+        required: false
+        type: string
 
 concurrency:
   group: agent-code-review-${{ github.event.pull_request.number || inputs.pr_number }}
@@ -72,11 +80,13 @@ env:
   SONAR_CHECK: SonarCloud Code Analysis
   REVIEW_CONTEXT: agent/code-review
   MUTATION_CONTEXT: agent/mutation-testing
+  PREMORTEM_CONTEXT: agent/pre-mortem
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
   # via jq, never via ${{ }} interpolation into a shell script). On a push it
-  # also cancels mutation runs of older commits and marks both stages pending.
+  # also cancels the downstream stage runs of older commits and marks all three
+  # stages pending.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -96,6 +106,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
@@ -104,6 +115,12 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
             if [ "$(jq -r .state pr.json)" != "open" ]; then
               echo "::error::PR #${INPUT_PR} is not open."
+              exit 1
+            fi
+            # An override is justified for one commit (it skips the SonarCloud
+            # gate); refuse it once the head has moved on.
+            if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+              echo "::error::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; the override does not cover the new head."
               exit 1
             fi
           fi
@@ -135,10 +152,14 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=pending -f context="$MUTATION_CONTEXT" \
             -f description="Waiting for ${REVIEW_CONTEXT}" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$PREMORTEM_CONTEXT" \
+            -f description="Waiting for ${MUTATION_CONTEXT}" > /dev/null
 
-      # Mutation runs are dispatched with run-name "... PR #<n> @ <sha>". A new
-      # push makes those of older commits worthless; stop them to save minutes.
-      - name: Cancel mutation runs of older commits
+      # The downstream stage runs are dispatched with run-name
+      # "... PR #<n> @ <sha>". A new push makes those of older commits
+      # worthless; stop them to save minutes.
+      - name: Cancel downstream stage runs of older commits
         if: steps.pr.outputs.same_repo == 'true' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -146,12 +167,14 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
         run: |
           set -euo pipefail
-          for state in queued in_progress; do
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/agent-mutation-testing.yml/runs?status=${state}&per_page=100" \
-              --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
-              2>/dev/null || true
+          for wf in agent-mutation-testing.yml agent-pre-mortem.yml; do
+            for state in queued in_progress; do
+              gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=${state}&per_page=100" \
+                --jq ".workflow_runs[] | select(.display_title | test(\" PR #${PR_NUMBER} @ \")) | select(.display_title | endswith(\"${HEAD_SHA}\") | not) | .id" \
+                2>/dev/null || true
+            done
           done | while read -r id; do
-            echo "Cancelling superseded mutation run ${id}"
+            echo "Cancelling superseded stage run ${id}"
             gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/cancel" > /dev/null || true
           done
 
@@ -162,15 +185,24 @@ jobs:
           retention-days: 1
 
       # After "Mark stages pending" a failure here (cancel query, artifact
-      # upload) would leave both stages `pending` with every later job skipped.
+      # upload) would leave all three stages `pending` with every later job skipped.
+      # The SHA is the resolved head (the commit "Mark stages pending" marked),
+      # or, when the first step failed before writing `head`, the dispatch input
+      # or the pushed head of a pull_request event.
       - name: Report resolve failure
-        if: failure() && steps.pr.outputs.head != ''
+        if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.pr.outputs.head }}
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+          # Only a manual dispatch without head_sha whose first step failed gets
+          # here with no SHA; the run log is then the only signal.
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
+            exit 0
+          fi
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -231,10 +263,13 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
-          echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER}"
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} did not run" > /dev/null
+          echo "::notice::Review not started (${reason}). Override after checking the SonarCloud findings: gh workflow run agent-code-review.yml --ref ${HEAD_REF} -f pr_number=${PR_NUMBER} -f head_sha=${HEAD_SHA}"
 
       # Without this, a step failure here (e.g. an API error under `set -e`)
-      # leaves both stages `pending` forever: `review` is skipped and `post`
+      # leaves the stages `pending` forever: `review` is skipped and `post`
       # only runs for a finished review.
       - name: Report gate failure
         if: failure()
@@ -248,6 +283,9 @@ jobs:
             -f description="SonarCloud gate failed; see the run log" > /dev/null
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
+            -f description="Not run: SonarCloud gate failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: SonarCloud gate failed" > /dev/null
 
   review:
@@ -281,11 +319,13 @@ jobs:
         with:
           node-version: 22
 
-      # Not --ignore-scripts: @opencode/cli needs its postinstall step to fetch
-      # the platform binary. The job holds no token, so the exposure is bounded.
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
       - name: Install opencode
         run: |
-          npm install -g "@opencode/cli@${OPENCODE_VERSION}"
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
           opencode --version
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
@@ -293,11 +333,13 @@ jobs:
       # workflow runs from, then the PR's own copy. If none of the three
       # exists, the job stops.
       #
-      # Duplicated by hand in agent-mutation-testing.yml: skill selection,
-      # agent config, verdict parse, tree-clean check and comment poster. A
-      # change to one copy must land in the other in the same commit.
+      # Duplicated by hand in agent-mutation-testing.yml and agent-pre-mortem.yml:
+      # skill selection, agent config, verdict parse, tree-clean check and
+      # comment poster. A change to one copy must land in the others in the
+      # same commit.
       - name: Select skill revision
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/review"
           skill="$RUNNER_TEMP/review/skill.md"
           git cat-file -e "${BASE_SHA}^{commit}"
@@ -384,7 +426,12 @@ jobs:
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count), and it must be one of
           # the four the skill allows.
-          last=$(grep -v '^[[:space:]]*$' "$out" | tail -n 1)
+          # A sign-off note the model put on its own line after the verdict (the
+          # skill asks for it on the verdict line) is tolerated: it is skipped
+          # when looking for the verdict, and stays in the posted comment.
+          last=$(grep -v '^[[:space:]]*$' "$out" \
+            | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
+            | tail -n 1)
           verdict=$(printf '%s\n' "$last" | tr -d '*' \
             | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
           if [ -z "$verdict" ]; then
@@ -457,6 +504,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
             -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: ${REVIEW_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.review.result == 'success'
@@ -505,13 +555,19 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$MUTATION_CONTEXT" \
                 -f description="Not run: dispatch of mutation testing failed" > /dev/null
-              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} to error."
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$PREMORTEM_CONTEXT" \
+                -f description="Not run: dispatch of mutation testing failed" > /dev/null
+              echo "::error::Failed to dispatch agent-mutation-testing.yml; set ${MUTATION_CONTEXT} and ${PREMORTEM_CONTEXT} to error."
               exit 1
             fi
             echo "Dispatched mutation testing for ${HEAD_SHA}."
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$MUTATION_CONTEXT" \
+              -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
               -f description="Not run: ${REVIEW_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
 
@@ -524,12 +580,44 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT"; do
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$ctx" \
                 -f description="Post step failed; see the run log" > /dev/null
+            fi
+          done
+
+  # A cancelled run (a hand-cancel, or a newer push through the concurrency
+  # group) skips every reporter above. This stage marks all three statuses
+  # pending on push, so without this job a cancel would strand all three on the
+  # commit. It runs only on cancellation and turns every still-pending stage
+  # status of the analysed commit into an error; a newer run that already wrote
+  # a final status is not touched (pending only).
+  report-cancelled:
+    needs: [resolve, sonar-gate, review, post]
+    if: ${{ cancelled() && (needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A run cancelled before resolve wrote `head` still names its commit.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled review run
+        run: |
+          set -euo pipefail
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Review run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
             fi
           done
