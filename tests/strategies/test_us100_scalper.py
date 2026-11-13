@@ -90,10 +90,13 @@ def test_breakout_arms_and_single_fill_then_eod_flatten():
     assert indicators["direction"].loc[entry_idx[0]] == "LONG"
     # SL = prev-H1-Close (12:00 -> 20000) minus 25 Punkte.
     assert indicators["sl_price"].loc[entry_idx[0]] == pytest.approx(19975.0)
-    # EOD-Flatten an der 16:00-ET-Bar (21:00 UTC).
+    # EOD-Flatten: Signal auf der Bar VOR 16:00 ET (15:00-ET-Bar = 20:00 UTC, deren
+    # Ende 16:00 erreicht); next_open fuellt dann am 16:00-ET-Open. Kein
+    # expliziter exit_price (Market-Exit, kein Level).
     exit_idx = exits[exits].index.tolist()
-    assert exit_idx == [df.index[df["timestamp"] == pd.Timestamp("2024-01-02 21:00", tz="UTC")][0]]
+    assert exit_idx == [df.index[df["timestamp"] == pd.Timestamp("2024-01-02 20:00", tz="UTC")][0]]
     assert indicators["exit_reason"].loc[exit_idx[0]] == "time_exit_eod"
+    assert indicators["exit_price"].isna().all()
 
 
 def test_no_breakout_no_trade():
@@ -127,17 +130,19 @@ def test_day_reset_flattens_without_eod_bar():
     ny = df["timestamp"].dt.tz_convert("America/New_York")
     et_day = ny.dt.date.astype(str)
     mins = ny.dt.hour * 60 + ny.dt.minute
-    df_gap = df[~((et_day == "2024-01-02") & (mins >= 16 * 60))].reset_index(drop=True)
+    # Auch die Bar VOR 16:00 ET (15:00-ET-Bar, die den EOD-Exit ausloest) fehlt.
+    df_gap = df[~((et_day == "2024-01-02") & (mins >= 15 * 60))].reset_index(drop=True)
     entries, exits, indicators, _ = module.generate_signals(df_gap, {})
     assert entries.sum() == 1
     exit_idx = exits[exits].index.tolist()
     assert len(exit_idx) == 1, "Day-Reset muss genau einen Exit buchen"
     assert indicators["exit_reason"].loc[exit_idx[0]] == "day_reset_flatten"
-    # Letzte Bar des ET-Tages 2024-01-02 = 20:00 UTC (15:00 ET), Close 20035.
+    # Letzte Bar des ET-Tages 2024-01-02 = 19:00 UTC (14:00 ET); Market-Exit ohne
+    # expliziten Preis (fuellt am naechsten Open).
     assert df_gap.loc[exit_idx[0], "timestamp"] == pd.Timestamp(
-        "2024-01-02 20:00", tz="UTC"
+        "2024-01-02 19:00", tz="UTC"
     )
-    assert indicators["exit_price"].loc[exit_idx[0]] == pytest.approx(20035.0)
+    assert pd.isna(indicators["exit_price"].loc[exit_idx[0]])
 
 
 def test_code_values_win_over_infos_txt():
@@ -191,9 +196,7 @@ def test_frame_end_flattens_open_position():
     exit_idx = exits[exits].index.tolist()
     assert exit_idx == [df_cut.index[-1]], "Exit muss auf der letzten Bar liegen"
     assert indicators["exit_reason"].iloc[-1] == "day_reset_flatten"
-    assert indicators["exit_price"].iloc[-1] == pytest.approx(
-        float(df_cut["close"].iloc[-1])
-    )
+    assert pd.isna(indicators["exit_price"].iloc[-1])
 
 
 def test_frame_end_flatten_skips_same_bar_entry():
@@ -212,3 +215,31 @@ def test_frame_end_flatten_skips_same_bar_entry():
     assert entries.sum() == 1, "Entry-Touch auf der letzten Bar muss als Entry erkannt sein"
     assert not exits.any(), "Kein Exit auf derselben Bar wie der Entry"
     assert indicators["exit_reason"].isna().all()
+
+
+def _minute_frame() -> pd.DataFrame:
+    """1m bars 2024-01-02 (EST): breakout armed overnight, entry at 08:00 ET, flat afterwards."""
+    stamps = pd.date_range("2024-01-02 05:00", "2024-01-03 02:00", freq="1min", tz="UTC", inclusive="left")
+    n = len(stamps)
+    df = pd.DataFrame(
+        {"timestamp": stamps, "open": 20000.0, "high": 20005.0, "low": 19995.0, "close": 20000.0, "volume": 10.0}
+    )
+    df.loc[df["timestamp"] == pd.Timestamp("2024-01-02 10:00", tz="UTC"), "high"] = 20050.0
+    touch = df["timestamp"] == pd.Timestamp("2024-01-02 14:00", tz="UTC")
+    df.loc[touch, "high"] = 20040.0
+    df.loc[df["timestamp"] > pd.Timestamp("2024-01-02 14:00", tz="UTC"), ["low", "close", "open"]] = [20020.0, 20035.0, 20035.0]
+    assert n > 0
+    return df
+
+
+def test_eod_flatten_signal_is_the_1559_bar_on_1m_data():
+    """1m: the exit is raised on the 15:59 ET bar so next_open fills at the 16:00 open."""
+    module = _load_module()
+    df = _minute_frame()
+    entries, exits, indicators, _ = module.generate_signals(df, {})
+    assert entries.sum() == 1
+    (exit_idx,) = exits[exits].index.tolist()
+    ts_et = df.loc[exit_idx, "timestamp"].tz_convert("America/New_York")
+    assert ts_et.strftime("%H:%M") == "15:59"
+    assert indicators["exit_reason"].loc[exit_idx] == "time_exit_eod"
+    assert indicators["exit_price"].isna().all()

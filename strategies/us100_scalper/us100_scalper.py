@@ -8,7 +8,9 @@ Vectorized port of the MQL5 EA "us100 intrayday scalper single-symbol mql5.txt"
 - Breakout detect 00:00-08:00 ET: any high > midnight_close + buffer -> armed.
 - Entry window 08:00-16:00 ET: hourly buy-stop at prev-H1-close + entry
   offset; fill approximated when the bar high touches the stop. One fill/day.
-- Protective stop at prev-H1-close - SL offset; EOD flatten at 16:00 ET.
+- Protective stop at prev-H1-close - SL offset; EOD flatten at 16:00 ET (market
+  exit filled at the 16:00 OPEN: the signal is raised on the bar before, because
+  signal exits fill at the next bar open).
 
 Session mapping: the MQL5 server hours (GMT+3) 07:00 / 07-15h / 15-23h / 23:00
 correspond to NY midnight / 00:00-08:00 ET / 08:00-16:00 ET / 16:00 ET; the
@@ -23,9 +25,11 @@ defaults below are the code values (30 / 25 / 30 points).
 import numpy as np
 import pandas as pd
 
+from shared.bar_timing import clock_exit_signal_mask, modal_bar_minutes
+
 STRATEGY_META = {
     "name": "US100 Intraday Scalper",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1453162378509418657/1453162378509418657",
     "notes": (
         "Long-only NQ scalper ported from 'us100 intrayday scalper "
@@ -40,9 +44,12 @@ STRATEGY_META = {
         "the native engine fills the touched buy-stop at the next open, "
         "while the vectorbt engine (D2 strict) fills at the stop level "
         "itself — gap-through fills at the stop, and no touch means no "
-        "fill (never a next-open fallback). EOD flatten books the bar "
-        "close; a missing post-16:00-ET bar books 'day_reset_flatten' on "
-        "the last bar of the ET day instead of dropping the position."
+        "fill (never a next-open fallback). 1.1.0: the EOD flatten is a market "
+        "exit without an explicit price; its signal is raised on the bar "
+        "before 16:00 ET so it fills at the 16:00 open (next_open), instead "
+        "of the old 'book the signal-bar close' price hack; a missing "
+        "post-16:00-ET bar books 'day_reset_flatten' on the last bar of the "
+        "ET day instead of dropping the position."
     ),
     "parameters": {
         "reference_price": 25000.0,
@@ -103,6 +110,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
         ts_ny = pd.Series(ts_ny, index=df.index)
     minutes_now = (ts_ny.dt.hour * 60 + ts_ny.dt.minute).to_numpy()
     et_day = ts_ny.dt.date.to_numpy()
+    # Signal exits fill at the NEXT bar's open: the EOD flatten is raised on the
+    # first bar whose end reaches 16:00 ET so it fills at the 16:00 open.
+    eod_signal = np.asarray(
+        clock_exit_signal_mask(minutes_now, modal_bar_minutes(ts_ny), _ENTRY_END)
+    )
 
     prev_h1 = _prev_h1_close(close, ts_ny)
     stop_level = prev_h1 + entry_points
@@ -134,7 +146,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 # close instead of silently dropping the open position
                 # (phantom trade: entry without exit).
                 exits.iloc[i - 1] = True
-                exit_price.iloc[i - 1] = float(close.iloc[i - 1])
                 exit_reason.iloc[i - 1] = "day_reset_flatten"
             cur_day = et_day[i]
             # H1 close into NY midnight: previous bar's close at the first bar
@@ -160,9 +171,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 exit_reason.iloc[i] = "stop_loss"
                 in_trade = False
                 active_sl = np.nan
-            elif mins >= _ENTRY_END:
+            elif eod_signal[i]:
                 exits.iloc[i] = True
-                exit_price.iloc[i] = float(close.iloc[i])
                 exit_reason.iloc[i] = "time_exit_eod"
                 in_trade = False
                 active_sl = np.nan
@@ -185,8 +195,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     if in_trade and len(df) > 0:
         # B-H1 edge: the frame ends mid-day with an open position (no further
-        # bar to trigger the 16:00 EOD exit or a day-change flatten). Book the
-        # exit on the last bar at its close instead of dropping the position
+        # bar to trigger the 16:00 EOD exit or a day-change flatten). Signal the
+        # exit on the last bar (the engine's end-of-data close takes it) instead of dropping the position
         # (phantom trade: entry without exit).
         last = len(df) - 1
         # PM11: skip when the entry fired on this very bar — a same-bar flatten
@@ -195,7 +205,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         # EOD exit picks it up instead.
         if not entries.iloc[last]:
             exits.iloc[last] = True
-            exit_price.iloc[last] = float(close.iloc[last])
             exit_reason.iloc[last] = "day_reset_flatten"
 
     _ = open_  # retained for OHLCV-shape parity; logic keys off high/low/close
