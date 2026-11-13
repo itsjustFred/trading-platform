@@ -31,6 +31,7 @@ from runner.engines import contract
 from runner.engines._drawings import DrawingList, _normalize_drawings
 from runner.engines._indicator_series import _build_indicator_series
 from runner.engines._shared import (
+    require_time_based_signal_exits,
     resolve_ask_high_low,
     resolve_bar_spread,
 )
@@ -672,6 +673,11 @@ class VectorbtAdapter(EngineAdapter):
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
+        # Issue #153: open-fill needs an explicit time-based-exits declaration
+        # in STRATEGY_META; identical rule and message in every engine.
+        require_time_based_signal_exits(
+            config, getattr(strategy_mod, "STRATEGY_META", None)
+        )
 
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)

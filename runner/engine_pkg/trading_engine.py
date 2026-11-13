@@ -294,12 +294,29 @@ class TradeEngine:
                     shares = max(shares, min_lot)
                 if max_lot > 0:
                     shares = min(shares, max_lot)
+                uncapped_shares = shares
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
                     max_value = self.equity * position_notional_limit
                     shares = min(shares, max_value / entry_price)
                 elif self._max_position_exposure_pct is not None:
                     max_value = self.equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
+                # Issue #151: the leverage/exposure cap is a raw
+                # equity/price ratio, so it can leave a size that is below
+                # `min_lot` or off the `lot_step` grid -- a size the broker
+                # would reject. Re-normalise after the cap with the same
+                # float-safe floor as above. A floored size below `min_lot`
+                # is SKIPPED (size 0), not raised back up: the cap is
+                # binding, so the trade is not affordable at the minimum.
+                # Only a size the cap actually reduced is re-normalised:
+                # flooring `k * lot_step` a second time is not idempotent in
+                # floating point (the quotient can land an ulp below `k` and
+                # lose a whole step), so an uncapped size must stay untouched.
+                if shares < uncapped_shares:
+                    if lot_step > 0:
+                        shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+                    if min_lot > 0 and shares < min_lot:
+                        return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(

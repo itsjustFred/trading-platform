@@ -11,6 +11,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
+from runner.engines._shared import require_time_based_signal_exits
 from runner.engines.base import (
     BacktestConfig,
     EngineAdapter,
@@ -110,6 +111,12 @@ class NativeAdapter(EngineAdapter):
         strategy_module = _load_strategy_module(strategy_path)
         if not hasattr(strategy_module, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals")
+        # Issue #153: open-fill is only sound for time-based signal exits and
+        # needs an explicit STRATEGY_META declaration. Fail before any data or
+        # engine work, in every engine that honours signal_exit_fill.
+        require_time_based_signal_exits(
+            config, getattr(strategy_module, "STRATEGY_META", None)
+        )
 
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)

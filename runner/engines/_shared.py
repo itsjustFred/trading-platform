@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 import pandas as pd
 
 from shared.models import EquityPoint, Trade
+from shared.strategy_registry import load_strategy_meta
+
+# Issue #153: STRATEGY_META key a strategy must set to ``True`` to opt in to
+# ``signal_exit_fill="open"``. Open-fill takes the exit price from the open of
+# the bar that produced the exit signal, which is only sound when the exit is
+# time-based (the decision to leave was made before the bar existed). For an
+# exit computed from the trigger bar (close, high/low, an indicator value)
+# the open precedes the information that triggered it: a lookahead.
+SIGNAL_EXITS_TIME_BASED_META_KEY = "signal_exits_time_based"
 
 
 def serialize_meta_value(value: Any) -> Any | None:
@@ -62,6 +72,67 @@ def resolve_max_leverage(explicit: float | None) -> float:
     if explicit is not None and explicit > 0:
         return float(explicit)
     return 2.0
+
+
+def require_time_based_signal_exits(
+    config: Any, strategy_meta: Mapping[str, Any] | None
+) -> None:
+    """Reject ``signal_exit_fill="open"`` unless the strategy opts in (#153).
+
+    ``signal_exit_fill="open"`` fills a signal exit at the OPEN of the bar
+    that triggered it — an MT5-parity convention that is only valid for
+    time-based exits, where the exit decision predates the bar. A strategy
+    whose exit is computed from the trigger bar itself (close, high/low, an
+    indicator) would fill before that information existed: a lookahead that
+    silently inflates the backtest. Such a strategy must declare
+
+        STRATEGY_META = {..., "signal_exits_time_based": True}
+
+    The check is shared by every engine that honours ``signal_exit_fill``
+    (native, vectorbt, pynecore) so the rule cannot drift between them. The
+    default ``"close"`` convention needs no declaration and is unaffected.
+
+    Raises:
+        ValueError: open-fill is configured and the strategy does not declare
+            ``signal_exits_time_based = True`` (the boolean itself, not a
+            truthy stand-in, so a typo cannot silently opt in).
+    """
+    fill = str(getattr(config, "signal_exit_fill", "close") or "close").strip().lower()
+    if fill != "open":
+        return
+    meta = strategy_meta if isinstance(strategy_meta, Mapping) else {}
+    if meta.get(SIGNAL_EXITS_TIME_BASED_META_KEY) is True:
+        return
+    name = str(
+        meta.get("name") or getattr(config, "strategy_name", "") or "<strategy>"
+    )
+    raise ValueError(
+        f"signal_exit_fill='open' is not allowed for strategy {name!r}: it fills a "
+        "signal exit at the open of the bar that triggered it, which is only "
+        "sound for time-based exits. An exit computed from the trigger bar "
+        "(close, high/low, indicator) would fill before that information "
+        f"existed — a lookahead. Declare STRATEGY_META[{SIGNAL_EXITS_TIME_BASED_META_KEY!r}] "
+        "= True if this strategy's signal exits are time-based, or use the "
+        "default signal_exit_fill='close'."
+    )
+
+
+def require_time_based_signal_exits_for_path(config: Any, strategy_path: str | Path) -> None:
+    """Apply :func:`require_time_based_signal_exits` using the file's meta.
+
+    For engines that do not import the strategy module (pynecore parses
+    ``STRATEGY_META`` statically). Metadata that cannot be read is treated as
+    "no declaration", so open-fill fails loudly rather than silently passing.
+    """
+    fill = str(getattr(config, "signal_exit_fill", "close") or "close").strip().lower()
+    if fill != "open":
+        return
+    resolved = Path(strategy_path).resolve()
+    try:
+        meta = load_strategy_meta(resolved, resolved.parent)
+    except Exception:
+        meta = {}
+    require_time_based_signal_exits(config, meta)
 
 
 def resolve_bar_spread(row: pd.Series, raw_col: Any) -> float:
