@@ -1562,11 +1562,12 @@ def test_stream_commission_is_scaled_by_the_deals_money_digits(isolated_db) -> N
     _seed_signal(database, signal_id)
     adapter = _execution_adapter()
     event = _fill_event(signal_id=signal_id, deal_id=4001)
-    event.deal.commission = 350
+    event.deal.commission = -350
     event.deal.moneyDigits = 2
 
     asyncio.run(adapter._persist_execution_event(event))
 
+    # cTrader reports a charge as a negative cash flow; it is stored as a positive cost.
     assert _commission_rows(database) == [pytest.approx(3.5)]
 
 
@@ -1577,7 +1578,7 @@ def test_reconciled_commission_is_scaled_by_the_deals_money_digits(isolated_db) 
     adapter = _reconcile_adapter()
 
     deal = _recovered_deal(5001, 500_000, moneyDigits=5)
-    deal.commission = 350_000
+    deal.commission = -350_000
 
     assert _reconcile(adapter, signal_id, [deal], None) == 1
     assert _commission_rows(database) == [pytest.approx(3.5)]
@@ -1592,9 +1593,13 @@ def test_commission_scaling_uses_real_protobuf_presence() -> None:
     assert _deal_commission(None) == 0.0
     assert _deal_commission(ProtoOADeal()) == 0.0
     deal = ProtoOADeal(commission=-1234, moneyDigits=3)
-    assert _deal_commission(deal) == pytest.approx(-1.234)
+    # A charge (negative broker sign) is a positive cost; a rebate stays a negative cost.
+    assert _deal_commission(deal) == pytest.approx(1.234)
+    assert _deal_commission(ProtoOADeal(commission=1234, moneyDigits=3)) == pytest.approx(-1.234)
     # A genuine moneyDigits of 0 is honoured, not replaced by the default.
-    assert _deal_commission(ProtoOADeal(commission=7, moneyDigits=0)) == pytest.approx(7.0)
+    assert _deal_commission(ProtoOADeal(commission=-7, moneyDigits=0)) == pytest.approx(7.0)
+    zero = _deal_commission(ProtoOADeal())
+    assert zero == 0.0 and str(zero) == "0.0"  # never -0.0
 
 
 def test_money_digits_fallback_is_logged(caplog) -> None:

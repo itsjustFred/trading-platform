@@ -1731,7 +1731,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
             actual_price = _to_float(fill_price)
             filled_qty = _to_float(filled_qty_value)
-            commission = _to_float(commission_value)
+            # `live_executions.commission` is a positive cost (base_adapter.commission_cost).
+            commission = abs(_to_float(commission_value))
             fill_ts = _to_datetime(getattr(data, "timestamp", None))
 
             execution_id = str(getattr(data, "execution_id", "") or "")
