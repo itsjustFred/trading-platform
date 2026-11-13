@@ -407,17 +407,33 @@ def _ensure_ctrader_smoke_deployment(*, account_id: str, symbol: str) -> str:
     ``strategy_name`` and PAUSED, so no runner trades it. Idempotent by ``strategy_name``, because
     that is the only field a readable lookup can key on.
 
-    ``live_deployments.account_id`` carries a foreign key to ``live_accounts``, so this fails closed
-    when the account row is absent rather than writing a second orphan - an orphan signal is
-    invisible to every deployment-scoped query, which is how seven of them went unnoticed.
+    ``live_deployments.account_id`` carries a foreign key to ``live_accounts``. The smoke is
+    demo-only (its adapter is built with ``demo=True``), so on a fresh database - where nothing
+    has run account discovery yet - the demo account row is registered here instead of failing
+    with a bare FOREIGN KEY error. An account row that already exists is never modified, so the
+    smoke cannot relabel or re-flag an account discovery registered.
     """
     from sqlmodel import select
 
-    from shared.database import LiveDeploymentModel, get_session, init_db
+    from shared.database import (
+        LiveDeploymentModel,
+        ensure_live_account,
+        get_live_account,
+        get_session,
+        init_db,
+    )
 
     # The worker mode reaches this before anything else touches the database, so on a fresh data
     # dir the tables do not exist yet and the select below would raise "no such table".
     init_db()
+    if get_live_account(account_id) is None:
+        ensure_live_account(
+            account_id,
+            "ctrader",
+            name=f"cTrader demo {account_id} (registered by live_smoke)",
+            ctid=account_id,
+            is_demo=True,
+        )
     strategy_name = f"ctrader-demo-smoke-{account_id}"
     with get_session() as session:
         existing = session.exec(

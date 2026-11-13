@@ -47,6 +47,10 @@ uv run python scripts/live_smoke.py --mode alpaca --accounts-env .accounts.env -
 uv run python scripts/live_smoke.py --mode ctrader --accounts-env .accounts.env --reports-dir docs/reports
 ```
 
+The cTrader smoke registers the demo account in `live_accounts` if it is not there yet (a fresh
+database), because its parent deployment row has a foreign key to it. An account that already
+exists is left untouched.
+
 ## Demo Daemon
 
 Only run after the paper smoke succeeds.
