@@ -6,7 +6,9 @@ import hashlib
 import inspect
 import math
 import os
+import logging
 import re
+import sys
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -34,6 +36,14 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.shutdown import (
+    DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+    DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    EXIT_CLEANUP_TIMEOUT,
+    EXIT_OK,
+    ShutdownCoordinator,
+    release_twisted_reactor_threads,
+)
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import (
     DiscordSignalSource,
@@ -1619,6 +1629,27 @@ async def _prepare_discord_signal_for_submission(
     return normalized_signal
 
 
+# Process-wide shutdown state. Order submissions deep in the listener tasks
+# consult it (``_begin_submission``) without it being threaded through every
+# call; ``run_daemon`` binds it to its loop and drives the shutdown sequence.
+_SHUTDOWN = ShutdownCoordinator()
+# The coordinator THIS process actually runs on. It is ``_SHUTDOWN`` in
+# production, and whatever a test injects into ``run_daemon(shutdown=...)``
+# there. The gate and the drain must sit on the same object: a drain that
+# counts a different coordinator's submissions sees an always-zero in-flight
+# count, waits for nothing, and then cancels an order submission that was
+# halfway to the broker - the exact failure graceful shutdown exists to prevent.
+_ACTIVE_SHUTDOWN: ShutdownCoordinator = _SHUTDOWN
+
+
+def _begin_submission() -> bool:
+    return _ACTIVE_SHUTDOWN.begin_submission()
+
+
+def _end_submission() -> None:
+    _ACTIVE_SHUTDOWN.end_submission()
+
+
 async def _submit_normalized_discord_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -1678,6 +1709,42 @@ async def _submit_normalized_discord_signal(
         )
         return
 
+    # Shutdown gate + in-flight registration happen in one synchronous step, so
+    # a signal either is refused here or is counted as in flight before any
+    # await: the shutdown drain can never miss an order that is about to be sent.
+    if not _begin_submission():
+        logger.warning(
+            "Skipping discord signal: daemon is shutting down; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                }
+            },
+        )
+        return
+    try:
+        await _claim_and_submit_prepared_signal(
+            account_id,
+            adapter,
+            deployment,
+            live_signal,
+            prepared_signal,
+            prepared_qty,
+        )
+    finally:
+        _end_submission()
+
+
+async def _claim_and_submit_prepared_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    prepared_signal: LiveSignal,
+    prepared_qty: float,
+) -> None:
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
     # deployment. The claim turns "still ACTIVE" into a single atomic database
@@ -1697,7 +1764,7 @@ async def _submit_normalized_discord_signal(
                 "data": {
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
-                    "symbol": normalized_signal.symbol,
+                    "symbol": live_signal.symbol,
                     "snapshot_status": deployment.status,
                 }
             },
@@ -3985,13 +4052,140 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
+async def _bounded(awaitable: object, *, timeout: float, phase: str) -> bool:
+    """Run one cleanup phase with a deadline; never raises. False = failed/timed out."""
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)  # type: ignore[arg-type]
+    except asyncio.TimeoutError:
+        logger.error(
+            "Shutdown phase timed out",
+            extra={"data": {"phase": phase, "timeout_seconds": timeout}},
+        )
+        return False
+    except Exception as exc:
+        logger.error(
+            "Shutdown phase failed",
+            extra={"data": {"phase": phase, "error": str(exc)}},
+        )
+        return False
+    return True
+
+
+async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]]) -> None:
+    pending = [task for task in tasks]
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _shutdown_cleanup(
+    *,
+    loop_tasks: tuple[asyncio.Task[None], ...],
+    active_listener_tasks: dict[str, asyncio.Task[None]],
+    active_discord_tasks: dict[str, asyncio.Task[None]],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_adapters: dict[str, BaseLiveAdapter],
+    scheduler: ServiceScheduler,
+    shutdown: ShutdownCoordinator,
+    drain_timeout: float,
+    cleanup_timeout: float,
+) -> bool:
+    """Bounded shutdown sequence. Returns True when every phase completed in time.
+
+    SAFETY: this only stops the daemon and closes its own connections. It must
+    never cancel or close broker orders or positions (no ``close_all_positions``,
+    ``cancel_open_orders`` or equivalent): they belong to the strategy exits and
+    the operator, and a restart must find the account as it was left.
+    """
+    ok = True
+    # 1. Stop the loops that would start new adapters/listeners or poll balances.
+    await _cancel_and_wait(loop_tasks)
+
+    # 2. Let an order that is already being sent finish. Listener tasks are still
+    #    running here, so the awaiting submission is not cancelled out from under
+    #    the broker request. New submissions are refused by the shutdown gate.
+    if not await shutdown.wait_idle(drain_timeout):
+        ok = False
+        logger.error(
+            "Shutdown timed out waiting for in-flight order submissions; "
+            "their broker outcome is unknown and needs reconciliation",
+            extra={
+                "data": {
+                    "in_flight": shutdown.inflight,
+                    "timeout_seconds": drain_timeout,
+                }
+            },
+        )
+
+    # 3. Stop listening for signals / executions.
+    ok &= await _bounded(
+        _cancel_and_wait(
+            [
+                *active_listener_tasks.values(),
+                *active_discord_tasks.values(),
+                *active_discord_bot_tasks.values(),
+            ]
+        ),
+        timeout=cleanup_timeout,
+        phase="cancel_listeners",
+    )
+
+    # 4. Close signal sources, the scheduler, and every broker connection.
+    async def _close_discord_sources() -> None:
+        for source in list(active_discord_bots.values()):
+            with contextlib.suppress(Exception):
+                await source.disconnect(failed=False)
+
+    ok &= await _bounded(
+        _close_discord_sources(), timeout=cleanup_timeout, phase="disconnect_discord"
+    )
+    ok &= await _bounded(scheduler.stop(), timeout=cleanup_timeout, phase="stop_scheduler")
+
+    async def _disconnect_all_adapters() -> None:
+        # Disconnect only: closes the daemon's own sessions. Orders and
+        # positions at the broker are left untouched.
+        for account_id, adapter in list(active_adapters.items()):
+            await _disconnect_adapter(adapter, account_id=account_id, reason="shutdown")
+        active_adapters.clear()
+
+    ok &= await _bounded(
+        _disconnect_all_adapters(), timeout=cleanup_timeout, phase="disconnect_adapters"
+    )
+    return ok
+
+
 async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
-) -> None:
+    shutdown: ShutdownCoordinator | None = None,
+    install_signal_handlers: bool = True,
+    drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+) -> int:
+    """Run the daemon until SIGINT/SIGTERM; return the process exit code.
+
+    0 = clean shutdown, ``EXIT_CLEANUP_TIMEOUT`` = a cleanup phase timed out.
+    A crash re-raises as before. See :mod:`live_runner.shutdown` for the contract.
+    """
+    shutdown = shutdown if shutdown is not None else _SHUTDOWN
+    global _ACTIVE_SHUTDOWN
+    # The submission gate must follow the coordinator this run drains on.
+    _ACTIVE_SHUTDOWN = shutdown
+    shutdown.bind(asyncio.get_running_loop())
+    installed_signals: list[str] = []
+    if install_signal_handlers:
+        installed_signals = shutdown.install_signal_handlers()
     logger.info(
         "Starting live daemon",
-        extra={"data": {"accounts_env": str(accounts_env)}},
+        extra={
+            "data": {
+                "accounts_env": str(accounts_env),
+                "shutdown_signals": installed_signals,
+            }
+        },
     )
     active_adapters: dict[str, BaseLiveAdapter] = {}
     active_listener_tasks: dict[str, asyncio.Task[None]] = {}
@@ -3999,32 +4193,52 @@ async def run_daemon(
     active_discord_bots: dict[str, DiscordSignalSource] = {}
     active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
     scheduler = ServiceScheduler()
+    loop_tasks: tuple[asyncio.Task[None], ...] = ()
+    stop_waiter: asyncio.Task[None] | None = None
+    cleanup_ok = True
 
-    await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
-    await asyncio.to_thread(_recover_failed_services)
-    await scheduler.start()
-
-    sync_task = asyncio.create_task(
-        sync_deployments_loop(
-            active_adapters,
-            active_listener_tasks,
-            active_discord_tasks,
-            accounts_env=accounts_env,
-        ),
-        name="deployment-sync-loop",
-    )
-    service_sync_task = asyncio.create_task(
-        sync_services_loop(
-            active_discord_bots,
-            active_discord_bot_tasks,
-            scheduler,
-            accounts_env=accounts_env,
-        ),
-        name="service-sync-loop",
-    )
-    balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task)
+        await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
+        await asyncio.to_thread(_recover_failed_services)
+        await scheduler.start()
+
+        sync_task = asyncio.create_task(
+            sync_deployments_loop(
+                active_adapters,
+                active_listener_tasks,
+                active_discord_tasks,
+                accounts_env=accounts_env,
+            ),
+            name="deployment-sync-loop",
+        )
+        service_sync_task = asyncio.create_task(
+            sync_services_loop(
+                active_discord_bots,
+                active_discord_bot_tasks,
+                scheduler,
+                accounts_env=accounts_env,
+            ),
+            name="service-sync-loop",
+        )
+        balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+        loop_tasks = (sync_task, service_sync_task, balance_task)
+        stop_waiter = asyncio.create_task(shutdown.wait(), name="shutdown-waiter")
+
+        pending: set[asyncio.Task[None]] = set(loop_tasks)
+        while pending and not shutdown.requested:
+            done, _ = await asyncio.wait(
+                {*pending, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task is stop_waiter:
+                    continue
+                pending.discard(task)
+                task.result()  # re-raise a crashed loop, exactly like gather did
+        if shutdown.requested:
+            logger.info(
+                "Live daemon shutting down",
+                extra={"data": {"reason": shutdown.reason}},
+            )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -4038,37 +4252,35 @@ async def run_daemon(
             )
         raise
     finally:
-        # B2: cancel EVERYTHING (sync + balance loops leaked before) and
-        # await the cancels — fire-and-forget cancel() leaves pending tasks
-        # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                sync_task, service_sync_task, balance_task, return_exceptions=True
-            )
-        for task in list(active_listener_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_bot_tasks.values()):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                *list(active_listener_tasks.values()),
-                *list(active_discord_tasks.values()),
-                *list(active_discord_bot_tasks.values()),
-                return_exceptions=True,
-            )
-        for source in list(active_discord_bots.values()):
-            with contextlib.suppress(Exception):
-                await source.disconnect(failed=False)
+        # Refuse new submissions on every exit path (crash, cancel, signal).
+        shutdown.request("run_daemon_exit")
+        if stop_waiter is not None and not stop_waiter.done():
+            stop_waiter.cancel()
+        # B2: cancel EVERYTHING and await the cancels - fire-and-forget cancel()
+        # leaves pending tasks and "Task was destroyed" warnings behind.
+        cleanup_ok = await _shutdown_cleanup(
+            loop_tasks=loop_tasks,
+            active_listener_tasks=active_listener_tasks,
+            active_discord_tasks=active_discord_tasks,
+            active_discord_bot_tasks=active_discord_bot_tasks,
+            active_discord_bots=active_discord_bots,
+            active_adapters=active_adapters,
+            scheduler=scheduler,
+            shutdown=shutdown,
+            drain_timeout=drain_timeout_seconds,
+            cleanup_timeout=cleanup_timeout_seconds,
+        )
+        # The Twisted reactor (cTrader) is process-global and never stopped by
+        # the adapter; without this its non-daemon thread pool hangs the exit.
         with contextlib.suppress(Exception):
-            await scheduler.stop()
+            release_twisted_reactor_threads()
+        shutdown.restore_signal_handlers()
+        # Only after the cleanup has awaited every in-flight submission's
+        # ``_end_submission``: the last submission of this run must still be
+        # accounted on the coordinator this run used, not on the process one.
+        # (``global _ACTIVE_SHUTDOWN`` is declared once at the top of
+        # ``run_daemon``; Python forbids repeating it after an assignment.)
+        _ACTIVE_SHUTDOWN = _SHUTDOWN
         logger.info(
             "Stopping live daemon",
             extra={
@@ -4076,13 +4288,19 @@ async def run_daemon(
                     "active_listener_tasks": len(active_listener_tasks),
                     "active_discord_tasks": len(active_discord_tasks),
                     "active_discord_bot_tasks": len(active_discord_bot_tasks),
+                    "cleanup_ok": cleanup_ok,
                 }
             },
         )
+    return EXIT_OK if cleanup_ok else EXIT_CLEANUP_TIMEOUT
 
 
 def main() -> None:
-    asyncio.run(run_daemon())
+    exit_code = asyncio.run(run_daemon())
+    # Flush and close log handlers before exiting; the exit code tells systemd
+    # whether the shutdown was clean.
+    logging.shutdown()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

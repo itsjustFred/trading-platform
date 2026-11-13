@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import contextlib
 import json
-import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -16,6 +15,7 @@ from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.shutdown import release_twisted_reactor_threads
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -95,27 +95,7 @@ def _resolve_ctrader_credentials(
     return app_id, app_secret, access_token, refresh_token, demo
 
 
-def _release_twisted_reactor_threads() -> None:
-    """Stop the Twisted reactor's thread pool so the process can exit.
-
-    The cTrader adapter starts the asyncio-backed Twisted reactor with
-    ``startRunning`` and never stops it (the daemon owns it for the process
-    lifetime). Twisted resolves the broker host name through its reactor thread
-    pool, whose worker threads are not daemon threads and are only stopped by
-    the reactor's shutdown event. Without this, a preflight that connected to
-    cTrader printed its result and then hung forever in interpreter shutdown.
-    """
-    if "twisted.internet.reactor" not in sys.modules:
-        return
-    from twisted.internet import reactor
-
-    if getattr(reactor, "threadpool", None) is None:
-        return
-    stop_thread_pool = getattr(reactor, "_stopThreadPool", None)
-    if callable(stop_thread_pool):
-        # The reactor's own shutdown-trigger handler: removes its triggers and
-        # joins the workers. Shutdown never fires here, so it is called directly.
-        stop_thread_pool()
+_release_twisted_reactor_threads = release_twisted_reactor_threads
 
 
 @contextlib.contextmanager

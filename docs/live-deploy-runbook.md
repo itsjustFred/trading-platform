@@ -60,3 +60,15 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 > NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+### Stopping the daemon
+
+`SIGTERM` (systemd stop, `kill`) and `SIGINT` (Ctrl-C) start a graceful shutdown:
+
+1. No new order submissions are accepted (a signal arriving now is logged and dropped before the broker request).
+2. An order submission already in flight is allowed to finish (default 30 s).
+3. Listeners, Discord bots, the scheduler and broker connections are closed (default 20 s per phase).
+4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of an in-flight order is unknown: the submission lease is kept, so reconcile the account before sending new signals.
+5. A second signal forces an immediate exit (code `130`) and skips all cleanup.
+
+Shutdown never cancels or closes open orders or positions at the broker; they are left exactly as they were. On systemd set `TimeoutStopSec` above 90 s so the unit is not killed mid-drain. On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
