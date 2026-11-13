@@ -84,7 +84,7 @@ def _check(tmp_path, frame, label, *, params=None, risk=0.02, **ref_kwargs):
 
 
 @MTM_SIZING_BUG
-@pytest.mark.parametrize("fixture", ["spy_1d.csv", "gld_1d.csv"])
+@pytest.mark.parametrize("fixture", ["spy_1d.csv.gz", "gld_1d.csv.gz"])
 def test_turtle_system1_real_etf_parity(tmp_path, fixture):
     frame = frame_from_fixture(fixture)
     sim, trades, run = _check(tmp_path, frame, fixture)
