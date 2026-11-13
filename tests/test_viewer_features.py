@@ -4840,15 +4840,586 @@ def test_remove_empty_portfolios_endpoint_removes_only_empty(viewer_client, monk
         encoding="utf-8",
     )
 
+    # Phase 1: dry run
     response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["dry_run"] is True
+    assert dry_run_payload["candidate_ids"] == ["portfolio-empty"]
+    assert len(dry_run_payload["candidates"]) == 1
+    assert dry_run_payload["candidates"][0]["id"] == "portfolio-empty"
 
+    # Phase 2: confirm with candidate ids
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["removed"] == 1
+    assert payload["dry_run"] is False
+    assert payload["deleted"] == 1
     assert payload["removed_ids"] == ["portfolio-empty"]
     assert payload["remaining"] >= 1
     assert not (portfolios_dir / "portfolio-empty.json").exists()
     assert (portfolios_dir / "portfolio-keep.json").exists()
+
+
+def test_remove_empty_portfolios_dry_run_deletes_nothing(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["candidate_ids"] == ["portfolio-empty"]
+    # File should still exist after dry run
+    assert (portfolios_dir / "portfolio-empty.json").exists()
+
+
+def test_remove_empty_portfolios_confirm_without_ids_returns_400(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False},
+    )
+    assert response.status_code == 400
+    assert "requires the id list" in response.json()["detail"]
+
+
+def test_remove_empty_portfolios_id_no_longer_empty_skipped(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["candidate_ids"] == ["portfolio-empty"]
+
+    # Simulate the portfolio gaining components between phases
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "New Strategy",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 2: confirm - should skip because portfolio now has components
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": ["portfolio-empty"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted"] == 0
+    assert payload["skipped"] == 1
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "no_longer_empty"
+    # File should still exist
+    assert (portfolios_dir / "portfolio-empty.json").exists()
+
+
+def test_remove_empty_portfolios_retry_safe(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    (portfolios_dir / "portfolio-empty.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-empty",
+                "name": "Empty Portfolio",
+                "components": [],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    candidate_ids = dry_run_payload["candidate_ids"]
+
+    # Phase 2: first confirm
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": candidate_ids},
+    )
+    assert response.status_code == 200
+    payload1 = response.json()
+    assert payload1["deleted"] == 1
+    assert payload1["removed_ids"] == ["portfolio-empty"]
+    assert not (portfolios_dir / "portfolio-empty.json").exists()
+
+    # Phase 2: retry with same list - should report skipped with reason not_found
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": candidate_ids},
+    )
+    assert response.status_code == 200
+    payload2 = response.json()
+    assert payload2["deleted"] == 0
+    assert payload2["skipped"] >= 1
+    assert any(item["status"] == "skipped" and item["reason"] == "not_found" for item in payload2["items"])
+
+
+def test_remove_empty_backtests_dry_run_and_confirm(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    # Monkeypatch the backtest metadata cache to return test data
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_snapshot_backtest_meta_cache",
+        lambda: [
+            {
+                "id": "backtest-empty",
+                "display_name": "Empty Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 0,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "id": "backtest-with-trades",
+                "display_name": "Backtest With Trades",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+        ],
+    )
+    # Also monkeypatch the skip reason check to use our test data
+    def fake_skip_reason(backtest_id):
+        if backtest_id == "backtest-empty":
+            return ""
+        if backtest_id == "backtest-with-trades":
+            return "no_longer_empty"
+        return "not_found"
+    monkeypatch.setattr(viewer_app_module, "_empty_backtest_skip_reason", fake_skip_reason)
+    # Monkeypatch the delete function
+    deleted_files = set()
+    def fake_delete(backtest_id):
+        deleted_files.add(backtest_id)
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/backtests/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["dry_run"] is True
+    assert "backtest-empty" in dry_run_payload["candidate_ids"]
+    assert "backtest-with-trades" not in dry_run_payload["candidate_ids"]
+
+    # Phase 2: confirm
+    response = viewer_client.post(
+        "/api/backtests/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted"] == 1
+    assert payload["removed_ids"] == ["backtest-empty"]
+    assert "backtest-empty" in deleted_files
+
+
+def test_deduplicate_portfolios_dry_run_and_confirm(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    # Two portfolios with same fingerprint (duplicates)
+    (portfolios_dir / "portfolio-dup1.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-dup1",
+                "name": "Duplicate Portfolio",
+                "created_at": "2026-01-02T00:00:00Z",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy A",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (portfolios_dir / "portfolio-dup2.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-dup2",
+                "name": "Duplicate Portfolio",
+                "account_capital": 100000.0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy A",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    # One non-duplicate portfolio
+    (portfolios_dir / "portfolio-unique.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-unique",
+                "name": "Unique Portfolio",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy B",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["dry_run"] is True
+    # Should have one candidate (the older duplicate)
+    assert len(dry_run_payload["candidate_ids"]) == 1
+    assert dry_run_payload["kept_ids"] == ["portfolio-dup1"]  # newer kept
+
+    # Phase 2: confirm
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted_ids"] == dry_run_payload["candidate_ids"]
+    assert payload["kept_ids"] == ["portfolio-dup1"]
+    assert not (portfolios_dir / f"{dry_run_payload['candidate_ids'][0]}.json").exists()
+    assert (portfolios_dir / "portfolio-dup1.json").exists()
+    assert (portfolios_dir / "portfolio-unique.json").exists()
+
+
+def test_deduplicate_portfolios_confirm_without_ids_returns_400(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False},
+    )
+    assert response.status_code == 400
+    assert "requires the id list" in response.json()["detail"]
+
+
+def test_deduplicate_portfolios_id_now_kept_skipped(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    # Two duplicates
+    (portfolios_dir / "portfolio-dup1.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-dup1",
+                "name": "Duplicate Portfolio",
+                "account_capital": 100000.0,
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy A",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (portfolios_dir / "portfolio-dup2.json").write_text(
+        json.dumps(
+            {
+                "id": "portfolio-dup2",
+                "name": "Duplicate Portfolio",
+                "account_capital": 100000.0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "components": [
+                    {
+                        "component_id": "component-001",
+                        "strategy_name": "Strategy A",
+                        "symbol": "AAPL",
+                        "timeframe": "1h",
+                        "weight": 1.0,
+                        "risk_config": {},
+                        "settings": {},
+                        "backtest_id": "",
+                    }
+                ],
+                "trades": [],
+                "combined_stats": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    candidate_id = dry_run_payload["candidate_ids"][0]
+    kept_id = dry_run_payload["kept_ids"][0]
+
+    # Delete the kept one to make the candidate the new kept
+    (portfolios_dir / f"{kept_id}.json").unlink()
+
+    # Phase 2: confirm with candidate id - should skip because it's now the kept entry
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": [candidate_id]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted_ids"] == []
+    assert payload["skipped_ids"] == [candidate_id]
+    assert payload["items"][0]["status"] == "skipped"
+    assert payload["items"][0]["reason"] == "no_longer_duplicate"
+
+
+def test_deduplicate_backtests_dry_run_and_confirm(viewer_client, monkeypatch, tmp_path):
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+    # Monkeypatch the duplicate backtest members to return test data
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_duplicate_backtest_members",
+        lambda: [
+            {
+                "id": "backtest-dup1",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-02T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": True,
+            },
+            {
+                "id": "backtest-dup2",
+                "display_name": "Duplicate Backtest",
+                "strategy_name": "Test",
+                "symbols": ["AAPL"],
+                "timeframe": "1d",
+                "trade_count": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": "backtest-dup1",
+                "is_kept": False,
+            },
+        ],
+    )
+    # Monkeypatch the delete function
+    deleted_files = set()
+    def fake_delete(backtest_id):
+        deleted_files.add(backtest_id)
+        return {"id": backtest_id, "status": "deleted", "database": "deleted", "artifact": "deleted"}
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/backtests/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["dry_run"] is True
+    # Should have one candidate (the older duplicate)
+    assert len(dry_run_payload["candidate_ids"]) == 1
+    assert dry_run_payload["kept_ids"] == ["backtest-dup1"]  # newer kept
+
+    # Phase 2: confirm
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted_ids"] == dry_run_payload["candidate_ids"]
+    assert payload["kept_ids"] == ["backtest-dup1"]
+    assert "backtest-dup2" in deleted_files
+
+
+def test_remove_empty_portfolios_partial_failure_middle_leaves_earlier_deleted(
+    viewer_client, monkeypatch, tmp_path
+):
+    import viewer.main as viewer_app_module
+    from viewer.main import _delete_portfolio_with_artifacts
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    # Three empty portfolios
+    for i in range(3):
+        (portfolios_dir / f"portfolio-empty{i}.json").write_text(
+            json.dumps(
+                {
+                    "id": f"portfolio-empty{i}",
+                    "name": f"Empty Portfolio {i}",
+                    "components": [],
+                    "trades": [],
+                    "combined_stats": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Phase 1: dry run
+    response = viewer_client.post("/api/portfolios/remove-empty")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert len(dry_run_payload["candidate_ids"]) == 3
+
+    # Make the second deletion fail by monkeypatching
+    original_delete = _delete_portfolio_with_artifacts
+    def failing_delete(portfolio_id):
+        if portfolio_id == "portfolio-empty1":
+            raise RuntimeError("Simulated failure")
+        return original_delete(portfolio_id)
+    monkeypatch.setattr(viewer_app_module, "_delete_portfolio_with_artifacts", failing_delete)
+
+    # Phase 2: confirm with all three ids
+    response = viewer_client.post(
+        "/api/portfolios/remove-empty",
+        json={"dry_run": False, "ids": dry_run_payload["candidate_ids"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is False
+    assert payload["deleted"] == 2  # first and third
+    assert payload["failed"] == 1  # second
+    assert set(payload["removed_ids"]) == {"portfolio-empty0", "portfolio-empty2"}
+    assert not (portfolios_dir / "portfolio-empty0.json").exists()
+    assert (portfolios_dir / "portfolio-empty1.json").exists()  # failed, still exists
+    assert not (portfolios_dir / "portfolio-empty2.json").exists()
+    # Items should report each correctly
+    statuses = [item["status"] for item in payload["items"]]
+    assert statuses == ["deleted", "failed", "deleted"]
 
 
 def test_portfolio_trades_normalize_qty_and_side_fields(viewer_client, monkeypatch, tmp_path):

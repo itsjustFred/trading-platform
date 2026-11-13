@@ -20,6 +20,8 @@ import type {
   BacktestMatrixSummary,
   BacktestMetadataItem,
   BacktestsDuplicatesResponse,
+  BacktestsDeduplicateDryRunResponse,
+  BacktestsRemoveEmptyDryRunResponse,
 } from "../api/types";
 import { BacktestFromSignalsModal } from "../components/BacktestFromSignalsModal";
 import { CreateBacktestModal } from "../components/CreateBacktestModal";
@@ -742,6 +744,10 @@ export function BacktestsPage() {
   const [loadingDuplicates, setLoadingDuplicates] = useState(false);
   const [runningDeduplicate, setRunningDeduplicate] = useState(false);
   const [runningRemoveEmpty, setRunningRemoveEmpty] = useState(false);
+  const [showDeduplicateConfirm, setShowDeduplicateConfirm] = useState(false);
+  const [deduplicateCandidates, setDeduplicateCandidates] = useState<BacktestsDeduplicateDryRunResponse | null>(null);
+  const [showRemoveEmptyConfirm, setShowRemoveEmptyConfirm] = useState(false);
+  const [removeEmptyCandidates, setRemoveEmptyCandidates] = useState<BacktestsRemoveEmptyDryRunResponse | null>(null);
 
   const loadAllMetadata = useCallback(
     async (force = false) => {
@@ -1038,20 +1044,51 @@ export function BacktestsPage() {
   const handleDeduplicate = async () => {
     setRunningDeduplicate(true);
     try {
-      const payload = await deduplicateBacktests();
+      // Phase 1: dry run to get candidates
+      const dryRunPayload = await deduplicateBacktests({ dry_run: true });
+      if (dryRunPayload.dry_run && dryRunPayload.candidate_ids.length === 0) {
+        showToast("No duplicate backtests to remove.", "info");
+        setShowDuplicatesModal(false);
+        return;
+      }
+      // Store candidates and show confirmation modal
+      setDeduplicateCandidates(dryRunPayload);
+      setShowDeduplicateConfirm(true);
+      setShowDuplicatesModal(false);
+    } catch (error: unknown) {
+      showToast(toErrorMessage(error, "Could not check duplicates."), "error");
+    } finally {
+      setRunningDeduplicate(false);
+    }
+  };
+
+  const handleDeduplicateConfirm = async () => {
+    if (!deduplicateCandidates || runningDeduplicate) return;
+    const candidateIds = deduplicateCandidates.candidate_ids;
+    setRunningDeduplicate(true);
+    try {
+      // Phase 2: confirm with candidate ids
+      const payload = await deduplicateBacktests({ dry_run: false, ids: candidateIds });
       const notice = formatMaintenanceDeletionResult(
         "duplicate backtest(s)",
         payload.deleted_ids.length,
         payload.items,
       );
       showToast(notice.message, notice.tone);
-      setShowDuplicatesModal(false);
+      setShowDeduplicateConfirm(false);
+      setDeduplicateCandidates(null);
       await loadAllMetadata(true);
     } catch (error: unknown) {
       showToast(toErrorMessage(error, "Could not remove duplicates."), "error");
     } finally {
       setRunningDeduplicate(false);
     }
+  };
+
+  const handleDeduplicateCancel = () => {
+    setShowDeduplicateConfirm(false);
+    setDeduplicateCandidates(null);
+    setShowDuplicatesModal(true);
   };
 
   const emptyBacktestsCount = useMemo(
@@ -1065,29 +1102,50 @@ export function BacktestsPage() {
       showToast("No empty backtests found.", "info");
       return;
     }
-    const confirmed = window.confirm(
-      `Remove ${emptyBacktestsCount} backtests with 0 trades?`,
-    );
-    if (!confirmed) return;
-
     setRunningRemoveEmpty(true);
     try {
-      const payload = await removeEmptyBacktests();
-      const notice = formatMaintenanceDeletionResult(
-        "empty backtest(s)",
-        payload.removed,
-        payload.items,
-      );
-      showToast(notice.message, notice.tone);
-      await loadAllMetadata(true);
+      // Phase 1: dry run to get candidates
+      const dryRunPayload = await removeEmptyBacktests({ dry_run: true });
+      if (dryRunPayload.dry_run && dryRunPayload.candidate_ids.length === 0) {
+        showToast("No empty backtests to remove.", "info");
+        return;
+      }
+      // Store candidates and show confirmation modal
+      setRemoveEmptyCandidates(dryRunPayload);
+      setShowRemoveEmptyConfirm(true);
     } catch (error: unknown) {
-      showToast(
-        toErrorMessage(error, "Could not remove empty backtests."),
-        "error",
-      );
+      showToast(toErrorMessage(error, "Could not check empty backtests."), "error");
     } finally {
       setRunningRemoveEmpty(false);
     }
+  };
+
+  const handleRemoveEmptyConfirm = async () => {
+    if (!removeEmptyCandidates || runningRemoveEmpty) return;
+    const candidateIds = removeEmptyCandidates.candidate_ids;
+    setRunningRemoveEmpty(true);
+    try {
+      // Phase 2: confirm with candidate ids
+      const payload = await removeEmptyBacktests({ dry_run: false, ids: candidateIds });
+      const notice = formatMaintenanceDeletionResult(
+        "empty backtest(s)",
+        payload.deleted,
+        payload.items,
+      );
+      showToast(notice.message, notice.tone);
+      setShowRemoveEmptyConfirm(false);
+      setRemoveEmptyCandidates(null);
+      await loadAllMetadata(true);
+    } catch (error: unknown) {
+      showToast(toErrorMessage(error, "Could not remove empty backtests."), "error");
+    } finally {
+      setRunningRemoveEmpty(false);
+    }
+  };
+
+  const handleRemoveEmptyCancel = () => {
+    setShowRemoveEmptyConfirm(false);
+    setRemoveEmptyCandidates(null);
   };
 
   const filterPanelContent = useMemo(
@@ -2158,6 +2216,198 @@ export function BacktestsPage() {
             </button>
           </div>
         </div>
+      </Modal>
+
+      <Modal
+        open={showDeduplicateConfirm}
+        onClose={handleDeduplicateCancel}
+        title="Confirm Remove Duplicate Backtests"
+        width="600px"
+      >
+        {deduplicateCandidates && (
+          <div style={{ display: "grid", gap: "14px" }}>
+            <div
+              style={{
+                color: "var(--color-text-muted)",
+                fontSize: "0.84rem",
+                lineHeight: 1.45,
+              }}
+            >
+              The following <b>{deduplicateCandidates.candidate_ids.length}</b>
+              duplicate backtest(s) will be deleted (newest kept):
+            </div>
+            <div
+              style={{
+                maxHeight: "240px",
+                overflowY: "auto",
+                border: "1px solid var(--color-border)",
+                borderRadius: "8px",
+                padding: "8px 10px",
+                fontSize: "0.76rem",
+                color: "var(--color-text)",
+              }}
+            >
+              {deduplicateCandidates.items.map((item) => (
+                <div
+                  key={item.id}
+                  style={{
+                    padding: "5px 0",
+                    borderBottom:
+                      "1px solid rgba(255,255,255,0.06)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <span>
+                    {item.display_name || item.id}
+                    {item.strategy_name && (
+                      <> · {item.strategy_name}</>
+                    )}
+                    {item.symbols && item.symbols.length > 0 && (
+                      <> · {item.symbols.join(", ")}</>
+                    )}
+                    {item.timeframe && <> · {item.timeframe}</>}
+                  </span>
+                  <span style={{ color: "var(--color-text-muted)" }}>
+                    trades: {item.trade_count}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div
+              style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}
+            >
+              <button
+                type="button"
+                onClick={handleDeduplicateCancel}
+                disabled={runningDeduplicate}
+                style={{
+                  borderRadius: "8px",
+                  border: "1px solid var(--color-border)",
+                  background: "transparent",
+                  color: "var(--color-text-muted)",
+                  padding: "8px 12px",
+                  cursor: runningDeduplicate ? "not-allowed" : "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDeduplicateConfirm()}
+                disabled={runningDeduplicate}
+                style={{
+                  borderRadius: "8px",
+                  border: "1px solid rgba(248,113,113,0.4)",
+                  background: "rgba(127,29,29,0.24)",
+                  color: "#fecaca",
+                  padding: "8px 12px",
+                  cursor: runningDeduplicate ? "not-allowed" : "pointer",
+                  opacity: runningDeduplicate ? 0.6 : 1,
+                }}
+              >
+                {runningDeduplicate ? "Removing..." : "Confirm Delete"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={showRemoveEmptyConfirm}
+        onClose={handleRemoveEmptyCancel}
+        title="Confirm Remove Empty Backtests"
+        width="600px"
+      >
+        {removeEmptyCandidates && (
+          <div style={{ display: "grid", gap: "14px" }}>
+            <div
+              style={{
+                color: "var(--color-text-muted)",
+                fontSize: "0.84rem",
+                lineHeight: 1.45,
+              }}
+            >
+              The following <b>{removeEmptyCandidates.candidate_ids.length}</b>
+              empty backtest(s) will be deleted:
+            </div>
+            <div
+              style={{
+                maxHeight: "240px",
+                overflowY: "auto",
+                border: "1px solid var(--color-border)",
+                borderRadius: "8px",
+                padding: "8px 10px",
+                fontSize: "0.76rem",
+                color: "var(--color-text)",
+              }}
+            >
+              {removeEmptyCandidates.candidates.map((candidate) => (
+                <div
+                  key={candidate.id}
+                  style={{
+                    padding: "5px 0",
+                    borderBottom:
+                      "1px solid rgba(255,255,255,0.06)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <span>
+                    {candidate.display_name || candidate.id}
+                    {candidate.strategy_name && (
+                      <> · {candidate.strategy_name}</>
+                    )}
+                    {candidate.symbols && candidate.symbols.length > 0 && (
+                      <> · {candidate.symbols.join(", ")}</>
+                    )}
+                    {candidate.timeframe && <> · {candidate.timeframe}</>}
+                  </span>
+                  <span style={{ color: "var(--color-text-muted)" }}>
+                    trades: {candidate.trade_count}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div
+              style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}
+            >
+              <button
+                type="button"
+                onClick={handleRemoveEmptyCancel}
+                disabled={runningRemoveEmpty}
+                style={{
+                  borderRadius: "8px",
+                  border: "1px solid var(--color-border)",
+                  background: "transparent",
+                  color: "var(--color-text-muted)",
+                  padding: "8px 12px",
+                  cursor: runningRemoveEmpty ? "not-allowed" : "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleRemoveEmptyConfirm()}
+                disabled={runningRemoveEmpty}
+                style={{
+                  borderRadius: "8px",
+                  border: "1px solid rgba(248,113,113,0.4)",
+                  background: "rgba(127,29,29,0.24)",
+                  color: "#fecaca",
+                  padding: "8px 12px",
+                  cursor: runningRemoveEmpty ? "not-allowed" : "pointer",
+                  opacity: runningRemoveEmpty ? 0.6 : 1,
+                }}
+              >
+                {runningRemoveEmpty ? "Removing..." : "Confirm Delete"}
+              </button>
+            </div>
+          </div>
+        )}
       </Modal>
 
       <CreateBacktestModal
