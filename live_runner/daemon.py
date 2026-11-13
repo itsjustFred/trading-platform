@@ -1633,14 +1633,21 @@ async def _prepare_discord_signal_for_submission(
 # consult it (``_begin_submission``) without it being threaded through every
 # call; ``run_daemon`` binds it to its loop and drives the shutdown sequence.
 _SHUTDOWN = ShutdownCoordinator()
+# The coordinator THIS process actually runs on. It is ``_SHUTDOWN`` in
+# production, and whatever a test injects into ``run_daemon(shutdown=...)``
+# there. The gate and the drain must sit on the same object: a drain that
+# counts a different coordinator's submissions sees an always-zero in-flight
+# count, waits for nothing, and then cancels an order submission that was
+# halfway to the broker - the exact failure graceful shutdown exists to prevent.
+_ACTIVE_SHUTDOWN: ShutdownCoordinator = _SHUTDOWN
 
 
 def _begin_submission() -> bool:
-    return _SHUTDOWN.begin_submission()
+    return _ACTIVE_SHUTDOWN.begin_submission()
 
 
 def _end_submission() -> None:
-    _SHUTDOWN.end_submission()
+    _ACTIVE_SHUTDOWN.end_submission()
 
 
 async def _submit_normalized_discord_signal(
@@ -4164,6 +4171,9 @@ async def run_daemon(
     A crash re-raises as before. See :mod:`live_runner.shutdown` for the contract.
     """
     shutdown = shutdown if shutdown is not None else _SHUTDOWN
+    global _ACTIVE_SHUTDOWN
+    # The submission gate must follow the coordinator this run drains on.
+    _ACTIVE_SHUTDOWN = shutdown
     shutdown.bind(asyncio.get_running_loop())
     installed_signals: list[str] = []
     if install_signal_handlers:
@@ -4265,6 +4275,12 @@ async def run_daemon(
         with contextlib.suppress(Exception):
             release_twisted_reactor_threads()
         shutdown.restore_signal_handlers()
+        # Only after the cleanup has awaited every in-flight submission's
+        # ``_end_submission``: the last submission of this run must still be
+        # accounted on the coordinator this run used, not on the process one.
+        # (``global _ACTIVE_SHUTDOWN`` is declared once at the top of
+        # ``run_daemon``; Python forbids repeating it after an assignment.)
+        _ACTIVE_SHUTDOWN = _SHUTDOWN
         logger.info(
             "Stopping live daemon",
             extra={
