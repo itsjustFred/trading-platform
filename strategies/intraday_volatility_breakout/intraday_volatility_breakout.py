@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "engine": "native",
     "parameters": {
         "atr_period": 5,
@@ -324,15 +324,27 @@ def generate_signals(df: pd.DataFrame, params: dict):
     # Filler bars: flat (O=H=L=C) bars with a known volume <= 0. Feeds pad closed
     # hours, holidays and whole weekends with them; MT5 history has no bar without a
     # tick, so they must not create or shape a D1 bar. Without a volume column
-    # nothing is treated as filler.
+    # nothing is treated as filler. A non-finite volume (NaN, a non-numeric marker,
+    # +/-inf) is unknown, exactly like a missing column: a flat bar with an unknown
+    # volume may be a real one-tick minute, so it is kept - but loudly, because the
+    # filler skip cannot work on those bars and the ATR may then be diluted.
     if "volume" in df.columns:
-        volume = pd.to_numeric(df["volume"], errors="coerce")
-        filler_bar = (
-            (volume <= 0)
-            & (df["open"] == df["high"])
+        volume = pd.to_numeric(df["volume"], errors="coerce").astype(float)
+        known_volume = np.isfinite(volume.to_numpy())
+        flat_bar = (
+            (df["open"] == df["high"])
             & (df["high"] == df["low"])
             & (df["low"] == df["close"])
         ).to_numpy()
+        filler_bar = known_volume & (volume.to_numpy() <= 0) & flat_bar
+        unknown_flat = int((~known_volume & flat_bar).sum())
+        if unknown_flat and daily_skip_filler_bars:
+            logger.warning(
+                "intraday_volatility_breakout: %d flat bar(s) have a non-finite volume; "
+                "they cannot be classified as filler and are kept in the D1 bars "
+                "(daily_skip_filler_bars has no effect on them)",
+                unknown_flat,
+            )
     else:
         filler_bar = np.zeros(len(df), dtype=bool)
 

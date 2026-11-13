@@ -1025,3 +1025,38 @@ def test_broker_clock_overlap_check_ignores_weekend_filler_bars():
 
     entries, _, _, _ = mod.generate_signals(df, params)
     assert len(entries) == len(df)
+
+
+@pytest.mark.parametrize("unknown", [np.nan, "n/a", np.inf, -np.inf])
+def test_non_finite_volume_is_unknown_not_filler_and_warns(unknown, caplog):
+    # A flat bar whose volume is non-finite cannot be told apart from a real one-tick
+    # minute, so it is kept like a bar of a feed without a volume column (ATR(2) on
+    # Friday = (TR 0 + TR 4) / 2 = 2.0) - and the run says so instead of silently
+    # letting the filler skip do nothing.
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),
+        ("2024-12-27 12:00", 103.0, 104.0, 102.0, 103.0),
+    ]
+    df = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, unknown, 5.0, 5.0])
+    mod, params = _atr_params()
+    with caplog.at_level("WARNING"):
+        _, _, indicators, _ = mod.generate_signals(df, params)
+    assert indicators["daily_atr"].iloc[4] == pytest.approx(2.0)
+    assert "non-finite volume" in caplog.text
+
+
+def test_finite_volume_feed_does_not_warn(caplog):
+    rows = [
+        ("2024-12-23 12:00", 100.0, 102.0, 98.0, 100.0),
+        ("2024-12-24 12:00", 100.0, 105.0, 99.0, 104.0),
+        ("2024-12-25 12:00", 104.0, 104.0, 104.0, 104.0),
+        ("2024-12-26 12:00", 104.0, 106.0, 102.0, 103.0),
+    ]
+    df = _with_volume(_one_bar_per_day(rows), [5.0, 5.0, 0.0, 5.0])
+    mod, params = _atr_params()
+    with caplog.at_level("WARNING"):
+        mod.generate_signals(df, params)
+    assert "non-finite volume" not in caplog.text
