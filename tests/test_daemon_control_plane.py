@@ -15,7 +15,7 @@ import pytest
 
 import live_runner.daemon as daemon
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
-from live_runner.base_adapter import ControlOutcome, order_not_submitted
+from live_runner.base_adapter import ControlOutcome, LiveQuote, order_not_submitted
 from shared.database import (
     clear_live_deployment_stopped_enforced,
     get_live_deployment,
@@ -70,6 +70,10 @@ class _ControlAdapter:
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     async def submit_order(self, signal, *, qty: float | None = None) -> str:
         self.submitted.append((signal, qty))

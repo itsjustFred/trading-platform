@@ -22,6 +22,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    LiveQuote,
     coerce_positive_live_qty,
     is_order_not_submitted,
     is_unbounded_tp,
@@ -46,6 +47,11 @@ from live_runner.stockkit_routing import (
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
+from risk.live import (
+    entry_deviation_sl_fraction,
+    entry_gate_settings,
+    resolve_live_levels,
+)
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.constants import normalize_timeframe
@@ -435,17 +441,6 @@ def _coerce_live_int(
     return parsed
 
 
-def _first_metadata_float(metadata: Mapping[str, object], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        if key not in metadata:
-            continue
-        value = metadata.get(key)
-        if value is None:
-            continue
-        return _coerce_live_float(value, field_name=key)
-    return None
-
-
 def _risk_config_for_deployment(deployment: LiveDeploymentConfig) -> RiskConfig:
     settings = deployment.settings or {}
     risk_per_trade_raw = settings.get(
@@ -756,27 +751,59 @@ def size_live_signal_for_submission(
     pip_value: float | None = None,
     current_positions: int | None = None,
 ) -> LiveSignal:
+    """Size a live entry with the deployment's risk config.
+
+    Levels come from :func:`risk.live.resolve_live_levels`, the one resolver the
+    submission path also uses (#125): entry is metadata ``entry_price`` else
+    ``theoretical_price``, SL/TP the shared metadata aliases. Only trade
+    descriptors (levels, ATR, timeframe) are read from the untrusted payload.
+
+    Args:
+        pip_value: Trusted per-symbol pip value from the caller (config or
+            broker). Never read from signal metadata; ``None`` means the
+            RiskEngine unit contract of 1.0 account-currency unit per pip.
+        current_positions: Open-position count from the broker. ``None`` when
+            the broker cannot report positions; the payload's
+            ``current_positions`` is never used in its place.
+
+    The returned metadata carries the engine's quantity/risk figures and
+    ``resolved_stop_loss``: the stop the engine actually sized on (the signal
+    stop, or the fallback it resolved). Any payload value under that key is
+    overwritten so it cannot diverge from the sized distance.
+    """
     metadata: dict[str, object] = dict(signal.metadata or {})
+    entry_price, stop_loss, take_profit = resolve_live_levels(signal)
+    # Broker truth only. A payload count is dropped, not forwarded.
+    metadata.pop("current_positions", None)
+    trusted_positions = 0
     if current_positions is not None:
-        metadata["current_positions"] = int(current_positions)
-    stop_loss = _first_metadata_float(
-        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
-    )
-    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+        trusted_positions = _coerce_live_int(
+            current_positions, field_name="current_positions", minimum=0
+        )
+        metadata["current_positions"] = trusted_positions
     resolved_timeframe = (
         str(metadata.get("timeframe") or deployment.timeframe).strip() or deployment.timeframe
     )
-    pip = pip_value if pip_value is not None else metadata.get("pip_value", 1.0)
-    resolved_pip = _coerce_live_float(pip, field_name="pip_value", minimum=0.0)
+    resolved_pip = (
+        1.0
+        if pip_value is None
+        else _coerce_live_float(pip_value, field_name="pip_value", minimum=0.0)
+    )
 
     trade_signal = TradeSignal(
         action=signal.action,
         symbol=signal.symbol,
-        entry_price=float(signal.theoretical_price),
+        entry_price=entry_price,
         stop_loss=stop_loss,
         take_profit=take_profit,
         timeframe=resolved_timeframe,
-        metadata={**metadata, "enforce_stop_direction": True},
+        # Whitelist what the engine may read: the payload's ATR is a trade
+        # descriptor; position state is broker truth.
+        metadata={
+            "atr": metadata.get("atr"),
+            "current_positions": trusted_positions,
+            "enforce_stop_direction": True,
+        },
     )
     sized_order = RiskEngine(_risk_config_for_deployment(deployment)).calculate_position_size(
         signal=trade_signal,
@@ -797,9 +824,272 @@ def size_live_signal_for_submission(
         else None
     )
     metadata["risk_timeframe"] = resolved_timeframe
-    if stop_loss is None and "resolved_stop_loss" in sized_order.signal.metadata:
-        metadata["resolved_stop_loss"] = float(sized_order.signal.metadata["resolved_stop_loss"])
+    sized_stop = sized_order.signal.stop_loss
+    if sized_stop is not None:
+        metadata["resolved_stop_loss"] = float(sized_stop)
+    else:
+        metadata.pop("resolved_stop_loss", None)
     return signal.model_copy(update={"metadata": metadata})
+
+
+#: Gate settings and their defaults are validated by
+#: :func:`risk.live.entry_gate_settings` (#125).
+
+#: How far a quote time may lie in the future before it is treated as a clock
+#: or feed fault rather than skew between our clock and the broker's.
+ENTRY_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+
+
+def _utc_now() -> datetime:
+    """The gate's clock (a seam so tests can freeze it)."""
+    return datetime.now(timezone.utc)
+
+#: Float slack for the gate comparison. Prices are decimal, so a quote exactly
+#: at the threshold (e.g. (100 - 99.6) / 4) must not be rejected by binary
+#: rounding noise (0.10000000000000142 > 0.1). 1e-9 of the stop distance is far
+#: below any tradable price increment.
+_ENTRY_DEVIATION_TOLERANCE = 1e-9
+
+#: Metadata keys the entry-deviation gate writes. Always all of them, so a
+#: payload value under one of these names can never survive to persistence.
+_ENTRY_QUOTE_METADATA_KEYS = (
+    "entry_quote_bid",
+    "entry_quote_ask",
+    "entry_quote_side",
+    "entry_quote_price",
+    "entry_quote_time",
+    "entry_quote_source",
+    "entry_quote_time_source",
+    "entry_quote_age_seconds",
+    "max_entry_quote_age_seconds",
+    "entry_deviation_sl_fraction",
+    "entry_deviation_direction",
+    "max_entry_deviation_sl_fraction",
+    "entry_gate_rejection_rule",
+)
+
+#: Rejection rules of the entry-deviation gate, checked in this order. Quote
+#: freshness comes first: a quote that is not current says nothing about where
+#: the market is, so no price rule may be judged on it. The crossed-level rules
+#: come next: they name the more specific problem when the quote has also moved
+#: further than the deviation limit.
+ENTRY_GATE_RULE_QUOTE_TIME_MISSING = "quote_time_missing"
+ENTRY_GATE_RULE_QUOTE_TIME_INVALID = "quote_time_invalid"
+ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = "quote_time_in_future"
+ENTRY_GATE_RULE_QUOTE_STALE = "quote_stale"
+ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
+ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
+ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
+ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS = "deviation_away_from_stop_loss"
+
+
+def _entry_gate_rejection_rule(
+    action: str,
+    *,
+    quote_price: float,
+    stop_loss: float,
+    take_profit: float | None,
+    deviation: float,
+    max_fraction: float,
+) -> str | None:
+    """Which gate rule, if any, rejects a quote (#125, revised decision)."""
+    buy = action == "buy"
+    if (quote_price <= stop_loss) if buy else (quote_price >= stop_loss):
+        return ENTRY_GATE_RULE_AT_STOP_LOSS
+    if take_profit is not None and (
+        (quote_price >= take_profit) if buy else (quote_price <= take_profit)
+    ):
+        return ENTRY_GATE_RULE_AT_TAKE_PROFIT
+    if abs(deviation) - max_fraction > _ENTRY_DEVIATION_TOLERANCE:
+        return (
+            ENTRY_GATE_RULE_TOWARD_STOP_LOSS
+            if deviation > 0
+            else ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS
+        )
+    return None
+
+
+def _quote_time_rule(
+    timestamp: object, *, now: datetime, max_age_seconds: float
+) -> tuple[str | None, float | None]:
+    """Freshness verdict and age in seconds for a quote time (#125 review).
+
+    Fails closed: a missing time, anything but a timezone-aware datetime, a
+    time beyond the clock-skew allowance in the future, or a quote older than
+    the limit all reject.
+    """
+    if timestamp is None:
+        return ENTRY_GATE_RULE_QUOTE_TIME_MISSING, None
+    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
+        return ENTRY_GATE_RULE_QUOTE_TIME_INVALID, None
+    age = (now - timestamp).total_seconds()
+    if -age > ENTRY_QUOTE_FUTURE_SKEW_SECONDS:
+        return ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE, age
+    if age > max_age_seconds:
+        return ENTRY_GATE_RULE_QUOTE_STALE, age
+    return None, age
+
+
+def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float]:
+    if not isinstance(quote, LiveQuote):
+        raise ValueError(
+            f"Broker returned no usable quote for {symbol} ({type(quote).__name__}); "
+            "refusing a live entry the deviation gate cannot check."
+        )
+    try:
+        bid = _coerce_live_float(quote.bid, field_name="quote bid")
+        ask = _coerce_live_float(quote.ask, field_name="quote ask")
+    except ValueError as exc:
+        raise ValueError(f"Broker quote for {symbol} is unusable: {exc}") from exc
+    if bid <= 0 or ask <= 0:
+        raise ValueError(
+            f"Broker quote for {symbol} is unusable: bid={bid!r}, ask={ask!r} "
+            "(both sides must be > 0)."
+        )
+    if bid > ask:
+        raise ValueError(
+            f"Broker quote for {symbol} is crossed: bid={bid!r} > ask={ask!r}; "
+            "refusing to gate on it."
+        )
+    return bid, ask
+
+
+# Upper bound for one quote fetch of the entry-deviation gate (#125). Above the
+# adapters' own limits (cTrader: subscribe 10 s + quote 5 s), so it only cuts off
+# a call that has no bound of its own (Alpaca's REST quote).
+ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS = 20.0
+
+
+async def _check_entry_deviation(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+    *,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float | None,
+) -> dict[str, object]:
+    """Gate a live entry against the current broker quote (#125).
+
+    The signal entry is compared with the side the market order fills
+    against (ask for a buy, bid for a sell), as a fraction of the SL distance.
+    It rejects (revised maintainer decision) when the quote is
+
+    * at or beyond the SL (buy: ask <= SL, sell: bid >= SL),
+    * at or beyond the TP, when one is set (buy: ask >= TP, sell: bid <= TP),
+    * further than ``max_entry_deviation_sl_fraction`` of the SL distance from
+      the entry in EITHER direction: toward the stop the setup may be invalid,
+      away from it the order chases and a fixed stop risks more than sized.
+
+    Before any price rule the quote must be current: a missing or invalid
+    broker time, a time beyond ``ENTRY_QUOTE_FUTURE_SKEW_SECONDS`` in the
+    future, or a quote older than ``max_entry_quote_age_seconds`` rejects (an
+    after-hours "latest" quote can be hours old).
+
+    The quote is a gate only: sizing has already run on the signal levels and
+    is not touched.
+
+    Fails closed: no quote support, a fetch error, or an unusable quote all
+    reject the entry. Returns the quote/deviation figures to persist on the
+    signal.
+    """
+    gate_settings = entry_gate_settings(deployment.settings)
+    max_fraction = gate_settings.max_deviation_sl_fraction
+    max_age = gate_settings.max_quote_age_seconds
+    log_data: dict[str, object] = {
+        "deployment_id": str(deployment.id),
+        "account_id": deployment.account_id,
+        "symbol": signal.symbol,
+        "action": signal.action,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "max_entry_deviation_sl_fraction": max_fraction,
+        "max_entry_quote_age_seconds": max_age,
+    }
+    get_quote = getattr(adapter, "get_quote", None)
+    try:
+        if not callable(get_quote):
+            raise NotImplementedError(f"{type(adapter).__name__} has no get_quote")
+        # Bounded here as well as in the adapters: a stalled broker call must
+        # not stall dispatch. A late quote would fail the freshness rule anyway.
+        quote = await asyncio.wait_for(
+            get_quote(signal.symbol), timeout=ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        logger.warning(
+            "Live quote unavailable; refusing the entry (deviation gate fails closed)",
+            extra={"data": {**log_data, "error": str(exc)}},
+        )
+        raise ValueError(
+            f"Refusing live entry for {signal.symbol}: no live broker quote for the "
+            f"entry deviation gate ({type(exc).__name__}: {exc})."
+        ) from exc
+    try:
+        bid, ask = _validated_quote_prices(quote, symbol=signal.symbol)
+    except ValueError as exc:
+        logger.warning(
+            "Live quote unusable; refusing the entry (deviation gate fails closed)",
+            extra={"data": {**log_data, "error": str(exc)}},
+        )
+        raise
+    side = "ask" if signal.action == "buy" else "bid"
+    quote_price = ask if signal.action == "buy" else bid
+    deviation = entry_deviation_sl_fraction(
+        signal.action,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        quote_price=quote_price,
+    )
+    quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
+    time_rule, quote_age = _quote_time_rule(
+        quote_time, now=_utc_now(), max_age_seconds=max_age
+    )
+    record: dict[str, object] = {
+        "entry_quote_bid": bid,
+        "entry_quote_ask": ask,
+        "entry_quote_side": side,
+        "entry_quote_price": quote_price,
+        "entry_quote_time": quote_time.isoformat() if isinstance(quote_time, datetime) else None,
+        "entry_quote_source": str(quote.source or type(adapter).__name__),
+        "entry_quote_time_source": str(quote.timestamp_source or ""),
+        "entry_quote_age_seconds": quote_age,
+        "max_entry_quote_age_seconds": max_age,
+        # Signed: positive = toward the stop, negative = away from it.
+        "entry_deviation_sl_fraction": deviation,
+        "entry_deviation_direction": (
+            "toward_stop_loss"
+            if deviation > 0
+            else "away_from_stop_loss"
+            if deviation < 0
+            else "none"
+        ),
+        "max_entry_deviation_sl_fraction": max_fraction,
+        "entry_gate_rejection_rule": None,
+    }
+    rule = time_rule or _entry_gate_rejection_rule(
+        signal.action,
+        quote_price=quote_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        deviation=deviation,
+        max_fraction=max_fraction,
+    )
+    if rule is not None:
+        record["entry_gate_rejection_rule"] = rule
+        logger.warning(
+            "Live entry deviation gate rejected the signal",
+            extra={"data": {**log_data, **record}},
+        )
+        raise ValueError(
+            f"Refusing live entry for {signal.symbol}: entry deviation gate rejected "
+            f"({rule}): signed deviation {deviation:.4f} of the SL distance "
+            f"(positive = toward the stop), limit +/-{max_fraction}; quote time "
+            f"{record['entry_quote_time']!r}, age {quote_age!r}s, limit {max_age}s "
+            f"(entry={entry_price}, stop={stop_loss}, take_profit={take_profit}, "
+            f"{side}={quote_price})."
+        )
+    return record
 
 
 def _resolve_exit_only_target_qty(
@@ -1001,7 +1291,11 @@ async def prepare_order_with_risk(
     lock the deployment out for the lease TTL.
 
     Nothing in here places an order. It does read broker state (positions,
-    balance) because sizing has to see broker truth.
+    balance) because sizing has to see broker truth, and, for entries, the
+    live quote for the entry-deviation gate (#125), which may reject.
+
+    ``pip_value`` is the trusted per-symbol pip value (config or broker); a
+    ``pip_value`` in signal metadata is never read.
     """
     metadata = dict(signal.metadata or {})
     if signal.action == "sell" and bool(metadata.get("exit_only")):
@@ -1049,17 +1343,30 @@ async def prepare_order_with_risk(
             }
         }
     )
-    # Sizing may have resolved a fallback stop (ATR/percent). Persist that
-    # resolution so the broker order carries the stop sizing actually assumed.
+    # One resolver for sizing and submission (#125): the broker order carries
+    # exactly the entry/SL/TP precedence the size was computed from.
+    # Sizing may have resolved a fallback stop (ATR/percent); that is the
+    # only level it may add, and the broker order carries it.
     # C1 (owner decision): a missing take profit FAILS — no invented 1.0-RR
     # bracket from theoretical_price. The guard below rejects it.
     sized_metadata = dict(sized_signal.metadata or {})
-    if "resolved_stop_loss" in sized_metadata:
-        metadata["stop_loss"] = float(sized_metadata["resolved_stop_loss"])
-    stop_loss = _first_metadata_float(
-        metadata, ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss")
+    entry_price, stop_loss, take_profit = resolve_live_levels(signal)
+    sized_stop_raw = sized_metadata.get("resolved_stop_loss")
+    sized_stop = (
+        None
+        if sized_stop_raw is None
+        else _coerce_live_float(sized_stop_raw, field_name="resolved_stop_loss")
     )
-    take_profit = _first_metadata_float(metadata, ("take_profit", "tp_price"))
+    if stop_loss is None:
+        stop_loss = sized_stop
+    elif sized_stop is not None and not math.isclose(
+        sized_stop, stop_loss, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            f"Sized stop {sized_stop!r} differs from the resolved signal stop "
+            f"{stop_loss!r} (deployment_id={deployment.id}, symbol={signal.symbol}); "
+            "refusing to submit a bracket the size was not computed for."
+        )
     # Fail closed: sizing divides the risk budget by the stop distance, so an
     # order without SL/TP would be sized on an invented distance and open an
     # unbounded position. Both broker adapters enforce the same guard. The
@@ -1072,13 +1379,23 @@ async def prepare_order_with_risk(
         missing.append("stop loss")
     if take_profit is None and not unbounded_tp:
         missing.append("take profit")
-    if missing:
+    if missing or stop_loss is None:
         raise ValueError(
             "Refusing to submit live order without "
             f"{' and '.join(missing)} (deployment_id={deployment.id}, "
             f"symbol={signal.symbol}); opening an unbounded position is "
             "not allowed."
         )
+    # Entry-deviation gate (#125) against the live broker quote. Runs last,
+    # after every local refusal, so a bad signal never costs a quote request.
+    quote_metadata = await _check_entry_deviation(
+        adapter,
+        deployment,
+        signal,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
     if take_profit is None and unbounded_tp:
         logger.warning(
             "Submitting live order with explicitly unbounded take profit "
@@ -1091,11 +1408,15 @@ async def prepare_order_with_risk(
                 }
             },
         )
+    metadata["entry_price"] = float(entry_price)
     metadata["stop_loss"] = float(stop_loss)
+    metadata["resolved_stop_loss"] = float(stop_loss)
     if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:
         metadata.pop("take_profit", None)
+    for key in _ENTRY_QUOTE_METADATA_KEYS:
+        metadata.pop(key, None)
     # Overlay the resolved SL/TP onto the SIZED metadata. The sized values for
     # qty/explicit_qty/risk_* must win: letting incoming metadata re-override
     # them would let a signal's self-declared qty bypass the risk sizing
@@ -1121,7 +1442,14 @@ async def prepare_order_with_risk(
         for key, value in {**sized_metadata, **preserved_metadata}.items()
         if key not in {"volume", "ctrader_volume"}
     }
-    sized_signal = sized_signal.model_copy(update={"metadata": final_metadata})
+    # The gate's figures are written last: a payload value under one of these
+    # keys can neither shadow nor survive them.
+    final_metadata.update(quote_metadata)
+    # theoretical_price carries the resolved entry so an adapter that places
+    # SL/TP as distances from it (cTrader) uses the distance that was sized.
+    sized_signal = sized_signal.model_copy(
+        update={"metadata": final_metadata, "theoretical_price": float(entry_price)}
+    )
     # C1/B2: the risk-sized qty is binding — pass it explicitly so the
     # adapter sizes exactly zero times (never with default config).
     return sized_signal, float(sized_signal.metadata["qty"])

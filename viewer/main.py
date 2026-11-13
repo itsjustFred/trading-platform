@@ -79,6 +79,7 @@ os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
+from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
@@ -12701,6 +12702,11 @@ async def create_live_deployment_endpoint(
         signal_config=signal_config_payload,
         settings=payload.settings or {},
     )
+    try:
+        # #125: refuse invalid entry-gate settings before anything is stored.
+        entry_gate_settings(deployment.settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
