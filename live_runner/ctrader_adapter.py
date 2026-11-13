@@ -171,6 +171,9 @@ class SymbolScale:
     ``price_digits``: broker-reported symbol price decimals retained as symbol
     metadata; relative SL/TP always uses the fixed protocol divisor.
     ``min_volume``: broker minimum order volume (fail-closed floor).
+    ``step_volume``: broker volume increment. cTrader rejects any order volume
+    that is not a multiple of it (``TRADING_BAD_VOLUME``), so a risk-sized
+    volume is floored onto this grid. ``1`` means no known grid.
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
     """
 
@@ -179,6 +182,7 @@ class SymbolScale:
     min_volume: int
     lot_size: float
     source: str = "fallback"
+    step_volume: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -285,6 +289,7 @@ def _symbol_scale_from_broker_props(
     lot_size: float | None,
     min_volume: int | None,
     fallback: SymbolScale | None,
+    step_volume: int | None = None,
 ) -> SymbolScale | None:
     """Build a broker-authoritative scale, using a fallback only when available."""
     try:
@@ -307,12 +312,19 @@ def _symbol_scale_from_broker_props(
         minimum = fallback.min_volume if fallback is not None else None
     if digit_count is None or lots is None or minimum is None:
         return None
+    try:
+        step = int(step_volume) if step_volume is not None else None
+    except (TypeError, ValueError):
+        step = None
+    if step is None or step <= 0:
+        step = fallback.step_volume if fallback is not None else 1
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
         min_volume=minimum,
         lot_size=lots,
         source="broker",
+        step_volume=step,
     )
 
 
@@ -328,6 +340,20 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
             "refusing to submit an order with a default size."
         )
     return volume
+
+
+def _floor_to_volume_step(volume: int, step_volume: int) -> int:
+    """Floor *volume* onto the broker's volume grid.
+
+    cTrader rejects an order whose volume is not a multiple of the symbol's
+    ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
+    lands on that grid, so it is rounded DOWN: rounding up would exceed the
+    risk budget. A result below the broker minimum is refused by the caller.
+    """
+    step = int(step_volume)
+    if step <= 1:
+        return int(volume)
+    return (int(volume) // step) * step
 
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
@@ -1296,6 +1322,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 lot_size=getattr(detail, "lotSize", None),
                 min_volume=getattr(detail, "minVolume", None),
                 fallback=fallback,
+                step_volume=getattr(detail, "stepVolume", None),
             )
             if scale is not None:
                 self._symbol_props[name] = scale
@@ -1333,7 +1360,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Signal has no positive quantity ('qty'); refusing to "
                 "submit an order with a default size."
             ) from exc
-        volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+        volume = _floor_to_volume_step(
+            _qty_to_broker_volume(qty, scale.volume_per_qty), scale.step_volume
+        )
         if volume < scale.min_volume:
             raise ValueError(
                 f"Risk-sized volume {volume} for {signal.symbol} is below "
