@@ -5,7 +5,7 @@ name: Agent Mutation Testing
 run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
 
 # Stage 3 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> CodeRabbit
+#   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> Agent Pre-Mortem -> CodeRabbit
 #
 # Mutation-tests the production Python a PR changes, using the
 # `.agents/skills/actions-mutation-testing` skill as the system prompt of an
@@ -17,7 +17,9 @@ run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_
 # It has no pull_request trigger. `agent-code-review.yml` dispatches it with
 # the PR head SHA when the review verdict is PASS. The run-name carries the PR
 # number and SHA, so a later push can cancel runs of older commits. A run whose
-# SHA is no longer the PR head stops without doing anything.
+# SHA is no longer the PR head stops without doing anything. On PASS it
+# dispatches `agent-pre-mortem.yml` for the same SHA; a failed dispatch is
+# reported as an error on that stage's status.
 #
 # Override (review red, findings judged irrelevant): justify each finding in a
 # PR comment, then dispatch by hand (head_sha defaults to the current head):
@@ -36,7 +38,9 @@ run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_
 #   files (to apply a mutation) and has a shell. The guards: the job holds no
 #   token or secret (`persist-credentials: false`, no GH_TOKEN), and the run
 #   fails if HEAD moved or the tree is dirty, so a mutation left in place is
-#   never reported as a clean result.
+#   never reported as a clean result. The jobs that hold a token run no repo
+#   code: `resolve` (statuses) and `post` (statuses, comment, and the dispatch
+#   of the pre-mortem stage).
 # - The workflow file runs from the dispatched ref (the PR branch), like the
 #   PR's copy on pull_request. Accepted for the same reason as in the review
 #   workflow. Fork PRs are skipped.
@@ -67,6 +71,7 @@ env:
   VARIANT: ${{ vars.MUTATION_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
   MUTATION_CONTEXT: agent/mutation-testing
+  PREMORTEM_CONTEXT: agent/pre-mortem
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
@@ -81,6 +86,7 @@ jobs:
       number: ${{ steps.pr.outputs.number }}
       base: ${{ steps.pr.outputs.base }}
       head: ${{ steps.pr.outputs.head }}
+      head_ref: ${{ steps.pr.outputs.head_ref }}
       same_repo: ${{ steps.pr.outputs.same_repo }}
       current: ${{ steps.pr.outputs.current }}
     steps:
@@ -110,6 +116,7 @@ jobs:
             echo "number=$(jq -r .number pr.json)"
             echo "base=$(jq -r .base.sha pr.json)"
             echo "head=$(jq -r .head.sha pr.json)"
+            echo "head_ref=$(jq -r .head.ref pr.json)"
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
@@ -371,8 +378,8 @@ jobs:
           path: ${{ runner.temp }}/mutation/comment.md
           retention-days: 14
 
-  # Posts the comment and sets the status. Runs no repo code. Also reports a
-  # failed mutation run as `error`.
+  # Posts the comment, sets the status and, on PASS, dispatches the pre-mortem
+  # stage. Runs no repo code. Also reports a failed mutation run as `error`.
   post:
     needs: [resolve, mutate]
     if: ${{ !cancelled() && (needs.mutate.result == 'success' || needs.mutate.result == 'failure') }}
@@ -381,19 +388,26 @@ jobs:
     permissions:
       pull-requests: write
       statuses: write
+      # `gh workflow run agent-pre-mortem.yml` below; this job runs no repo code.
+      actions: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      HEAD_REF: ${{ needs.resolve.outputs.head_ref }}
       VERDICT: ${{ needs.mutate.outputs.verdict }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report failed mutation run
         if: needs.mutate.result == 'failure'
         run: |
+          set -euo pipefail
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$MUTATION_CONTEXT" \
             -f description="Mutation run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$PREMORTEM_CONTEXT" \
+            -f description="Not run: ${MUTATION_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.mutate.result == 'success'
@@ -422,7 +436,7 @@ jobs:
             gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
           fi
 
-      - name: Set status
+      - name: Set status and start pre-mortem
         if: needs.mutate.result == 'success'
         run: |
           set -euo pipefail
@@ -434,9 +448,26 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$MUTATION_CONTEXT" \
             -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+          if [ "$VERDICT" = "PASS" ]; then
+            # A failed dispatch would otherwise leave agent/pre-mortem
+            # `pending` forever on this SHA, with no error anywhere.
+            if ! gh workflow run agent-pre-mortem.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF" \
+              -f pr_number="$PR_NUMBER" -f head_sha="$HEAD_SHA"; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$PREMORTEM_CONTEXT" \
+                -f description="Not run: dispatch of pre-mortem failed" > /dev/null
+              echo "::error::Failed to dispatch agent-pre-mortem.yml; set ${PREMORTEM_CONTEXT} to error."
+              exit 1
+            fi
+            echo "Dispatched pre-mortem for ${HEAD_SHA}."
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Not run: ${MUTATION_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
+          fi
 
       # A failure above (artifact download, comment POST/PATCH, status write)
-      # would otherwise leave the stage `pending` on this SHA forever. Only a
+      # would otherwise leave a stage `pending` on this SHA forever. Only a
       # still-pending context is touched, so a terminal verdict stands.
       - name: Report post failure
         if: failure()
@@ -444,10 +475,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${MUTATION_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-              -f state=error -f context="$MUTATION_CONTEXT" \
-              -f description="Post step failed; see the run log" > /dev/null
-          fi
+          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Post step failed; see the run log" > /dev/null
+            fi
+          done
