@@ -43,8 +43,6 @@ Execution semantics the platform supplies (documented differences, see
 
 from __future__ import annotations
 
-import pandas as pd
-
 STRATEGY_META = {
     "name": "ref_sma_cross_all_in",
     "version": "1.0",
