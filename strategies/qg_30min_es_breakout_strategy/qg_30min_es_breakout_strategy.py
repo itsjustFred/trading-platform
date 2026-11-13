@@ -7,9 +7,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from shared.bar_timing import clock_exit_signal_mask, modal_bar_minutes
+
 STRATEGY_META = {
     "name": "QG-30Min ES Breakout Strategy",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1387506825603059762/1387506825603059762",
     "notes": (
         "- Original nutzt Stop-Orders (`strategy.entry(..., stop=...)`).\n"
@@ -19,7 +21,10 @@ STRATEGY_META = {
         "close < breakout_long, Short bei ADX > 30 und close < breakout_short; "
         "beide Level nutzen |open - low| "
         "(breakout_short = high - FRACT * |open - low|).\n"
-        "- Time-Exit 14:55 NY wie im Pine.\n"
+        "- Time-Exit 14:55 NY wie im Pine. Signal-Exits fuellen am naechsten Bar-Open "
+        "(next_open): das Signal geht daher auf der ersten Bar raus, deren Ende 14:55 NY "
+        "erreicht (1m: 14:54), der Fill liegt am 14:55-Open. Kein expliziter exit_price "
+        "fuer den Market-Exit (v1.1.0); das Reason-Label folgt den forced_exit-Parametern.\n"
         "- Original hat keinen expliziten Stop-Loss. Fuer robustes Risk-Sizing und begrenzte Tail-Risiken "
         "nutzt die Konvertierung einen technischen Schutz-Stop aus dem Entry-Bar "
         "(Long=low, Short=high) und schliesst bei Stop-Hit (dokumentierte Plattform-Erweiterung)."
@@ -124,7 +129,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
     forced_exit_minutes = forced_exit_hour * 60 + forced_exit_minute
 
     in_time = (ny_minutes >= open_minutes) & (ny_minutes < close_minutes)
-    exit_now = ny_minutes >= forced_exit_minutes
+    # Signal exits fill at the NEXT bar's open: raise the forced exit on the first
+    # bar whose end reaches the forced-exit time so the fill lands AT that open.
+    exit_now = clock_exit_signal_mask(
+        ny_minutes, modal_bar_minutes(timestamps_utc), forced_exit_minutes
+    )
+    time_exit_reason = f"time_exit_{forced_exit_hour:02d}{forced_exit_minute:02d}_ny"
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
@@ -159,9 +169,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 active_sl = np.nan
             elif bool(exit_now.iloc[i]):
                 exits.iloc[i] = True
-                exit_price.iloc[i] = float(close.iloc[i])
                 sl_price_at_exit.iloc[i] = float(active_sl)
-                exit_reason.iloc[i] = "time_exit_1455_ny"
+                exit_reason.iloc[i] = time_exit_reason
                 in_trade = False
                 active_direction = None
                 active_sl = np.nan
