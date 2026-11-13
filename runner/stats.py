@@ -514,6 +514,11 @@ def _resolve_backtest_period_bounds(
         if not pd.isna(entry_ts):
             trade_start_times.append(pd.Timestamp(entry_ts))
 
+        # #123: a trade without exits has no end time (``last_exit_time``
+        # raises instead of faking a zero-duration trade); it only contributes
+        # its start to the window.
+        if not trade.exits:
+            continue
         exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
         if not pd.isna(exit_ts):
             trade_end_times.append(pd.Timestamp(exit_ts))

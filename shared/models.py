@@ -448,6 +448,15 @@ class Trade:
     stop_loss: float | None = None
     take_profit: float | None = None
 
+    def __post_init__(self) -> None:
+        # #123: no case normalisation and no guessing. Anything outside
+        # VALID_DIRECTIONS used to read as SHORT through ``direction_sign``
+        # (and as LONG through several engine comparisons), flipping PnL sign.
+        if self.direction not in VALID_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,
@@ -518,12 +527,27 @@ class Trade:
 
     @property
     def last_exit_time(self) -> str:
-        """Time of the final exit."""
-        return self.exits[-1].time if self.exits else self.entry_time
+        """Time of the final exit.
+
+        Raises ValueError for a trade without exits (#123): an open or
+        malformed trade has no exit time, and the old fallback to
+        ``entry_time`` made it look like a zero-duration closed trade.
+        """
+        if not self.exits:
+            raise ValueError(f"trade {self.id} has no exits; last_exit_time is undefined")
+        return self.exits[-1].time
 
     @property
     def direction_sign(self) -> int:
-        return 1 if self.direction == "LONG" else -1
+        # #123: exhaustive and strict - never default to SHORT for a value
+        # that is not in VALID_DIRECTIONS (including after a field mutation).
+        if self.direction == "LONG":
+            return 1
+        if self.direction == "SHORT":
+            return -1
+        raise ValueError(
+            f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+        )
 
 
 # ─── Equity point ────────────────────────────────────────────────────────────
