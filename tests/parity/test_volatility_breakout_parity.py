@@ -38,7 +38,7 @@ def _run(tmp_path, frame, label):
         leverage=4.0,
         tmp_path=tmp_path,
     )
-    assert_parity(run, trades, sim.realized_by_time, label)
+    assert_parity(run, trades, sim.curve_by_time, label)
     return sim, trades, run
 
 
@@ -72,6 +72,7 @@ def test_volatility_breakout_synthetic_covers_event_classes():
                 continue
             same_bar += leg.time == t.entry_time
             bar = by_time[leg.time]
-            gap_through += (bar.open < leg.price) if t.direction == "LONG" else (bar.open > leg.price)
+            # rule A: a gap through the stop fills AT the bar's open
+            gap_through += leg.time != t.entry_time and bar.open == leg.price
     assert longs >= 5 and shorts >= 5
     assert wrong_side + same_bar + gap_through >= 3

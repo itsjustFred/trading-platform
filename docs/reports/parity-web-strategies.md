@@ -1,13 +1,13 @@
 # Parity of the backtest engine on publicly documented strategies
 
-Branch `test/parity-web-strategies` (base `integration/backtest-fixes`). Engine under test:
+Branch `test/parity-web-strategies` (base `integration/backtest-fixes-v2`). Engine under test:
 `NativeAdapter` / `TradeEngine`. Reference: plain-Python event loops in `tests/parity/`
 (`reference_turtle.py`, `reference_orb.py`, `reference_vola.py` for the signals,
-`reference_execution.py` for fills, intrabar stops, sizing and realized equity). The
+`reference_execution.py` for fills, intrabar stops, sizing and the mark-to-market equity curve). The
 reference imports nothing from `runner/`, `risk/`, `shared/` or `strategies/`.
 
 Compared per trade: entry time/price/direction, quantity, exit time/price/reason,
-net PnL, and the published equity curve at every point the engine publishes.
+net PnL, and the published mark-to-market equity curve at every point the engine publishes.
 Tolerances: price 1e-6, quantity 1e-6 relative, PnL 0.005, curve 0.02.
 
 ## Strategies
@@ -26,27 +26,38 @@ resampled to 5-minute regular-session bars, 2026-03-20..2026-05-15 (38 full sess
 
 ## Parity results
 
-Result on the engine WITH the realized-cash sizing fix of PR #190 (`fix/engine-differential-bugs`
-merged into this branch in a scratch checkout, `pytest tests/parity --runxfail`): **all 42 tests
-pass, zero differences**.
+Engine contract under test (base `integration/backtest-fixes-v2` = main + #186/#203 + #188 + #208
+chain, including #190 realized-cash sizing, #196 mark-to-market equity, #208 owner decisions
+2026-11-13): (A) a bar that opens beyond a stop/target fills at the OPEN, intrabar touches at the
+level; (B) signal exits fill at the NEXT bar's open (`signal_exit_fill="next_open"` default; a
+last-bar signal closes at the end-of-data close and is flagged
+`signal_exit_deferred_to_end_of_data`). The independent reference was updated to these rules
+and to the per-bar mark-to-market curve; it still imports nothing from the platform.
 
-| Scenario | Engine trades | Reference trades | Differences | Final realized equity (engine = reference) |
-|---|---|---|---|---|
-| Turtle S1, SPY daily, 2 % risk, pyramiding | 355 | 355 | 0 | 52,508.22 |
-| Turtle S1, GLD daily | 318 | 318 | 0 | 103,326.02 |
-| ORB, USA500 5 min | 24 | 24 | 0 | 98,078.65 |
-| volatility_breakout, USA500 5 min | 141 | 141 | 0 | 102,067.12 |
-| Turtle single-unit synthetic, 12 seeds x 420 bars | match | match | 0 | |
-| Turtle pyramiding synthetic, 6 seeds | match | match | 0 | |
-| ORB / volatility_breakout synthetic sessions, 8 seeds each | match | match | 0 | |
+Result: `pytest tests/parity` **all 47 tests pass, zero differences** (before the update on the
+v2 base with the old reference: 30 failed / 5 passed / 8 xfailed; before that on the old base:
+34 passed / 8 strict xfail, 42 with #190 in a scratch checkout). The 8 strict xfails are gone
+(pyramiding now matches exactly on realized-cash sizing).
+
+| Scenario | Engine trades | Reference trades | Differences | Final realized equity (engine = reference) | Old contract (close exits, gap at level) |
+|---|---|---|---|---|---|
+| Turtle S1, SPY daily, 2 % risk, pyramiding | 355 | 355 | 0 | 49,215.24 | 52,508.22 |
+| Turtle S1, GLD daily | 318 | 318 | 0 | 78,117.72 | 103,326.02 |
+| ORB, USA500 5 min | 24 | 24 | 0 | 91,484.50 | 98,078.65 |
+| volatility_breakout, USA500 5 min | 141 | 141 | 0 | 102,244.73 | 102,067.12 |
+| Turtle single-unit synthetic, 12 seeds x 420 bars | match | match | 0 | | |
+| Turtle pyramiding synthetic, 6 seeds | match | match | 0 | | |
+| ORB / volatility_breakout synthetic sessions, 8 seeds each | match | match | 0 | | |
+| ORB legacy `signal_exit_fill="close"` opt-in, 2 seeds | match | match | 0 | | |
+| ORB last-bar signal exit -> flagged end-of-data close | match | match | 0 | | |
 
 Event classes exercised and compared (counts from the reference):
 
 | Event | SPY | GLD | ORB | VolaBO | Synthetic (asserted minimum) |
 |---|---|---|---|---|---|
-| Stop-loss exits (intrabar) | 150 | 132 | 18 | 4 | >= 20 (Turtle) |
-| Signal exits (10-day channel / session close) | 202 | 185 | 6 | 137 | >= 20 |
-| Stop fill when the bar OPENED beyond the stop (gap through) | 30 | 40 | 2 | 0 | >= 3 Turtle, >= 1 ORB |
+| Stop-loss exits (intrabar or gap) | 152 | 142 | 19 | 4 | >= 20 (Turtle) |
+| Signal exits at the next open (10-day channel / session close) | 200 | 175 | 5 | 137 | >= 20 |
+| Stop fill when the bar OPENED beyond the stop (filled at the open, rule A) | 32 | 50 | 3 | 0 | >= 3 Turtle, >= 1 ORB |
 | Entry bar stopped on its own fill bar (same-bar entry+stop) | 4 | 4 | 0 | 0 | >= 3 |
 | Entry skipped, stop on the wrong side of the fill | 0 | 1 | 0 | 0 | >= 1 |
 | Unit sized to zero by the 5 % aggregate open-risk ceiling | 45 | 49 | 0 | 0 | >= 1 |
@@ -56,27 +67,39 @@ Event classes exercised and compared (counts from the reference):
 
 ## Engine findings
 
-1. **Mark-to-market sizing on this base (known, owned by PR #190).** With a profitable open
-   unit, the next unit is sized on equity including its unrealized PnL, contradicting the
-   realized-cash contract in `docs/sizing-semantics.md`. Reproduction: SPY 2005-02-16 second
-   Turtle unit, engine quantity 832.976 vs 826.925 (equity 100,732 vs 100,000); over the full
-   SPY run the engine produces 386 trades and 49,304.17 vs the reference 355 and 52,508.22,
-   because the different quantities change which later units fit under the 5 % ceiling.
-   Single-position strategies (ORB, volatility_breakout, Turtle with `max_units=1`) are unaffected.
-   The pyramiding tests are `xfail(strict=True)` on this base; when #190 lands the strict
-   xfail fails with a message to remove the marker.
-2. **No other engine defect found**, including stop fills, same-bar entry+stop, wrong-side
-   skips, the leverage ceiling, short side, and the realized-equity curve.
+1. **No engine defect found** on the v2 base: stop/target fills incl. gaps at the open, same-bar
+   entry+stop, signal exits at the next open, last-bar deferral, wrong-side skips, realized-cash
+   sizing of concurrent units, the leverage ceiling, the short side, and the mark-to-market curve
+   all match the independent reference exactly.
+2. The earlier finding "mark-to-market sizing of the 2nd+ concurrent unit" (SPY 2005-02-16,
+   832.976 vs 826.925; 386 vs 355 trades) is fixed by #190; the strict xfails were removed.
 
-## Observations (not defects, documented contract behavior)
+## Effect of the new fill rules (not defects, quantified)
 
-* A stop that the bar gaps through fills **at the stop level**, not at the open
-  (`docs/cross-engine-backtest-contract.md` section 1). Real execution would fill at the
-  worse open. Over the real runs the optimism is: SPY 30 gap-through stops = 6,382 of PnL
-  (6.4 % of initial capital), GLD 40 = 15,625, ORB 2 = 200. This matters for the Turtle
-  results below.
-* The published equity curve is realized cash at trade-exit events (206 points for SPY,
-  not one per bar); the parity check therefore compares realized equity at those timestamps.
+The earlier version of this report noted that gap-through stops filled at the stop level, which
+flattered results (SPY 6,382, GLD 15,625, ORB 200 of PnL). Rule A removes that flattering: gap
+exits now fill at the open. Rule B moves signal exits to the next open. Final realized equity
+from the same reference with each rule switched on separately (initial capital 100,000):
+
+| Run | Old contract | + A only | + B only | A + B (current) |
+|---|---|---|---|---|
+| Turtle SPY | 52,508.22 | 47,089.57 (-5,418.65) | 54,875.49 (+2,367.27) | 49,215.24 (-3,292.98) |
+| Turtle GLD | 103,326.02 | 89,995.97 (-13,330.05) | 89,684.37 (-13,641.65) | 78,117.72 (-25,208.30) |
+| ORB USA500 | 98,078.65 | 97,878.35 (-200.30) | 91,671.72 (-6,406.93) | 91,484.50 (-6,594.15) |
+| volatility_breakout | 102,067.12 | 102,067.12 (0, no gap exits) | 102,244.73 (+177.61) | 102,244.73 (+177.61) |
+
+(Compounding makes the effects non-additive; the PnL of the gap-stop trades themselves under the
+current rules is -38,358 over 32 SPY, -99,083 over 50 GLD and -2,397 over 3 ORB trades.) The ORB
+"flat at the session close" signal now fills at the NEXT session's open, so the position is held
+overnight: its 5 signal exits and 3 gap stops carry overnight gap risk, which is where the
+-6.4k comes from. `signal_exit_fill="close"` restores the intended intraday behaviour and is
+parity-tested too (reference `RefConfig.signal_exit_fill="close"`).
+
+## Observations
+
+* The published equity curve is mark-to-market per bar (#196); the parity check compares the
+  reference's bar-close MTM equity at every timestamp the engine publishes. On the final bar
+  the position is already closed, so it reports realized cash.
 * The strategies assume every signalled unit fills. If the 5 % ceiling sizes a Turtle unit
   to zero (45 times on SPY) the strategy still counts the unit toward the 4-unit limit
   (documented in the strategy docstring).
@@ -86,13 +109,13 @@ Event classes exercised and compared (counts from the reference):
 * **Turtle System 1.** The original Turtles traded futures (1983-88) and are reported as
   highly profitable; no public per-trade ledger exists for ETFs. On SPY/GLD 2005-2023 with
   close-based breakouts, per-unit stops and no stop ratchet this implementation shows
-  win rate 30 %/29 %, profit factor 0.77/1.01. That is a different market, a modified
-  exit/stop model and optimistic gap fills, so it is not a replication of the published
+  win rate 32 %/30 %, profit factor 0.76/0.93. That is a different market, a modified
+  exit/stop model and a different fill model, so it is not a replication of the published
   results; parity here means engine = independent reference, not engine = publication.
 * **ORB.** Published results (Zarattini, Barbon, Aziz 2024): top-20 relative-volume
   stocks, 2016-2023, annualized 41.6 % (secondary source: total 1,637 %, Sharpe 2.81). This
   run trades one index CFD for 24 trades in ~2 months with no stock selection and 10 % ATR
-  stops that were hit in 18 of 24 trades (win rate 25 %, PF 0.78); the sample is far too
+  stops that were hit in 19 of 24 trades (win rate 12.5 %, PF 0.18 with next-open session exits, i.e. overnight holds); the sample is far too
   small and differently constituted to compare, and an independent blog replication on index
   CFDs reports the edge disappearing after spreads. The QQQ paper (Zarattini & Aziz 2023) is a
   different rule set (first-candle stop, 10R target).

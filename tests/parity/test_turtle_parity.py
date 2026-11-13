@@ -6,13 +6,10 @@ nothing from the platform.  Compared trade by trade: entry time and price,
 quantity (``risk_per_trade_pct=2 %`` of REALIZED equity over the 2N stop = one
 Turtle unit), exit time/price/reason (intrabar stops, gap through the stop,
 same-bar entry+stop, 10-day signal exits), net PnL, and the published
-realized-equity curve.
+mark-to-market equity curve (PR #196).
 
-Scenarios that hold more than one concurrent unit are marked ``xfail(strict)``
-on engines that still size on mark-to-market equity instead of realized cash
-(``docs/sizing-semantics.md``, ``TestSizingEquityExcludesUnrealizedPnl``): that
-sizing fix is owned by PR #190.  Once it is on the base branch the strict
-xfail turns into a failure that says "remove the marker".
+Multi-unit (pyramiding) scenarios size every concurrent unit on REALIZED cash
+(``docs/sizing-semantics.md``; PR #190), so they hold exact parity as well.
 """
 
 from __future__ import annotations
@@ -32,13 +29,6 @@ from tests.parity.reference_turtle import TurtleRef
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 STRATEGY = REPO_ROOT / "strategies" / "turtle_system1" / "turtle_system1.py"
-
-#: concurrent units are sized on mark-to-market equity until PR #190 lands.
-MTM_SIZING_BUG = pytest.mark.xfail(
-    strict=True,
-    reason="engine sizes the 2nd+ concurrent unit on mark-to-market equity "
-    "(realized-cash contract fixed by PR #190)",
-)
 
 SHORT_PARAMS = {
     "entry_len": 10,
@@ -76,14 +66,13 @@ def _check(tmp_path, frame, label, *, params=None, risk=0.02, **ref_kwargs):
         params=params,
         tmp_path=tmp_path,
     )
-    assert_parity(run, ref_trades, sim.realized_by_time, label)
+    assert_parity(run, ref_trades, sim.curve_by_time, label)
     return sim, ref_trades, run
 
 
 # ───────────────────────── real ETF data ────────────────────────────────────
 
 
-@MTM_SIZING_BUG
 @pytest.mark.parametrize("fixture", ["spy_1d.csv.gz", "gld_1d.csv.gz"])
 def test_turtle_system1_real_etf_parity(tmp_path, fixture):
     frame = frame_from_fixture(fixture)
@@ -141,8 +130,8 @@ def _stats(sim, trades, bars):
         if leg.time == t.entry_time:
             same_bar += 1
         bar = open_by_time[leg.time]
-        beyond = bar.open < leg.price if t.direction == "LONG" else bar.open > leg.price
-        if beyond:
+        # rule A: a gap through the stop fills AT the bar's open
+        if leg.time != t.entry_time and bar.open == leg.price:
             gap_through += 1
     return {
         "gap_through": gap_through,
@@ -178,7 +167,6 @@ def test_turtle_single_unit_synthetic_covers_event_classes(tmp_path):
     assert total["stops"] >= 20 and total["signal"] >= 20, total
 
 
-@MTM_SIZING_BUG
 @pytest.mark.parametrize("seed", SEEDS[:6])
 def test_turtle_pyramiding_synthetic_parity(tmp_path, seed):
     frame = synthetic_frame(seed)

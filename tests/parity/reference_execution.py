@@ -17,16 +17,26 @@ Fills
   at bar *N+1*'s **open** (``next_bar_open``). A signal on the last bar never
   fills.
 * Protective exits (stop-loss / take-profit) are evaluated per bar on the
-  bar's low/high; a LONG stop triggers on ``low <= stop`` and fills **at the
-  stop level itself** (a gap through the stop fills at the level, not at the
-  open), mirrored for SHORT. The same applies to take-profit levels.
+  bar's low/high; a LONG stop triggers on ``low <= stop``, mirrored for SHORT.
+  Owner decision 2026-11-13 (A): a bar that OPENS beyond the level (LONG stop:
+  ``open <= stop``; LONG take-profit: ``open >= tp``; mirrored for SHORT; an
+  open exactly at the level counts) fills at the **open**; an intrabar touch
+  fills at the level. A gap exit wins over anything later in the bar, so a
+  gapped stop beats a same-bar take-profit and vice versa. Not applied on the
+  position's own fill bar (it was opened at that very open).
 * Same-bar stop AND take-profit with no intrabar data resolves
   **stop-first**.
 * A position is stop-checked on its own fill bar (``A-H1``): a fill bar that
   trades through the fresh level exits on the fill bar.
-* A signal exit fills at the **trigger bar's close** and closes every open
-  position (reason ``signal``). Open positions at the end of the frame are
-  closed at the last bar's close (reason ``end_of_data``).
+* Owner decision 2026-11-13 (B): a signal exit produced on bar *N* fills at
+  bar *N+1*'s **open** (reason ``signal``) and closes every position carried
+  into bar *N+1*, unless that open already gapped through a protective level
+  (then the stop/target reason wins; same price). Positions opened at bar
+  *N+1*'s open are not touched by it. A signal exit on the LAST bar has no
+  next bar: the position closes at the last bar's close with reason
+  ``end_of_data`` (flagged ``signal_exit_deferred_to_end_of_data``). Open
+  positions at the end of the frame are closed at the last bar's close
+  (reason ``end_of_data``).
 * An entry whose stop sits on the wrong side of the fill (LONG stop >= fill,
   SHORT stop <= fill) is skipped, as is an order that sizes to zero or more
   positions than the engine's concurrent-position policy allows.
@@ -108,6 +118,9 @@ class RefConfig:
     #: fallback stop re-derived at the fill (the platform's current policy for
     #: stopless MARKET orders); the stop level is then that fallback level.
     stopless_fallback_at_fill: bool = True
+    #: ``next_open`` (default, owner decision B) or the explicit legacy opt-in
+    #: ``close`` (a signal exit fills at the trigger bar's own close).
+    signal_exit_fill: str = "next_open"
 
 
 @dataclass(frozen=True)
@@ -200,6 +213,10 @@ class ReferenceSimulator:
         self.curve: list[float] = []
         self.realized_curve: list[float] = []
         self._bars: list[Bar] = []
+        #: a signal exit parked on the previous bar, filled at this bar's open
+        self._signal_exit_parked = False
+        #: True when a last-bar signal exit was deferred to the end-of-data close
+        self.signal_exit_deferred_to_end = False
 
     # -- sizing --------------------------------------------------------------
 
@@ -315,6 +332,13 @@ class ReferenceSimulator:
 
     # -- exits ---------------------------------------------------------------
 
+    def _signal_exit_at_close(self, i: int) -> None:
+        bar = self._bars[i]
+        for position in list(self.positions):
+            self._close_partial(position, i, float(bar.close), position.remaining, "signal")
+            self._finalize(position)
+        self.positions = [p for p in self.positions if p.remaining > 1e-9]
+
     def _protective_exit(self, i: int, position: _Position, *, only_new: bool) -> None:
         bar = self._bars[i]
         if only_new and position.entry_index != i:
@@ -331,15 +355,37 @@ class ReferenceSimulator:
                 else bar.low <= position.take_profit
             )
         )
+        # (A) a bar that OPENS beyond a level gaps through it: fill at the open,
+        # and that first event beats anything later in the bar.
+        long_side = position.direction == "LONG"
+        gap_stop = (
+            not only_new
+            and position.stop is not None
+            and (bar.open <= position.stop if long_side else bar.open >= position.stop)
+        )
+        gap_tp = (
+            not only_new
+            and position.take_profit is not None
+            and (bar.open >= position.take_profit if long_side else bar.open <= position.take_profit)
+        )
+        if gap_stop:
+            stop_hit, tp_hit = True, False
+        elif gap_tp:
+            stop_hit, tp_hit = False, True
+        # B: a parked signal exit fills at this open unless a gap already exited
+        if self._signal_exit_parked and not only_new and not gap_stop and not gap_tp:
+            self._record_excursion(bar, position, adverse_cap=bar.open, favorable_cap=bar.open)
+            self._close_partial(position, i, float(bar.open), position.remaining, "signal")
+            return
         # stop-first when the bar touches both levels and no intrabar data exists
         if stop_hit:
-            self._record_excursion(bar, position, adverse_cap=position.stop)
-            self._close_partial(position, i, position.stop, position.remaining, "stop_loss")
+            price = float(bar.open) if gap_stop else float(position.stop)
+            self._record_excursion(bar, position, adverse_cap=price)
+            self._close_partial(position, i, price, position.remaining, "stop_loss")
         elif tp_hit:
-            self._record_excursion(bar, position, favorable_cap=position.take_profit)
-            self._close_partial(
-                position, i, position.take_profit, position.remaining, "take_profit"
-            )
+            price = float(bar.open) if gap_tp else float(position.take_profit)
+            self._record_excursion(bar, position, favorable_cap=price)
+            self._close_partial(position, i, price, position.remaining, "take_profit")
         else:
             self._record_excursion(bar, position)
 
@@ -415,13 +461,6 @@ class ReferenceSimulator:
             )
         )
 
-    def _signal_exit(self, i: int) -> None:
-        bar = self._bars[i]
-        for position in list(self.positions):
-            self._close_partial(position, i, float(bar.close), position.remaining, "signal")
-            self._finalize(position)
-        self.positions = [p for p in self.positions if p.remaining > 1e-9]
-
     # -- main loop ------------------------------------------------------------
 
     def _reported_equity(self, bar: Bar) -> float:
@@ -452,6 +491,9 @@ class ReferenceSimulator:
                 self._finalize(position)
             self.positions = [p for p in self.positions if p.remaining > 1e-9]
 
+            # a signal exit parked on the previous bar was consumed at this open
+            self._signal_exit_parked = False
+
             # 2) fill the pending MARKET orders at this bar's open
             if self.pending:
                 self._fill_pending(i)
@@ -466,15 +508,19 @@ class ReferenceSimulator:
             if sig.entries[i]:
                 self._create_order(i, sig)
 
-            # 5) signal exit at the trigger bar's close
+            # 5) signal exit: park it, it fills at the NEXT bar's open (B)
             if sig.exits[i] and self.positions:
-                self._signal_exit(i)
+                if self.cfg.signal_exit_fill == "close":
+                    self._signal_exit_at_close(i)
+                else:
+                    self._signal_exit_parked = True
 
             # 6) reported equity: realized cash + unrealized mark-to-market
             self.curve.append(_round(self._reported_equity(bar), 2))
             self.realized_curve.append(_round(self.realized, 2))
 
         if self.positions:
+            self.signal_exit_deferred_to_end = self._signal_exit_parked
             last = self._bars[-1]
             for position in list(self.positions):
                 self._close_partial(position, n - 1, float(last.close), position.remaining, "end_of_data")

@@ -37,6 +37,8 @@ class EngineRun:
     curve: list[tuple[str, float]]
     warnings: list[str]
     run_summary: dict
+    #: trades flagged ``signal_exit_deferred_to_end_of_data``
+    deferred_to_end: int = 0
 
 
 def load_fixture(name: str) -> list[Bar]:
@@ -73,7 +75,7 @@ def build_config(
     capital: float = 100_000.0,
     fee_rate: float = 0.0,
     fee_flat: float = 0.0,
-    signal_exit_fill: str = "close",
+    signal_exit_fill: str = "next_open",
 ) -> BacktestConfig:
     parameters = dict(params or {})
     if fee_rate or fee_flat:
@@ -117,6 +119,7 @@ def run_engine(
     capital: float = 100_000.0,
     fee_rate: float = 0.0,
     fee_flat: float = 0.0,
+    signal_exit_fill: str = "next_open",
     tmp_path: Path | None = None,
 ) -> EngineRun:
     """Run the native engine over ``frame`` and return normalised trades."""
@@ -136,6 +139,7 @@ def run_engine(
         capital=capital,
         fee_rate=fee_rate,
         fee_flat=fee_flat,
+        signal_exit_fill=signal_exit_fill,
     )
     result = NativeAdapter().run(config, str(strategy_path))
     trades = [_normalise(trade) for trade in result.trades]
@@ -149,6 +153,9 @@ def run_engine(
         curve=[(_iso(point.time), float(point.equity)) for point in result.equity_curve],
         warnings=warnings,
         run_summary={},
+        deferred_to_end=sum(
+            bool((t.meta or {}).get("signal_exit_deferred_to_end_of_data")) for t in result.trades
+        ),
     )
 
 
