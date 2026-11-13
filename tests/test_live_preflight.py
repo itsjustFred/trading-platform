@@ -367,3 +367,88 @@ def test_live_preflight_threads_accounts_env_path_to_ctrader_adapter(
     # The default .accounts.env must be untouched.
     default_after = default_path.read_text(encoding="utf-8") if default_path.exists() else None
     assert default_after == default_before
+
+
+# ─── ${VAR} expansion honours --accounts-env (#184 finding 6) ───────────────────
+
+
+_ENV_REF_CONFIG = """
+    accounts:
+      - id: alpaca-paper
+        broker: alpaca
+
+    deployments:
+      - strategy_name: discord_follow
+        account_id: alpaca-paper
+        symbols: [AAPL]
+        timeframe: 1h
+        signal_source: discord
+        signal_config:
+          channel_id: "${PREFLIGHT_TEST_CHANNEL_ID}"
+    """
+
+
+def test_live_preflight_expands_config_refs_from_accounts_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PREFLIGHT_TEST_CHANNEL_ID", raising=False)
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("PREFLIGHT_TEST_CHANNEL_ID=123456\n", encoding="utf-8")
+
+    result = run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert not any("PREFLIGHT_TEST_CHANNEL_ID" in err for err in result.deployment_errors)
+    assert not any("unexpanded" in err.lower() for err in result.deployment_errors)
+
+
+def test_live_preflight_accounts_env_file_wins_over_process_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same file-first precedence as credentials (resolve_env_value).
+    monkeypatch.setenv("PREFLIGHT_TEST_CHANNEL_ID", "from-process")
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("PREFLIGHT_TEST_CHANNEL_ID=from-file\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    import live_runner.preflight as preflight
+
+    real = preflight.parse_live_deployments_config
+
+    def spy(path, *, env_values=None):
+        accounts, deployments = real(path, env_values=env_values)
+        seen["channel"] = deployments[0].signal_config["channel_id"]
+        return accounts, deployments
+
+    monkeypatch.setattr(preflight, "parse_live_deployments_config", spy)
+    run_live_preflight(config_path, accounts_env_path=accounts_env)
+
+    assert seen["channel"] == "from-file"
+
+
+def test_live_preflight_still_expands_from_process_env_without_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PREFLIGHT_TEST_CHANNEL_ID", "777")
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+
+    result = run_live_preflight(
+        config_path, accounts_env_path=tmp_path / "missing.accounts.env"
+    )
+
+    assert not any("PREFLIGHT_TEST_CHANNEL_ID" in err for err in result.deployment_errors)
+
+
+def test_live_preflight_unset_config_ref_is_still_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PREFLIGHT_TEST_CHANNEL_ID", raising=False)
+    config_path = _write_config(tmp_path / "live_deployments.yaml", _ENV_REF_CONFIG)
+
+    result = run_live_preflight(
+        config_path, accounts_env_path=tmp_path / "missing.accounts.env"
+    )
+
+    assert result.ok is False
+    assert any("PREFLIGHT_TEST_CHANNEL_ID" in err for err in result.deployment_errors)
