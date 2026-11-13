@@ -8,8 +8,16 @@ so ``pytest tests/parity`` runs in CI without the reference dependency.
 
 Usage (from the repository root, with a venv that has ``backtesting`` installed):
 
-    python scripts/reference_parity/generate_reference_parity_fixtures.py
     python -m scripts.reference_parity.generate_reference_parity_fixtures.py
+    python scripts/reference_parity/generate_reference_parity_fixtures.py   # same thing
+    python -m scripts.reference_parity.generate_reference_parity_fixtures.py --no-write
+
+``--no-write`` runs every reference strategy and every invariant check and writes
+nothing: use it to re-verify the committed fixtures (or a new seed) without
+touching them. The four recorded runs are the three quickstart/bracket strategies
+plus a **zero-commission** SmaCross, which is the case where the platform and the
+library size identically, so the exit-fill convention is the only remaining
+difference and the fixture pins it exactly.
 
 What it does
 ------------
@@ -47,6 +55,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_DIR = REPO_ROOT / "tests" / "parity" / "fixtures"
 DATA_FIXTURE = FIXTURE_DIR / "ref_parity_daily.csv"
 
+# A direct ``python scripts/reference_parity/generate_reference_parity_fixtures.py``
+# puts *this* directory on sys.path, not the repository root, so the absolute
+# ``scripts.reference_parity.reference_strategies`` imports below would fail. This
+# module imports nothing from ``shared`` (see tests/test_script_import_origin.py:
+# the guard exists to stop ``shared`` being resolved from a different checkout),
+# so the root may be prepended safely. The canonical invocation is still
+# ``python -m`` from the root.
+if __package__ in (None, ""):  # pragma: no cover - exercised only by a direct run
+    sys.path.insert(0, str(REPO_ROOT))
+
 #: Fixed deterministic inputs for the fixture data.
 SEED = 20240617
 #: Total bars generated before the fixture is trimmed to a point where every
@@ -58,6 +76,11 @@ START_PRICE = 88.0
 #: (slug, reference strategy, backtesting.py commission)
 RUNS = (
     ("smacross_all_in", "SmaCross", "QUICKSTART"),
+    # zero-commission twin of the quickstart run: with no commission to gross
+    # up, ``size=1`` and the platform's notional cap produce the *same* share
+    # count, so the suite can assert exact quantity equality and pin the
+    # exit-fill convention as the only difference (see the report).
+    ("smacross_zero_fee", "SmaCross", "ZERO"),
     ("bracket_long", "BracketLong", "ZERO"),
     ("bracket_short", "BracketShort", "ZERO"),
 )
