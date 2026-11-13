@@ -2,6 +2,7 @@
 
 ## Quelle
 - Original: `desenyon/quantconnect-strategies` — `short_term_reversal_strategy.py` (cross-sectional long/short-Universum, 20/20)
+- Version: 1.2.0 (Market-Exits ohne exit_price=close; 5-Bar-Hold dokumentiert)
 - Konvertiert: 2026-03-08, korrigiert: 2026-09-09 (Hold 10→5 Bars, Target +3 %→+5 % PnL, fixer 8-%-Stop statt ATR, RSI-Filter ersatzlos entfernt)
 
 ## Kernlogik
@@ -15,7 +16,7 @@ Kein RSI-Filter (die Quelle kennt keinen RSI).
 Vollausstieg bei einem von drei Events (alle quellenbasiert):
 1. Fixer Stop-Loss: Positions-PnL `<= -8 %` (`stop_loss`).
 2. Profit-Target: Positions-PnL `>= +5 %` (`profit_target`).
-3. Time-Exit nach 5 Bars (`time_exit`).
+3. Time-Exit nach 5 Bars (`time_exit`). Unter `signal_exit_fill="next_open"` (Default; Entries UND Signal-Exits fuellen am naechsten Bar-Open) zaehlt der Hold ab der **Signal-Bar** `i`: Entry-Fill am Open von `i+1`, Exit-Signal auf `i+5`, Fill am Open von `i+6` - die Position ist exakt den Bars `i+1..i+5` ausgesetzt (5 Bars, Open-zu-Open) und damit gleich lang wie frueher „Entry-Open bis Close von Bar 5“. Der Zaehler wird bewusst **nicht** um eins verschoben (das waere ein 4-Bar-Hold). Alle drei Exits sind Market-Exits auf Close-Basis ohne expliziten `exit_price` (seit v1.2.0; ein Preis = Signal-Bar-Close widerspraeche dem Next-Open-Timestamp).
 
 ### Stop-Loss
 Fixer prozentualer Stop ab Entry (exakt wie die Quellen-Logik `pnl_pct < -0.08`).
