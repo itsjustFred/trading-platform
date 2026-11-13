@@ -19,6 +19,11 @@ from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.trailing import (
+    REPLAY_SUPPORTED_TRAILING_MODES,
+    TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_trailing_sl_config,
+)
 from signal_bots.registry import get_signal_processor
 
 logger = logging.getLogger(__name__)
@@ -560,6 +565,17 @@ class SignalReplayAdapter:
             if effective_signal is None:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
+            # #150 fail closed at signal time: a signal whose trailing mode
+            # replay cannot execute (unknown, or e.g. supertrend_flip until
+            # #168) is rejected — it is not traded, instead of being traded
+            # with the requested trailing silently dropped. This aborts the
+            # run on purpose: a config error must not produce a backtest
+            # result that silently differs from the strategy's intent.
+            validate_trailing_sl_config(
+                (effective_signal.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
+                supported=REPLAY_SUPPORTED_TRAILING_MODES,
+                context=f"signal replay ({effective_signal.symbol})",
+            )
             # Settle protective exits for ALL open positions up to this
             # signal's fill time (CodeRabbit round): previously only the
             # signaled symbol's position was settled, so a stop-out on another

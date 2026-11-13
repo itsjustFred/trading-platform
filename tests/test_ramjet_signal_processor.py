@@ -64,10 +64,71 @@ def test_process_signal_ports_ramjet_sl_tp_and_trailing_config():
     assert signal.metadata["signal_price"] == pytest.approx(111.25)
 
     trailing = signal.metadata["trailing_sl_config"]
+    # #150 (decided behaviour change): the mode is a config setting with a
+    # deliberate default of 'none' (initial stop only) until #167/#168 land.
+    # The old hard-coded 'supertrend_flip' asked for a workflow no path runs.
+    assert trailing == {"mode": "none"}
+    # No workflow fields that would promise trailing the paths do not run.
+    assert "breakeven_after_tp1" not in trailing
+    assert "activation_phase" not in trailing
+    assert "exit_phase" not in trailing
+    # TP1/supertrend context metadata stays: computed facts, not workflow claims.
+    assert signal.metadata["tp1_price"] == pytest.approx(signal.take_profit)
+    assert "supertrend_green_at_entry" in signal.metadata
+    assert "supertrend_ready" in signal.metadata
+
+
+def test_process_signal_selects_trailing_mode_via_config():
+    """#150: the trailing mode comes from config, not from hard-coding."""
+    processor = RamJetSignalProcessor(
+        {"ram_jet": {"trailing_mode": "percent", "trailing_percent": 0.02}}
+    )
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data()
+    )
+    assert signal.metadata["trailing_sl_config"] == {
+        "mode": "percent",
+        "percent": 0.02,
+    }
+
+
+def test_process_signal_emits_supertrend_flip_config_for_known_mode():
+    """#150: supertrend_flip is known, so the processor builds and emits its
+    workflow description; executing paths reject the signal (#168 enables it
+    by extending the support sets)."""
+    processor = RamJetSignalProcessor({"ram_jet": {"trailing_mode": "supertrend_flip"}})
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data()
+    )
+    trailing = signal.metadata["trailing_sl_config"]
     assert trailing["mode"] == "supertrend_flip"
     assert trailing["breakeven_after_tp1"] is True
     assert trailing["activation_phase"] == "wait_for_first_green_after_tp1"
     assert trailing["exit_phase"] == "exit_on_first_red_after_activation"
+
+
+def test_unknown_trailing_mode_rejected_at_config_time():
+    with pytest.raises(ValueError, match="Unknown trailing stop mode"):
+        RamJetSignalProcessor({"ram_jet": {"trailing_mode": "martingale_trail"}})
+
+
+def test_percent_trailing_mode_requires_trailing_percent():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor({"ram_jet": {"trailing_mode": "percent"}})
+
+
+def test_trailing_percent_rejected_for_other_modes():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "none", "trailing_percent": 0.02}}
+        )
+
+
+def test_trailing_percent_out_of_range_rejected():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "percent", "trailing_percent": 1.5}}
+        )
 
 
 def test_process_signal_rejects_non_buy_actions():

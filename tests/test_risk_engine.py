@@ -544,7 +544,7 @@ def test_submit_order_with_risk_applies_qty_before_submit():
 
 
 class TestIssueC1FallbackGuards:
-    """C1: no silent healing of bad ATR; unsupported trailing warns."""
+    """C1: no silent healing of bad ATR; #150: unsupported trailing rejects."""
 
     def _engine(self) -> RiskEngine:
         return RiskEngine(
@@ -577,14 +577,33 @@ class TestIssueC1FallbackGuards:
                 current_exposure=0.0,
             )
 
-    def test_unsupported_trailing_mode_warns_and_leaves_stop(self, caplog) -> None:
-        import logging
+    def test_unsupported_trailing_mode_rejected(self) -> None:
+        """#150 (decided behaviour change): the old warned no-op is gone.
 
-        signal = self._signal(
-            trailing_sl_config={"mode": "supertrend_flip"},
-        )
+        supertrend_flip is a known mode no executing path supports yet (#168);
+        the engine refuses it instead of trading the signal untrailed.
+        """
+        signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0
-        with caplog.at_level(logging.WARNING, logger="risk.engine"):
-            result = self._engine().apply_trailing_stop(signal, market_price=101.0)
+        with pytest.raises(ValueError, match="supertrend_flip"):
+            self._engine().apply_trailing_stop(signal, market_price=101.0)
+
+    def test_unknown_trailing_mode_rejected(self) -> None:
+        signal = self._signal(trailing_sl_config={"mode": "martingale_trail"})
+        signal.stop_loss = 98.0
+        with pytest.raises(ValueError, match="Unknown trailing stop mode"):
+            self._engine().apply_trailing_stop(signal, market_price=101.0)
+
+    def test_none_trailing_mode_keeps_initial_stop(self) -> None:
+        """#150: mode 'none' means initial stop only — no trailing, no error."""
+        signal = self._signal(trailing_sl_config={"mode": "none"})
+        signal.stop_loss = 98.0
+        result = self._engine().apply_trailing_stop(signal, market_price=101.0)
         assert result == pytest.approx(98.0)
-        assert any("supertrend_flip" in record.message for record in caplog.records)
+        assert signal.stop_loss == pytest.approx(98.0)
+
+    def test_percent_trailing_mode_still_trails(self) -> None:
+        signal = self._signal(trailing_sl_config={"mode": "percent", "percent": 0.02})
+        signal.stop_loss = 98.0
+        result = self._engine().apply_trailing_stop(signal, market_price=101.0)
+        assert result == pytest.approx(101.0 * 0.98)
