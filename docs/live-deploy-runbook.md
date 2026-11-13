@@ -30,6 +30,8 @@ must still be rotated when an account is retired or reassigned.
 ```bash
 uv sync --all-extras
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env
+# Also connect to every broker account and read balance/positions (still no orders):
+uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env --check-connectivity
 uv run python scripts/live_smoke.py --mode discord-replay --reports-dir docs/reports
 ```
 
