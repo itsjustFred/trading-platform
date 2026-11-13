@@ -4,7 +4,15 @@ Intraday Volatility Breakout Strategy
 Vectorized conversion of the MQL5 EA IntradayVolatilityBreakout.mq5.
 
 Logic:
-- Daily ATR (shifted by 1 day) is forward-filled to the main timeframe.
+- Daily ATR (shifted by 1 day) is forward-filled to the main timeframe. MT5's built-in
+  iATR is a simple moving average of the true range (``atr_smoothing="sma"``, the
+  default); Wilder smoothing is available as ``atr_smoothing="wilder"``.
+- Day boundaries, the D1 bars behind the ATR and the HH:MM inputs are MT5 *server*
+  time. ``broker_clock`` selects an explicit broker clock (``shared.broker_clock``);
+  ``session_timezone`` / ``session_timezone_offset_hours`` remain for civil zones.
+- D1 bars are trading-day bars: flat zero-volume filler bars do not form or shape
+  them (``daily_skip_filler_bars``), and Saturday/Sunday rows are dropped unless the
+  broker clock says the broker's D1 history carries them (``daily_weekend_bars``).
 - Each day an entry-setup is calculated once: open price at entry_time plus/minus
   ATR * ATR_Multiplier gives the breakout levels.
 - Regime filter compares short-term ATR vs long-term ATR on daily basis.
@@ -21,6 +29,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
+
+from shared.broker_clock import resolve_broker_clock
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +41,7 @@ STRATEGY_META = {
     "engine": "native",
     "parameters": {
         "atr_period": 5,
+        "atr_smoothing": "sma",
         "atr_multiplier": 0.25,
         "stop_atr_multiplier": 0.25,
         "use_candle_close": True,
@@ -46,6 +58,9 @@ STRATEGY_META = {
         "exit_time": "22:55",
         "session_timezone": "",
         "session_timezone_offset_hours": 0,
+        "broker_clock": "",
+        "daily_weekend_bars": "auto",
+        "daily_skip_filler_bars": True,
         "evaluate_on_confirmation_bar": True,
         "magic_number": 123456,
     },
@@ -125,14 +140,54 @@ def _normalize_trade_direction(value) -> str:
     return normalized
 
 
-def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
-    period = max(1, int(period))
+ATR_SMOOTHINGS = ("sma", "wilder")
+DAILY_WEEKEND_BAR_POLICIES = ("auto", "drop", "keep")
+
+
+def _normalize_choice(value, allowed: tuple[str, ...], name: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in allowed:
+        raise ValueError(f"{name} must be one of {', '.join(allowed)}; got {value!r}")
+    return normalized
+
+
+def _valid_values(true_range: pd.Series) -> tuple[pd.Series, np.ndarray]:
     values = pd.to_numeric(true_range, errors="coerce").astype(float)
+    return values, np.flatnonzero(values.notna().to_numpy())
+
+
+def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
+    """MT5 built-in ``iATR``: simple moving average of the true range.
+
+    MetaQuotes' ATR indicator keeps a running sum, ``ATR[i] = ATR[i-1] +
+    (TR[i] - TR[i-period]) / period``, i.e. ``SMA(TR, period)`` - not Wilder's
+    recursive smoothing used by MT4 and most other platforms. Verified against
+    the EA's logged daily ATR (EURUSD 2024-2026: equal to 1e-14 on 568 of 641
+    days; Wilder matches none). NaN true ranges are skipped: the window spans the
+    last ``period`` valid values and a NaN position gets no ATR.
+    """
+    period = max(1, int(period))
+    values, valid_positions = _valid_values(true_range)
     if period == 1:
         return values.copy()
 
     atr = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
-    valid_positions = np.flatnonzero(values.notna().to_numpy())
+    if len(valid_positions) < period:
+        return atr
+    valid = values.to_numpy()[valid_positions]
+    window_means = sliding_window_view(valid, period).mean(axis=1)
+    atr.iloc[valid_positions[period - 1 :]] = window_means
+    return atr
+
+
+def _wilder_atr(true_range: pd.Series, period: int) -> pd.Series:
+    """Wilder ATR: SMA seed over the first ``period`` values, then ``(prev*(n-1)+TR)/n``."""
+    period = max(1, int(period))
+    values, valid_positions = _valid_values(true_range)
+    if period == 1:
+        return values.copy()
+
+    atr = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
     if len(valid_positions) < period:
         return atr
 
@@ -146,9 +201,28 @@ def _mt5_atr(true_range: pd.Series, period: int) -> pd.Series:
     return atr
 
 
+def _daily_atr(true_range: pd.Series, period: int, smoothing: str) -> pd.Series:
+    if smoothing == "wilder":
+        return _wilder_atr(true_range, period)
+    return _mt5_atr(true_range, period)
+
+
 def generate_signals(df: pd.DataFrame, params: dict):
     # --- Parameter extraction ------------------------------------------------
     atr_period = int(params.get("atr_period", params.get("ATR_Period", 5)))
+    atr_smoothing = _normalize_choice(
+        params.get("atr_smoothing", params.get("ATR_Smoothing", "sma")),
+        ATR_SMOOTHINGS,
+        "atr_smoothing",
+    )
+    daily_skip_filler_bars = bool(
+        params.get("daily_skip_filler_bars", params.get("Daily_Skip_Filler_Bars", True))
+    )
+    daily_weekend_bars = _normalize_choice(
+        params.get("daily_weekend_bars", params.get("Daily_Weekend_Bars", "auto")),
+        DAILY_WEEKEND_BAR_POLICIES,
+        "daily_weekend_bars",
+    )
     atr_multiplier = float(
         params.get("atr_multiplier", params.get("ATR_Multiplier", 0.25))
     )
@@ -198,10 +272,21 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "session_timezone_offset_hours",
         params.get("Session_Timezone_Offset_Hours", 0),
     )
-    session_zone = _resolve_session_zone(
-        session_timezone,
-        session_timezone_offset_hours,
+    broker_clock = resolve_broker_clock(
+        params.get("broker_clock", params.get("Broker_Clock", ""))
     )
+    if broker_clock is not None:
+        if str(session_timezone or "").strip() or float(session_timezone_offset_hours or 0):
+            raise ValueError(
+                "broker_clock cannot be combined with session_timezone or "
+                "session_timezone_offset_hours"
+            )
+        session_zone = None
+    else:
+        session_zone = _resolve_session_zone(
+            session_timezone,
+            session_timezone_offset_hours,
+        )
     evaluate_on_confirmation_bar = bool(
         params.get(
             "evaluate_on_confirmation_bar",
@@ -213,17 +298,43 @@ def generate_signals(df: pd.DataFrame, params: dict):
     open_ = df["open"]
     idx = df.index
 
+    # Session ("server") wall time. Civil zones stay tz-aware; a broker clock yields
+    # naive server wall time (what MT5's TimeCurrent() reports), see shared.broker_clock.
     def _to_session_time(values):
         converted = pd.to_datetime(values, utc=True, errors="coerce")
         if getattr(converted, "dt", None) is None:
             raise ValueError("timestamp values must be datetime-like")
+        if broker_clock is not None:
+            return pd.Series(broker_clock.to_server_time(converted), index=converted.index)
         return converted.dt.tz_convert(session_zone)
 
     def _index_to_session_time(values):
         converted = pd.DatetimeIndex(pd.to_datetime(values, utc=True, errors="coerce"))
         if converted.tz is None:
             raise ValueError("datetime index must be timezone-aware")
+        if broker_clock is not None:
+            return broker_clock.to_server_time(converted)
         return converted.tz_convert(session_zone)
+
+    def _utc_bar_times():
+        if "timestamp" in df.columns:
+            return pd.DatetimeIndex(pd.to_datetime(df["timestamp"], utc=True, errors="coerce"))
+        return pd.DatetimeIndex(pd.to_datetime(idx, utc=True, errors="coerce"))
+
+    # Filler bars: flat (O=H=L=C) bars with a known volume <= 0. Feeds pad closed
+    # hours, holidays and whole weekends with them; MT5 history has no bar without a
+    # tick, so they must not create or shape a D1 bar. Without a volume column
+    # nothing is treated as filler.
+    if "volume" in df.columns:
+        volume = pd.to_numeric(df["volume"], errors="coerce")
+        filler_bar = (
+            (volume <= 0)
+            & (df["open"] == df["high"])
+            & (df["high"] == df["low"])
+            & (df["low"] == df["close"])
+        ).to_numpy()
+    else:
+        filler_bar = np.zeros(len(df), dtype=bool)
 
     # --- Time features -------------------------------------------------------
     if "timestamp" in df.columns:
@@ -239,6 +350,19 @@ def generate_signals(df: pd.DataFrame, params: dict):
             "intraday_volatility_breakout requires a timestamp column or datetime index"
         )
 
+    if broker_clock is not None:
+        utc_times = _utc_bar_times()
+        traded = ~filler_bar
+        server_times = _index_to_session_time(utc_times[traded])
+        if utc_times[traded].is_monotonic_increasing and not server_times.is_monotonic_increasing:
+            # A clock that steps back while bars trade would fold two different hours onto
+            # the same server wall time; MT5 history never contains that, so fail closed.
+            # (Broker clocks switch over the weekend, where only filler bars exist.)
+            raise ValueError(
+                f"broker_clock {broker_clock.name!r} maps these bars onto a non-monotonic "
+                "server clock (bars inside a clock fall-back overlap)"
+            )
+
     entry_minute = _parse_minutes(entry_time)
     max_entry_minute = _parse_minutes(max_entry_time)
     exit_minute = _parse_minutes(exit_time)
@@ -253,8 +377,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
         return _index_to_session_time(idx)
 
     # --- Daily indicators (resample to D1, shift 1, ffill) ------------------
+    # ``weekend_bars_listed`` marks D1 rows on a Saturday/Sunday that the broker's D1
+    # history does carry (only a broker clock can say so; see shared.broker_clock).
     daily_ohlcv = params.get("daily_ohlcv")
+    weekend_bars_listed = None
     if isinstance(daily_ohlcv, pd.DataFrame) and not daily_ohlcv.empty:
+        if broker_clock is not None:
+            # Native D1 files are stamped on their own (usually UTC) day; MT5 builds its
+            # D1 bars on the server clock, so they must come from the intraday bars.
+            raise ValueError(
+                "daily_ohlcv cannot be combined with broker_clock: D1 bars are built "
+                "from the intraday bars on the broker's server clock"
+            )
         daily_frame = daily_ohlcv.copy()
         daily_frame.columns = [str(col).lower() for col in daily_frame.columns]
         daily_ts = pd.to_datetime(daily_frame.get("timestamp"), utc=True, errors="coerce")
@@ -286,11 +420,17 @@ def generate_signals(df: pd.DataFrame, params: dict):
             },
             index=dt_idx,
         )
+        d1_source = temp_df[~filler_bar] if daily_skip_filler_bars else temp_df
         daily = (
-            temp_df.resample("D")
+            d1_source.resample("D")
             .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
             .dropna()
         )
+        if broker_clock is not None:
+            listed = pd.Series(broker_clock.weekend_d1_bars(_utc_bar_times()), index=dt_idx)
+            weekend_bars_listed = (
+                listed.resample("D").max().reindex(daily.index).fillna(False).astype(bool)
+            )
         # Re-align daily values to main timeframe
         def _ffill_daily(daily_series):
             return daily_series.reindex(temp_df.index, method="ffill").values
@@ -307,6 +447,17 @@ def generate_signals(df: pd.DataFrame, params: dict):
         def _ffill_daily(daily_series):
             return daily_series.reindex(day.values, method="ffill").values
 
+    # MT5's D1 series holds trading-day bars only: a Saturday/Sunday session-date row is
+    # a carry/stray row (e.g. a UTC-day file's Sunday-evening open, or a flat filler
+    # print) that would otherwise take a slot of the ATR window. "auto" drops it unless
+    # the broker clock lists weekend bars for that period; "drop" / "keep" force it.
+    if daily_weekend_bars != "keep" and len(daily):
+        is_weekend = pd.DatetimeIndex(pd.to_datetime(daily.index)).dayofweek.to_numpy() >= 5
+        keep = ~is_weekend
+        if daily_weekend_bars == "auto" and weekend_bars_listed is not None:
+            keep |= weekend_bars_listed.to_numpy()
+        daily = daily[keep]
+
     prev_close_daily = daily["close"].shift(1)
     tr_daily = pd.concat(
         [
@@ -317,9 +468,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
         axis=1,
     ).max(axis=1)
 
-    daily_atr = _mt5_atr(tr_daily, atr_period).shift(1)
-    daily_atr_short = _mt5_atr(tr_daily, atr_short_period).shift(1)
-    daily_atr_long = _mt5_atr(tr_daily, atr_long_period).shift(1)
+    daily_atr = _daily_atr(tr_daily, atr_period, atr_smoothing).shift(1)
+    daily_atr_short = _daily_atr(tr_daily, atr_short_period, atr_smoothing).shift(1)
+    daily_atr_long = _daily_atr(tr_daily, atr_long_period, atr_smoothing).shift(1)
 
     daily_atr_ffill = pd.Series(_ffill_daily(daily_atr), index=idx)
     daily_atr_short_ffill = pd.Series(_ffill_daily(daily_atr_short), index=idx)
