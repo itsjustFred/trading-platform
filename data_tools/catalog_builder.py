@@ -469,7 +469,9 @@ def _merge_catalog_dates(current: str | None, candidate: object, *, latest: bool
 
 def _coerce_nonnegative_int(value: object) -> int:
     try:
-        numeric = int(value)  # type: ignore[arg-type]
+        # `int` is overloaded and an `object` argument matches none of the
+        # overloads, so mypy reports call-overload rather than arg-type.
+        numeric = int(value)  # type: ignore[call-overload]
     except (TypeError, ValueError):
         return 0
     return max(numeric, 0)
@@ -854,7 +856,7 @@ def merge_ohlcv_entries(entries: list[dict]) -> list[dict]:
 
 def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
     """Scan ohlcv/ subdirectory and return dataset entries."""
-    entries = []
+    entries: list[dict] = []
     ohlcv_root = data_dir / "ohlcv"
     if not ohlcv_root.exists():
         return entries
@@ -883,6 +885,11 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
             fingerprint = _file_fingerprint(parquet_file)
             cached_entry = catalog_cache.get(_catalog_path_key(parquet_file, data_dir))
             if _should_reuse_cached_summary(cached_entry, fingerprint):
+                # `_should_reuse_cached_summary` only returns True for a dict
+                # entry, so every read below is on a mapping. mypy cannot see
+                # that guard, so the narrowing is restated here rather than
+                # assumed; the `else {}` arm is the branch the helper refuses.
+                reused: dict[str, Any] = cached_entry if isinstance(cached_entry, dict) else {}
                 for key in (
                     "rows",
                     "size_bytes",
@@ -892,8 +899,8 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
                     "start",
                     "end",
                 ):
-                    if key in cached_entry:
-                        entry[key] = cached_entry[key]
+                    if key in reused:
+                        entry[key] = reused[key]
                 if entry.get("last_updated") is None and fingerprint is not None:
                     entry["last_updated"] = _mtime_to_iso(fingerprint[0] / 1_000_000_000)
             else:
@@ -928,7 +935,7 @@ def scan_ohlcv(data_dir: Path, include_validation: bool = False) -> list[dict]:
 
 def scan_universes(data_dir: Path) -> list[dict]:
     """Scan universes/ subdirectory."""
-    entries = []
+    entries: list[dict] = []
     uni_dir = data_dir / "universes"
     if not uni_dir.exists():
         return entries
@@ -948,7 +955,7 @@ def scan_universes(data_dir: Path) -> list[dict]:
 
 def scan_fundamentals(data_dir: Path) -> list[dict]:
     """Scan fundamentals/ subdirectory for non-OHLCV datasets."""
-    entries = []
+    entries: list[dict] = []
     fund_root = data_dir / "fundamentals"
     if not fund_root.exists():
         return entries

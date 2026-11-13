@@ -243,13 +243,18 @@ class AlpacaDownloader(Downloader):
         pages: list[pd.DataFrame] = []
 
         while True:
+            # No `page_token=` here: it is not a field of `StockBarsRequest` in the
+            # pinned alpaca-py, so pydantic silently dropped it and every request
+            # in this loop was page one. The repeated-token guard below is what
+            # stops the loop, and a response that ever *does* carry a usable
+            # `next_page_token` still advances it (see `get_stock_bars`, which
+            # accepts the params object only).
             request = StockBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=alpaca_tf,
                 start=parsed_start.to_pydatetime() if parsed_start is not None else None,
                 end=parsed_end.to_pydatetime() if parsed_end is not None else None,
                 limit=ALPACA_MAX_LIMIT,
-                page_token=page_token,
             )
             response = client.get_stock_bars(request)
             frame = getattr(response, "df", None)

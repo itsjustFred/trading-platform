@@ -378,7 +378,11 @@ def main() -> None:
     end = args.end or None
     workers = max(1, args.workers)
 
-    planned = [
+    # The row is deliberately heterogeneous (a symbol string, a symbol string
+    # and a list of timeframes), which is what `Any` says. Without the annotation
+    # mypy joins the three value types to `Sequence[str]`, and every consumer then
+    # reads a plain string where a sequence was expected.
+    planned: list[dict[str, Any]] = [
         {
             "requested_symbol": requested,
             "canonical_symbol": normalize_symbol(requested, oil_alias=args.oil_type),
