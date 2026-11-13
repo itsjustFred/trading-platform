@@ -25,9 +25,11 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 STRATEGY = REPO_ROOT / "strategies" / "zarattini_orb" / "zarattini_orb.py"
 
 
-def _run(tmp_path, frame, label):
+def _run(tmp_path, frame, label, *, signal_exit_fill="next_open"):
     bars = bar_list(frame)
-    sim = ReferenceSimulator(RefConfig(risk_pct=0.01, notional_cap=4.0))
+    sim = ReferenceSimulator(
+        RefConfig(risk_pct=0.01, notional_cap=4.0, signal_exit_fill=signal_exit_fill)
+    )
     trades = sim.run(bars, orb_signals(bars))
     run = run_engine(
         STRATEGY,
@@ -38,9 +40,10 @@ def _run(tmp_path, frame, label):
         risk_pct=0.01,
         position_pct=None,
         leverage=4.0,
+        signal_exit_fill=signal_exit_fill,
         tmp_path=tmp_path,
     )
-    assert_parity(run, trades, sim.realized_by_time, label)
+    assert_parity(run, trades, sim.curve_by_time, label)
     return sim, trades, run
 
 
@@ -79,8 +82,57 @@ def test_orb_synthetic_covers_event_classes():
                 continue
             same_bar += leg.time == t.entry_time
             bar = by_time[leg.time]
-            gap_through += (bar.open < leg.price) if t.direction == "LONG" else (bar.open > leg.price)
+            # rule A: a gap through the stop fills AT the bar's open
+            gap_through += leg.time != t.entry_time and bar.open == leg.price
     assert wrong_side >= 2
     assert same_bar >= 3
     assert gap_through >= 1
     assert longs >= 10 and shorts >= 10
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_orb_legacy_close_exit_parity(tmp_path, seed):
+    """Explicit opt-in ``signal_exit_fill="close"``: flat at the session's last close."""
+    sim, trades, run = _run(
+        tmp_path, synthetic_sessions(seed), f"close-seed{seed}", signal_exit_fill="close"
+    )
+    assert any(t.legs[-1].reason == "signal" for t in trades)
+
+
+def test_orb_default_signal_exit_is_next_session_open(tmp_path):
+    """Rule B: the session-end signal exit fills at the NEXT bar's open (overnight)."""
+    frame = synthetic_sessions(1)
+    sim, trades, run = _run(tmp_path, frame, "next-open")
+    by_time = {b.time: b for b in bar_list(frame)}
+    signal_trades = [t for t in trades if t.legs[-1].reason == "signal"]
+    assert signal_trades
+    for t in signal_trades:
+        leg = t.legs[-1]
+        assert leg.price == by_time[leg.time].open
+        assert leg.time != t.entry_time
+
+
+def _tail_cut_with_deferred_exit():
+    """First (seed, cut) whose truncated frame ends on a session's last bar with the
+    position still open, found with the (fast) reference alone."""
+    for seed in range(1, 9):
+        frame = synthetic_sessions(seed)
+        stamps = frame["timestamp"].dt.tz_convert("America/New_York").dt.date
+        last_of_day = [k for k in range(len(frame) - 1) if stamps.iloc[k] != stamps.iloc[k + 1]]
+        for k in last_of_day[3:]:
+            cut = frame.iloc[: k + 1].reset_index(drop=True)
+            bars = bar_list(cut)
+            sim = ReferenceSimulator(RefConfig(risk_pct=0.01, notional_cap=4.0))
+            sim.run(bars, orb_signals(bars))
+            if sim.signal_exit_deferred_to_end:
+                return cut
+    raise AssertionError("no truncation exercises the deferred last-bar signal exit")
+
+
+def test_orb_last_bar_signal_exit_defers_to_end_of_data(tmp_path):
+    """A signal exit on the final bar has no next open: end-of-data close, flagged."""
+    frame = _tail_cut_with_deferred_exit()
+    sim, trades, run = _run(tmp_path, frame, "tail")
+    assert sim.signal_exit_deferred_to_end and run.deferred_to_end == 1
+    assert trades[-1].legs[-1].reason == "end_of_data"
+    assert trades[-1].legs[-1].price == bar_list(frame)[-1].close
