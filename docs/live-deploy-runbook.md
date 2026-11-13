@@ -51,6 +51,10 @@ The cTrader smoke registers the demo account in `live_accounts` if it is not the
 database), because its parent deployment row has a foreign key to it. An account that already
 exists is left untouched.
 
+The cTrader smoke order is anchored at a live price (the close of the latest M1 trendbar) with a
+real stop-loss and take-profit 0.5 % away. It fails with a clear message when the market is closed
+(no M1 bar in the last 30 minutes) rather than building an order on an invented price.
+
 ## Demo Daemon
 
 Only run after the paper smoke succeeds.
