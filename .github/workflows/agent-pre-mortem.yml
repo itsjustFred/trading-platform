@@ -63,6 +63,10 @@ run-name: "Agent Pre-Mortem PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha ||
 #   PREMORTEM_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
+  # TEMP (test branch only): a push trigger so GitHub registers this
+  # dispatch-only workflow from a non-default branch.
+  push:
+    branches: [test/pre-mortem-register]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -90,6 +94,7 @@ jobs:
   # ${{ }} interpolation into a shell script). Marks the stage running and
   # stops when the analysed SHA is no longer the PR head.
   resolve:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
