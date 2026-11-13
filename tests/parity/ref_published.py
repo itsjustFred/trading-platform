@@ -10,8 +10,10 @@ identically to every strategy:
 * a decision is taken on the CLOSE of bar ``i``;
 * an entry fills at the OPEN of bar ``i+1`` (no fill if ``i`` is the last bar);
 * an exit fills at the CLOSE of bar ``i`` (``signal_exit_fill="close"``);
-* quantity is ``cash * cap / close[i]`` (sized on the signal bar's close,
-  fully invested; the 100 % position cap is the binding sizing rule);
+* quantity is ``cash / open`` at the fill (fully invested; the 100 % position cap is the binding sizing rule,
+  measured on the FILL price; the fee is charged on top, not reserved);
+* a position still open on the last bar is closed at that bar's close
+  (the engine's ``end_of_data`` exit);
 * proportional fee ``fee_rate`` on each side's notional.
 """
 from __future__ import annotations
@@ -80,10 +82,11 @@ def simulate(
     for day in days:
         # 1. fill the entry decided on the previous bar at today's open
         if pending is not None:
-            symbol, q = pending
+            symbol, _ = pending
             pending = None
             bar = index[symbol].get(day)
             if bar is not None and holding is None:
+                q = cash / bar.open  # fees are NOT reserved by the engine's sizing
                 fee = fee_rate * q * bar.open
                 cash -= q * bar.open + fee
                 holding, qty, entry_price, entry_day, entry_fees = symbol, q, bar.open, day, fee
@@ -98,11 +101,20 @@ def simulate(
             )
             holding = None
             qty = 0.0
+        if holding is not None and day == last_day:
+            bar = index[holding][day]
+            fee = fee_rate * qty * bar.close
+            cash += qty * bar.close - fee
+            res.trades.append(
+                Trade(holding, entry_day, entry_price, qty, day, bar.close, entry_fees + fee)
+            )
+            holding = None
+            qty = 0.0
         if holding is None and day != last_day:
             for symbol, want in decisions.items():
                 if want:
                     close = index[symbol][day].close
-                    pending = (symbol, cash / close)  # cap = 100 % of cash
+                    pending = (symbol, 0.0)  # quantity is fixed at the fill (cash / open)
                     break
         res.realized[day] = cash
         mark = cash + (qty * index[holding][day].close if holding and day in index[holding] else 0.0)
