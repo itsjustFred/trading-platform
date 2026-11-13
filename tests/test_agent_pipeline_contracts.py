@@ -8,7 +8,7 @@ regression - a verdict missing from the `case`, a renamed marker, a dispatch dro
 merge silently and either strand a stage `pending` on the head SHA with no error anywhere, or
 report a red verdict as a green status: a gate that says PASS for a finding it was shown.
 
-The chain branch closed exactly this class of gap three times by hand (its commits
+The chain branch closed exactly this class of gap four times by hand (its commits
 `fdf92ed`, `4fe3b75`, `55f9af7`, `6c08189`). This test is the mechanical version of those
 fixes: it reads the workflows the CI run is about to execute and pins the invariants their
 comments claim.
