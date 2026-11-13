@@ -425,6 +425,14 @@ def _build_trades(
             if not hit.empty:
                 exit_index = int(hit.index[0])
                 exit_price = stop
+                # Owner decision 2026-11-13: a bar that OPENS beyond the stop
+                # (gap) fills at its open - the price a broker actually gives -
+                # not at the skipped stop level. Intrabar touches keep the level.
+                gap_open = _opposite_side_price(df.iloc[exit_index], side, "open")
+                if (side == "LONG" and gap_open <= stop) or (
+                    side != "LONG" and gap_open >= stop
+                ):
+                    exit_price = gap_open
                 exit_reason = "stop_loss"
 
         account_currency = str(case.get("account_currency", "USD"))
