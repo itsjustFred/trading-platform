@@ -4,6 +4,7 @@
 - Original: `opening_range_breakout` (`algorithm.py`, Variante 2 mit Preis-Prozent-Trailing-Stop)
   aus `alexisbouley2/quantconnect`
   (`https://github.com/alexisbouley2/quantconnect/tree/main/strategies/opening_range_breakout`)
+- Version: 2.1.0 (Time-Exit eine Bar frueher fuer Next-Open-Fills)
 - Konvertiert: 2026-09-09 (Rewrite als echte Opening-Range-Breakout-Strategie, v2.0.0;
   die v1.x-Implementierung war ein SMA-Crossover mit ATR-Bracket, das unter diesem
   Slug versehentlich weitergefuehrt wurde)
@@ -25,9 +26,16 @@ Bar-Timestamps in `America/New_York` abgeleitet. Bars vor 09:30 ET
 - Trailing Stop (Variante 2): Reversion um 1 % des Water Marks
   - Long: Exit wenn `close < HWM - HWM * 0.01`
   - Short: Exit wenn `close > LWM + LWM * 0.01`
-- Time-Exit: Zwangsglattstellung ab 15:45 ET (`time_exit`).
-- Hinweis: Auf 24h-CFD-Feeds (z. B. US500 mit Handelspause 16:00-18:00 ET) kann
-  der Fill des 15:45-Exits auf der naechsten verfuegbaren Bar liegen.
+- Time-Exit: Zwangsglattstellung zu 15:45 ET (`time_exit`). Pine fuellt
+  `strategy.close()` am **naechsten Bar-Open** (`signal_exit_fill="next_open"`);
+  seit v2.1.0 geht die Order deshalb auf der ersten Bar raus, deren *Ende* 15:45
+  erreicht (Bar-Laenge aus dem Chart-Timeframe, kein Blick auf spaetere Bars):
+  1m/5m/15m -> Fill genau am 15:45-Open, 30m -> 16:00-Open (erster Open >= 15:45).
+  Vorher feuerte sie auf der ersten Bar >= 15:45 und fuellte eine Bar zu spaet
+  (auf RTH-only-Daten erst am naechsten Tag = Overnight-Halt). Fehlt die Bar vor
+  15:45 (Datenluecke), kommt das Signal auf der ersten vorhandenen Bar.
+  Der Tageswechsel-Flatten (`day_reset_flatten`) bleibt Fallback: er kann nicht
+  frueher als auf der ersten Bar des neuen Tages feuern.
 
 ### Stop-Loss
 Der initiale Schutzabstand entspricht dem Trailing-Start (1 % vom Entry, da

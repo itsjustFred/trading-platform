@@ -33,6 +33,7 @@ import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
+from shared.bar_timing import clock_exit_signal_mask, modal_bar_minutes
 from shared.broker_clock import resolve_broker_clock
 
 logger = logging.getLogger(__name__)
@@ -207,21 +208,6 @@ def _daily_atr(true_range: pd.Series, period: int, smoothing: str) -> pd.Series:
     if smoothing == "wilder":
         return _wilder_atr(true_range, period)
     return _mt5_atr(true_range, period)
-
-
-def _bar_minutes(utc_times: pd.DatetimeIndex) -> float:
-    """Modal spacing of the bars in minutes (0.0 when it cannot be told).
-
-    The bar length is a property of the feed, so the most frequent positive step is
-    used; gaps (weekends, missing bars) are larger steps and do not win the vote.
-    """
-    valid = utc_times[~utc_times.isna()]
-    steps = np.diff(valid.to_numpy()).astype("timedelta64[s]").astype(np.int64)
-    steps = steps[steps > 0]
-    if steps.size == 0:
-        return 0.0
-    values, counts = np.unique(steps, return_counts=True)
-    return float(values[counts == counts.max()].min()) / 60.0
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -670,8 +656,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     # particular bar); the rest is the known clock schedule, so a signal on bar t
     # never depends on bars after t. A missing bar cannot be anticipated: if the bar
     # before exit_time is absent the signal comes on the first bar that exists.
-    bar_minutes = _bar_minutes(_utc_bar_times())
-    exit_time_mask = (minute_of_day + bar_minutes) >= exit_minute
+    bar_minutes = modal_bar_minutes(_utc_bar_times())
+    exit_time_mask = clock_exit_signal_mask(minute_of_day, bar_minutes, exit_minute)
     # MT5's stale-position rule closes a position from a previous day at the first tick
     # of the new day. "Last bar of the day" is not knowable at that bar, so the signal
     # is raised on the first bar of a new server day instead (only before the entry
