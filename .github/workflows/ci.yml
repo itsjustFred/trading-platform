@@ -103,18 +103,11 @@ jobs:
     name: Workflow lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      ACTIONLINT_VERSION: "1.7.12"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache: false
-      # go install verifies the module against the Go checksum database, so
-      # nothing is downloaded and executed unverified.
-      - name: Install actionlint
-        run: go install "github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}"
+      # The official image (actionlint plus shellcheck), pinned by digest, so
+      # nothing is downloaded, built or executed unverified.
       - name: Lint workflows
-        run: |
-          "$(go env GOPATH)/bin/actionlint" -color -ignore 'SC2016'
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: -color -ignore SC2016
