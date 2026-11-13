@@ -7,6 +7,7 @@ search surface is the asset universe plus portfolio risk contributions.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -15,13 +16,20 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+logger = logging.getLogger(__name__)
+
+# #129: float slack for the bound-feasibility checks (n * bound vs 1.0).
+_FEASIBILITY_TOL = 1e-12
+
 
 @dataclass(frozen=True)
 class RiskParitySelection:
     symbols: list[str]
     weights: dict[str, float]
     score: float
-    sharpe: float
+    # None when the observation frequency is unknown (no datetime index): the
+    # Sharpe is then undefined and the score excludes the Sharpe term.
+    sharpe: float | None
     volatility: float
     diversification_ratio: float
     avg_abs_correlation: float
@@ -36,6 +44,27 @@ def returns_from_equity_matrix(equity_matrix: np.ndarray) -> np.ndarray:
     previous = np.maximum(equity_matrix[:-1], 1e-12)
     returns = np.diff(equity_matrix, axis=0) / previous
     return np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
+    """Resample per-bar returns to daily close-to-close returns.
+
+    Sharpe is annualised with sqrt(252) across the platform
+    (``runner/stats.py``, ``runner/portfolio_optimizer.py``), which is only
+    valid for daily observations (#87, #129 H8). Per-bar returns inside a UTC
+    day are compounded (``prod(1 + r) - 1``), which is exactly the day's
+    close-to-close return because each bar return already spans the gap to the
+    previous bar. Days without any bar (weekends, holidays) are dropped, not
+    zero-filled.
+
+    Returns ``None`` when the frame has no ``DatetimeIndex``: the observation
+    frequency is then unknown and the caller must not invent an annualisation.
+    """
+    if not isinstance(returns_frame.index, pd.DatetimeIndex):
+        return None
+    growth = (1.0 + returns_frame.sort_index()).resample("1D")
+    daily = growth.prod() - 1.0
+    return daily[growth.size() > 0]
 
 
 def shrink_covariance(returns: np.ndarray, *, shrinkage: float = 0.2) -> np.ndarray:
@@ -75,23 +104,52 @@ def risk_contributions(weights: np.ndarray, covariance: np.ndarray) -> np.ndarra
     return contributions
 
 
+def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
+    """Euclidean projection onto {w : sum(w) == 1, lower <= w_i <= upper}.
+
+    #129: clipping then renormalising can push weights back outside the cap
+    (inverse-vol [0.8, 0.1, 0.1] capped at 0.4 renormalises to [0.667, ...]).
+    The projection has the form clip(v_i - tau, lower, upper): its sum is
+    continuous and non-increasing in tau, so bisection finds the unique tau
+    whose sum is 1. The caller must have verified that the set is non-empty.
+    """
+    values = np.asarray(values, dtype=float)
+    low = float(np.min(values)) - upper
+    high = float(np.max(values)) - lower
+    for _ in range(200):
+        tau = 0.5 * (low + high)
+        if tau == low or tau == high:
+            break
+        if float(np.sum(np.clip(values - tau, lower, upper))) > 1.0:
+            low = tau
+        else:
+            high = tau
+    return np.clip(values - 0.5 * (low + high), lower, upper)
+
+
 def solve_risk_parity_weights(
     covariance: np.ndarray,
     *,
     min_weight: float = 0.0,
     max_weight: float = 0.6,
 ) -> np.ndarray:
-    """Solve long-only weights whose risk contributions are as equal as possible."""
+    """Solve long-only weights whose risk contributions are as equal as possible.
+
+    Raises ``ValueError`` when the bounds are infeasible for the asset count.
+    """
     cov = np.asarray(covariance, dtype=float)
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] == 0:
         raise ValueError("covariance must be a non-empty square matrix")
     n_assets = cov.shape[0]
     lower = max(0.0, float(min_weight))
-    upper = min(1.0, max(lower, float(max_weight)))
-    if lower * n_assets > 1.0:
+    upper = min(1.0, float(max_weight))
+    # #129: fail closed on infeasible bounds instead of silently relaxing them.
+    # (upper < lower is caught by one of the two checks below unless both
+    # bounds equal 1/n within float noise, which is feasible.)
+    if lower * n_assets > 1.0 + _FEASIBILITY_TOL:
         raise ValueError("min_weight is infeasible for the number of assets")
-    if upper * n_assets < 1.0:
-        upper = 1.0
+    if upper * n_assets < 1.0 - _FEASIBILITY_TOL:
+        raise ValueError("max_weight is infeasible for the number of assets")
 
     target = np.full(n_assets, 1.0 / n_assets)
     initial = np.full(n_assets, 1.0 / n_assets)
@@ -114,11 +172,9 @@ def solve_risk_parity_weights(
     else:
         weights = np.asarray(result.x, dtype=float)
 
-    weights = np.clip(weights, lower, upper)
-    total = float(np.sum(weights))
-    if total <= 0:
-        return initial
-    return weights / total
+    # #129: project onto the capped simplex on every path so the returned
+    # weights always sum to 1 inside [lower, upper].
+    return _project_to_capped_simplex(weights, lower=lower, upper=upper)
 
 
 def score_risk_parity_universe(
@@ -127,8 +183,17 @@ def score_risk_parity_universe(
     *,
     min_weight: float = 0.0,
     max_weight: float = 0.6,
+    daily: bool = False,
 ) -> RiskParitySelection:
-    """Score one asset universe using covariance risk parity diagnostics."""
+    """Score one asset universe using covariance risk parity diagnostics.
+
+    ``returns`` must already be DAILY close-to-close returns when ``daily`` is
+    true (see :func:`daily_returns_frame`); only then is Sharpe annualised with
+    sqrt(252). With ``daily=False`` the observation frequency is unknown, so
+    Sharpe is left undefined (``None``) and the score uses only the
+    scale-invariant structure terms. Weights, diversification ratio,
+    correlation and risk contributions do not depend on the return scale.
+    """
     if len(symbols) < 2:
         raise ValueError("Risk parity requires at least two symbols")
     cov = shrink_covariance(returns)
@@ -136,10 +201,16 @@ def score_risk_parity_universe(
     portfolio_returns = returns @ weights_array
     mean_return = float(np.mean(portfolio_returns)) if len(portfolio_returns) else 0.0
     volatility = float(np.std(portfolio_returns) + 1e-12)
-    # #87: annualized Sharpe on the daily convention (sqrt(252)), consistent
-    # with runner/stats.py and runner/portfolio_optimizer.py — the previous
-    # raw mean/std was not comparable under the same "sharpe" name.
-    sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
+    # #87 / #129 H8: annualized Sharpe on the daily convention (sqrt(252)),
+    # consistent with runner/stats.py and runner/portfolio_optimizer.py. That
+    # factor is only correct for daily returns, so it is applied only when the
+    # caller says the input is daily; otherwise the Sharpe is undefined rather
+    # than guessed (e.g. per-trade rows have no fixed observation frequency).
+    sharpe: float | None
+    if daily:
+        sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
+    else:
+        sharpe = None
 
     asset_vols = np.sqrt(np.maximum(np.diag(cov), 1e-12))
     weighted_asset_vol = float(weights_array @ asset_vols)
@@ -158,7 +229,7 @@ def score_risk_parity_universe(
     # average absolute correlation (0-1 scale), 2.0 penalizes squared
     # risk-budget deviation (small scale, needs the larger multiplier to
     # bind). Tune explicitly if the selection over/under-weights one axis.
-    score = sharpe + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
+    score = (sharpe or 0.0) + (0.35 * diversification_ratio) - (0.5 * avg_abs_corr) - (2.0 * rc_error)
     weights = {symbol: float(weight) for symbol, weight in zip(symbols, weights_array)}
     risk = {symbol: float(value) for symbol, value in zip(symbols, rc)}
     return RiskParitySelection(
@@ -215,13 +286,36 @@ def select_best_risk_parity_universe(
         raise ValueError("No valid risk parity universes were generated")
 
     selections: list[RiskParitySelection] = []
+    infeasible_skipped = 0
     for universe in configured:
         columns = [symbol for symbol in universe if symbol in returns_frame.columns]
         if len(columns) < 2:
             continue
         # C3: intersection, not zero-fill — missing bars are not 0% returns.
         subset = returns_frame[columns].dropna()
+        # #129 H8: covariance, Sharpe and score all use daily close-to-close
+        # returns when timestamps are available (None => frequency unknown).
+        daily_subset = daily_returns_frame(subset)
+        if daily_subset is not None:
+            subset = daily_subset
         if len(subset) < 2:
+            continue
+        # #129: bounds that are infeasible for this universe size (e.g.
+        # max_weight=0.4 with 2 assets) must not abort the whole search; skip
+        # that universe explicitly and say so.
+        if (
+            max(0.0, float(min_weight)) * len(columns) > 1.0 + _FEASIBILITY_TOL
+            or min(1.0, float(max_weight)) * len(columns) < 1.0 - _FEASIBILITY_TOL
+        ):
+            logger.warning(
+                "Skipping risk parity universe %s: min_weight=%s / max_weight=%s "
+                "are infeasible for %d assets",
+                columns,
+                min_weight,
+                max_weight,
+                len(columns),
+            )
+            infeasible_skipped += 1
             continue
         selections.append(
             score_risk_parity_universe(
@@ -229,14 +323,32 @@ def select_best_risk_parity_universe(
                 subset.to_numpy(dtype=float),
                 min_weight=min_weight,
                 max_weight=max_weight,
+                daily=daily_subset is not None,
             )
+        )
+    if not selections and infeasible_skipped:
+        raise ValueError(
+            "No risk parity universe satisfies min_weight/max_weight "
+            f"({infeasible_skipped} skipped as infeasible for their asset count)"
         )
     if not selections:
         raise ValueError("No risk parity universe had enough return history")
 
-    selections.sort(key=lambda item: (item.score, item.sharpe, len(item.symbols)), reverse=True)
+    selections.sort(
+        key=lambda item: (
+            item.score,
+            item.sharpe if item.sharpe is not None else 0.0,
+            len(item.symbols),
+        ),
+        reverse=True,
+    )
     best = selections[0]
     return {
+        # "structure_only": no datetime index, Sharpe undefined and excluded
+        # from the score (not comparable with Sharpe-based scores).
+        "score_basis": (
+            "sharpe_and_structure" if best.sharpe is not None else "structure_only"
+        ),
         "best_symbols": best.symbols,
         "best_weights": best.weights,
         "best_score": best.score,

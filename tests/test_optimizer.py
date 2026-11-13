@@ -703,6 +703,9 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     weights = payload["effective_best_parameters"]["risk_parity_weights"].values()
     assert sum(weights) == pytest.approx(1.0)
     assert payload["risk_parity"]["evaluated_universes"]
+    # #129 H8: market-data frames carry timestamps, so Sharpe is daily-annualised.
+    assert payload["train_stats"]["risk_parity_score_basis"] == "sharpe_and_structure"
+    assert payload["train_stats"]["risk_parity_sharpe"] is not None
     saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
     assert len(saved_files) == 1
 
