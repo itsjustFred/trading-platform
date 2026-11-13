@@ -57,13 +57,10 @@ def compare(
     curve_tol = CURVE_ABS + qty_abs * 1e3 * max(len(eng), 1)
     matched = 0
     for stamp, equity in run.curve:
-        if stamp in ref.realized:
+        if stamp in ref.marked:
             matched += 1
-            if not (
-                math.isclose(equity, ref.realized[stamp], rel_tol=rel, abs_tol=curve_tol)
-                or math.isclose(equity, ref.marked[stamp], rel_tol=rel, abs_tol=curve_tol)
-            ):
-                diffs.append(f"curve[{stamp}] engine={equity} ref realized={ref.realized[stamp]} marked={ref.marked[stamp]}")
+            if not math.isclose(equity, ref.marked[stamp], rel_tol=rel, abs_tol=curve_tol):
+                diffs.append(f"curve[{stamp}] engine={equity} ref marked={ref.marked[stamp]}")
                 if len(diffs) > 6:
                     break
     if matched < len(run.curve) - 1:

@@ -61,7 +61,8 @@ def with_cash_leg(ref: SimResult, irx: pd.DataFrame) -> pd.Series:
     marked = marked_series(ref)
     held = pd.Series(False, index=marked.index)
     for t in ref.trades:
-        # position is held from the entry bar's open through the exit bar's close
+        # daily approximation: held from the entry day through the exit day (the exit now fills at that day's open, so
+        # the exit day's open-to-close part would earn cash; ignored, it is a reference-only estimate)
         held.loc[(held.index > pd.Timestamp(t.entry_day)) & (held.index <= pd.Timestamp(t.exit_day))] = True
         held.loc[pd.Timestamp(t.entry_day)] = True
     y = pd.Series(irx["close"].to_numpy(), index=pd.to_datetime(irx["timestamp"].dt.tz_localize(None)))
