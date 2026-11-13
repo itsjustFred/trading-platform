@@ -86,8 +86,7 @@ def build_comparison_matrix(
         ),
     ]
 
-    for case in mt5_cases:
-        rows.append(_build_mt5_row(case))
+    rows.extend(_build_mt5_row(case) for case in mt5_cases)
 
     rows.append(
         _build_json_reference_row(

@@ -45,8 +45,7 @@ def _trend_frame(rows: int = 260, start: str = "2024-01-01", freq: str = "1h") -
                 price += 0.5
                 closes.append(price)
         else:
-            for _ in range(max(rows // 4, 1)):
-                closes.append(price)
+            closes.extend(price for _ in range(max(rows // 4, 1)))
     while len(closes) < rows:
         price -= 0.5
         closes.append(price)
@@ -119,7 +118,7 @@ def test_pine_strategies_4_tuple_output_flows_through_vectorbt_normalization():
     )
     df = _trend_frame()
     output = _call(module, df)
-    signals, indicators, drawings = _normalize_signal_output(
+    signals, indicators, _drawings = _normalize_signal_output(
         output, df.index, symbol="TEST"
     )
     assert list(signals.columns[:2]) == ["entries", "exits"]
@@ -326,7 +325,7 @@ def test_post_vix_without_vix_data_emits_no_entries(monkeypatch):
     monkeypatch.setattr(module, "_load_vix_data", lambda start=None, end=None: None)
 
     df = _daily_frame()
-    entries, exits, indicators, _ = _call(module, df, {"sma_period": 5})
+    entries, _exits, indicators, _ = _call(module, df, {"sma_period": 5})
 
     assert not entries.any(), "no entries may be produced without VIX data"
     assert not bool(indicators["VIX_Data_Available"].iloc[0])
@@ -379,7 +378,7 @@ def test_post_vix_date_matching_is_not_quadratic(monkeypatch):
     import time
 
     started = time.perf_counter()
-    entries, _, indicators, _ = _call(module, df, {"sma_period": 5, "rsi_period": 3})
+    _entries, _, indicators, _ = _call(module, df, {"sma_period": 5, "rsi_period": 3})
     elapsed = time.perf_counter() - started
 
     assert elapsed < 5.0, f"VIX alignment took {elapsed:.2f}s — still quadratic?"
@@ -642,7 +641,7 @@ def test_ivb_candle_close_fallback_is_reported_in_indicators():
     params = dict(module.STRATEGY_META["parameters"])
     params["confirmation_timeframe"] = "15m"
 
-    entries, exits, indicators, _ = _call(module, df, params)
+    _entries, _exits, indicators, _ = _call(module, df, params)
 
     assert "signal_price_fallback_used" in indicators, (
         "the fallback must be surfaced as an indicator column"
@@ -689,7 +688,7 @@ def test_ivb_confirmation_semantics_are_stable_on_intraday_data():
         }
     )
 
-    entries, exits, indicators, _ = _call(module, df, params)
+    entries, _exits, indicators, _ = _call(module, df, params)
 
     entry_indices = entries[entries].index.tolist()
     assert entry_indices == [breakout_bar], (

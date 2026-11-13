@@ -128,7 +128,7 @@ def run_strategy_grid(
                 # never read raw.
                 def _num_or_none(*keys: str) -> float | None:
                     for key in keys:
-                        value = stats.get(key)
+                        value = stats.get(key)  # noqa: B023 - helper is only called within this iteration
                         if value is None:
                             continue
                         try:

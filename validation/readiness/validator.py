@@ -119,16 +119,16 @@ class ReadinessValidator:
             missing_required.append("statistics comparison")
 
         if missing_required:
-            for artifact in missing_required:
-                checks.append(
-                    ReadinessCheck(
-                        name=f"required_{artifact.replace(' ', '_')}",
-                        description=f"Required artifact present: {artifact}",
-                        passed=False,
-                        severity="error",
-                        message=f"Missing required artifact: {artifact}",
-                    )
+            checks.extend(
+                ReadinessCheck(
+                    name=f"required_{artifact.replace(' ', '_')}",
+                    description=f"Required artifact present: {artifact}",
+                    passed=False,
+                    severity="error",
+                    message=f"Missing required artifact: {artifact}",
                 )
+                for artifact in missing_required
+            )
 
         # `applicable` is excluded from both counts: a check with no answer must not be counted
         # as a failure, and must not be counted as a pass either. Default True, so this is a

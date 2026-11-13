@@ -406,7 +406,9 @@ def test_the_corpus_has_no_declared_undefined_sentinels_today():
         undefined = payload.get("undefined_metrics")
         if not isinstance(undefined, list):
             continue
-        for column, value in zip(("sharpe_ratio", "psr", "cagr", "p_value"), values):
+        for column, _ in zip(
+            ("sharpe_ratio", "psr", "cagr", "p_value"), values, strict=True
+        ):
             if column in undefined and payload.get(column) is not None:
                 withheld += 1
     assert withheld == 0, (

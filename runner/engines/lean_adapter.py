@@ -17,7 +17,7 @@ import logging
 import os
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from runner.agent_process import build_backtest_child_env
@@ -109,7 +109,13 @@ class LeanAdapter(EngineAdapter):
 
     def _run_lean(self, config_path: Path) -> Path:
         """Execute LEAN backtest via the ``lean`` CLI console script."""
-        output_dir = self.project_dir / "output" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        # UTC: the folder name is the label a human matches back against the
+        # LEAN result inside it, and every other timestamp this repo writes (and
+        # every LEAN log line) is UTC. A local-clock name would be an hour or
+        # more off from the data it contains when read on a different machine.
+        output_dir = self.project_dir / "output" / datetime.now(timezone.utc).strftime(
+            "%Y%m%d_%H%M%S"
+        )
         output_dir.mkdir(parents=True, exist_ok=True)
 
         lean_bin = shutil.which("lean")
@@ -131,6 +137,7 @@ class LeanAdapter(EngineAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=600,

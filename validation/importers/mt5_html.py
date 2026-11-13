@@ -752,7 +752,10 @@ class MT5HTMLImporter(BaseImporter):
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
-                dt = datetime.strptime(text, fmt)
+                # The report carries no zone in the string itself; `source_tz`
+                # is resolved explicitly below and the naive value is then
+                # converted, so a `%z` in the format would reject the input.
+                dt = datetime.strptime(text, fmt)  # noqa: DTZ007
                 if source_tz:
                     import zoneinfo
                     tz = zoneinfo.ZoneInfo(source_tz)

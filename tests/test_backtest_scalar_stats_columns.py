@@ -53,7 +53,7 @@ def _columns(backtest_id: str) -> dict[str, float]:
             select(*(getattr(database.BacktestRecord, name) for name in COLUMNS))
             .where(database.BacktestRecord.id == backtest_id)
         ).first()
-    return dict(zip(COLUMNS, row))
+    return dict(zip(COLUMNS, row, strict=True))
 
 
 def test_the_four_columns_are_actually_mapped() -> None:

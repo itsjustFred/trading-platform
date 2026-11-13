@@ -88,8 +88,7 @@ def _read_csv(path: Path) -> list[dict]:
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            rows.append(row)
+        rows.extend(row for row in reader)
     return rows
 
 
@@ -201,11 +200,15 @@ def _parse_datetime(date_str: str, time_str: str) -> str:
     raw f-string downstream into sort/match.
     """
     try:
-        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")
+        # The CSV carries no zone, so the naive parse below is stamped with
+        # the documented zone after the fact (DTZ007 wants a %z here, which
+        # would reject every string the format actually matches).
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S")  # noqa: DTZ007
     except ValueError:
         # One retry for date-only values (midnight UTC, documented).
         try:
-            dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-        except ValueError:
-            raise ValueError(f"unparsable stockkit datetime: {date_str!r} {time_str!r}")
+            # See the note on the first `strptime`: no zone in the source.
+            dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")  # noqa: DTZ007
+        except ValueError as exc:
+            raise ValueError(f"unparsable stockkit datetime: {date_str!r} {time_str!r}") from exc
     return dt.replace(tzinfo=timezone.utc).isoformat()

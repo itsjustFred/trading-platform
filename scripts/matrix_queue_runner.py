@@ -231,6 +231,7 @@ def run_strategy(slug: str) -> dict:
     try:
         proc = subprocess.run(
             cmd,
+            check=False,
             cwd=REPO,
             text=True,
             stdout=subprocess.PIPE,

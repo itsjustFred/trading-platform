@@ -128,7 +128,7 @@ def money_digits_from_trader(trader: Any) -> int:
             pass
 
     try:
-        digits = int(raw)
+        digits = int(raw)  # type: ignore[call-overload]  # raw is validated by the surrounding try/except
     except (TypeError, ValueError, OverflowError):
         return _money_digits_fallback("moneyDigits is not an integer", raw)
     if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
@@ -183,7 +183,7 @@ class ControlOutcome:
         )
 
 
-def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")
     try:

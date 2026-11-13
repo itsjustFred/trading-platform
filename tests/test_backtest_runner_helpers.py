@@ -14,7 +14,7 @@ def test_consume_backtest_line_tracks_latest_saved_to():
         backtest_id=backtest_id,
     )
     assert outcome is not None
-    message, stage, out_path, backtest_id = outcome
+    _message, _stage, out_path, backtest_id = outcome
     assert out_path.endswith("first.trades.json")
     assert backtest_id == "first"
 

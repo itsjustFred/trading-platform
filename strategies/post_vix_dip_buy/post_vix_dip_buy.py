@@ -71,7 +71,7 @@ import numpy as np
 import pandas as pd
 
 
-def _load_vix_data(start: str = None, end: str = None) -> pd.Series | None:
+def _load_vix_data(start: str | None = None, end: str | None = None) -> pd.Series | None:
     from shared.constants import DATA_DIR
 
     ohlcv_root = DATA_DIR / "ohlcv"
@@ -110,7 +110,7 @@ def _wilder_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     vix_spike_min = float(params.get("vix_spike_min", 10.0))
     vix_level_min = float(params.get("vix_level_min", 19.0))
@@ -429,27 +429,27 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": "Entry",
+            }
+            for ts in entry_times.iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "Exit",
+            }
+            for ts in exit_times.iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

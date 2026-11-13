@@ -55,7 +55,7 @@ def _make_reference(**overrides: Any) -> ValidationReference:
 
 
 def _invoke_cli(args: list[str]) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, "-m", "validation.cli"] + args
+    cmd = [sys.executable, "-m", "validation.cli", *args]
     return subprocess.run(
         cmd,
         capture_output=True,

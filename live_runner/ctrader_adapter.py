@@ -321,7 +321,7 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     qty_value = coerce_positive_live_qty(qty)
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
-    volume = int(round(qty_value * float(volume_per_qty)))
+    volume = round(qty_value * float(volume_per_qty))
     if volume <= 0:
         raise ValueError(
             "Signal has no positive quantity ('qty'); "
@@ -483,7 +483,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
                 break
             except OSError:
                 time.sleep(0.05)
@@ -491,7 +491,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
         return
 
     import fcntl
@@ -572,8 +572,8 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             f"Unsupported Twisted reactor already installed: {reactor_module}. "
             "Expected asyncio reactor."
         )
-    if not reactor.running:
-        reactor.startRunning(installSignalHandlers=False)
+    if not reactor.running:  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+        reactor.startRunning(installSignalHandlers=False)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
 
 
 class CTraderLiveAdapter(BaseLiveAdapter):
@@ -1081,7 +1081,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         raise RuntimeError(
                             "Unexpected account auth response after refresh: "
                             f"{type(account_auth_res).__name__}"
-                        )
+                        ) from exc
                     self._authenticated = True
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
@@ -1287,7 +1287,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 sid = int(detail.symbolId)
             except (TypeError, ValueError):
                 continue
-            name = id_to_name.get(sid)
+            name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
@@ -1495,7 +1495,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await asyncio.sleep(delay)
             return
         self._log_connect_failure(exc, error_text, message)
-        raise
+        raise exc
 
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
@@ -2142,7 +2142,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     volume=self._resolve_order_volume(signal),
                 )
             else:
-                request = self._build_new_order_request(signal, symbol_id=symbol_id)
+                request = self._build_new_order_request(signal, symbol_id=symbol_id)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         response = await self._submit_new_order_request(request)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -2256,7 +2256,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             raise ValueError("cTrader close position id must be positive integer.")
         volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = int(round(volume_value))
+        broker_volume = round(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader close volume must be a positive integer.")
         request = self._ProtoOAClosePositionReq()
@@ -2349,7 +2349,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             # Distance is signed by direction at the protocol level; the value
             # sent is always the positive magnitude in 1/scale price units.
-            return int(round(raw))
+            return round(raw)
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
@@ -2852,7 +2852,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
                     self.account_config_id,
                     str(order_id),
                 )

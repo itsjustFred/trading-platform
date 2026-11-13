@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, pstdev
 
@@ -240,7 +240,7 @@ rows.sort(key=lambda r: (strategy_order.index(r['strategy']), symbol_order.get(r
 summaries = [strategy_summaries[k] for k in sorted(strategy_summaries, key=lambda s: strategy_order.index(s))]
 
 overview = {
-    'generated_at': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+    'generated_at': datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + 'Z',
     'source': str(BASE),
     'report_started_at': report.get('started_at'),
     'report_updated_at': report.get('updated_at'),

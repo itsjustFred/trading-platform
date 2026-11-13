@@ -334,8 +334,10 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
         ]
     )
     if entry_expressions:
-        for expression in entry_expressions:
-            lines.append(f"    entry_rules.append(({expression}).fillna(False))")
+        lines.extend(
+            f"    entry_rules.append(({expression}).fillna(False))"
+            for expression in entry_expressions
+        )
     else:
         lines.append(f"    entry_rules.append(_cross_over({primary_signal}, {secondary_signal}))")
 
@@ -351,8 +353,10 @@ def generate_vectorbt_strategy_code(strategy_ir: StrategyIR) -> str:
         ]
     )
     if exit_expressions:
-        for expression in exit_expressions:
-            lines.append(f"    exit_rules.append(({expression}).fillna(False))")
+        lines.extend(
+            f"    exit_rules.append(({expression}).fillna(False))"
+            for expression in exit_expressions
+        )
     else:
         lines.append(f"    exit_rules.append(_cross_under({primary_signal}, {secondary_signal}))")
 

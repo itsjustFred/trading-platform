@@ -162,7 +162,7 @@ class TestBuildDailyEquityCurve:
             pnl=500.0,
         )
         result = make_result(trades=[trade1, trade2])
-        points, returns = build_daily_equity_curve(result)
+        points, _returns = build_daily_equity_curve(result)
 
         assert points[0].time == "2024-01-01T00:00:00+00:00"
         assert any(point.time.startswith("2024-01-15") for point in points)
@@ -228,7 +228,7 @@ class TestBuildDailyEquityCurve:
         """Test daily return is calculated correctly."""
         trade1 = make_trade(pnl=5000.0)  # 5% return
         result = make_result(trades=[trade1])
-        points, returns = build_daily_equity_curve(result)
+        _points, returns = build_daily_equity_curve(result)
 
         assert len(returns) == 32
         january_return = next(item for item in returns if item["date"] == "2024-01-15")
@@ -273,7 +273,7 @@ class TestBuildDailyEquityCurve:
             trades=[make_trade(exit_time="2024-01-15T23:30:00-05:00", pnl=500.0)]
         )
 
-        points, returns = build_daily_equity_curve(result)
+        _points, returns = build_daily_equity_curve(result)
 
         by_date = {daily["date"]: daily for daily in returns}
         assert by_date["2024-01-15"]["equity"] == 100_000.0
@@ -308,7 +308,7 @@ class TestBuildDailyEquityCurve:
             trades=[make_trade(exit_time="2024-01-15T23:30:00", pnl=500.0)]
         )
 
-        points, returns = build_daily_equity_curve(result)
+        _points, returns = build_daily_equity_curve(result)
 
         by_date = {daily["date"]: daily for daily in returns}
         assert by_date["2024-01-15"]["equity"] == 100_500.0
@@ -1953,7 +1953,7 @@ class TestEnginePathMatchesCalendarPath:
 
         assert [row["date"] for row in engine_returns] == [row["date"] for row in calendar_returns]
         assert len(engine_returns) == 10, "one return per calendar day of a 10-day window"
-        for engine_row, calendar_row in zip(engine_returns, calendar_returns):
+        for engine_row, calendar_row in zip(engine_returns, calendar_returns, strict=True):
             assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-12)
             # Both published views are cent-quantised, like the curve points.
             assert engine_row["equity"] == calendar_row["equity"]
@@ -2027,7 +2027,7 @@ class TestEnginePathMatchesCalendarPath:
         assert len(calendar_returns) == 10
         assert [row["date"] for row in engine_returns] == [row["date"] for row in calendar_returns]
         assert engine_returns[0] == {"date": "2024-01-01", "return": 0.0, "equity": 100_000.0}
-        for engine_row, calendar_row in zip(engine_returns, calendar_returns):
+        for engine_row, calendar_row in zip(engine_returns, calendar_returns, strict=True):
             assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-12)
         timestamps = [point.time for point in engine_points]
         assert len(set(timestamps)) == len(timestamps)
@@ -2135,7 +2135,7 @@ class TestEngineCurvePublishedContract:
             f"2024-01-{day:02d}" for day in range(1, 11)
         ]
         assert engine_returns[0] == {"date": "2024-01-01", "return": 0.0, "equity": 100_000.0}
-        for engine_row, calendar_row in zip(engine_returns, calendar_returns):
+        for engine_row, calendar_row in zip(engine_returns, calendar_returns, strict=True):
             assert engine_row["date"] == calendar_row["date"]
             assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-12)
             assert engine_row["equity"] == calendar_row["equity"]

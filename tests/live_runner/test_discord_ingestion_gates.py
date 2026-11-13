@@ -1853,7 +1853,7 @@ class TestNitroGrammarContract:
         from signal_bots.registry import get_signal_processor
 
         processor = get_signal_processor("nitro", {})
-        with pytest.raises(ValueError, match="BUY|LONG"):
+        with pytest.raises(ValueError, match=r"BUY|LONG"):
             processor._normalize_buy_action("sell")
 
     def test_sell_bearing_words_do_not_flip_a_buy_message(self):
@@ -2445,7 +2445,7 @@ class TestRejectionStreakIsLoggedNotFatal:
             _parse_trade_signal_from_message,
         )
 
-        for index in range(count):
+        for _ in range(count):
             _parse_trade_signal_from_message(
                 _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=author),
                 default_timeframe="1h",

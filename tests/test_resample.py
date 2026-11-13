@@ -347,7 +347,7 @@ class TestEveryBarsTimestampIsItsIntervalStart:
         # through a marker range - a range is meaningless across a month boundary, where one
         # Mon-Sun week legitimately holds markers 26..31 and 1.
         stamps = pd.to_datetime(result["timestamp"])
-        for stamp, volume in zip(stamps, result["volume"]):
+        for stamp, volume in zip(stamps, result["volume"], strict=True):
             monday = stamp
             days_in_bucket = int(
                 (
@@ -563,7 +563,7 @@ class TestOriginIsOnlyPassedWherePandasHonoursIt:
         source = self._ragged_source().set_index("timestamp")
         for key, rule in TIMEFRAME_MAP.items():
             def buckets(**extra):
-                resampled = source.resample(rule, **extra).agg(
+                resampled = source.resample(rule, **extra).agg(  # noqa: B023 - buckets() is only called within this iteration
                     {"high": "max", "low": "min", "volume": "sum"}
                 )
                 return resampled[resampled["volume"] > 0]

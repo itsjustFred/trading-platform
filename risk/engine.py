@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from risk.config import RiskConfig
 from risk.models import RiskDecision, SizedOrder, TradeSignal
@@ -24,11 +25,11 @@ class RiskEngine:
         if atr is not None:
             try:
                 atr_value = float(atr)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"ATR value {atr!r} is not a number; refusing to size "
                     "on an uninterpretable stop distance."
-                )
+                ) from exc
             if not math.isfinite(atr_value) or atr_value <= 0:
                 raise ValueError(
                     f"ATR value {atr!r} is not finite and positive; refusing "
@@ -136,7 +137,7 @@ class RiskEngine:
         )
 
     @staticmethod
-    def _finite_number(value: object, field_name: str) -> float:
+    def _finite_number(value: Any, field_name: str) -> float:
         if isinstance(value, bool):
             raise ValueError(f"{field_name} must be numeric")
         try:
@@ -311,9 +312,10 @@ class RiskEngine:
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
-            risk_distance: float | None = abs(signal.entry_price - stop_loss)
-            if risk_distance <= 0 or not math.isfinite(risk_distance):
-                risk_distance = None
+            distance = abs(signal.entry_price - stop_loss)
+            risk_distance: float | None = (
+                distance if distance > 0 and math.isfinite(distance) else None
+            )
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,

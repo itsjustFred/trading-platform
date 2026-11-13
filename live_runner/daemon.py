@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -121,7 +122,7 @@ def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
     )
 
 
-def _is_terminal_ctrader_runtime_error(exc: BaseException) -> bool:
+def _is_terminal_ctrader_runtime_error(exc: BaseException | str) -> bool:
     if isinstance(exc, CTraderAuthTerminalError):
         return True
     message = str(exc).strip().lower()
@@ -397,7 +398,7 @@ def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
 
 
 def _coerce_live_float(
-    value: object,
+    value: Any,
     *,
     field_name: str,
     minimum: float | None = None,
@@ -416,7 +417,7 @@ def _coerce_live_float(
 
 
 def _coerce_live_int(
-    value: object,
+    value: Any,
     *,
     field_name: str,
     minimum: int | None = None,
@@ -732,7 +733,7 @@ def _apply_signal_processor(
         "timeframe": signal.timeframe,
         "metadata": dict(signal.metadata or {}),
     }
-    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
+    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
     metadata = dict(signal.metadata or {})
     metadata.update(dict(processed.metadata or {}))
     metadata["signal_processor"] = processor_name
@@ -935,7 +936,7 @@ def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> i
     open_positions_count = 0
     for position in positions:
         try:
-            position_qty = float(position.get("qty") or 0.0)
+            position_qty = float(position.get("qty") or 0.0)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         except (TypeError, ValueError):
             position_qty = 0.0
         if abs(position_qty) > 0:
@@ -1017,7 +1018,7 @@ async def prepare_order_with_risk(
             update["action"] = close_action
         # C1/B2: the broker-resolved flatten qty is binding — pass it
         # explicitly so the adapter never re-sizes.
-        return signal.model_copy(update=update), float(metadata["explicit_qty"])
+        return signal.model_copy(update=update), float(metadata["explicit_qty"])  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -1091,7 +1092,7 @@ async def prepare_order_with_risk(
                 }
             },
         )
-    metadata["stop_loss"] = float(stop_loss)
+    metadata["stop_loss"] = float(stop_loss)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
     if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
     else:
@@ -1217,7 +1218,7 @@ def _trade_signal_to_live_signal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),
         symbol=signal.symbol,
-        action=live_action,
+        action=live_action,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         theoretical_price=float(signal.entry_price),
         timestamp=datetime.now(timezone.utc),
         metadata=metadata,
@@ -2223,14 +2224,14 @@ def _create_adapter_for_account(
             )
             return None
     if account.broker == "ctrader":
-        credentials = _resolve_ctrader_credentials(env_values)
-        if credentials is None:
+        ctrader_credentials = _resolve_ctrader_credentials(env_values)
+        if ctrader_credentials is None:
             logger.warning(
                 "Missing cTrader credentials for account",
                 extra={"data": {"account_id": account.id}},
             )
             return None
-        app_id, app_secret, access_token, refresh_token, demo = credentials
+        app_id, app_secret, access_token, refresh_token, demo = ctrader_credentials
         account_identifier = ctrader_account_identifier(account)
         try:
             return CTraderLiveAdapter(
@@ -2980,7 +2981,7 @@ async def _poll_balances(
         async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
             try:
                 await asyncio.wait_for(
-                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),  # noqa: B023 - _poll_one is gathered and awaited within this loop iteration
                     timeout=BALANCE_POLL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -3604,7 +3605,7 @@ async def _enforce_stopped_deployments(
                 "data": {
                     "deployment_id": deployment_id,
                     "account_id": deployment.account_id,
-                    "cancelled": cancelled.describe(),
+                    "cancelled": cancelled.describe(),  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
                     "flattened": flattened.describe(),
                 }
             },
@@ -3759,7 +3760,11 @@ async def _connect_active_accounts(
         ),
         return_exceptions=True,
     )
-    for account_id, result in zip(sorted(account_ids), results):
+    # `results` is one entry per `account_ids` element: `asyncio.gather`
+    # returns one result per awaitable it was given, in order. `strict=True`
+    # turns "the two got out of step" into an error instead of into weights
+    # read off the wrong account.
+    for account_id, result in zip(sorted(account_ids), results, strict=True):
         if isinstance(result, asyncio.CancelledError):
             raise result
         if isinstance(result, BaseException):

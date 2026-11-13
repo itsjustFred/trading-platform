@@ -105,7 +105,69 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = [
+    "E", "F", "I", "W",
+    # Bug-class rules only (no style families, no mass reformat). Each family
+    # enabled here was enabled only once every hit it produced had been fixed, so
+    # adding to this list is never free: enable it, fix it, or document below why
+    # it stays off.
+    #
+    # `B` in full, not a subset. The bugbear rules this repo already had (B006,
+    # B008, B023, B904) plus the four that were firing and were fixed: B007 (an
+    # unused loop index silently reads as "the index matters" at review time),
+    # B009/B010 (`getattr`/`setattr` with a constant name, which is the
+    # "dynamic lookup" without the dynamism - and a name a refactor cannot see),
+    # and B905 (`zip()` that truncates the longer side instead of asserting the
+    # two sequences are the same length).
+    "B",
+    # `DTZ` in full: naive datetimes. A trading platform cross-references a
+    # broker's bar timestamps, a calendar's session dates and a UTC
+    # order-submission deadline, so a naive `datetime.now()` on one side of a
+    # comparison against an aware one is either a TypeError at the worst moment
+    # or a silently mis-signed staleness verdict. DTZ901 is not excluded -
+    # `datetime.min`/`max` used as a bound is exactly the same trap.
+    "DTZ",
+    # `PERF` in full: manual comprehension loops. Every hit here is the same
+    # shape and is rewritten to the comprehension form, which is not a style
+    # change but a difference between building an intermediate list and not.
+    "PERF",
+    "PLE",     # pylint errors (e.g. bare raise outside a handler)
+    "PLW0120", # else on a loop that never breaks
+    "PLW0602", # global declared but never assigned
+    "PLW1510", # subprocess.run without explicit check=
+    "RUF005",  # collection literal concatenation instead of unpacking
+    "RUF006",  # fire-and-forget asyncio task that can be garbage collected
+    "RUF007",  # zip() over a sequence and itself shifted by one, i.e. pairwise
+    "RUF012",  # mutable class attribute default
+    "RUF013",  # implicit Optional
+    "RUF015",  # single-element slice as a first-element access
+    "RUF019",  # `if key in dict:` guarding a plain dict access
+    "RUF021",  # `and`/`or` chain without explicit parentheses
+    "RUF023",  # unsorted `__slots__`
+    "RUF036",  # `None` not last in a union
+    "RUF043",  # `pytest.raises(match=...)` pattern with unescaped metacharacters
+    "RUF046",  # `int()` around a value that is already an integer
+    "RUF059",  # unpacked variable that is never used
+    "S307",    # eval()
+]
+
+# Families NOT enabled, and why each stays off rather than being fixed:
+#   UP   `datetime.timezone.utc` -> `datetime.UTC` is a 470-site pure rename whose
+#        value is nil and whose diff cost is enormous; the DTZ family above already
+#        forces the timezone question to be answered. UP042 (`str, Enum` ->
+#        `StrEnum`) is a real behaviour change for serialised model fields.
+#   SIM/PT Both are style/test-quality families, and PT011 (narrow
+#        `pytest.raises` to the specific exception type) risks a test being
+#        narrowed away rather than made honest.
+#   PL   PLC0415 (import outside top level) and PLR2004 (magic value) fire
+#        3,400+ times on code that is correct, which would turn the advisory
+#        `ruff check .` step into noise nobody reads.
+#   S    S101 alone fires 9,091 times, every one of it in tests, where the
+#        assert IS the check.
+#   RUF001-003 (ambiguous unicode), RUF022 (unsorted `__all__`), RUF100
+#        (unused noqa) are set-dependent or cosmetic; RUF100 in particular
+#        counts directives for rules that are not enabled, so its number would
+#        change every time this block does.
 
 # E402 is "module level import not at top of file", and every occurrence here is
 # load-order the module genuinely depends on. None are accidental: these files
@@ -133,6 +195,27 @@ select = ["E", "F", "I", "W"]
 "scripts/*" = ["E402"]
 "signal_bots/registry.py" = ["E402"]
 "viewer/main.py" = ["E402"]
+# pynecore strategies declare inputs as `src = input.source(...)` default
+# arguments; that call IS the framework's declaration API and must run at
+# definition time, so B008 is a false positive there.
+"strategies/pynecore_*/*" = ["B008"]
+# Test doubles: class-level mutable attributes are per-test fixtures that are
+# never shared across instances in a way that matters, and test subprocesses
+# are asserted on via returncode/output rather than check=True.
+"tests/*" = ["RUF012", "PLW1510"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+# Scope is deliberately narrow: the packages whose type errors can become a
+# wrong order. Widen by adding paths here, not by loosening the flags.
+files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py"]
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_missing_imports = true
+# Imported-but-unchecked modules are followed so signatures resolve, but their
+# own errors are not reported (they are outside `files`).
+follow_imports = "silent"

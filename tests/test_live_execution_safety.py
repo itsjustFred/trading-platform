@@ -1291,7 +1291,7 @@ def test_ctrader_reconcile_sparse_deal_uses_order_executed_volume():
 
 def test_ctrader_get_positions_qty_matches_volume_contract():
     """get_positions qty must use the same unit as signal metadata qty."""
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
     adapter._authenticated = True
     adapter._symbol_name_to_id = {"EURUSD": 1}
 
@@ -2045,7 +2045,9 @@ def test_live_signal_timestamp_lookup_normalizes_to_utc(isolated_db):
     assert database.get_live_signal_timestamp("") is None
     assert database.get_live_signal_timestamp(str(uuid4())) is None
 
-    naive_timestamp = datetime(2026, 7, 15, 10, 30)
+    # Deliberately naive: this is the timestamp the normalisation under test
+    # exists to stamp, so the fixture has to stay naive.
+    naive_timestamp = datetime(2026, 7, 15, 10, 30)  # noqa: DTZ001
     naive_signal = LiveSignal(
         deployment_id="dep-naive",
         symbol="EURUSD",
@@ -3166,7 +3168,7 @@ def test_ctrader_order_recovery_fails_closed_when_match_is_not_unique(
     orders, has_more
 ):
     """Zero, duplicate, or incomplete broker results must never select an order."""
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
 
     class _OrderListReq:
         def __init__(self) -> None:
@@ -3391,7 +3393,7 @@ def test_alpaca_build_order_request_rejects_unknown_signal_action():
 
 
 def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
-    module, adapter = _make_ctrader_adapter()
+    _module, adapter = _make_ctrader_adapter()
     adapter._client = object()
     adapter._connected = True
     adapter._authenticated = True
@@ -3433,7 +3435,7 @@ def test_ctrader_rejects_unknown_signal_action_instead_of_selling():
 
 def test_ctrader_new_order_request_carries_sl_tp_prices():
     """The computed SL/TP must land on the broker request, not just metadata."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -3450,8 +3452,8 @@ def test_ctrader_new_order_request_carries_sl_tp_prices():
     # MARKET orders ignore the absolute stopLoss/takeProfit fields; the
     # distances must arrive via the relative int64 fields (1/100000 units):
     # BUY stop = entry - relativeStopLoss, take = entry + relativeTakeProfit.
-    assert request.relativeStopLoss == int(round(abs(1.1 - 1.05) * 100_000))
-    assert request.relativeTakeProfit == int(round(abs(1.2 - 1.1) * 100_000))
+    assert request.relativeStopLoss == round(abs(1.1 - 1.05) * 100_000)
+    assert request.relativeTakeProfit == round(abs(1.2 - 1.1) * 100_000)
 
 
 @pytest.mark.parametrize(
@@ -3489,12 +3491,12 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
         )
 
     buy_request = adapter._build_new_order_request(_signal("buy", 1.05, 1.2), symbol_id=7)
-    assert buy_request.relativeStopLoss == int(round(0.05 * 100_000))
-    assert buy_request.relativeTakeProfit == int(round(0.1 * 100_000))
+    assert buy_request.relativeStopLoss == round(0.05 * 100_000)
+    assert buy_request.relativeTakeProfit == round(0.1 * 100_000)
 
     sell_request = adapter._build_new_order_request(_signal("sell", 1.2, 1.0), symbol_id=7)
-    assert sell_request.relativeStopLoss == int(round(0.1 * 100_000))
-    assert sell_request.relativeTakeProfit == int(round(0.1 * 100_000))
+    assert sell_request.relativeStopLoss == round(0.1 * 100_000)
+    assert sell_request.relativeTakeProfit == round(0.1 * 100_000)
 
     wrong_side = adapter._build_new_order_request
     wrong_side_signal = _signal("buy", 1.2, 1.05)
@@ -3512,7 +3514,7 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
 
 
 def test_ctrader_new_order_request_fails_closed_without_sl_tp():
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -3530,7 +3532,7 @@ def test_ctrader_new_order_request_fails_closed_without_sl_tp():
 
 def test_ctrader_build_new_order_request_rejects_unknown_signal_action():
     """The request-builder guard must hold even when submit_order is bypassed."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
     bad_signal = _live_signal_with_action("close")
 
     with pytest.raises(ValueError, match=r"[Uu]nsupported .*action: close"):
@@ -3864,7 +3866,7 @@ def test_alpaca_unbounded_tp_rejects_invalid_stop() -> None:
 
 
 def test_ctrader_exit_only_uses_position_addressed_close():
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
 
     class _CloseReq:
         def __init__(self) -> None:
@@ -4012,7 +4014,7 @@ def test_ctrader_exit_only_with_multiple_position_ids_fails_closed() -> None:
 
 def test_ctrader_entry_guard_still_blocks_naked_non_exit_orders():
     """The exit-only bypass must not open a hole on cTrader either."""
-    module, adapter = _make_ctrader_request_builder_adapter()
+    _module, adapter = _make_ctrader_request_builder_adapter()
     signal = LiveSignal(
         deployment_id="dep-1",
         symbol="AAPL",
@@ -4189,7 +4191,7 @@ def test_ctrader_index_fallback_class() -> None:
 def test_ctrader_unknown_symbol_fails_closed() -> None:
     """No broker props + no fallback class = no trade, never a guessed size."""
     _module, adapter = _make_ctrader_adapter()
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         adapter._resolve_order_volume(_ctrader_signal("NOTASYMBOLXYZ", {"qty": 5.0}))
 
 
@@ -4260,7 +4262,7 @@ def test_ctrader_non_fx_six_letter_symbols_fail_closed(symbol: str) -> None:
     from live_runner import ctrader_adapter as module
 
     assert module._fallback_scale_class(symbol) is None
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         module._fallback_symbol_scale(symbol)
 
 
@@ -4270,7 +4272,7 @@ def test_ctrader_crypto_symbols_fail_closed_not_fx() -> None:
 
     assert module._fallback_scale_class("BTCUSD") is None
     assert module._fallback_scale_class("ETHUSD") is None
-    with pytest.raises(ValueError, match="[Uu]nknown cTrader symbol"):
+    with pytest.raises(ValueError, match=r"[Uu]nknown cTrader symbol"):
         module._fallback_symbol_scale("BTCUSD")
 
 

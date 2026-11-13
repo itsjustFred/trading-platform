@@ -460,6 +460,8 @@ class EngineStatsKeys:
         collision; the engine value under a canonical name is dropped.
         """
         merged: dict[str, Any] = dict(engine_specific or {})
-        for key, value in (canonical or {}).items():
-            merged[key] = value
+        # `dict.update` is the same operation as the per-item loop it replaces, and
+        # it keeps the precedence the docstring promises: canonical wins on a
+        # collision, the engine value under a canonical name is dropped.
+        merged.update(canonical or {})
         return merged

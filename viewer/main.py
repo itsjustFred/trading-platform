@@ -2358,7 +2358,7 @@ def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
     elapsed = (ended - started).total_seconds()
     if elapsed < 0:
         return 0
-    return int(round(elapsed))
+    return round(elapsed)
 
 
 def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
@@ -2371,7 +2371,7 @@ def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | 
     eta = elapsed_seconds * (100.0 - progress) / progress
     if not math.isfinite(eta):
         return None
-    return max(0, int(round(eta)))
+    return max(0, round(eta))
 
 
 def _json_safe(value: Any) -> Any:
@@ -2511,7 +2511,7 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
     sampled.append(float(values[-1]))
     # Hard cap in case bucket logic overshoots.
     if len(sampled) > normalized_limit:
-        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+        sampled = [*sampled[: normalized_limit - 1], float(values[-1])]
     return sampled
 
 
@@ -8195,7 +8195,7 @@ def _download_and_verify_missing_data(
     for index, missing in enumerate(missing_items, start=1):
         progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_before, f"Downloading data... {int(round(progress_before))}%")
+            progress_callback(progress_before, f"Downloading data... {round(progress_before)}%")
 
         symbol = str(missing["symbol"])
         source = str(missing["source"])
@@ -8251,7 +8251,7 @@ def _download_and_verify_missing_data(
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+            progress_callback(progress_after, f"Downloading data... {round(progress_after)}%")
 
 
 def _ensure_backtest_data_availability(
@@ -8486,14 +8486,14 @@ def _aggregate_symbol_timeframe_entries(
 ) -> list[dict[str, Any]]:
     logical_entries: list[dict[str, Any]] = []
     merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
-    for entry in merged_entries:
-        logical_entries.append(
-            _aggregate_ohlcv_entry_payload(
-                entry,
-                include_category=include_category,
-                include_size_bytes=include_size_bytes,
-            )
+    logical_entries.extend(
+        _aggregate_ohlcv_entry_payload(
+            entry,
+            include_category=include_category,
+            include_size_bytes=include_size_bytes,
         )
+        for entry in merged_entries
+    )
 
     logical_entries.sort(
         key=lambda item: (
@@ -9580,7 +9580,7 @@ def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[st
     event_count = max(1, int(event_ns.size))
     budget_per_event = max(REPLAY_MIN_BARS_PER_EVENT, REPLAY_TARGET_BARS // event_count)
     bars_per_event = min(REPLAY_MAX_BARS_PER_EVENT, budget_per_event)
-    window_before = max(1, int(round(bars_per_event * 0.6)))
+    window_before = max(1, round(bars_per_event * 0.6))
     window_after = max(1, bars_per_event - window_before)
     insert_idx = np.searchsorted(timestamp_values, event_ns, side="left")
     insert_idx = np.clip(insert_idx, 0, len(df) - 1)
@@ -10283,7 +10283,7 @@ def _backtest_runner_stage(message: str) -> tuple[float, str] | None:
             progress_message = payload[2].strip() or "Running backtest..."
             scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
             if progress_message:
-                return (scaled, f"Running backtest... {int(round(scaled))}%")
+                return (scaled, f"Running backtest... {round(scaled)}%")
             return (scaled, "Running backtest...")
         return None
     if "auto-detected date range" in normalized:
@@ -10550,13 +10550,13 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 # collects the exit status after EOF (or after the kill).
                 try:
                     returncode = proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
                     if proc.poll() is None:
                         watchdog_timed_out.set()
                         _kill_process_group(proc)
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
-                    )
+                    ) from exc
                 if watchdog_timed_out.is_set():
                     # The watchdog killed the child, so its returncode is the
                     # signal that terminated it (-9), not a real exit status.
@@ -12491,7 +12491,11 @@ async def get_live_dashboard() -> dict[str, Any]:
         *(_live_trades_payload(account.id) for account in accounts)
     )
 
-    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
+    # Both payload lists come from `asyncio.gather` over the same `accounts`
+    # comprehension, so all three are the same length; `strict=True` turns a
+    # dropped gather result into an error instead of into another account's
+    # trades being shown under this one.
+    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads, strict=True):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
         total_equity += equity
         account_payloads.append(
@@ -14343,14 +14347,14 @@ async def list_logs() -> list[LogFileModel]:
     logs: list[LogFileModel] = [
         LogFileModel(name=ALL_LOGS_NAME, size_bytes=total_size, modified=latest_modified)
     ]
-    for log_file in log_files:
-        logs.append(
-            LogFileModel(
-                name=log_file.name,
-                size_bytes=log_file.stat().st_size,
-                modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
-            )
+    logs.extend(
+        LogFileModel(
+            name=log_file.name,
+            size_bytes=log_file.stat().st_size,
+            modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
         )
+        for log_file in log_files
+    )
     return logs
 
 

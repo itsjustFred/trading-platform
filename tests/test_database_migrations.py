@@ -521,7 +521,7 @@ def test_equity_curve_column_add_and_backfill_happen_in_same_migration(isolated_
 
 
 def test_equity_curve_backfill_from_equity_points(isolated_db) -> None:
-    database, engine, _data_dir, _bt = isolated_db
+    database, _engine, _data_dir, _bt = isolated_db
     database.init_db()
     with get_session() as session:
         session.add(
@@ -543,7 +543,7 @@ def test_equity_curve_backfill_from_equity_points(isolated_db) -> None:
 
 
 def test_equity_curve_backfill_from_json_file(isolated_db) -> None:
-    database, engine, _data_dir, backtests_dir = isolated_db
+    database, _engine, _data_dir, backtests_dir = isolated_db
     database.init_db()
     with get_session() as session:
         session.add(
@@ -574,7 +574,7 @@ def test_equity_curve_backfill_from_json_file(isolated_db) -> None:
 
 
 def test_equity_curve_backfill_rejects_json_with_mismatched_id(isolated_db) -> None:
-    database, engine, _data_dir, backtests_dir = isolated_db
+    database, _engine, _data_dir, backtests_dir = isolated_db
     database.init_db()
     with get_session() as session:
         session.add(
@@ -602,7 +602,7 @@ def test_equity_curve_backfill_rejects_json_with_mismatched_id(isolated_db) -> N
 
 
 def test_equity_curve_backfill_does_not_overwrite_non_empty(isolated_db) -> None:
-    database, engine, _data_dir, backtests_dir = isolated_db
+    database, _engine, _data_dir, _backtests_dir = isolated_db
     database.init_db()
     original = [{"time": "2024-01-01", "equity": 1.0}]
     with get_session() as session:
@@ -622,7 +622,7 @@ def test_equity_curve_backfill_does_not_overwrite_non_empty(isolated_db) -> None
 
 
 def test_migrate_json_tops_up_empty_equity_curve_when_skipping(isolated_db) -> None:
-    database, engine, _data_dir, backtests_dir = isolated_db
+    database, _engine, _data_dir, backtests_dir = isolated_db
     database.init_db()
     # Existing row with an empty equity_curve (simulates earlier migration).
     with get_session() as session:

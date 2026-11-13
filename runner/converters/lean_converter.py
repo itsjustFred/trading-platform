@@ -182,7 +182,7 @@ def _build_trades(data: dict) -> list[Trade]:
             ]
             trade = Trade(
                 id=len(trades) + 1,
-                symbol=ticker,
+                symbol=ticker,  # noqa: B023 - comprehension is evaluated immediately
                 direction=open_direction,
                 entry_time=entry_dt,
                 entry_price=round(entry_price, 6),

@@ -270,7 +270,7 @@ class TestRiskTargetMath:
         # pin the vectorbt side through risk_math's stop_distance fallback.
         frame = _deterministic_frame()
         env = _sizing_env_from(frame, stop=False)
-        tmp_path, strategy_path, config = env
+        _tmp_path, strategy_path, config = env
         result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades
         risk_math = result.trades[0].meta["risk_math"]

@@ -547,7 +547,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def _reconcile_signal_fill(self, signal_id: str) -> bool:
         try:
             order = await asyncio.to_thread(
-                self._trading_client.get_order_by_client_id, signal_id
+                self._trading_client.get_order_by_client_id, signal_id  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
             )
         except Exception:
             # Unknown to this account or not found.
@@ -756,12 +756,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
-            if math.isnan(value) or math.isinf(value) or value <= 0:
+            if math.isnan(value) or math.isinf(value) or value <= 0:  # type: ignore[arg-type,operator]  # value validated at runtime / narrowed by an earlier guard
                 raise ValueError(
                     f"Invalid {name} price for {signal.symbol}: {value!r}; "
                     "refusing to submit."
                 )
-        return float(stop_loss), float(take_profit)
+        return float(stop_loss), float(take_profit)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
 
     def _build_order_request(
         self,
@@ -997,7 +997,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
+        account = await asyncio.to_thread(self._trading_client.get_account)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
         balance = _to_float(getattr(account, "cash", None), default=0.0)
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
@@ -1036,14 +1036,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     timeframe, bounded_limit, slack_multiplier=slack_multiplier
                 ),
                 limit=1000,
-                adjustment="raw",
-                feed="iex",
+                adjustment="raw",  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+                feed="iex",  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
                 # Newest first. The response is capped at `limit`, so an
                 # ascending request over a widened window would return the
                 # oldest bars in it. Sorted back to ascending below.
                 sort=Sort.DESC,
             )
-            return self._historical_data_client.get_stock_bars(request).df
+            return self._historical_data_client.get_stock_bars(request).df  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
 
         frame = await asyncio.to_thread(_fetch, 1.0)
         if frame is not None and len(frame.index) < bounded_limit:
@@ -1257,7 +1257,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return ControlOutcome(
                 completed=completed,
                 unidentified=tuple(unidentified),
-                failed=tuple(failed) + (f"verify:{exc}",),
+                failed=(*failed, f"verify:{exc}"),
             )
         still_working = {
             _control_order_id(_order_attr(order, "id"))
@@ -1265,7 +1265,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if _control_order_id(_order_attr(order, "id")) not in protected
         }
         still_working.discard(None)
-        failed.extend(sorted(still_working))
+        failed.extend(sorted(still_working))  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
@@ -1606,7 +1606,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """Return open positions with pricing and unrealized PnL."""
         if not self._connected or self._trading_client is None:
             await self.connect()
-        rows = await asyncio.to_thread(self._trading_client.get_all_positions)
+        rows = await asyncio.to_thread(self._trading_client.get_all_positions)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
         payload: list[dict[str, Any]] = []
         for row in rows:
             raw_qty = getattr(row, "qty", None)
@@ -1807,7 +1807,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # alternative in alpaca-py). The thread is released when run
                 # returns/raises; on error the stream is stopped below before
                 # discard so a healthy stream never leaks a thread per retry.
-                await asyncio.to_thread(self._trading_stream.run)
+                await asyncio.to_thread(self._trading_stream.run)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

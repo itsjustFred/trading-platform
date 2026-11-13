@@ -172,7 +172,7 @@ def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_n
     """
     from sqlalchemy.exc import IntegrityError
 
-    database, engine, _data_dir = isolated_db_no_schema
+    _database, engine, _data_dir = isolated_db_no_schema
     from scripts.live_smoke import _ensure_ctrader_smoke_deployment
 
     with pytest.raises(IntegrityError):

@@ -228,7 +228,7 @@ def test_one_trade_per_day():
     params["regime_filter_mode"] = "low"
     params["use_candle_close"] = False
 
-    entries, exits, indicators, _ = mod.generate_signals(df, params)
+    entries, _exits, _indicators, _ = mod.generate_signals(df, params)
     entry_indices = entries[entries].index
     # At most one entry per day
     days = df.loc[entry_indices, "timestamp"].dt.date
@@ -500,7 +500,7 @@ def test_sl_price_present_in_indicators():
     params["atr_regime_factor"] = 2.0
     params["atr_period"] = 1
     params["atr_long_period"] = 1
-    entries, exits, indicators, _ = mod.generate_signals(df, params)
+    entries, _exits, indicators, _ = mod.generate_signals(df, params)
     assert "sl_price" in indicators
     sl = indicators["sl_price"]
     entry_sl = sl[entries]

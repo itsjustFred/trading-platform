@@ -149,13 +149,18 @@ def probe_single_day(
 
 
 def _year_probe_date(year: int) -> date:
-    today = date.today()
+    # UTC, not the machine's local calendar: the probe is a single .bi5
+    # hourly bucket on Dukascopy's feed, whose day boundary is UTC. A local
+    # `date.today()` would make the answer a property of the caller's
+    # timezone and the same code would probe a different date on two hosts.
+    today = datetime.now(timezone.utc).date()
     candidate = min(date(year, 12, 31), today)
     return candidate - timedelta(days=1) if candidate.weekday() == 5 else candidate
 
 
 def _month_probe_date(year: int, month: int) -> date:
-    today = date.today()
+    # UTC, for the reason documented on `_year_probe_date`.
+    today = datetime.now(timezone.utc).date()
     candidate = min(date(year, month, calendar.monthrange(year, month)[1]), today)
     return candidate - timedelta(days=1) if candidate.weekday() == 5 else candidate
 
@@ -237,7 +242,7 @@ def _find_start_year(
     start_year: int = 2020,
     min_year: int = 1990,
 ) -> int:
-    current_year = date.today().year
+    current_year = datetime.now(timezone.utc).year
     year = min(start_year, current_year)
     _progress(f"Progress {symbol} {timeframe}: locating start year")
 

@@ -210,7 +210,7 @@ class TestNoTradeTrialsCannotWin:
             n_trials=2,
             parameter_ranges={"fast_length": {"type": "int", "min": 2, "max": 10}},
         )
-        with pytest.raises(RuntimeError, match="no-trade|no trades|no completed"):
+        with pytest.raises(RuntimeError, match=r"no-trade|no trades|no completed"):
             run_optimization(config, progress_callback=None)
 
         # Whatever the value is, it must carry the explicit no-trade penalty marker.

@@ -581,11 +581,9 @@ class MT5XLSXImporter(BaseImporter):
         # the same convention as the HTML importer. A per-column detector
         # let the two importers disagree on one report (unified detector,
         # single convention per report).
-        cell_values: list[str | None] = []
-        for _, row in orders_df.iterrows():
-            for value in row:
-                if pd.notna(value):
-                    cell_values.append(str(value))
+        cell_values: list[str | None] = [
+            str(value) for _, row in orders_df.iterrows() for value in row if pd.notna(value)
+        ]
         decimal_comma = detect_decimal_comma(cell_values)
 
         def _parse(cell: Any, order_id: Any) -> float | None:
@@ -878,7 +876,10 @@ class MT5XLSXImporter(BaseImporter):
         tz = _resolve_source_timezone(source_tz)
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
-                dt = datetime.strptime(text, fmt)
+                # The report carries no zone in the string itself; `tz` is
+                # resolved explicitly above and the naive value is then
+                # converted, so a `%z` in the format would reject the input.
+                dt = datetime.strptime(text, fmt)  # noqa: DTZ007
                 if tz:
                     dt = dt.replace(tzinfo=tz)
                     dt = dt.astimezone(timezone.utc)

@@ -70,7 +70,7 @@ def _parse_minutes(value: str) -> int:
     return int(hour) * 60 + int(minute)
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     atr_period = int(
         params.get("daily_atr_period", params.get("atr_period", params.get("DailyATRMulti", 5)))
@@ -300,27 +300,27 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": "Entry",
+            }
+            for ts in entry_times.iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "Exit",
+            }
+            for ts in exit_times.iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

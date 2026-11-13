@@ -47,6 +47,15 @@ jobs:
       - name: Lint (advisory)
         continue-on-error: true
         run: uv run --no-sync --no-build ruff check .
+      - name: Type check (mypy)
+        if: runner.os == 'Linux'
+        # mypy is pinned here, not in the dev extra: `uv lock` could not be
+        # regenerated when this was added (no disk space for the full resolve
+        # in the authoring environment), and a hand-edited uv.lock would fail
+        # `uv lock --check`. --with layers it over the locked project env, so
+        # third-party types resolve exactly as in local runs. Config and scope
+        # live in [tool.mypy] in pyproject.toml.
+        run: uv run --no-sync --no-build --with mypy==2.4.1 mypy
       - name: Tests
         if: runner.os == 'Linux'
         run: >-

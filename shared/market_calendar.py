@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import datetime as dt
 from functools import lru_cache
+from itertools import pairwise
 from zoneinfo import ZoneInfo
 
 from pandas.tseries.holiday import (
@@ -146,7 +147,13 @@ _HOLIDAY_RULES: tuple[Holiday, ...] = (
         month=6,
         day=19,
         observance=_observed_fixed_date,
-        start_date=dt.datetime(2022, 1, 1),
+        # Naive by necessity: `pandas.tseries.holiday.Holiday` normalises
+        # `start_date` with `Timestamp(start_date)` and then compares it against
+        # the `DatetimeIndex` its own rules generate from naive datetimes
+        # (`self.start_date.tz_localize(filter_start_date.tz)`), so an aware
+        # value here raises `TypeError` when the two sides are compared. See the
+        # `rule.dates(...)` call in `holidays()` below.
+        start_date=dt.datetime(2022, 1, 1),  # noqa: DTZ001
     ),
     GoodFriday,
     USMemorialDay,
@@ -186,8 +193,16 @@ def holidays(start: dt.date, end: dt.date) -> frozenset[dt.date]:
     """US equity closures (scheduled and known special) in ``[start, end]``."""
     found: set[dt.date] = {day for day in SPECIAL_CLOSURES if start <= day <= end}
     for rule in _HOLIDAY_RULES:
+        # Naive by necessity: `Holiday.dates` is a naive-datetime API. It
+        # normalises both bounds with `Timestamp(...)`, then filters the
+        # `DatetimeIndex` its own `rrule` produces, and both sides of that filter
+        # comparison come from these bounds - passing an aware bound here raises
+        # `TypeError: Cannot compare tz-naive and tz-aware ...` on the filter
+        # line. `moment` is reduced to `.date()` immediately below, so no
+        # timezone information is lost by the naive bound.
         for moment in rule.dates(
-            dt.datetime(start.year - 1, 1, 1), dt.datetime(end.year + 1, 12, 31)
+            dt.datetime(start.year - 1, 1, 1),  # noqa: DTZ001
+            dt.datetime(end.year + 1, 12, 31),  # noqa: DTZ001
         ):
             observed = moment.date()
             if start <= observed <= end:
@@ -369,7 +384,7 @@ def longest_scheduled_closure_days(years: tuple[int, int] = (2025, 2031)) -> flo
         raise ValueError(f"calendar window {years} contains no sessions")
     gaps = [
         (session_open_utc(nxt) - session_close_utc(cur)).total_seconds() / 86_400.0
-        for cur, nxt in zip(days, days[1:])
+        for cur, nxt in pairwise(days)
     ]
     return max(gaps)
 

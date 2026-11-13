@@ -715,7 +715,7 @@ def test_the_optimization_artifact_carries_provenance_survivorship_and_stability
         exits = (
             [
                 (_midpoint(subperiod), pnl)
-                for subperiod, pnl in zip(subperiods, realized_by_window[window])
+                for subperiod, pnl in zip(subperiods, realized_by_window[window], strict=True)
                 if pnl
             ]
             if is_train
@@ -892,7 +892,7 @@ def test_contradictory_universe_flags_fail_before_the_engine_runs(monkeypatch, t
         ]
     )
 
-    with pytest.raises(ValueError, match="as-of|as_of"):
+    with pytest.raises(ValueError, match=r"as-of|as_of"):
         cli.cmd_run(args)
 
     assert engine.run_calls == 0, "the engine ran before the flags were rejected"

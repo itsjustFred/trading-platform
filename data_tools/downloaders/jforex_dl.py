@@ -715,8 +715,7 @@ def _discover_jvm_paths() -> list[str]:
         java_home_path = Path(home)
         if not _is_trusted_java_home(java_home_path):
             continue
-        for jvm_path in _jvm_candidates_from_java_home(home):
-            candidates.append(jvm_path)
+        candidates.extend(jvm_path for jvm_path in _jvm_candidates_from_java_home(home))
 
     # Let JPype try its own platform-specific discovery as a fallback.
     try:
@@ -755,8 +754,7 @@ def _format_jvm_startup_diagnostics(
         f"Classpath source: {classpath_source}",
         f"Classpath entries ({len(classpath)}):",
     ]
-    for entry in classpath:
-        lines.append(f"  - {entry}")
+    lines.extend(f"  - {entry}" for entry in classpath)
 
     lines.append(f"JVM candidates tried ({len(candidates)}):")
     if candidates:
@@ -980,16 +978,16 @@ def _collect_jforex_rows(
         while cursor <= end_ms:
             window_end = min(cursor + step_ms - 1, end_ms)
             ticks = history.getTicks(java_instrument, cursor, window_end)
-            for tick in ticks:
-                rows.append(
-                    (
-                        int(tick.getTime()),
-                        float(tick.getAsk()),
-                        float(tick.getBid()),
-                        float(tick.getAskVolume()),
-                        float(tick.getBidVolume()),
-                    )
+            rows.extend(
+                (
+                    int(tick.getTime()),
+                    float(tick.getAsk()),
+                    float(tick.getBid()),
+                    float(tick.getAskVolume()),
+                    float(tick.getBidVolume()),
                 )
+                for tick in ticks
+            )
             cursor = window_end + 1
         return rows
 
@@ -1014,17 +1012,17 @@ def _collect_jforex_rows(
             cursor,
             window_end,
         )
-        for bar in bars:
-            rows.append(
-                (
-                    int(bar.getTime()),
-                    float(bar.getOpen()),
-                    float(bar.getHigh()),
-                    float(bar.getLow()),
-                    float(bar.getClose()),
-                    float(bar.getVolume()),
-                )
+        rows.extend(
+            (
+                int(bar.getTime()),
+                float(bar.getOpen()),
+                float(bar.getHigh()),
+                float(bar.getLow()),
+                float(bar.getClose()),
+                float(bar.getVolume()),
             )
+            for bar in bars
+        )
         cursor = window_end + interval_ms
     return rows
 

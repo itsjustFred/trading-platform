@@ -249,9 +249,11 @@ def _executable_code_is_clean(code: str) -> bool:
             continue
         executable = _code_without_string_literals(segment)
         lowered = executable.lower()
-        for pattern in forbidden:
-            if pattern in lowered:
-                violations.append(f"{type(node).__name__}: {pattern!r} in {executable!r}")
+        violations.extend(
+            f"{type(node).__name__}: {pattern!r} in {executable!r}"
+            for pattern in forbidden
+            if pattern in lowered
+        )
 
     return not violations
 
