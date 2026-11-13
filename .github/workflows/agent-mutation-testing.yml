@@ -140,10 +140,10 @@ jobs:
 
       # After "Mark running" a failure here (artifact upload) would leave the
       # stage `pending` with every later job skipped, and with it the downstream
-      # stage's status the review workflow already marked pending. The SHA comes
-      # from the dispatch input, not from a step output: a failure of the first
-      # step (before `head` is written) must still leave the reporter a SHA to
-      # clear, or the pending status never reaches an error.
+      # stage's status the review workflow already marked pending. The reporter
+      # clears the resolved head and falls back to the dispatch input: a failure of
+      # the first step (before `head` is written) must still leave it a SHA to clear,
+      # or the pending status never reaches an error.
       - name: Report resolve failure
         if: failure()
         env:

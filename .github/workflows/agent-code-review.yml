@@ -187,12 +187,13 @@ jobs:
       # After "Mark stages pending" a failure here (cancel query, artifact
       # upload) would leave all three stages `pending` with every later job skipped.
       # The SHA is the resolved head (the commit "Mark stages pending" marked),
-      # or the dispatch input when the first step failed before writing `head`.
+      # or, when the first step failed before writing `head`, the dispatch input
+      # or the pushed head of a pull_request event.
       - name: Report resolve failure
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # Only a manual dispatch without head_sha whose first step failed gets
@@ -586,5 +587,36 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$ctx" \
                 -f description="Post step failed; see the run log" > /dev/null
+            fi
+          done
+
+  # A cancelled run (a hand-cancel, or a newer push through the concurrency
+  # group) skips every reporter above. This stage marks all three statuses
+  # pending on push, so without this job a cancel would strand all three on the
+  # commit. It runs only on cancellation and turns every still-pending stage
+  # status of the analysed commit into an error; a newer run that already wrote
+  # a final status is not touched (pending only).
+  report-cancelled:
+    needs: [resolve, sonar-gate, review, post]
+    if: ${{ cancelled() && needs.resolve.outputs.head != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled review run
+        run: |
+          set -euo pipefail
+          for ctx in "$REVIEW_CONTEXT" "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
+            if [ "$state" = "pending" ]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+                -f state=error -f context="$ctx" \
+                -f description="Review run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
             fi
           done

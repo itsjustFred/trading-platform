@@ -378,11 +378,14 @@ def test_every_dispatch_refuses_a_head_that_moved_past_its_sha() -> None:
 
 def test_a_cancelled_run_clears_its_pending_stage() -> None:
     """A cancelled run skips every failure() reporter and the post job, so without a dedicated
-    job a hand-cancel or a superseding dispatch strands the stage `pending` on the head. The
-    mutation and pre-mortem stages, which mark themselves running, each own a job that runs
-    only on cancellation and turns their (and every later) still-pending context into an
-    error."""
-    owed = {MUTATION: ("MUTATION_CONTEXT", "PREMORTEM_CONTEXT"), PREMORTEM: ("PREMORTEM_CONTEXT",)}
+    job a hand-cancel or a superseding run strands the stage `pending` on the head. Every stage
+    owns a job that runs only on cancellation and turns its own and every later still-pending
+    context into an error; the review stage owes all three, since it marks all three on push."""
+    owed = {
+        REVIEW: ("REVIEW_CONTEXT", "MUTATION_CONTEXT", "PREMORTEM_CONTEXT"),
+        MUTATION: ("MUTATION_CONTEXT", "PREMORTEM_CONTEXT"),
+        PREMORTEM: ("PREMORTEM_CONTEXT",),
+    }
     for name, contexts in owed.items():
         jobs = _load(name)["jobs"]
         job = jobs.get("report-cancelled")
