@@ -510,7 +510,26 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
-                if order.stop_loss is None and getattr(order, "_sizing_stop_loss", None) is None:
+                # Fail closed on an unpriced fill bar (e.g. an all-NaN OHLC
+                # row): a non-finite fill would open a position at
+                # entry_price=NaN and poison every later pnl/equity value
+                # (or, with an explicit stop, crash deep in the risk engine).
+                # The contract does not define a fill on unusable data, so
+                # refuse it loudly, matching vectorbt's `_size_trade`
+                # ("entry_price must be finite and > 0").
+                if not math.isfinite(float(fill_price)) or float(fill_price) <= 0:
+                    raise ValueError(
+                        f"Cannot fill {order.symbol} {order.direction} "
+                        f"{order.order_type.value} order created at "
+                        f"{order.created_time} on bar {fill_time}: fill price "
+                        f"{fill_price!r} is not finite and > 0 (unpriced bar)."
+                    )
+                # A fallback sizing stop (no explicit stop, no sizing-only
+                # stop) is a distance from the ENTRY, i.e. the fill. The
+                # value stored at order creation was derived from the signal
+                # bar's close, so re-derive it here from the actual fill
+                # (contract §4: "2% of entry").
+                if order.stop_loss is None and not getattr(order, "_sizing_only_stop", False):
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     fallback_distance = (
                         float(order.stop_distance)
@@ -599,6 +618,29 @@ class TradeEngine:
                             stop_loss_price=sizing_stop_value,
                             direction=order.direction,
                             take_profit_price=take_profit,
+                            stop_distance=order.stop_distance,
+                            exclude_order=order,
+                        )
+                        if order.quantity <= 0:
+                            continue
+                    else:
+                        # No explicit and no sizing-only stop: the order was
+                        # sized at creation from the SIGNAL bar's close with
+                        # the fallback stop. Re-size on the fill price, like
+                        # every other sizing path here (contract §4 sizes from
+                        # the entry). Without this, a gap between signal close
+                        # and next open mis-sizes the risk and can breach the
+                        # max_leverage / position notional cap (the cap is
+                        # applied as equity * limit / entry_price).
+                        order.quantity = self._calculate_position_size(
+                            entry_price=float(fill_price),
+                            stop_loss_price=None,
+                            direction=order.direction,
+                            take_profit_price=(
+                                float(order.take_profit_levels[0]["price"])
+                                if order.take_profit_levels
+                                else None
+                            ),
                             stop_distance=order.stop_distance,
                             exclude_order=order,
                         )
