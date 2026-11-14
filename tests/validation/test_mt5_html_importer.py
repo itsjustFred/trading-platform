@@ -329,3 +329,40 @@ class TestPositionFillClassification:
         assert evidence["orphan_exit_count"] == 1
         assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
         assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)
+
+
+class TestFeeSign:
+    @staticmethod
+    def _table(commission: str, swap: str):
+        return BeautifulSoup(
+            f"""
+            <table><thead><tr>
+              <th>Zeit</th><th>Trade</th><th>Symbol</th><th>Typ</th><th>Richtung</th>
+              <th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th><th>Swap</th>
+              <th>Gewinn</th><th>Kommentar</th>
+            </tr></thead><tbody>
+              <tr>
+                <td>2024.01.02 08:00:00</td><td>1</td><td>EURUSD</td>
+                <td>buy</td><td>in</td><td>0.10</td><td>1.08</td>
+                <td>902</td><td>{commission}</td><td>0</td><td>0</td><td>Entry</td>
+              </tr>
+              <tr>
+                <td>2024.01.02 16:00:00</td><td>1</td><td>EURUSD</td>
+                <td>sell</td><td>out</td><td>0.10</td><td>1.09</td>
+                <td>903</td><td>0</td><td>{swap}</td><td>100</td><td>TP</td>
+              </tr>
+            </tbody></table>
+            """,
+            "lxml",
+        ).find("table")
+
+    def test_costs_become_positive_fee_and_reduce_net_pnl(self):
+        trades, _ = MT5HTMLImporter._build_trades(self._table("-2.5", "-1.5"), {})
+        assert trades[0].fees == pytest.approx(4.0)
+        assert trades[0].net_pnl == pytest.approx(96.0)
+        assert trades[0].meta["commission"] == pytest.approx(-2.5)
+
+    def test_net_swap_credit_yields_negative_fee(self):
+        trades, _ = MT5HTMLImporter._build_trades(self._table("-0.5", "1.5"), {})
+        assert trades[0].fees == pytest.approx(-1.0)
+        assert trades[0].net_pnl == pytest.approx(101.0)

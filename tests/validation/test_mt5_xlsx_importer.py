@@ -674,18 +674,27 @@ class TestZeroFeesBecomeNone:
         assert trade.meta["commission"] is None
         assert trade.meta["swap"] is None
 
-    def test_nonzero_fees_are_stored_as_the_summed_value(self, tmp_path: Path):
+    def test_costs_are_stored_as_a_positive_fee(self, tmp_path: Path):
+        # MT5 signs costs negative; Trade.fees is a positive cost.
         ref = MT5XLSXImporter().load(
-            self._write_report(tmp_path, commission=2.5, swap=1.5)
+            self._write_report(tmp_path, commission=-2.5, swap=-1.5)
         )
         trade = ref.trades[0]
         assert trade.fees == pytest.approx(4.0)
-        assert trade.meta["commission"] == pytest.approx(2.5)
-        assert trade.meta["swap"] == pytest.approx(1.5)
+        assert trade.meta["commission"] == pytest.approx(-2.5)
+        assert trade.meta["swap"] == pytest.approx(-1.5)
 
     def test_net_pnl_subtracts_fees_from_gross(self, tmp_path: Path):
         ref = MT5XLSXImporter().load(
-            self._write_report(tmp_path, commission=2.5, swap=1.5, profit=100.0)
+            self._write_report(tmp_path, commission=-2.5, swap=-1.5, profit=100.0)
         )
         trade = ref.trades[0]
-        assert trade.net_pnl == pytest.approx(trade.pnl - 4.0)
+        assert trade.net_pnl == pytest.approx(96.0)
+
+    def test_net_swap_credit_yields_negative_fee(self, tmp_path: Path):
+        ref = MT5XLSXImporter().load(
+            self._write_report(tmp_path, commission=-0.5, swap=1.5, profit=100.0)
+        )
+        trade = ref.trades[0]
+        assert trade.fees == pytest.approx(-1.0)
+        assert trade.net_pnl == pytest.approx(101.0)

@@ -325,7 +325,7 @@ Der Importer erzeugt für jede vollständig geschlossene Position genau ein
 | `quantity` | `Volumen` aller Entry-Fills | Summe der Entry-Mengen |
 | `exits` | Alle Exit-Fills | Ein `TradeExit` pro Exit-Zeile |
 | `pnl` | `Gewinn` aller Exit-Fills | Summe der Exit-PnL |
-| `fees` | `Kommission` + `Swap` aller Fills | Über Entry- und Exit-Fills summieren |
+| `fees` | `-(Kommission + Swap)` aller Fills | Über Entry- und Exit-Fills summieren, Vorzeichen umkehren (positive Kosten) |
 | `net_pnl` | `pnl - fees` | Berechnen |
 | `exit_reason` | Letzter Exit-Kommentar | z.B. `"sl 1.20643"` → `"stop_loss"` |
 | `tags` | Kommentar des ersten Entry-Fills | z.B. `["Breakout Long"]` |
@@ -341,7 +341,7 @@ Jede Exit-Zeile wird zu einem `TradeExit`; es gibt pro Position einen
 | `price` | `Preis` |
 | `quantity` | `Volumen` |
 | `pnl` | `Gewinn` |
-| `fees` | `Kommission + Swap` |
+| `fees` | (nicht gesetzt; Kosten nur auf `Trade.fees`) |
 | `reason` | Geparst aus `Kommentar` |
 
 ### Stop-Loss & Take-Profit Mapping
@@ -382,7 +382,7 @@ Jede Exit-Zeile wird zu einem `TradeExit`; es gibt pro Position einen
    nicht als abgeschlossene Trades exportiert, sondern in
    `raw_metadata.position_fills` mit Restmenge und Status dokumentiert.
 4. **Sprachabhängigkeit:** Die Report-Kopf-Begriffe sind deutsch (`Strategietesterbericht`, `Ergebnisse`, `Eröffnungszeit`, etc.). Der Importer sollte auf Spalten-Index-Ebene arbeiten (nicht auf Begriffsebene), um Mehrsprachigkeit zu unterstützen.
-5. **Vorzeichen von Kommission und Swap (offen, Bug):** Die Importer speichern `fees = Kommission + Swap` mit MT5-Vorzeichen (Kosten negativ). `net_pnl` wird aber als `pnl - fees` berechnet, also mit umgekehrtem Vorzeichen. Der MT5-Summenwert `Nettogewinn gesamt` entspricht in allen drei Referenz-Goldens genau `Σ pnl + Σ fees`. Bis zur Korrektur markieren `xfail(strict=True)`-Tests in `tests/validation/test_golden_reconciliation.py` und `test_mt5_xlsx_fixture_shapes.py` den Fehler.
+5. **Vorzeichen von Kommission und Swap:** MT5 weist Kosten negativ aus. Die Importer (XLSX und HTML) normalisieren an der Importgrenze: `fees = -(Kommission + Swap)`, also ein positiver Kostenbetrag, und `net_pnl = pnl - fees`. Eine Netto-Swap-Gutschrift ergibt entsprechend eine negative `fees`. Die rohen MT5-Werte stehen weiter vorzeichenbehaftet in `meta.commission` und `meta.swap`. Der MT5-Summenwert `Nettogewinn gesamt` entspricht damit `Σ pnl - Σ fees` (geprüft in `tests/validation/test_golden_reconciliation.py`).
 6. **Keine HTML-Reports:** Es liegen ausschließlich XLSX-Dateien vor. Der geplante `MT5HTMLConverter` benötigt separate Fixture-Dateien.
 
 ---
