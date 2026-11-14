@@ -4825,3 +4825,74 @@ def test_ctrader_missing_step_volume_keeps_unrounded_volume() -> None:
 
     assert adapter._scale_for("EURUSD").step_volume == 1
     assert adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": 1.23456})) == 123_456
+
+
+@pytest.mark.parametrize(
+    ("qty", "volume_per_qty", "step", "expected"),
+    [
+        # Demo finding (#184): qty 34.66 rounded UP to 35 and lost $10.09 at the
+        # stop on a $10 risk budget.
+        (34.66, 1.0, 1, 34),
+        (34.66, 1.0, 5, 30),
+        (0.5, 1.0, 1, None),  # floors to 0 -> refused, not rounded up to 1
+        (5.9999, 1000.0, 1, 5999),
+        (5.9999, 1000.0, 1000, 5000),
+        (0.29, 100.0, 1, 29),  # float error must not floor 28.999... to 28
+        (2.0, 1000.0, 1, 2000),
+    ],
+)
+def test_ctrader_entry_volume_never_rounds_risk_up(
+    qty: float, volume_per_qty: float, step: int, expected: int | None
+) -> None:
+    module, _adapter = _make_ctrader_adapter()
+    if expected is None:
+        with pytest.raises(ValueError, match="past the risk budget"):
+            module._qty_to_broker_volume(qty, volume_per_qty)
+        return
+    volume = module._floor_to_volume_step(
+        module._qty_to_broker_volume(qty, volume_per_qty), step
+    )
+    assert volume == expected
+    assert volume <= qty * volume_per_qty * (1 + 1e-9)
+    # Risk at the stop (loss per volume unit * volume) stays within budget.
+    loss_per_unit = 10.0 / (qty * volume_per_qty)
+    assert loss_per_unit * volume <= 10.0 + 1e-9
+
+
+def test_ctrader_sub_unit_qty_with_unit_step_is_refused_not_upsized() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=None)  # step falls back to 1
+
+    with pytest.raises(ValueError):
+        adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": 0.0004}))
+
+
+def test_ctrader_close_all_sends_full_unfloored_position_volume() -> None:
+    from types import SimpleNamespace
+
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+    sent: list[tuple[int, int]] = []
+
+    async def _fetch():
+        # 1_234_567 is off the step grid: a close must still send it whole.
+        return [
+            SimpleNamespace(positionId=7, tradeData=SimpleNamespace(volume=1_234_567))
+        ]
+
+    class _Req:
+        pass
+
+    async def _send(request, *, timeout_seconds=15):
+        sent.append((request.positionId, request.volume))
+        return SimpleNamespace()
+
+    adapter._fetch_open_positions = _fetch
+    adapter._ProtoOAClosePositionReq = _Req
+    adapter.ctid_trader_account_id = 1
+    adapter._send_request_with_refresh_retry = _send
+    adapter._raise_if_order_error_event = lambda _r: None
+
+    asyncio.run(adapter.close_all_positions())
+
+    assert sent == [(7, 1_234_567)]
