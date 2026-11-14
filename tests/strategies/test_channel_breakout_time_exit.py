@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 STRATEGY_PATH = (
     Path(__file__).parent.parent.parent / "strategies" / "channel_breakout" / "channel_breakout.py"
