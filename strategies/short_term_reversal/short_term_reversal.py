@@ -8,7 +8,16 @@ reversal completion, fixed stop, or end of holding period.
 Source fidelity
 ---------------
 - ``lookback_period = 5``: entry on ``Return_5D < -0.05``.
-- ``holding_period = 5``: time exit after 5 bars.
+- ``holding_period = 5``: time exit after 5 bars. Semantics under the default
+  ``signal_exit_fill="next_open"`` (entries AND signal exits fill at the next bar's
+  open): a signal on bar ``i`` enters at the open of ``i+1``; the time exit is
+  signalled once ``bars_held >= 5`` counted from the signal bar, i.e. on bar
+  ``i+5``, and fills at the open of ``i+6``. The position is therefore exposed to
+  exactly bars ``i+1 .. i+5`` (open ``i+1`` -> open ``i+6`` = 5 bars), the same
+  exposure as the former "enter at the open, exit at the close of bar 5" - so the
+  counter is NOT shifted by one. Stop / target / time exits are market exits on a
+  close-based trigger and carry no explicit ``exit_price`` (a price equal to the
+  signal bar's close would contradict the next-open fill).
 - Profit target +-5 % from entry (source: ``pnl_pct > 0.05`` long /
   ``pnl_pct < -0.05`` short; long-only proxy uses +5 %).
 - Fixed stop +-8 % from entry (source stop-loss; long-only: -8 %).
@@ -30,13 +39,15 @@ adapter runs one symbol, long-only:
 
 STRATEGY_META = {
     "name": "Short Term Reversal",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/short_term_reversal_strategy.py",
     "notes": (
         "Single-symbol long-only proxy of a cross-sectional long/short "
         "universe system. Source-exact: 5d lookback, -5 % entry, +5 % "
         "profit target, -8 % fixed stop, 5-bar hold. No RSI (source has "
-        "none), no ATR stop (source uses a fixed 8 % stop). Dropped: "
+        "none), no ATR stop (source uses a fixed 8 % stop). 1.2.0: market exits "
+        "no longer carry exit_price=close (fill at the next open); 5-bar hold = "
+        "open of bar i+1 to open of bar i+6. Dropped: "
         "universe ranking, short leg, z-score/volume filters, SPY regime "
         "filter, sector caps."
     ),
@@ -102,10 +113,10 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 exits.iloc[i] = True
                 bars_held_at_exit.iloc[i] = bars_held
                 # A-M2: all triggers are close-based (pnl_pct derives from the
-                # close), so every leg fills at the CLOSE — filling the stop
-                # leg at entry*(1-stop_pct) above the close systematically
-                # sells LONGs too high.
-                exit_price.iloc[i] = float(close.iloc[i])
+                # close), so every leg is a MARKET exit: no explicit exit_price,
+                # it fills at the next bar's open. (An explicit price at the
+                # entry*(1-stop_pct) level would sell LONGs too high; one at the
+                # signal bar's close would contradict the next-open timestamp.)
                 if stop_hit:
                     exit_reason.iloc[i] = "stop_loss"
                 elif profit_hit:

@@ -203,3 +203,29 @@ class TestOrbContextMirror:
         ctx = _load_context_module().build_trade_context(df, {})
         assert ctx["direction"].iloc[1] == "LONG"
         assert ctx["exit_reason"].iloc[2] == "day_reset_flatten"
+
+    def test_forced_exit_is_marked_on_the_bar_before_the_exit_time(self):
+        # 2.1.0: the script raises the 15:45 ET exit on the first bar whose END
+        # reaches 15:45 (Pine fills at the next open, i.e. AT 15:45). On 15m bars
+        # that is the 15:30 ET bar, so the context marks it there, not at 15:45.
+        idx = pd.date_range("2024-01-02 14:30", "2024-01-02 21:00", freq="15min", tz="UTC")
+        close = [100.0, 100.0] + [105.0 + 0.01 * i for i in range(len(idx) - 2)]
+        df = pd.DataFrame(
+            {
+                "timestamp": idx,
+                "open": close,
+                "high": [c + 1 for c in close],
+                "low": [c - 1 for c in close],
+                "close": close,
+                "volume": 1.0,
+            }
+        )
+        df.loc[:1, ["high", "low"]] = [101.0, 99.0]
+        ctx = _load_context_module().build_trade_context(df, {})
+        marked = ctx["exit_reason"].dropna()
+        times = [
+            idx[int(i)].tz_convert("America/New_York").strftime("%H:%M")
+            for i in marked.index
+            if marked.loc[i] == "time_exit"
+        ]
+        assert times[0] == "15:30"

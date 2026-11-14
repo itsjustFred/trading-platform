@@ -225,6 +225,94 @@ def generate_signals(df, params):
         assert config.signal_exit_fill == "close"
 
 
+def _exit_price_strategy_text(*, exit_bar: int, price_expr: str) -> str:
+    """Entry on bar 2, signal exit on ``exit_bar`` carrying an explicit exit_price."""
+    return f'''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    exits.iloc[{exit_bar}] = True
+    exit_price = pd.Series(float("nan"), index=df.index)
+    exit_price.iloc[{exit_bar}] = {price_expr}
+    indicators = {{
+        "direction": pd.Series(["LONG"] * n, index=df.index),
+        "exit_price": exit_price,
+    }}
+    return entries, exits, indicators, []
+'''
+
+
+class TestExplicitExitPriceContract:
+    """Explicit ``exit_price`` values are LEVELS (stop/limit/target).
+
+    A market signal exit that carries ``exit_price == signal bar close`` used to
+    be shifted to the next bar but still filled at the signal bar's close
+    (timestamp and price disagreed). Under ``signal_exit_fill="next_open"`` the
+    market-close price is dropped, flagged and filled at the next open; real
+    levels are still honoured; the legacy ``close`` opt-in keeps its meaning.
+    """
+
+    MARKET_CLOSE = 'float(df["close"].iloc[7])'
+
+    def test_vectorbt_market_close_exit_price_fills_at_next_open(self, tmp_path: Path, caplog):
+        frame = _frame()
+        text = _exit_price_strategy_text(exit_bar=7, price_expr=self.MARKET_CLOSE)
+        with caplog.at_level("WARNING"):
+            result = _vectorbt_result(tmp_path, frame, text)
+        (trade,) = result.trades
+        exit_leg = trade.exits[0]
+        assert pd.to_datetime(exit_leg.time, utc=True) == frame["timestamp"].iloc[8]
+        # price and timestamp agree: the OPEN of the exit bar, not bar 7's close
+        assert exit_leg.price == pytest.approx(float(frame["open"].iloc[8]))
+        assert exit_leg.price != pytest.approx(float(frame["close"].iloc[7]))
+        assert trade.meta["exit_price_ignored_market_close"] is True
+        assert any("exit_price" in rec.getMessage() for rec in caplog.records)
+
+    def test_native_ignores_market_close_exit_price_and_fills_at_next_open(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_price_strategy_text(exit_bar=7, price_expr=self.MARKET_CLOSE)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "contract_exit_price_native")
+        native = _native_result(frame, strategy_fn)
+        (trade,) = native.trades
+        assert trade.exits[0].price == pytest.approx(float(frame["open"].iloc[8]))
+
+    def test_engines_agree_on_market_close_exit_price_input(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_price_strategy_text(exit_bar=7, price_expr=self.MARKET_CLOSE)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "contract_exit_price_parity")
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+        assert native.trades[0].exits[0].price == pytest.approx(
+            vectorbt.trades[0].exits[0].price
+        )
+        assert pd.to_datetime(native.trades[0].exits[0].time, utc=True) == pd.to_datetime(
+            vectorbt.trades[0].exits[0].time, utc=True
+        )
+
+    def test_vectorbt_real_level_is_still_honoured(self, tmp_path: Path):
+        frame = _frame()
+        # a level inside the exit bar's range (bar 8: open 108.0, range 107.75-108.25)
+        text = _exit_price_strategy_text(exit_bar=7, price_expr="108.1")
+        result = _vectorbt_result(tmp_path, frame, text)
+        (trade,) = result.trades
+        assert trade.exits[0].price == pytest.approx(108.1)
+        assert "exit_price_ignored_market_close" not in trade.meta
+
+    def test_vectorbt_legacy_close_opt_in_keeps_the_explicit_price(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_price_strategy_text(exit_bar=7, price_expr=self.MARKET_CLOSE)
+        result = _vectorbt_result(tmp_path, frame, text, signal_exit_fill="close")
+        (trade,) = result.trades
+        assert pd.to_datetime(trade.exits[0].time, utc=True) == frame["timestamp"].iloc[7]
+        assert trade.exits[0].price == pytest.approx(float(frame["close"].iloc[7]))
+        assert "exit_price_ignored_market_close" not in trade.meta
+
+
 class TestNativeWarmupLoad:
     """A-H4: NativeAdapter loads from warmup_start so indicators are warm."""
 

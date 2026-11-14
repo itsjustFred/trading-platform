@@ -28,8 +28,8 @@ Final-Balance-Delta, XLSX↔Log-Keys.)
 ## Platform-Backtests (exakte MT5-Daily-ATR injiziert, sonst andere ATR-Historie)
 
 Config: native Engine, M1, `fixed_risk_amount=500`, `max_leverage=100`,
-`spread_price_col='spread_price'`, `signal_exit_fill='open'`,
-MT5-CSVs als `mt5audit`-Symbole (inkl. Spread-Spalte in Preis-Units).
+`spread_price_col='spread_price'` (Default `signal_exit_fill='next_open'`; seit Strategie 1.2.0
+kein `'open'`-Opt-in mehr nötig, s. u.), MT5-CSVs als `mt5audit`-Symbole (inkl. Spread-Spalte in Preis-Units).
 
 | Fenster | MT5 | Platform | Gemeinsame Trades | PnL-Diff |
 |---|---|---|---|---|
@@ -151,11 +151,42 @@ Behoben: die Vergleichsmatrix importiert die Reports jetzt über denselben
 `scripts/analyze_mt5_parity.py` nutzt denselben Weg: Report-Import und
 Session-/Jahres-Bucketing laufen auf der Broker-Serverzeit des jeweiligen
 Symbols statt auf `Europe/Athens`.
-## Hinweis 2026-11-13: neuer Default `signal_exit_fill="next_open"`
+## Signal-Exit-Fill `next_open` (Owner-Entscheid 2026-11-13) und der MT5-Time-Exit
 
-Der Owner-Entscheid vom 2026-11-13 lässt Signal-Exits standardmäßig zum **nächsten**
-Bar-Open füllen (wie Entries). Der MT5-Time-Exit füllt aber am ersten Tick der
-Exit-Minute = Open der Signal-Bar selbst (22:55). Die MT5-Parity-Läufe müssen deshalb
-weiterhin `signal_exit_fill='open'` setzen (Config oben, unverändert, ergibt identische
-Ergebnisse); mit dem neuen Default liegen die Time-Exits genau eine Bar (M1: eine Minute)
-zu spät (Exit-Preis-Treffer auf den Audit-Fenstern 6→0 bzw. 3→0).
+Signal-Exits füllen engine-weit standardmäßig am **nächsten** Bar-Open (wie Entries,
+`signal_exit_fill="next_open"`). Der MT5-Time-Exit füllt am ersten Tick ≥ `Exit_Time`
+(`now_mins >= exit_mins`, unabhängig vom Chart-Timeframe; Tester-Model 1 = M1-OHLC),
+also am Open der ersten Bar ab 22:55. Die Strategie hat dafür bis 1.1.0 das Exit-Signal
+*auf* der 22:55-Bar gesetzt; mit `next_open` lag der Exit eine Bar zu spät, deshalb
+musste der Parity-Lauf `signal_exit_fill='open'` setzen.
+
+Seit Strategie **1.2.0** meldet sie das Time-Exit-Signal auf der ersten Bar, deren
+*Ende* `exit_time` erreicht (M1: 22:54-Bar → Fill 22:55-Open; M15/H1: Bar mit 22:55 →
+Fill 23:00-Open, erster Open ≥ 22:55). Die Parity-Läufe brauchen kein Opt-in mehr; mit
+dem Legacy-`'open'` läge der Exit jetzt eine Bar *zu früh*. Der Stale-Position-Exit
+(Vortags-Position, MT5: erster Tick des neuen Tages) kommt als Signal auf der ersten Bar
+des neuen Server-Tages statt auf der „letzten Bar des Tages“ (kein Look-ahead mehr).
+
+`run_native_window.py` (dieses Verzeichnis) reproduziert die Platform-Läufe oben mit der
+nativen Engine auf den MT5-M1-CSVs (MT5-ATR aus dem EA-Log injiziert, Fixed-Risk-Sizing,
+Spread-Modell; `.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py
+--ref-dir <parse_mt5_reference-Output> [--signal-exit-fill open] [--strategy-file <alte Version>]`,
+ca. 4 min je Symbol). Gemessen 2026-11-13 – Treffer unter den gematchten Trades (Server-Tag +
+Richtung), Exit-Minute / Exit-Preis (Toleranz 1e-6) gleich wie MT5:
+
+| Lauf | EURUSD (7 gematcht) | NAS100 (9) | SP500 (13) |
+|---|---|---|---|
+| Strategie 1.1.0, `signal_exit_fill='open'` (bisherige Parity-Config) | 7 / 3 | 9 / 7 | 11 / 6 |
+| Strategie 1.1.0, Default `next_open` (Regression) | 4 / 0 | 2 / 0 | 5 / 0 |
+| Strategie 1.2.0, Default `next_open` | **7 / 3** | **9 / 7** | **11 / 6** |
+| Strategie 1.2.0, Legacy `'open'` (jetzt eine Bar zu früh) | 4 / 0 | 2 / 0 | 5 / 0 |
+
+(Zahlenpaare = gleiche Exit-Minute / gleicher Exit-Preis; Entries, Lots und PnL-Diffs
+der 1.2.0-Läufe sind identisch zur bisherigen Config: 7/9/13 gematcht, 7/9/13 gleiche
+Entry-Minute. Die restlichen Exit-Preis-Abweichungen sind SL-Exits mit Real-Tick- vs.
+M1-Timing, s. „Nicht replizierbar“.) Die Voll-Historien-Tabelle oben stammt aus
+`scripts/regenerate_mt5_parity_artifacts.py`; deren lokale Dukascopy-Parquets enthalten
+nur die Audit-Fenster, die committeten 2018–2026-Artefakte wurden deshalb nicht neu
+erzeugt und die dortigen Zahlen nicht neu gemessen (der Simulator füllt ein Signal-Exit
+jetzt am Open der Folgebar; auf M1 ist das dieselbe Minute wie bisher, nur lokal verifiziert
+auf den Fenstern).

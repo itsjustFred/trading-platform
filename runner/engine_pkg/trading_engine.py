@@ -1502,24 +1502,19 @@ class TradeEngine:
         step_bars = max(1000, by_percent)
         next_emit = 0
 
+        # Perf: one boxed Timestamp list instead of a second frame.iloc[i + 1]
+        # row construction per bar (same Timestamp objects row["timestamp"] yields).
+        timestamps = list(frame["timestamp"])
+        entries_arr = entries.to_numpy(dtype=bool)
+        exits_arr = exits.to_numpy(dtype=bool)
+
         for i in range(total_bars):
             row = frame.iloc[i]
             if trade_from is not None and pd.to_datetime(
                 row["timestamp"], utc=True
             ) < trade_from:
                 continue  # warmup bar: indicators only, no trading
-            next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
-            signal_row = (
-                self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()
-            )
-            # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
-            # (aligned by label). The previous ``pd.concat([row, signal_row])``
-            # stacked the two Series vertically, producing a row of length
-            # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
-            # became ambiguous and colliding signal names ("close", "high", …)
-            # silently corrupted or crashed entry extraction.
-            merged_row = row.combine_first(signal_row)
-
+            next_time = timestamps[i + 1] if i + 1 < total_bars else None
             self._check_stops(row, i, next_time)
             # The parked signal exit (if any) was consumed at this bar's open.
             self._pending_signal_exit = False
@@ -1535,11 +1530,27 @@ class TradeEngine:
             # special case here.
             self._check_stops(row, i, next_time, only_entry_index=i)
 
-            if bool(entries.iloc[i]):
+            if entries_arr[i]:
+                # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
+                # (aligned by label). The previous ``pd.concat([row, signal_row])``
+                # stacked the two Series vertically, producing a row of length
+                # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
+                # became ambiguous and colliding signal names ("close", "high", …)
+                # silently corrupted or crashed entry extraction.
+                # Perf: the merged row is only consumed by order creation, so it
+                # is built lazily on entry bars (combine_first is pure — no
+                # observable difference from building it on every bar, ~85% of
+                # the old per-bar cost).
+                signal_row = (
+                    self._signals_frame.iloc[i]
+                    if self._signals_frame is not None
+                    else pd.Series()
+                )
+                merged_row = row.combine_first(signal_row)
                 direction = self._resolve_direction(merged_row)
                 self._create_order(merged_row, i, direction)
 
-            if bool(exits.iloc[i]):
+            if exits_arr[i]:
                 if self._signal_exit_next_open:
                     # Fills at the NEXT bar's open (see _check_stops). On the
                     # last bar there is no next bar: the end-of-data close

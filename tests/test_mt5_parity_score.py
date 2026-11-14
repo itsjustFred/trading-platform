@@ -98,6 +98,9 @@ def test_pairs_on_the_server_trading_day_and_direction(tmp_path):
     assert (
         summary["matched_same_entry_minute"] == 1
     )  # 2023-07-05 only; 2025-07-01 differs by 15 min
+    # both matched trades exit at 22:55 server time; only the 2025-07-01 SHORT shares the price
+    assert summary["matched_same_exit_minute"] == 2
+    assert summary["matched_same_exit_price"] == 1
     assert summary["mt5_pnl"] == pytest.approx(35.0)
     assert summary["pf_pnl"] == pytest.approx(22.0 + 10.0 - 1.0)
     assert summary["matched_pnl_delta"] == pytest.approx((22.0 - 20.0) + (10.0 - 10.0))

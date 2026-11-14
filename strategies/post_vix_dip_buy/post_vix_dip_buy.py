@@ -14,7 +14,7 @@ Source semantics:
 - ORB leg (default ON): 9:30-10:00 range (9:30-9:59 bars), breakout cross
   above OR-high during NY 10:00-14:00.
 - Exits: TP +2% / SL -0.3% (stop-first on same-bar ambiguity), 50% scale-out
-  from 14:00 NY, EOD flatten from 15:50 NY. Long-only, one position at a time.
+  at 14:00 NY, EOD flatten at 15:50 NY (both filled at that clock time's OPEN). Long-only, one position at a time.
 
 VIX data dependency: the VIX daily close series is read from
 ``<DATA_DIR>/ohlcv/**/VIX/1d.parquet``. When the dataset is missing the
@@ -25,7 +25,12 @@ strategy frame itself (the source runs on the SPX/SPY chart, so the frame
 symbol proxies SPX) by UTC-date resampling.
 
 vectorbt notes:
-- Next-open execution: signals fire on bar close, fills on next open.
+- Next-open execution: signals fire on bar close, fills on next open (entries AND
+  signal exits). The clock exits (14:00 power hour, 15:50 EOD) are therefore raised
+  on the first bar whose END reaches that time (the bar before), with the bar
+  spacing taken inside each NY day; they carry no explicit exit_price (market
+  exits). A position still open on a later NY day (missing bars) is flattened on
+  that day's first bar.
 - The 50% power-hour scale has no partial-fill representation in vectorbt;
   it is modeled as a FULL exit with reason ``scale_50pct_power_hour``
   (documented approximation).
@@ -38,7 +43,7 @@ vectorbt notes:
 
 STRATEGY_META = {
     "name": "Post VIX Dip Buy",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1458625986039119982/1458626059988762696",
     "notes": (
         "- Source: post vix dip buy pine.txt (VIX chg%>=10 & VIX>=19 & SPX chg%<=-1%, "
@@ -46,6 +51,8 @@ STRATEGY_META = {
         "near-prior-low; ORB 9:30-10:00 range / 10:00-14:00 breakout; "
         "TP+2%/SL-0.3%, 50% scale >=14:00 NY, EOD flatten >=15:50 NY).\n"
         "- VIX missing -> FAIL-CLOSED (no entries), as before.\n"
+        "- 1.2.0: 14:00 / 15:50 clock exits raised on the bar before (next_open fills at "
+        "that time's open); no market-close exit_price.\n"
         "- 50% power-hour scale modeled as full exit (no partials in vectorbt).\n"
         "- RSI is Wilder (RMA) per ta.rsi; VWAP is daily-reset hlc3 (volume-weighted "
         "when volume exists, else cumulative mean).\n"
@@ -69,6 +76,8 @@ STRATEGY_META = {
 
 import numpy as np
 import pandas as pd
+
+from shared.bar_timing import modal_bar_minutes_by_group
 
 
 def _load_vix_data(start: str = None, end: str = None) -> pd.Series | None:
@@ -298,8 +307,17 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
 
     in_early = ((ny_hour == 9) & (ny_minute >= 30)) | (ny_hour == 10)
     in_orb_session = (ny_hour >= 10) & (ny_hour < 14)
-    power_hour = ny_hour >= 14
-    eod = (ny_hour > 15) | ((ny_hour == 15) & (ny_minute >= 50))
+    # Clock exits fill at the NEXT bar's open: raise them on the first bar whose END
+    # reaches the clock time (bar spacing taken inside the bar's own NY day).
+    ny_minutes_of_day = (ny_hour * 60 + ny_minute).to_numpy()
+    bar_spacing = modal_bar_minutes_by_group(bar_ts, ny.dt.date.to_numpy())
+    power_hour = pd.Series(
+        (ny_minutes_of_day + bar_spacing) >= 14 * 60, index=df.index
+    ) & (ny_hour >= 0)
+    eod = pd.Series(
+        (ny_minutes_of_day + bar_spacing) >= 15 * 60 + 50, index=df.index
+    ) & (ny_hour >= 0)
+    ny_date_arr = ny.dt.date.to_numpy()
     orb_form_mask = ((ny_hour == 9) & (ny_minute >= 30)).to_numpy()
 
     # OR range per UTC date from 9:30-9:59 NY bars.
@@ -334,6 +352,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     for i in range(n):
         if in_trade:
             bars_held = i - entry_idx
+            stale = ny_date_arr[i] != ny_date_arr[entry_idx]
             sl_hit = pd.notna(stop_loss) and float(low.iloc[i]) <= float(stop_loss)
             tp_hit = pd.notna(take_profit) and float(high.iloc[i]) >= float(take_profit)
             # Stop-first on same-bar ambiguity (conservative).
@@ -351,16 +370,21 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 bars_held_at_exit.iloc[i] = bars_held
                 in_trade = False
                 continue
+            if stale:
+                # Still open on a later NY day (the 14:00/15:50 bars were missing).
+                exits.iloc[i] = True
+                exit_reason.iloc[i] = "eod_flatten"
+                bars_held_at_exit.iloc[i] = bars_held
+                in_trade = False
+                continue
             if bool(power_hour.iloc[i]):
                 exits.iloc[i] = True
-                exit_price.iloc[i] = float(close.iloc[i])
                 exit_reason.iloc[i] = "scale_50pct_power_hour"
                 bars_held_at_exit.iloc[i] = bars_held
                 in_trade = False
                 continue
             if bool(eod.iloc[i]):
                 exits.iloc[i] = True
-                exit_price.iloc[i] = float(close.iloc[i])
                 exit_reason.iloc[i] = "eod_flatten"
                 bars_held_at_exit.iloc[i] = bars_held
                 in_trade = False
