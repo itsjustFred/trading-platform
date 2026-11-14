@@ -2523,8 +2523,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        self._scale_for(signal.symbol)
+        symbol_scale = self._scale_for(signal.symbol)
         scale = CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+        # The broker validates a relative distance against the symbol's own price
+        # precision (``Relative stop loss has invalid precision``): on a 2-digit symbol
+        # (ETHUSD, XAUUSD, indices) it must be a multiple of 1000 protocol units, on a
+        # 3-digit one a multiple of 100. Sent unrounded, every such order is rejected.
+        grid = 10 ** max(0, int(math.log10(scale)) - symbol_scale.price_digits)
 
         def _distance(price: float) -> int:
             if math.isnan(price) or math.isinf(price) or price <= 0:
@@ -2546,8 +2551,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"(below one 1/{scale} price unit); refusing to submit."
                 )
             # Distance is signed by direction at the protocol level; the value
-            # sent is always the positive magnitude in 1/scale price units.
-            return int(round(raw))
+            # sent is always the positive magnitude in 1/scale price units, snapped
+            # to the symbol's price grid (never below one tick).
+            return max(grid, int(round(raw / grid)) * grid)
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
