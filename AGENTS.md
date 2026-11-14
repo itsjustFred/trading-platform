@@ -15,7 +15,7 @@ Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result
 
 ## Lint and type checking
 
-Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Run `ruff check <changed files>` and `mypy` (no arguments; scope comes from `files`) before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog) and mypy (blocking). mypy is pinned in `.github/workflows/ci.yml`, not in the dev extra.
+Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Run `ruff check <changed files>` and `mypy` (no arguments; scope comes from `files`) before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `signal_bots`, `strategies`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog) and mypy (blocking). mypy is pinned in `.github/workflows/ci.yml`, not in the dev extra.
 
 ## Issues
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from risk.models import TradeSignal
 from signal_bots.ramjet.processor import RamJetSignalProcessor
@@ -20,7 +20,7 @@ class NitroSignalProcessor(RamJetSignalProcessor):
         super().__init__(loaded)
 
     @staticmethod
-    def _normalize_buy_action(raw_action: Any) -> str:
+    def _normalize_buy_action(raw_action: Any) -> Literal["buy"]:
         action = str(raw_action or "").strip().lower()
         if action in {"buy", "long"}:
             return "buy"

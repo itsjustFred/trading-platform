@@ -211,7 +211,7 @@ testpaths = ["tests"]
 python_version = "3.12"
 # Scope is deliberately narrow: the packages whose type errors can become a
 # wrong order. Widen by adding paths here, not by loosening the flags.
-files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py"]
+files = ["risk", "live_runner", "shared/models.py", "shared/market_calendar.py", "signal_bots", "strategies"]
 check_untyped_defs = true
 warn_unused_ignores = true
 no_implicit_optional = true

@@ -23,6 +23,6 @@ def generate_signals(df, params):
         'slow': slow
     }
 
-    drawings = []
+    drawings: list[dict] = []
 
     return entries, exits, indicators_dict, drawings

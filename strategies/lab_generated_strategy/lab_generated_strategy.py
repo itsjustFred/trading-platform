@@ -66,6 +66,6 @@ def generate_signals(df, params):
     }
 
     # Optional drawings - keep contract-compatible empty list when unused
-    drawings = []
+    drawings: list[dict] = []
 
     return entries, exits, indicators_dict, drawings
