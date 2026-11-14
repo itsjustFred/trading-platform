@@ -50,12 +50,16 @@ from runner.engines.base import (
     resolve_strategy_parameters,
 )
 from runner.engines.contract import resolve_same_bar_exit
+from runner.engines.mtm_equity import (
+    build_mark_to_market_curve,
+    closes_from_frame,
+    describe_basis,
+)
 from runner.fees import resolve_fee_model
 from shared.constants import DATA_DIR
 from shared.models import (
     BacktestMeta,
     BacktestResult,
-    EquityPoint,
     IndicatorSeries,
     Trade,
     TradeExit,
@@ -839,62 +843,40 @@ class VectorbtAdapter(EngineAdapter):
         # re-scale chronologically from shared equity instead of compounding
         # N symbols x full capital. Single-symbol runs keep the legacy path
         # bit-identical (no replay).
+        curve_start = (
+            f"{config.start_date}T00:00:00+00:00"
+            if len(config.start_date) == 10
+            else config.start_date
+        )
         shared_summary: dict[str, Any] = {}
         if num_symbols > 1 and all_trades:
             from runner.engines._shared import replay_shared_equity
 
-            all_trades, shared_equity_curve, shared_summary = replay_shared_equity(
+            all_trades, _, shared_summary = replay_shared_equity(
                 all_trades,
                 config.initial_capital,
-                start_time=(
-                    f"{config.start_date}T00:00:00+00:00"
-                    if len(config.start_date) == 10
-                    else config.start_date
-                ),
+                start_time=curve_start,
             )
             # Renumber again: the replay re-sorts chronologically by entry.
             all_trades.sort(key=lambda t: t.entry_time)
             for idx, trade in enumerate(all_trades, start=1):
                 trade.id = idx
-            all_equity = shared_equity_curve
-        else:
-            # Build equity curve from sorted trades (Cleanup 16-D1, F5).
-            # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
-            # curve over EXIT time. Each symbol's own sizing compounds from the
-            # shared initial capital inside `_process_symbol`; summing those
-            # per-symbol paths into one "portfolio" equity would multiply capital
-            # by the symbol count, so the aggregate curve here intentionally
-            # replays only closed PnL, once per portfolio, credited at the trade's
-            # exit — and therefore replayed in EXIT order (native/pynecore do the
-            # same). Drawdown/Sharpe computed on this curve describe the realized
-            # portfolio, not an intraday mark-to-market path — the limitation is
-            # documented in the cross-engine contract.
-            all_equity: list[EquityPoint] = [
-                EquityPoint(
-                    time=(
-                        f"{config.start_date}T00:00:00+00:00"
-                        if len(config.start_date) == 10
-                        else config.start_date
-                    ),
-                    equity=round(config.initial_capital, 2),
-                )
-            ]
-            equity = config.initial_capital
-            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                # #84: portfolio replay accumulates NET pnl.
-                equity += (
-                    float(trade.net_pnl)
-                    if trade.net_pnl is not None
-                    else float(trade.pnl) - float(trade.fees or 0.0)
-                )
-                point = EquityPoint(
-                    time=trade.last_exit_time or trade.entry_time,
-                    equity=round(equity, 2),
-                )
-                if all_equity[-1].time == point.time:
-                    all_equity[-1] = point
-                else:
-                    all_equity.append(point)
+        # The persisted curve is the MARK-TO-MARKET portfolio equity (one
+        # observation per bar, built once from the final trades): drawdown /
+        # Sharpe / volatility must see the paper drawdown of open positions.
+        # It describes reporting only - sizing stays on realized cash inside
+        # `_process_symbol`. Per-symbol paths are NOT summed (that would
+        # multiply capital by the symbol count).
+        all_equity, unmarked_symbols = build_mark_to_market_curve(
+            all_trades,
+            _load_mark_closes(
+                data_root,
+                config,
+                {trade.symbol for trade in all_trades},
+            ),
+            config.initial_capital,
+            start_time=curve_start,
+        )
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
@@ -938,6 +920,7 @@ class VectorbtAdapter(EngineAdapter):
                 # A-M4 (D5): shared-equity replay summary for multi-symbol
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,
+                **describe_basis(unmarked_symbols),
             },
             initial_capital=config.initial_capital,
             risk_per_trade_pct=config.risk_per_trade_pct,
@@ -1507,6 +1490,32 @@ def _load_ohlcv(
         df = contract.apply_date_filter(df, start=start_date, end=end_date)
 
     return df.reset_index(drop=True), selected_path
+
+
+def _load_mark_closes(
+    data_root: Path,
+    config: BacktestConfig,
+    symbols: set[str],
+) -> dict[str, pd.Series]:
+    """Close series of the traded symbols over the backtest window.
+
+    Used only to mark open positions to market in the reporting equity curve
+    (never for sizing or signals). A symbol whose data cannot be loaded is left
+    out; the curve builder reports it as unmarked instead of failing the run.
+    """
+    closes: dict[str, pd.Series] = {}
+    for symbol in sorted(symbols):
+        try:
+            frame, _ = _load_ohlcv(
+                data_root, symbol, config.timeframe, config.start_date, config.end_date
+            )
+        except Exception:  # noqa: BLE001 - marking is best effort, reported via meta
+            logger.warning("Could not load mark prices for %s", symbol, exc_info=True)
+            continue
+        series = closes_from_frame(frame)
+        if series is not None:
+            closes[symbol] = series
+    return closes
 
 
 def _normalize_intrabar_resolution(value: str | None) -> str:

@@ -17,8 +17,13 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
+from runner.engines.mtm_equity import (
+    build_mark_to_market_curve,
+    closes_from_frame,
+    describe_basis,
+)
 from shared.constants import DATA_DIR
-from shared.models import BacktestMeta, BacktestResult, EquityPoint
+from shared.models import BacktestMeta, BacktestResult
 
 TIMEFRAME_ORDER = contract.TIMEFRAME_ORDER
 
@@ -119,6 +124,7 @@ class NativeAdapter(EngineAdapter):
         used_timeframes = [config.timeframe]
         symbols_total = max(len(config.symbols), 1)
         total_loaded_bars = 0
+        symbol_closes: dict[str, pd.Series] = {}
 
         for symbol_index, symbol in enumerate(config.symbols):
             # warmup_start extends the
@@ -134,6 +140,9 @@ class NativeAdapter(EngineAdapter):
                     "refusing to run a silent empty backtest"
                 )
             total_loaded_bars += len(data)
+            closes = closes_from_frame(data)
+            if closes is not None:
+                symbol_closes[symbol] = closes
 
             symbol_start = 10.0 + (80.0 * symbol_index / symbols_total)
             symbol_end = 10.0 + (80.0 * (symbol_index + 1) / symbols_total)
@@ -187,46 +196,36 @@ class NativeAdapter(EngineAdapter):
         # 1; the replay re-scales quantities chronologically from shared
         # equity (position size is linear in equity). Single-symbol runs keep
         # the legacy path bit-identical (no replay).
-        # Realized-PnL portfolio curve over EXIT time (Cleanup 16-D1, F5):
-        # per-symbol engines each compound sizing from full capital; a
-        # portfolio curve must not sum those per-symbol equities (it would
-        # multiply capital by the symbol count). The aggregate curve replays
-        # closed PnL once per portfolio, credited at exit — documented in the
-        # cross-engine contract.
-        equity_curve: list[EquityPoint] = [
-            EquityPoint(
-                time=f"{config.start_date}T00:00:00+00:00"
-                if len(config.start_date) == 10
-                else config.start_date,
-                equity=round(config.initial_capital, 2),
-            )
-        ]
+        # Reporting equity is MARK-TO-MARKET (portfolio, one observation per
+        # bar): drawdown / Sharpe / volatility must see the paper drawdown of
+        # open positions. Sizing is unaffected - it stays on realized cash
+        # (``TradeEngine._sizing_equity``). Per-symbol engines each compound
+        # sizing from full capital, so the portfolio curve is rebuilt once from
+        # the (shared-equity-replayed) trades rather than summing per-symbol
+        # equities, which would multiply capital by the symbol count.
+        curve_start = (
+            f"{config.start_date}T00:00:00+00:00"
+            if len(config.start_date) == 10
+            else config.start_date
+        )
         shared_summary: dict[str, Any] = {}
         if len(config.symbols) > 1 and all_trades:
             from runner.engines._shared import replay_shared_equity
 
-            all_trades, replayed_curve, shared_summary = replay_shared_equity(
+            all_trades, _, shared_summary = replay_shared_equity(
                 all_trades,
                 config.initial_capital,
-                start_time=equity_curve[0].time,
+                start_time=curve_start,
             )
             all_trades.sort(key=lambda trade: (trade.entry_time, trade.id))
             for index, trade in enumerate(all_trades, start=1):
                 trade.id = index
-            equity_curve = replayed_curve
-        else:
-            running = config.initial_capital
-            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
-                running += (
-                    float(trade.net_pnl)
-                    if trade.net_pnl is not None
-                    else float(trade.pnl) - float(trade.fees or 0.0)
-                )
-                point = EquityPoint(time=trade.last_exit_time, equity=round(running, 2))
-                if equity_curve[-1].time == point.time:
-                    equity_curve[-1] = point
-                else:
-                    equity_curve.append(point)
+        equity_curve, unmarked_symbols = build_mark_to_market_curve(
+            all_trades,
+            symbol_closes,
+            config.initial_capital,
+            start_time=curve_start,
+        )
         emit_progress(90.0, "Calculating statistics...")
 
         now = datetime.now(timezone.utc)
@@ -257,6 +256,7 @@ class NativeAdapter(EngineAdapter):
                 # A-M4 (D5): shared-equity replay summary for multi-symbol
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,
+                **describe_basis(unmarked_symbols),
             },
             initial_capital=config.initial_capital,
             risk_per_trade_pct=config.risk_per_trade_pct,

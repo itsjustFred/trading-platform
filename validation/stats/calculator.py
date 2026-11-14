@@ -19,7 +19,12 @@ Mathematical conventions (kept explicit so results are reproducible):
   of *negative* returns only (same negatives-only convention as
   ``runner/stats.py`` ``_sortino_manual``).
 * **Drawdown:** absolute is in account currency; ``max_drawdown_pct`` is a
-  fraction (0..1) of the running peak.
+  fraction (0..1) of the running peak. This calculator only sees closed
+  trades (imported MT5 / QuantConnect ledgers carry no bar data), so it is a
+  *balance* (realized) drawdown - the counterpart of
+  ``runner.stats``' ``max_drawdown_realized_pct``, NOT of its headline
+  ``max_drawdown_pct`` (mark-to-market equity drawdown). Compare it with the
+  reference platform's balance drawdown, not its equity drawdown.
 * **PnL basis (DV-B46):** win/loss classification, ``net_profit``, Sharpe,
   Sortino, drawdown, ``profit_factor``, averages and the largest winner/loser
   use the *net* per-trade PnL (``net_pnl`` when set, else gross PnL minus

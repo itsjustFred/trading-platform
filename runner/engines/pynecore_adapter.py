@@ -47,6 +47,11 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
+from runner.engines.mtm_equity import (
+    build_mark_to_market_curve,
+    closes_from_frame,
+    describe_basis,
+)
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
@@ -268,6 +273,7 @@ class PyneCoreAdapter(EngineAdapter):
         asset_classes: dict[str, str] = {}
         trade_counter = 0
         total_bars = 0
+        symbol_closes: dict[str, pd.Series] = {}
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
@@ -290,6 +296,9 @@ class PyneCoreAdapter(EngineAdapter):
                 )
 
             total_bars += len(df)
+            closes = closes_from_frame(df)
+            if closes is not None:
+                symbol_closes[symbol] = closes
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
             )
@@ -321,10 +330,15 @@ class PyneCoreAdapter(EngineAdapter):
             asset_class_by_symbol=asset_classes,
             fee_model=fee_model,
         )
+        equity_curve, unmarked_symbols = _equity_curve_from_trades(
+            config, all_trades, symbol_closes
+        )
+        meta = _pyne_meta(config, strategy_name, resolved_parameters, total_bars)
+        meta.data = {**(meta.data or {}), **describe_basis(unmarked_symbols)}
         result = BacktestResult(
-            meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
+            meta=meta,
             trades=all_trades,
-            equity_curve=_equity_curve_from_trades(config, all_trades),
+            equity_curve=equity_curve,
             stats=all_stats,
             drawings=all_drawings,
         )
@@ -509,41 +523,25 @@ def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
         trade.net_pnl = round(float(trade.pnl) - fees, 2)
 
 
-def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
-    """Build a net, exit-timed equity curve from merged trades."""
-    equity = float(config.initial_capital)
-    events: list[tuple[str, float]] = []
-    for trade in all_trades:
-        exits = sorted(trade.exits or [], key=lambda item: str(item.time))
-        if not exits:
-            events.append((str(trade.entry_time), float(trade.net_pnl or 0.0)))
-            continue
-        gross_total = sum(float(leg.pnl or 0.0) for leg in exits)
-        net_total = (
-            float(trade.net_pnl)
-            if trade.net_pnl is not None
-            else float(trade.pnl) - float(trade.fees or 0.0)
-        )
-        fee_delta = net_total - gross_total
-        for leg in exits:
-            gross_leg = float(leg.pnl or 0.0)
-            share = gross_leg / gross_total if gross_total else 1.0 / len(exits)
-            events.append((str(leg.time), gross_leg + fee_delta * share))
-
-    if not events:
-        return []
+def _equity_curve_from_trades(
+    config: BacktestConfig,
+    all_trades: list[Trade],
+    closes: dict[str, pd.Series],
+) -> tuple[list[EquityPoint], list[str]]:
+    """Mark-to-market portfolio curve from the merged (risk-sized) trades."""
+    if not all_trades:
+        return [], []
     start = pd.to_datetime(config.start_date, utc=True, errors="coerce")
     if pd.isna(start):
-        start = pd.to_datetime(events[0][0], utc=True)
-    curve = [EquityPoint(time=pd.Timestamp(start).isoformat(), equity=round(equity, 2))]
-    for timestamp, pnl in sorted(events, key=lambda item: (pd.Timestamp(item[0]), item[0])):
-        equity += pnl
-        point = EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=round(equity, 2))
-        if curve[-1].time == point.time:
-            curve[-1] = point
-        else:
-            curve.append(point)
-    return curve
+        start = pd.to_datetime(
+            min(str(trade.entry_time) for trade in all_trades), utc=True, format="mixed"
+        )
+    return build_mark_to_market_curve(
+        all_trades,
+        closes,
+        float(config.initial_capital),
+        start_time=pd.Timestamp(start).isoformat(),
+    )
 
 
 def _pyne_meta(

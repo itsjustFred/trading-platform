@@ -44,3 +44,12 @@ documented here.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
+
+## Sizing equity vs reporting equity
+
+Sizing draws on **realized cash** (`initial_capital` + closed-trade net PnL;
+`TradeEngine._sizing_equity`): unrealized profit is not spendable and a paper
+drawdown does not shrink new positions. The **reporting** equity curve that
+feeds drawdown / Sharpe / volatility is separate and **mark-to-market** on every
+engine, so an open position's drawdown is reported even though it never changes
+a position size. See `docs/cross-engine-backtest-contract.md` §4b.
