@@ -42,6 +42,7 @@ _guard.ensure_own_checkout("regenerate_mt5_parity_artifacts")
 import shared  # noqa: F401
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import resolve_strategy_parameters
+from runner.engines.mtm_equity import BASIS_REALIZED_EXIT_TIMED, EQUITY_CURVE_BASIS_KEY
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -561,6 +562,12 @@ def regenerate_case(
                     else []
                 ),
                 "source": "ohlcv",
+                # These trades are priced with MT5 tick values and currency
+                # conversion, which cannot be re-derived from bar closes, so the
+                # curve here is the BALANCE curve (credited at exit). Its
+                # drawdown/Sharpe are balance-based - compare them with MT5's
+                # "balance drawdown", never with its (deeper) equity drawdown.
+                EQUITY_CURVE_BASIS_KEY: BASIS_REALIZED_EXIT_TIMED,
             },
             initial_capital=capital,
             parameters=params,

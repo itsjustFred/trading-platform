@@ -202,6 +202,43 @@ Implementation:
   order against one realized-equity ledger, and the aggregate open notional
   is capped by shared `max_leverage`.
 
+## 4b. Reporting equity curve (mark-to-market)
+
+Drawdown, Sharpe, Sortino, volatility and Calmar are computed from the
+persisted `equity_curve`, so that curve must show the paper PnL of open
+positions. **Every engine persists a mark-to-market (MTM) portfolio curve**
+(`runner/engines/mtm_equity.py`, native / vectorbt / pynecore / signal-replay,
+single- and multi-symbol alike):
+
+- one observation per bar of the traded symbols plus every entry / exit-leg
+  time, starting at `start_date` with the initial capital; the observation at
+  `t` uses the close of the bar stamped `t`;
+- equity = `initial_capital` + realized exit legs (gross) + unrealized PnL of
+  the still-open quantity marked at the last close; fees are recognised when
+  the trade fully closes, so from the final exit on a trade contributes exactly
+  its `net_pnl` and the last point equals `initial_capital + Σ net_pnl`
+  (total return is identical to the old realized-only curve);
+- multi-symbol runs build ONE portfolio curve from the shared-equity-replayed
+  trades; per-symbol paths are never summed;
+- runs of unchanged equity with no open position are thinned to their end
+  points (lossless for the daily resampling every ratio uses);
+- `meta.data["equity_curve_basis"]` is `mark_to_market`
+  (`mark_to_market_partial` + `equity_curve_unmarked_symbols` when a traded
+  symbol had no bars to mark against) or `realized_exit_timed` for artifacts
+  whose PnL cannot be re-derived from bars (MT5-parity trades priced with tick
+  values);
+- `stats.daily_returns` / `meta.data["daily_equity_curve"]` are derived from
+  the same curve (`runner/daily_equity.py`), never from the closed-trade ledger
+  next to an MTM curve.
+
+**Headline vs balance drawdown (MT5 reports both).** `max_drawdown_pct` is the
+*equity* drawdown on the MTM curve. `max_drawdown_realized_pct` (extras) is the
+*balance* drawdown of closed-trade net PnL replayed in exit order; it is always
+shallower than or equal to the headline figure.
+
+**Sizing is unaffected.** The MTM curve is reporting only: sizing keeps
+drawing on realized cash (§4, `TradeEngine._sizing_equity`).
+
 ## 5. Execution-timing models (documented divergence)
 
 Three execution-timing models coexist. They are **documented, per-engine

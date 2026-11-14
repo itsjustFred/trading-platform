@@ -35,6 +35,8 @@ from shared.models import (  # noqa: E402
 
 GOLDEN_PATH = ROOT / "tests" / "fixtures" / "backtest" / "native_cli_v1.json"
 RESULT_ID = "backtest-golden-native-v1"
+#: Two half-cent roundings (previous and current close) bound a cent-quantised return.
+EQUITY_CENT_ROUNDING = 0.01
 DYNAMIC_CREATED_AT = "<dynamic>"
 DYNAMIC_PATH = "<dynamic-path>"
 MAX_REPORTED_PATHS = 40
@@ -522,6 +524,25 @@ def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> 
     return result
 
 
+def _oracle_mtm_equities(result: BacktestResult) -> list[float]:
+    """Independent per-bar mark-to-market equity from the raw bars and the ledger."""
+    bar_times = pd.date_range("2024-01-01T00:00:00Z", periods=len(CLOSES), freq="h")
+    equities = [100_000.0]
+    for stamp, close in zip(bar_times, CLOSES, strict=True):
+        moment = stamp.to_pydatetime()
+        value = 100_000.0
+        for trade in result.trades:
+            exit_time = _utc_timestamp(trade.exits[-1].time)
+            if _utc_timestamp(trade.entry_time) > moment:
+                continue
+            if exit_time <= moment:
+                value += trade.net_pnl
+            else:
+                value += (close - trade.entry_price) * trade.quantity
+        equities.append(value)
+    return equities
+
+
 def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.meta.id == RESULT_ID
     assert result.meta.engine == "native"
@@ -550,9 +571,15 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.stats["losers"] == 2
     assert result.stats["profit_factor"] is not None
     assert result.stats["daily_return_count"] == 3
-    assert len(result.equity_curve) == result.stats["daily_return_count"] + 1
+    # The persisted curve is MARK-TO-MARKET at bar resolution (hourly here), not
+    # one realized point per day: drawdown / Sharpe must see the paper loss of an
+    # open position. Its daily compaction is `daily_returns` (checked below).
     assert result.equity_curve[0].time == "2024-01-01T00:00:00+00:00"
     assert result.equity_curve[0].equity == 100_000.0
+    curve_times = [_utc_timestamp(point.time) for point in result.equity_curve]
+    assert curve_times == sorted(set(curve_times)), "curve must be strictly increasing"
+    assert len(result.equity_curve) > result.stats["daily_return_count"] + 1
+    assert result.meta.data["equity_curve_basis"] == "mark_to_market"
 
     equity = 100_000.0
     peak_equity = equity
@@ -614,28 +641,31 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     for index, row in enumerate(daily_rows, start=1):
         day_pnl = expected_daily_pnl[row["date"]]
         expected_close = running_equity + day_pnl
-        curve_point = result.equity_curve[index]
-        curve_time = _utc_timestamp(curve_point.time)
-        # The pipeline may keep the engine's own curve, whose marks sit at each
-        # day's last trade exit rather than at the end-of-day close.  Both are
-        # valid daily curves, so pin the day, the ordering, that the mark is not
-        # taken before the day's last exit, and the economic content - not one
-        # particular timestamp convention.
-        assert curve_time.date().isoformat() == row["date"]
-        assert curve_time > _utc_timestamp(result.equity_curve[index - 1].time)
+        # The day's close is the LAST curve observation of that UTC day (every
+        # golden trade is flat by day end, so close equity == realized ledger).
+        day_points = [
+            point
+            for point in result.equity_curve
+            if _utc_timestamp(point.time).date().isoformat() == row["date"]
+        ]
+        assert day_points, f"curve has no observation on {row['date']}"
+        curve_point = day_points[-1]
         last_exit = last_exit_by_day.get(row["date"])
         if last_exit is not None:
-            assert curve_time >= last_exit
+            assert _utc_timestamp(curve_point.time) >= last_exit
         assert curve_point.equity == round(expected_close, 2)
         assert abs(curve_point.equity - expected_close) <= 0.005
         # The reported equity is cent-quantised so that the two published views
         # of the same instant agree; the return still uses the exact balance.
         assert row["equity"] == round(expected_close, 2)
         assert row["equity"] == curve_point.equity
+        # The published return is derived from the cent-quantised equity path
+        # (the same mark-to-market curve the stats use), so it can differ from
+        # the exact ledger ratio by at most the two half-cent roundings.
         assert row["return"] == pytest.approx(
             day_pnl / running_equity,
             rel=1e-12,
-            abs=1e-12,
+            abs=EQUITY_CENT_ROUNDING / running_equity,
         )
         running_equity = expected_close
     assert running_equity == pytest.approx(equity, rel=1e-12, abs=1e-9)
@@ -649,12 +679,39 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     )
     expected_total_return = equity / 100_000.0 - 1.0
     assert result.stats["total_return"] == pytest.approx(expected_total_return, abs=1e-6)
-    assert result.stats["max_drawdown_pct"] == pytest.approx(-max_drawdown, abs=1e-6)
-    assert result.stats["max_drawdown_duration"] == 2
+    # Headline drawdown is measured on the mark-to-market equity, rebuilt here
+    # from the raw bars with an independent per-bar loop (no engine code).
+    mtm_equities = _oracle_mtm_equities(result)
+    mtm_peak = mtm_equities[0]
+    mtm_drawdown = 0.0
+    for value in mtm_equities:
+        mtm_peak = max(mtm_peak, value)
+        mtm_drawdown = max(mtm_drawdown, (mtm_peak - value) / mtm_peak)
+    # Mark-to-market can only be as deep or deeper than the balance drawdown
+    # (this fixture's losers fall monotonically into their exits, so here the
+    # two coincide; intra-trade drawdown is pinned by tests/test_mtm_equity.py).
+    assert mtm_drawdown >= max_drawdown - 1e-12
+    assert result.stats["max_drawdown_pct"] == pytest.approx(-mtm_drawdown, abs=1e-6)
+    # The balance (closed-trade) drawdown stays available under its own name.
+    assert result.stats["max_drawdown_realized_pct"] == pytest.approx(
+        -max_drawdown, abs=1e-6
+    )
+    curve_peak = result.equity_curve[0].equity
+    duration = longest = 0
+    for point in result.equity_curve:
+        if point.equity >= curve_peak:
+            curve_peak, duration = point.equity, 0
+        else:
+            duration += 1
+            longest = max(longest, duration)
+    assert result.stats["max_drawdown_duration"] == longest
     compounded_returns = 1.0
     for daily_return in result.stats["daily_returns"]:
         compounded_returns *= 1.0 + daily_return["return"]
-    assert compounded_returns - 1.0 == pytest.approx(expected_total_return, rel=1e-12, abs=1e-12)
+    # Cent-quantised daily returns telescope to the rounded final equity.
+    assert compounded_returns - 1.0 == pytest.approx(
+        expected_total_return, rel=1e-12, abs=EQUITY_CENT_ROUNDING / 2 / 100_000.0
+    )
     # CAGR annualizes over the configured calendar window, not over the span of
     # whatever curve the engine happened to keep.
     elapsed_days = (window_end - window_start).total_seconds() / 86_400.0
