@@ -3,11 +3,16 @@ Strategy: Supertrend + DEMA (Pine Script Conversion)
 
 Combines Supertrend indicator with Double EMA (DEMA) filter.
 Long when Supertrend flips bullish AND price > DEMA.
+
+Exits: the trailing Supertrend stop is an explicit price level; the
+Supertrend flip-down is a close-triggered market exit (no explicit
+``exit_price``), so under the default ``signal_exit_fill="next_open"`` it fills
+at the next bar's open.
 """
 
 STRATEGY_META = {
     "name": "Supertrend + DEMA",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "tags": {
         "type": ["trend-following"],
         "source": "indikatoren-repo",
@@ -101,11 +106,13 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or bool(exit_cond.iloc[i]):
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = active_stop
+                # The trailing stop is a price LEVEL (explicit exit_price). The
+                # Supertrend flip is a close-triggered MARKET exit: no explicit
+                # exit_price, so it fills at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "trailing_stop"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "supertrend_flip_down"
                 in_trade = False
                 active_stop = np.nan

@@ -15,12 +15,15 @@ Meta/tags below describe the implemented single-instrument behavior.
 
 STRATEGY_META = {
     "name": "Volatility-Regime Long (single instrument)",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/risk_parity_strategy.py",
     "notes": (
         "- Implementiert NICHT die Multi-Asset-Risk-Parity-Allokation des "
         "Originals; diese Strategie handelt ein einzelnes Instrument "
         "long/flat mit Volatilitaets-Regime- und SMA-Trendfilter.\n"
+        "- 1.2.0: Regime- und Trend-Ausstiege sind Market-Exits ohne "
+        "exit_price=close (Fill am naechsten Open); der ATR-Stop bleibt ein "
+        "explizites Level.\n"
         "- Die echte Multi-Asset-Risk-Parity-Gewichtung liegt in "
         "scripts/run_risk_parity_backtest.py (QuantConnect-Reimplementierung) "
         "und runner/risk_parity_optimizer.py."
@@ -98,14 +101,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
             trend_break = not bool(uptrend.iloc[i])
             if stop_hit or regime_break or trend_break:
                 exits.iloc[i] = True
+                # Only the ATR stop is a price LEVEL (explicit exit_price). The
+                # regime / trend breaks are close-triggered MARKET exits: no
+                # explicit exit_price, so they fill at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif regime_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "regime_break"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "trend_break"
                 in_trade = False
                 active_stop = np.nan

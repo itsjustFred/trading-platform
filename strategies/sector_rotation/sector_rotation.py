@@ -34,12 +34,14 @@ symbol:
 
 STRATEGY_META = {
     "name": "Sector Rotation",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/sector_rotation_strategy.py",
     "notes": (
         "Single-symbol proxy of a multi-sector rotation system. "
         "Source-exact entry: mom63 > 0, mom21 > 0, close > SMA200. "
-        "Default exit: trend break (close < SMA200). Dropped (not "
+        "Default exit: trend break (close < SMA200). 1.2.0: market exits "
+        "carry no exit_price=close and fill at the next open; the ATR stop "
+        "stays an explicit level. Dropped (not "
         "single-symbol-expressible): sector universe, RS ranking, "
         "regime tables, defensive basket. ATR stop / mom63<0 exit / "
         "10d-weakness exit are opt-in only (default OFF)."
@@ -128,17 +130,18 @@ def generate_signals(df: pd.DataFrame, params: dict):
             weakness_hit = bool(short_weakness.iloc[i]) if use_weakness_exit else False
             if stop_hit or trend_break or momentum_break or weakness_hit:
                 exits.iloc[i] = True
+                # Only the ATR stop is a price LEVEL (explicit exit_price). The
+                # trend / momentum / weakness exits are close-triggered MARKET
+                # exits: no explicit exit_price, so they fill at the next bar's
+                # open under the default next_open convention.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif trend_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "trend_break"
                 elif momentum_break:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "momentum_break"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "short_weakness"
                 in_trade = False
                 active_stop = np.nan

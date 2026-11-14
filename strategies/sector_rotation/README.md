@@ -17,6 +17,8 @@ Opt-in Exits (default OFF, keine Quelllogik — muessen explizit per Parameter a
 2. `use_momentum_exit=true`: Regimebruch `Momentum(63) < 0`.
 3. `use_weakness_exit=true`: Kurzfristige Schwaeche `close.pct_change(10) < -3 %`.
 
+**Fill-Konvention (Version 1.2.0):** Marktausstiege auf Close-Basis (Trendbruch-, Momentum- und Weakness-Exit) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Der ATR-Stop bleibt ein explizites Level (`exit_price`).
+
 ### Stop-Loss
 Kein Stop-Loss im Standard (die Quelle nutzt keinen ATR-Stop).
 Opt-in via `use_atr_stop=true`: `sl_price = entry_close - ATR_Wilder(14) * 2.0`.

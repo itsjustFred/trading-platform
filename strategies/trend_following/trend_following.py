@@ -14,7 +14,9 @@ Source fidelity
   ``new_stop = price - 2.5 x ATR``, ratcheted up, never down.
 - Entry proxy for the source's ``|composite| > 0.5`` long trigger:
   EMA20 crosses above EMA50 while EMA50 is above EMA200.
-- Exit on fast cross down (signal reversal) or stop hit.
+- Exit on fast cross down (signal reversal) or stop hit. Both are
+  close-triggered market exits: no explicit ``exit_price``, so under the
+  default ``signal_exit_fill="next_open"`` they fill at the next bar's open.
 
 Scope notes (documented, not implemented)
 -----------------------------------------
@@ -32,12 +34,14 @@ symbol, long-only:
 
 STRATEGY_META = {
     "name": "Trend Following",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/trend_following_cta.py",
     "notes": (
         "Single-symbol long-only proxy of a multi-market long/short CTA. "
         "Source-exact: EMA 20/50/200, Wilder ATR20, 2.5xATR stop with "
-        "trailing only after 2.0 ATR profit. Dropped (not "
+        "trailing only after 2.0 ATR profit. 1.2.0: market exits (trailing "
+        "stop, EMA cross-down) carry no exit_price=close and fill at the next "
+        "open. Dropped (not "
         "single-symbol-expressible): Donchian breakout, composite "
         "weighting, vol targeting, sector/correlation caps, shorts."
     ),
@@ -132,10 +136,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 in_trade = False
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = trailing_stop_value
-                # A-M2: the trigger is close-based, so the fill is the CLOSE
-                # (filling at the stop level above the close systematically
-                # sells LONGs too high) — same price for both legs.
-                exit_price.iloc[i] = float(close.iloc[i])
+                # Both exit legs are close-triggered MARKET exits: no explicit
+                # exit_price (a price equal to the signal bar's close would
+                # contradict the default next_open fill). They fill at the next
+                # bar's open. Filling at the stop level above the close would
+                # systematically sell LONGs too high, which is why no level is
+                # emitted here either.
                 if trailing_stop_hit:
                     exit_reason.iloc[i] = "trailing_stop"
                 else:

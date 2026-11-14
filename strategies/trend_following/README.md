@@ -15,6 +15,8 @@ Vollausstieg bei einem von zwei Events:
 1. `EMA(20)` kreuzt die `EMA(50)` von oben nach unten (`ema_cross_down`, Signalumkehr).
 2. Der Schlusskurs faellt auf/unter den aktiven Stop (`trailing_stop`).
 
+**Fill-Konvention (Version 1.2.0):** Marktausstiege auf Close-Basis (EMA-Kreuz und Trailing-Stop-Hit) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Der Stop-Level-Fill entfaellt fuer diesen Exit-Pfad.
+
 ### Stop-Loss
 Initialer Stop-Loss beim Entry (exakt wie die Quelle): `sl_price = entry_close - ATR_Wilder(20) * 2.5`.
 
