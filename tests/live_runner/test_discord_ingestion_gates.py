@@ -546,6 +546,15 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         async def get_positions(self):
             return []
 
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
         async def get_quote(self, symbol):
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
@@ -620,6 +629,15 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
         async def get_positions(self):
             return []
 
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
         async def get_quote(self, symbol):
             # #125 entry-deviation gate: a quote at the signal entry passes.
             from live_runner.base_adapter import LiveQuote
@@ -688,6 +706,15 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
 
         async def get_quote(self, symbol):
             # #125 entry-deviation gate: a quote at the signal entry passes.
@@ -1291,6 +1318,15 @@ def test_dispatch_discards_stale_signals() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
 
         async def get_quote(self, symbol):
             # #125 entry-deviation gate: a quote at the signal entry passes.
@@ -4145,6 +4181,15 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
 
         async def get_quote(self, symbol):
             # #125 entry-deviation gate: a quote at the signal entry passes.

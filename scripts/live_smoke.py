@@ -960,6 +960,19 @@ class _DiscordSmokeAdapter:
             source="discord-smoke",
         )
 
+    async def get_pip_value(self, symbol: str) -> Any:
+        # #146: the replayed AAPL entry is a USD share in a USD account.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="discord-smoke",
+        )
+
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:
     from types import SimpleNamespace
