@@ -10,8 +10,8 @@ Arithmetic used throughout (EURUSD, 1 lot = 100 000 units):
 * LONG pnl  = (exit - entry) * lots * 100 000
 * SHORT pnl = (entry - exit) * lots * 100 000
 
-Commission and swap are MT5-signed: a cost is negative. ``Trade.fees`` is the
-signed sum of commission and swap over every fill of the position.
+Commission and swap are MT5-signed (a cost is negative). ``Trade.fees`` is the positive
+cost: the negated sum of commission and swap over every fill of the position.
 
 Positions in ``hedged_partial_open.xlsx`` (scope = symbol + entry side):
 
@@ -89,9 +89,9 @@ class TestHedgedPartialOpenReport:
                 "take_profit",
             )
         ]
-        # (1.1050 - 1.1000) * 0.10 * 100 000 = 50.00; fees -0.70 - 0.70 = -1.40
+        # (1.1050 - 1.1000) * 0.10 * 100 000 = 50.00; MT5 commission -0.70 - 0.70 = fees 1.40
         assert t.pnl == pytest.approx(50.00)
-        assert t.fees == pytest.approx(-1.40)
+        assert t.fees == pytest.approx(1.40)
         assert t.stop_loss == pytest.approx(1.0950)
         assert t.take_profit == pytest.approx(1.1050)
         assert t.exit_reason == "take_profit"
@@ -107,8 +107,8 @@ class TestHedgedPartialOpenReport:
         ]
         # (1.1040 - 1.1010) * 0.12 * 100 000 = 36.00; (1.1030 - 1.1010) * 0.08 * 100 000 = 16.00
         assert t.pnl == pytest.approx(52.00)
-        # fees: entry -1.40; exits -0.84 and -0.56
-        assert t.fees == pytest.approx(-2.80)
+        # MT5 commission: entry -1.40; exits -0.84 and -0.56 -> fees 2.80
+        assert t.fees == pytest.approx(2.80)
         assert t.stop_loss == pytest.approx(1.0980)
         assert t.take_profit is None
         # Last exit's comment decides the trade's exit reason.
@@ -130,8 +130,8 @@ class TestHedgedPartialOpenReport:
         ]
         # (1.1020 - 1.1035) * 0.10 * 100 000 = -15.00
         assert t.pnl == pytest.approx(-15.00)
-        # fees: entry -0.70; exit -0.70 commission and -0.30 swap = -1.70
-        assert t.fees == pytest.approx(-1.70)
+        # MT5: entry -0.70; exit -0.70 commission and -0.30 swap -> fees 1.70
+        assert t.fees == pytest.approx(1.70)
         assert t.stop_loss == pytest.approx(1.1050)
         assert t.exit_reason == "stop_loss"
 
@@ -200,15 +200,9 @@ class TestHedgedPartialOpenReport:
         # 50.00 + 52.00 - 15.00 = 87.00 over the three closed trades only.
         assert sum(t.pnl for t in hedged.trades) == pytest.approx(87.00)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Known bug: importer sets net_pnl = pnl - fees, but fees are MT5-signed "
-            "(commission and swap are negative when they cost money). Net should be "
-            "pnl + fees. Expected net for P1 is 50.00 - 1.40 = 48.60, not 51.40."
-        ),
-    )
-    def test_net_pnl_is_gross_plus_signed_fees(self, hedged: ValidationReference) -> None:
+    def test_net_pnl_is_gross_minus_positive_fees(self, hedged: ValidationReference) -> None:
+        # MT5 commission/swap -1.40 is stored as a positive cost of 1.40.
+        assert hedged.trades[0].fees == pytest.approx(1.40)
         assert hedged.trades[0].net_pnl == pytest.approx(48.60)
 
 
@@ -237,8 +231,8 @@ class TestPositionIdSharedReport:
             (pytest.approx(1.1030), pytest.approx(0.05), pytest.approx(15.00)),
         ]
         assert t.pnl == pytest.approx(55.00)
-        # fees: -0.50 -0.25 (entries) and -0.50 -0.25 (exits)
-        assert t.fees == pytest.approx(-1.50)
+        # MT5 -0.50 -0.25 (entries) and -0.50 -0.25 (exits) -> fees 1.50
+        assert t.fees == pytest.approx(1.50)
         assert t.exit_reason == "take_profit"
 
     def test_short_round_trip(self, shared: ValidationReference) -> None:
@@ -247,7 +241,7 @@ class TestPositionIdSharedReport:
         assert t.quantity == pytest.approx(0.20)
         # (1.1100 - 1.1080) * 0.20 * 100 000 = 40.00
         assert t.pnl == pytest.approx(40.00)
-        assert t.fees == pytest.approx(-2.00)
+        assert t.fees == pytest.approx(2.00)
         assert t.exit_reason == "take_profit"
 
     def test_overlapping_same_side_position_is_kept_separate(
@@ -262,9 +256,9 @@ class TestPositionIdSharedReport:
         assert t.entry_time == "2024-02-01T18:30:00Z"
         assert t.entry_price == pytest.approx(1.1070)
         assert t.quantity == pytest.approx(0.05)
-        # (1.1080 - 1.1070) * 0.05 * 100 000 = 5.00; fees -0.25 -0.25
+        # (1.1080 - 1.1070) * 0.05 * 100 000 = 5.00; MT5 -0.25 -0.25 -> fees 0.50
         assert t.pnl == pytest.approx(5.00)
-        assert t.fees == pytest.approx(-0.50)
+        assert t.fees == pytest.approx(0.50)
 
     def test_partial_repeated_id_yields_no_trade(self, shared: ValidationReference) -> None:
         evidence = shared.raw_metadata["position_fills"]

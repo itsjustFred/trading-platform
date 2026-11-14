@@ -65,8 +65,8 @@ class TestHTMLSplitFills:
     def test_fees_sum_over_all_fills(self) -> None:
         ref = MT5HTMLImporter().load(_split_fill_html())
         first = ref.trades[0]
-        # -0.50 (entry 1) -0.25 (entry 2) -0.75 (exit 1) -0.50 (exit 2)
-        assert first.fees == pytest.approx(-2.00)
+        # MT5 -0.50 (entry 1) -0.25 (entry 2) -0.75 (exit 1) -0.50 (exit 2) -> fees 2.00
+        assert first.fees == pytest.approx(2.00)
 
     def test_importers_agree_on_same_position_sequence(self) -> None:
         """Both importers must produce the same positions from the same report."""
