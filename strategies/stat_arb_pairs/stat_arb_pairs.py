@@ -16,13 +16,15 @@ import pandas as pd
 
 STRATEGY_META = {
     "name": "Single-Leg Z-Score Mean Reversion",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/statistical_arbitrage_pairs.py",
     "notes": (
         "- KEIN Pairs-Trading: der Z-Score wird auf den kumulierten Log-"
         "Returns des EINZELNEN Instruments berechnet (Single-Leg Mean "
         "Reversion), nicht auf einem Spread zwischen zwei Instrumenten.\n"
         "- Long-only; keine Market-Neutral-Absicherung.\n"
+        "- 1.3.0: Z-Score-Ausstiege sind Market-Exits ohne exit_price=close "
+        "(Fill am naechsten Open); der ATR-Stop bleibt ein explizites Level.\n"
         "- Quellen-Schwellen exakt: Lookback 60, Entry |z| >= 2.0, "
         "Mean-Reversion-Exit bei z >= -0.5, statistischer Fail-Stop bei "
         "z <= -4.0 (stop_zscore der Quelle).\n"
@@ -102,14 +104,15 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             zscore_stop_hit = z_value <= -stop_zscore
             if stop_hit or mean_reversion_hit or zscore_stop_hit:
                 exits.iloc[i] = True
+                # Only the ATR stop is a price LEVEL (explicit exit_price). The
+                # z-score exits are close-triggered MARKET exits: no explicit
+                # exit_price, so they fill at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 elif mean_reversion_hit:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "mean_reversion"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "zscore_stop"
                 in_long = False
                 active_stop = np.nan
