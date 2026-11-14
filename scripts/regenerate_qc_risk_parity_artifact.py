@@ -173,7 +173,9 @@ def _build_result(result: dict[str, Any], prices: pd.DataFrame, *, start: str, e
 
 def regenerate(*, data_dir: Path, source: Path, output: Path, start: str, end: str,
                history_start: str = "2015-08-04") -> BacktestResult:
-    prices, open_prices = _load_local_prices(data_dir, source, history_start, end)
+    prices, open_prices = _load_local_prices(
+        data_dir, source, risk_parity.price_history_start(start, history_start), end
+    )
 
     def local_prices(_: str, __: str, history_start: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
         return prices.copy(), open_prices.copy()
