@@ -7,7 +7,7 @@ the MT5-logged daily ATR is injected (``Stop / Stop_ATR_Multiplier`` of the EA's
 ATR stop distance and the bid/ask spread model (``spread_price_col``).
 
   .venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py \
-      --ref-dir data/audit_ref --symbols nas100 sp500 [--signal-exit-fill open|next_open|close] \
+      --ref-dir data/audit_ref --symbols nas100 sp500 [--signal-exit-fill next_open|close] \
       [--strategy-file <older strategy .py to compare against>]
 
 Needs the references from ``parse_mt5_reference.py`` (``--ref-dir``) and the tester CSV/log

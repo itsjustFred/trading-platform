@@ -537,3 +537,28 @@ class TestSharedEquityReplayMath:
         replayed, _, _ = replay_shared_equity([a, b, d], 100_000.0)
         by_id = {t.id: t for t in replayed}
         assert by_id[1].quantity == pytest.approx(100.0)
+
+
+class TestSignalExitFillOpenRemoved:
+    """Issue #153: ``open`` filled a signal exit at the open of the bar it was
+    computed from (lookahead). Every engine entry must reject it."""
+
+    @pytest.mark.parametrize("spelling", ["open", "OPEN", " Open "])
+    def test_normalizer_rejects_open_with_migration_message(self, spelling):
+        from runner.engines import contract
+
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            contract.normalize_signal_exit_fill(spelling)
+
+    @pytest.mark.parametrize("value", ["next_open", "Close", "CLOSE "])
+    def test_normalizer_accepts_the_supported_modes(self, value):
+        from runner.engines import contract
+
+        assert contract.normalize_signal_exit_fill(value) == value.strip().lower()
+
+    def test_vectorbt_helpers_reject_open(self):
+        from runner.engines import vectorbt_adapter as vbt
+
+        row = pd.Series({"open": 1.0, "close": 2.0})
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            vbt._resolve_exit_price(row, 0, None, signal_exit_fill="open")

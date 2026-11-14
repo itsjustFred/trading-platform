@@ -180,13 +180,9 @@ class BacktestConfig(BaseModel):
         # bar engines — a typo ("clos", "OPEN ") silently fell through to
         # close-fill everywhere (every reader tests `== "open"`). Normalize
         # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
-        normalized = str(v or "").strip().lower()
-        if normalized not in {"next_open", "close", "open"}:
-            raise ValueError(
-                f"Invalid signal_exit_fill {v!r}, must be 'next_open', "
-                "'close' or 'open'"
-            )
-        return normalized
+        # Issue #153: the lookahead-prone "open" mode is removed; the shared
+        # gate raises a migration message for it.
+        return contract.normalize_signal_exit_fill(v)
 
     @field_validator("timeframe")
     @classmethod
