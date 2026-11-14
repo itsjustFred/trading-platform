@@ -2,6 +2,7 @@
 
 ## Quelle
 - Original: Pine Script v6 (`rndm_stuff/QG-30Min_ES_Breakout_Strategy.pine`), Kommentar-Link: `https://discord.com/channels/1230977283888648315/1387506825603059762/1387506825603059762`
+- Version: 1.1.0 (Time-Exit eine Bar frueher, kein exit_price fuer den Market-Exit)
 - Konvertiert: 2026-05-04, source-faithful Fix: 2026-09-09 (Fade-Semantik, Short-Level, Exit-Zeit direkt am Pine verifiziert)
 
 ## Kernlogik
@@ -23,7 +24,7 @@
 
 ### Exit
 - Stop-Loss-Exit (Plattform-Erweiterung, dokumentiert): Exit bei Stop-Hit (`stop_loss`).
-- Time-Exit: Offene Position wird per Signal um 14:55 NY geschlossen (`time_exit_1455_ny`, wie `exit_time` im Pine). Wegen Next-Open-Ausführung im vectorbt-Adapter liegt der Fill auf der Folge-Bar.
+- Time-Exit: Offene Position wird per Signal zum **14:55-NY-Open** geschlossen (`time_exit_1455_ny`, wie `exit_time` im Pine; das Label folgt den `forced_exit_*`-Parametern). Signal-Exits fuellen am naechsten Bar-Open (`next_open`), deshalb geht das Signal auf der ersten Bar raus, deren Ende 14:55 erreicht (1m: 14:54, 1h: 14:00 -> Fill 15:00). Seit v1.1.0 ohne expliziten `exit_price` (der Market-Close-Preis kollidierte mit dem Next-Open-Fill).
 
 ### Stop-Loss
 - Originalstrategie definiert keinen expliziten Stop-Loss.

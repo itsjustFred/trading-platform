@@ -15,8 +15,10 @@ Source semantics (NT8, Calculate.OnBarClose):
   negative gap -> shorts only, gap < MinGap (incl. gap==0) -> NO trades.
 - Channel exit (default ON): opposite-side stop (long exits at
   downBound-TickSize, short at upBound+TickSize).
-- Session-close exit (IsExitOnSessionCloseStrategy, 30s): flatten at the last
-  bar of each NY session day (no overnight holds).
+- Session-close exit (IsExitOnSessionCloseStrategy, 30s): flat by the last
+  bar of each NY session day (no overnight holds). Signal exits fill at the next
+  bar's open, so the flatten is raised on the second-to-last bar of the session
+  (feed schedule + bar spacing, no look-ahead) and fills at the last bar's open.
 - EMA exit (default OFF) + fixed-$ stop (default OFF, $100) are opt-in params
   defaulting to source defaults.
 
@@ -37,12 +39,14 @@ import logging
 import numpy as np
 import pandas as pd
 
+from shared.bar_timing import modal_bar_minutes
+
 logger = logging.getLogger(__name__)
 
 
 STRATEGY_META = {
     "name": "Intraday Channel Breakout",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1383712509831155782/1388096847498707044",
     "notes": (
         "- Source: Intraday Channel Breakout nt8.txt (Length=5, EMA200 filter ON, "
@@ -56,6 +60,10 @@ STRATEGY_META = {
         "stop_loss_amount / point_value (default point_value 20.0 = NQ, "
         "so $100 ~= 5 pts). Set point_value to the traded instrument's "
         "$/point.\n"
+        "- 1.2.0: session-close is raised on the second-to-last bar of the NY session "
+        "(fills at the last bar's open under next_open instead of holding overnight); "
+        "market exits (trailing / EMA / session close) no longer carry exit_price=close; "
+        "no entries from that bar on.\n"
         "- Gap/session-close use NY calendar dates (US Equities RTH); without a "
         "`timestamp` column the gap filter is bypassed (documented)."
     ),
@@ -133,7 +141,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     n = len(df)
     # Gap direction per bar: 1 = long only, -1 = short only, 0 = no trades.
     gap_direction = pd.Series(np.zeros(n, dtype=int), index=df.index)
-    ny_dates, _ = _ny_dates(df)
+    ny_dates, _ny_ts = _ny_dates(df)
     gap_filter_active = bool(use_gap_filter) and (ny_dates is not None)
     if gap_filter_active:
         dates = np.array(ny_dates)
@@ -162,27 +170,45 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         for i in range(n):
             gap_direction.iloc[i] = gap_by_date[dates[i]]
 
-    # B-M2: last-bar-of-day markers are derived whenever a session calendar
-    # is available — INDEPENDENT of the gap filter. Previously
-    # is_last_of_day stayed all-False with use_gap_filter=False, so
-    # exit_on_session_close=True silently held positions overnight.
-    is_last_of_day = pd.Series(False, index=df.index)
+    # B-M2: session-close markers are derived whenever a session calendar is
+    # available - INDEPENDENT of the gap filter (with use_gap_filter=False,
+    # exit_on_session_close=True used to silently hold positions overnight).
+    #
+    # Signal exits fill at the NEXT bar's open (signal_exit_fill="next_open"), and
+    # "last bar of the day" is not knowable on that bar without peeking at the next
+    # bar's date. So the flatten is raised on the SECOND-TO-LAST bar of the session,
+    # derived from the feed's session schedule (modal last-bar time of day) and bar
+    # spacing only: the position is closed at the last bar's open instead of being
+    # carried into the next session. Whole-day feed properties, no per-bar look-ahead.
+    # Safeguard: if a day ends early (holiday/half day) the signal bar never comes;
+    # the position is then flattened on the first bar of the next session
+    # (``session_day_start``) - one bar later, never skipped.
+    session_exit_bar = pd.Series(False, index=df.index)
+    session_day_start = pd.Series(False, index=df.index)
     session_dates = np.array(ny_dates) if ny_dates is not None else None
+    session_ts = _ny_ts
     if session_dates is None and "timestamp" in df.columns and (
         bool(use_gap_filter) or bool(exit_on_session_close)
     ):
         # NY conversion failed -> fall back to UTC dates for session-close
         # only; gap stays bypassed (documented).
         try:
-            ts_utc = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            session_dates = ts_utc.dt.date.to_numpy()
+            session_ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            session_dates = session_ts.dt.date.to_numpy()
         except Exception:
             logger.warning("Session-date fallback failed; session-close exit disabled")
             session_dates = None
-    if session_dates is not None:
-        for i in range(n):
-            if i == n - 1 or session_dates[i] != session_dates[i + 1]:
-                is_last_of_day.iloc[i] = True
+    if session_dates is not None and session_ts is not None:
+        spacing = modal_bar_minutes(pd.to_datetime(df["timestamp"], utc=True, errors="coerce"))
+        minute_of_day = session_ts.dt.hour * 60 + session_ts.dt.minute
+        last_minute_by_day = minute_of_day.groupby(session_dates).max()
+        if len(last_minute_by_day):
+            session_end = float(last_minute_by_day.mode().min()) + spacing
+            # first bar whose END reaches the START of the session's last bar
+            session_exit_bar = (minute_of_day + 2.0 * spacing) >= session_end
+        session_day_start = pd.Series(
+            np.r_[False, session_dates[1:] != session_dates[:-1]], index=df.index
+        )
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
@@ -229,14 +255,15 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         trailing_stop_value = None
                         continue
                 else:
-                    # A-M2: close-triggered trailing exit fills at the CLOSE,
-                    # not at the stop level (filling LONGs at the level above
-                    # the close systematically sells too high). Stop-order
-                    # legs (fixed stop on low/high, channel exit on low/high)
-                    # keep level fills — only close-triggered legs move.
+                    # A-M2: the trailing exit is close-triggered, so it is a MARKET
+                    # exit (no explicit exit_price): it fills at the next bar's
+                    # open under next_open, never at the stop level (filling
+                    # LONGs at the level above the close sells too high) and
+                    # never at the signal bar's close with a next-bar timestamp.
+                    # Stop-order legs (fixed stop on low/high, channel exit on
+                    # low/high) keep level fills.
                     if trailing_stop_value is not None and c <= trailing_stop_value:
                         exits.iloc[i] = True
-                        exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None
@@ -254,16 +281,16 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 # 3) EMA exit (close-based per source)
                 if use_ema_exit and c < float(ema_v):
                     exits.iloc[i] = True
-                    exit_price.iloc[i] = c
                     exit_reason.iloc[i] = "ema_exit"
                     in_trade = False
                     active_direction = None
                     trailing_stop_value = None
                     continue
                 # 4) session-close flatten
-                if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
+                if bool(exit_on_session_close) and bool(
+                    session_exit_bar.iloc[i] or session_day_start.iloc[i]
+                ):
                     exits.iloc[i] = True
-                    exit_price.iloc[i] = c
                     exit_reason.iloc[i] = "session_close"
                     in_trade = False
                     active_direction = None
@@ -284,11 +311,10 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                         trailing_stop_value = None
                         continue
                 else:
-                    # A-M2: close-triggered trailing exit fills at the CLOSE
-                    # (mirror of the LONG leg) — never at the stop level.
+                    # A-M2: market exit (mirror of the LONG leg) - no explicit
+                    # exit_price, never the stop level.
                     if trailing_stop_value is not None and c >= trailing_stop_value:
                         exits.iloc[i] = True
-                        exit_price.iloc[i] = c
                         exit_reason.iloc[i] = "trailing_stop"
                         in_trade = False
                         active_direction = None
@@ -304,15 +330,15 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     continue
                 if use_ema_exit and c > float(ema_v):
                     exits.iloc[i] = True
-                    exit_price.iloc[i] = c
                     exit_reason.iloc[i] = "ema_exit"
                     in_trade = False
                     active_direction = None
                     trailing_stop_value = None
                     continue
-                if bool(exit_on_session_close) and bool(is_last_of_day.iloc[i]):
+                if bool(exit_on_session_close) and bool(
+                    session_exit_bar.iloc[i] or session_day_start.iloc[i]
+                ):
                     exits.iloc[i] = True
-                    exit_price.iloc[i] = c
                     exit_reason.iloc[i] = "session_close"
                     in_trade = False
                     active_direction = None
@@ -327,6 +353,11 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                 long_allowed = bool(enable_long)
                 short_allowed = bool(enable_short)
 
+            if bool(exit_on_session_close) and bool(session_exit_bar.iloc[i]):
+                # An entry signalled now would fill at/after the session-close
+                # flatten bar and be carried overnight: no new entries from the
+                # second-to-last bar of the session.
+                continue
             long_breakout = c > float(up_prev)
             short_breakout = c < float(dn_prev)
             long_ema_ok = (not use_ema_filter) or (c > float(ema_v))

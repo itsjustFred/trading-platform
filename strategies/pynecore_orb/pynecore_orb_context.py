@@ -14,9 +14,11 @@ machine on closes so each trade is enriched with:
 - ``trailing_stop_at_exit`` (exit-sampled HWM/LWM trailing level),
 - ``exit_reason`` (``trailing_stop`` / ``time_exit`` at exit bars).
 
-Approximation note: the helper replays fills at signal-bar closes while the
+Approximation note: the helper replays signals on bar closes while the
 broker emulator fills at the next bar open, so entry/exit bar alignment — and
-hence HWM paths — can differ by one bar on gap opens. Exit reasons are
+hence HWM paths — can differ by one bar on gap opens. The forced exit is raised
+on the bar before the exit time (the first bar whose end reaches it), exactly
+like the script, so the fill lands AT the exit-time open. Exit reasons are
 best-effort mirrors of the script logic, not copies of the trade ledger.
 """
 
@@ -57,6 +59,14 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
 
     or_end = _OR_START_MINUTES + opening_range_minutes
     exit_minutes = exit_hour * 60 + exit_minute
+    # The script raises the forced exit on the bar BEFORE 15:45 (Pine fills at the
+    # next open), so the replay does too: first bar whose end reaches the exit.
+    # (No ``shared`` import here: helper code is import-whitelisted, so the modal
+    # bar spacing - the same rule as ``shared.bar_timing`` - is computed inline.)
+    ts_utc = pd.DatetimeIndex(pd.to_datetime(df["timestamp"] if "timestamp" in df.columns else df.index, utc=True, errors="coerce"))
+    spacing = ts_utc[~ts_utc.isna()].to_series().diff().dropna().dt.total_seconds()
+    spacing = spacing[spacing > 0]
+    bar_minutes = float(spacing.mode().min()) / 60.0 if len(spacing) else 0.0
     n = len(df)
 
     or_high = pd.Series(float("nan"), index=df.index)
@@ -120,7 +130,7 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
 
         price = float(close.iloc[i])
 
-        if mins >= exit_minutes:
+        if mins + bar_minutes >= exit_minutes:
             if position != 0:
                 exit_reason.iloc[i] = "time_exit"
                 position = 0

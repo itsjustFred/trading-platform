@@ -4,6 +4,7 @@
 - Original: MQL5-EA `us100 intrayday scalper single-symbol mql5.txt` (+ `infos.txt`)
   aus `discord-zenomtrader-forum-strategies / US100 INTRADAY SCALPER`
   (`https://discord.com/channels/1230977283888648315/1453162378509418657/1453162378509418657`)
+- Version: 1.1.0 (EOD-Exit zum 16:00-Open statt Signal-Bar-Close)
 - Konvertiert: 2026-09-09
 
 ## Kernlogik
@@ -25,7 +26,13 @@ Session-Zeiten werden aus den Bar-Timestamps in `America/New_York` abgeleitet.
 
 ### Exit
 - Stop-Loss-Exit am SL-Preis, sobald das Bar-Low den Stop beruehrt.
-- Time-Exit (EOD-Flatten) an der ersten Bar ab 16:00 ET zum Close.
+- Time-Exit (EOD-Flatten) zum **16:00-ET-Open**: Signal-Exits fuellen am naechsten
+  Bar-Open (`signal_exit_fill="next_open"`), daher geht das Signal (`time_exit_eod`)
+  auf der ersten Bar raus, deren Ende 16:00 ET erreicht (1m: 15:59, 1h: 15:00;
+  Bar-Laenge = haeufigster Bar-Abstand, kein Blick auf spaetere Bars). Seit v1.1.0
+  ohne expliziten `exit_price` (der Market-Close-Preis kollidierte mit dem
+  Next-Open-Fill). Fehlt auch die Bar davor (Datenluecke), bucht
+  `day_reset_flatten` auf der letzten Bar des Tages.
 
 ### Engine + Daten
 - Buy-Stop-Fills brauchen den `entry_stop`-Pfad des vectorbt-Adapters

@@ -119,6 +119,23 @@ implemented once per engine:
   entry leg; the intrabar walk for a signal exit ends at the exit bar's open.
 - PyneCore: Pine fills at the next open natively; `_apply_fill_parity` prices a
   non-level ledger leg at its own (fill) bar's open under `next_open`.
+- **Explicit `exit_price` = a LEVEL.** A strategy-supplied `exit_price` is a
+  stop/limit/target level, never a market-at-close request. Only vectorbt reads
+  the column (native, PyneCore and signal replay ignore it and always fill a
+  signal exit at the next open). Under `next_open` the vectorbt engine therefore
+  drops an `exit_price` that equals the *signal bar's own close* (a market-close
+  hack, which would otherwise book the next bar's timestamp at the previous
+  bar's close), fills at the exit bar's open, logs a warning once and flags the
+  trade `meta["exit_price_ignored_market_close"]`. Real levels are honoured;
+  the legacy `close`/`open` opt-ins keep the explicit price.
+- **Clock exits (strategy authors).** A strategy that must be flat *at* a clock time
+  T (end-of-day flatten, session close, forced exit) raises its exit signal on the
+  bar BEFORE the one that opens at T - the first bar whose end reaches T - so the
+  next-open fill lands at T's open. Derive it from the bar spacing plus the clock
+  schedule only, never from a later bar (`shared.bar_timing.modal_bar_minutes` /
+  `clock_exit_signal_mask`; PyneCore scripts use `timeframe.in_seconds()`), and add a
+  first-bar-of-the-next-session safeguard for data gaps. Do not write a market
+  `exit_price` for these exits.
 - Signal replay: external signals — entries and flip/exit-only exits alike — are
   executed when they arrive at the fill bar's close (§5), so "exits like
   entries" already holds; there is no separate next-open exit.

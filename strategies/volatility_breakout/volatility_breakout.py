@@ -28,14 +28,25 @@ Notes on fidelity:
   entry/exit clock (16:30/18:05/22:55) of the previous port are removed.
 - Session clock uses America/New_York (the source uses the instrument
   TradingHours timezone; NY assumed for US intraday).
-- Exit robustness: every exit signal sets BOTH exit_price and exit_reason,
-  every entry sets sl_price (= rthOpen) and direction, so the adapter never
-  sizes a trade or prices an exit off NaN (the NaN-PnL cascade class).
+- Exit robustness: every exit signal sets exit_reason, every entry sets
+  sl_price (= rthOpen) and direction, so the adapter never sizes a trade off
+  NaN (the NaN-PnL cascade class). Only the protective-stop exit carries an
+  explicit exit_price (a LEVEL); the market exits (force_close, session_exit)
+  do not - an explicit price == the signal bar close would contradict the
+  next-bar-open fill (signal_exit_fill="next_open").
+- Exit timing (1.2.0): NT8 bars are stamped at their CLOSE, so "t >= 14:00" is
+  evaluated on the bar that closes at 14:00 and the order fills at the next
+  open = 14:00. With bars stamped at their START and signal exits filling at the
+  next bar's open, the force-close is raised on the first bar whose END reaches
+  session_end - force_close_in_min; the session-close flatten on the
+  second-to-last in-session bar (fills at the last in-session bar's open).
+  Bar spacing + the clock only - no look at a later bar. A position still open
+  after the session / on a new day (data gap) is flattened on that bar.
 """
 
 STRATEGY_META = {
     "name": "Volatility Breakout",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1342609786633584670/1433816630118449322",
     "notes": (
         "- Source: optimized_version_vola_breackout nt8.txt (daily ATR(5)[1], "
@@ -45,8 +56,11 @@ STRATEGY_META = {
         "- Session clock is America/New_York (source: instrument timezone).\n"
         "- Source force-close sets a flag that is never read; re-entry after "
         "force-close stays possible (effective behavior, documented).\n"
-        "- Every exit sets exit_price+exit_reason; every entry sets "
-        "sl_price+direction (no NaN sizing/pricing)."
+        "- Every exit sets exit_reason; every entry sets sl_price+direction "
+        "(no NaN sizing). Market exits carry no explicit exit_price (1.2.0).\n"
+        "- 1.2.0: force_close / session_exit are raised one bar earlier so "
+        "next_open fills land at session_end - 60 min and at the last "
+        "in-session bar's open."
     ),
     "tags": {
         "type": ["breakout"],
@@ -59,6 +73,8 @@ STRATEGY_META = {
 
 import numpy as np
 import pandas as pd
+
+from shared.bar_timing import clock_exit_signal_mask, modal_bar_minutes
 
 
 def _wilder_rma(series: pd.Series, length: int) -> pd.Series:
@@ -114,6 +130,8 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     start_min = _parse_minutes(start_time)
     end_min = _parse_minutes(end_time)
     force_close_min = end_min - force_close_in_min if force_close_in_min > 0 else None
+    # Signal exits fill at the NEXT bar's open (see module docstring, "Exit timing").
+    bar_minutes = modal_bar_minutes(ts_utc) if clock_ok else 0.0
 
     # Daily bars (NY dates) from the intraday frame for the daily ATR.
     # ATR[i] uses Wilder smoothing; the signal on date d uses the PREVIOUS
@@ -194,6 +212,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
     in_trade = False
     active_direction: str | None = None
     active_stop = np.nan
+    active_date = None
 
     for i in range(n):
         c = float(close.iloc[i])
@@ -206,9 +225,13 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
 
         # Force-close runs before the session gate (source order): flatten an
         # open position once t >= session_end - force_close_in_min.
-        if in_trade and force_close_min is not None and clock_ok and m >= force_close_min:
+        if (
+            in_trade
+            and force_close_min is not None
+            and clock_ok
+            and bool(clock_exit_signal_mask(m, bar_minutes, force_close_min))
+        ):
             exits.iloc[i] = True
-            exit_price.iloc[i] = c
             exit_reason.iloc[i] = "force_close"
             in_trade = False
             active_direction = None
@@ -235,16 +258,16 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
                     active_direction = None
                     active_stop = np.nan
                     continue
-            # Session-close flatten at the last in-session bar of the day.
+            # Session-close flatten: raised on the second-to-last in-session bar
+            # (fills at the last in-session bar's open); a position that is still
+            # open after the session or on a new day (data gap) goes on that bar.
             if bool(exit_on_session_close) and clock_ok:
-                last_in_session = start_min <= m < end_min and (
-                    i == n - 1
-                    or ny_dates[i + 1] != d
-                    or not (start_min <= int(ny_minutes[i + 1]) < end_min)
+                in_session = start_min <= m < end_min
+                session_bar = in_session and bool(
+                    clock_exit_signal_mask(m, bar_minutes, end_min - bar_minutes)
                 )
-                if last_in_session:
+                if session_bar or not in_session or d != active_date:
                     exits.iloc[i] = True
-                    exit_price.iloc[i] = c
                     exit_reason.iloc[i] = "session_exit"
                     in_trade = False
                     active_direction = None
@@ -259,6 +282,12 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         # double-gating the same warmup.
         if not clock_ok or not (start_min <= m < end_min):
             continue
+        if bool(exit_on_session_close) and bool(
+            clock_exit_signal_mask(m, bar_minutes, end_min - bar_minutes)
+        ):
+            # An entry signalled from the session-close bar on would fill at/after
+            # the flatten and be carried past the session.
+            continue
         if day_index_by_date.get(d, 0) < 5:
             continue
         if pd.isna(ro) or pd.isna(atr_v):
@@ -272,6 +301,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             in_trade = True
             active_direction = "LONG"
             active_stop = float(ro)
+            active_date = d
         elif c < short_level:
             entries.iloc[i] = True
             direction.iloc[i] = "SHORT"
@@ -279,6 +309,7 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
             in_trade = True
             active_direction = "SHORT"
             active_stop = float(ro)
+            active_date = d
 
     indicators_dict = {
         "Session_Open": session_open,

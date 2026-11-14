@@ -440,10 +440,34 @@ def _process_symbol(
             # (in_trade=False above); skip before sizing/equity.
             return
         trade_counter += 1
+        # Contract: explicit exit prices are LEVELS (stop / limit / target). Under
+        # next_open the exit leg was shifted one bar, so an explicit price equal to
+        # the SIGNAL bar's close is a market-at-close request that contradicts the
+        # next-open fill: it is dropped (the exit fills at the open) and flagged
+        # instead of producing a next-bar timestamp with a stale close price.
+        explicit_exit_series = exit_price_series
+        ignored_market_close_exit = False
+        if next_open_exits and exit_price_series is not None and i > 0:
+            if _is_signal_bar_close_price(
+                exit_price_series.iloc[i], df.iloc[i - 1].get("close")
+            ):
+                explicit_exit_series = None
+                ignored_market_close_exit = True
+                _warn_once(
+                    (symbol, config.timeframe, "market_close_exit_price_ignored"),
+                    "%s/%s: the strategy emitted exit_price == the signal bar's "
+                    "close for a signal exit, which contradicts "
+                    "signal_exit_fill='next_open'; the explicit price is ignored "
+                    "and the exit fills at the next bar open. Drop exit_price for "
+                    "market exits (explicit prices are stop/limit/target levels) "
+                    "or opt into signal_exit_fill='close'.",
+                    symbol,
+                    config.timeframe,
+                )
         exit_price = _resolve_exit_price(
             exit_row,
             i,
-            exit_price_series,
+            explicit_exit_series,
             # A forced end-of-data close has no next bar: under the default
             # next_open convention it fills at the last bar's close.
             signal_exit_fill=(
@@ -460,6 +484,8 @@ def _process_symbol(
         entry_ts = str(entry_row.get("timestamp", entry_row.name))
         exit_ts = str(exit_row.get("timestamp", exit_row.name))
         trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+        if ignored_market_close_exit:
+            trade_meta["exit_price_ignored_market_close"] = True
         if forced_end and next_open_exits and last_bar_signal_exit:
             # The strategy signalled an exit on the last bar; there is no next
             # open to fill it at, so end-of-data took the trade (flagged).
@@ -1377,6 +1403,22 @@ def _vbt_ask_bar(
     if not bool((parameters or {}).get("ask_ohlc", False)):
         return None, None
     return resolve_ask_high_low(row, _vbt_bar_spread(row, parameters))
+
+
+def _is_signal_bar_close_price(explicit_price: Any, signal_bar_close: Any) -> bool:
+    """True when an explicit exit price is just the signal bar's own close.
+
+    Such a price is a market-at-close request (the strategy "books the bar
+    close"), not a stop/limit/target level.
+    """
+    if explicit_price is None or signal_bar_close is None:
+        return False
+    if pd.isna(explicit_price) or pd.isna(signal_bar_close):
+        return False
+    explicit = float(explicit_price)
+    if explicit <= 0:
+        return False
+    return math.isclose(explicit, float(signal_bar_close), rel_tol=1e-9, abs_tol=1e-12)
 
 
 def _resolve_exit_price(

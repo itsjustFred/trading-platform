@@ -7,7 +7,8 @@ Single-symbol intraday breakout of the first-30-minute range:
 - Long when close breaks above or_high + or_range * breakout_buffer (0.2).
 - Short when close breaks below or_low - or_range * breakout_buffer.
 - 1%-of-price trailing stop from the high/low water mark.
-- Forced exit at 15:45 ET. One trade per day.
+- Forced exit at 15:45 ET (flat AT the 15:45 open: the close order goes out on
+  the bar before, because Pine fills at the next bar open). One trade per day.
 
 Session times are derived from each bar's timestamp in America/New_York.
 Faithful port of opening_range_breakout/algorithm.py (Variant 2,
@@ -16,15 +17,17 @@ price-percentage trailing stop) with the variant_2.py buffer default (0.2).
 
 STRATEGY_META = {
     "name": "Opening Range Breakout (PyneCore)",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "source_url": "https://github.com/alexisbouley2/quantconnect/tree/main/strategies/opening_range_breakout",
     "notes": (
         "Single-symbol intraday ORB per opening_range_breakout/algorithm.py "
         "(Variant 2: 1%-of-price trailing stop from HWM/LWM, forced exit "
         "15:45 ET, one trade per day) with the variant_2.py buffer default "
         "0.2. Session logic derives 9:30-15:45 ET from bar timestamps "
-        "(America/New_York). Replaces the previous SMA-crossover implementation "
-        "that was kept under this slug by mistake."
+        "(America/New_York). 2.1.0: the forced-exit order is raised on the bar "
+        "before 15:45 so it fills AT the 15:45 open (next-open fills). "
+        "Replaces the previous SMA-crossover implementation that was kept "
+        "under this slug by mistake."
     ),
     "parameters": {
         "opening_range_minutes": 30,
@@ -127,6 +130,7 @@ def main(
     minutes_now = bar_hour * 60 + bar_minute
     or_end = _OR_START_MINUTES + opening_range_minutes
     exit_minutes = exit_hour_ny * 60 + exit_minute_ny
+    bar_minutes = timeframe.in_seconds() / 60.0
 
     # Accumulate the opening range only inside its window; bars before 09:30
     # ET (e.g. overnight CFD bars) must not pollute it.
@@ -144,8 +148,13 @@ def main(
 
     position = strategy.position_size
 
-    # Forced exit first: flat into 15:45 ET, no entries afterwards.
-    if minutes_now >= exit_minutes:
+    # Forced exit first: flat into 15:45 ET, no entries afterwards. Pine fills
+    # strategy.close() at the NEXT bar's open, so the order is raised on the first
+    # bar whose END reaches 15:45 (the bar before 15:45) to be flat AT the 15:45
+    # open instead of one bar later (which holds overnight on RTH-only data).
+    # Bar length comes from the chart timeframe, no later bar is looked at; a
+    # missing bar before 15:45 just moves the signal to the first bar present.
+    if minutes_now + bar_minutes >= exit_minutes:
         if position != 0:
             strategy.close("Long", comment="time_exit")
             strategy.close("Short", comment="time_exit")
