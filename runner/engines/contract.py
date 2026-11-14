@@ -36,6 +36,7 @@ __all__ = [
     "apply_date_filter",
     "flag_missing_intrabar",
     "parse_date_bound",
+    "resolve_protective_exit",
     "resolve_same_bar_exit",
     "select_ohlcv_path",
     "ohlcv_path_metadata",
@@ -408,6 +409,53 @@ def level_fill_price(
     if level_gapped_at_open(direction=direction, kind=kind, level=level, bar_open=bar_open):
         return float(bar_open)
     return float(level)
+
+
+def resolve_protective_exit(
+    *,
+    direction: str,
+    bar_open: float | None,
+    high: float,
+    low: float,
+    stop_price: float | None,
+    take_profit_price: float | None,
+    allow_gap: bool = True,
+) -> tuple[str | None, bool]:
+    """Classify one bar/step into ``(kind, gapped)`` with the gap checked FIRST.
+
+    Owner decision 2026-11-13: the open is the first event of a bar, so a bar
+    that opens beyond a protective level exits on that level at the open and
+    beats any later same-bar touch of the other level (a favourable gap
+    through the target is a target exit even when the bar later trades
+    through the stop). Order, mirroring native ``TradeEngine._check_stops``:
+    gap through the stop, gap through the target, then the range-based
+    :func:`resolve_same_bar_exit` (stop-first tie-break).
+
+    ``bar_open`` is the open on the side the exits trigger on (the ask open
+    for an ask-triggered SHORT). ``allow_gap`` is False on the bar/step the
+    position was opened at: it cannot have been gapped through. Returns
+    ``(None, False)`` when neither level is hit.
+    """
+    if allow_gap and bar_open is not None and not pd.isna(bar_open):
+        if stop_price is not None and level_gapped_at_open(
+            direction=direction, kind="stop", level=float(stop_price), bar_open=float(bar_open)
+        ):
+            return "stop", True
+        if take_profit_price is not None and level_gapped_at_open(
+            direction=direction,
+            kind="tp",
+            level=float(take_profit_price),
+            bar_open=float(bar_open),
+        ):
+            return "tp", True
+    kind = resolve_same_bar_exit(
+        direction=direction,
+        high=high,
+        low=low,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+    )
+    return kind, False
 
 
 def flag_missing_intrabar(

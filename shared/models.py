@@ -545,6 +545,17 @@ class EquityPoint:
 # ─── Backtest metadata ──────────────────────────────────────────────────────
 
 
+#: ``signal_exit_fill`` of a persisted record that does not carry the key.
+#: Every reader (``BacktestMeta.from_dict``, the SQLite record loader, the
+#: optimizer's base-runtime reconstruction) must use this one value: before
+#: the 2026-11-13 next-open decision the default was ``"close"`` and
+#: ``to_dict`` omitted the key when it held that default, so a missing key
+#: means the record was produced with signal exits filled at the signal
+#: bar's close. Reading it as ``"next_open"`` would re-run (e.g. re-optimise)
+#: a legacy result under a different exit model than its stored stats.
+LEGACY_SIGNAL_EXIT_FILL = "close"
+
+
 @dataclass
 class BacktestMeta:
     """Metadata about a backtest run."""
@@ -658,7 +669,7 @@ class BacktestMeta:
             max_leverage=d.get("max_leverage"),
             modeling_resolution=d.get("modeling_resolution", "main_timeframe"),
             # Missing key = record from before the 2026-11-13 next-open decision.
-            signal_exit_fill=d.get("signal_exit_fill", "close"),
+            signal_exit_fill=d.get("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
             allow_fallback_stop=d.get("allow_fallback_stop", True),
             reject_missing_stop=d.get("reject_missing_stop", False),
             require_explicit_column_roles=d.get("require_explicit_column_roles", False),

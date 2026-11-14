@@ -14,7 +14,6 @@ from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
-from runner.engines.contract import resolve_same_bar_exit
 from runner.engines.mtm_equity import (
     build_mark_to_market_curve,
     closes_from_frame,
@@ -425,45 +424,32 @@ class SignalReplayAdapter:
         stop-first tie-break applies when both levels are hit.
         """
         self._update_excursions(position, bar)
-        event = resolve_same_bar_exit(
+        stop_level = float(position.stop_loss) if position.stop_loss is not None else None
+        tp_level = float(position.take_profit) if position.take_profit is not None else None
+        # Owner decision 2026-11-13: a bar that OPENS beyond a level gapped
+        # through it. The open is the bar's first event, so that exit wins over
+        # a later same-bar touch of the other level and fills at the OPEN (the
+        # price actually available), not at the skipped level - the gap is
+        # checked BEFORE the stop-first range test, mirroring native
+        # _check_stops. Intrabar touches keep filling at the level.
+        bar_open = float(bar["open"])
+        event, gapped = contract.resolve_protective_exit(
             direction=position.direction,
+            bar_open=bar_open,
             high=float(bar["high"]),
             low=float(bar["low"]),
-            stop_price=float(position.stop_loss) if position.stop_loss is not None else None,
-            take_profit_price=(
-                float(position.take_profit) if position.take_profit is not None else None
-            ),
+            stop_price=stop_level,
+            take_profit_price=tp_level,
         )
         if event is None:
             self._apply_trailing_stop(position, bar)
             return None
-        # Owner decision 2026-11-13: a bar that OPENS beyond the level gapped
-        # through it and fills at its OPEN (the price actually available), not at
-        # the skipped level. Intrabar touches keep filling at the level.
-        bar_open = float(bar["open"])
+        level = stop_level if event == "stop" else tp_level
+        assert level is not None  # a hit is only reported for a set level
+        exit_price = bar_open if gapped else level
         if event == "stop":
-            exit_price = (
-                contract.level_fill_price(
-                    direction=position.direction,
-                    kind="stop",
-                    level=float(position.stop_loss),
-                    bar_open=bar_open,
-                )
-                if position.stop_loss is not None
-                else float(bar["close"])
-            )
             reason = "trailing_stop" if position.trailing_updates > 0 else "stop_loss"
         else:
-            exit_price = (
-                contract.level_fill_price(
-                    direction=position.direction,
-                    kind="tp",
-                    level=float(position.take_profit),
-                    bar_open=bar_open,
-                )
-                if position.take_profit is not None
-                else float(bar["close"])
-            )
             reason = "take_profit"
         return self._close_position(
             position,
