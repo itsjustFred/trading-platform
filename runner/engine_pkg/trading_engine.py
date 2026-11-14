@@ -64,6 +64,14 @@ class TradeEngine:
         self._indicator_series: list[IndicatorSeries] = []
         self._execution_model = ExecutionModelSettings.from_config(config)
         self._realized_pnl = 0.0
+        # Sizing capital (Cleanup 16-D1, F21 / decision record D2): position
+        # sizing draws on realized cash only (initial capital + closed-trade
+        # PnL, fees included). The mark-to-market ``self.equity`` stays the
+        # *reporting* equity (it feeds the equity curve), but it is not
+        # spendable for sizing — unrealized PnL of open positions must not
+        # compound into the next entry's quantity, and an unrealized drawdown
+        # must not deflate it.
+        self._sizing_equity = float(config.initial_capital)
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
         self._intrabar = self._prepare_intrabar(intrabar_data)
@@ -203,7 +211,9 @@ class TradeEngine:
     def _current_risk_exposure(
         self, reference_price: float, exclude_order: Order | None = None
     ) -> float:
-        if self.equity <= 0:
+        # F21: the aggregate-risk denominator is the same realized cash the
+        # sizing call uses (never the mark-to-market reporting equity).
+        if self._sizing_equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
@@ -217,7 +227,9 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless open position"
                 )
             risk_distance = abs(float(position.entry_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
+            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(
+                self._sizing_equity
+            )
 
         for order in self.pending_orders:
             if exclude_order is not None and order is exclude_order:
@@ -245,7 +257,9 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless pending order"
                 )
             risk_distance = abs(float(reference_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
+            risk_exposure += (risk_distance * float(order.quantity)) / float(
+                self._sizing_equity
+            )
 
         return max(0.0, risk_exposure)
 
@@ -295,10 +309,10 @@ class TradeEngine:
                 if max_lot > 0:
                     shares = min(shares, max_lot)
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self.equity * position_notional_limit
+                    max_value = self._sizing_equity * position_notional_limit
                     shares = min(shares, max_value / entry_price)
                 elif self._max_position_exposure_pct is not None:
-                    max_value = self.equity * self._max_position_exposure_pct
+                    max_value = self._sizing_equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
                 return max(shares, 0.0)
 
@@ -322,7 +336,10 @@ class TradeEngine:
             )
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
-                account_balance=float(self.equity),
+                # F21 (D2): realized cash, NOT the mark-to-market
+                # ``self.equity`` — an open position's paper PnL must not
+                # change the size of the next entry.
+                account_balance=float(self._sizing_equity),
                 pip_value=1.0,
                 current_exposure=self._current_risk_exposure(
                     float(entry_price), exclude_order=exclude_order
@@ -339,7 +356,9 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        max_value = self.equity * position_notional_limit
+        # F21 (D2): the notional/leverage cap is denominated in the same
+        # realized sizing cash as the risk target.
+        max_value = self._sizing_equity * position_notional_limit
         shares = min(shares, max_value / entry_price)
         return max(shares, 0.0)
 
@@ -433,7 +452,10 @@ class TradeEngine:
         # running portfolio equity (position size is linear in equity, so the
         # per-unit coefficient quantity/equity_at_entry replays exactly).
         position_meta = dict(getattr(order, "meta", None) or {})
-        position_meta["equity_at_entry"] = round(float(self.equity), 2)
+        # The basis is the equity the order was SIZED from (realized cash,
+        # F21/D2), not the mark-to-market reporting equity: the replay
+        # recovers the per-unit coefficient quantity / equity_at_entry from it.
+        position_meta["equity_at_entry"] = round(float(self._sizing_equity), 2)
         sizing_stop = getattr(order, "_sizing_stop_loss", None)
         if sizing_stop is not None:
             position_meta["sizing_stop_loss"] = float(sizing_stop)
@@ -510,7 +532,26 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
-                if order.stop_loss is None and getattr(order, "_sizing_stop_loss", None) is None:
+                # Fail closed on an unpriced fill bar (e.g. an all-NaN OHLC
+                # row): a non-finite fill would open a position at
+                # entry_price=NaN and poison every later pnl/equity value
+                # (or, with an explicit stop, crash deep in the risk engine).
+                # The contract does not define a fill on unusable data, so
+                # refuse it loudly, matching vectorbt's `_size_trade`
+                # ("entry_price must be finite and > 0").
+                if not math.isfinite(float(fill_price)) or float(fill_price) <= 0:
+                    raise ValueError(
+                        f"Cannot fill {order.symbol} {order.direction} "
+                        f"{order.order_type.value} order created at "
+                        f"{order.created_time} on bar {fill_time}: fill price "
+                        f"{fill_price!r} is not finite and > 0 (unpriced bar)."
+                    )
+                # A fallback sizing stop (no explicit stop, no sizing-only
+                # stop) is a distance from the ENTRY, i.e. the fill. The
+                # value stored at order creation was derived from the signal
+                # bar's close, so re-derive it here from the actual fill
+                # (contract §4: "2% of entry").
+                if order.stop_loss is None and not getattr(order, "_sizing_only_stop", False):
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     fallback_distance = (
                         float(order.stop_distance)
@@ -604,6 +645,29 @@ class TradeEngine:
                         )
                         if order.quantity <= 0:
                             continue
+                    else:
+                        # No explicit and no sizing-only stop: the order was
+                        # sized at creation from the SIGNAL bar's close with
+                        # the fallback stop. Re-size on the fill price, like
+                        # every other sizing path here (contract §4 sizes from
+                        # the entry). Without this, a gap between signal close
+                        # and next open mis-sizes the risk and can breach the
+                        # max_leverage / position notional cap (the cap is
+                        # applied as equity * limit / entry_price).
+                        order.quantity = self._calculate_position_size(
+                            entry_price=float(fill_price),
+                            stop_loss_price=None,
+                            direction=order.direction,
+                            take_profit_price=(
+                                float(order.take_profit_levels[0]["price"])
+                                if order.take_profit_levels
+                                else None
+                            ),
+                            stop_distance=order.stop_distance,
+                            exclude_order=order,
+                        )
+                        if order.quantity <= 0:
+                            continue
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT
                 # stop <= entry) would produce an instantly-triggered,
@@ -663,7 +727,40 @@ class TradeEngine:
             )
         )
         position.remaining_qty -= qty
+        # #84: exit legs accumulate gross; ``_finalize_position`` backs the
+        # fees out, so this running realized figure is net (F21/D2).
         self._realized_pnl += pnl
+        # F21 (D2): cash becomes spendable the moment it is realized, net of
+        # the round-trip fees the still-open position will owe.
+        self._refresh_sizing_equity()
+
+    def _refresh_sizing_equity(self) -> None:
+        """Spendable cash: realized PnL less fees still owed on partly-closed positions.
+
+        ``_close_partial`` books exit legs gross and ``_finalize_position``
+        backs the fees out only when the last leg closes, so cash from a
+        partial exit must not be spendable while its round-trip fees are still
+        owed. The owed amount is the fee model's price of the full position at
+        the exits so far; the final, exact fee replaces it at finalisation.
+        """
+        owed = 0.0
+        fee_model = None
+        for pos in self.positions:
+            if pos.remaining_qty <= 1e-9 or not pos.exits:
+                continue
+            total_qty = sum(float(item.quantity or 0.0) for item in pos.exits)
+            if total_qty <= 0:
+                continue
+            if fee_model is None:
+                fee_model = resolve_fee_model(self.config.parameters)
+            avg_exit = (
+                sum(float(item.price or 0.0) * float(item.quantity or 0.0) for item in pos.exits)
+                / total_qty
+            )
+            owed += fee_model.fee_for_trade(
+                float(pos.entry_price), avg_exit, float(pos.quantity)
+            )
+        self._sizing_equity = self.config.initial_capital + self._realized_pnl - owed
 
     def _finalize_position(self, position: Position, exit_index: int) -> None:
         if position.remaining_qty > 1e-9:
@@ -691,6 +788,10 @@ class TradeEngine:
         # #84: exit legs accumulated gross into _realized_pnl — back the
         # costs out here so the equity path is net.
         self._realized_pnl -= fees
+        # F21 (D2): the spendable sizing cash follows the NET realized figure
+        # (the fee model is part of the realized path), so it is refreshed here
+        # as well as at every partial close.
+        self._refresh_sizing_equity()
         take_profit = None
         if position.take_profit_levels:
             first_level = position.take_profit_levels[0]
@@ -1154,6 +1255,12 @@ class TradeEngine:
             position.mae = min(position.mae, low_pnl)
 
         self.equity = self.config.initial_capital + self._realized_pnl + unrealized
+        # NOTE (Cleanup 16-D1, F21 / decision record D2): ``self.equity`` is the
+        # mark-to-market REPORTING equity (it feeds the equity curve); it
+        # deliberately does NOT feed position sizing. Sizing draws on
+        # ``self._sizing_equity`` (realized cash only), so an unrealized
+        # drawdown cannot deflate new sizes and unrealized profit cannot
+        # compound into them either.
         self.equity_curve.append(
             EquityPoint(time=self._to_iso(row["timestamp"]), equity=round(float(self.equity), 2))
         )

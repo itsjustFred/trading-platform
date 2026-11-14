@@ -569,50 +569,6 @@ def check_native(tmp_path: Path, case: Case) -> None:
     assert_final_equity(result, ref, case.ref_cfg(), NATIVE_TOL, f"native/{case.name}")
 
 
-def check_native_known_fallback_deviation(tmp_path: Path, case: Case) -> None:
-    """Pin the documented native fallback-sizing defect to its exact signature.
-
-    The strict xfail on the full comparison only says "something differs". This
-    companion says WHAT: native must equal the reference that sizes a no-stop
-    order on the SIGNAL-bar close, trade for trade, fee for fee and in final
-    equity. A partial fix, or any other regression in these scenarios, breaks it
-    instead of hiding behind the expected failure.
-    """
-    _guard_scenario(case)
-    ref = case.reference(fallback_on_fill=False)
-    result = run_native(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
-    assert_trades_match(
-        _engine_trades(result),
-        ref,
-        NATIVE_TOL,
-        check_reason=True,
-        label=f"native-known-deviation/{case.name}",
-    )
-    assert_final_equity(
-        result,
-        ref,
-        case.ref_cfg(fallback_on_fill=False),
-        NATIVE_TOL,
-        f"native-known-deviation/{case.name}",
-    )
-
-
-def check_vectorbt_known_wrong_side_deviation(tmp_path: Path, case: Case) -> None:
-    """Pin the documented vectorbt wrong-side sizing-stop defect to its signature:
-    the trade is opened and sized on ``abs(entry - stop)`` instead of being skipped."""
-    _guard_scenario(case)
-    ref = case.reference(vectorbt=True, skip_wrong_side_stop=False)
-    result = run_vbt(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
-    assert_trades_match(
-        _engine_trades(result),
-        ref,
-        VBT_TOL,
-        check_reason=False,
-        label=f"vectorbt-known-deviation/{case.name}",
-    )
-    assert len(ref) > len(case.reference(vectorbt=True)), "scenario no longer exercises the defect"
-
-
 def check_vectorbt(tmp_path: Path, case: Case) -> None:
     _guard_scenario(case)
     ref = case.reference(vectorbt=True)
@@ -638,29 +594,19 @@ def check_engines_agree(tmp_path: Path, case: Case) -> None:
     )
 
 
-# Native sizes an order that has NO explicit stop (2% fallback stop) once, on the
-# SIGNAL bar's close, and never re-sizes it on the fill price. Whenever the next
-# open differs from that close the position's notional/risk is wrong (it can even
-# exceed the leverage cap). Contract section 4 + vectorbt both size on the entry.
-NATIVE_FALLBACK_SIZING_BUG = (
-    "native engine sizes a no-explicit-stop order at the signal bar's close and does "
-    "not re-size it at the fill (runner/engine_pkg/trading_engine.py: _create_order "
-    "qty at ~L394 from entry_price=close; _fill_pending_orders re-sizes only when a "
-    "sizing stop exists, ~L561-606). Contract 4 / vectorbt size on the entry (fill) price."
-)
-xfail_native_fallback = pytest.mark.xfail(strict=True, reason=NATIVE_FALLBACK_SIZING_BUG)
+# Native and vectorbt both size a no-explicit-stop order (2% fallback stop) on
+# the FILL price (contract section 4); the gap scenarios below pin that.
 
 
 def _make_params(
     scenarios: dict,
-    xfail: dict[str, pytest.MarkDecorator] | set[str] = frozenset(),
+    xfail: dict[str, pytest.MarkDecorator] | None = None,
     *,
     agree: bool = False,
 ) -> list:
-    """Parametrisation; ``xfail`` maps scenario -> strict-xfail mark (a bare set means
-    the native fallback-sizing defect)."""
-    if not isinstance(xfail, dict):
-        xfail = {name: xfail_native_fallback for name in xfail}
+    """Parametrisation; ``xfail`` maps scenario -> strict-xfail mark for a known,
+    documented engine defect (none are open at the moment)."""
+    xfail = xfail or {}
     out = []
     for name in sorted(scenarios):
         if agree and scenarios[name]().has_protective_exit():
@@ -757,17 +703,11 @@ SMA_SCENARIOS = {
     "nan_bar_flat": _sma_nan_flat,
     "nan_bar_in_position": _sma_nan_in_position,
 }
-SMA_XFAIL_NATIVE = {"gap_up_at_fill", "weekend_gap_down"}
 
 
-@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS, SMA_XFAIL_NATIVE))
+@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS))
 def test_sma_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, SMA_SCENARIOS[scenario]())
-
-
-@pytest.mark.parametrize("scenario", sorted(SMA_XFAIL_NATIVE))
-def test_sma_native_known_fallback_deviation(tmp_path, scenario):
-    check_native_known_fallback_deviation(tmp_path, SMA_SCENARIOS[scenario]())
 
 
 @pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS))
@@ -775,7 +715,7 @@ def test_sma_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, SMA_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS, SMA_XFAIL_NATIVE, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS, agree=True))
 def test_sma_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, SMA_SCENARIOS[scenario]())
 
@@ -907,10 +847,7 @@ def _don_zero_volume():
 # NaN edge cases: a bar whose OHLC is entirely NaN is untradable. The reference
 # skips it (no fill, no protective check) and rolling windows that contain it are
 # undefined, so no signal fires from them.
-DON_XFAIL_NATIVE: set[str] = set()
-
-
-@pytest.mark.parametrize("scenario", _make_params(DON_SCENARIOS, DON_XFAIL_NATIVE))
+@pytest.mark.parametrize("scenario", _make_params(DON_SCENARIOS))
 def test_donchian_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, DON_SCENARIOS[scenario]())
 
@@ -1019,53 +956,32 @@ RSI_FALLBACK_SCENARIOS = {
         "rsi/fallback_stop_gap_up", _rsi_gap_fill(0.0), stop_pct=0.0
     ),
 }
-RSI_XFAIL_NATIVE: set[str] = set()
-VBT_WRONG_SIDE_SIZING_STOP = (
-    "vectorbt only applies its inverted-stop guard to the PROTECTIVE stop series "
-    "(runner/engines/vectorbt_adapter.py ~L539-565); a sizing-only stop on the wrong "
-    "side of the fill (LONG sizing stop >= fill after a gap down) is not rejected, the "
-    "trade is opened and sized on abs(entry - stop). The native engine skips it "
-    "(trading_engine.py ~L574-591) as the documented A-C2 guard intends."
-)
-RSI_XFAIL_VBT = {
-    "gap_below_sizing_stop_skips_trade": pytest.mark.xfail(
-        strict=True, reason=VBT_WRONG_SIDE_SIZING_STOP
-    )
-}
+# A LONG sizing-only stop left at/above the fill by a gap down has no risk
+# distance: both engines skip the trade (native A-C2 guard, vectorbt inverted
+# sizing-stop guard) -- pinned by ``gap_below_sizing_stop_skips_trade``.
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, RSI_XFAIL_NATIVE))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS))
 def test_rsi_time_exit_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, RSI_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, RSI_XFAIL_VBT))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS))
 def test_rsi_time_exit_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, RSI_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, {**RSI_XFAIL_VBT}, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, agree=True))
 def test_rsi_time_exit_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, RSI_SCENARIOS[scenario]())
 
 
 @pytest.mark.parametrize(
     "scenario",
-    _make_params(RSI_FALLBACK_SCENARIOS, {"fallback_stop_gap_up_at_fill"}),
+    _make_params(RSI_FALLBACK_SCENARIOS),
 )
 def test_rsi_fallback_stop_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, RSI_FALLBACK_SCENARIOS[scenario]())
-
-
-def test_rsi_fallback_stop_native_known_fallback_deviation(tmp_path):
-    check_native_known_fallback_deviation(
-        tmp_path, RSI_FALLBACK_SCENARIOS["fallback_stop_gap_up_at_fill"]()
-    )
-
-
-@pytest.mark.parametrize("scenario", sorted(RSI_XFAIL_VBT))
-def test_rsi_vectorbt_known_wrong_side_deviation(tmp_path, scenario):
-    check_vectorbt_known_wrong_side_deviation(tmp_path, RSI_SCENARIOS[scenario]())
 
 
 @pytest.mark.parametrize("scenario", _make_params(RSI_FALLBACK_SCENARIOS))
@@ -1116,9 +1032,10 @@ def test_donchian_wide_levels_native_and_vectorbt_agree(tmp_path, scenario):
 
 
 # ───────────────────────────── NaN on the fill bar ─────────────────────────────
-# The contract is silent on an unpriced (all-NaN) bar that an order would fill
-# on, so no particular behaviour is pinned: failing loudly is fine, silently
-# producing NaN trades/equity is not (a NaN equity curve poisons every metric).
+# Contract section 1: a fill on an unpriced (all-NaN) bar fails closed. Both
+# engines raise; this differential check only demands "loud or finite" (silently
+# producing NaN trades/equity would poison every metric). The exact native
+# error is pinned in tests/test_native_engine_execution.py.
 
 
 def _assert_finite_or_loud(run) -> None:
@@ -1127,22 +1044,17 @@ def _assert_finite_or_loud(run) -> None:
     except (ValueError, RuntimeError) as exc:
         # Failing closed is acceptable, but only with the engines' documented refusal of an
         # unpriced fill; any other failure (path drift, refactor, dependency) must surface.
-        assert "must be finite" in str(exc), f"not the NaN-fill refusal: {exc!r}"
+        # native: "... fill price nan is not finite and > 0 (unpriced bar)";
+        # vectorbt: "entry_price must be finite and > 0".
+        message = str(exc)
+        assert "must be finite" in message or "(unpriced bar)" in message, (
+            f"not the NaN-fill refusal: {exc!r}"
+        )
         return
     for t in result.trades:
         values = [t.entry_price, t.quantity, t.pnl, t.net_pnl, *(e.price for e in t.exits)]
         assert all(math.isfinite(float(v)) for v in values), f"non-finite trade: {t}"
     assert all(math.isfinite(p.equity) for p in result.equity_curve), "non-finite equity curve"
-
-
-NAN_FILL_NATIVE_DEFECT = (
-    "native fills a pending order on an all-NaN bar without checking the price "
-    "(runner/engine_pkg/trading_engine.py _fill_pending_orders: fill_price = bar_open at "
-    "~L473, no isfinite guard before _open_position ~L633). With a fallback-stop (no "
-    "explicit stop) order the position opens at entry_price=NaN and the trade pnl and "
-    "every later equity point are NaN. With an explicit stop the risk engine raises "
-    "instead, i.e. the behaviour depends on whether a stop was published."
-)
 
 
 def _nan_fill_sma():
@@ -1187,9 +1099,7 @@ def test_nan_fill_control_runs_to_completion(tmp_path, engine, frame_case):
         pytest.param(_nan_fill_don, id="donchian_explicit_stop"),
     ],
 )
-def test_nan_fill_bar_never_yields_non_finite_results(tmp_path, engine, builder, request):
-    if engine == "native" and builder is _nan_fill_sma:
-        request.applymarker(pytest.mark.xfail(strict=True, reason=NAN_FILL_NATIVE_DEFECT))
+def test_nan_fill_bar_never_yields_non_finite_results(tmp_path, engine, builder):
     case = builder()
     runner = run_native if engine == "native" else run_vbt
     _assert_finite_or_loud(
@@ -1256,17 +1166,11 @@ REAL_SCENARIOS = {
     "rsi_time_exit_zero_cost": lambda: _real_rsi(),
     "rsi_time_exit_with_costs": lambda: _real_rsi(fee_rate=0.00002, fee_flat=0.5),
 }
-REAL_XFAIL_NATIVE = {"sma_zero_cost", "sma_with_costs"}
 
 
-@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, REAL_XFAIL_NATIVE))
+@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS))
 def test_real_slice_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, REAL_SCENARIOS[scenario]())
-
-
-@pytest.mark.parametrize("scenario", sorted(REAL_XFAIL_NATIVE))
-def test_real_slice_native_known_fallback_deviation(tmp_path, scenario):
-    check_native_known_fallback_deviation(tmp_path, REAL_SCENARIOS[scenario]())
 
 
 @pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS))
@@ -1274,7 +1178,7 @@ def test_real_slice_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, REAL_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, REAL_XFAIL_NATIVE, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, agree=True))
 def test_real_slice_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, REAL_SCENARIOS[scenario]())
 
