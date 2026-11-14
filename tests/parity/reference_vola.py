@@ -1,15 +1,36 @@
 """Independent reference for the ``volatility_breakout`` (NT8 VolaBreakout) signals.
 
-Written from the rules in the strategy's documented contract (daily ATR(5,
-Wilder)[1], levels ``session_open +/- 0.3 * ATR``, close breakout, protective
-stop AT the session open, force close 60 minutes before the session end, session
-close flatten, entries 08:30 <= t < 15:00 New York).  Imports nothing from the
-platform.  Per-session event loop; the stateful "assumed fill" semantics of the
-strategy are reproduced because they are part of the signal contract.
+Written from the rules in the strategy's documented contract (v1.2.0, README
+"Exit" section and module docstring "Exit timing"): daily ATR(5, Wilder)[1],
+levels ``session_open +/- 0.3 * ATR``, close breakout, protective stop AT the
+session open, force close 60 minutes before the session end, session close
+flatten, entries 08:30 <= t < 15:00 New York.
+
+Exit timing (v1.2.0).  Bars are stamped at their START and a signal exit fills at
+the NEXT bar's open, so a clock exit must be raised one bar early.  A bar's END is
+``minute_of_day + bar spacing``; the signal is raised on the first bar whose END
+reaches the clock time:
+
+* force close (``session_end - force_close_in``): every bar with
+  ``minute + spacing >= force_at`` while in a trade;
+* session close: the bar with ``minute + spacing >= session_end - spacing`` (the
+  second-to-last in-session bar, filling at the last in-session bar's open).
+  No entries are signalled from that bar on.  A position still open after the
+  session or on a new day (data gap) is flattened on the first such bar.
+
+The bar spacing is the most frequent positive gap between consecutive bar stamps
+(ties resolved to the shorter gap).  Only the clock and the bar spacing are used,
+never a later bar.
+
+This module imports nothing from the platform.  It is a per-bar event loop; the
+stateful "assumed fill" semantics of the strategy (an entry marks the position
+open at the signal bar until its exit) are reproduced because they are part of the
+signal contract.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,8 +40,29 @@ NY = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 
 
+def _utc(stamp: str) -> datetime:
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
 def _ny(stamp: str) -> datetime:
-    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).astimezone(NY)
+    return _utc(stamp).astimezone(NY)
+
+
+def _bar_spacing_minutes(times: list[datetime]) -> float:
+    """Nominal bar length: the most frequent positive gap (ties -> shorter gap).
+
+    Weekend and holiday gaps are longer steps and do not win the vote.
+    Returns 0.0 when the spacing cannot be determined.
+    """
+    gaps: Counter = Counter()
+    for earlier, later in zip(times, times[1:]):
+        seconds = int((later - earlier).total_seconds())
+        if seconds > 0:
+            gaps[seconds] += 1
+    if not gaps:
+        return 0.0
+    most = max(gaps.values())
+    return min(seconds for seconds, count in gaps.items() if count == most) / 60.0
 
 
 def vola_signals(
@@ -43,6 +85,7 @@ def vola_signals(
     clock = [_ny(b.time) for b in bars]
     minute = [c.hour * 60 + c.minute for c in clock]
     day = [c.date() for c in clock]
+    spacing = _bar_spacing_minutes([_utc(b.time) for b in bars])
 
     # per-day aggregates, Wilder ATR (alpha = 1/len, seeded by the first TR)
     order: list = []
@@ -74,11 +117,14 @@ def vola_signals(
             session_open[day[i]] = b.open
 
     force_at = end - force_close_in
+    session_close_at = end - spacing  # the session-close signal bar's END reaches this
     in_trade = False
     side = ""
     stop = 0.0
+    entry_day = None
     for i, b in enumerate(bars):
-        if in_trade and minute[i] >= force_at:
+        bar_end = minute[i] + spacing  # a bar is stamped at its start
+        if in_trade and bar_end >= force_at:
             sig.exits[i] = True
             in_trade = False
             continue
@@ -87,15 +133,17 @@ def vola_signals(
                 sig.exits[i] = True
                 in_trade = False
                 continue
-            last_in_session = start <= minute[i] < end and (
-                i == size - 1 or day[i + 1] != day[i] or not (start <= minute[i + 1] < end)
-            )
-            if last_in_session:
+            in_session = start <= minute[i] < end
+            session_bar = in_session and bar_end >= session_close_at
+            if session_bar or not in_session or day[i] != entry_day:
                 sig.exits[i] = True
                 in_trade = False
             continue
         d = day[i]
         if not (start <= minute[i] < end) or day_number[d] < 5:
+            continue
+        if bar_end >= session_close_at:
+            # an entry from the session-close bar on would be carried past the close
             continue
         ro, atr = session_open.get(d), atr_for_day.get(d)
         if ro is None or atr is None:
@@ -110,4 +158,5 @@ def vola_signals(
         sig.direction[i] = side
         sig.stop_loss[i] = ro
         in_trade, stop = True, ro
+        entry_day = d
     return sig
