@@ -682,3 +682,83 @@ def test_short_covariance_window_is_logged_and_recorded(caplog):
     first = result["portfolio_target_signals"][0]["metadata"]
     assert first["covariance_observations"] < first["covariance_lookback_days"]
     assert any("covariance window" in r.message for r in caplog.records)
+
+
+def _patch_equal_weights(monkeypatch):
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    baseline = {ticker: 1.0 / len(TICKERS) for ticker in TICKERS}
+    monkeypatch.setattr(risk_parity, "calculate_covariance", lambda *a, **k: np.eye(len(TICKERS)))
+    monkeypatch.setattr(
+        risk_parity, "calculate_risk_parity_weights", lambda *a, **k: dict(baseline)
+    )
+    monkeypatch.setattr(risk_parity, "adjust_for_regime", lambda weights, regime: dict(weights))
+    monkeypatch.setattr(
+        risk_parity,
+        "apply_volatility_scaling",
+        lambda weights, cov, target_vol, max_leverage, max_weight, tickers: dict(weights),
+    )
+    monkeypatch.setattr(risk_parity, "apply_tail_risk_hedge", lambda weights: dict(weights))
+    monkeypatch.setattr(risk_parity, "weekly_correlation_regimes", lambda returns: {})
+
+
+def test_attribution_baseline_is_the_last_executed_rebalance_not_a_skipped_date(monkeypatch):
+    """cubic #188: a scheduled rebalance dropped from the return index (a missing close)
+    must not become the next rebalance's attribution baseline."""
+    _patch_equal_weights(monkeypatch)
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    # QQQ: 100 on Jan 2, jumps to 110 mid-January (so the Feb 1 close differs from
+    # Jan 2), then to 121 in mid-February.
+    prices.loc[pd.Timestamp("2024-01-15") :, "QQQ"] = 110.0
+    prices.loc[pd.Timestamp("2024-02-15") :, "QQQ"] = 121.0
+    # SPY has no close on the Feb 1 rebalance date -> that bar leaves the returns.
+    prices.loc[pd.Timestamp("2024-02-01"), "SPY"] = np.nan
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    assert "2024-02-01T00:00:00Z" not in [
+        s["timestamp"] for s in result["portfolio_target_signals"]
+    ]
+    # Held 1/11 of 1,000,000 in QQQ since Jan 2 (100) -> Mar 1 (121).
+    expected = (121.0 - 100.0) / 100.0 * (1.0 / len(TICKERS)) * 1_000_000.0
+    assert result["stats"]["rebalance_attribution_net_profit"] == pytest.approx(
+        expected, abs=0.02
+    )
+
+
+def test_rebalance_with_a_single_prior_return_is_skipped_not_run_on_nan_weights(monkeypatch):
+    """cubic #188: one completed return gives a NaN sample covariance."""
+    import scripts.run_risk_parity_backtest as risk_parity
+
+    monkeypatch.setattr(risk_parity, "weekly_correlation_regimes", lambda returns: {})
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2023-12-28", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(
+        100.0 * np.cumprod(1 + rng.normal(0, 0.01, size=(len(dates), len(TICKERS))), axis=0),
+        index=dates,
+        columns=TICKERS,
+    )
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    signals = result["portfolio_target_signals"]
+    assert signals, "later rebalances still run"
+    assert signals[0]["timestamp"] != "2024-01-02T00:00:00Z"
+    for signal in signals:
+        assert all(np.isfinite(w) for w in signal["target_weights"].values())
+    assert np.isfinite(result["portfolio_value"]).all()

@@ -102,7 +102,8 @@ behavior only; the perf fix lands with the structural cleanup (16-D2) to keep
 the golden-master diffs reviewable.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`
-(LIMIT, STOP and the stopless-MARKET exception).
+(LIMIT and STOP re-sized at the trigger price, and the stopless MARKET order
+sized at the fill price with the fallback stop anchored to it — no exception).
 
 ## D5 — Stats definitions are environment-independent (F17)
 
