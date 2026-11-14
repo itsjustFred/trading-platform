@@ -244,6 +244,99 @@ class TestBuilderThinning:
         times = {pd.Timestamp(p.time) for p in curve}
         assert all(_stamps(20)[i] in times for i in range(2, 19))
 
+    def test_underwater_flat_runs_keep_drawdown_duration_in_bars(self):
+        # Review #196 P1 (r6): one losing trade early, then 996 flat bars with
+        # the account underwater. Thinning those bars reported a duration of 2.
+        n = 1000
+        stamps = _stamps(n, "h")
+        loser = Trade(
+            id=1,
+            symbol="AAA",
+            direction="LONG",
+            entry_time=stamps[0].isoformat(),
+            entry_price=100.0,
+            quantity=100.0,
+            exits=[TradeExit(time=stamps[3].isoformat(), price=90.0, quantity=100.0)],
+            pnl=-1000.0,
+            fees=0.0,
+            net_pnl=-1000.0,
+        )
+        closes = {"AAA": pd.Series(100.0, index=stamps)}
+        curve, _ = build_mark_to_market_curve(
+            [loser], closes, CAPITAL, start_time=stamps[0].isoformat()
+        )
+        assert len(curve) == n
+        stats = compute_stats([loser], CAPITAL, curve)
+        # bars 3..999 are below the 100_000 peak
+        assert stats["max_drawdown_duration"] == n - 3
+        assert stats["max_drawdown_pct"] == pytest.approx(-0.01)
+
+    def test_flat_runs_at_a_new_peak_are_still_thinned(self):
+        winner = _trade(entry_idx=1, entry_price=100.0, quantity=10.0, legs=[(3, 110.0, 10.0)])
+        curve, _ = _curve([winner], {"AAA": _closes([100.0] * 20)})
+        times = {pd.Timestamp(p.time) for p in curve}
+        # after the exit at bar 3 equity sits at its peak: only the end points remain
+        assert [i for i in range(3, 20) if _stamps(20)[i] in times] == [3, 19]
+
+
+class TestBuilderNaNCloses:
+    def test_nan_close_mid_hold_carries_the_last_valid_mark(self):
+        # Review #196 P3 (r5): a NaN bar booked the whole paper PnL as lost.
+        trade = _trade(entry_idx=0, entry_price=100.0, quantity=100.0, legs=[(5, 110.0, 100.0)])
+        close = _closes([100.0, 110.0, np.nan, 110.0, 110.0, 110.0])
+        curve, unmarked = _curve([trade], {"AAA": close})
+        assert unmarked == []
+        equities = [p.equity for p in curve]
+        assert min(equities[1:]) == CAPITAL + 1000.0
+        assert _stamps(20)[2] not in {pd.Timestamp(p.time) for p in curve}
+
+    def test_nan_close_on_a_shared_grid_bar_uses_the_previous_mark(self):
+        # Another symbol keeps the NaN bar's timestamp on the grid.
+        trade = _trade(entry_idx=0, entry_price=100.0, quantity=100.0, legs=[(5, 110.0, 100.0)])
+        closes = {
+            "AAA": _closes([100.0, 110.0, np.nan, 110.0, 110.0, 110.0]),
+            "BBB": _closes([1.0] * 6),
+        }
+        curve, _ = _curve([trade], closes)
+        assert _equity_at(curve, 2) == CAPITAL + 1000.0
+
+    def test_all_nan_closes_mark_the_symbol_as_unmarked(self):
+        trade = _trade(entry_idx=0, entry_price=100.0, quantity=1.0, legs=[(3, 110.0, 1.0)])
+        curve, unmarked = _curve([trade], {"AAA": _closes([np.nan] * 5)})
+        assert unmarked == ["AAA"]
+        assert curve[-1].equity == CAPITAL + 10.0
+
+
+def test_realized_drawdown_can_be_deeper_than_headline_with_overlapping_positions():
+    # Review #196 P2 (r1): A realizes -20k while B carries +30k unrealized, so
+    # the MTM portfolio never falls below its peak but the balance does.
+    def trade(tid, symbol, exit_idx, exit_price):
+        pnl = (exit_price - 100.0) * 1000.0
+        return Trade(
+            id=tid,
+            symbol=symbol,
+            direction="LONG",
+            entry_time=_stamps(10)[0].isoformat(),
+            entry_price=100.0,
+            quantity=1000.0,
+            exits=[
+                TradeExit(time=_stamps(10)[exit_idx].isoformat(), price=exit_price, quantity=1000.0)
+            ],
+            pnl=pnl,
+            fees=0.0,
+            net_pnl=pnl,
+        )
+
+    a, b = trade(1, "A", 4, 80.0), trade(2, "B", 9, 130.0)
+    closes = {
+        "A": _closes([100, 95, 90, 85, 80, 80, 80, 80, 80, 80.0]),
+        "B": _closes([100, 110, 120, 125, 130, 130, 130, 130, 130, 130.0]),
+    }
+    curve, _ = _curve([a, b], closes, n=10)
+    stats = compute_stats([a, b], CAPITAL, curve)
+    assert stats["max_drawdown_pct"] == pytest.approx(0.0)
+    assert stats["max_drawdown_realized_pct"] == pytest.approx(-0.2)
+
 
 def test_closes_from_frame_handles_timestamp_column_and_datetime_index():
     stamps = _stamps(3)

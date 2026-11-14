@@ -640,8 +640,11 @@ def _realized_max_drawdown_pct(trades: list[Trade], initial_capital: float) -> f
 
     Replays net trade PnL in exit order starting from ``initial_capital`` — the
     account *balance*, blind to the paper PnL of open positions. The headline
-    ``max_drawdown_pct`` uses the mark-to-market equity curve instead; the
-    realized figure is therefore always ``>=`` it (shallower or equal).
+    ``max_drawdown_pct`` uses the mark-to-market equity curve instead. With
+    non-overlapping positions the realized figure is shallower than or equal
+    to the headline; with concurrent positions it can be DEEPER (a realized
+    loss offset by another open position's paper gain shows on the balance but
+    not on the equity curve), so no ordering between the two may be assumed.
     """
     if not trades:
         return None
