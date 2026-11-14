@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -194,7 +194,7 @@ class RamJetSignalProcessor:
         return frame
 
     @staticmethod
-    def _normalize_buy_action(raw_action: Any) -> str:
+    def _normalize_buy_action(raw_action: Any) -> Literal["buy"]:
         action = str(raw_action or "").strip().lower()
         if action in {"buy", "long"}:
             return "buy"

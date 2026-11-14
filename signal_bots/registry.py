@@ -10,7 +10,7 @@ all explicit, all derived from code, never from a user-supplied string.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import yaml
 
@@ -42,11 +42,14 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+_ProcessorT = TypeVar("_ProcessorT")
+
+
 def _build_from_config(
     config_path: Path,
-    factory: Callable[[dict[str, Any]], object],
+    factory: Callable[[dict[str, Any]], _ProcessorT],
     config: dict[str, Any],
-) -> object:
+) -> _ProcessorT:
     """Merge the bot's own config file with caller overrides and build it.
 
     `config` is caller-controlled data used as *values* only; it never selects
@@ -108,9 +111,9 @@ def get_signal_processor_config_path(name: str) -> Path:
 
 def _build_from_bot_dir(
     bot_dir: str,
-    factory: Callable[[dict[str, Any]], object],
+    factory: Callable[[dict[str, Any]], _ProcessorT],
     config: dict[str, Any],
-) -> object:
+) -> _ProcessorT:
     return _build_from_config(_bot_config_path(bot_dir), factory, config)
 
 

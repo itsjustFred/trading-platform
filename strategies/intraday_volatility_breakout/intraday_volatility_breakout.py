@@ -17,6 +17,7 @@ Logic:
 
 import logging
 from datetime import timedelta, timezone
+from typing import SupportsFloat
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
@@ -82,7 +83,7 @@ _TF_FREQ_MAP = {
 }
 
 
-def _resolve_session_zone(session_timezone: object, offset_hours: object):
+def _resolve_session_zone(session_timezone: object, offset_hours: SupportsFloat | str | None):
     name = str(session_timezone or "").strip()
     offset = float(offset_hours or 0)
     if name and offset:
