@@ -6,7 +6,8 @@ Rules (re-implemented independently by the reference in
 - ``rsi``: Wilder smoothing, ``alpha = 1/rsi_len`` with the recursion seeded by
   the first price change (pandas ``ewm(alpha, adjust=False, min_periods=rsi_len)``
   on gains and losses); ``rsi = 100`` when the average loss is 0.
-- flat and ``rsi < oversold`` -> entry signal on that bar.
+- flat and ``rsi < oversold`` on a bar with a finite close -> entry signal on
+  that bar (an unpriced bar never signals and never publishes a NaN stop).
 - ``hold_bars`` bars after the entry-signal bar -> exit signal (time exit);
   no entry on the exit bar itself.
 - Optional ``stop_pct``: publishes ``sizing_sl_price = close*(1-stop_pct)`` on
@@ -51,7 +52,7 @@ def generate_signals(df, params):
             if i - entry_bar >= hold_bars:
                 exits.iloc[i] = True
                 entry_bar = None
-        elif rsi.iloc[i] < oversold:
+        elif np.isfinite(close.iloc[i]) and rsi.iloc[i] < oversold:
             entries.iloc[i] = True
             entry_bar = i
             if stop_pct > 0:
