@@ -180,6 +180,51 @@ class TestSizingEquityExcludesUnrealizedPnl:
         )
 
 
+class TestSizingEquityBasis:
+    def test_equity_at_entry_records_the_sizing_basis_not_mark_to_market(self):
+        """cubic #190: the replay derives quantity / equity_at_entry, so the
+        recorded basis must be the realized cash the entry was sized from."""
+        frame = _linear_frame(6, start=100.0)
+        frame.loc[2, "high"] = 130.0
+        frame.loc[2, "close"] = 130.0
+        frame.loc[3, "close"] = 130.0
+        frame.loc[3, "open"] = 130.0
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, lambda df, params: (entries, exits))
+
+        assert len(engine.closed_trades) >= 2
+        # Open +30/qty profit from entry 1 must not leak into the basis.
+        assert engine.closed_trades[1].meta["equity_at_entry"] == pytest.approx(100_000.0)
+
+    def test_partial_exit_cash_is_net_of_fees_still_owed(self):
+        """cubic #190: gross partial proceeds are not spendable until the
+        round-trip fee of the still-open position is settled."""
+        from runner.engine import Order, OrderType
+
+        engine = TradeEngine(
+            _config(Path("/tmp"), parameters={"fee_rate": 0.001}), symbol="PROBE"
+        )
+        order = Order(
+            symbol="PROBE",
+            direction="LONG",
+            order_type=OrderType.MARKET,
+            created_index=0,
+            created_time="2024-01-01T00:00:00+00:00",
+            quantity=100.0,
+        )
+        engine._open_position(order, 100.0, "2024-01-01T01:00:00+00:00", 1)
+        position = engine.positions[0]
+        engine._close_partial(position, 110.0, 50.0, "2024-01-01T02:00:00+00:00", "tp1")
+
+        gross = 50.0 * 10.0
+        owed = (100.0 + 110.0) * 100.0 * 0.001  # round trip on the full position
+        assert engine._sizing_equity == pytest.approx(100_000.0 + gross - owed)
+
+
 # ─── F22: max_positions comes from risk policy, not strategy params ─────────
 
 

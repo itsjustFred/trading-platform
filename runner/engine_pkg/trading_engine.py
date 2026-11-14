@@ -452,7 +452,10 @@ class TradeEngine:
         # running portfolio equity (position size is linear in equity, so the
         # per-unit coefficient quantity/equity_at_entry replays exactly).
         position_meta = dict(getattr(order, "meta", None) or {})
-        position_meta["equity_at_entry"] = round(float(self.equity), 2)
+        # The basis is the equity the order was SIZED from (realized cash,
+        # F21/D2), not the mark-to-market reporting equity: the replay
+        # recovers the per-unit coefficient quantity / equity_at_entry from it.
+        position_meta["equity_at_entry"] = round(float(self._sizing_equity), 2)
         sizing_stop = getattr(order, "_sizing_stop_loss", None)
         if sizing_stop is not None:
             position_meta["sizing_stop_loss"] = float(sizing_stop)
@@ -727,8 +730,37 @@ class TradeEngine:
         # #84: exit legs accumulate gross; ``_finalize_position`` backs the
         # fees out, so this running realized figure is net (F21/D2).
         self._realized_pnl += pnl
-        # F21 (D2): cash becomes spendable the moment it is realized.
-        self._sizing_equity = self.config.initial_capital + self._realized_pnl
+        # F21 (D2): cash becomes spendable the moment it is realized, net of
+        # the round-trip fees the still-open position will owe.
+        self._refresh_sizing_equity()
+
+    def _refresh_sizing_equity(self) -> None:
+        """Spendable cash: realized PnL less fees still owed on partly-closed positions.
+
+        ``_close_partial`` books exit legs gross and ``_finalize_position``
+        backs the fees out only when the last leg closes, so cash from a
+        partial exit must not be spendable while its round-trip fees are still
+        owed. The owed amount is the fee model's price of the full position at
+        the exits so far; the final, exact fee replaces it at finalisation.
+        """
+        owed = 0.0
+        fee_model = None
+        for pos in self.positions:
+            if pos.remaining_qty <= 1e-9 or not pos.exits:
+                continue
+            total_qty = sum(float(item.quantity or 0.0) for item in pos.exits)
+            if total_qty <= 0:
+                continue
+            if fee_model is None:
+                fee_model = resolve_fee_model(self.config.parameters)
+            avg_exit = (
+                sum(float(item.price or 0.0) * float(item.quantity or 0.0) for item in pos.exits)
+                / total_qty
+            )
+            owed += fee_model.fee_for_trade(
+                float(pos.entry_price), avg_exit, float(pos.quantity)
+            )
+        self._sizing_equity = self.config.initial_capital + self._realized_pnl - owed
 
     def _finalize_position(self, position: Position, exit_index: int) -> None:
         if position.remaining_qty > 1e-9:
@@ -759,7 +791,7 @@ class TradeEngine:
         # F21 (D2): the spendable sizing cash follows the NET realized figure
         # (the fee model is part of the realized path), so it is refreshed here
         # as well as at every partial close.
-        self._sizing_equity = self.config.initial_capital + self._realized_pnl
+        self._refresh_sizing_equity()
         take_profit = None
         if position.take_profit_levels:
             first_level = position.take_profit_levels[0]
