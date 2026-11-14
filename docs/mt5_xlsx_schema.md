@@ -382,7 +382,8 @@ Jede Exit-Zeile wird zu einem `TradeExit`; es gibt pro Position einen
    nicht als abgeschlossene Trades exportiert, sondern in
    `raw_metadata.position_fills` mit Restmenge und Status dokumentiert.
 4. **Sprachabhängigkeit:** Die Report-Kopf-Begriffe sind deutsch (`Strategietesterbericht`, `Ergebnisse`, `Eröffnungszeit`, etc.). Der Importer sollte auf Spalten-Index-Ebene arbeiten (nicht auf Begriffsebene), um Mehrsprachigkeit zu unterstützen.
-5. **Keine HTML-Reports:** Es liegen ausschließlich XLSX-Dateien vor. Der geplante `MT5HTMLConverter` benötigt separate Fixture-Dateien.
+5. **Vorzeichen von Kommission und Swap (offen, Bug):** Die Importer speichern `fees = Kommission + Swap` mit MT5-Vorzeichen (Kosten negativ). `net_pnl` wird aber als `pnl - fees` berechnet, also mit umgekehrtem Vorzeichen. Der MT5-Summenwert `Nettogewinn gesamt` entspricht in allen drei Referenz-Goldens genau `Σ pnl + Σ fees`. Bis zur Korrektur markieren `xfail(strict=True)`-Tests in `tests/validation/test_golden_reconciliation.py` und `test_mt5_xlsx_fixture_shapes.py` den Fehler.
+6. **Keine HTML-Reports:** Es liegen ausschließlich XLSX-Dateien vor. Der geplante `MT5HTMLConverter` benötigt separate Fixture-Dateien.
 
 ---
 

@@ -1,0 +1,122 @@
+{
+  "strategy_name": "Synthetic Hedge Partial Fixture",
+  "source_framework": "mt5_xlsx",
+  "symbol": "EURUSD",
+  "timeframe": "h1",
+  "trades": [
+    {
+      "id": 1,
+      "symbol": "EURUSD",
+      "direction": "LONG",
+      "entry_time": "2024-01-02T08:00:00Z",
+      "entry_price": 1.1,
+      "quantity": 0.1,
+      "pnl": 50.0,
+      "fees": -1.4,
+      "stop_loss": 1.095,
+      "take_profit": 1.105,
+      "exit_reason": "take_profit",
+      "tags": [
+        "Breakout Long"
+      ],
+      "position_id": "position-1",
+      "exits": [
+        {
+          "time": "2024-01-02T12:00:00Z",
+          "price": 1.105,
+          "quantity": 0.1,
+          "pnl": 50.0,
+          "reason": "take_profit"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "symbol": "EURUSD",
+      "direction": "LONG",
+      "entry_time": "2024-01-03T08:00:00Z",
+      "entry_price": 1.101,
+      "quantity": 0.2,
+      "pnl": 52.0,
+      "fees": -2.8,
+      "stop_loss": 1.098,
+      "take_profit": null,
+      "exit_reason": "take_profit",
+      "tags": [
+        "Breakout Long"
+      ],
+      "position_id": "position-2",
+      "exits": [
+        {
+          "time": "2024-01-03T12:00:00Z",
+          "price": 1.104,
+          "quantity": 0.12,
+          "pnl": 36.0,
+          "reason": null
+        },
+        {
+          "time": "2024-01-03T13:00:00Z",
+          "price": 1.103,
+          "quantity": 0.08,
+          "pnl": 16.0,
+          "reason": "take_profit"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "symbol": "EURUSD",
+      "direction": "SHORT",
+      "entry_time": "2024-01-03T09:00:00Z",
+      "entry_price": 1.102,
+      "quantity": 0.1,
+      "pnl": -15.0,
+      "fees": -1.7,
+      "stop_loss": 1.105,
+      "take_profit": null,
+      "exit_reason": "stop_loss",
+      "tags": [
+        "Hedge Short"
+      ],
+      "position_id": "position-3",
+      "exits": [
+        {
+          "time": "2024-01-03T10:00:00Z",
+          "price": 1.1035,
+          "quantity": 0.1,
+          "pnl": -15.0,
+          "reason": "stop_loss"
+        }
+      ]
+    }
+  ],
+  "stats": {
+    "total_trades": 3,
+    "winners": 2,
+    "losers": 1,
+    "win_rate": 66.67,
+    "total_pnl": 102.51,
+    "total_deals": 10,
+    "total_return": 0.010251
+  },
+  "position_fills": {
+    "closed_position_count": 3,
+    "partial_position_count": 1,
+    "open_position_count": 2,
+    "open_only_count": 1,
+    "orphan_exit_count": 0,
+    "closed_position_ids": [
+      "position-1",
+      "position-2",
+      "position-3"
+    ],
+    "partial_position_ids": [
+      "position-4"
+    ],
+    "open_only_position_ids": [
+      "position-5"
+    ],
+    "residual_position_count": 2,
+    "residual_exit_count": 0
+  }
+}
