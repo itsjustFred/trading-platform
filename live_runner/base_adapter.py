@@ -159,10 +159,12 @@ def commission_cost(signed_cash_flow: float) -> float:
 class LiveQuote:
     """A broker top-of-book quote, in price units of the symbol.
 
-    Used by the daemon's entry-deviation gate (#125) only: it decides whether a
-    signal may still be submitted, and is never a sizing input. Adapters return
-    what the broker sent; the daemon validates it (finite, positive, not
-    crossed) and fails closed on anything else.
+    An entry-gate quote (#125) only decides whether a signal may still be
+    submitted and is never a sizing input. A *conversion* quote (#146), carried
+    in :class:`LivePipValue`, is the one sizing input: it converts the quote
+    currency into the account currency. Adapters return what the broker sent;
+    the daemon validates it (finite, positive, not crossed) and fails closed on
+    anything else.
 
     ``timestamp`` must be timezone-aware. The daemon rejects a quote whose time
     is missing, invalid, in the future or older than the deployment's

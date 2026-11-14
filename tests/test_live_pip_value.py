@@ -960,3 +960,39 @@ def test_alpaca_refuses_an_empty_symbol():
 def test_base_adapter_default_fails_closed():
     with pytest.raises(NotImplementedError, match="cannot provide a pip value"):
         asyncio.run(_Adapter().get_pip_value("EURUSD"))
+
+
+def test_ctrader_refuses_a_caller_pip_value_whose_scale_cannot_be_verified():
+    # cubic #187: a caller override carries no units-per-qty, so the submit-time
+    # scale guard cannot run; converting qty with whatever scale is current
+    # could be a different position size. Fail closed.
+    fixture = _CTrader({})
+    signal = LiveSignal(
+        deployment_id="d", symbol="EURUSD", action="buy", theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "pip_value": 2.0, "pip_value_source": "caller"},
+    )
+
+    with pytest.raises(ValueError, match="cannot verify the volume scale"):
+        fixture.adapter._resolve_order_volume(signal)
+
+
+def test_ctrader_pip_value_does_not_wait_for_the_asset_name_lookup():
+    # cubic #187: asset names are labels only; a slow asset list must not hold
+    # entry sizing.
+    fixture = _CTrader({"EURUSD": _quote(1.1)})
+    fixture.adapter._asset_names = {}
+
+    async def run() -> Any:
+        async def hang(request: Any, *, timeout_seconds: float = 15) -> Any:
+            await asyncio.sleep(3600)
+
+        fixture.adapter._send_request_with_refresh_retry = hang  # type: ignore[method-assign]
+        result = await asyncio.wait_for(fixture.adapter.get_pip_value("EURUSD"), timeout=2)
+        task = fixture.adapter._asset_names_task
+        assert task is not None and not task.done()
+        task.cancel()
+        return result
+
+    result = asyncio.run(run())
+    assert result.quote_asset == str(USD)

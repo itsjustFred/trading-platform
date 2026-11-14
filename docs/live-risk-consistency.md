@@ -93,7 +93,13 @@ jedes Live-Signal durch `RiskEngine`.
   (`ProtoOASymbolsForConversionReq`) mit Live-Quotes. Pro Hop wird die Seite
   genommen, die den Kurs **höher** macht (Ask beim Multiplizieren, Bid beim
   Dividieren): ein höherer Pip-Value sized kleiner, der Spread kann den Verlust am
-  SL also nur unter das Budget drücken. Nur ein vom Broker gesendetes `lotSize` zählt;
+  SL also nur unter das Budget drücken. Das gilt nur für den Umrechnungs-Quote zum
+  Sizing-Zeitpunkt: Cross-Währungs-Kurse können sich bis zum Stop bewegen, und der
+  Submit prüft nur die Symbol-Skala, nicht den Umrechnungskurs. Das SL-Budget ist
+  daher keine harte Verlustgrenze in Konto-Währung. Ein expliziter `pip_value`-Override
+  (`source="caller"`) trägt keine `units_per_qty`; cTrader verweigert ihn, weil die
+  Skala beim Submit nicht prüfbar wäre.
+  Nur ein vom Broker gesendetes `lotSize` zählt;
   die statische Fallback-Tabelle (in Basis-Einheiten, für FX/XAU 100x unter den
   Broker-Cent, #184) wird nie fürs Sizing benutzt. Ändert sich die Skala zwischen
   Sizing und Submit (z. B. Reconnect mit fehlgeschlagenem Props-Fetch), verweigert
