@@ -4249,6 +4249,58 @@ def test_ctrader_jpy_relative_sl_tp_uses_fixed_protocol_divisor() -> None:
     assert request.relativeTakeProfit == 10000
 
 
+@pytest.mark.parametrize(
+    ("digits", "grid"),
+    [(2, 1000), (3, 100), (4, 10), (5, 1)],
+)
+def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: int) -> None:
+    """cTrader rejects a relative distance that is finer than the symbol's price digits
+    (``Relative stop loss has invalid precision``, seen on a demo ETHUSD order), so the
+    sent distance is snapped to the symbol grid: 1000 units at 2 digits, 100 at 3, ..."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0,
+        price_digits=digits,
+        min_volume=1,
+        lot_size=100.0,
+        source="broker",
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        # 9.62751 below / 9.62749 above: both off-grid below 5 digits.
+        metadata={"qty": 1.0, "stop_loss": 1925.50 - 9.62751, "take_profit": 1925.50 + 9.62749},
+    )
+    request = adapter._build_new_order_request(signal, symbol_id=9)
+    assert request.relativeStopLoss % grid == 0
+    assert request.relativeTakeProfit % grid == 0
+    # Snapping moves a distance by at most half a tick.
+    assert abs(request.relativeStopLoss - 962_751) <= grid / 2
+    assert abs(request.relativeTakeProfit - 962_749) <= grid / 2
+
+
+def test_ctrader_relative_sl_tp_never_rounds_a_distance_to_zero() -> None:
+    """A distance under half a tick is sent as one tick, not 0 (0 means 'no TP')."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0, price_digits=2, min_volume=1, lot_size=100.0, source="broker"
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.0, "stop_loss": 1925.496, "take_profit": 1925.504},
+    )
+    request = adapter._build_new_order_request(signal, symbol_id=9)
+    assert request.relativeStopLoss == 1000
+    assert request.relativeTakeProfit == 1000
+
+
 def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:
     """XAU qty 5.0 (0.05 lots = 5 oz) resolves to volume 5, not 5000."""
     _module, adapter = _make_ctrader_adapter()
