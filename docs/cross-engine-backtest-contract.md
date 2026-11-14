@@ -58,8 +58,17 @@ parent Cleanup 16 record.
   bar, so it also beats a later same-bar touch of the other level and needs no
   intrabar data. The entry bar is never a gap (the position was opened at that
   very open). Shared primitives: `contract.level_gapped_at_open` /
-  `contract.level_fill_price`. SHORT exits buy the ask, so the native engine
-  adds the spread on top of the open exactly as it does on a level fill. When a
+  `contract.level_fill_price`; the gap-first ordering (gap through the stop,
+  then gap through the target, then the stop-first range test) lives in
+  `contract.resolve_protective_exit`, which vectorbt's intrabar walk and signal
+  replay share with native `_check_stops`. SHORT exits buy the ask, so native
+  and vectorbt both add the spread (`spread_price_col`) on top of the open on a
+  gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
+  target gapped by less than the spread fills at `open + spread`, which can be
+  worse than the target level — realistic, and identical in both engines. The
+  vectorbt walk prices the spread from the **sub-bar** row (the intrabar data
+  must carry the spread column), native from the main bar. Signal replay has no
+  spread model. When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -147,6 +156,13 @@ closed by the forced **end-of-data** close at that bar's close with reason
 PyneCore's ledger drops a trade that never closes, signal replay closes
 end-of-data at the last close). Stop/TP exits fill at the level or, on a gap,
 the open (§1).
+
+**Records without `signal_exit_fill`** predate this decision: the old default
+was `close` and the key was omitted when it held that default. Every reader —
+`BacktestMeta.from_dict`, the SQLite record loader and the optimizer's
+base-runtime reconstruction — reads a missing value as
+`shared.models.LEGACY_SIGNAL_EXIT_FILL` (`close`), so a legacy result is never
+re-run (or re-optimised) under a different exit model than its stored stats.
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with

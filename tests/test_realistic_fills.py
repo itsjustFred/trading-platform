@@ -476,17 +476,20 @@ def _subbars(rows, per_bar: int = 4) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _walk(direction, stop, tp, sub_rows):
+def _walk(
+    direction, stop, tp, sub_rows, *, spread: float = 0.0, parameters: dict | None = None
+):
     """Run the intrabar walk over hand-written 15m sub-bars (entry at 00:00)."""
-    sub = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01 00:00", periods=len(sub_rows), freq="15min", tz="UTC"),
-            "open": [r[0] for r in sub_rows],
-            "high": [r[1] for r in sub_rows],
-            "low": [r[2] for r in sub_rows],
-            "close": [r[3] for r in sub_rows],
-        }
-    )
+    data: dict[str, object] = {
+        "timestamp": pd.date_range("2024-01-01 00:00", periods=len(sub_rows), freq="15min", tz="UTC"),
+        "open": [r[0] for r in sub_rows],
+        "high": [r[1] for r in sub_rows],
+        "low": [r[2] for r in sub_rows],
+        "close": [r[3] for r in sub_rows],
+    }
+    if spread:
+        data["spread_price"] = [spread] * len(sub_rows)
+    sub = pd.DataFrame(data)
     return _resolve_intrabar_exit(
         intrabar_df=sub,
         intrabar_timeframe="15m",
@@ -496,7 +499,7 @@ def _walk(direction, stop, tp, sub_rows):
         scheduled_exit_time="2024-01-01T03:00:00+00:00",
         stop_price=stop,
         take_profit_price=tp,
-        parameters={},
+        parameters=parameters or {},
     )
 
 
@@ -786,3 +789,136 @@ class TestPyneCoreContainment:
         trade = _pyne_trade("LONG", 93.0, sl=95.0)
         _normalize_trade_exits([trade])
         assert trade.exits[-1].price == pytest.approx(95.0)
+
+
+# --------------------------------------------------------------------------- #
+# cross-engine: the gap is the bar's first event (review of #208, P2)
+# --------------------------------------------------------------------------- #
+
+# (direction, stop, tp, gap bar OHLC, expected fill, expected kind). Each bar
+# OPENS beyond one level and later trades through the other: the open came
+# first, so the gapped level wins at the open in EVERY engine - also when the
+# gap is the favourable one (target) and the later touch is the stop, where a
+# stop-first range test would book a loss at the stop instead.
+_GAP_FIRST_CASES = [
+    ("LONG", 95.0, 110.0, (120.0, 125.0, 90.0, 100.0), 120.0, "tp"),
+    ("SHORT", 105.0, 90.0, (80.0, 110.0, 75.0, 100.0), 80.0, "tp"),
+    ("LONG", 95.0, 110.0, (90.0, 125.0, 88.0, 120.0), 90.0, "stop"),
+    ("SHORT", 105.0, 90.0, (110.0, 112.0, 75.0, 80.0), 110.0, "stop"),
+]
+_REASONS = {"tp": {"tp", "take_profit"}, "stop": {"stop_loss"}}
+
+
+class TestGapIsTheFirstEventAcrossEngines:
+    @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
+    def test_contract_primitive(self, direction, stop, tp, bar, fill, kind):
+        o, h, lo, _ = bar
+        assert contract.resolve_protective_exit(
+            direction=direction, bar_open=o, high=h, low=lo, stop_price=stop, take_profit_price=tp
+        ) == (kind, True)
+        # The entry bar/step cannot be a gap: the range test (stop-first) decides.
+        assert contract.resolve_protective_exit(
+            direction=direction,
+            bar_open=o,
+            high=h,
+            low=lo,
+            stop_price=stop,
+            take_profit_price=tp,
+            allow_gap=False,
+        ) == ("stop", False)
+
+    @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
+    def test_native(self, direction, stop, tp, bar, fill, kind):
+        result = _native(
+            [_flat(), _flat(), bar, _flat(bar[3])], direction=direction, stop=stop, take_profit=tp
+        )
+        (trade,) = result.trades
+        assert trade.exits[-1].price == pytest.approx(fill)
+        assert trade.exits[-1].reason in _REASONS[kind]
+
+    @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
+    def test_vectorbt_intrabar_walk(self, direction, stop, tp, bar, fill, kind):
+        hit = _walk(direction, stop, tp, [(100, 100.5, 99.5, 100), bar])
+        assert hit["price"] == pytest.approx(fill)
+        assert hit["reason"] in _REASONS[kind]
+        assert hit["gap"] is True
+
+    @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
+    def test_signal_replay(self, direction, stop, tp, bar, fill, kind):
+        o, h, lo, c = bar
+        trade = _replay(
+            _replay_frame([100, o, c], [100.5, h, c + 0.2], [99.5, lo, c - 0.2], [100, c, c]),
+            action="buy" if direction == "LONG" else "sell",
+            stop=stop,
+            tp=tp,
+        )
+        assert trade.exits[-1].price == pytest.approx(fill)
+        assert trade.exit_reason in _REASONS[kind]
+
+    def test_vectorbt_end_to_end_favourable_gap_beats_a_later_stop_touch(self, tmp_path):
+        rows = [_flat(), _flat(), (120.0, 125.0, 90.0, 100.0), _flat(100.0), _flat(100.0)]
+        intrabar = _subbars(rows)
+        # Put the whole gap bar's range into its FIRST sub-bar: it opens above
+        # the target and trades down through the stop within that one step.
+        gap_sub = intrabar["timestamp"] == pd.Timestamp("2024-01-01 02:00", tz="UTC")
+        intrabar.loc[gap_sub, ["high", "low"]] = [125.0, 90.0]
+        result = _vbt_run(
+            tmp_path, rows, _vbt_strategy(0, 4, stop=95.0, tp=110.0), intrabar=intrabar
+        )
+        (trade,) = result.trades
+        assert trade.exits[0].price == pytest.approx(120.0)
+        assert trade.exits[0].reason == "take_profit"
+
+
+# --------------------------------------------------------------------------- #
+# cross-engine: SHORT protective exits buy the ask (review of #208, P3)
+# --------------------------------------------------------------------------- #
+
+_SPREAD = 0.4
+# (stop, tp, bar, expected fill = base + spread). The last case gaps just
+# through the target (opens 89.8 below the 90 target) by less than the spread:
+# the fill at the ask (90.2) is WORSE than the target. That is realistic - a
+# gap fill is a market fill at the available price - and both engines agree.
+_SHORT_SPREAD_CASES = [
+    (105.0, None, (110.0, 112.0, 109.0, 111.0), 110.0 + _SPREAD),  # gap through stop
+    (105.0, None, (101.0, 106.0, 100.5, 104.0), 105.0 + _SPREAD),  # stop touch
+    (120.0, 90.0, (95.0, 96.0, 88.0, 89.0), 90.0 + _SPREAD),  # target touch
+    (120.0, 90.0, (89.8, 90.0, 88.0, 89.0), 89.8 + _SPREAD),  # gap through target
+]
+
+
+class TestShortProtectiveFillsCarryTheSpreadAcrossEngines:
+    @pytest.mark.parametrize(("stop", "tp", "bar", "fill"), _SHORT_SPREAD_CASES)
+    def test_native(self, stop, tp, bar, fill):
+        result = _native(
+            [_flat(), _flat(), bar, _flat(bar[3])],
+            direction="SHORT",
+            stop=stop,
+            take_profit=tp,
+            spread=_SPREAD,
+            parameters={"spread_price_col": "spread_price"},
+        )
+        (trade,) = result.trades
+        assert trade.entry_price == pytest.approx(100.0)  # SHORT entry hits the bid
+        assert trade.exits[-1].price == pytest.approx(fill)
+
+    @pytest.mark.parametrize(("stop", "tp", "bar", "fill"), _SHORT_SPREAD_CASES)
+    def test_vectorbt_intrabar_walk(self, stop, tp, bar, fill):
+        hit = _walk(
+            "SHORT",
+            stop,
+            tp,
+            [(100, 100.5, 99.5, 100), bar],
+            spread=_SPREAD,
+            parameters={"spread_price_col": "spread_price"},
+        )
+        assert hit["price"] == pytest.approx(fill)
+
+    def test_long_protective_fills_carry_no_spread_in_the_walk(self):
+        # LONG exits sell the bid: no surcharge on a gap or a touch.
+        kw = {"spread": _SPREAD, "parameters": {"spread_price_col": "spread_price"}}
+        entry = (100, 100.5, 99.5, 100)
+        gap = _walk("LONG", 95.0, None, [entry, (90, 91, 88, 89)], **kw)
+        touch = _walk("LONG", 95.0, None, [entry, (99, 99.5, 94, 96)], **kw)
+        assert gap["price"] == pytest.approx(90.0)
+        assert touch["price"] == pytest.approx(95.0)

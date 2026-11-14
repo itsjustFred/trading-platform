@@ -1715,32 +1715,43 @@ def _resolve_intrabar_exit(
                 high = ask_high
             if ask_low is not None:
                 low = ask_low
-        event = _match_intrabar_exit_event(
+        # Owner decision 2026-11-13: a sub-bar that OPENS beyond a level gapped
+        # through it - the open is the sub-bar's first event, so that exit wins
+        # over a later touch of the other level on the same sub-bar and fills
+        # at the open, not at the skipped level (gap checked BEFORE the
+        # stop-first range test, mirroring native _check_stops). The entry
+        # bar's first sub-bar is exempt (the position was opened at that very
+        # open). Intrabar touches keep filling at the level.
+        spread = _vbt_bar_spread(row, parameters) if direction == "SHORT" else 0.0
+        sub_open = row.get("open")
+        trigger_open: float | None = None
+        if sub_open is not None and pd.notna(sub_open):
+            trigger_open = float(sub_open)
+            if direction == "SHORT" and bool((parameters or {}).get("ask_ohlc", False)):
+                trigger_open += spread
+        kind, gapped = contract.resolve_protective_exit(
             direction=direction,
+            bar_open=trigger_open,
             high=high,
             low=low,
             stop_price=stop_price,
             take_profit_price=take_profit_price,
+            allow_gap=timestamp > entry_ts,
         )
-        if event is None:
+        if kind is None:
             continue
-        # Owner decision 2026-11-13: a sub-bar that OPENS beyond the level
-        # gapped through it - fill at that open, not at the skipped level. The
-        # entry bar's first sub-bar is exempt (the position was opened at that
-        # very open). Intrabar touches keep filling at the level.
-        if timestamp > entry_ts:
-            level = stop_price if event["reason"] == "stop_loss" else take_profit_price
-            kind = "stop" if event["reason"] == "stop_loss" else "tp"
-            sub_open = row.get("open")
-            if level is not None and sub_open is not None and pd.notna(sub_open):
-                trigger_open = float(sub_open)
-                if direction == "SHORT" and bool((parameters or {}).get("ask_ohlc", False)):
-                    trigger_open += _vbt_bar_spread(row, parameters)
-                if contract.level_gapped_at_open(
-                    direction=direction, kind=kind, level=float(level), bar_open=trigger_open
-                ):
-                    event["price"] = float(sub_open)
-                    event["gap"] = True
+        level = stop_price if kind == "stop" else take_profit_price
+        assert level is not None  # a hit is only reported for a set level
+        # SHORT exits buy the ask: level and gap fills both carry the sub-bar
+        # spread, exactly like native _level_fill_price (A-H7). A gap fill at
+        # open + spread can be worse than the level - it is a market fill.
+        base = float(sub_open) if gapped else float(level)
+        event = {
+            "price": base + spread,
+            "reason": "stop_loss" if kind == "stop" else "take_profit",
+        }
+        if gapped:
+            event["gap"] = True
         event["time"] = timestamp.isoformat()
         event["resolution"] = intrabar_timeframe
         return event
