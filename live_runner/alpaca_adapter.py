@@ -23,6 +23,7 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
     order_not_submitted,
 )
+from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from live_runner.credential_env import parse_bool_env, resolve_env_value
 from shared.database import (
     get_live_signal_broker_order_id,
@@ -480,6 +481,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._trading_client: Any | None = None
         self._trading_stream: Any | None = None
         self._historical_data_client: Any | None = None
+        self._crypto_data_client: Any | None = None
         # #78: subscribe exactly once per stream instance. Re-subscribing
         # the same (or a reconnected) stream duplicates callbacks. The
         # subscribed stream object itself is tracked (not its id(): CPython
@@ -631,6 +633,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self._subscribed_stream = None
         self._trading_client = None
         self._historical_data_client = None
+        self._crypto_data_client = None
         self._connected = False
         if stream is None:
             return
@@ -1021,6 +1024,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         normalized_symbol = str(symbol or "").strip().upper()
         if not normalized_symbol:
             raise ValueError("symbol is required for Alpaca market data")
+        # Raises UnclassifiableSymbolError (a ValueError) rather than guessing the feed.
+        is_crypto = classify_symbol(normalized_symbol) == "crypto"
+        if is_crypto:
+            normalized_symbol = canonical_crypto_symbol(normalized_symbol)
         resolved_timeframe, _normalized = _alpaca_timeframe(timeframe)
         bounded_limit = max(1, min(int(limit), 1000))
         if not self._connected or self._historical_data_client is None:
@@ -1028,7 +1035,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca adapter must be connected before requesting market data"
             )
 
+        def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
+            from alpaca.data.historical import CryptoHistoricalDataClient
+            from alpaca.data.requests import CryptoBarsRequest
+
+            if self._crypto_data_client is None:
+                self._crypto_data_client = CryptoHistoricalDataClient(
+                    self.api_key, self.secret_key
+                )
+            request = CryptoBarsRequest(
+                symbol_or_symbols=[normalized_symbol],
+                timeframe=resolved_timeframe,
+                start=_alpaca_market_data_start(
+                    timeframe, bounded_limit, slack_multiplier=slack_multiplier
+                ),
+                limit=1000,
+                sort=Sort.DESC,
+            )
+            return self._crypto_data_client.get_crypto_bars(request).df
+
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
+            if is_crypto:
+                return _fetch_crypto(slack_multiplier)
             request = StockBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,

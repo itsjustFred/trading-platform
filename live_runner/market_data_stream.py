@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.symbol_class import (
+    UnclassifiableSymbolError,
+    canonical_crypto_symbol,
+    classify_symbol,
+)
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -16,10 +21,23 @@ logger = get_logger("live-runner")
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
-    normalized = str(symbol or "").strip().upper()
-    if not normalized:
-        return False
-    return "/" in normalized or normalized.endswith("USD") and "-" in normalized
+    """True for a known crypto pair in any form; raises if unclassifiable.
+
+    Never falls back to ``False``: an unclassifiable symbol silently routed to the stock
+    feed gets no data (issue #122).
+    """
+    return classify_symbol(symbol) == "crypto"
+
+
+def _bar_key(symbol: str) -> str:
+    """Storage key for bars: crypto pairs share one canonical form (``BTC/USD``)."""
+    normalized = _normalize_symbol(symbol)
+    try:
+        if classify_symbol(normalized) == "crypto":
+            return canonical_crypto_symbol(normalized)
+    except UnclassifiableSymbolError:
+        pass
+    return normalized
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -238,7 +256,22 @@ class LiveMarketDataStreamService:
                 symbol = _normalize_symbol(raw_symbol)
                 if not symbol:
                     continue
-                stream_kind = "crypto" if _is_crypto_symbol(symbol) else "stock"
+                try:
+                    stream_kind = classify_symbol(symbol)
+                except UnclassifiableSymbolError as exc:
+                    logger.error(
+                        "Refusing to subscribe unclassifiable symbol to market data",
+                        extra={
+                            "data": {
+                                "deployment_id": str(deployment.id),
+                                "symbol": symbol,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
+                if stream_kind == "crypto":
+                    symbol = canonical_crypto_symbol(symbol)
                 target_symbols[(key, stream_kind)].add(symbol)
 
         # B2: decide under the lock, do network I/O outside it — stop/start/
@@ -298,7 +331,7 @@ class LiveMarketDataStreamService:
         normalized = _normalize_symbol(symbol)
         if not normalized:
             return {"symbol": "", "latest": None, "bars": []}
-        bars = await asyncio.to_thread(self._bars_for_symbol, normalized)
+        bars = await asyncio.to_thread(self._bars_for_symbol, _bar_key(normalized))
         latest = bars[-1] if bars else None
         return {"symbol": normalized, "latest": latest, "bars": bars}
 
@@ -315,7 +348,7 @@ class LiveMarketDataStreamService:
     def _ingest_manual_bars_sync(self, bars: list[dict[str, Any]]) -> None:
         with self._lock:
             for bar in bars:
-                symbol = _normalize_symbol(str(bar.get("symbol") or ""))
+                symbol = _bar_key(str(bar.get("symbol") or ""))
                 if not symbol:
                     continue
                 queue = self._bars[symbol]
@@ -323,7 +356,7 @@ class LiveMarketDataStreamService:
 
     async def _on_bar(self, bar: Any) -> None:
         payload = _serialize_bar_payload(bar)
-        symbol = payload["symbol"]
+        symbol = _bar_key(payload["symbol"])
         if not symbol:
             return
         await asyncio.to_thread(self._append_bar_sync, symbol, payload)
