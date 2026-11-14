@@ -62,18 +62,20 @@ test("bounds are computed from measured values only, never a phantom zero", asyn
   assert.deepEqual(boundsFromValues([], fallback), fallback);
 });
 
-test("an unmeasured value never satisfies a numeric range", async () => {
-  const { inNumericRange, passesNumericFilters, listMetricsFor } =
-    await import("../src/lib/backtestListMetrics.ts");
+test("an unmeasured value never satisfies a narrowed numeric range", async () => {
+  const { inNumericRange } = await import("../src/lib/backtestListMetrics.ts");
 
-  // Range that spans zero: a 0 fallback used to pass, a null must not.
+  // Range that spans zero: a null must not be treated as the 0 it spans.
   assert.equal(inNumericRange(null, { min: -2, max: 3 }), false);
   assert.equal(inNumericRange(0, { min: -2, max: 3 }), true);
-  // p-value: a null used to be coerced to 1 and could fail the filter for the
-  // wrong reason; it must now be excluded regardless of the range.
   assert.equal(inNumericRange(null, { min: 0, max: 1 }), false);
+});
 
-  const full = {
+test("default sliders hide nothing: rows with null metrics stay visible", async () => {
+  const { passesNumericFilters, listMetricsFor } =
+    await import("../src/lib/backtestListMetrics.ts");
+
+  const bounds = {
     totalReturn: { min: -1000, max: 1000 },
     sharpe: { min: -2, max: 3 },
     psr: { min: 0, max: 1 },
@@ -82,11 +84,39 @@ test("an unmeasured value never satisfies a numeric range", async () => {
     maxDrawdown: { min: 0, max: 1000 },
     winRate: { min: 0, max: 100 },
   };
-  assert.equal(passesNumericFilters(listMetricsFor(item()), full), true);
-  assert.equal(
-    passesNumericFilters(listMetricsFor(item({ sharpe_ratio: null })), full),
-    false,
+  // filters === bounds is the default state after load.
+  const unmeasured = listMetricsFor(
+    item({ sharpe_ratio: null, psr: null, p_value: null, cagr: null, win_rate: null }),
   );
+  assert.equal(passesNumericFilters(unmeasured, bounds, bounds), true);
+  assert.equal(passesNumericFilters(listMetricsFor(item()), bounds, bounds), true);
+});
+
+test("a narrowed range excludes null rows and never treats them as 0", async () => {
+  const { passesNumericFilters, listMetricsFor } =
+    await import("../src/lib/backtestListMetrics.ts");
+
+  const bounds = {
+    totalReturn: { min: -1000, max: 1000 },
+    sharpe: { min: -2, max: 3 },
+    psr: { min: 0, max: 1 },
+    pValue: { min: 0, max: 1 },
+    cagr: { min: -1000, max: 1000 },
+    maxDrawdown: { min: 0, max: 1000 },
+    winRate: { min: 0, max: 100 },
+  };
+  // Sharpe narrowed to a band that contains 0: a null sharpe must still fail.
+  const narrowed = { ...bounds, sharpe: { min: -0.5, max: 0.5 } };
+  const nullSharpe = listMetricsFor(item({ sharpe_ratio: null }));
+  assert.equal(passesNumericFilters(nullSharpe, narrowed, bounds), false);
+  // A measured zero inside the narrowed band still passes.
+  assert.equal(
+    passesNumericFilters(listMetricsFor(item({ sharpe_ratio: 0 })), narrowed, bounds),
+    true,
+  );
+  // Narrowing sharpe does not hide null rows on OTHER metrics that stay at default.
+  const nullCagrOnly = listMetricsFor(item({ sharpe_ratio: 0.2, cagr: null }));
+  assert.equal(passesNumericFilters(nullCagrOnly, narrowed, bounds), true);
 });
 
 test("sorting keeps unmeasured values last in both directions", async () => {
