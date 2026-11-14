@@ -1,6 +1,7 @@
 # Parity of the backtest engine on publicly documented strategies
 
-Branch `test/parity-web-strategies` (base `integration/backtest-fixes-v2`). Engine under test:
+Branch `test/parity-web-strategies` (base `integration/backtest-fixes-v3`; the v2 base was
+`integration/backtest-fixes-v2`). Engine under test:
 `NativeAdapter` / `TradeEngine`. Reference: plain-Python event loops in `tests/parity/`
 (`reference_turtle.py`, `reference_orb.py`, `reference_vola.py` for the signals,
 `reference_execution.py` for fills, intrabar stops, sizing and the mark-to-market equity curve). The
@@ -34,6 +35,16 @@ last-bar signal closes at the end-of-data close and is flagged
 `signal_exit_deferred_to_end_of_data`). The independent reference was updated to these rules
 and to the per-bar mark-to-market curve; it still imports nothing from the platform.
 
+`volatility_breakout` is at v1.2.0 (PR #211, base `integration/backtest-fixes-v3`): its force
+close is raised on the first bar whose END reaches 14:00 NY (one bar early, so the next-open fill
+lands at 14:00), its session-close flatten on the second-to-last in-session bar (fill at the last
+in-session bar's open), no entries from that bar on, and market exits carry no `exit_price`. The
+reference (`reference_vola.py`) re-implements that rule from the strategy's documented spec with its
+own bar-spacing code (most frequent positive bar gap); it does not import `shared/bar_timing.py`.
+With the previous (v1.1.0-timing) reference, 9 volatility_breakout parity tests (synthetic seeds 1-8
+and USA500) failed on the v3 strategy; after the update all 10 volatility_breakout tests pass with
+exact parity.
+
 Result: `pytest tests/parity` **all 47 tests pass, zero differences** (before the update on the
 v2 base with the old reference: 30 failed / 5 passed / 8 xfailed; before that on the old base:
 34 passed / 8 strict xfail, 42 with #190 in a scratch checkout). The 8 strict xfails are gone
@@ -44,7 +55,7 @@ v2 base with the old reference: 30 failed / 5 passed / 8 xfailed; before that on
 | Turtle S1, SPY daily, 2 % risk, pyramiding | 355 | 355 | 0 | 49,215.24 | 52,508.22 |
 | Turtle S1, GLD daily | 318 | 318 | 0 | 78,117.72 | 103,326.02 |
 | ORB, USA500 5 min | 24 | 24 | 0 | 91,484.50 | 98,078.65 |
-| volatility_breakout, USA500 5 min | 141 | 141 | 0 | 102,244.73 | 102,067.12 |
+| volatility_breakout v1.2.0, USA500 5 min | 125 | 125 | 0 | 104,329.46 | 102,067.12 (v1.1.0 timing, see below) |
 | Turtle single-unit synthetic, 12 seeds x 420 bars | match | match | 0 | | |
 | Turtle pyramiding synthetic, 6 seeds | match | match | 0 | | |
 | ORB / volatility_breakout synthetic sessions, 8 seeds each | match | match | 0 | | |
@@ -56,13 +67,13 @@ Event classes exercised and compared (counts from the reference):
 | Event | SPY | GLD | ORB | VolaBO | Synthetic (asserted minimum) |
 |---|---|---|---|---|---|
 | Stop-loss exits (intrabar or gap) | 152 | 142 | 19 | 4 | >= 20 (Turtle) |
-| Signal exits at the next open (10-day channel / session close) | 200 | 175 | 5 | 137 | >= 20 |
+| Signal exits at the next open (10-day channel / session close) | 200 | 175 | 5 | 121 | >= 20 |
 | Stop fill when the bar OPENED beyond the stop (filled at the open, rule A) | 32 | 50 | 3 | 0 | >= 3 Turtle, >= 1 ORB |
 | Entry bar stopped on its own fill bar (same-bar entry+stop) | 4 | 4 | 0 | 0 | >= 3 |
 | Entry skipped, stop on the wrong side of the fill | 0 | 1 | 0 | 0 | >= 1 |
 | Unit sized to zero by the 5 % aggregate open-risk ceiling | 45 | 49 | 0 | 0 | >= 1 |
 | Four concurrent units | yes | yes | n/a | n/a | yes |
-| Shorts | 137 | 136 | 13 | 42 | >= 10 |
+| Shorts | 137 | 136 | 13 | 38 | >= 10 |
 | Leverage ceiling (4x) binding on entries (ORB) | | | >= 10 | | |
 
 ## Engine findings
@@ -86,7 +97,11 @@ from the same reference with each rule switched on separately (initial capital 1
 | Turtle SPY | 52,508.22 | 47,089.57 (-5,418.65) | 54,875.49 (+2,367.27) | 49,215.24 (-3,292.98) |
 | Turtle GLD | 103,326.02 | 89,995.97 (-13,330.05) | 89,684.37 (-13,641.65) | 78,117.72 (-25,208.30) |
 | ORB USA500 | 98,078.65 | 97,878.35 (-200.30) | 91,671.72 (-6,406.93) | 91,484.50 (-6,594.15) |
-| volatility_breakout | 102,067.12 | 102,067.12 (0, no gap exits) | 102,244.73 (+177.61) | 102,244.73 (+177.61) |
+| volatility_breakout (v1.1.0 timing, historical) | 102,067.12 | 102,067.12 (0, no gap exits) | 102,244.73 (+177.61) | 102,244.73 (+177.61) |
+
+volatility_breakout v1.2.0 (current; clock exits one bar earlier, no session-close entries): final
+realized 104,329.46 (+4,329.46 on 100,000), 125 trades, 121 signal exits at the next open, 4 stop
+losses, 0 gap-through stops. Its historical columns above are v1.1.0 numbers and were not re-measured.
 
 (Compounding makes the effects non-additive; the PnL of the gap-stop trades themselves under the
 current rules is -38,358 over 32 SPY, -99,083 over 50 GLD and -2,397 over 3 ORB trades.) The ORB
