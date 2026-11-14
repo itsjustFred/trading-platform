@@ -287,7 +287,8 @@ def test_smoke_sl_tp_are_on_the_correct_side_and_pass_the_adapter_conversion(act
         assert take_profit < price < stop_loss
 
     signal = SimpleNamespace(symbol="EURUSD", action=action, theoretical_price=price)
-    stub = SimpleNamespace(_scale_for=lambda _symbol: None)
+    eurusd_scale = SimpleNamespace(price_digits=5)  # the adapter snaps to the symbol's grid
+    stub = SimpleNamespace(_scale_for=lambda _symbol: eurusd_scale)
     relative_stop, relative_take = CTraderLiveAdapter._resolve_relative_sl_tp(
         stub, signal, stop_loss, take_profit
     )
