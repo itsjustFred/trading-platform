@@ -5,7 +5,7 @@ name: Agent Mutation Testing
 run-name: "Agent Mutation Testing PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
 
 # Stage 3 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> Agent Pre-Mortem -> CodeRabbit
+#   SonarCloud -> Agent Code Review -> Agent Mutation Testing (this) -> Agent Pre-Mortem -> Cubic
 #
 # Mutation-tests the production Python a PR changes, using the
 # `.agents/skills/actions-mutation-testing` skill as the system prompt of an
@@ -72,6 +72,7 @@ env:
   SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
   MUTATION_CONTEXT: agent/mutation-testing
   PREMORTEM_CONTEXT: agent/pre-mortem
+  CUBIC_CONTEXT: agent/cubic-review
 
 jobs:
   # Resolves the PR for both triggers and writes its metadata (title and body
@@ -110,7 +111,7 @@ jobs:
             echo "current=false" >> "$GITHUB_OUTPUT"
             # Close what the push marked on the superseded commit, so its stage
             # status ends terminal instead of pending (only if still pending).
-            for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+            for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
               state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
                 --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
               if [ "$state" = "pending" ]; then
@@ -171,7 +172,7 @@ jobs:
             echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
             exit 0
           fi
-          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -442,6 +443,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Not run: ${MUTATION_CONTEXT} failed" > /dev/null
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=error -f context="$CUBIC_CONTEXT" \
+            -f description="Not run: ${MUTATION_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.mutate.result == 'success'
@@ -490,13 +494,16 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
                 -f state=error -f context="$PREMORTEM_CONTEXT" \
                 -f description="Not run: dispatch of pre-mortem failed" > /dev/null
-              echo "::error::Failed to dispatch agent-pre-mortem.yml; set ${PREMORTEM_CONTEXT} to error."
+              echo "::error::Failed to dispatch agent-pre-mortem.yml; set ${PREMORTEM_CONTEXT} and ${CUBIC_CONTEXT} to error."
               exit 1
             fi
             echo "Dispatched pre-mortem for ${HEAD_SHA}."
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Not run: ${MUTATION_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$CUBIC_CONTEXT" \
               -f description="Not run: ${MUTATION_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
           fi
 
@@ -509,7 +516,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -540,7 +547,7 @@ jobs:
       - name: Report cancelled mutation testing run
         run: |
           set -euo pipefail
-          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT"; do
+          for ctx in "$MUTATION_CONTEXT" "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
             if [ "$state" = "pending" ]; then
