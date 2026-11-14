@@ -19,8 +19,12 @@ XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Ru
 Reproduktion der Referenz-Seite:
 
 ```bash
-.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --out /tmp/audit_ref
+.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --out data/intraday_volatility_breakout_audit
 ```
+
+Vom Repo-Root aufrufen. `--out` muss innerhalb des Arbeitsverzeichnisses oder
+des Audit-Ordners liegen (Guard in `_resolve_output_dir`, absichtlich nicht
+aufgeweicht); `data/` ist git-ignoriert.
 
 (Skript failt laut bei jeder Inkonsistenz: Deal-Sequenz, Volumen-Paarung,
 Final-Balance-Delta, XLSX↔Log-Keys.)
