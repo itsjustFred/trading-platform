@@ -8593,7 +8593,7 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
+@app.get("/api/strategies/{name:path}")
 async def get_strategy(name: str) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
     if entry is None:
@@ -13551,7 +13551,7 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
     return await asyncio.to_thread(_data_category_payload, category_name)
 
 
-@app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
+@app.post("/api/data/cache/invalidate")
 async def invalidate_data_cache(
     reason: str = Query(default="manual"),
     include_validation: bool | None = Query(default=None),
