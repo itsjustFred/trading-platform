@@ -406,13 +406,17 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     qty_value = coerce_positive_live_qty(qty)
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
-    volume = int(round(qty_value * float(volume_per_qty)))
+    # Floor, never round: rounding to nearest can size up by half a volume unit
+    # and put the loss at the stop above the risk budget. The relative nudge
+    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
+    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
     if volume <= 0:
         raise ValueError(
-            "Signal has no positive quantity ('qty'); "
-            "refusing to submit an order with a default size."
+            f"qty {qty_value!r} is below one broker volume unit at "
+            f"{float(volume_per_qty)!r} units per qty; refusing to round it up "
+            "past the risk budget."
         )
-    return volume
+    return int(volume)
 
 
 def _floor_to_volume_step(volume: int, step_volume: int) -> int:
