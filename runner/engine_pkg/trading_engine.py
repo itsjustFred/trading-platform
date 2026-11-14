@@ -30,6 +30,7 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
+from runner.engines import contract
 from runner.engines.contract import (
     SIGNAL_EXIT_FILL_NEXT_OPEN,
     flag_missing_intrabar,
@@ -86,8 +87,11 @@ class TradeEngine:
         # bar) and before pending entry orders fill (so a reversal's exit leg
         # closes the OLD position, never the position the same open creates).
         self._pending_signal_exit = False
+        # Fail loudly even if the config bypassed pydantic validation (#153).
         self._signal_exit_next_open = (
-            str(getattr(config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
+            contract.normalize_signal_exit_fill(
+                getattr(config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)
+            )
             == SIGNAL_EXIT_FILL_NEXT_OPEN
         )
         self._intrabar = self._prepare_intrabar(intrabar_data)
@@ -870,26 +874,20 @@ class TradeEngine:
 
         - the forced ``end_of_data`` close, always at the last bar's close
           under ``next_open`` (there is no next bar);
-        - the explicit legacy opt-ins ``signal_exit_fill="close"`` (the signal
-          bar's close) and ``"open"`` (the signal bar's open - MT5 clock exits
-          whose signal bar IS the exit minute; closing a SHORT buys the ask,
-          open + spread, verified tick-for-tick on MT5 22:55 time exits).
+        - the explicit legacy opt-in ``signal_exit_fill="close"`` (the signal
+          bar's close). The former ``"open"`` mode was removed (issue #153).
         """
         if not self.positions:
             return
 
-        mode = str(getattr(self.config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
-        fill_at_open = mode == "open"
-        spread = self._bar_spread(row) if fill_at_open else 0.0
-        base_exit = float(row["open"]) if fill_at_open else float(row["close"])
+        base_exit = float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
 
         for position in self.positions:
-            exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
             self._close_partial(
                 position,
-                price=exit_price,
+                price=base_exit,
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,

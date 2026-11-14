@@ -414,7 +414,9 @@ def _process_symbol(
     trade_counter = 0
     inverted_stop_drops = 0
     next_open_exits = (
-        str(getattr(config, "signal_exit_fill", contract.SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
+        contract.normalize_signal_exit_fill(
+            getattr(config, "signal_exit_fill", contract.SIGNAL_EXIT_FILL_NEXT_OPEN)
+        )
         == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
     )
 
@@ -1160,11 +1162,13 @@ def _prepare_next_open_execution_data(
       the exit leg (exits + exit-when series: exit_price, exit_reason, exit_*,
       exit_meta_*) shifts by one bar too, so the exit fires on - and fills at
       the open of - the bar after the signal, exactly like entries. The legacy
-      opt-ins ``"close"`` / ``"open"`` keep the exit leg UNSHIFTED (fills on the
-      signal bar itself).
+      opt-in ``"close"`` keeps the exit leg UNSHIFTED (fills on the signal bar
+      itself); ``"open"`` was removed (issue #153) and raises.
     """
     shift_exit_leg = (
-        str(signal_exit_fill or contract.SIGNAL_EXIT_FILL_NEXT_OPEN).lower()
+        contract.normalize_signal_exit_fill(
+            signal_exit_fill or contract.SIGNAL_EXIT_FILL_NEXT_OPEN
+        )
         == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
     )
     roles = dict(explicit_roles or {})
@@ -1433,8 +1437,8 @@ def _resolve_exit_price(
     # Owner decision 2026-11-13: signal exits fill at the next bar's open. The
     # exit leg is shifted onto the execution bar (see
     # _prepare_next_open_execution_data), so "next_open" prices that bar's open;
-    # the legacy opt-ins keep the exit on the signal bar ("close": its close,
-    # "open": its open, mirroring native _close_position). Stop/TP legs resolve
+    # the legacy opt-in keeps the exit on the signal bar ("close": its close,
+    # mirroring native _close_position; the lookahead-prone "open" was removed, #153). Stop/TP legs resolve
     # via the intrabar walk (level, or the open on a gap). An explicit strategy
     # exit_price level always wins.
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
@@ -1445,7 +1449,10 @@ def _resolve_exit_price(
             return float(exit_price)
     # next_open: the exit leg was shifted onto the execution bar, so the exit
     # fills at THAT bar's open - the same arithmetic as the legacy "open" mode.
-    fill_at_open = str(signal_exit_fill or "next_open").lower() in {"open", "next_open"}
+    fill_at_open = (
+        contract.normalize_signal_exit_fill(signal_exit_fill or "next_open")
+        == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
+    )
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)

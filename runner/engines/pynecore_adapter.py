@@ -120,8 +120,8 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "next_open" (default) and "open" fill at the
-      exit bar's open, "close" (legacy opt-in) at its close; SHORT open-exits
+      follow ``signal_exit_fill``: "next_open" (default) fills at the
+      exit bar's open ("open" was removed, issue #153), "close" (legacy opt-in) at its close; SHORT open-exits
       pay the spread (ask). Level exits keep the engine price (the level, or the
       bar's open when it gapped through the level - see
       :func:`_normalize_trade_exits`).
@@ -141,9 +141,12 @@ def _apply_fill_parity(
     # convention (owner decision 2026-11-13) prices the leg's own bar at its
     # open - the same arithmetic as the legacy ``open`` opt-in. Only the legacy
     # ``close`` opt-in re-prices to the leg bar's close.
-    fill_at_open = str(
-        getattr(config, "signal_exit_fill", "next_open") or "next_open"
-    ).lower() in {"open", "next_open"}
+    fill_at_open = (
+        contract.normalize_signal_exit_fill(
+            getattr(config, "signal_exit_fill", "next_open") or "next_open"
+        )
+        == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
+    )
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)

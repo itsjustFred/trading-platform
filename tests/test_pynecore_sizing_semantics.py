@@ -455,16 +455,23 @@ class TestFillParity:
         )
         assert trades[0].exits[-1].price == pytest.approx(101.2)
 
-    def test_signal_exit_open_fill(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
-        trades = [_trade(exit_reason="signal")]
-        _apply_fill_parity(
-            trades, _frame(), config, {"spread_price_col": "spread_price"}
-        )
-        assert trades[0].exits[-1].price == pytest.approx(101.0)
+    def test_signal_exit_open_is_rejected(self, tmp_path):
+        # Issue #153: "open" is removed; the adapter fails loudly even when the
+        # config bypassed pydantic validation.
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            _config(tmp_path, signal_exit_fill="open")
+        config = _config(tmp_path)
+        object.__setattr__(config, "signal_exit_fill", "open")
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            _apply_fill_parity(
+                [_trade(exit_reason="signal")],
+                _frame(),
+                config,
+                {"spread_price_col": "spread_price"},
+            )
 
     def test_short_open_exit_pays_spread(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
+        config = _config(tmp_path)
         trades = [_trade(direction="SHORT", exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
@@ -472,7 +479,7 @@ class TestFillParity:
         assert trades[0].exits[-1].price == pytest.approx(101.0 + 0.2)
 
     def test_stop_level_exit_untouched(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
+        config = _config(tmp_path, signal_exit_fill="close")
         trades = [_trade(exit_price=99.0, exit_reason="stop_loss")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}

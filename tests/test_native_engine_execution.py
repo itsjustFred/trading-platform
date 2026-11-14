@@ -162,26 +162,36 @@ def test_market_long_pays_spread_short_hits_bid():
     assert trade.entry_price == 101.0 + 0.2
 
 
-def test_signal_exit_fill_open_uses_bar_open():
-    from runner.engine import TradeEngine as _TE
-
-    engine = _TE(
-        BacktestConfig(risk_per_trade_pct=0.01,
-            strategy_name="test",
-            symbols=["T"],
-            timeframe="1m",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            initial_capital=100_000.0,
-            signal_exit_fill="open",
-            parameters={"fees": "zero"},
-        ),
-        symbol="T",
+def _open_config_kwargs(**extra):
+    kwargs = dict(
+        parameters={"fees": "zero"},
+        risk_per_trade_pct=0.01,
+        strategy_name="test",
+        symbols=["T"],
+        timeframe="1m",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        initial_capital=100_000.0,
     )
-    result = engine.run(_spread_frame(), _spread_strategy)
-    assert len(result.trades) == 1
-    # Signal exit on bar 2 fills at bar 2 open (not close 102.2).
-    assert result.trades[0].exits[0].price == 102.0
+    kwargs.update(extra)
+    return kwargs
+
+
+def test_signal_exit_fill_open_is_rejected_with_migration_message():
+    # Issue #153: "open" filled a signal exit at the OPEN of the bar the exit was
+    # computed from (lookahead). It is removed and must fail loudly.
+    for spelling in ("open", "OPEN ", "Open"):
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            BacktestConfig(**_open_config_kwargs(signal_exit_fill=spelling))
+
+
+def test_native_engine_rejects_open_even_if_config_bypassed_validation():
+    config = BacktestConfig.model_construct(
+        **BacktestConfig(**_open_config_kwargs()).model_dump()
+    )
+    object.__setattr__(config, "signal_exit_fill", "open")
+    with pytest.raises(ValueError, match="removed.*next_open"):
+        TradeEngine(config, symbol="T")
 
 
 def test_signal_exit_fill_close_is_explicit_legacy_opt_in():
@@ -214,27 +224,37 @@ def _short_spread_strategy(df, params):
     return entries, exits, {"direction": direction}, []
 
 
-def test_signal_exit_fill_open_short_pays_spread():
-    # MT5 parity: closing a SHORT buys the ask (open + spread).
+def test_next_open_short_exit_pays_spread():
+    # Default next_open: the SHORT exit signalled on bar 2 fills at bar 3's open
+    # plus the spread (closing a SHORT buys the ask).
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [f"2024-01-01 00:0{i}" for i in range(5)], utc=True
+            ),
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [100.5, 101.5, 102.5, 103.5, 104.5],
+            "low": [99.5, 100.5, 101.5, 102.5, 103.5],
+            "close": [100.2, 101.2, 102.2, 103.2, 104.2],
+            "spread_price": [0.2] * 5,
+        }
+    )
+
+    def strategy(df, params):
+        entries = pd.Series([True, False, False, False, False], index=df.index)
+        exits = pd.Series([False, False, True, False, False], index=df.index)
+        direction = pd.Series(["SHORT"] + [None] * 4, index=df.index, dtype=object)
+        return entries, exits, {"direction": direction}, []
+
     engine = TradeEngine(
-        BacktestConfig(risk_per_trade_pct=0.01,
-            strategy_name="test",
-            symbols=["T"],
-            timeframe="1m",
-            start_date="2024-01-01",
-            end_date="2024-01-02",
-            initial_capital=100_000.0,
-            signal_exit_fill="open",
+        BacktestConfig(**_open_config_kwargs(
             parameters={"fees": "zero", "spread_price_col": "spread_price"},
-        ),
+        )),
         symbol="T",
     )
-    result = engine.run(_spread_frame(), _short_spread_strategy)
-    assert len(result.trades) == 1
-    trade = result.trades[0]
-    # SHORT entry hits the bid; signal exit fills at open + spread (ask).
+    (trade,) = engine.run(frame, strategy).trades
     assert trade.entry_price == 101.0
-    assert trade.exits[0].price == 102.0 + 0.2
+    assert trade.exits[0].price == pytest.approx(103.0 + 0.2)
 
 
 def test_warmup_bars_feed_indicators_but_create_no_trades():

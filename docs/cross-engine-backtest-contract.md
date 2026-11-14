@@ -105,9 +105,15 @@ conformance tests).
 A-M1/D4 "Fill-zum-Trigger-Close").** A signal exit (not a protective level
 exit) fills at the **next bar's open**, exactly like an entry: a signal on bar
 *N* exits at bar *N+1*'s open. `BacktestConfig.signal_exit_fill` is validated to
-`next_open` (default) / `close` / `open`; the last two are explicit legacy
-opt-ins that fill on the *signal bar itself* (its close / its open — `open`
-serves MT5 clock exits whose signal bar *is* the exit minute). The convention is
+`next_open` (default) / `close`; `close` is an explicit legacy opt-in that fills
+on the *signal bar itself* (its close). The former `open` mode (fill at the
+signal bar's own open) was **removed** (issue #153): an exit computed from bar
+*N* cannot be filled at bar *N*'s open without lookahead, and its only
+legitimate use (MT5 clock exits) is served by raising the signal one bar early
+under `next_open` (e.g. `intraday_volatility_breakout` 1.2.0). Every engine
+(`BacktestConfig` validation, native, vectorbt, pynecore) rejects `open` with a
+`ValueError` carrying that migration message (`contract.normalize_signal_exit_fill`).
+The convention is
 implemented once per engine:
 
 - native: the exit signal is parked and executed at the next bar's open inside
@@ -333,7 +339,7 @@ level-violating exit leg to the recorded protective level:
 Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
 sizing: non-level exit legs (signal/time exits) are re-priced to the fill
 convention the other engines use — the configured `signal_exit_fill`
-(default `next_open`, equal to `open` for the Pine ledger whose legs are
+(default `next_open`; the Pine ledger's legs are
 stamped on the fill bar: that bar's open; legacy `close`: that bar's close) —
 when the recorded Pine price disagrees with that convention. Level exits
 (`stop_loss`/`take_profit`) keep their recorded price. This re-pricing is a
