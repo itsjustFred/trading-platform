@@ -26,6 +26,8 @@ Die Quelle kombiniert mehrere Exit-Mechaniken:
 - optionale Partial Exits
 - Exit bei Gegen-Flip des Supertrends
 
+**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Gegen-Flip) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Stop-Loss und fester RRR-Take-Profit bleiben explizite Level (`exit_price`).
+
 ### Stop-Loss
 Im Original nicht rein statisch, sondern struktur- bzw. bandbasiert:
 

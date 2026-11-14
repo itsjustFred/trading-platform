@@ -15,6 +15,8 @@ Der Score summiert exakt wie `CalculateMomentumScore` in der Quelle: EMA(12/26)-
 Standard (Quellverhalten): Vollausstieg, sobald der Score nicht mehr positiv ist (`score_reversal`, d. h. `Momentum_Score <= 0` — entspricht dem kontinuierlichen Rebalancing der Quelle in Richtung Target-Weight).
 Opt-in (default OFF, keine Quelllogik): `use_atr_stop=true` fuer Stop-Loss-Hit auf dem ATR-Schutzstop.
 
+**Fill-Konvention (Version 1.2.0):** Marktausstiege auf Close-Basis (Score-Reversal-Exit) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Der ATR-Stop bleibt ein explizites Level (`exit_price`).
+
 ### Stop-Loss
 Kein Stop-Loss im Standard (die Quelle nutzt keinen ATR-Stop).
 Opt-in via `use_atr_stop=true`: `sl_price = entry_close - ATR_Wilder(14) * 2.0`.
