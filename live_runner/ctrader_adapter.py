@@ -755,6 +755,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_assets: dict[str, tuple[int, int]] = {}
         self._deposit_asset_id: int | None = None
         self._asset_names: dict[int, str] = {}
+        self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
         self._position_ids_by_symbol: dict[str, tuple[int, ...]] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
@@ -1456,6 +1457,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "submit an order with a default size."
             ) from exc
         sized_units = metadata.get("pip_value_units_per_qty")
+        if sized_units is None and metadata.get("pip_value_source") == "caller":
+            # An explicit caller pip value carries no units-per-qty, so the
+            # submit-time scale check below cannot run; converting the sized
+            # qty with whatever scale is current could be a different
+            # position size (#146). Fail closed instead of skipping the check.
+            raise ValueError(
+                f"cTrader cannot verify the volume scale for {signal.symbol}: the "
+                "caller-supplied pip value carries no pip_value_units_per_qty; "
+                "refusing to submit a qty whose sizing scale is unknown."
+            )
         if sized_units is not None:
             # #146: the daemon sized this qty with a pip value derived from the
             # symbol scale at sizing time. If the scale changed since (e.g. a
@@ -2134,6 +2145,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_assets.clear()
         self._deposit_asset_id = None
         self._asset_names.clear()
+        if self._asset_names_task is not None:
+            self._asset_names_task.cancel()
+            self._asset_names_task = None
         self._order_id_to_symbol.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
@@ -2681,7 +2695,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         quote_asset_id = assets[1]
         deposit_asset_id = await self._account_deposit_asset_id()
-        names = await self._asset_name_map()
+        # Names are labels only: use what is cached and refresh in the
+        # background, so a slow asset list never delays entry sizing.
+        names = self._asset_names
+        self._schedule_asset_name_refresh()
         units_per_qty = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
         if not math.isfinite(units_per_qty) or units_per_qty <= 0:
             raise ValueError(f"cTrader symbol {upper!r} has no positive volume scale")
@@ -2719,6 +2736,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise ValueError("cTrader trader has no deposit asset id; account currency unknown")
         self._deposit_asset_id = deposit
         return deposit
+
+    def _schedule_asset_name_refresh(self) -> None:
+        """Start one background asset-name fetch when no names are cached."""
+        task = self._asset_names_task
+        if self._asset_names or (task is not None and not task.done()):
+            return
+        self._asset_names_task = asyncio.get_running_loop().create_task(self._asset_name_map())
 
     async def _asset_name_map(self) -> dict[int, str]:
         """Asset id -> name (e.g. 15 -> "USD"), best-effort, for logs only.
