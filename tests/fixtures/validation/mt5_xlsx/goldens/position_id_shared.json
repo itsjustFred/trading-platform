@@ -1,0 +1,120 @@
+{
+  "strategy_name": "Synthetic Position Id Fixture",
+  "source_framework": "mt5_xlsx",
+  "symbol": "EURUSD",
+  "timeframe": "h4",
+  "trades": [
+    {
+      "id": 1,
+      "symbol": "EURUSD",
+      "direction": "LONG",
+      "entry_time": "2024-02-01T09:00:00Z",
+      "entry_price": 1.1,
+      "quantity": 0.15,
+      "pnl": 55.0,
+      "fees": -1.5,
+      "stop_loss": null,
+      "take_profit": null,
+      "exit_reason": "take_profit",
+      "tags": [
+        "Entry A"
+      ],
+      "position_id": "1001",
+      "exits": [
+        {
+          "time": "2024-02-01T12:00:00Z",
+          "price": 1.104,
+          "quantity": 0.1,
+          "pnl": 40.0,
+          "reason": "take_profit"
+        },
+        {
+          "time": "2024-02-01T13:00:00Z",
+          "price": 1.103,
+          "quantity": 0.05,
+          "pnl": 15.0,
+          "reason": "take_profit"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "symbol": "EURUSD",
+      "direction": "SHORT",
+      "entry_time": "2024-02-01T14:00:00Z",
+      "entry_price": 1.11,
+      "quantity": 0.2,
+      "pnl": 40.0,
+      "fees": -2.0,
+      "stop_loss": null,
+      "take_profit": null,
+      "exit_reason": "take_profit",
+      "tags": [
+        "Short"
+      ],
+      "position_id": "1002",
+      "exits": [
+        {
+          "time": "2024-02-01T16:00:00Z",
+          "price": 1.108,
+          "quantity": 0.2,
+          "pnl": 40.0,
+          "reason": "take_profit"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "symbol": "EURUSD",
+      "direction": "LONG",
+      "entry_time": "2024-02-01T18:30:00Z",
+      "entry_price": 1.107,
+      "quantity": 0.05,
+      "pnl": 5.0,
+      "fees": -0.5,
+      "stop_loss": null,
+      "take_profit": null,
+      "exit_reason": "take_profit",
+      "tags": [
+        "Overlap Long"
+      ],
+      "position_id": "1004",
+      "exits": [
+        {
+          "time": "2024-02-01T19:00:00Z",
+          "price": 1.108,
+          "quantity": 0.05,
+          "pnl": 5.0,
+          "reason": "take_profit"
+        }
+      ]
+    }
+  ],
+  "stats": {
+    "total_trades": 3,
+    "winners": 3,
+    "losers": 0,
+    "win_rate": 100.0,
+    "total_pnl": 99.3,
+    "total_deals": 10,
+    "total_return": 0.00993
+  },
+  "position_fills": {
+    "closed_position_count": 3,
+    "partial_position_count": 1,
+    "open_position_count": 1,
+    "open_only_count": 0,
+    "orphan_exit_count": 0,
+    "closed_position_ids": [
+      "1001",
+      "1002",
+      "1004"
+    ],
+    "partial_position_ids": [
+      "1003"
+    ],
+    "open_only_position_ids": [],
+    "residual_position_count": 1,
+    "residual_exit_count": 0
+  }
+}
