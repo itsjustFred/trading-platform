@@ -2,7 +2,7 @@
 
 ## Quelle
 - Original: MQL5 (MetaTrader 5), `strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5`
-- Version: 1.00
+- Version: 1.2.0 (1.2.0: Time-Exit-Signal eine Bar vor dem Exit-Open für `signal_exit_fill="next_open"`; Stale-Exit am ersten Bar des Tages statt Last-Bar-Look-ahead)
 - Konvertiert: 2026-06-24
 
 ## Ziel
@@ -119,7 +119,7 @@ Hinweis: Die EA-Logik berechnet ATR und Regime-Filter immer auf `PERIOD_D1`, una
 | `iClose(_Symbol, Confirmation_Timeframe, 1)` | `df["close"].shift(1)` auf dem Resampled Confirmation-DataFrame; oder direkt `df["close"]` wenn Haupt-TF = Confirmation-TF. | In vektorbasiertem Backtest: Signal triggert am Close der vorherigen Bar. |
 | `Use_Candle_Close` | Bestätigungs-Logik als separate boolesche Serie: `signal_price = confirmation_df["close"].shift(1)` | Nur ein Signal pro neuer Confirmation-Bar erlauben. |
 | `IsInEntryWindow()` | `(df.index.hour * 60 + df.index.minute >= entry_mins) & (df.index.hour * 60 + df.index.minute < max_entry_mins)` | Tägliche Maske. |
-| `ShouldClosePosition()` / `Exit_Time` | `(df.index.hour * 60 + df.index.minute >= exit_mins)` als Exit-Signal. | Verwende `pd.Series(False, index=df.index)` als Basis-Exit und setze Exit-Bar auf True. |
+| `ShouldClosePosition()` / `Exit_Time` | Exit-Signal auf der **ersten Bar, deren Ende `exit_time` erreicht** (Bar-Start + Bar-Länge ≥ `exit_time`), danach auf jeder weiteren Bar. | MT5 schließt am ersten Tick ≥ `Exit_Time` = Open der ersten Bar ab `Exit_Time`. Die Engines füllen Signal-Exits am **nächsten** Bar-Open (`signal_exit_fill="next_open"`, Default) — das Signal muss also eine Bar früher kommen: M1 22:54 → Fill 22:55-Open; M15 22:45 / H1 22:00 → Fill 23:00-Open (erster Open ≥ 22:55; die EA-Exit-Minute liegt dort innerhalb der Bar). Die Bar-Länge ist der häufigste Bar-Abstand des Frames; sonst nur Uhr-Zeitplan, kein Blick auf spätere Bars. |
 | `PositionSelect(_Symbol)` | In vectorbt: Engine verwaltet Position; in `generate_signals` nur Entry/Exit-Booleans liefern. Maximal ein Trade pro Tag via `~entries.cumsum().groupby(df.index.date).diff().gt(0)` oder ähnlich sicherstellen. | `g_trade_taken`-Flag mappen auf „nur erster Entry-Signal pro Tag". |
 | `Reverse_Mode` | Vertausche Long/Short-Bedingungen: `entries_long = lower_hit, entries_short = upper_hit` statt umgekehrt. | Einfache boolean-Flip. |
 | `Trade_Direction` + `Reverse_Mode` | Richtungsfilter wird auf die finale Seite nach dem Reverse-Mapping angewandt (MT5 prüft `Trade_Direction` gegen die tatsächlich gehandelte Seite). | Vor dem Fix wurde vor dem Swap gefiltert — bei `long_only`+Reverse entstanden fälschlich SHORTs statt Fade-LONGs. |
@@ -141,7 +141,10 @@ Evidenz und Parität pro Symbol: `strategy-comparisons/intraday_volatility_break
 ## Bekannte Abweichungen
 - `ORDER_FILLING_FOK` wird nicht explizit simuliert; vectorbt nutzt Market-Order am Open der nächsten Bar.
 - `SYMBOL_LAST` (Tick-Preis) wird nicht verfügbar sein; bei `Use_Candle_Close=false` wird `df["close"]` als Proxy verwendet.
-- Der EA checkt in `OnTick` Positionen auf Vortags-Staleness und schließt diese sofort. In einem vektorbasierten Backtest endet der Tag implizit mit dem Exit-Signal.
+- Der EA checkt in `OnTick` Positionen auf Vortags-Staleness und schließt diese am ersten Tick des neuen Tages. Die Strategie meldet dafür ein Exit-Signal auf der **ersten Bar eines neuen Server-Tages** (nur vor dem Entry-Fenster, damit es nie mit einem Entry-Signal zusammenfällt; ohne offene Position wirkungslos). Seit 1.2.0 gibt es kein „letzte Bar des Tages"-Signal mehr (das war Look-ahead): bei vorzeitigem Sitzungsende (Datenlücke über `exit_time`) liegt der Exit deshalb eine Bar nach dem Tageswechsel statt am Tageswechsel selbst.
+- Fehlt die Bar vor `exit_time` (Datenlücke), kann das nicht vorausgesehen werden: das Signal kommt auf der ersten vorhandenen Bar ab dort, der Fill eine Bar nach MT5s erstem Tick.
+- Time-Exit auf M15/H1-Frames füllt am ersten Open ≥ `exit_time` (23:00), MT5 schließt bereits 22:55; für exakte MT5-Parität die Strategie auf M1-Bars ausführen (die Parity-Läufe tun das).
+- Seit 1.2.0 setzt der Time-Exit das Signal **eine Bar vor** den Exit-Open und ist für den Default `signal_exit_fill="next_open"` gebaut. Mit dem Legacy-Opt-in `signal_exit_fill="open"` läge der Exit jetzt eine Bar zu früh (M1: 22:54) — die Parity-Läufe nutzen den Default.
 - Der EA verwendet `SYMBOL_ASK` für Long-Entries und `SYMBOL_BID` für Short-Entries. In einer Bar-Engine wird typischerweise `close` als Einheits-Entry-Preis verwendet; eine Ask/Bid-Spread-Simulation ist optional.
 
 ## Backtest-Ergebnis (Referenz)

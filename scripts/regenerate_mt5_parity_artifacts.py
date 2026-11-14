@@ -413,7 +413,12 @@ def _build_trades(
             stop_distance_from_signal = abs(signal_close - float(signal_stop_loss))
             stop_loss = entry_price - stop_distance_from_signal if side == "LONG" else entry_price + stop_distance_from_signal
 
-        exit_index = int(exit_indices[exit_cursor])
+        # A signal exit fills at the open of the bar AFTER the signal bar, like the native
+        # engine's default (signal_exit_fill="next_open"). The strategy raises its MT5
+        # time-exit signal on the bar before the exit time, so that open IS MT5's first
+        # tick at/after Exit_Time. A signal on the last bar has no next bar: it keeps
+        # filling at that bar's own open.
+        exit_index = min(int(exit_indices[exit_cursor]) + 1, len(df) - 1)
         exit_reason = "signal"
         exit_price = _opposite_side_price(df.iloc[exit_index], side, "open")
 

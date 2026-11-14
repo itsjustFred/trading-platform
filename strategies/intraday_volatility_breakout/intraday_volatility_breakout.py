@@ -18,8 +18,10 @@ Logic:
 - Regime filter compares short-term ATR vs long-term ATR on daily basis.
 - Entry signals fire inside the entry window (entry_time … max_entry_time) when
   the signal price breaks a level.  Only one trade per day is allowed.
-- Exits are time-based at exit_time and additionally at the last bar of each day
-  (stale-position safeguard).
+- Exits are time-based at exit_time and additionally on the first bar of a new server
+  day (stale-position safeguard). The time-exit signal is raised on the first bar whose
+  end reaches exit_time so that the default next-bar-open exit fill lands on MT5's
+  first tick at/after exit_time (see "Exits" in generate_signals).
 - sl_price is emitted per entry bar as ATR-based distance from the entry close.
 """
 
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 STRATEGY_META = {
     "name": "intraday_volatility_breakout",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "engine": "native",
     "parameters": {
         "atr_period": 5,
@@ -205,6 +207,21 @@ def _daily_atr(true_range: pd.Series, period: int, smoothing: str) -> pd.Series:
     if smoothing == "wilder":
         return _wilder_atr(true_range, period)
     return _mt5_atr(true_range, period)
+
+
+def _bar_minutes(utc_times: pd.DatetimeIndex) -> float:
+    """Modal spacing of the bars in minutes (0.0 when it cannot be told).
+
+    The bar length is a property of the feed, so the most frequent positive step is
+    used; gaps (weekends, missing bars) are larger steps and do not win the vote.
+    """
+    valid = utc_times[~utc_times.isna()]
+    steps = np.diff(valid.to_numpy()).astype("timedelta64[s]").astype(np.int64)
+    steps = steps[steps > 0]
+    if steps.size == 0:
+        return 0.0
+    values, counts = np.unique(steps, return_counts=True)
+    return float(values[counts == counts.max()].min()) / 60.0
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -642,13 +659,29 @@ def generate_signals(df: pd.DataFrame, params: dict):
         sl_price = sl_price.shift(-1)
         entry_stop_distance = entry_stop_distance.shift(-1)
 
-    # --- Exits (time exit + EOD safety net) ----------------------------------
-    exit_time_mask = minute_of_day >= exit_minute
-    # Last bar of each day
-    idx_series = pd.Series(idx, index=idx)
-    is_last_bar = idx_series.groupby(day_str.values).transform("last") == idx_series
-    eod_exit_mask = is_last_bar
-    exits = exit_time_mask | eod_exit_mask
+    # --- Exits (time exit + stale-position safeguard) ------------------------
+    # MT5 closes at the FIRST TICK at/after Exit_Time, i.e. at the OPEN of the first bar
+    # that starts at/after exit_time. The engines fill a signal exit at the NEXT bar's
+    # open (``signal_exit_fill="next_open"``, the default), so the signal is raised on
+    # the first bar whose END reaches exit_time (bar start + bar length >= exit_time). On M1 that is the bar before
+    # exit_time (22:54 -> fills 22:55); on M15/H1 it is the bar containing exit_time
+    # (22:45 / 22:00 -> fills 23:00, the first open at/after 22:55). The bar length is
+    # the modal bar spacing of the frame (a property of the data feed, not of a
+    # particular bar); the rest is the known clock schedule, so a signal on bar t
+    # never depends on bars after t. A missing bar cannot be anticipated: if the bar
+    # before exit_time is absent the signal comes on the first bar that exists.
+    bar_minutes = _bar_minutes(_utc_bar_times())
+    exit_time_mask = (minute_of_day + bar_minutes) >= exit_minute
+    # MT5's stale-position rule closes a position from a previous day at the first tick
+    # of the new day. "Last bar of the day" is not knowable at that bar, so the signal
+    # is raised on the first bar of a new server day instead (only before the entry
+    # window, so it can never share a bar with an entry signal). It is a no-op when
+    # flat, and it only matters when the time exit could not fire (session closed
+    # before exit_time, data gap across it).
+    day_start = day != day.shift(1)
+    day_start.iloc[0] = False
+    stale_exit_mask = day_start & ((minute_of_day + max(bar_minutes, 1.0)) < entry_minute)
+    exits = exit_time_mask | stale_exit_mask
 
     # --- Signal/risk/execution contract metadata -------------------------------
     strategy_id = "intraday_volatility_breakout"
@@ -684,7 +717,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     exit_reason = pd.Series(index=idx, dtype=object)
     exit_reason.loc[exit_time_mask] = "time_exit"
-    exit_reason.loc[eod_exit_mask & ~exit_time_mask] = "end_of_day"
+    exit_reason.loc[stale_exit_mask & ~exit_time_mask] = "end_of_day"
 
     # --- Indicators ----------------------------------------------------------
     indicators_dict = {

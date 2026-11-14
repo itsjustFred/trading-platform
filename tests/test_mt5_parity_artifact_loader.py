@@ -371,3 +371,50 @@ def test_comparison_cases_run_on_the_broker_clock_without_utc_day_d1_files():
         assert resolve_broker_clock(case["broker_clock"]) is not None
         # UTC-day D1 files have other day boundaries than the broker's server-clock D1 bars.
         assert not case.get("use_native_daily_ohlcv")
+
+
+def _exit_fill_frame():
+    timestamps = pd.date_range("2024-01-02 22:50", periods=7, freq="1min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100.0, 100.0, 100.0, 100.0, 107.0, 108.0, 109.0],
+            "high": [100.5] * 7,
+            "low": [99.5] * 7,
+            "close": [100.0] * 7,
+        }
+    )
+
+
+def _exit_fill_trades(exit_bar: int):
+    frame = _exit_fill_frame()
+    entries = pd.Series([True] + [False] * 6, index=frame.index)
+    exits = pd.Series([i == exit_bar for i in range(7)], index=frame.index)
+    indicators = {
+        "fixed_risk_amount": 500.0,
+        "direction": pd.Series(["LONG"] + [None] * 6, index=frame.index),
+        "sl_price": pd.Series([np.nan] * 7, index=frame.index),
+        "stop_distance": pd.Series([5.0] + [np.nan] * 6, index=frame.index),
+    }
+    return _build_trades(
+        case={"symbol": "USA500.IDX", "execution_symbol": "US500", "execution_timeframe": "1m"},
+        df=frame,
+        entries=entries,
+        exits=exits,
+        indicators=indicators,
+        capital=100_000.0,
+        conversion=None,
+    )
+
+
+def test_build_trades_fills_a_signal_exit_at_the_next_bar_open():
+    # The strategy raises its MT5 time-exit signal on the bar BEFORE the exit time, so
+    # the fill is the open of the following bar (bar 4, open 107.0), not the signal bar's.
+    (trade,) = _exit_fill_trades(exit_bar=3)
+    assert trade.exits[0].price == 107.0
+    assert trade.exits[0].time.startswith("2024-01-02T22:54")
+
+
+def test_build_trades_keeps_a_last_bar_signal_exit_on_that_bar():
+    (trade,) = _exit_fill_trades(exit_bar=6)
+    assert trade.exits[0].price == 109.0
