@@ -132,9 +132,11 @@ class BacktestConfig(BaseModel):
     # ("next_open", default). A signal on the LAST bar has no next bar: the
     # position is closed by the end-of-data forced close at that bar's close and
     # the trade is flagged (meta["signal_exit_deferred_to_end_of_data"]).
-    # "close" / "open" remain explicit legacy opt-ins that fill on the SIGNAL
-    # bar itself (its close / its open); "open" serves MT5 clock exits whose
-    # signal bar IS the exit minute. Stop/take-profit fills are independent of
+    # "close" remains an explicit legacy opt-in that fills on the SIGNAL
+    # bar itself (its close); the former "open" mode was removed (issue #153)
+    # because an exit computed from bar N cannot fill at bar N's open without
+    # lookahead — MT5 clock exits raise their signal one bar early instead.
+    # Stop/take-profit fills are independent of
     # this switch: a level fills at the level, or at the bar's open when the
     # bar gaps through it.
     signal_exit_fill: str = "next_open"
@@ -213,13 +215,9 @@ class BacktestConfig(BaseModel):
         # bar engines — a typo ("clos", "OPEN ") silently fell through to
         # close-fill everywhere (every reader tests `== "open"`). Normalize
         # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
-        normalized = str(v or "").strip().lower()
-        if normalized not in {"next_open", "close", "open"}:
-            raise ValueError(
-                f"Invalid signal_exit_fill {v!r}, must be 'next_open', "
-                "'close' or 'open'"
-            )
-        return normalized
+        # Issue #153: the lookahead-prone "open" mode is removed; the shared
+        # gate raises a migration message for it.
+        return contract.normalize_signal_exit_fill(v)
 
     @field_validator("timeframe")
     @classmethod

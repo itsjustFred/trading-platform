@@ -114,12 +114,10 @@ class TestSpreadAwareFills:
 
     def test_market_short_hits_bid(self, parity_env):
         path = _write_strategy(parity_env, "s_short", _strategy_text("SHORT"))
-        result = VectorbtAdapter().run(
-            _config(parity_env, path, signal_exit_fill="open"), path
-        )
+        result = VectorbtAdapter().run(_config(parity_env, path), path)
         trade = result.trades[0]
         assert trade.entry_price == pytest.approx(101.0)
-        # SHORT signal exit fills at open + spread (ask).
+        # SHORT signal exit fills at the (next) bar open + spread (ask).
         assert trade.exits[0].price == pytest.approx(102.0 + 0.2)
 
 
@@ -129,12 +127,21 @@ class TestSignalExitFill:
         result = VectorbtAdapter().run(_config(parity_env, path), path)
         assert result.trades[0].exits[0].price == pytest.approx(102.2)
 
-    def test_signal_exit_fill_open_uses_bar_open(self, parity_env):
+    def test_signal_exit_fill_open_is_rejected(self, parity_env):
+        # Issue #153: the lookahead-prone "open" mode is removed.
         path = _write_strategy(parity_env, "s_o", _strategy_text("LONG"))
-        result = VectorbtAdapter().run(
-            _config(parity_env, path, signal_exit_fill="open"), path
-        )
-        assert result.trades[0].exits[0].price == pytest.approx(102.0)
+        with pytest.raises(ValueError, match="removed.*next_open"):
+            _config(parity_env, path, signal_exit_fill="open")
+
+    def test_vectorbt_engine_rejects_open_even_if_config_bypassed_validation(
+        self, parity_env
+    ):
+        path = _write_strategy(parity_env, "s_o2", _strategy_text("LONG"))
+        config = _config(parity_env, path)
+        object.__setattr__(config, "signal_exit_fill", "open")
+        # The adapter wraps per-symbol failures in a RuntimeError; the cause text stays.
+        with pytest.raises((ValueError, RuntimeError), match="removed.*next_open"):
+            VectorbtAdapter().run(config, path)
 
 
 class TestWarmupGate:

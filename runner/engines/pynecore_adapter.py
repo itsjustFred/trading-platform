@@ -115,11 +115,14 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "close" fills at the exit bar's close,
-      "open" and "next_open" at its open (the ledger leg is stamped on
-      Pine's fill bar, so next_open prices that bar's open); SHORT
-      open-exits pay the spread (ask). Level exits keep the engine price
-      (stop-market fills at the level).
+      follow ``signal_exit_fill``: "close" fills at the exit bar's close;
+      "next_open" prices the leg bar's open (the ledger leg is stamped on
+      Pine's fill bar, so the next bar's open IS that bar's open) — the
+      frozen adapter maps ``next_open`` to ``close`` before this runs, so
+      production only ever sees ``close``; the lookahead-prone ``open``
+      mode was removed (issue #153) and ``normalize_signal_exit_fill``
+      rejects it. SHORT open-exits pay the spread (ask). Level exits keep
+      the engine price (stop-market fills at the level).
     - Touched legs get their pnl recomputed from the new prices so
       trade.pnl stays consistent ahead of risk sizing.
 
@@ -134,11 +137,14 @@ def _apply_fill_parity(
     # "next_open" prices the leg bar's open: PyneCore stamps the ledger leg
     # on the fill bar itself, so the next bar's open IS that bar's open. The
     # adapter maps next_open to "close" before this runs (frozen engine), so
-    # production never passes it; handling it here keeps the helper total
-    # over the documented enum.
-    fill_at_open = str(
-        getattr(config, "signal_exit_fill", "close") or "close"
-    ).lower() in {"open", "next_open"}
+    # production never passes it; normalizing here keeps the helper total
+    # over the documented enum and fails loudly on the removed "open" mode.
+    fill_at_open = (
+        contract.normalize_signal_exit_fill(
+            getattr(config, "signal_exit_fill", "close") or "close"
+        )
+        == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
+    )
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
