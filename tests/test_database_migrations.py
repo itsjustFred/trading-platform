@@ -318,6 +318,47 @@ def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db, signal_
     assert rows[0].broker_order_id == "BRK-AAA"
 
 
+def test_conflicting_broker_order_id_is_persisted_and_reported(
+    isolated_db, signal_parent, caplog
+) -> None:
+    """Issue #126: a conflicting id is recorded on the signal, not only logged."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-3", broker_order_id="BRK-AAA")
+    )
+    with caplog.at_level("ERROR"):
+        for _ in range(2):  # redelivery of the same conflict is recorded once
+            save_live_signal(
+                _make_live_signal(discord_message_id="ord-3", broker_order_id="BRK-BBB")
+            )
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-AAA"
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert any("BRK-BBB" in record.getMessage() for record in caplog.records)
+    assert list_live_signal_broker_order_conflicts() == [
+        {
+            "signal_id": first_id,
+            "deployment_id": "dep-1",
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": ["BRK-BBB"],
+        }
+    ]
+
+
+def test_matching_or_missing_broker_order_id_records_no_conflict(
+    isolated_db, signal_parent
+) -> None:
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    save_live_signal(_make_live_signal(discord_message_id="ord-4", broker_order_id="BRK-1"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-4", broker_order_id="BRK-1"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-4"))
+    assert list_live_signal_broker_order_conflicts() == []
+
+
 # ─── Finding 5: migration backfill of discord_message_id ─────────────────────
 
 

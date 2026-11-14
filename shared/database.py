@@ -2236,6 +2236,10 @@ def _find_existing_live_signal_by_idempotency_key(
     ).first()
 
 
+# metadata_json key holding broker order ids that conflicted with a signal's tracked id.
+BROKER_ORDER_CONFLICTS_KEY = "conflicting_broker_order_ids"
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2256,9 +2260,25 @@ def _reconcile_existing_live_signal(
             record.discord_message_id,
         )
     elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        logger.warning(
-            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
+        # A second, different broker order id for one logical signal: either a second broker
+        # order was placed or the ids were mapped wrongly. Either way a broker order exists
+        # that the ledger does not track. The stored id is kept (never overwritten), but the
+        # conflicting id is persisted on the signal so operators and reconciliation can find
+        # and resolve it instead of it living only in a log line (issue #126).
+        metadata = dict(existing.metadata_json or {})
+        conflicts = [str(item) for item in metadata.get(BROKER_ORDER_CONFLICTS_KEY) or []]
+        if new_broker_id not in conflicts:
+            conflicts.append(new_broker_id)
+            metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+            existing.metadata_json = metadata
+            session.add(existing)
+            session.commit()
+        logger.error(
+            "Conflicting broker_order_id for duplicate live signal: an untracked broker "
+            "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
             existing.id,
+            existing_broker_id,
+            new_broker_id,
         )
         return
     else:
@@ -2559,6 +2579,36 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
             return None
         metadata = dict(record.metadata_json or {})
     return metadata
+
+
+def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+    """Signals whose duplicate delivery carried a different broker order id.
+
+    Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
+    should be checked against the broker's open orders and positions.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveSignalModel).order_by(LiveSignalModel.timestamp.desc())
+        ).all()
+        conflicts: list[dict[str, Any]] = []
+        for row in rows:
+            ids = (row.metadata_json or {}).get(BROKER_ORDER_CONFLICTS_KEY) or []
+            if not ids:
+                continue
+            conflicts.append(
+                {
+                    "signal_id": str(row.id),
+                    "deployment_id": str(row.deployment_id),
+                    "symbol": row.symbol,
+                    "broker_order_id": row.broker_order_id,
+                    "conflicting_broker_order_ids": [str(item) for item in ids],
+                }
+            )
+            if len(conflicts) >= max(1, int(limit)):
+                break
+    return conflicts
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
