@@ -459,3 +459,48 @@ def test_explicit_fees_reduce_net_pnl():
     assert trade.fees > 0
     assert trade.fees == pytest.approx(expected_fees)
     assert trade.net_pnl == trade.pnl - trade.fees
+
+
+def test_native_engine_orders_take_profit_levels_numerically():
+    # Regression (#154): string sorting put tp10/tp11 before tp2.
+    engine = _engine()
+    # Insert out of order so the result cannot come from column order.
+    columns = ["tp10", "tp2", "tp11", "tp1", "tp9", "tp3", "tp4", "tp5", "tp6", "tp7", "tp8"]
+    row = pd.Series({name: 100.0 + int(name[2:]) for name in columns})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == [f"tp{i}" for i in range(1, 12)]
+    assert [level["price"] for level in take_profit_levels] == [100.0 + i for i in range(1, 12)]
+
+
+def test_native_engine_maps_pct_fractions_to_numerically_ordered_levels():
+    engine = _engine()
+    data = {f"tp{i}": 100.0 + i for i in range(1, 12)}
+    # Fractions are keyed by level name, so they must follow their level
+    # through the numeric re-ordering (tp2_pct -> tp2, tp10_pct -> tp10).
+    data["tp2_pct"] = 0.5
+    data["tp10_pct"] = 0.1
+    row = pd.Series(data)
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    fractions = {level["name"]: level["fraction"] for level in take_profit_levels}
+    default_fraction = 1.0 / 11
+    assert fractions["tp2"] == pytest.approx(0.5)
+    assert fractions["tp10"] == pytest.approx(0.1)
+    for name in ("tp1", "tp3", "tp4", "tp5", "tp6", "tp7", "tp8", "tp9", "tp11"):
+        assert fractions[name] == pytest.approx(default_fraction)
+
+
+def test_native_engine_puts_plain_take_profit_before_numbered_levels():
+    engine = _engine()
+    row = pd.Series(
+        {"tp2": 102.0, "tp10": 110.0, "tp_pct": 0.25, "tp1": 101.0, "take_profit": 99.0}
+    )
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp", "tp1", "tp2", "tp10"]
+    assert take_profit_levels[0]["price"] == 99.0
+    assert take_profit_levels[0]["fraction"] == pytest.approx(0.25)

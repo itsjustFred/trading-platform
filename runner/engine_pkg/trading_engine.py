@@ -42,6 +42,14 @@ logger = logging.getLogger(__name__)
 TRADE_ENGINE_MAX_POSITIONS = 5
 
 
+def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
+    """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
+    name = item[0]
+    if name == "tp":
+        return (0, 0, name)
+    return (1, int(name[2:]), name)
+
+
 class TradeEngine:
     def __init__(
         self,
@@ -175,10 +183,12 @@ class TradeEngine:
             lower = str(key).lower()
             if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
                 tp_candidates.append(("tp", float(row.get(key))))
-            elif lower.startswith("tp") and lower[2:].isdigit() and pd.notna(row.get(key)):
+            elif lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
                 tp_candidates.append((lower, float(row.get(key))))
 
-        tp_candidates.sort(key=lambda item: item[0])
+        # Plain "tp" (take_profit / tp_price) first, then numbered levels by
+        # their numeric suffix so tp10 follows tp9, not tp1.
+        tp_candidates.sort(key=_tp_sort_key)
         if tp_candidates:
             default_fraction = 1.0 / len(tp_candidates)
             for name, price in tp_candidates:
