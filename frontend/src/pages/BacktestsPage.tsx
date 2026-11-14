@@ -1,6 +1,14 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { normalizeWinRate, toPercentPointsForKey } from "../api/metricScale";
+import {
+  boundsFromValues,
+  compareMeasuredLast,
+  listMetricsFor,
+  passesNumericFilters,
+  sortableMetric,
+  type NumericRange,
+} from "../lib/backtestListMetrics";
 import { formatMaintenanceDeletionResult } from "../lib/maintenanceDeletion";
+import { UNAVAILABLE_STAT_TEXT } from "../lib/statFormat";
 import { Link, useNavigate } from "react-router-dom";
 import { ArrowUpDown, Plus, Scale, Trash2 } from "lucide-react";
 
@@ -41,8 +49,6 @@ type SortField =
   | "win_rate"
   | "trade_count";
 type SortOrder = "asc" | "desc";
-
-type NumericRange = { min: number; max: number };
 
 interface NumericBoundsState {
   totalReturn: NumericRange;
@@ -134,17 +140,17 @@ function metricValue(value: number | null | undefined, fallback = 0): number {
 }
 
 function percentage(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "N/A";
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE_STAT_TEXT;
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
 function formatNumber(value: number | null | undefined, digits = 3): string {
-  if (value == null || !Number.isFinite(value)) return "N/A";
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE_STAT_TEXT;
   return value.toFixed(digits);
 }
 
 function formatPValue(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "N/A";
+  if (value == null || !Number.isFinite(value)) return UNAVAILABLE_STAT_TEXT;
   return value.toFixed(4);
 }
 
@@ -237,62 +243,39 @@ function normalizeBacktestRow(
   };
 }
 
-function toBounds(values: number[], fallback: NumericRange): NumericRange {
-  const valid = values.filter((value) => Number.isFinite(value));
-  if (valid.length === 0) return fallback;
-  return {
-    min: Math.min(...valid),
-    max: Math.max(...valid),
-  };
-}
-
+/**
+ * Slider bounds come from measured values only. An unmeasured metric is not a
+ * zero, so it must not stretch the range; see lib/backtestListMetrics.ts.
+ */
 function buildNumericBounds(items: BacktestCardModel[]): NumericBoundsState {
+  const metrics = items.map((item) => listMetricsFor(item));
   return {
-    totalReturn: toBounds(
-      items.map(
-        (item) =>
-          toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0,
-      ),
+    totalReturn: boundsFromValues(
+      metrics.map((m) => m.totalReturn),
       { min: -50, max: 50 },
     ),
-    sharpe: toBounds(
-      items.map((item) => metricValue(item.sharpe_ratio)),
+    sharpe: boundsFromValues(
+      metrics.map((m) => m.sharpe),
       { min: -2, max: 3 },
     ),
-    psr: toBounds(
-      items.map((item) => metricValue(item.psr)),
+    psr: boundsFromValues(
+      metrics.map((m) => m.psr),
       { min: 0, max: 1 },
     ),
-    pValue: toBounds(
-      items.map((item) => metricValue(item.p_value, 1)),
+    pValue: boundsFromValues(
+      metrics.map((m) => m.pValue),
       { min: 0, max: 1 },
     ),
-    cagr: toBounds(
-      items.map(
-        (item) =>
-          toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0,
-      ),
+    cagr: boundsFromValues(
+      metrics.map((m) => m.cagr),
       { min: -20, max: 40 },
     ),
-    maxDrawdown: toBounds(
-      items.map(
-        (item) =>
-          toPercentPointsForKey(
-            "backtest_list",
-            "max_drawdown",
-            Math.abs(metricValue(item.max_drawdown)),
-          ) ?? 0,
-      ),
-      {
-        min: 0,
-        max: 60,
-      },
+    maxDrawdown: boundsFromValues(
+      metrics.map((m) => m.maxDrawdown),
+      { min: 0, max: 60 },
     ),
-    winRate: toBounds(
-      items.map(
-        (item) =>
-          toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0,
-      ),
+    winRate: boundsFromValues(
+      metrics.map((m) => m.winRate),
       { min: 0, max: 100 },
     ),
   };
@@ -827,37 +810,12 @@ export function BacktestsPage() {
         }
       }
 
-      const totalReturn =
-        toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0;
-      const sharpe = metricValue(item.sharpe_ratio);
-      const psr = metricValue(item.psr);
-      const pValue = metricValue(item.p_value, 1);
-      const cagr =
-        toPercentPointsForKey("backtest_list", "cagr", metricValue(item.cagr)) ?? 0;
-      const maxDrawdown =
-        toPercentPointsForKey(
-          "backtest_list",
-          "max_drawdown",
-          Math.abs(metricValue(item.max_drawdown)),
-        ) ?? 0;
-      const winRate =
-        toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0;
-
-      return (
-        totalReturn >= numericFilters.totalReturn.min &&
-        totalReturn <= numericFilters.totalReturn.max &&
-        sharpe >= numericFilters.sharpe.min &&
-        sharpe <= numericFilters.sharpe.max &&
-        psr >= numericFilters.psr.min &&
-        psr <= numericFilters.psr.max &&
-        pValue >= numericFilters.pValue.min &&
-        pValue <= numericFilters.pValue.max &&
-        cagr >= numericFilters.cagr.min &&
-        cagr <= numericFilters.cagr.max &&
-        maxDrawdown >= numericFilters.maxDrawdown.min &&
-        maxDrawdown <= numericFilters.maxDrawdown.max &&
-        winRate >= numericFilters.winRate.min &&
-        winRate <= numericFilters.winRate.max
+      // A narrowed metric range excludes unmeasured rows; default ranges hide
+      // nothing. See lib/backtestListMetrics.ts.
+      return passesNumericFilters(
+        listMetricsFor(item),
+        numericFilters,
+        numericBounds,
       );
     });
 
@@ -870,23 +828,18 @@ export function BacktestsPage() {
           return left.id.localeCompare(right.id) * direction;
         return (leftTime - rightTime) * direction;
       }
-      if (sortField === "win_rate") {
-        const leftWin = normalizeWinRate(left.win_rate) ?? -1;
-        const rightWin = normalizeWinRate(right.win_rate) ?? -1;
-        if (leftWin === rightWin)
-          return left.id.localeCompare(right.id) * direction;
-        return (leftWin - rightWin) * direction;
-      }
-      const leftValue = Number(left[sortField] ?? 0);
-      const rightValue = Number(right[sortField] ?? 0);
+      // Unmeasured values sort last in both directions, never as zero.
+      const leftValue = sortableMetric(left, sortField);
+      const rightValue = sortableMetric(right, sortField);
       if (leftValue === rightValue)
         return left.id.localeCompare(right.id) * direction;
-      return (leftValue - rightValue) * direction;
+      return compareMeasuredLast(leftValue, rightValue, direction);
     });
     return result;
   }, [
     items,
     numericFilters,
+    numericBounds,
     selectedStrategies,
     selectedSymbols,
     selectedTimeframes,
@@ -1657,20 +1610,8 @@ export function BacktestsPage() {
         >
           {currentPageItems.map((item) => {
             const selected = selectedIds.has(item.id);
-            const totalReturnPct =
-              toPercentPointsForKey("backtest_list", "total_return", metricValue(item.total_return)) ?? 0;
-            const cagrPct =
-              item.cagr == null
-                ? null
-                : (toPercentPointsForKey("backtest_list", "cagr", item.cagr) ?? 0);
-            const maxDrawdownPct =
-              toPercentPointsForKey(
-                "backtest_list",
-                "max_drawdown",
-                Math.abs(metricValue(item.max_drawdown)),
-              ) ?? 0;
-            const winRatePct =
-              toPercentPointsForKey("backtest_list", "win_rate", item.win_rate) ?? 0;
+            // Each `null` stays unmeasured and renders as "—", never as 0.
+            const metrics = listMetricsFor(item);
             const sparkline = previewById[item.id] ?? item.equity_preview ?? [];
 
             return (
@@ -1855,37 +1796,43 @@ export function BacktestsPage() {
                 >
                   <StatBadge
                     label="Return"
-                    value={percentage(totalReturnPct)}
-                    color={statColorPositive(totalReturnPct)}
+                    value={percentage(metrics.totalReturn)}
+                    color={statColorPositive(metrics.totalReturn)}
                   />
                   <StatBadge
                     label="Sharpe (higher = better)"
-                    value={formatNumber(item.sharpe_ratio)}
-                    color={sharpeColor(item.sharpe_ratio)}
+                    value={formatNumber(metrics.sharpe)}
+                    color={sharpeColor(metrics.sharpe)}
                   />
                   <StatBadge
                     label="PSR (higher = better)"
                     value={
-                      item.psr == null
-                        ? "N/A"
-                        : `${(item.psr * 100).toFixed(1)}%`
+                      metrics.psr === null
+                        ? UNAVAILABLE_STAT_TEXT
+                        : `${(metrics.psr * 100).toFixed(1)}%`
                     }
-                    color={psrColor(item.psr)}
+                    color={psrColor(metrics.psr)}
                   />
                   <StatBadge
                     label="CAGR (higher = better)"
-                    value={percentage(cagrPct)}
-                    color={statColorPositive(cagrPct)}
+                    value={percentage(metrics.cagr)}
+                    color={statColorPositive(metrics.cagr)}
                   />
                   <StatBadge
                     label="Max DD (lower = better)"
-                    value={percentage(-maxDrawdownPct)}
+                    value={percentage(
+                      metrics.maxDrawdown === null ? null : -metrics.maxDrawdown,
+                    )}
                     color="#f87171"
                   />
                   <StatBadge
                     label="Win Rate (higher = better)"
-                    value={`${winRatePct.toFixed(1)}%`}
-                    color={statColorPositive(winRatePct)}
+                    value={
+                      metrics.winRate === null
+                        ? UNAVAILABLE_STAT_TEXT
+                        : `${metrics.winRate.toFixed(1)}%`
+                    }
+                    color={statColorPositive(metrics.winRate)}
                   />
                 </div>
 
