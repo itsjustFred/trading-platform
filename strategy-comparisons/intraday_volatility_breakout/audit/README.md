@@ -1,7 +1,7 @@
 # Strategy-Test-Audit: IntradayVolatilityBreakout (MT5 ↔ Platform)
 
 Branch: `strategy-test-audit`. Ziel: MT5-Code (`../IntradayVolatilityBreakout.mq5`,
-Referenz-Runs in `/home/ubuntu/trading-platform-references/`) gegen die
+Referenz-Runs im Verzeichnis `$TRADING_PLATFORM_REFERENCES` bzw. `--reference-dir`) gegen die
 Platform-Strategie (`strategies/intraday_volatility_breakout/`, native Engine)
 verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 
@@ -19,7 +19,7 @@ XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Ru
 Reproduktion der Referenz-Seite:
 
 ```bash
-.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --out /tmp/audit_ref
+python parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out /tmp/audit_ref
 ```
 
 (Skript failt laut bei jeder Inkonsistenz: Deal-Sequenz, Volumen-Paarung,
