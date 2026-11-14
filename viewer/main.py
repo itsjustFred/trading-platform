@@ -8634,10 +8634,26 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
 
 
 def _matrix_result_path(filename: str) -> Path:
+    """Return the resolved path of a matrix result file inside MATRIX_RESULTS_DIR.
+
+    Separator and drive forms are refused up front so the same input is rejected
+    on Linux, Windows and macOS alike. The candidate is then resolved (following
+    symlinks) and must stay inside the resolved results directory (#155).
+    """
     normalized = str(filename or "").strip()
-    if not normalized or ".." in normalized or normalized.startswith("/"):
+    if (
+        not normalized
+        or ".." in normalized
+        or normalized.startswith("/")
+        or "\\" in normalized
+        or ":" in normalized
+    ):
         raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    return MATRIX_RESULTS_DIR / normalized
+    base = MATRIX_RESULTS_DIR.resolve()
+    resolved = (base / normalized).resolve()
+    if resolved == base or not resolved.is_relative_to(base):
+        raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    return resolved
 
 
 def _stale_grid_findings(
