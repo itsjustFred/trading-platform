@@ -25,6 +25,8 @@ What is pinned here:
   cancel superseded downstream runs);
 - the cubic stage gates on a cubic review of the head commit, counts P0/P1 as blocking and
   P2/P3 as advisory, and runs no repo code;
+- a draft PR's cubic stage writes success without waiting, and a PR marked ready runs the stage
+  again only once the pre-mortem has passed on its head;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
   extraction, tree-clean check, head-moved comment guard, strict skill selection) stay
   identical modulo the names each copy substitutes;
@@ -751,6 +753,214 @@ def test_the_cubic_classification_reads_only_the_newest_review_of_the_commit(tmp
     assert result["verdict"] == "PASS"
     assert result["blocking"] == "0"
     assert result["review_id"] == "43"
+
+
+REPO = "itsjustFred/trading-platform"
+PR_NUMBER = 201
+PR_HEAD = "c" * 40
+SKIP_DESCRIPTION = "skipped: draft PR — cubic reviews only ready PRs"
+
+# A `gh` for the cubic workflow's own steps: a shell function, so no executable has to be found
+# on PATH (portable to Git Bash). It logs every call to $GH_LOG, answers GETs of a pull request
+# or of a commit status from the fixture files, and accepts every write without sending it.
+_GH_STUB = r"""gh() {
+  local path jq_expr method src
+  printf '%s\n' "$*" >> "$GH_LOG"
+  [ "${1:-}" = api ] || return 1
+  path=""
+  jq_expr=""
+  method=GET
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jq) jq_expr=$2; shift 2 ;;
+      --method) method=$2; shift 2 ;;
+      -f|-F) shift 2 ;;
+      -*) shift ;;
+      *) path=$1; shift ;;
+    esac
+  done
+  [ "$method" = GET ] || return 0
+  case "$path" in
+    */pulls/*) src=$GH_PR_JSON ;;
+    */status) src=$GH_STATUS_JSON ;;
+    *) echo "gh stub: unexpected GET $path" >&2; return 1 ;;
+  esac
+  if [ -n "$jq_expr" ]; then jq -r "$jq_expr" "$src"; else cat "$src"; fi
+}
+"""
+
+
+def _pr_payload(*, draft: bool) -> dict:
+    return {
+        "number": PR_NUMBER,
+        "state": "open",
+        "draft": draft,
+        "base": {"sha": "b" * 40},
+        "head": {"sha": PR_HEAD, "ref": "chore/coderabbit-on-demand", "repo": {"full_name": REPO}},
+    }
+
+
+def _run_cubic_step(
+    root: Path, step_body: str, *, env: dict[str, str], pr: dict, statuses: list[dict]
+) -> tuple[subprocess.CompletedProcess, dict[str, str], str]:
+    """Run one step of the cubic workflow with the stub `gh`. Returns the process, the outputs
+    the step wrote to GITHUB_OUTPUT, and the calls it made to `gh`."""
+    work = root / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    (root / "pr.json").write_text(json.dumps(pr), encoding="utf-8")
+    (root / "status.json").write_text(json.dumps({"statuses": statuses}), encoding="utf-8")
+    (root / "event.json").write_text(json.dumps({"pull_request": pr}), encoding="utf-8")
+    (root / "output").write_text("", encoding="utf-8")
+    (root / "calls.log").write_text("", encoding="utf-8")
+    cubic_env = _load(CUBIC)["env"]
+    run_env = {
+        **os.environ,
+        "CUBIC_CONTEXT": str(cubic_env["CUBIC_CONTEXT"]),
+        "PREMORTEM_CONTEXT": str(cubic_env["PREMORTEM_CONTEXT"]),
+        "GH_LOG": str(root / "calls.log"),
+        "GH_PR_JSON": str(root / "pr.json"),
+        "GH_STATUS_JSON": str(root / "status.json"),
+        "GITHUB_OUTPUT": str(root / "output"),
+        "GITHUB_EVENT_PATH": str(root / "event.json"),
+        "GITHUB_REPOSITORY": REPO,
+        "RUNNER_TEMP": str(work),
+        **env,
+    }
+    proc = subprocess.run(
+        [shutil.which("bash") or "bash", "-c", _GH_STUB + "\n" + step_body],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=work,
+        env=run_env,
+    )
+    outputs = dict(
+        line.split("=", 1)
+        for line in (root / "output").read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    return proc, outputs, (root / "calls.log").read_text(encoding="utf-8")
+
+
+def test_the_cubic_stage_runs_again_when_a_draft_becomes_ready() -> None:
+    """cubic does not review drafts, so a draft's dispatch is skipped. Marking the PR ready must
+    run the stage again, and it is the only event that does besides the pre-mortem's dispatch:
+    a push or a reopen is the chain's to re-run."""
+    data = _load(CUBIC)
+    on = _triggers(data)
+    assert on.get("pull_request") == {"types": ["ready_for_review"]}, (
+        f"cubic triggers on {on.get('pull_request')}, want exactly ready_for_review"
+    )
+    assert "workflow_dispatch" in on, "cubic lost the dispatch the pre-mortem sends it"
+    assert "github.event.pull_request.number" in data["concurrency"]["group"], (
+        "a ready run shares no concurrency group with the PR's other cubic runs"
+    )
+
+
+def test_a_draft_head_is_never_waited_for_and_is_written_as_a_success() -> None:
+    """The draft exit is a static pin as well as a behaviour: the status the mark-running step
+    writes and the wait job both exclude drafts, so a draft cannot sit `pending` for 20 minutes
+    and end as `error`."""
+    jobs = _load(CUBIC)["jobs"]
+    assert "draft" in _find_step(jobs["resolve"], r"^Mark running$")["if"], (
+        "Mark running does not exclude drafts"
+    )
+    assert "draft" in jobs["wait"]["if"], "the wait job does not exclude drafts"
+    skip = _find_step(jobs["resolve"], r"^Skip draft PR$")
+    assert "draft" in skip["if"], "the skip step runs on ready PRs"
+    assert "state=success" in _run(skip), "the skip step does not write success"
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
+)
+def test_a_draft_head_resolves_without_a_call_and_is_written_as_a_success(tmp_path) -> None:
+    jobs = _load(CUBIC)["jobs"]
+    resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path / "resolve",
+        resolve,
+        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
+        pr=_pr_payload(draft=True),
+        statuses=[],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["current"] == "true" and outputs["draft"] == "true"
+    assert calls == "", "resolving a draft calls the API, so it could gate on something"
+
+    skip = _run(_find_step(jobs["resolve"], r"^Skip draft PR$"))
+    proc, _outputs, calls = _run_cubic_step(
+        tmp_path / "skip", skip, env={"HEAD_SHA": PR_HEAD}, pr=_pr_payload(draft=True), statuses=[]
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert f"repos/{REPO}/statuses/{PR_HEAD}" in calls, "the skip writes to another commit"
+    assert "-f state=success" in calls
+    assert "-f context=agent/cubic-review" in calls
+    assert f"-f description={SKIP_DESCRIPTION}" in calls
+    assert "state=error" not in calls and "state=pending" not in calls
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
+)
+@pytest.mark.parametrize(
+    ("premortem", "current"),
+    [
+        ("success", "true"),
+        ("pending", "false"),
+        ("failure", "false"),
+        ("error", "false"),
+        (None, "false"),
+    ],
+)
+def test_a_ready_pr_runs_only_when_the_pre_mortem_passed_on_its_head(
+    premortem, current, tmp_path
+) -> None:
+    """A ready_for_review run is not dispatched by the chain. It proceeds only on the verdict that
+    dispatches this stage (the pre-mortem's success on the head); any other state leaves the
+    statuses to the chain, which still reaches this stage when the pre-mortem passes."""
+    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
+    statuses = [] if premortem is None else [{"context": "agent/pre-mortem", "state": premortem}]
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path,
+        resolve,
+        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
+        pr=_pr_payload(draft=False),
+        statuses=statuses,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["current"] == current
+    assert f"repos/{REPO}/commits/{PR_HEAD}/status" in calls, "the gate reads another commit"
+    assert "--method" not in calls, "a ready run's resolve writes a status"
+    if current == "true":
+        assert outputs["head"] == PR_HEAD
+        assert outputs["number"] == str(PR_NUMBER)
+        assert outputs["draft"] == "false"
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
+)
+def test_a_dispatch_is_not_gated_on_the_pre_mortem(tmp_path) -> None:
+    """The override dispatches this stage by hand after a red pre-mortem, so only a ready run
+    waits for the pre-mortem's verdict."""
+    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path,
+        resolve,
+        env={
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_PR": str(PR_NUMBER),
+            "INPUT_SHA": PR_HEAD,
+        },
+        pr=_pr_payload(draft=False),
+        statuses=[{"context": "agent/pre-mortem", "state": "failure"}],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["current"] == "true"
+    assert f"repos/{REPO}/pulls/{PR_NUMBER}" in calls
+    assert "/status" not in calls
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:

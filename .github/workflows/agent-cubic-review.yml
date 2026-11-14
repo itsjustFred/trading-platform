@@ -2,7 +2,7 @@ name: Agent Cubic Review
 # Quoted: an unquoted "#" after a space starts a YAML comment, which dropped the
 # PR number and SHA from display_title (see agent-mutation-testing.yml for what
 # that broke: the superseded-run cancel in agent-code-review.yml).
-run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
+run-name: "Agent Cubic Review PR #${{ github.event.pull_request.number || inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || inputs.head_sha || 'current head' }}"
 
 # Stage 5, the last stage of the PR verification pipeline (see the
 # `platform-pr-verify` skill):
@@ -15,7 +15,8 @@ run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha 
 # `agent/cubic-review`:
 #   pending: waiting for cubic's review (or for the pre-mortem dispatch)
 #   success: cubic reviewed the head commit and found no P0/P1 finding
-#            (P2/P3 are advisory and do not block)
+#            (P2/P3 are advisory and do not block), or the PR is a draft and
+#            cubic was not asked to review it (see "Draft PRs" below)
 #   failure: cubic found at least one P0/P1 finding
 #   error:   no cubic review arrived within the wait, the run failed, or not run
 #
@@ -32,12 +33,20 @@ run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha 
 # earlier commit was red - and a push that leaves the code untouched does not
 # re-raise it.
 #
-# It has no pull_request trigger. `agent-pre-mortem.yml` dispatches it with the
-# PR head SHA when the pre-mortem verdict is PASS. The run-name carries the PR
-# number and SHA, so a later push can cancel runs of older commits. A run whose
-# SHA is no longer the PR head stops without doing anything. On PASS it
-# dispatches nothing: this is the last stage, and CodeRabbit is an on-demand
-# second opinion triggered by hand (see the skill).
+# Triggers: `agent-pre-mortem.yml` dispatches it with the PR head SHA when the
+# pre-mortem verdict is PASS, and `ready_for_review` runs it again when a draft
+# PR is marked ready (see "Draft PRs"). The run-name carries the PR number and
+# SHA, so a later push can cancel runs of older commits. A run whose SHA is no
+# longer the PR head stops without doing anything. On PASS it dispatches
+# nothing: this is the last stage, and CodeRabbit is an on-demand second
+# opinion triggered by hand (see the skill).
+#
+# Draft PRs: cubic does not review drafts, so a run on a draft head writes
+# `success` with the description "skipped: draft PR — cubic reviews only ready
+# PRs" and waits for nothing. Marking the PR ready runs the stage again. That run
+# proceeds only if `agent/pre-mortem` is `success` on the same commit (the verdict
+# that dispatches this stage); otherwise it stops without writing a status and
+# the chain decides.
 #
 # Override (pre-mortem red, findings judged irrelevant): justify each finding in
 # a PR comment, then dispatch by hand:
@@ -45,7 +54,7 @@ run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha 
 # Override (cubic red, P0/P1 judged irrelevant): justify each finding in a PR
 # comment; nothing runs after this stage.
 #
-# A PR that cubic never reviewed (a draft, a rate limit, a skipped review) ends
+# A ready PR that cubic never reviewed (a rate limit, a skipped review) ends
 # as `error` after the wait instead of blocking: the fix is to re-trigger cubic
 # from its review footer ("Re-trigger cubic") and dispatch the stage again.
 #
@@ -59,6 +68,8 @@ run-name: "Agent Cubic Review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha 
 #   Apps, so a PR author cannot post a review that this stage counts.
 
 on:
+  pull_request:
+    types: [ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -71,10 +82,11 @@ on:
         type: string
 
 concurrency:
-  group: agent-cubic-review-${{ inputs.pr_number }}
+  group: agent-cubic-review-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 env:
+  PREMORTEM_CONTEXT: agent/pre-mortem
   CUBIC_CONTEXT: agent/cubic-review
   # The review body marker and the bot that posts it. Both are cubic's, not
   # ours; change them here if cubic renames either.
@@ -97,6 +109,7 @@ jobs:
       head: ${{ steps.pr.outputs.head }}
       same_repo: ${{ steps.pr.outputs.same_repo }}
       current: ${{ steps.pr.outputs.current }}
+      draft: ${{ steps.pr.outputs.draft }}
     steps:
       - name: Resolve PR
         id: pr
@@ -106,7 +119,11 @@ jobs:
           INPUT_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+          fi
           if [ "$(jq -r .state pr.json)" != "open" ]; then
             echo "::error::PR #${INPUT_PR} is not open."
             exit 1
@@ -127,16 +144,29 @@ jobs:
             fi
             exit 0
           fi
+          # A ready_for_review run is not dispatched by the chain, so it gates only
+          # when the pre-mortem passed on this commit: the verdict that dispatches
+          # this stage. Otherwise the chain decides; nothing is written here.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$(jq -r .draft pr.json)" != "true" ]; then
+            premortem=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$(jq -r .head.sha pr.json)/status" \
+              --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+            if [ "$premortem" != "success" ]; then
+              echo "::notice::${PREMORTEM_CONTEXT} is ${premortem} on this commit; the chain decides, nothing to do."
+              echo "current=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
           echo "current=true" >> "$GITHUB_OUTPUT"
           {
             echo "number=$(jq -r .number pr.json)"
             echo "base=$(jq -r .base.sha pr.json)"
             echo "head=$(jq -r .head.sha pr.json)"
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+            echo "draft=$(jq -r .draft pr.json)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Mark running
-        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true'
+        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true' && steps.pr.outputs.draft != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head }}
@@ -146,6 +176,20 @@ jobs:
             -f state=pending -f context="$CUBIC_CONTEXT" -f description="Running" \
             -f target_url="$RUN_URL" > /dev/null
 
+      # cubic does not review draft PRs, so waiting for it would only end in `error`
+      # after 20 minutes. A draft head is a success that says why instead; marking
+      # the PR ready runs this stage again (ready_for_review).
+      - name: Skip draft PR
+        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true' && steps.pr.outputs.draft == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=success -f context="$CUBIC_CONTEXT" \
+            -f description="skipped: draft PR — cubic reviews only ready PRs" > /dev/null
+
       # After "Mark running" a failure here (an API error) would leave the stage
       # `pending` with every later job skipped. The reporter clears the resolved
       # head and falls back to the dispatch input: a failure of the first step
@@ -154,7 +198,7 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           if [ -z "$HEAD_SHA" ]; then
@@ -175,7 +219,7 @@ jobs:
   # is normally already there; the wait only covers the slow cases.
   wait:
     needs: resolve
-    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' }}
+    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' && needs.resolve.outputs.draft != 'true' }}
     runs-on: ubuntu-latest
     # Up to 20 minutes of polling plus the API calls.
     timeout-minutes: 25
@@ -386,7 +430,7 @@ jobs:
   # run that already wrote its final status is not touched (pending only).
   report-cancelled:
     needs: [resolve, wait, post]
-    if: ${{ cancelled() && (needs.resolve.outputs.head != '' || inputs.head_sha != '') }}
+    if: ${{ cancelled() && (needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -394,7 +438,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # A run cancelled before resolve wrote `head` still names its commit.
-      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled cubic stage run

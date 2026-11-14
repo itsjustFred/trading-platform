@@ -31,8 +31,9 @@ run-name: "Agent Pre-Mortem PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha ||
 #   error:   INCOMPLETE or the run failed
 #
 # On PASS it dispatches `agent-cubic-review.yml`, the last stage, which waits
-# for cubic's review of the same SHA and gates on its P0/P1 findings. That is
-# why the post job holds `actions: write`, like the mutation stage's.
+# for cubic's review of the same SHA and gates on its P0/P1 findings (on a draft
+# PR it writes success without waiting; see that workflow). That is why the post
+# job holds `actions: write`, like the mutation stage's.
 #
 # Override (mutation testing red, findings judged irrelevant): justify each
 # finding in a PR comment, then dispatch by hand. Pass the head SHA as well as the
