@@ -93,16 +93,18 @@ class BacktestConfig(BaseModel):
     max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
     max_leverage: float | None = Field(None, gt=0.0)
     modeling_resolution: str = "main_timeframe"
-    # Fill convention for signal-driven
-    # exits in bar engines. D4 (A-M1): the unified convention is
-    # Fill-zum-Trigger-Close — "close" (default) fills at the signal bar's
-    # close in every engine (native _close_position and vectorbt
-    # _resolve_exit_price with an unshifted exit leg). "open" fills at the
-    # signal bar's open — closer to MT5, which exits at the first tick
-    # inside the exit minute (~bar open) — and stays available as an
-    # explicitly configured opt-in. Stop-loss fills are unaffected (always
-    # the stop level, SHORT legs on the ask when spread/ask_ohlc applies).
-    signal_exit_fill: str = "close"
+    # Fill convention for signal-driven exits in bar engines. Owner decision
+    # 2026-11-13 (supersedes D4 / A-M1 "Fill-zum-Trigger-Close"): a signal exit
+    # produced on bar N fills at bar N+1's OPEN, exactly like market entries
+    # ("next_open", default). A signal on the LAST bar has no next bar: the
+    # position is closed by the end-of-data forced close at that bar's close and
+    # the trade is flagged (meta["signal_exit_deferred_to_end_of_data"]).
+    # "close" / "open" remain explicit legacy opt-ins that fill on the SIGNAL
+    # bar itself (its close / its open); "open" serves MT5 clock exits whose
+    # signal bar IS the exit minute. Stop/take-profit fills are independent of
+    # this switch: a level fills at the level, or at the bar's open when the
+    # bar gaps through it.
+    signal_exit_fill: str = "next_open"
     # Indicator warmup. When set (date
     # string), market data is loaded from this earlier date so indicators
     # needing history (e.g. daily ATR) are already warmed up at start_date.
@@ -179,9 +181,10 @@ class BacktestConfig(BaseModel):
         # close-fill everywhere (every reader tests `== "open"`). Normalize
         # case/whitespace so "Close"/"OPEN" keep working, reject the rest.
         normalized = str(v or "").strip().lower()
-        if normalized not in {"close", "open"}:
+        if normalized not in {"next_open", "close", "open"}:
             raise ValueError(
-                f"Invalid signal_exit_fill {v!r}, must be 'close' or 'open'"
+                f"Invalid signal_exit_fill {v!r}, must be 'next_open', "
+                "'close' or 'open'"
             )
         return normalized
 

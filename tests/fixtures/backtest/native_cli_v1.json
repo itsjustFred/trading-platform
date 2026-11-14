@@ -25,59 +25,71 @@
       "time": "2024-01-01T06:00:00+00:00"
     },
     {
-      "equity": 99849.0,
+      "equity": 99851.85,
       "time": "2024-01-01T07:00:00+00:00"
     },
     {
-      "equity": 99849.0,
+      "equity": 99830.49,
+      "time": "2024-01-01T08:00:00+00:00"
+    },
+    {
+      "equity": 99830.49,
       "time": "2024-01-02T02:00:00+00:00"
     },
     {
-      "equity": 99849.0,
+      "equity": 99830.49,
       "time": "2024-01-02T03:00:00+00:00"
     },
     {
-      "equity": 99817.8,
+      "equity": 99799.29,
       "time": "2024-01-02T04:00:00+00:00"
     },
     {
-      "equity": 99786.59,
+      "equity": 99768.1,
       "time": "2024-01-02T05:00:00+00:00"
     },
     {
-      "equity": 99755.39,
+      "equity": 99736.9,
       "time": "2024-01-02T06:00:00+00:00"
     },
     {
-      "equity": 99721.47,
+      "equity": 99705.7,
       "time": "2024-01-02T07:00:00+00:00"
     },
     {
-      "equity": 99721.47,
+      "equity": 99687.4,
+      "time": "2024-01-02T08:00:00+00:00"
+    },
+    {
+      "equity": 99687.4,
       "time": "2024-01-03T02:00:00+00:00"
     },
     {
-      "equity": 99721.47,
+      "equity": 99687.4,
       "time": "2024-01-03T03:00:00+00:00"
     },
     {
-      "equity": 100022.0,
+      "equity": 99987.82,
       "time": "2024-01-03T04:00:00+00:00"
     },
     {
-      "equity": 100158.61,
+      "equity": 100124.38,
       "time": "2024-01-03T05:00:00+00:00"
     },
     {
-      "equity": 100295.21,
+      "equity": 100260.94,
       "time": "2024-01-03T06:00:00+00:00"
     },
     {
-      "equity": 100497.05,
+      "equity": 100465.78,
       "time": "2024-01-03T07:00:00+00:00"
     },
     {
-      "equity": 100497.05,
+      "equity": 100462.71,
+      "time": "2024-01-03T08:00:00+00:00"
+    },
+    {
+      "equity": 100462.71,
       "time": "2024-01-03T23:00:00+00:00"
     }
   ],
@@ -93,23 +105,23 @@
           "time": "2024-01-01T00:00:00+00:00"
         },
         {
-          "equity": 99849.0,
-          "time": "2024-01-01T07:00:00+00:00"
+          "equity": 99830.49,
+          "time": "2024-01-01T08:00:00+00:00"
         },
         {
-          "equity": 99721.47,
-          "time": "2024-01-02T07:00:00+00:00"
+          "equity": 99687.4,
+          "time": "2024-01-02T08:00:00+00:00"
         },
         {
-          "equity": 100497.05,
+          "equity": 100462.71,
           "time": "2024-01-03T23:00:00+00:00"
         }
       ],
       "daily_return_count": 3,
       "engine_curve_reconciliation": {
-        "drift": -0.00014802957593929023,
-        "engine_final_equity": 100497.05,
-        "expected_final_equity": 100497.05014802958,
+        "drift": 0.0017411773151252419,
+        "engine_final_equity": 100462.71,
+        "expected_final_equity": 100462.70825882269,
         "tolerance": 0.03,
         "trade_count": 3
       },
@@ -126,7 +138,7 @@
           "max_position_exposure_semantics": "aggregate_open_risk",
           "modeling_resolution": "main_timeframe",
           "risk_per_trade_pct": 0.01,
-          "signal_exit_fill": "close",
+          "signal_exit_fill": "next_open",
           "warmup_start": ""
         },
         "symbols": [
@@ -144,7 +156,7 @@
         "max_position_exposure_semantics": "aggregate_open_risk",
         "modeling_resolution": "main_timeframe",
         "risk_per_trade_pct": 0.01,
-        "signal_exit_fill": "close",
+        "signal_exit_fill": "next_open",
         "warmup_start": ""
       },
       "shared_equity": {},
@@ -194,33 +206,34 @@
       "fee_rate": 0.0005
     },
     "risk_per_trade_pct": 0.01,
+    "signal_exit_fill": "next_open",
     "strategies": [
       "backtest_golden"
     ],
     "total_bars": 72
   },
   "stats": {
-    "avg_holding_bars": 4.0,
-    "avg_loser": -139.26,
-    "avg_winner": 775.58,
-    "cagr": 0.828799,
-    "calmar_ratio": 297.5618,
+    "avg_holding_bars": 5.0,
+    "avg_loser": -156.3,
+    "avg_winner": 775.31,
+    "cagr": 0.754265,
+    "calmar_ratio": 241.2877,
     "daily_return_count": 3,
     "daily_returns": [
       {
         "date": "2024-01-01",
-        "equity": 99849.0,
-        "return": -0.00151
+        "equity": 99830.49,
+        "return": -0.0016950999999999477
       },
       {
         "date": "2024-01-02",
-        "equity": 99721.47,
-        "return": -0.001277228615208954
+        "equity": 99687.4,
+        "return": -0.0014333296370679044
       },
       {
         "date": "2024-01-03",
-        "equity": 100497.05,
-        "return": 0.007777462566486452
+        "equity": 100462.71,
+        "return": 0.00777741219050765
       }
     ],
     "duplicate_equity_timestamps": 0,
@@ -228,16 +241,16 @@
     "losers": 2,
     "max_consecutive_losses": 2,
     "max_consecutive_wins": 1,
-    "max_drawdown_duration": 12,
-    "max_drawdown_pct": -0.002785,
-    "max_drawdown_realized_pct": -0.002785,
-    "p_value": 0.320491,
-    "profit_factor": 2.7846,
+    "max_drawdown_duration": 15,
+    "max_drawdown_pct": -0.003126,
+    "max_drawdown_realized_pct": -0.003126,
+    "p_value": 0.33407,
+    "profit_factor": 2.4802,
     "risk_free_rate": 0.0,
-    "sharpe_ratio": 4.9858,
-    "sortino_ratio": 23.1256,
-    "total_pnl": 497.05,
-    "total_return": 0.00497,
+    "sharpe_ratio": 4.5598,
+    "sortino_ratio": 19.1942,
+    "total_pnl": 462.71,
+    "total_return": 0.004627,
     "total_trades": 3,
     "undefined_metrics": [],
     "win_rate": 0.3333,
@@ -250,15 +263,15 @@
       "entry_time": "2024-01-01T03:00:00+00:00",
       "exits": [
         {
-          "pnl": -148.14814814814815,
-          "price": 96.0,
+          "pnl": -166.66666666666669,
+          "price": 95.0,
           "quantity": 18.51851851851852,
           "reason": "signal",
-          "time": "2024-01-01T07:00:00+00:00"
+          "time": "2024-01-01T08:00:00+00:00"
         }
       ],
-      "fees": 2.851851851851852,
-      "holding_bars": 4,
+      "fees": 2.8425925925925926,
+      "holding_bars": 5,
       "id": 1,
       "mae": -166.66666666666669,
       "meta": {
@@ -275,7 +288,9 @@
           "intrabar_resolution": null,
           "lower_timeframe_replay": false,
           "market_order_timing": "next_bar_open",
+          "protective_gap_fill": "open",
           "same_bar_order": "stop_first",
+          "signal_exit_fill": "next_open",
           "stop_trigger_side": "bar_low_high",
           "take_profit_trigger_side": "bar_high_low"
         },
@@ -283,11 +298,11 @@
         "sizing_stop_loss": 50.0
       },
       "mfe": 18.51851851851852,
-      "net_pnl": -151.0,
-      "pnl": -148.14814814814815,
-      "pnl_pct": -7.840384615384615,
+      "net_pnl": -169.50925925925927,
+      "pnl": -166.66666666666669,
+      "pnl_pct": -8.801442307692307,
       "quantity": 18.51851851851852,
-      "r_multiple": -0.151,
+      "r_multiple": -0.16950925925925928,
       "stop_loss": 50.0,
       "symbol": "PARITY",
       "tags": [
@@ -300,17 +315,17 @@
       "entry_time": "2024-01-02T03:00:00+00:00",
       "exits": [
         {
-          "pnl": -124.81125,
-          "price": 106.0,
-          "quantity": 15.60140625,
+          "pnl": -140.38662760416668,
+          "price": 105.0,
+          "quantity": 15.598514178240741,
           "reason": "signal",
-          "time": "2024-01-02T07:00:00+00:00"
+          "time": "2024-01-02T08:00:00+00:00"
         }
       ],
-      "fees": 2.7161546875,
-      "holding_bars": 4,
+      "fees": 2.7080373025173614,
+      "holding_bars": 5,
       "id": 2,
-      "mae": -140.41265625,
+      "mae": -140.38662760416668,
       "meta": {
         "entry_fill": {
           "order_type": "market",
@@ -318,26 +333,28 @@
           "price_side": "open",
           "timestamp": "2024-01-02T03:00:00+00:00"
         },
-        "equity_at_entry": 99849.0,
+        "equity_at_entry": 99830.49,
         "equity_proportional_sizing": true,
         "execution_model": {
           "entry_price_side": "open",
           "intrabar_resolution": null,
           "lower_timeframe_replay": false,
           "market_order_timing": "next_bar_open",
+          "protective_gap_fill": "open",
           "same_bar_order": "stop_first",
+          "signal_exit_fill": "next_open",
           "stop_trigger_side": "bar_low_high",
           "take_profit_trigger_side": "bar_high_low"
         },
         "exit_reason": "signal",
         "sizing_stop_loss": 50.0
       },
-      "mfe": 15.60140625,
-      "net_pnl": -127.5274046875,
-      "pnl": -124.81125,
-      "pnl_pct": -7.170260338725511,
-      "quantity": 15.60140625,
-      "r_multiple": -0.12772026228354816,
+      "mfe": 15.598514178240741,
+      "net_pnl": -143.09466490668405,
+      "pnl": -140.38662760416668,
+      "pnl_pct": -8.047025149238477,
+      "quantity": 15.598514178240741,
+      "r_multiple": -0.14333763547081035,
       "stop_loss": 50.0,
       "symbol": "PARITY",
       "tags": [
@@ -350,17 +367,17 @@
       "entry_time": "2024-01-03T03:00:00+00:00",
       "exits": [
         {
-          "pnl": 778.6471147853168,
+          "pnl": 778.3810378524029,
           "price": 180.0,
-          "quantity": 13.660475697988014,
+          "quantity": 13.655807681621104,
           "reason": "signal",
-          "time": "2024-01-03T07:00:00+00:00"
+          "time": "2024-01-03T08:00:00+00:00"
         }
       ],
-      "fees": 3.069562068245184,
-      "holding_bars": 4,
+      "fees": 3.0688548637655972,
+      "holding_bars": 5,
       "id": 3,
-      "mae": -13.660475697988014,
+      "mae": -13.655807681621104,
       "meta": {
         "entry_fill": {
           "order_type": "market",
@@ -368,26 +385,28 @@
           "price_side": "open",
           "timestamp": "2024-01-03T03:00:00+00:00"
         },
-        "equity_at_entry": 99721.47,
+        "equity_at_entry": 99687.4,
         "equity_proportional_sizing": true,
         "execution_model": {
           "entry_price_side": "open",
           "intrabar_resolution": null,
           "lower_timeframe_replay": false,
           "market_order_timing": "next_bar_open",
+          "protective_gap_fill": "open",
           "same_bar_order": "stop_first",
+          "signal_exit_fill": "next_open",
           "stop_trigger_side": "bar_low_high",
           "take_profit_trigger_side": "bar_high_low"
         },
         "exit_reason": "signal",
         "sizing_stop_loss": 50.0
       },
-      "mfe": 792.3075904833048,
-      "net_pnl": 775.5775527170716,
-      "pnl": 778.6471147853168,
-      "pnl_pct": 46.158777322843065,
-      "quantity": 13.660475697988014,
-      "r_multiple": 0.7777437822889995,
+      "mfe": 792.036845534024,
+      "net_pnl": 775.3121829886372,
+      "pnl": 778.3810378524029,
+      "pnl_pct": 46.158756978482515,
+      "quantity": 13.655807681621104,
+      "r_multiple": 0.7777434395004589,
       "stop_loss": 50.0,
       "symbol": "PARITY",
       "tags": [

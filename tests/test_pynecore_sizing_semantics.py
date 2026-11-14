@@ -437,8 +437,18 @@ class TestFillParity:
         )
         assert trades[0].entry_price == pytest.approx(100.0)
 
-    def test_signal_exit_defaults_to_close(self, tmp_path):
-        config = _config(tmp_path)  # signal_exit_fill="close"
+    def test_signal_exit_defaults_to_next_open(self, tmp_path):
+        # Owner decision 2026-11-13: the default is next_open. The ledger leg is
+        # stamped on Pine's fill bar, so it prices at that bar's open.
+        config = _config(tmp_path)
+        trades = [_trade(exit_reason="signal")]
+        _apply_fill_parity(
+            trades, _frame(), config, {"spread_price_col": "spread_price"}
+        )
+        assert trades[0].exits[-1].price == pytest.approx(101.0)
+
+    def test_signal_exit_close_is_explicit_legacy_opt_in(self, tmp_path):
+        config = _config(tmp_path, signal_exit_fill="close")
         trades = [_trade(exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
@@ -474,10 +484,10 @@ class TestFillParity:
         trades = [_trade(exit_reason="signal")]
         before = (trades[0].entry_price, trades[0].exits[-1].price)
         _apply_fill_parity(trades, _frame(), config, {})
-        # close-fill re-price to the located bar close is still applied;
+        # next-open re-price to the located bar open is still applied;
         # entry without spread stays.
         assert trades[0].entry_price == pytest.approx(before[0])
-        assert trades[0].exits[-1].price == pytest.approx(101.2)
+        assert trades[0].exits[-1].price == pytest.approx(101.0)
 
     def test_uppercase_spread_column_still_prices_spread(self, tmp_path):
         """A-L6 parity with native/_vbt: frame columns load lowercased, so an

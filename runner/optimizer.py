@@ -29,7 +29,7 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.models import BacktestResult
+from shared.models import LEGACY_SIGNAL_EXIT_FILL, BacktestResult
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
@@ -1291,7 +1291,10 @@ def _runtime_config_from_base_result(result: BacktestResult) -> dict[str, Any]:
         "max_position_exposure_pct": value("max_position_exposure_pct"),
         "max_leverage": value("max_leverage"),
         "modeling_resolution": value("modeling_resolution", "open_close"),
-        "signal_exit_fill": value("signal_exit_fill", "close"),
+        # A base result that records no exit model is a legacy artifact made
+        # under the old same-bar close fill; re-optimising it under next_open
+        # would compare trials against base stats from a different model.
+        "signal_exit_fill": value("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
         "allow_fallback_stop": value("allow_fallback_stop", True),
         "reject_missing_stop": value("reject_missing_stop", False),
         "require_explicit_column_roles": value("require_explicit_column_roles", False),

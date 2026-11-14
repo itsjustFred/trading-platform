@@ -115,9 +115,12 @@ def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):
 
 
 class TestSignalExitConvention:
-    """D4 (A-M1): signal exits fill at the trigger bar's close, both engines."""
+    """Signal exits fill at the NEXT bar's open, both engines.
 
-    def test_exit_price_equals_trigger_close_on_both_engines(self, tmp_path: Path):
+    Owner decision 2026-11-13 supersedes D4 (A-M1) "Fill-zum-Trigger-Close".
+    """
+
+    def test_exit_price_equals_next_open_on_both_engines(self, tmp_path: Path):
         frame = _frame()
         text = _strategy_text(entry_bar=2, exit_bar=7)
         strategy_fn = _load_strategy_fn(text, tmp_path, "contract_exit")
@@ -128,13 +131,13 @@ class TestSignalExitConvention:
         assert len(native.trades) == 1
         assert len(vectorbt.trades) == 1
         expected_entry = float(frame["open"].iloc[3])  # next-open after bar 2
-        expected_exit = float(frame["close"].iloc[7])  # trigger close
+        expected_exit = float(frame["open"].iloc[8])  # next open after bar 7
         for result in (native, vectorbt):
             trade = result.trades[0]
             assert trade.entry_price == pytest.approx(expected_entry)
             assert trade.exits[0].price == pytest.approx(expected_exit)
             assert trade.exits[0].reason == "signal"
-        # Exit timestamps agree (same trigger bar, format-insensitive).
+        # Exit timestamps agree (same fill bar, format-insensitive).
         native_ts = pd.to_datetime(native.trades[0].exits[0].time, utc=True)
         vbt_ts = pd.to_datetime(vectorbt.trades[0].exits[0].time, utc=True)
         assert native_ts == vbt_ts
@@ -180,11 +183,11 @@ def generate_signals(df, params):
 
         assert len(native.trades) == 1
         assert len(vectorbt.trades) == 1
-        # Entry signal bar 6 fills at bar 7 open; exit signal bar 8 at close.
+        # Entry signal bar 6 fills at bar 7 open; exit signal bar 8 at bar 9 open.
         assert native.trades[0].entry_price == pytest.approx(float(frame["open"].iloc[7]))
         assert vectorbt.trades[0].entry_price == pytest.approx(float(frame["open"].iloc[7]))
-        assert native.trades[0].exits[0].price == pytest.approx(float(frame["close"].iloc[8]))
-        assert vectorbt.trades[0].exits[0].price == pytest.approx(float(frame["close"].iloc[8]))
+        assert native.trades[0].exits[0].price == pytest.approx(float(frame["open"].iloc[9]))
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(float(frame["open"].iloc[9]))
 
     def test_warmup_without_start_date_fails_loudly(self, tmp_path: Path):
         text = _strategy_text()

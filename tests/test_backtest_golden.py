@@ -559,13 +559,15 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
         "2024-01-02T03:00:00+00:00",
         "2024-01-03T03:00:00+00:00",
     ]
+    # Signal exits on bars 7/31/55 fill at the NEXT bar's open (owner decision
+    # 2026-11-13; the earlier golden filled at the signal bar's close 96/106/180).
     assert [trade.exits[-1].time for trade in result.trades] == [
-        "2024-01-01T07:00:00+00:00",
-        "2024-01-02T07:00:00+00:00",
-        "2024-01-03T07:00:00+00:00",
+        "2024-01-01T08:00:00+00:00",
+        "2024-01-02T08:00:00+00:00",
+        "2024-01-03T08:00:00+00:00",
     ]
     assert [trade.entry_price for trade in result.trades] == [104.0, 114.0, 123.0]
-    assert [trade.exits[-1].price for trade in result.trades] == [96.0, 106.0, 180.0]
+    assert [trade.exits[-1].price for trade in result.trades] == [95.0, 105.0, 180.0]
     assert result.stats["total_trades"] == 3
     assert result.stats["winners"] == 1
     assert result.stats["losers"] == 2

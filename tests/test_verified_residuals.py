@@ -72,10 +72,22 @@ def test_explicit_roles_support_noncanonical_dataframe_columns() -> None:
         indicators,
         {"open_signal": "entry", "close_signal": "exit"},
         require_explicit_roles=True,
+        # Legacy same-bar exit leg: this test is about role resolution, not
+        # exit timing (owner decision 2026-11-13 made the default next_open).
+        signal_exit_fill="close",
     )
     assert prepared["entries"].tolist() == [False, True, False]
     assert prepared["exits"].tolist() == [False, False, True]
     assert drawings == []
+    # Default (next_open): the declared exit leg shifts with the entry leg.
+    shifted, _ = _prepare_next_open_execution_data(
+        signals,
+        indicators,
+        {"open_signal": "entry", "close_signal": "exit"},
+        require_explicit_roles=True,
+    )
+    assert shifted["entries"].tolist() == [False, True, False]
+    assert shifted["exits"].tolist() == [False, False, False]  # signal on last bar
 
 
 def test_replay_uses_the_declared_finest_timeframe() -> None:

@@ -38,6 +38,7 @@ from sqlmodel.sql.expression import SelectOfScalar
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.logging import get_logger
 from shared.models import (
+    LEGACY_SIGNAL_EXIT_FILL,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -5458,7 +5459,7 @@ def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
         max_position_exposure_pct=runtime.get("max_position_exposure_pct"),
         max_leverage=runtime.get("max_leverage"),
         modeling_resolution=runtime.get("modeling_resolution", "main_timeframe"),
-        signal_exit_fill=runtime.get("signal_exit_fill", "close"),
+        signal_exit_fill=runtime.get("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
         allow_fallback_stop=runtime.get("allow_fallback_stop", True),
         reject_missing_stop=runtime.get("reject_missing_stop", False),
         require_explicit_column_roles=runtime.get("require_explicit_column_roles", False),
