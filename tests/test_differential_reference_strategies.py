@@ -4,7 +4,8 @@ Three textbook strategies are run on the native engine (``NativeAdapter``) and
 the vectorbt engine (``VectorbtAdapter``) and compared, trade by trade, with a
 reference implementation written in plain Python in THIS module. Nothing from
 ``runner/`` is imported for the reference (only the engines under test are
-imported to *run* them); the only data access is ``pandas.read_parquet``.
+imported to *run* them). Data access is ``pandas.read_parquet`` for the synthetic
+scenarios and ``pandas.read_csv`` for the one committed real-data slice.
 
 Strategies
 ----------
@@ -31,6 +32,7 @@ Conventions (``docs/cross-engine-backtest-contract.md``, ``docs/sizing-semantics
   exit's reason and over the other level. A stop and a target touched by the same
   bar resolve stop-first (no intrabar data). The fill bar itself can be stopped
   out (A-H1) but is never a gap (the position was opened at that very open).
+* The reference is LONG-only (a short leg needs a direction-aware guard here first).
 * A protective/sizing stop on the wrong side of the fill price (``stop >= fill``
   for a LONG) skips the trade.
 * Risk sizing: ``qty = equity*risk / |fill - stop|`` capped by the position
@@ -71,7 +73,6 @@ SMA_PATH = str(STRATEGIES_DIR / "diff_sma_cross.py")
 DONCHIAN_PATH = str(STRATEGIES_DIR / "diff_donchian.py")
 RSI_PATH = str(STRATEGIES_DIR / "diff_rsi_time_exit.py")
 
-REAL_DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "ohlcv"
 CAPITAL = 100_000.0
 #: The native risk engine's aggregate-exposure default also bounds one trade's risk.
 NATIVE_RISK_CEILING = 0.05
@@ -202,7 +203,7 @@ def ref_rsi_time_signals(
             if i - entry_bar >= hold_bars:
                 sig.exits[i] = True
                 entry_bar = None
-        elif _finite(rsi[i]) and rsi[i] < oversold:
+        elif _finite(rsi[i], close[i]) and rsi[i] < oversold:
             sig.entries[i] = True
             entry_bar = i
             if stop_pct > 0:
@@ -225,6 +226,9 @@ class RefConfig:
     native_risk_ceiling: bool = True
     #: honour protective stop / target levels as exits (False = vectorbt, no intrabar)
     protective: bool = True
+    #: skip a trade whose sizing stop is on the wrong side of the fill (LONG: stop >= fill);
+    #: False reproduces the documented vectorbt sizing-only defect
+    skip_wrong_side_stop: bool = True
     #: size an explicit-stop-less trade on the fill price (contract section 4)
     #: instead of the signal-bar close
     fallback_on_fill: bool = True
@@ -306,17 +310,21 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
 
     def size(fill: float, stop: float | None, signal_close: float) -> float:
         risk = min(cfg.risk_pct, NATIVE_RISK_CEILING) if cfg.native_risk_ceiling else cfg.risk_pct
-        if stop is None:
-            basis = fill if cfg.fallback_on_fill else signal_close
-            distance = basis * FALLBACK_STOP_PCT
-        else:
-            distance = abs(fill - stop)
+        # The documented native defect prices the WHOLE no-stop order (risk distance and
+        # notional cap) on the signal-bar close; the contract prices it on the fill.
+        basis = fill if (stop is not None or cfg.fallback_on_fill) else signal_close
+        distance = abs(fill - stop) if stop is not None else basis * FALLBACK_STOP_PCT
         qty = equity * risk / distance
-        return min(qty, equity * cfg.notional_cap / fill)
+        return min(qty, equity * cfg.notional_cap / basis)
 
     for i in range(n):
         if not _finite(o[i], h[i], lo[i], c[i]):
-            continue  # an unpriced bar cannot be traded on (see test_nan_bar_*)
+            # An unpriced bar cannot be traded on (see test_nan_bar_*), and an order
+            # whose fill bar it is expires: the contract fills at the NEXT bar's open,
+            # never at a later one.
+            if pending is not None and pending < i:
+                pending = None
+            continue
         # The open comes first: a gap exit, then the parked signal exit, and only
         # then the rest of the bar (intrabar touches).
         if position is not None and cfg.protective:
@@ -335,7 +343,8 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
             stop = sig.stop[s]
             sizing_stop = sig.sizing_stop[s] if stop is None else stop
             fill = o[i]
-            if sizing_stop is None or sizing_stop < fill:  # wrong-side stop => skip
+            wrong_side = sizing_stop is not None and sizing_stop >= fill
+            if sizing_stop is None or not wrong_side or not cfg.skip_wrong_side_stop:
                 position = _Open(i, fill, size(fill, sizing_stop, c[s]), stop, sig.take_profit[s])
                 protective_exit(i, gap_allowed=False)  # the fill bar can already be stopped out
         if sig.entries[i] and position is None and pending is None:
@@ -557,8 +566,10 @@ class Case:
         )
         return replace(base, **overrides)
 
-    def reference(self, *, vectorbt: bool = False) -> list[RefTrade]:
-        cfg = self.ref_cfg(protective=not vectorbt, native_risk_ceiling=not vectorbt)
+    def reference(self, *, vectorbt: bool = False, **overrides) -> list[RefTrade]:
+        cfg = self.ref_cfg(
+            protective=not vectorbt, native_risk_ceiling=not vectorbt, **overrides
+        )
         return ref_execute(self.frame, self.sig, cfg)
 
     def has_protective_exit(self) -> bool:
@@ -841,9 +852,7 @@ DON_SCENARIOS = {
         min_trades=2,
         expect=("end_of_data",),
     ),
-    "risk_exceeds_native_ceiling_not_tested": None,
 }
-del DON_SCENARIOS["risk_exceeds_native_ceiling_not_tested"]
 
 
 def _don_weekend():
@@ -934,17 +943,8 @@ RSI_SCENARIOS = {
             f.loc[s, "close"] - 0.5,
         ),
     ),
-    "time_exit_cut_by_end_of_data": lambda: (
-        _rsi_edge(
-            "rsi/time_exit_cut_by_end_of_data",
-            lambda f, s: f,
-            min_trades=1,
-            expect=("end_of_data",),
-        )
-        if False
-        else _rsi_truncated(
-            "rsi/end_of_data_before_time_exit", _rsi_entries[1] + 3, ("end_of_data",)
-        )
+    "time_exit_cut_by_end_of_data": lambda: _rsi_truncated(
+        "rsi/end_of_data_before_time_exit", _rsi_entries[1] + 3, ("end_of_data",)
     ),
     "entry_signal_on_last_bar": lambda: _rsi_truncated(
         "rsi/entry_signal_on_last_bar", _rsi_entries[1] + 1, (), min_trades=1
@@ -1068,7 +1068,15 @@ def test_donchian_wide_levels_native_and_vectorbt_agree(tmp_path, scenario):
 def _assert_finite_or_loud(run) -> None:
     try:
         result = run()
-    except Exception:  # noqa: BLE001 - failing closed is an acceptable outcome
+    except (ValueError, RuntimeError) as exc:
+        # Failing closed is acceptable, but only with the engines' documented refusal of an
+        # unpriced fill; any other failure (path drift, refactor, dependency) must surface.
+        # native: "... fill price nan is not finite and > 0 (unpriced bar)";
+        # vectorbt: "entry_price must be finite and > 0".
+        message = str(exc)
+        assert "must be finite" in message or "(unpriced bar)" in message, (
+            f"not the NaN-fill refusal: {exc!r}"
+        )
         return
     for t in result.trades:
         values = [t.entry_price, t.quantity, t.pnl, t.net_pnl, *(e.price for e in t.exits)]
@@ -1083,6 +1091,28 @@ def _nan_fill_sma():
 def _nan_fill_don():
     frame = _nan_bar(_quiet_fill(DON_BASE, _don_entries[0]), _don_entries[0] + 1)
     return don_case("don/nan_fill_bar", frame, min_trades=0)
+
+
+@pytest.mark.parametrize("engine", ["native", "vectorbt"])
+@pytest.mark.parametrize(
+    "frame_case",
+    [
+        pytest.param(lambda: sma_case("sma/nan_control", SMA_BASE), id="sma"),
+        pytest.param(
+            lambda: don_case(
+                "don/nan_control", _quiet_fill(DON_BASE, _don_entries[0]), min_trades=0
+            ),
+            id="donchian",
+        ),
+    ],
+)
+def test_nan_fill_control_runs_to_completion(tmp_path, engine, frame_case):
+    """Control for the NaN-fill test: the same scenario WITHOUT the unpriced bar must run
+    to completion, so a refusal in the mutated run is attributable to the NaN bar."""
+    case = frame_case()
+    runner = run_native if engine == "native" else run_vbt
+    result = runner(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
+    assert all(math.isfinite(p.equity) for p in result.equity_curve)
 
 
 @pytest.mark.parametrize(
@@ -1178,3 +1208,48 @@ def test_real_slice_vectorbt_matches_reference(tmp_path, scenario):
 @pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, agree=True))
 def test_real_slice_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, REAL_SCENARIOS[scenario]())
+
+
+# ───────────────────── reference / strategy NaN-bar handling (cubic #189) ──────────
+
+
+def test_rsi_strategy_never_signals_on_an_unpriced_close():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("diff_rsi_time_exit", RSI_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # Falling prices keep rsi below 30. The first entry is on bar 5 and its time exit on
+    # bar 9; bar 10 (flat again, rsi still < 30 because the average carries across the
+    # NaN) is unpriced and must not re-enter.
+    close = [100.0 - k for k in range(14)]
+    close[10] = NAN
+    frame = pd.DataFrame({"close": close})
+
+    entries, _exits, indicators, _ = module.generate_signals(frame, {"rsi_len": 5})
+
+    assert entries.iloc[5], "control: the decline signals on a priced bar"
+    assert not entries.iloc[10], "an unpriced bar must not emit an entry"
+    assert indicators["sizing_sl_price"][entries].notna().all()
+
+
+def test_reference_expires_an_order_whose_fill_bar_is_unpriced():
+    n = 6
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="D", tz="UTC"),
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.0] * n,
+        }
+    )
+    frame.loc[2, ["open", "high", "low", "close"]] = NAN
+    sig = Signals(
+        [i == 1 for i in range(n)], [False] * n, [None] * n, [None] * n, [None] * n
+    )
+
+    trades = ref_execute(frame, sig, RefConfig())
+
+    assert trades == [], "an order must not slip to the bar after an unpriced fill bar"

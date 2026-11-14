@@ -81,6 +81,8 @@ TICKERS = list(ASSETS.keys())
 # First trading session of the QuantConnect data history (log line 1:
 # "Algorithm starting warm up..." 2015-08-04). The LEAN SMA(200) hedge
 # indicator counts its 200 ready-bars from here.
+#: A sample covariance needs at least two observations (one gives NaN).
+MIN_COVARIANCE_OBSERVATIONS = 2
 QC_DATA_START = pd.Timestamp("2015-08-04")
 
 # QC's ``History(symbol, 130, Daily)`` is not bounded by the algorithm's data start: at the
@@ -568,14 +570,24 @@ def run_backtest(
         """
         return float(prices.at[date, ticker])
 
-    for i, reb_date in enumerate(rebalance_dates):
-        if reb_date not in returns.index or returns.index.get_loc(reb_date) < 1:
-            # No completed bar before the rebalance: nothing to decide on. Skip BEFORE the
-            # mark-to-market advances so no state is mutated, and make the skip visible.
+    # Attribution compares against the last rebalance that actually executed, not the
+    # previous scheduled date (which may have been skipped).
+    last_processed_reb_date: pd.Timestamp | None = None
+    for reb_date in rebalance_dates:
+        if (
+            reb_date not in returns.index
+            or returns.index.get_loc(reb_date) < MIN_COVARIANCE_OBSERVATIONS
+        ):
+            # Fewer completed return bars precede the rebalance than a sample covariance
+            # needs (one observation gives NaN weights): nothing valid to decide on. Skip
+            # BEFORE the mark-to-market advances so no state is mutated, and make the skip
+            # visible.
             logger.warning(
-                "Rebalance %s skipped: no completed return bar precedes it; the portfolio "
-                "stays in cash until the next rebalance",
+                "Rebalance %s skipped: no completed return bar precedes it, or fewer than %d "
+                "do (too few for a covariance); the portfolio is not rebalanced until the "
+                "next rebalance",
                 reb_date.date(),
+                MIN_COVARIANCE_OBSERVATIONS,
             )
             continue
         interval_start_portfolio_value = portfolio_value_at_rebalance
@@ -660,9 +672,9 @@ def run_backtest(
             # ``Portfolio[symbol].HoldingsValue / TotalPortfolioValue``).
             held_weight = current_weights.get(ticker, 0.0)
             prev_weight = drifted_weights[ticker]
-            if i > 0 and held_weight:
+            if last_processed_reb_date is not None and held_weight:
                 attribution_price = float(prices[ticker].loc[reb_date])
-                attribution_prev_price = float(prices[ticker].loc[rebalance_dates[i - 1]])
+                attribution_prev_price = float(prices[ticker].loc[last_processed_reb_date])
                 attribution_pnl = (
                     (attribution_price - attribution_prev_price)
                     / attribution_prev_price
@@ -722,6 +734,7 @@ def run_backtest(
 
         current_weights = next_weights
         rebalance_schedule[reb_date] = dict(current_weights)
+        last_processed_reb_date = reb_date
 
     # Build portfolio return series from held weights
     portfolio_value = _simulate_portfolio_value(
