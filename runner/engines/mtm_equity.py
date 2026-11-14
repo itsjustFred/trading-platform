@@ -29,9 +29,19 @@ shared multi-symbol replay):
   ``TradeEngine._finalize_position``), so from the final exit onward a trade
   contributes exactly its ``net_pnl`` and the final point equals
   ``initial_capital + sum(net PnL)`` — total return is unchanged by the switch.
-* Runs of unchanged equity with no open position are thinned to their end
-  points (lossless for the daily resampling every ratio uses) so sub-daily data
-  does not persist millions of flat points.
+* A bar whose close is NaN is not an observation: the last valid close stays
+  the mark (a bad bar must not book the open position's paper PnL as lost).
+* Runs of unchanged equity with no open position *at the running equity peak*
+  are thinned to their end points so sub-daily data does not persist millions
+  of flat points. This is lossless for the daily resampling every ratio uses
+  and for ``max_drawdown_pct``; underwater flat bars are kept, so
+  ``max_drawdown_duration`` (counted in curve points) stays counted in bars of
+  the underlying price series.
+* Exit legs inside a bar (e.g. a vectorbt intrabar stop at 10:30 within the
+  10:00 hourly bar) are realized at their own timestamp, which falls after the
+  grid point of the bar that contains them; that grid point still shows the
+  position marked at that bar's close. This only orders the points, the final
+  numbers are unaffected.
 """
 
 from __future__ import annotations
@@ -135,7 +145,10 @@ def build_mark_to_market_curve(
         if series is None:
             unmarked.append(symbol)
             continue
-        series = series[~series.index.duplicated(keep="last")].sort_index()
+        series = series[~series.index.duplicated(keep="last")].sort_index().dropna()
+        if series.empty:
+            unmarked.append(symbol)
+            continue
         clean[symbol] = series
 
     stamps: set[pd.Timestamp] = set(entry_times)
@@ -147,7 +160,7 @@ def build_mark_to_market_curve(
     # portfolio has a defined, constant equity on every bar of the window.
     for symbol, series in closes.items():
         if symbol not in clean and series is not None and not series.empty:
-            parts.append(pd.DatetimeIndex(series.index))
+            parts.append(pd.DatetimeIndex(series.dropna().index))
     grid = parts[0]
     for part in parts[1:]:
         grid = grid.union(part)
@@ -207,7 +220,10 @@ def build_mark_to_market_curve(
         same_prev = equity[1:-1] == equity[:-2]
         same_next = equity[1:-1] == equity[2:]
         interior_flat = flat[1:-1] & flat[:-2] & flat[2:]
-        keep[1:-1] = ~(same_prev & same_next & interior_flat)
+        # Underwater flat bars are kept: drawdown duration counts curve points,
+        # so thinning them would shorten the reported duration.
+        at_peak = equity >= np.maximum.accumulate(np.maximum(equity, capital))
+        keep[1:-1] = ~(same_prev & same_next & interior_flat & at_peak[1:-1])
 
     curve: list[EquityPoint] = [start_point]
     for ts, value in zip(grid[keep], equity[keep]):

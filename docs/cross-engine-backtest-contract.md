@@ -220,8 +220,11 @@ single- and multi-symbol alike):
   (total return is identical to the old realized-only curve);
 - multi-symbol runs build ONE portfolio curve from the shared-equity-replayed
   trades; per-symbol paths are never summed;
-- runs of unchanged equity with no open position are thinned to their end
-  points (lossless for the daily resampling every ratio uses);
+- a NaN close is not an observation: the last valid close stays the mark;
+- runs of unchanged equity with no open position at the running equity peak
+  are thinned to their end points (lossless for the daily resampling every
+  ratio uses and for drawdown); underwater flat bars are kept, so
+  `max_drawdown_duration` is counted in bars of the price series;
 - `meta.data["equity_curve_basis"]` is `mark_to_market`
   (`mark_to_market_partial` + `equity_curve_unmarked_symbols` when a traded
   symbol had no bars to mark against) or `realized_exit_timed` for artifacts
@@ -233,8 +236,11 @@ single- and multi-symbol alike):
 
 **Headline vs balance drawdown (MT5 reports both).** `max_drawdown_pct` is the
 *equity* drawdown on the MTM curve. `max_drawdown_realized_pct` (extras) is the
-*balance* drawdown of closed-trade net PnL replayed in exit order; it is always
-shallower than or equal to the headline figure.
+*balance* drawdown of closed-trade net PnL replayed in exit order. When
+positions never overlap it is shallower than or equal to the headline figure;
+with concurrent positions (multi-symbol, pyramiding) it can be deeper, because
+a realized loss can be offset on the equity curve by another position's
+unrealized gain. Consumers must not assume an ordering between the two.
 
 **Sizing is unaffected.** The MTM curve is reporting only: sizing keeps
 drawing on realized cash (§4, `TradeEngine._sizing_equity`).
