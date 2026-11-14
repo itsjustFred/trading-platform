@@ -198,7 +198,7 @@ def ref_rsi_time_signals(
             if i - entry_bar >= hold_bars:
                 sig.exits[i] = True
                 entry_bar = None
-        elif _finite(rsi[i]) and rsi[i] < oversold:
+        elif _finite(rsi[i], close[i]) and rsi[i] < oversold:
             sig.entries[i] = True
             entry_bar = i
             if stop_pct > 0:
@@ -303,7 +303,12 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
 
     for i in range(n):
         if not _finite(o[i], h[i], lo[i], c[i]):
-            continue  # an unpriced bar cannot be traded on (see test_nan_bar_*)
+            # An unpriced bar cannot be traded on (see test_nan_bar_*), and an order
+            # whose fill bar it is expires: the contract fills at the NEXT bar's open,
+            # never at a later one.
+            if pending is not None and pending < i:
+                pending = None
+            continue
         protective_exit(i)
         if pending is not None and pending < i:
             s = pending
@@ -1272,3 +1277,48 @@ def test_real_slice_vectorbt_matches_reference(tmp_path, scenario):
 @pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, REAL_XFAIL_NATIVE, agree=True))
 def test_real_slice_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, REAL_SCENARIOS[scenario]())
+
+
+# ───────────────────── reference / strategy NaN-bar handling (cubic #189) ──────────
+
+
+def test_rsi_strategy_never_signals_on_an_unpriced_close():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("diff_rsi_time_exit", RSI_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # Falling prices keep rsi below 30. The first entry is on bar 5 and its time exit on
+    # bar 9; bar 10 (flat again, rsi still < 30 because the average carries across the
+    # NaN) is unpriced and must not re-enter.
+    close = [100.0 - k for k in range(14)]
+    close[10] = NAN
+    frame = pd.DataFrame({"close": close})
+
+    entries, _exits, indicators, _ = module.generate_signals(frame, {"rsi_len": 5})
+
+    assert entries.iloc[5], "control: the decline signals on a priced bar"
+    assert not entries.iloc[10], "an unpriced bar must not emit an entry"
+    assert indicators["sizing_sl_price"][entries].notna().all()
+
+
+def test_reference_expires_an_order_whose_fill_bar_is_unpriced():
+    n = 6
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="D", tz="UTC"),
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.0] * n,
+        }
+    )
+    frame.loc[2, ["open", "high", "low", "close"]] = NAN
+    sig = Signals(
+        [i == 1 for i in range(n)], [False] * n, [None] * n, [None] * n, [None] * n
+    )
+
+    trades = ref_execute(frame, sig, RefConfig())
+
+    assert trades == [], "an order must not slip to the bar after an unpriced fill bar"
