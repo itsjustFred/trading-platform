@@ -161,6 +161,8 @@
     "p_value": 0.320491,
     "profit_factor": 2.7846,
     "risk_free_rate": 0.0,
+    "ruin_time": null,
+    "ruined": false,
     "sharpe_ratio": 4.9858,
     "sortino_ratio": 23.1256,
     "total_pnl": 497.05,

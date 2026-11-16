@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
@@ -280,12 +281,46 @@ class LiveSignal(BaseModel):
 
 #: Verdicts for `LiveExecution.actual_price_observed`.
 #:
-#: `observed`  a finite, positive price was read from the broker payload.
-#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
-#: `absent`    the broker stated no price at all on any field the resolver reads.
+#: `observed`             a finite, positive price was read for THIS fill from the broker payload.
+#: `derived`              a finite, positive price computed from broker-stated prices rather than
+#:                        stated for this fill: Alpaca's order-level `filled_avg_price` on a
+#:                        single-fill order, or a reconciled remainder derived from it (#124).
+#:                        Usable, but it is arithmetic, not a quote - hence its own label.
+#: `sent_bad`             the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`               the broker stated no price at all on any field the resolver reads.
+#: `derived_unavailable`  the broker stated the order's average, but this fill's own price could
+#:                        not be derived honestly (an unpriced sibling leg, or an implausible
+#:                        result). The QUANTITY is real and recorded; the stored price is 0.0.
 PRICE_OBSERVED = "observed"
+PRICE_DERIVED = "derived"
 PRICE_SENT_BAD = "sent_bad"
 PRICE_ABSENT = "absent"
+PRICE_DERIVED_UNAVAILABLE = "derived_unavailable"
+
+#: Verdicts that vouch for the stored price. `None` is a row written before the column existed.
+#: Anything else - a typo, a verdict added later without updating the readers - is not a price.
+USABLE_PRICE_VERDICTS = frozenset({PRICE_OBSERVED, PRICE_DERIVED})
+
+
+def execution_price_is_usable(price: Any, verdict: Any) -> bool:
+    """Whether a stored execution price may be used as a price.
+
+    Allowlist: only no verdict (legacy row), `observed` and `derived` qualify, so `sent_bad`,
+    `absent`, `derived_unavailable` and any unknown or misspelled verdict fail closed.
+    Also False for a missing, non-finite or non-positive number whatever its verdict - a legacy row
+    (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
+    """
+    if verdict is not None and (
+        not isinstance(verdict, str) or verdict not in USABLE_PRICE_VERDICTS
+    ):
+        return False
+    if price is None or isinstance(price, bool):
+        return False
+    try:
+        number = float(price)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
 
 
 class LiveExecution(BaseModel):
@@ -295,7 +330,14 @@ class LiveExecution(BaseModel):
     signal_id: UUID
     actual_price: float
     filled_qty: float
-    commission: float
+    # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
+    #
+    # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
+    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
+    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # purpose - an adapter must decide which of the two it has, rather than inherit a default
+    # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
+    commission: float | None
     timestamp: datetime
     broker_order_id: str
     dedupe_key: str | None = None
@@ -313,8 +355,9 @@ class LiveExecution(BaseModel):
     # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
     broker_fill_id: int | None = None
 
-    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
-    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    # Whether `actual_price` is a price the broker actually stated: `observed`, `sent_bad`,
+    # `absent`, and for prices computed from broker data `derived` / `derived_unavailable` (#124,
+    # see the verdict constants above).
     #
     # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
     # be read" produces the same stored value whether the broker omitted `executionPrice` or
@@ -323,9 +366,8 @@ class LiveExecution(BaseModel):
     # existed nothing said which rows those were.
     #
     # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
-    # one is `absent`. Nullable because rows written before this column existed, and adapters that
-    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
-    # `observed`.
+    # one is `absent`. Nullable because rows written before this column existed carry no verdict -
+    # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
 
@@ -373,6 +415,38 @@ class Portfolio(BaseModel):
 
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
+
+
+class TradeContractError(ValueError):
+    """A ``Trade`` violates its contract (direction outside ``VALID_DIRECTIONS``).
+
+    A ``ValueError`` subclass so existing callers keep working; readers of
+    stored results can catch exactly this instead of every ``ValueError``.
+    """
+
+# Spellings a strategy may use for a per-entry direction. Wider than
+# VALID_DIRECTIONS because signal frames commonly carry lower-case or +1/-1.
+_LONG_DIRECTION_SPELLINGS = ("LONG", "long", 1)
+_SHORT_DIRECTION_SPELLINGS = ("SHORT", "short", -1)
+
+
+def normalize_direction_value(value: Any) -> str:
+    """Map a strategy's per-entry direction value to LONG/SHORT, or raise (#123).
+
+    Anything outside the explicit spellings (NaN/None/``pd.NA`` at an entry
+    bar, ``0``, booleans incl. ``np.bool_``, ``"BUY"``, a typo) raises
+    ``ValueError`` instead of silently becoming LONG.
+    """
+    if isinstance(value, bool) or type(value).__name__ in ("bool", "bool_"):
+        raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
+    try:
+        if value in _SHORT_DIRECTION_SPELLINGS:
+            return "SHORT"
+        if value in _LONG_DIRECTION_SPELLINGS:
+            return "LONG"
+    except (TypeError, ValueError):  # e.g. pd.NA has no truth value
+        pass
+    raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
 
 
 # ─── Exit ────────────────────────────────────────────────────────────────────
@@ -448,6 +522,15 @@ class Trade:
     stop_loss: float | None = None
     take_profit: float | None = None
 
+    def __post_init__(self) -> None:
+        # #123: no case normalisation and no guessing. Anything outside
+        # VALID_DIRECTIONS used to read as SHORT through ``direction_sign``
+        # (and as LONG through several engine comparisons), flipping PnL sign.
+        if self.direction not in VALID_DIRECTIONS:
+            raise TradeContractError(
+                f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "id": self.id,
@@ -518,12 +601,27 @@ class Trade:
 
     @property
     def last_exit_time(self) -> str:
-        """Time of the final exit."""
-        return self.exits[-1].time if self.exits else self.entry_time
+        """Time of the final exit.
+
+        Raises ValueError for a trade without exits (#123): an open or
+        malformed trade has no exit time, and the old fallback to
+        ``entry_time`` made it look like a zero-duration closed trade.
+        """
+        if not self.exits:
+            raise ValueError(f"trade {self.id} has no exits; last_exit_time is undefined")
+        return self.exits[-1].time
 
     @property
     def direction_sign(self) -> int:
-        return 1 if self.direction == "LONG" else -1
+        # #123: exhaustive and strict - never default to SHORT for a value
+        # that is not in VALID_DIRECTIONS (including after a field mutation).
+        if self.direction == "LONG":
+            return 1
+        if self.direction == "SHORT":
+            return -1
+        raise TradeContractError(
+            f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+        )
 
 
 # ─── Equity point ────────────────────────────────────────────────────────────
@@ -711,13 +809,13 @@ class BacktestStats:
     avg_holding_bars: float | None = None
     max_drawdown_pct: float = 0.0
     max_drawdown_duration: int = 0
-    sharpe_ratio: float = 0.0
-    sortino_ratio: float = 0.0
-    calmar_ratio: float = 0.0
-    cagr: float = 0.0
+    sharpe_ratio: float | None = 0.0
+    sortino_ratio: float | None = 0.0
+    calmar_ratio: float | None = 0.0
+    cagr: float | None = 0.0
     total_return: float = 0.0
     psr: float | None = None
-    p_value: float = 1.0
+    p_value: float | None = 1.0
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -743,7 +841,10 @@ class BacktestStats:
         }
         if self.avg_holding_bars is not None:
             data["avg_holding_bars"] = self.avg_holding_bars
-        if self.psr is not None:
+        # PSR is omitted when never computed. A ruined run (#132) publishes it
+        # as an explicit null instead, so the payload says "undefined by ruin"
+        # rather than looking like an artifact that never carried the metric.
+        if self.psr is not None or self.extras.get("ruined") is True:
             data["psr"] = self.psr
         data.update(self.extras)
         return data

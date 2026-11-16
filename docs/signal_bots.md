@@ -126,9 +126,34 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.
 - Nachraten über `POLL_LIMIT` (20) hinaus werden nicht mehr still verworfen: der
-  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und den Grenz-IDs
-  (`last_seen_message_id`, `oldest_fetched_message_id`) geloggt. Snowflake-IDs
+  Poll paginiert **vorwärts** ab dem Cursor (`after=<letzte ID>`), jede Seite wird
+  nach Snowflake-ID chronologisch emittiert, und der Cursor rückt nur bis zur
+  neuesten tatsächlich emittierten Nachricht vor. Pro Poll werden höchstens
+  `MAX_BACKFILL_PAGES` (5) Seiten geholt; eine größere Lücke wird in den nächsten
+  Poll übernommen (im laufenden Betrieb geht dadurch nichts verloren) und als Warnung mit Kanal und den
+  Grenz-IDs (`last_seen_message_id`, `newest_fetched_message_id`, `pages_fetched`)
+  geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
+  numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Eine Seite ganz ohne
+  numerische ID kann keinen Folge-Request verankern: der Poll stoppt mit Warnung,
+  der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
+  bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+  Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
+  die N Nachrichten direkt nach der ID, im Array neueste zuerst
+  ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
+  "Returns an array of message objects from newest to oldest"). Dass es die
+  ältesten N nach der ID sind, steht dort nicht wörtlich; discord.py verlässt sich
+  aber genauso darauf: in der gepinnten Version `discord-py==2.7.1`
+  (`discord/abc.py`, `Messageable.history`, `_after_strategy`) setzt die
+  Vorwärts-Paginierung `after` auf `data[0]` (die neueste Nachricht der Seite) und
+  dreht die Seite für die chronologische Ausgabe um; das funktioniert nur, wenn
+  `after` die direkt folgenden Nachrichten liefert.
+  Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
+  neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
+  die älter als diese Seite sind, werden daher nicht nachgeholt und erreichen auch
+  die Altersprüfung (`max_signal_age_seconds`) nie. Bei langen Timeframes
+  (z. B. `1d`, Budget 2 Tage) kann so ein während eines Neustarts geposteter Exit
+  verloren gehen; ein persistierter Cursor ist als Follow-up offen.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf

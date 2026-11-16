@@ -29,7 +29,7 @@ from runner.universe_provenance import (
 )
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, OPTIMIZATIONS_DIR, normalize_timeframe
-from shared.models import BacktestResult
+from shared.models import BacktestResult, resolve_defined_stat
 from shared.strategy_registry import find_strategy_entry
 
 logger = logging.getLogger(__name__)
@@ -174,6 +174,27 @@ def _study_direction(target_metric: str) -> str:
     return direction
 
 
+def _penalize_trial(
+    trial: Any,
+    metric_name: str,
+    completed_trading_values: list[float],
+    target_metric: str,
+) -> float:
+    """Mark ``trial`` as penalised and return a value that can never win.
+
+    Shared by the no-trade and undefined-metric branches so both always set the
+    ``penalty_applied`` marker and the recorded value together.
+    """
+    trial.set_user_attr("penalty_applied", True)
+    trial.set_user_attr("metric_name", metric_name)
+    penalty = _no_trade_penalty_value(
+        completed_trading_values,
+        direction=_study_direction(target_metric),
+    )
+    trial.set_user_attr("metric_value", float(penalty))
+    return penalty
+
+
 def _no_trade_penalty_value(
     completed_trading_values: list[float],
     *,
@@ -211,7 +232,9 @@ def _best_trial_or_raise(
 
     No-trade (penalized) trials are excluded from selection (Cleanup 16-D1,
     AC 2): a study whose completed trials are ALL no-trade trials must not
-    hand back a no-trade parameter set as "best".
+    hand back a no-trade parameter set as "best". The same marker covers a
+    trial whose target metric was never measured (#132, e.g. a ruined run), so
+    a sentinel value can never win the study.
 
     ``direction`` must match the study's direction (#82): minimize-studies
     (p_value) rank lower-is-better, so the best trading trial is the MINIMUM.
@@ -231,9 +254,10 @@ def _best_trial_or_raise(
     ]
     if not trading_trials:
         raise RuntimeError(
-            "Every completed optimization trial was a no-trade trial — no "
-            "parameter region produced trades. Widen parameter_ranges or "
-            "relax position-sizing constraints before retrying."
+            "Every completed optimization trial was a no-trade trial or had an "
+            "undefined target metric — no parameter region produced a rankable "
+            "result. Widen parameter_ranges or relax position-sizing "
+            "constraints before retrying."
         )
     if direction == "minimize":
         return min(trading_trials, key=lambda trial: float(trial.value or 0.0))
@@ -550,14 +574,30 @@ def run_optimization(
             # The explicit penalty is strictly below the value of the worst
             # trading trial observed so far, and the marker stays on the trial
             # for downstream validation.
-            trial.set_user_attr("penalty_applied", True)
-            trial.set_user_attr("metric_name", _metric_key(config.target_metric, train_stats))
-            penalty = _no_trade_penalty_value(
+            return _penalize_trial(
+                trial,
+                _metric_key(config.target_metric, train_stats),
                 completed_trading_values,
-                direction=_study_direction(config.target_metric),
+                config.target_metric,
             )
-            trial.set_user_attr("metric_value", float(penalty))
-            return penalty
+
+        metric_key = _metric_key(config.target_metric, train_stats)
+        if train_stats.get("ruined") is True or (
+            resolve_defined_stat(train_stats, metric_key, None) is None
+        ):
+            # #132: a ruined run publishes its return metrics as None, and an
+            # undefined objective is unrankable - it is not a score of 0.0,
+            # which would beat every honest losing trial. A metric the producer
+            # names in `undefined_metrics` is unrankable even when a placeholder
+            # 0.0 is published (degenerate curves). A ruined run never ranks
+            # whatever the target: its drawdown can exceed 1.0 (negative equity),
+            # which would otherwise trip the percent-scale guard. It gets the same
+            # worst-trial penalty as a no-trade trial so it can never be
+            # selected as the best parameter set, and the study keeps going
+            # instead of aborting on the whole run.
+            return _penalize_trial(
+                trial, metric_key, completed_trading_values, config.target_metric
+            )
 
         raw_metric_value = _metric_value(train_stats, config.target_metric)
         metric_value = raw_metric_value
@@ -565,7 +605,6 @@ def run_optimization(
         # carry mandatory trade-count/drawdown haircuts so lucky sparse
         # runs cannot beat robust ones. Terms are recorded for transparency.
         metric_direction = _study_direction(config.target_metric)
-        metric_key = _metric_key(config.target_metric, train_stats)
         if config.risk_adjust_objective:
             metric_value, penalty_terms = _risk_adjusted_metric_value(
                 metric_value,
@@ -889,7 +928,9 @@ def _trade_net_pnl(trade: Any) -> float:
         return float("nan")
 
 
-def _trial_subperiod_pnl(result: BacktestResult, subperiods: list[dict[str, Any]]) -> dict[str, float]:
+def _trial_subperiod_pnl(
+    result: BacktestResult, subperiods: list[dict[str, Any]]
+) -> dict[str, float]:
     """Realized net PnL of one trial, per stability sub-period."""
     if not subperiods:
         return {}
@@ -1464,6 +1505,9 @@ def _run_risk_parity_covariance_optimization(
         "test_period": test_period,
         "train_stats": {
             "risk_parity_score": selection["best_score"],
+            # "structure_only" => Sharpe undefined (no datetime index) and
+            # excluded from the score; see runner/risk_parity_optimizer.py.
+            "risk_parity_score_basis": selection.get("score_basis"),
             "risk_parity_sharpe": selection["best_sharpe"],
             "risk_parity_volatility": selection["best_volatility"],
             "diversification_ratio": selection["best_diversification_ratio"],
@@ -1506,7 +1550,13 @@ def _asset_returns_frame_from_base_result(result: BacktestResult) -> pd.DataFram
     # NOTE (C3): the 0.0 here fills STRATEGY-equity days (a day without a
     # trade leaves equity flat, so 0% is exact — not fabricated market data).
     # Market-data bars use intersection instead (see above).
-    return pd.DataFrame(series).sort_index().fillna(0.0)
+    frame = pd.DataFrame(series).sort_index().fillna(0.0)
+    # #129 H8: these rows are per-TRADE equity changes, not a fixed-frequency
+    # time series, so no annualisation (sqrt(252)) is valid for them. Drop the
+    # timestamps so the risk-parity scorer sees an unknown observation
+    # frequency and reports Sharpe as undefined instead of inventing one.
+    # Weights/correlations do not need the index.
+    return frame.reset_index(drop=True)
 
 
 def _asset_returns_frame_from_market_data(

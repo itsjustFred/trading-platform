@@ -49,8 +49,9 @@ class DiscordChannelForbiddenError(RuntimeError):
         self.channel_id = channel_id
 
 
-#: Maximum backfill pages per poll when a gap is detected (B2: bursts beyond
-#: POLL_LIMIT and 429-windows must not lose signals incl. exits).
+#: Maximum forward backfill pages (REST requests) per poll. A gap larger than
+#: this is carried into the next poll instead of being dropped (B2: bursts
+#: beyond POLL_LIMIT and 429-windows must not lose signals incl. exits).
 MAX_BACKFILL_PAGES = 5
 
 #: ``auth_scheme`` values that mean "a Developer Portal BOT token" — sent with
@@ -265,6 +266,22 @@ def _safe_message_id_int(message_id: str) -> int | None:
         return int(message_id)
     except ValueError:
         return None
+
+
+def _message_sort_key(message: dict[str, Any]) -> tuple[bool, int]:
+    """Chronological snowflake order; a non-numeric (poison) id sorts last."""
+    parsed = _safe_message_id_int(str(message.get("id")))
+    return (parsed is None, parsed or 0)
+
+
+def _newest_numeric_id(page: Iterable[dict[str, Any]]) -> str | None:
+    """Highest numeric message id in ``page``, or ``None`` if none is numeric."""
+    values = [
+        value
+        for value in (_safe_message_id_int(str(m.get("id"))) for m in page)
+        if value is not None
+    ]
+    return str(max(values)) if values else None
 
 
 def _is_discord_auth_error(exc: BaseException | None) -> bool:
@@ -1240,61 +1257,149 @@ class DiscordSignalSource(BaseSignalSource):
 
         return body if isinstance(body, list) else []
 
-    def _page_reaches_cursor(
-        self, messages: list[dict[str, Any]], last_seen: str
-    ) -> bool:
-        """Whether a newest-first page reaches back to the tracked cursor."""
-        if not last_seen:
-            return True
-        last_int = _safe_message_id_int(last_seen)
-        if last_int is None:
-            return True
-        for message in messages:
-            oldest_int = _safe_message_id_int(str(message.get("id")))
-            if oldest_int is not None and oldest_int <= last_int:
-                return True
-        return False
+    def _advance_cursor(self, channel_id: str, newest: str) -> bool:
+        """Move the monotonic cursor forward to ``newest``.
+
+        Returns whether it moved. Within a running process the poll path only
+        advances it to a message that was fetched and emitted, and only ever
+        forward, so it never jumps past history still to be backfilled (startup
+        priming in ``_prime_cursors`` is the documented exception). A non-numeric
+        id (a poison message or a malformed response) cannot anchor the next
+        ``after`` request and reports ``False``.
+        """
+        newest_int = _safe_message_id_int(newest)
+        if newest_int is None:
+            return False
+        last_int = _safe_message_id_int(self._last_seen_message_ids.get(channel_id, ""))
+        if last_int is not None and newest_int <= last_int:
+            return False
+        self._last_seen_message_ids[channel_id] = newest
+        return True
 
     async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
-        first_page = await self._fetch_messages(channel_id)
-        if not first_page:
-            return
         seen = self._seen_ids.setdefault(channel_id, set())
         last_seen = self._last_seen_message_ids.get(channel_id, "")
-        # B2: bursts beyond POLL_LIMIT (and 429-windows) must not lose
-        # signals incl. exits — paginate backwards with `before` until a
-        # page overlaps the tracked cursor (bounded by MAX_BACKFILL_PAGES).
-        # A short page proves Discord returned everything (no gap), so only
-        # full pages trigger another fetch — otherwise REST traffic doubles
-        # on every quiet poll straight into the next 429.
-        pages = [first_page]
-        while (
-            len(pages[-1]) >= POLL_LIMIT
-            and not self._page_reaches_cursor(pages[-1], last_seen)
-            and len(pages) <= MAX_BACKFILL_PAGES
-        ):
-            oldest = str(pages[-1][-1].get("id"))
-            if _safe_message_id_int(oldest) is None:
-                break
-            older = await self._fetch_messages(channel_id, before=oldest)
-            if not older:
-                break
-            pages.append(older)
-        # Messages arrive newest-first; iterate oldest page first, reversed,
-        # so the queue receives them in chronological (oldest -> newest) order.
-        for page in reversed(pages):
-            for message in reversed(page):
+        if last_seen and _safe_message_id_int(last_seen) is None:
+            # A non-numeric cursor can never anchor `after=`: Discord would
+            # reject every request and the channel would ingest nothing
+            # forever. Drop it and re-seed from the newest page instead.
+            logger.warning(
+                "Discord cursor is not a numeric snowflake; re-priming",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "last_seen_message_id": last_seen,
+                    }
+                },
+            )
+            self._last_seen_message_ids.pop(channel_id, None)
+            last_seen = ""
+        if not last_seen:
+            # First poll without a cursor (the daemon primes the cursor in
+            # `_prime_cursors` first; this path is a direct/priming-less call).
+            # Keep the historical behaviour: read the newest page and adopt its
+            # newest id, without inventing a cursor to paginate from.
+            first_page = await self._fetch_messages(channel_id)
+            if not first_page:
+                return
+            for message in sorted(first_page, key=_message_sort_key):
                 await self._emit_polled_message(channel_id, message, seen, emit=emit)
-        newest = str(first_page[0].get("id"))
-        self._log_page_gap(channel_id, last_seen, first_page)
-        # B2: poison-message guard — a non-numeric id must never crash the
-        # cursor update into a tight crash loop (seen-set dedupes anyway).
-        newest_int = _safe_message_id_int(newest)
-        last_int = _safe_message_id_int(last_seen)
-        if not last_seen or (
-            newest_int is not None and (last_int is None or newest_int > last_int)
-        ):
-            self._last_seen_message_ids[channel_id] = newest
+            newest = _newest_numeric_id(first_page)
+            if newest is not None:
+                self._advance_cursor(channel_id, newest)
+            self._prune_seen_ids(channel_id, seen)
+            return
+
+        # B2: close the gap by paginating FORWARD from the cursor with `after`.
+        # Discord returns an `after` page holding the messages immediately
+        # after the anchor (the same contract discord.py's
+        # `history(after=...)` pagination relies on; see docs/signal_bots.md).
+        # Each page is emitted in snowflake-id order (the response order is
+        # not relied on) and each full page anchors the next request; a short
+        # page proves the newest message was reached. The per-poll page
+        # bound caps REST traffic and a larger gap is carried into the next
+        # poll, because the cursor advances only to the newest message actually
+        # emitted -- never past unfetched history. A 429 or error raised while
+        # fetching leaves every already-emitted page committed for exactly that
+        # reason.
+        anchor = last_seen
+        pages_fetched = 0
+        while pages_fetched < MAX_BACKFILL_PAGES:
+            page = await self._fetch_messages(channel_id, after=anchor)
+            pages_fetched += 1
+            if not page:
+                break
+            # Order by snowflake id instead of trusting the response order, so
+            # emission is chronological and the cursor is the true newest id
+            # even if Discord (or a proxy) hands the page back the other way
+            # round. A non-numeric (poison) id sorts last and never becomes
+            # the cursor: anchoring on it would re-request the same page on
+            # every poll and stall the channel behind one malformed message.
+            # `after` guarantees every id is above the anchor. A numeric id at
+            # or below it is stale (a server ignoring `after`): never emit it,
+            # since the seen-set may already have pruned it and a re-emit
+            # would be a duplicate trade signal.
+            anchor_int = _safe_message_id_int(anchor)
+            fresh = [
+                m
+                for m in page
+                if (parsed := _safe_message_id_int(str(m.get("id")))) is None
+                or anchor_int is None
+                or parsed > anchor_int
+            ]
+            if len(fresh) < len(page):
+                logger.warning(
+                    "Discord page contained ids at or below the cursor; dropped",
+                    extra={
+                        "data": {
+                            "channel_id": channel_id,
+                            "anchor": anchor,
+                            "dropped": len(page) - len(fresh),
+                        }
+                    },
+                )
+            ordered = sorted(fresh, key=_message_sort_key)
+            for message in ordered:
+                await self._emit_polled_message(channel_id, message, seen, emit=emit)
+            newest_in_page = _newest_numeric_id(fresh)
+            if newest_in_page is None:
+                # Nothing in the page can anchor another request; stop and let
+                # the next poll retry from the last good cursor. A page that is
+                # all non-numeric ids is logged, so a stalled channel is
+                # visible in ops instead of looking idle.
+                if fresh:
+                    logger.warning(
+                        "Discord page has no numeric message id; cursor not advanced",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "anchor": anchor,
+                                "page_size": len(page),
+                            }
+                        },
+                    )
+                break
+            if not self._advance_cursor(channel_id, newest_in_page):
+                # The page did not move past the cursor (a server ignoring
+                # `after`): stop instead of looping on the same page.
+                break
+            anchor = newest_in_page
+            if len(page) < POLL_LIMIT:
+                break
+        else:
+            # The bound was reached with a full last page: more may remain. The
+            # cursor stays at the newest emitted id and the gap is carried into
+            # the next poll, so nothing is lost.
+            self._log_backfill_deferred(
+                channel_id,
+                last_seen=last_seen,
+                newest_fetched=anchor,
+                pages_fetched=pages_fetched,
+            )
         self._prune_seen_ids(channel_id, seen)
 
     async def _emit_polled_message(
@@ -1308,12 +1413,10 @@ class DiscordSignalSource(BaseSignalSource):
         message_id = str(message.get("id"))
         if message_id in seen:
             return
-        # Dedupe is the cumulative seen-set's job alone. The monotonic
-        # cursor must NOT filter emits: after a burst larger than
-        # POLL_LIMIT the cursor sits above messages that were never
-        # fetched, and a cursor-based filter would drop them (the exact
-        # bug this class exists to prevent). The cursor only seeds `seen`
-        # at priming time.
+        # Dedupe is the cumulative seen-set's job alone. The monotonic cursor
+        # must NOT filter emits: an `after`-cursor page is newer than the
+        # cursor, and the seen-set also absorbs the boundary message a repeat
+        # page may hand back. The cursor only seeds `seen` at priming time.
         seen.add(message_id)
         if not emit:
             return
@@ -1368,40 +1471,34 @@ class DiscordSignalSource(BaseSignalSource):
         )
         seen.intersection_update(survivors)
 
-    def _log_page_gap(
+    def _log_backfill_deferred(
         self,
         channel_id: str,
+        *,
         last_seen: str,
-        messages: list[dict[str, Any]],
+        newest_fetched: str,
+        pages_fetched: int,
     ) -> None:
-        """Surface skipped history instead of silently skipping it.
+        """Surface a gap larger than the per-poll backfill bound.
 
-        The REST poll fetches at most POLL_LIMIT messages per call. When the
-        page does not reach back to the last seen message, messages between
-        the page boundary and the cursor were never fetched. The snowflake id
-        distance is NOT a message count (ids are not contiguous), so the log
-        reports the boundary ids rather than an invented count; ops can query
-        Discord's audit log for the exact volume if needed.
+        Forward pagination fetches contiguously from the cursor, so no message
+        between ``last_seen`` and ``newest_fetched`` is skipped. When the
+        per-poll page bound is reached while a full page still came back, the
+        remainder is carried into the next poll. Log it so a long drain stays
+        visible in ops instead of looking like a stalled channel.
         """
-        if not last_seen:
-            return
-        oldest = str(messages[-1].get("id"))
-        try:
-            if int(oldest) <= int(last_seen):
-                # The page overlaps history we already tracked: nothing skipped.
-                return
-        except ValueError:
-            return
         logger.warning(
-            "Discord poll gap detected; messages between the last seen id and "
-            "the oldest fetched id were not polled",
+            "Discord backfill reached the per-poll page bound with a full page; "
+            "more messages may remain and are fetched on the next poll",
             extra={
                 "data": {
                     "bot_name": self.bot_name,
                     "service_id": self.service_id,
                     "channel_id": channel_id,
                     "last_seen_message_id": last_seen,
-                    "oldest_fetched_message_id": oldest,
+                    "newest_fetched_message_id": newest_fetched,
+                    "pages_fetched": pages_fetched,
+                    "max_backfill_pages": MAX_BACKFILL_PAGES,
                     "poll_limit": POLL_LIMIT,
                 }
             },
@@ -1447,7 +1544,9 @@ class DiscordSignalSource(BaseSignalSource):
             for message in messages:
                 message_id = str(message.get("id"))
                 seen.add(message_id)
-            self._last_seen_message_ids[channel_id] = str(messages[0].get("id"))
+            newest = _newest_numeric_id(messages)
+            if newest is not None:
+                self._last_seen_message_ids[channel_id] = newest
 
     async def _poll_loop(self) -> None:
         while not self._paused:

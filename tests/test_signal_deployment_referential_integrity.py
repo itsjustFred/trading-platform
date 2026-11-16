@@ -166,17 +166,26 @@ def test_the_smoke_helper_initialises_the_database_before_querying(isolated_db_n
     """The worker mode reaches the helper before anything else touches the database.
 
     On a fresh data dir the tables do not exist yet, so without `init_db()` the first SELECT raises
-    "no such table" - a failure that names the wrong problem. The call still fails, by design: the
-    account row is absent and `live_deployments.account_id` carries a foreign key, so writing the
-    deployment would create a second orphan.
+    "no such table" - a failure that names the wrong problem.
+    The account row is absent too, so the helper registers the demo account instead of failing
+    with a bare FOREIGN KEY error.
     """
-    from sqlalchemy.exc import IntegrityError
-
     database, engine, _data_dir = isolated_db_no_schema
     from scripts.live_smoke import _ensure_ctrader_smoke_deployment
 
-    with pytest.raises(IntegrityError):
-        _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+    deployment_id = _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="XAUUSD")
+    assert deployment_id
+
+    account = database.get_live_account("44695443")
+    assert account is not None
+    assert account.broker == "ctrader"
+    assert account.ctid == "44695443"
+    assert account.name == "cTrader demo 44695443 (registered by live_smoke)", (
+        "the smoke-registered row must carry its marker, or it reads as a plain account id and "
+        "the operator cannot tell which tool wrote it"
+    )
+    with database.get_session() as session:
+        assert session.get(database.LiveAccountModel, "44695443").is_demo is True
 
     with engine.connect() as connection:
         tables = {
@@ -730,3 +739,86 @@ def test_init_db_refuses_to_adopt_a_parent_of_a_different_account(isolated_db_sa
 
     with pytest.raises(RuntimeError, match="belongs to account"):
         database.init_db()
+
+
+def test_the_smoke_helper_does_not_modify_an_existing_account_row(isolated_db_sandbox) -> None:
+    """An account discovery already registered keeps its name and flags."""
+    database, _engine, _data_dir = isolated_db_sandbox
+    from scripts.live_smoke import _ensure_ctrader_smoke_deployment
+
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="44695443", broker="ctrader", name="Fusion Live", is_demo=False
+            )
+        )
+        session.commit()
+
+    _ensure_ctrader_smoke_deployment(account_id="44695443", symbol="EURUSD")
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False
+
+
+def test_the_create_only_registration_leaves_an_existing_row_alone(isolated_db_sandbox) -> None:
+    """Registering an account is create-only: an existing row is returned as it was.
+
+    ``ensure_live_account`` is an upsert, so calling it after a separate existence check left a
+    window in which a row discovery inserted in between was renamed and re-flagged by the smoke.
+    """
+    database, _engine, _data_dir = isolated_db_sandbox
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id="44695443", broker="ctrader", name="Fusion Live", is_demo=False
+            )
+        )
+        session.commit()
+
+    registered = database.register_live_account_if_absent(
+        "44695443", "ctrader", name="cTrader demo 44695443", ctid="44695443", is_demo=True
+    )
+
+    assert registered is False
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False
+
+
+def test_the_create_only_registration_survives_a_row_appearing_mid_registration(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """Fault injection: discovery inserts the row after the check, before the write.
+
+    The insert must fail rather than overwrite the row discovery wrote, and the failure must
+    surface so the smoke stops before any order.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    database, _engine, _data_dir = isolated_db_sandbox
+    original_create = database._create_live_account_record
+
+    def discovery_wins_the_race(session, account_id, broker, **kwargs):
+        with database.get_session() as other:
+            other.add(
+                database.LiveAccountModel(
+                    id=account_id, broker=broker, name="Fusion Live", is_demo=False
+                )
+            )
+            other.commit()
+        return original_create(session, account_id, broker, **kwargs)
+
+    monkeypatch.setattr(database, "_create_live_account_record", discovery_wins_the_race)
+
+    with pytest.raises(IntegrityError):
+        database.register_live_account_if_absent(
+            "44695443", "ctrader", name="cTrader demo 44695443", ctid="44695443", is_demo=True
+        )
+
+    with database.get_session() as session:
+        row = session.get(database.LiveAccountModel, "44695443")
+    assert row.name == "Fusion Live"
+    assert row.is_demo is False

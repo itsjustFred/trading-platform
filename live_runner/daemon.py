@@ -67,6 +67,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -1167,21 +1168,38 @@ def _mint_signal_idempotency_key(
     producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
     if not producer_stamp:
         return
-    key_material = "|".join(
-        [
-            str(deployment.id),
-            str(signal.symbol).upper(),
-            str(signal.action).lower(),
-            repr(float(signal.entry_price)),
-            repr(signal.stop_loss),
-            repr(signal.take_profit),
-            str(signal.timeframe),
-            str(producer_stamp),
-        ]
-    )
-    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
-        :32
-    ]
+    # The same producer event can be redelivered with its timestamp spelled differently (``Z``
+    # vs ``+00:00``, aware vs naive, another UTC offset). Key on the instant, not the spelling,
+    # without rounding it: distinct instants - even a microsecond apart - keep distinct keys.
+    # Text that is not a time keeps its verbatim form.
+    raw_stamp = str(producer_stamp)
+    canonical_stamp = canonical_utc_timestamp(producer_stamp) or raw_stamp
+
+    def _key(stamp: str) -> str:
+        key_material = "|".join(
+            [
+                str(deployment.id),
+                str(signal.symbol).upper(),
+                str(signal.action).lower(),
+                repr(float(signal.entry_price)),
+                repr(signal.stop_loss),
+                repr(signal.take_profit),
+                str(signal.timeframe),
+                stamp,
+            ]
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:32]
+
+    metadata["idempotency_key"] = _key(canonical_stamp)
+    if canonical_stamp != raw_stamp:
+        # Signals persisted before #127 were keyed on the verbatim spelling. A replay of one of
+        # them right after the upgrade (a restart is exactly when producers replay) must still
+        # find that row instead of placing a second broker order, so the pre-#127 key travels
+        # along as a lookup-only fallback. It is never stored as the row's own key.
+        # Bound: this only dedupes a replay that carries the SAME spelling as the stored
+        # pre-#127 row. A replay re-spelled differently (``Z`` stored, ``+00:00`` replayed)
+        # misses it; closing that needs a data migration of stored keys and is not done here.
+        metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
 def _trade_signal_to_live_signal(
@@ -3002,6 +3020,59 @@ async def _poll_balances(
         await asyncio.sleep(interval_seconds)
 
 
+#: How often unknown commissions are backfilled (#124). Alpaca posts crypto fees once a day, so an
+#: hourly pass prices a posted day within the hour and costs a handful of REST calls.
+COMMISSION_BACKFILL_INTERVAL_SECONDS = 3600
+#: One hung broker must not stall the pass for the others.
+COMMISSION_BACKFILL_TIMEOUT_SECONDS = 120.0
+
+
+async def _backfill_commissions_once(adapters: dict[str, BaseLiveAdapter]) -> None:
+    """Run every ready adapter's commission backfill once; a failure is logged, never raised."""
+    ready = [
+        (account_id, adapter)
+        for account_id, adapter in list(adapters.items())
+        if _adapter_is_ready(adapter)
+    ]
+
+    async def _backfill_one(account_id: str, adapter: BaseLiveAdapter) -> None:
+        try:
+            updated = await asyncio.wait_for(
+                adapter.backfill_commissions(), timeout=COMMISSION_BACKFILL_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Commission backfill failed; commissions stay unknown until the next pass",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc) or type(exc).__name__,
+                    }
+                },
+            )
+            return
+        if updated:
+            logger.info(
+                "Backfilled commissions",
+                extra={"data": {"account_id": account_id, "executions": updated}},
+            )
+
+    await asyncio.gather(*(_backfill_one(account_id, adapter) for account_id, adapter in ready))
+
+
+async def _backfill_commissions_loop(
+    adapters: dict[str, BaseLiveAdapter],
+    *,
+    interval_seconds: int = COMMISSION_BACKFILL_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        await _backfill_commissions_once(adapters)
+        await asyncio.sleep(interval_seconds)
+
+
 def _deployment_task_name(account_id: str, kind: str) -> str:
     return f"deployment-{kind}-{account_id}"
 
@@ -4023,8 +4094,11 @@ async def run_daemon(
         name="service-sync-loop",
     )
     balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+    commission_task = asyncio.create_task(
+        _backfill_commissions_loop(active_adapters), name="commission-backfill"
+    )
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task)
+        await asyncio.gather(sync_task, service_sync_task, balance_task, commission_task)
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -4041,12 +4115,16 @@ async def run_daemon(
         # B2: cancel EVERYTHING (sync + balance loops leaked before) and
         # await the cancels — fire-and-forget cancel() leaves pending tasks
         # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task):
+        for task in (sync_task, service_sync_task, balance_task, commission_task):
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(
-                sync_task, service_sync_task, balance_task, return_exceptions=True
+                sync_task,
+                service_sync_task,
+                balance_task,
+                commission_task,
+                return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):
             if not task.done():

@@ -191,9 +191,24 @@ def _metric_delta(
     if reference is None or platform is None:
         return MetricDelta(metric, reference, platform, None, None, "missing metric")
     absolute = platform - reference
-    denominator = max(abs(reference), abs(platform))
-    relative = absolute / denominator if denominator else 0.0
-    return MetricDelta(metric, reference, platform, absolute, relative)
+    if reference == 0.0:
+        if platform == 0.0:
+            return MetricDelta(metric, reference, platform, absolute, 0.0)
+        # #128: no proportion exists for a zero reference; report the absolute
+        # delta and leave the relative one undefined rather than inventing one.
+        return MetricDelta(
+            metric,
+            reference,
+            platform,
+            absolute,
+            None,
+            "relative delta is undefined for a zero reference",
+        )
+    # #128: signed drift against the reference magnitude — max(|reference|,
+    # |platform|) halved real drift (100 -> 200 read as 50%, not 100%).
+    return MetricDelta(
+        metric, reference, platform, absolute, absolute / abs(reference)
+    )
 
 
 def _normalize_mt5_stats(

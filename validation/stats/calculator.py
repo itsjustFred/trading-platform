@@ -156,7 +156,9 @@ def _trade_span_years(trades: List[Trade]) -> float | None:
         return None
     for trade in trades:
         trade_dated = False
-        for raw in (trade.entry_time, trade.last_exit_time):
+        # #123: a trade without exits has no exit time (``last_exit_time``
+        # raises); it is dated by its entry alone.
+        for raw in (trade.entry_time, trade.last_exit_time if trade.exits else None):
             if raw is None:
                 continue
             ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
@@ -194,7 +196,7 @@ def _daily_net_series(
     day_totals: dict[str, float] = {}
     span: list[pd.Timestamp] = []
     for trade in trades:
-        for raw in (trade.entry_time, trade.last_exit_time):
+        for raw in (trade.entry_time, trade.last_exit_time if trade.exits else None):
             if raw is None:
                 continue
             ts = pd.to_datetime(str(raw), utc=True, errors="coerce")
@@ -207,6 +209,10 @@ def _daily_net_series(
     if end <= start:
         return None
     for trade in trades:
+        if not trade.exits:
+            # #123: no exit, so no exit day to book on (previously the entry
+            # time was silently used as a fake exit time).
+            continue
         exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
         if pd.isna(exit_ts):
             return None

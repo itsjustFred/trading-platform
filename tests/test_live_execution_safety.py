@@ -559,7 +559,11 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-123",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     assert asyncio.run(adapter.submit_order(first, qty=1.0)) == _alpaca_order_id("order-1")
@@ -585,7 +589,11 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-timeout"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-timeout",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
     submit_calls: list[Any] = []
     lookup_calls: list[str] = []
@@ -631,7 +639,11 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 2, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-persisted"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-persisted",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     def _forbidden(*_args, **_kwargs):
@@ -2412,10 +2424,13 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
 
     _client = SimpleNamespace(
@@ -2439,6 +2454,8 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     assert str(saved[0][0].signal_id) == signal_id
     assert saved[0][1] == 25.0
+    # #124: the broker's cumulative average goes to the save, which derives the remainder price.
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
@@ -2473,7 +2490,9 @@ def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     monkeypatch.setattr(
-        module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
+        module,
+        "save_live_execution_up_to_cumulative",
+        lambda execution, _cap, **_kwargs: execution.filled_qty,
     )
     broker_queries: list[str] = []
     adapter._trading_client = SimpleNamespace(
@@ -2515,10 +2534,13 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         module, "get_live_signal_filled_qty", lambda _signal_id: 1.0, raising=False
     )
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
@@ -2539,6 +2561,7 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         f"alpaca:order:{_alpaca_order_id('partial-recovery')}:reconciled:3.0"
     )
     assert saved[0][1] == 3.0
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 @pytest.mark.parametrize("local_filled_qty", [3.0, 4.0])
@@ -4725,3 +4748,249 @@ def test_create_live_deployment_validates_against_the_broker_identity(
         database.create_live_deployment(
             deployment.model_copy(update={"id": str(uuid4()), "account_id": "acc-2"})
         )
+
+
+# ── Alpaca bracket entries: whole shares and penny-grid SL/TP ─────────────────
+#
+# Reproduced on Alpaca paper (2026-11-13) through daemon.prepare_order_with_risk:
+#   - TP 369.04400000000004 -> HTTP 422 "sub-penny increment does not fulfill
+#     minimum pricing criteria"
+#   - qty 7.0422 (risk-sized) -> HTTP 422 "fractional orders must have
+#     order_class=simple"
+# With qty 7 and SL/TP 347.75 / 369.04 the same bracket was accepted.
+
+
+def _alpaca_bracket_adapter(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    submitted: list[Any] = []
+    saved: list[LiveSignal] = []
+
+    def _submit_order(*, order_data):
+        submitted.append(order_data)
+        return SimpleNamespace(id=_alpaca_order_id("bracket-1"))
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=_submit_order,
+    )
+
+    def _save(signal):
+        saved.append(signal)
+        return str(signal.id), True
+
+    monkeypatch.setattr(module, "save_live_signal", _save)
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda sid, oid: True)
+    return adapter, submitted, saved
+
+
+def _alpaca_entry(action: str, price: float, sl: float, tp: float) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action=action,
+        theoretical_price=price,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": sl, "take_profit": tp},
+    )
+
+
+def test_alpaca_bracket_entry_floors_qty_and_rounds_levels_toward_entry(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75300000000004, 369.04400000000004)
+
+    asyncio.run(adapter.submit_order(signal, qty=7.045195857404557))
+
+    request = submitted[0]
+    assert float(request.qty) == 7.0
+    # Buy: the stop rounds UP (toward the entry, less risk than sized), the
+    # target rounds DOWN (never beyond the requested level).
+    assert float(request.stop_loss.stop_price) == 347.76
+    assert float(request.take_profit.limit_price) == 369.04
+    # The persisted signal records exactly what was submitted.
+    assert saved[0].metadata["qty"] == 7.0
+    assert saved[0].metadata["explicit_qty"] == 7.0
+    assert saved[0].metadata["stop_loss"] == 347.76
+    assert saved[0].metadata["take_profit"] == 369.04
+
+
+def test_alpaca_short_bracket_entry_rounds_levels_toward_entry(monkeypatch):
+    adapter, submitted, _saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("sell", 100.0, 102.0049, 95.0051)
+
+    asyncio.run(adapter.submit_order(signal, qty=3.9))
+
+    request = submitted[0]
+    assert float(request.qty) == 3.0
+    assert float(request.stop_loss.stop_price) == 102.0
+    assert float(request.take_profit.limit_price) == 95.01
+
+
+def test_alpaca_sub_dollar_bracket_uses_four_decimal_tick(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 0.5, 0.480012345, 0.540098765)
+
+    asyncio.run(adapter.submit_order(signal, qty=1000.4))
+
+    request = submitted[0]
+    assert saved[0].metadata["explicit_qty"] == 1000.0
+    assert float(request.stop_loss.stop_price) == 0.4801
+    assert float(request.take_profit.limit_price) == 0.5400
+
+
+def test_alpaca_bracket_entry_below_one_share_is_refused_before_persistence(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75, 369.04)
+
+    submission = adapter.submit_order(signal, qty=0.7)
+    with pytest.raises(ValueError, match="below one whole share"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_bracket_level_within_one_tick_of_entry_is_refused(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 99.996, 110.0)
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="within one tick"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_whole_share_on_grid_entry_is_unchanged(monkeypatch):
+    adapter, submitted, _saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75, 369.04)
+
+    asyncio.run(adapter.submit_order(signal, qty=7.0))
+
+    request = submitted[0]
+    assert float(request.qty) == 7.0
+    assert float(request.stop_loss.stop_price) == 347.75
+    assert float(request.take_profit.limit_price) == 369.04
+
+
+@pytest.mark.parametrize(
+    ("action", "stop", "take"),
+    [
+        ("buy", 98.0, 95.0),  # take profit below a buy's entry
+        ("buy", 101.0, 110.0),  # stop above a buy's entry
+        ("sell", 102.0, 105.0),  # take profit above a sell's entry
+        ("sell", 99.0, 95.0),  # stop below a sell's entry
+        ("buy", 98.0, 100.0),  # take profit exactly at the entry
+    ],
+)
+def test_alpaca_bracket_level_on_wrong_side_is_refused_before_persistence(
+    monkeypatch, action, stop, take
+):
+    # A wrong-side leg is an instantly marketable order (or a broker 422 after the
+    # signal row was saved, which wedges redelivery); refuse it before either.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry(action, 100.0, stop, take)
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="wrong side of the entry"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"take_profit": 110.0},  # missing stop
+        {"stop_loss": 95.0},  # missing take profit
+        {"stop_loss": float("nan"), "take_profit": 110.0},
+        {"stop_loss": 95.0, "take_profit": float("inf")},
+        {"stop_loss": -1.0, "take_profit": 110.0},
+    ],
+)
+def test_alpaca_missing_or_invalid_sl_tp_is_refused_before_persistence(monkeypatch, metadata):
+    # Refusing after save_live_signal would wedge redelivery (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0).model_copy(update={"metadata": metadata})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0)
+    signal = signal.model_copy(update={"metadata": {**signal.metadata, "extended_hours": True}})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="Extended-hours"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD"])
+def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="crypto"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_unbounded_tp_entry_rounds_stop_and_submits_stop_only_oto(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.003, 110.0).model_copy(
+        update={
+            "metadata": {
+                "stop_loss": 95.003,
+                "take_profit_policy": "unbounded_exit_on_opposite_signal",
+            }
+        }
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=2.7))
+
+    request = submitted[0]
+    assert str(getattr(request.order_class, "value", request.order_class)).lower() == "oto"
+    assert float(request.qty) == 2.0
+    assert float(request.stop_loss.stop_price) == 95.01
+    assert getattr(request, "take_profit", None) is None
+    assert saved[0].metadata["stop_loss"] == 95.01
+    assert saved[0].metadata["explicit_qty"] == 2.0
+    assert "take_profit" not in saved[0].metadata
+
+
+def test_alpaca_exit_only_entry_passes_through_normalization_unchanged(monkeypatch):
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+
+    async def _positions():
+        return [{"symbol": "AAPL", "qty": "10"}]
+
+    monkeypatch.setattr(adapter, "get_positions", _positions)
+    signal = _alpaca_entry("sell", 100.0, 95.0, 110.0).model_copy(
+        update={"metadata": {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}}
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=3.9))
+
+    request = submitted[0]
+    assert float(request.qty) == 3.9
+    assert getattr(request, "stop_loss", None) is None
+    assert saved[0].metadata == {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}

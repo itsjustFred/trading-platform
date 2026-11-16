@@ -70,6 +70,15 @@ def compute_stats(
     if not trades and not equity_curve:
         return _empty_stats(risk_free_rate)
 
+    ruined = False
+    ruin_time: str | None = None
+    if equity_curve:
+        # #132: at the first non-positive equity point the account is gone, so
+        # every metric below must see the curve only up to and including it.
+        # Dropping the later returns instead (the old behaviour) measured the
+        # pre-ruin subset and let a blown-up strategy publish a good Sharpe.
+        equity_curve, ruined, ruin_time = _truncate_at_ruin(equity_curve)
+
     if trades:
         # #84: net-based stats — gross t.pnl ignores fees and flatters every
         # selection metric. Prefer stored net_pnl, else subtract stored fees.
@@ -117,13 +126,13 @@ def compute_stats(
     # Equity-curve-based metrics
     max_drawdown_pct = 0.0
     max_drawdown_duration = 0
-    sharpe_ratio = 0.0
-    sortino_ratio = 0.0
+    sharpe_ratio: float | None = 0.0
+    sortino_ratio: float | None = 0.0
     calmar_ratio = 0.0
     cagr = 0.0
     total_return = 0.0
     psr = None  # Probabilistic Sharpe Ratio
-    p_value = 1.0
+    p_value: float | None = 1.0
     undefined_metrics: set[str] = set()
     return_frequency = "none"
     return_frequency_reason: str | None = None
@@ -234,6 +243,26 @@ def compute_stats(
             }
         )
 
+    if ruined:
+        # #132: the return series ends at zero, so it describes no tradable
+        # path. Publishing ratios measured on the pre-ruin subset is exactly
+        # the failure this flag exists to prevent; `undefined_metrics` names
+        # them so a consumer cannot read a null as "not computed yet".
+        #
+        # CAGR and Calmar are undefined too: an account that reached zero has
+        # no annualised growth rate. Publishing the 0.0 that the CAGR guard
+        # returns would rank a liquidated run above every honest losing run
+        # for a consumer that maximises CAGR or Calmar.
+        undefined_metrics.update(
+            {"sharpe_ratio", "sortino_ratio", "psr", "p_value", "cagr", "calmar_ratio"}
+        )
+        sharpe_ratio = None
+        sortino_ratio = None
+        psr = None
+        p_value = None
+        cagr = None
+        calmar_ratio = None
+
     return BacktestStats(
         total_trades=total_trades,
         winners=win_count,
@@ -248,13 +277,13 @@ def compute_stats(
         avg_holding_bars=round(avg_holding_bars, 1) if avg_holding_bars is not None else None,
         max_drawdown_pct=round(float(max_drawdown_pct), 6),
         max_drawdown_duration=max_drawdown_duration,
-        sharpe_ratio=round(float(sharpe_ratio), 4),
-        sortino_ratio=round(float(sortino_ratio), 4),
-        calmar_ratio=round(float(calmar_ratio), 4),
-        cagr=round(float(cagr), 6),
+        sharpe_ratio=round(float(sharpe_ratio), 4) if sharpe_ratio is not None else None,
+        sortino_ratio=round(float(sortino_ratio), 4) if sortino_ratio is not None else None,
+        calmar_ratio=round(float(calmar_ratio), 4) if calmar_ratio is not None else None,
+        cagr=round(float(cagr), 6) if cagr is not None else None,
         total_return=round(float(total_return), 6),
         psr=round(float(psr), 4) if psr is not None else None,
-        p_value=round(float(p_value), 6),
+        p_value=round(float(p_value), 6) if p_value is not None else None,
         extras={
             "risk_free_rate": float(risk_free_rate),
             "undefined_metrics": sorted(undefined_metrics),
@@ -262,6 +291,8 @@ def compute_stats(
                 return_frequency, return_frequency_reason
             ),
             "duplicate_equity_timestamps": duplicate_timestamp_count,
+            "ruined": ruined,
+            "ruin_time": ruin_time,
         },
     ).to_dict()
 
@@ -296,6 +327,59 @@ def merge_canonical_stats(
 
 
 # ─── QuantStats helpers ──────────────────────────────────────────────────────
+
+
+def _truncate_at_ruin(
+    equity_curve: list[EquityPoint],
+) -> tuple[list[EquityPoint], bool, str | None]:
+    """Cut an equity curve at its first non-positive point, in time order (#132).
+
+    Returns the curve truncated **inclusive** of that point, whether ruin
+    happened, and the point's original ``time`` string. Zero or negative
+    equity means the account is gone: nothing after that point is a path the
+    strategy could have traded, so no equity metric may see it, and no return
+    metric can be measured over a series that ends in ruin.
+
+    A non-finite equity (NaN/inf) also counts as ruin and fails closed: it is
+    not a tradeable account, and silently skipping it would let a corrupt
+    curve publish measured-looking ratios and pass the live-deployment gate.
+    The test is ``not (equity > 0)``, which is true for NaN as well.
+    """
+    ordered = _equity_curve_in_time_order(equity_curve)
+    for index, point in enumerate(ordered):
+        equity = float(point.equity)
+        if not (math.isfinite(equity) and equity > 0):
+            return ordered[: index + 1], True, point.time
+    # Not ruined: hand back the curve exactly as given so a healthy run's
+    # metrics do not depend on this sort (only the ruin search needs time order).
+    return equity_curve, False, None
+
+
+def _equity_curve_in_time_order(equity_curve: list[EquityPoint]) -> list[EquityPoint]:
+    """Sort the curve by timestamp so "first ruin" means first in time.
+
+    Engines need not emit sorted points. The sort is stable, so points sharing
+    a timestamp keep their given order. When any timestamp cannot be read the
+    given order is kept: it is the best available reading of "first" and
+    matches how the return-series helpers fall back.
+    """
+    if len(equity_curve) < 2:
+        return list(equity_curve)
+    try:
+        timestamps = pd.to_datetime(
+            [point.time for point in equity_curve],
+            utc=True,
+            format="mixed",
+            errors="coerce",
+        )
+    except (TypeError, ValueError):
+        return list(equity_curve)
+    if timestamps.isna().any():
+        return list(equity_curve)
+    return [
+        point
+        for _timestamp, point in sorted(zip(timestamps, equity_curve), key=lambda pair: pair[0])
+    ]
 
 
 def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | None:
@@ -514,6 +598,11 @@ def _resolve_backtest_period_bounds(
         if not pd.isna(entry_ts):
             trade_start_times.append(pd.Timestamp(entry_ts))
 
+        # #123: a trade without exits has no end time (``last_exit_time``
+        # raises instead of faking a zero-duration trade); it only contributes
+        # its start to the window.
+        if not trade.exits:
+            continue
         exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
         if not pd.isna(exit_ts):
             trade_end_times.append(pd.Timestamp(exit_ts))
@@ -597,6 +686,8 @@ def _empty_stats(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, An
             ],
             "equity_return_frequency": "none",
             "duplicate_equity_timestamps": 0,
+            "ruined": False,
+            "ruin_time": None,
         }
     ).to_dict()
 

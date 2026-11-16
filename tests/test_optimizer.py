@@ -703,6 +703,9 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     weights = payload["effective_best_parameters"]["risk_parity_weights"].values()
     assert sum(weights) == pytest.approx(1.0)
     assert payload["risk_parity"]["evaluated_universes"]
+    # #129 H8: market-data frames carry timestamps, so Sharpe is daily-annualised.
+    assert payload["train_stats"]["risk_parity_score_basis"] == "sharpe_and_structure"
+    assert payload["train_stats"]["risk_parity_sharpe"] is not None
     saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
     assert len(saved_files) == 1
 
@@ -740,6 +743,179 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
     assert penalties == {1: True, 2: False}
     no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
+
+
+def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial publishes sharpe_ratio=None; it is unrankable, not 0.0.
+
+    0.0 would beat the honest losing trial (-0.5), so the ruined parameter set
+    would be selected as "best".
+    """
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+    studies = []
+    create_study = optimizer_module.optuna.create_study
+
+    def capturing_create_study(*args, **kwargs):
+        study = create_study(*args, **kwargs)
+        studies.append(study)
+        return study
+
+    monkeypatch.setattr(optimizer_module.optuna, "create_study", capturing_create_study)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["sharpe_ratio"] = None
+            result.stats["ruined"] = True
+            result.stats["undefined_metrics"] = ["sharpe_ratio"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert payload["best_value"] == -0.5
+    penalties = {
+        trial["params"]["window"]: trial["penalty_applied"]
+        for trial in payload["top_trials"]
+    }
+    assert penalties == {1: True, 2: False}
+    recorded = {t.params["window"]: t.user_attrs["metric_value"] for t in studies[0].trials}
+    assert recorded[1] == optimizer_module._no_trade_penalty_value([-0.5], direction="maximize")
+    assert recorded[1] != 0.0
+
+
+def test_zero_target_metric_trial_is_rankable(monkeypatch, tmp_path: Path):
+    """A measured 0.0 is a metric value, not an undefined one: it can win."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        return _trial_result(config, metric=0.0 if window == 1 else -0.5, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 1}
+    assert payload["best_value"] == 0.0
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: False,
+        2: False,
+    }
+
+
+def test_ruined_cagr_target_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial's CAGR is undefined (None), so it cannot beat an honest loser."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        result.stats["cagr"] = None if window == 1 else -0.5
+        result.stats["ruined"] = window == 1
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="cagr",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_degenerate_curve_total_return_target_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """A published 0.0 that `undefined_metrics` names is unrankable, not a score."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["total_return"] = 0.0
+            result.stats["undefined_metrics"] = ["total_return"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="total_return",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_ruined_negative_equity_trial_with_raw_target_is_penalised_not_failed(
+    monkeypatch, tmp_path: Path
+):
+    """A ruined run can report max_drawdown_pct beyond 1.0; it must not crash the trial."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["ruined"] = True
+            result.stats["win_rate"] = 0.9
+            result.stats["max_drawdown_pct"] = -1.5
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="win_rate",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
 
 
 def _patch_grid_sampler(monkeypatch, choices: list[int]) -> None:

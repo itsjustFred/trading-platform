@@ -336,11 +336,58 @@ class TestCostBasedTieBreak:
         assert result.missing == []
         assert result.extra == []
 
-    def test_exact_tie_keeps_lowest_index(self) -> None:
-        from validation.comparison.matcher import TradeMatcher
+    def test_exact_tie_breaks_by_canonical_order(self) -> None:
+        """Ties resolve to the first actual in canonical order, not input order.
 
+        The two actuals are content-identical twins, so the id breaks the tie:
+        the canonical order is by id regardless of how the list was passed in.
+        """
         ref = [_make_trade(trade_id=1)]
-        act = [_make_trade(trade_id=2), _make_trade(trade_id=3)]
+        act = [_make_trade(trade_id=3), _make_trade(trade_id=2)]
         result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
         assert len(result.matched) == 1
         assert result.matched[0][1].id == 2
+
+    def test_nonfinite_price_pair_is_dropped_not_matched(self) -> None:
+        """A NaN price makes the cost NaN; such a pair must never be matched."""
+        ref = [_make_trade(trade_id=1, entry_price=1.1)]
+        act = [_make_trade(trade_id=2, entry_price=float("nan"))]
+        result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
+        assert result.matched == []
+        assert [t.id for t in result.missing] == [1]
+        assert [t.id for t in result.extra] == [2]
+
+
+def test_global_assignment_splits_into_components_without_a_full_matrix(monkeypatch) -> None:
+    """#131: the solver must not allocate a ref x act matrix for disjoint trades.
+
+    Long trade lists would otherwise need gigabytes; each disjoint pair is its
+    own component, so every dense solve here is 1 x 1.
+    """
+    import validation.comparison.matcher as matcher_module
+    from shared.models import Trade, TradeExit
+
+    shapes: list[tuple[int, int]] = []
+    real_solve = matcher_module._solve_dense
+
+    def spy(ref_count, act_count, feasible):
+        shapes.append((ref_count, act_count))
+        return real_solve(ref_count, act_count, feasible)
+
+    monkeypatch.setattr(matcher_module, "_solve_dense", spy)
+
+    def trade(trade_id: int, day: int) -> Trade:
+        entry = f"2024-01-{day:02d}T10:00:00Z"
+        exit_ = f"2024-01-{day:02d}T11:00:00Z"
+        return Trade(
+            id=trade_id, symbol="EURUSD", direction="LONG", entry_time=entry,
+            entry_price=1.0, quantity=1.0,
+            exits=[TradeExit(time=exit_, price=1.0, quantity=1.0)], pnl=0.0,
+        )
+
+    refs = [trade(i, i) for i in range(1, 29)]
+    acts = [trade(100 + i, i) for i in range(1, 29)]
+    result = matcher_module.TradeMatcher.match(refs, acts, time_tolerance_seconds=60)
+
+    assert len(result.matched) == 28 and not result.missing and not result.extra
+    assert shapes and max(r * a for r, a in shapes) == 1

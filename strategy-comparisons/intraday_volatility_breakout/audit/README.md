@@ -1,7 +1,7 @@
 # Strategy-Test-Audit: IntradayVolatilityBreakout (MT5 ↔ Platform)
 
 Branch: `strategy-test-audit`. Ziel: MT5-Code (`../IntradayVolatilityBreakout.mq5`,
-Referenz-Runs in `/home/ubuntu/trading-platform-references/`) gegen die
+Referenz-Runs im Verzeichnis `$TRADING_PLATFORM_REFERENCES` bzw. `--reference-dir`) gegen die
 Platform-Strategie (`strategies/intraday_volatility_breakout/`, native Engine)
 verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 
@@ -16,11 +16,19 @@ verifizieren, bis Trade-Listen und Stats (nahezu) identisch sind.
 Kontrakte (auf den Cent verifiziert): EURUSD 1 Lot = 100.000, Indices 1 Lot = 1.
 XLSX = EUR-Account (500 € Risk, Swaps, USD→EUR-Konvertierung), Logs = USD-Runs.
 
-Reproduktion der Referenz-Seite:
+Reproduktion der Referenz-Seite (vom Repo-Root aufrufen):
 
 ```bash
-.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --out /tmp/audit_ref
+python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py --reference-dir <Referenz-Verzeichnis> --out data/intraday_volatility_breakout_audit
 ```
+
+`--out` ist optional (Default: der Audit-Ordner selbst) und muss innerhalb des
+Arbeitsverzeichnisses oder des Audit-Ordners liegen (Guard in
+`_resolve_output_dir`, absichtlich nicht aufgeweicht); `data/` ist
+git-ignoriert. Das Referenz-Verzeichnis kommt aus `--reference-dir` oder
+`$TRADING_PLATFORM_REFERENCES` (Flag gewinnt); ohne beides bricht das Skript
+mit Exit-Code 2 und Meldung auf stderr ab. Das Skript lässt sich auch aus
+`audit/` heraus mit relativem Pfad aufrufen.
 
 (Skript failt laut bei jeder Inkonsistenz: Deal-Sequenz, Volumen-Paarung,
 Final-Balance-Delta, XLSX↔Log-Keys.)
