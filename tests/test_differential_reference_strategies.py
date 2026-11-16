@@ -692,27 +692,24 @@ NATIVE_FALLBACK_SIZING_BUG = (
     "qty at ~L394 from entry_price=close; _fill_pending_orders re-sizes only when a "
     "sizing stop exists, ~L561-606). Contract 4 / vectorbt size on the entry (fill) price."
 )
-xfail_native_fallback = pytest.mark.xfail(strict=True, reason=NATIVE_FALLBACK_SIZING_BUG)
+# ``raises=AssertionError``: the expected failure is a mismatch in the comparison. Any other
+# exception (an import or refactor break, a crash in the engine) is reported as a failure.
+xfail_native_fallback = pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason=NATIVE_FALLBACK_SIZING_BUG
+)
 
 
 def _make_params(
     scenarios: dict,
     xfail: dict[str, pytest.MarkDecorator] | set[str] = frozenset(),
-    *,
-    agree: bool = False,
 ) -> list:
     """Parametrisation; ``xfail`` maps scenario -> strict-xfail mark (a bare set means
     the native fallback-sizing defect).
 
-    ``agree`` marks the scenarios that must also be checked for native/vectorbt
-    agreement. It used to *filter* them here, which meant calling each scenario
-    builder to ask ``has_protective_exit()`` during import - and a real-data
-    builder downloads the slice on demand. A missing download then raised
-    ``pytest.skip`` while the module was being imported, which pytest refuses
-    ("outside of a test will skip the entire module") and which took the whole
-    module's collection down with it. The filter therefore lives in
-    :func:`check_engines_agree`, where a skip is legitimate; the parameter list
-    itself is a pure function of the scenario names.
+    The agreement check's protective-exit filter lives in :func:`check_engines_agree`,
+    not here: calling each builder at import time to ask ``has_protective_exit()`` would
+    download the real slice during collection, where a skip is refused by pytest. The
+    parameter list is therefore a pure function of the scenario names.
     """
     if not isinstance(xfail, dict):
         xfail = {name: xfail_native_fallback for name in xfail}
@@ -827,7 +824,7 @@ def test_sma_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, SMA_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS, SMA_XFAIL_NATIVE, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(SMA_SCENARIOS, SMA_XFAIL_NATIVE))
 def test_sma_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, SMA_SCENARIOS[scenario]())
 
@@ -1081,7 +1078,7 @@ VBT_WRONG_SIDE_SIZING_STOP = (
 )
 RSI_XFAIL_VBT = {
     "gap_below_sizing_stop_skips_trade": pytest.mark.xfail(
-        strict=True, reason=VBT_WRONG_SIDE_SIZING_STOP
+        strict=True, raises=AssertionError, reason=VBT_WRONG_SIDE_SIZING_STOP
     )
 }
 
@@ -1096,7 +1093,7 @@ def test_rsi_time_exit_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, RSI_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, {**RSI_XFAIL_VBT}, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, {**RSI_XFAIL_VBT}))
 def test_rsi_time_exit_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, RSI_SCENARIOS[scenario]())
 
@@ -1162,7 +1159,7 @@ def test_donchian_wide_levels_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, WIDE_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(WIDE_SCENARIOS, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(WIDE_SCENARIOS))
 def test_donchian_wide_levels_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, WIDE_SCENARIOS[scenario]())
 
@@ -1178,8 +1175,10 @@ def _assert_finite_or_loud(run) -> None:
         result = run()
     except (ValueError, RuntimeError) as exc:
         # Failing closed is acceptable, but only with the engines' documented refusal of an
-        # unpriced fill; any other failure (path drift, refactor, dependency) must surface.
-        assert "must be finite" in str(exc), f"not the NaN-fill refusal: {exc!r}"
+        # unpriced fill. Any other failure (path drift, refactor, dependency) is re-raised
+        # as itself, so it is not absorbed by the expected-failure mark on the native case.
+        if "must be finite" not in str(exc):
+            raise
         return
     for t in result.trades:
         values = [t.entry_price, t.quantity, t.pnl, t.net_pnl, *(e.price for e in t.exits)]
@@ -1241,7 +1240,9 @@ def test_nan_fill_control_runs_to_completion(tmp_path, engine, frame_case):
 )
 def test_nan_fill_bar_never_yields_non_finite_results(tmp_path, engine, builder, request):
     if engine == "native" and builder is _nan_fill_sma:
-        request.applymarker(pytest.mark.xfail(strict=True, reason=NAN_FILL_NATIVE_DEFECT))
+        request.applymarker(
+            pytest.mark.xfail(strict=True, raises=AssertionError, reason=NAN_FILL_NATIVE_DEFECT)
+        )
     case = builder()
     runner = run_native if engine == "native" else run_vbt
     _assert_finite_or_loud(
@@ -1308,10 +1309,9 @@ def _load_real_slice() -> pd.DataFrame:
         pytest.skip(decision.reason)
     if decision.action == "fail":
         pytest.fail(decision.reason)
-    try:
-        return read_slice(decision.path)
-    except SliceValidationError as exc:
-        pytest.fail(f"the real-data slice at {decision.path} is unusable: {exc}")
+    # A present but malformed slice raises SliceValidationError, which names the file and
+    # the rule it broke; it is left to fail the test rather than re-wrapped.
+    return read_slice(decision.path)
 
 
 def _real_frame() -> pd.DataFrame:
@@ -1381,7 +1381,7 @@ def test_real_slice_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, REAL_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, REAL_XFAIL_NATIVE, agree=True))
+@pytest.mark.parametrize("scenario", _make_params(REAL_SCENARIOS, REAL_XFAIL_NATIVE))
 def test_real_slice_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, REAL_SCENARIOS[scenario]())
 
@@ -1537,5 +1537,5 @@ def test_real_slice_malformed_file_fails_loudly(tmp_path, monkeypatch, violation
     monkeypatch.setenv(SLICE_PATH_ENV, str(path))
 
     assert _real_slice_decision().action == "load", "a present file is always loaded"
-    with pytest.raises(pytest.fail.Exception, match=re.escape(fragment)):
+    with pytest.raises(SliceValidationError, match=re.escape(fragment)):
         _load_real_slice()
