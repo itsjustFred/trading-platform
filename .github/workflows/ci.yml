@@ -61,10 +61,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
-          # The script hash is the key: a changed window, schema or resample rule must
+          # The key hashes the fetch script and the whole data_tools package: the window,
+          # schema and validation (differential_slice.py), the 1m parse (downloaders/),
+          # and the 15m resample rules (resample.py). A change to any of them must
           # regenerate the slice, not reuse one built under the old rules. A hit means
           # the download below is skipped entirely, so the network is touched rarely.
-          key: differential-slice-${{ hashFiles('scripts/fetch_differential_slice.py', 'data_tools/differential_slice.py') }}
+          key: differential-slice-${{ hashFiles('scripts/fetch_differential_slice.py', 'data_tools/**/*.py') }}
       - name: Fetch the differential real-data slice
         if: runner.os == 'Linux'
         run: >-

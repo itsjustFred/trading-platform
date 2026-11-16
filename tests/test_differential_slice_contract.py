@@ -390,8 +390,9 @@ def test_the_fetch_script_reuses_a_valid_cached_slice(tmp_path):
     """CI's ``--skip-if-valid`` path, without the network.
 
     On a cache hit the script must exit 0 having downloaded nothing: the cache key is
-    the script's hash, so a hit means an unchanged slice. A miss is a fresh download,
-    which is the one case this test cannot exercise without reaching Dukascopy.
+    the hash of the script and of ``data_tools/``, so a hit means unchanged rules. A
+    miss is a fresh download, which is the one case this test cannot exercise without
+    reaching Dukascopy.
     """
     path = write_slice_like(tmp_path / "cached.csv")
     result = subprocess.run(

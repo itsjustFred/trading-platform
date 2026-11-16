@@ -280,7 +280,7 @@ python -m scripts.fetch_differential_slice
 ```
 
 * `DIFFERENTIAL_REAL_SLICE_CSV` overrides that path (CI points it at a path it
-  restores from `actions/cache`, keyed on the fetch script's hash).
+  restores from `actions/cache`, keyed on the fetch script and `data_tools/`).
 * `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. CI sets
   it, so the real-data scenarios can never be skipped silently; locally a
   missing slice skips them with a message naming the script.
