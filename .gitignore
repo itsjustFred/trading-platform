@@ -59,7 +59,6 @@ logs/
 *.parquet
 *.csv
 !tests/fixtures/*.csv
-!tests/fixtures/differential/*.csv
 !tests/fixtures/validation/quantconnect-reference/*.csv
 !tests/fixtures/*.json
 # The differential real-data slice is downloaded, not committed: the repo is public and
