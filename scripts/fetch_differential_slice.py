@@ -122,9 +122,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--attempts",
         type=int,
-        default=3,
+        default=4,
         help=(
-            "whole-window retries on top of the per-file retries (default: 3). Dukascopy "
+            "whole-window retries on top of the per-file retries (default: 4). Dukascopy "
             "answers a burst from one address with HTTP 429 for minutes at a time, which no "
             "per-file count can out-wait"
         ),
@@ -132,8 +132,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-pause-seconds",
         type=float,
-        default=30.0,
-        help="pause between whole-window attempts (default: 30)",
+        default=45.0,
+        help=(
+            "pause before the second whole-window attempt (default: 45). The pause doubles "
+            "per attempt, capped at 300s"
+        ),
     )
     parser.add_argument("--quiet", action="store_true", help="only report errors")
     return parser

@@ -18,7 +18,11 @@ makes that safe lives in this file, without the network:
 
 from __future__ import annotations
 
+import asyncio
 import re
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +38,7 @@ from data_tools.differential_slice import (
     SLICE_WINDOW_START,
     SliceValidationError,
     default_slice_path,
+    fetch_slice_frame,
     normalise_slice_frame,
     read_slice,
     resolve_slice_path,
@@ -41,6 +46,7 @@ from data_tools.differential_slice import (
     slice_grid,
     validate_slice_frame,
 )
+from data_tools.downloaders import dukascopy_native
 from tests.helpers.differential_slice import slice_like_frame, violations, write_slice_like
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -250,6 +256,80 @@ def test_the_require_flag_is_read_from_the_environment(monkeypatch):
         assert slice_required() is expected
 
 
+# ───────────────────────────── the download entry point ────────────────────────
+
+
+def _minute_grid_frame() -> pd.DataFrame:
+    """Enough minute bars inside the window to yield one 15m bar."""
+    stamps = pd.date_range("2026-02-20 00:00", periods=15, freq="1min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": stamps,
+            "open": [1.18] * 15,
+            "high": [1.1805] * 15,
+            "low": [1.1795] * 15,
+            "close": [1.18] * 15,
+            "volume": [1.0] * 15,
+        }
+    )
+
+
+def test_the_minute_candle_entry_point_refuses_a_both_sided_fetch():
+    """The two sides live in different daily URLs, so there is nothing to split afterwards.
+
+    Refused here rather than requested as a URL that cannot exist and come back as an
+    unexplained empty frame, which the caller would then have to diagnose.
+    """
+    start = datetime(2026, 2, 20, tzinfo=timezone.utc)
+    with pytest.raises(NotImplementedError, match="one offer side"):
+        asyncio.run(
+            dukascopy_native.download_minute_candles("eurusd", start, start, side="both")
+        )
+
+
+# ───────────────────────── the bounded retry around a throttled download ───────
+
+
+def _throttled_downloader(failures: int, calls: list[int]):
+    """A stand-in for the download call that raises ``failures`` times, then succeeds."""
+
+    async def _download(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise SliceValidationError("no bar falls inside the window (HTTP 429 storm)")
+        return _minute_grid_frame()
+
+    return _download
+
+
+def test_the_outer_retry_recovers_from_a_throttled_window(monkeypatch):
+    """Dukascopy's rate limit is per-address and outlasts the per-file retries, so the
+    whole window is retried - and a recovery must be used, not reported as a failure."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        dukascopy_native, "download_minute_candles", _throttled_downloader(2, calls)
+    )
+
+    frame = asyncio.run(fetch_slice_frame(attempts=4, retry_pause_seconds=0))
+
+    assert len(calls) == 3, "two throttled attempts, then the recovery"
+    assert len(frame) == 1
+
+
+def test_the_outer_retry_is_bounded_and_raises(monkeypatch):
+    """Patient, but not unbounded: a slice that cannot be produced must fail the run
+    rather than loop, because a run that never finishes is the same as a red build."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        dukascopy_native, "download_minute_candles", _throttled_downloader(99, calls)
+    )
+
+    with pytest.raises(SliceValidationError, match="could not generate the slice"):
+        asyncio.run(fetch_slice_frame(attempts=3, retry_pause_seconds=0))
+
+    assert len(calls) == 3, "exactly three attempts, no more"
+
+
 # ───────────────────────────── nothing is committed again ─────────────────────
 
 
@@ -273,3 +353,34 @@ def test_the_retired_fixture_path_stays_gitignored():
     assert retired in ignore, (
         f"{retired} must stay in .gitignore so a local regenerated copy cannot be committed"
     )
+
+
+# ───────────────────────────── the fetch script itself ─────────────────────────
+
+
+def test_the_fetch_script_reuses_a_valid_cached_slice(tmp_path):
+    """CI's ``--skip-if-valid`` path, without the network.
+
+    On a cache hit the script must exit 0 having downloaded nothing: the cache key is
+    the script's hash, so a hit means an unchanged slice. A miss is a fresh download,
+    which is the one case this test cannot exercise without reaching Dukascopy.
+    """
+    path = write_slice_like(tmp_path / "cached.csv")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.fetch_differential_slice",
+            "--out",
+            str(path),
+            "--skip-if-valid",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reusing the valid cached slice" in result.stdout
+    # And it must not have rewritten the file it was told to reuse.
+    assert len(read_slice(path)) == EXPECTED_SLICE_ROWS

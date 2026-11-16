@@ -103,6 +103,11 @@ def violations() -> dict[str, object]:
         frame = slice_like_frame()
         return frame.drop(columns=["volume"]), "missing columns"
 
+    def _zero_close() -> tuple[pd.DataFrame, str]:
+        frame = slice_like_frame()
+        frame.loc[8, "close"] = 0.0
+        return frame, "non-positive prices"
+
     return {
         "truncated": _truncated(),
         "not_increasing": _not_increasing(),
@@ -111,6 +116,7 @@ def violations() -> dict[str, object]:
         "high_below_body": _high_below_body(),
         "low_above_body": _low_above_body(),
         "missing_column": _missing_column(),
+        "zero_close": _zero_close(),
     }
 
 

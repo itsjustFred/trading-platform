@@ -15,14 +15,14 @@ are worth understanding before trusting the code below:
   can clone, so the slice is generated on demand instead of committed.
 * Provenance was mislabelled. The committed slice was documented as "Dukascopy
   bid, resampled from the local 1m store". It was not: bar for bar it is an
-  **MT5 export** (``$TRADING_DATA_DIR/ohlcv/mt5audit/forex/EURUSD_MT5``),
-  which shares its daily extremes with Dukascopy's bid candles only by
-  coincidence of the underlying market. No public downloader in this repo can
-  reproduce it, and its volumes are integer tick counts rather than
-  Dukascopy's float volumes. The slice is therefore regenerated here from
-  Dukascopy's bid minute candles, which *is* reproducible, and the values
-  differ from the removed fixture accordingly. Everything downstream of this
-  module compares an engine against a reference on the same frame, so a
+  **MT5 export** (``$TRADING_DATA_DIR/ohlcv/mt5audit/forex/EURUSD_MT5``), a
+  different broker's feed of the same market - close in price (it shares several
+  of the window's daily highs and lows) but not the same quotes, and with
+  integer tick-count volumes where Dukascopy reports float volumes. No
+  downloader in this repo can reproduce it. The slice is therefore regenerated
+  here from Dukascopy's bid minute candles, which *is* reproducible, and the
+  values differ from the removed file accordingly. Everything downstream of
+  this module compares an engine against a reference on the same frame, so a
   different quote series validates the same contract.
 
 The contract this module owns, and that both the fetch script and the test
@@ -113,6 +113,11 @@ VOLUME_DECIMALS = 2
 #: bars and hand the engines a series of fake flat bars. The slice covers
 #: trading days only, which is also what the removed MT5-sourced fixture did.
 _TRADING_WEEKDAY_MAX = 4  # Monday..Friday (pandas: Monday == 0)
+
+#: Ceiling for the whole-window retry pause. Dukascopy's rate limiting is
+#: per-address and has been measured lasting minutes; the pause doubles per
+#: attempt and stops here, so a throttled run is patient but still bounded.
+MAX_RETRY_PAUSE_SECONDS = 300.0
 
 
 class SliceValidationError(ValueError):
@@ -227,11 +232,14 @@ def slice_from_minute_bars(minute: pd.DataFrame) -> pd.DataFrame:
         )
     stamps = pd.to_datetime(minute["timestamp"], utc=True)
     bounded = minute.loc[window.contains(stamps)]
+    if bounded.empty:
+        raise SliceValidationError(
+            f"no bar falls inside {SLICE_WINDOW_START} → {SLICE_WINDOW_END}"
+        )
     trading = _trading_days_only(bounded)
     if trading.empty:
         raise SliceValidationError(
-            f"every bar in {SLICE_WINDOW_START} → {SLICE_WINDOW_END} fell outside a trading "
-            "day, which cannot be right"
+            "every bar inside the window is outside a trading day, which cannot be right"
         )
     resampled = resample_ohlcv(trading, SLICE_TIMEFRAME)
     return normalise_slice_frame(resampled)
@@ -256,8 +264,8 @@ async def fetch_slice_frame(
     pipeline_batches: int = 1,
     pause_ms: int = 1000,
     max_retries: int = 3,
-    attempts: int = 3,
-    retry_pause_seconds: float = 30.0,
+    attempts: int = 4,
+    retry_pause_seconds: float = 45.0,
     log_callback=None,
 ) -> pd.DataFrame:
     """Download the window, resample it to 15m and return the slice frame.
@@ -267,9 +275,10 @@ async def fetch_slice_frame(
     :func:`data_tools.downloaders.dukascopy_native.download_bi5_files`.
     Dukascopy answers a burst of requests from one address with HTTP 429 for
     minutes at a time, which no per-file retry count can out-wait; the outer
-    loop gives the whole window a fresh, slower start instead of half a day of
-    bars. Every attempt is still bounded, and a run that cannot produce a valid
-    slice raises rather than writing a partial file.
+    loop gives the whole window a fresh start instead of half a day of bars, and
+    its pause doubles per attempt up to :data:`MAX_RETRY_PAUSE_SECONDS`. Every
+    attempt is still bounded, and a run that cannot produce a valid slice raises
+    rather than writing a partial file.
     """
     from data_tools.downloaders.dukascopy_native import download_minute_candles
 
@@ -293,14 +302,17 @@ async def fetch_slice_frame(
             last_error = exc
             if attempt >= max(1, attempts):
                 break
+            pause = min(
+                retry_pause_seconds * 2 ** (attempt - 1), MAX_RETRY_PAUSE_SECONDS
+            )
             logger.warning(
                 "slice fetch attempt %d/%d failed (%s); retrying in %.0fs",
                 attempt,
                 attempts,
                 exc,
-                retry_pause_seconds,
+                pause,
             )
-            await asyncio.sleep(retry_pause_seconds)
+            await asyncio.sleep(pause)
     raise SliceValidationError(f"could not generate the slice: {last_error}")
 
 
