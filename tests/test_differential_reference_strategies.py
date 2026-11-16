@@ -181,6 +181,17 @@ def ref_donchian_signals(
     return sig
 
 
+def _wilder_step(avg: float, value: float, alpha: float, gap: int) -> float:
+    """One smoothing step over ``gap`` bars. ``gap == 1`` is the plain recursion; a longer
+    gap (an unpriced close in between) decays the old average by ``(1-alpha)**gap``
+    before blending in the new value, which is pandas ``ewm(adjust=False,
+    ignore_na=False)`` on positions. Checked against pandas in the RSI tests."""
+    if gap == 1:
+        return (1 - alpha) * avg + alpha * value
+    decay = (1 - alpha) ** gap
+    return (decay * avg + alpha * value) / (decay + alpha)
+
+
 def ref_rsi_time_signals(
     close: list[float],
     *,
@@ -189,20 +200,30 @@ def ref_rsi_time_signals(
     hold_bars: int = 4,
     stop_pct: float = 0.03,
 ) -> Signals:
+    """RSI on the closes, then the entry/time-exit state machine.
+
+    An unpriced close is not an observation: its change is NaN and the averages carry
+    across it (see :func:`_wilder_step`), so the RSI stays defined on the bars after it.
+    An entry still requires a finite close on its own bar.
+    """
     n = len(close)
     alpha = 1.0 / rsi_len
     avg_gain = avg_loss = NAN
     observations = 0
+    last_observed = 0
     rsi = [NAN] * n
     for i in range(1, n):
         change = close[i] - close[i - 1]
-        gain, loss = max(change, 0.0), max(-change, 0.0)
-        if observations == 0:
-            avg_gain, avg_loss = gain, loss
-        else:
-            avg_gain = (1 - alpha) * avg_gain + alpha * gain
-            avg_loss = (1 - alpha) * avg_loss + alpha * loss
-        observations += 1
+        if _finite(change):
+            gain, loss = max(change, 0.0), max(-change, 0.0)
+            if observations == 0:
+                avg_gain, avg_loss = gain, loss
+            else:
+                gap = i - last_observed
+                avg_gain = _wilder_step(avg_gain, gain, alpha, gap)
+                avg_loss = _wilder_step(avg_loss, loss, alpha, gap)
+            observations += 1
+            last_observed = i
         if observations >= rsi_len:
             rsi[i] = 100.0 if avg_loss == 0.0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
     sig = Signals([False] * n, [False] * n, [None] * n, [None] * n, [None] * n)
@@ -339,6 +360,10 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
         if sig.exits[i] and position is not None:
             close_position(i, c[i], "signal")
     if position is not None:
+        if not _finite(c[n - 1]):
+            # The end-of-data mark is the last close. An unpriced last bar has none, and
+            # marking at NaN would make pnl and equity NaN without any failure.
+            raise ValueError("an open position cannot be marked on an unpriced last bar")
         close_position(n - 1, c[n - 1], "end_of_data")
     return trades
 
@@ -1364,13 +1389,19 @@ def test_real_slice_native_and_vectorbt_agree(tmp_path, scenario):
 # ───────────────────── reference / strategy NaN-bar handling (cubic #189) ──────────
 
 
-def test_rsi_strategy_never_signals_on_an_unpriced_close():
+def _load_rsi_strategy():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("diff_rsi_time_exit", RSI_PATH)
-    assert spec is not None and spec.loader is not None
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def test_rsi_strategy_never_signals_on_an_unpriced_close():
+    module = _load_rsi_strategy()
     # Falling prices keep rsi below 30. The first entry is on bar 5 and its time exit on
     # bar 9; bar 10 (flat again, rsi still < 30 because the average carries across the
     # NaN) is unpriced and must not re-enter.
@@ -1383,6 +1414,47 @@ def test_rsi_strategy_never_signals_on_an_unpriced_close():
     assert entries.iloc[5], "control: the decline signals on a priced bar"
     assert not entries.iloc[10], "an unpriced bar must not emit an entry"
     assert indicators["sizing_sl_price"][entries].notna().all()
+
+
+@pytest.mark.parametrize("seed", [4, 5])
+def test_rsi_reference_agrees_with_the_strategy_across_unpriced_closes(seed):
+    """The strategy's RSI is pandas ewm, which carries the average across an unpriced bar
+    and decays it by the number of bars the gap spans. A reference that let one NaN
+    poison its average would stop signalling for good and disagree on any scenario that
+    contains an unpriced close, for a reason that has nothing to do with an engine."""
+    module = _load_rsi_strategy()
+    closes = walk(seed, 80, start=100.0, step=2.0)
+    for gap_bar in (9, 10, 31, 47, 48):
+        closes[gap_bar] = NAN
+    entries, _exits, _indicators, _ = module.generate_signals(
+        pd.DataFrame({"close": closes}), {"rsi_len": 5}
+    )
+    ref = ref_rsi_time_signals(closes, rsi_len=5)
+
+    assert sum(ref.entries) >= 3, "scenario must exercise entries after the unpriced bars"
+    assert list(ref.entries) == [bool(v) for v in entries], (
+        "reference and strategy disagree on the entry bars"
+    )
+
+
+def test_reference_refuses_to_mark_an_open_position_on_an_unpriced_last_bar():
+    """The end-of-data mark is the last close; an unpriced last bar has none, and an
+    invented NaN mark would make pnl and equity NaN without any failure."""
+    n = 6
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=n, freq="D", tz="UTC"),
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.0] * n,
+        }
+    )
+    frame.loc[n - 1, ["open", "high", "low", "close"]] = NAN
+    sig = Signals([i == 0 for i in range(n)], [False] * n, [None] * n, [None] * n, [None] * n)
+
+    with pytest.raises(ValueError, match="unpriced last bar"):
+        ref_execute(frame, sig, RefConfig())
 
 
 def test_reference_expires_an_order_whose_fill_bar_is_unpriced():
