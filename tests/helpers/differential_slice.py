@@ -18,7 +18,6 @@ import pandas as pd
 
 from data_tools.differential_slice import (
     EXPECTED_SLICE_ROWS,
-    SLICE_COLUMNS,
     slice_csv_text,
     slice_grid,
 )
@@ -99,6 +98,40 @@ def violations() -> dict[str, object]:
         frame.loc[7, "low"] = frame.loc[7, ["open", "close"]].max() + 0.001
         return frame, "low > min(open, close)"
 
+    def _high_inside_body() -> tuple[pd.DataFrame, str]:
+        # A bar with a real body (open < close): its high sits between min and max of
+        # open/close, so only the max-based containment rule can reject it.
+        frame = slice_like_frame()
+        close = float(frame.loc[6, "close"])
+        frame.loc[6, ["open", "high", "low"]] = [
+            round(close - 0.0008, 5),
+            round(close - 0.0004, 5),
+            round(close - 0.0012, 5),
+        ]
+        return frame, "high < max(open, close)"
+
+    def _duplicate_stamp() -> tuple[pd.DataFrame, str]:
+        # Non-decreasing but not strictly increasing: only the duplicate check fires.
+        frame = slice_like_frame()
+        frame.loc[5, "timestamp"] = frame.loc[4, "timestamp"]
+        return frame, "not strictly increasing"
+
+    def _inf_high() -> tuple[pd.DataFrame, str]:
+        # A corrupted-but-parseable cache file: "inf" reads back as a float, passes notna().
+        frame = slice_like_frame()
+        frame.loc[9, "high"] = float("inf")
+        return frame, "non-finite OHLC"
+
+    def _nan_volume() -> tuple[pd.DataFrame, str]:
+        frame = slice_like_frame()
+        frame.loc[10, "volume"] = float("nan")
+        return frame, "volume must be finite"
+
+    def _inf_volume() -> tuple[pd.DataFrame, str]:
+        frame = slice_like_frame()
+        frame.loc[11, "volume"] = float("inf")
+        return frame, "volume must be finite"
+
     def _missing_column() -> tuple[pd.DataFrame, str]:
         frame = slice_like_frame()
         return frame.drop(columns=["volume"]), "missing columns"
@@ -114,7 +147,12 @@ def violations() -> dict[str, object]:
         "missing_stamp": _missing_stamp(),
         "nan_high": _nan_high(),
         "high_below_body": _high_below_body(),
+        "high_inside_body": _high_inside_body(),
         "low_above_body": _low_above_body(),
+        "duplicate_stamp": _duplicate_stamp(),
+        "inf_high": _inf_high(),
+        "nan_volume": _nan_volume(),
+        "inf_volume": _inf_volume(),
         "missing_column": _missing_column(),
         "zero_close": _zero_close(),
     }
@@ -126,8 +164,3 @@ def write_slice_like(path, frame: pd.DataFrame | None = None):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(slice_csv_text(payload), encoding="utf-8")
     return path
-
-
-def valid_columns() -> tuple[str, ...]:
-    """The canonical column order, re-exported for assertions in the tests."""
-    return SLICE_COLUMNS

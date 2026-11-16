@@ -45,6 +45,7 @@ from data_tools.differential_slice import (
     slice_from_minute_bars,
     slice_grid,
     validate_slice_frame,
+    write_slice,
 )
 from data_tools.downloaders import dukascopy_native
 from tests.helpers.differential_slice import slice_like_frame, violations, write_slice_like
@@ -67,7 +68,8 @@ def test_the_window_derives_the_slices_own_row_count():
     assert len(grid) == EXPECTED_SLICE_ROWS
     assert str(grid[0]) == "2026-02-20 00:00:00+00:00"
     assert str(grid[-1]) == "2026-03-02 05:45:00+00:00", "the last bar starts, not ends, at 05:45"
-    assert grid.is_monotonic_increasing and not grid.duplicated().any()
+    assert grid.is_monotonic_increasing
+    assert not grid.duplicated().any()
     assert (grid.minute.isin([0, 15, 30, 45])).all(), "bars are on the quarter hour"
 
 
@@ -189,6 +191,31 @@ def test_each_broken_rule_is_rejected_and_named(violation):
     frame, fragment = violations()[violation]
     with pytest.raises(SliceValidationError, match=re.escape(fragment)):
         validate_slice_frame(frame, source="test")
+
+
+def test_a_high_exactly_at_the_body_top_is_valid():
+    """The containment rule is inclusive: a high equal to max(open, close) is a valid bar.
+    Guards the rule against being tightened into a rejection of every bar with a body."""
+    frame = slice_like_frame()
+    close = float(frame.loc[6, "close"])
+    frame.loc[6, ["open", "high", "low"]] = [
+        round(close - 0.0008, 5),
+        round(close, 5),
+        round(close - 0.0012, 5),
+    ]
+    validate_slice_frame(frame, source="test")
+
+
+def test_write_slice_refuses_an_invalid_frame_and_writes_nothing(tmp_path):
+    """A truncated frame must not reach the cache: the write path has its own guard, so a
+    bad download cannot be logged as written and only caught on the next read."""
+    frame, fragment = violations()["truncated"]
+    path = tmp_path / "cache" / "slice.csv"
+
+    with pytest.raises(SliceValidationError, match=re.escape(fragment)):
+        write_slice(path, frame)
+
+    assert not path.exists()
 
 
 def test_the_csv_schema_is_pinned(tmp_path):

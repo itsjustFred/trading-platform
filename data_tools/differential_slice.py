@@ -368,10 +368,13 @@ def validate_slice_frame(frame: pd.DataFrame, *, source: str = "slice") -> None:
     if not stamps.is_monotonic_increasing or stamps.duplicated().any():
         raise SliceValidationError(f"{source}: timestamps are not strictly increasing UTC")
 
+    # ``notna`` is not enough: a CSV field of ``inf`` parses as a float and would pass it,
+    # so finiteness is checked explicitly for prices and volume alike.
     prices = frame.loc[:, ["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
-    if not bool(prices.notna().all().all()):
-        counts = prices.isna().sum()
-        raise SliceValidationError(f"{source}: non-finite OHLC values: {counts.to_dict()}")
+    finite = np.isfinite(prices.to_numpy(dtype=float))
+    if not bool(finite.all()):
+        counts = {column: int(n) for column, n in zip(prices.columns, (~finite).sum(axis=0))}
+        raise SliceValidationError(f"{source}: non-finite OHLC values: {counts}")
     if not bool((prices > 0).all().all()):
         raise SliceValidationError(f"{source}: non-positive prices are not valid quotes")
 
@@ -389,8 +392,8 @@ def validate_slice_frame(frame: pd.DataFrame, *, source: str = "slice") -> None:
         at = frame["timestamp"].iloc[int(broken_low[0])]
         raise SliceValidationError(f"{source}: low > min(open, close) at {at}")
 
-    volume = pd.to_numeric(frame["volume"], errors="coerce")
-    if volume.isna().any() or bool((volume < 0).any()):
+    volume = pd.to_numeric(frame["volume"], errors="coerce").to_numpy(dtype=float)
+    if not bool(np.isfinite(volume).all()) or bool((volume < 0).any()):
         raise SliceValidationError(f"{source}: volume must be finite and non-negative")
 
 
