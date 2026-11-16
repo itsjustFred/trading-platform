@@ -48,6 +48,7 @@ from data_tools.differential_slice import (
     write_slice,
 )
 from data_tools.downloaders import dukascopy_native
+from scripts import fetch_differential_slice as fetch_script
 from tests.helpers.differential_slice import slice_like_frame, violations, write_slice_like
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -411,3 +412,59 @@ def test_the_fetch_script_reuses_a_valid_cached_slice(tmp_path):
     assert "reusing the valid cached slice" in result.stdout
     # And it must not have rewritten the file it was told to reuse.
     assert len(read_slice(path)) == EXPECTED_SLICE_ROWS
+
+
+def test_a_valid_cache_is_reused_only_when_the_flag_is_given(tmp_path):
+    path = write_slice_like(tmp_path / "cached.csv")
+
+    reuse, message = fetch_script._plan(path, skip_if_valid=True)
+    assert reuse is True
+    assert "reusing the valid cached slice" in message
+
+    assert fetch_script._plan(path, skip_if_valid=False) == (False, ""), (
+        "without --skip-if-valid a cache is never reused, even a valid one"
+    )
+
+
+def test_an_invalid_cache_is_never_reported_as_reusable(tmp_path):
+    """CI's cache-hit path must not go green on a broken slice."""
+    path = write_slice_like(
+        tmp_path / "cached.csv", slice_like_frame(rows=EXPECTED_SLICE_ROWS - 1)
+    )
+
+    reuse, message = fetch_script._plan(path, skip_if_valid=True)
+
+    assert reuse is False
+    assert "is not usable" in message and "downloading again" in message
+
+
+def test_an_invalid_cache_is_replaced_by_a_fresh_download(tmp_path, monkeypatch, capsys):
+    path = write_slice_like(
+        tmp_path / "cached.csv", slice_like_frame(rows=EXPECTED_SLICE_ROWS - 1)
+    )
+    downloads: list[int] = []
+
+    async def _fresh_download(**_kwargs):
+        downloads.append(1)
+        return slice_like_frame()
+
+    monkeypatch.setattr(fetch_script, "fetch_slice_frame", _fresh_download)
+
+    assert fetch_script.main(["--out", str(path), "--skip-if-valid", "--quiet"]) == 0
+
+    assert len(downloads) == 1, "an unusable cache must trigger a download, not a reuse"
+    assert "reusing" not in capsys.readouterr().out
+    assert len(read_slice(path)) == EXPECTED_SLICE_ROWS
+
+
+def test_a_failed_generation_exits_one_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "out.csv"
+
+    async def _failing_download(**_kwargs):
+        raise SliceValidationError("no m1 bid candles for EURUSD")
+
+    monkeypatch.setattr(fetch_script, "fetch_slice_frame", _failing_download)
+
+    assert fetch_script.main(["--out", str(path), "--quiet"]) == 1
+    assert not path.exists()
+    assert "no m1 bid candles" in capsys.readouterr().err

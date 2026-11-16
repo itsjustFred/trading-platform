@@ -175,17 +175,22 @@ def main(argv: list[str] | None = None) -> int:
     if reuse:
         return 0
 
-    frame = asyncio.run(
-        fetch_slice_frame(
-            batch_size=args.batch_size,
-            pause_ms=args.pause_ms,
-            max_retries=args.max_retries,
-            attempts=args.attempts,
-            retry_pause_seconds=args.retry_pause_seconds,
-            log_callback=print if not args.quiet else None,
+    try:
+        frame = asyncio.run(
+            fetch_slice_frame(
+                batch_size=args.batch_size,
+                pause_ms=args.pause_ms,
+                max_retries=args.max_retries,
+                attempts=args.attempts,
+                retry_pause_seconds=args.retry_pause_seconds,
+                log_callback=print if not args.quiet else None,
+            )
         )
-    )
-    written = write_slice(destination, frame)
+        written = write_slice(destination, frame)
+    except SliceValidationError as exc:
+        # A run that cannot produce a valid slice is a failed run, and CI must see it as one.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(
         f"wrote {written.name}: {len(frame)} {SLICE_TIMEFRAME} {SLICE_SYMBOL} {OFFER_SIDE} bars "
         f"({SLICE_WINDOW_START} → {SLICE_WINDOW_END}, resampled from {SLICE_SOURCE_TIMEFRAME}) "
@@ -195,8 +200,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except SliceValidationError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    raise SystemExit(main())
