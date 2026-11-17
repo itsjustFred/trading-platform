@@ -62,6 +62,11 @@ def release_twisted_reactor_threads() -> None:
         # The reactor's own shutdown-trigger handler: removes its triggers and
         # joins the workers. Shutdown never fires here, so it is called directly.
         stop_thread_pool()
+    else:
+        logger.warning(
+            "Twisted reactor has a thread pool but no _stopThreadPool handler; "
+            "the process may hang at exit. The Twisted private API likely changed."
+        )
 
 
 def force_exit(code: int = FORCED_EXIT_CODE) -> None:
@@ -165,8 +170,9 @@ class ShutdownCoordinator:
             return True
         assert self._idle is not None, "bind() must be called first"
         try:
-            await asyncio.wait_for(self._idle.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+            async with asyncio.timeout(timeout):
+                await self._idle.wait()
+        except TimeoutError:
             return False
         return True
 

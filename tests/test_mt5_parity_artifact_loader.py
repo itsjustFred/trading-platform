@@ -1,8 +1,11 @@
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
+import scripts.regenerate_mt5_parity_artifacts as regen
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
     _build_trades,
@@ -358,3 +361,111 @@ def test_bug4_searchsorted_uses_last_known_rate():
     )
     value = _price_unit_value("USATECH.IDX", "2024-01-01T00:02:00Z", conversion, account_currency="EUR")
     assert value == 1.0 / 1.10
+
+
+def test_comparison_cases_run_on_the_broker_clock_without_utc_day_d1_files():
+    from shared.broker_clock import resolve_broker_clock
+
+    by_label = {c["label"]: c for c in COMPARISON_CASES}
+    assert by_label["EURUSD_H1"]["broker_clock"] == "dukascopy_mt5_forex"
+    assert by_label["NAS100_M15"]["broker_clock"] == "dukascopy_mt5_index"
+    assert by_label["SP500_M1"]["broker_clock"] == "dukascopy_mt5_index"
+    for case in COMPARISON_CASES:
+        assert resolve_broker_clock(case["broker_clock"]) is not None
+        # UTC-day D1 files have other day boundaries than the broker's server-clock D1 bars.
+        assert not case.get("use_native_daily_ohlcv")
+
+
+# ---------------------------------------------------------------------------
+# main() orchestration and regenerate_case plumbing, with fakes (no data run)
+# ---------------------------------------------------------------------------
+def _run_main(monkeypatch, argv: list[str], calls: list[dict]):
+    conversions: list[object] = []
+
+    def fake_conversion(data_dir, start, end):
+        conversions.append((data_dir, start, end))
+        return pd.Series([1.1], index=pd.DatetimeIndex([pd.Timestamp("2018-01-01", tz="UTC")]))
+
+    def fake_regenerate_case(case, **kwargs):
+        calls.append({"label": case["label"], "conversion": kwargs["conversion"]})
+        return {"label": case["label"]}
+
+    monkeypatch.setattr(regen, "_conversion_series", fake_conversion)
+    monkeypatch.setattr(regen, "regenerate_case", fake_regenerate_case)
+    monkeypatch.setattr(sys, "argv", ["regenerate_mt5_parity_artifacts.py", *argv])
+    regen.main()
+    return conversions
+
+
+def test_main_runs_every_case_and_loads_conversion_for_the_eur_account(monkeypatch, capsys):
+    calls: list[dict] = []
+    conversions = _run_main(monkeypatch, [], calls)
+
+    assert [c["label"] for c in calls] == [case["label"] for case in COMPARISON_CASES]
+    assert len(conversions) == 1
+    # NAS100 is the one EUR-account case: every case receives the conversion series.
+    assert all(c["conversion"] is not None for c in calls)
+
+
+def test_main_skips_conversion_when_no_eur_account_case_is_selected(monkeypatch):
+    calls: list[dict] = []
+    conversions = _run_main(monkeypatch, ["--case", "EURUSD_H1"], calls)
+
+    assert [c["label"] for c in calls] == ["EURUSD_H1"]
+    assert conversions == []
+    assert calls[0]["conversion"] is None
+
+
+def test_main_loads_conversion_for_a_eur_account_case_alone(monkeypatch):
+    calls: list[dict] = []
+    conversions = _run_main(monkeypatch, ["--case", "NAS100_M15"], calls)
+
+    assert [c["label"] for c in calls] == ["NAS100_M15"]
+    assert len(conversions) == 1
+    assert calls[0]["conversion"] is not None
+
+
+def test_main_repeated_case_flags_accumulate_in_case_order(monkeypatch):
+    calls: list[dict] = []
+    _run_main(monkeypatch, ["--case", "SP500_M1", "--case", "EURUSD_H1"], calls)
+
+    # Both flags are kept (append), in the roster's order, not only the last one.
+    assert [c["label"] for c in calls] == ["EURUSD_H1", "SP500_M1"]
+
+
+def test_main_rejects_an_unknown_case_label(monkeypatch):
+    with pytest.raises(SystemExit):
+        _run_main(monkeypatch, ["--case", "GBPUSD_H1"], [])
+
+
+def test_regenerate_case_threads_the_case_broker_clock_into_the_strategy(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-02 00:00", periods=3, freq="1min", tz="UTC"),
+            "open": [1.0, 1.0, 1.0],
+            "high": [1.0, 1.0, 1.0],
+            "low": [1.0, 1.0, 1.0],
+            "close": [1.0, 1.0, 1.0],
+        }
+    )
+
+    def fake_load_ohlcv(data_dir, symbol, timeframe, start, end):
+        return frame.copy()
+
+    def fake_generate_signals(df, params):
+        captured["params"] = dict(params)
+        no_signal = pd.Series(False, index=df.index)
+        return no_signal, no_signal.copy(), {}, []
+
+    monkeypatch.setattr(regen, "_load_ohlcv", fake_load_ohlcv)
+    monkeypatch.setattr(regen, "generate_signals", fake_generate_signals)
+    monkeypatch.setattr(regen, "attach_daily_equity", lambda result, **kwargs: None)
+
+    case = {**COMPARISON_CASES[0], "output": tmp_path / "eurusd.json"}
+    assert case["broker_clock"] == "dukascopy_mt5_forex"
+    regen.regenerate_case(case, data_dir=tmp_path, capital=100_000.0, risk_pct=0.01)
+
+    assert captured["params"]["broker_clock"] == "dukascopy_mt5_forex"
+    assert captured["params"]["reference_symbol"] == "EURUSD"
+    assert (tmp_path / "eurusd.json").exists()

@@ -31,7 +31,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -99,6 +98,28 @@ class _GateAdapter:
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_pip_value(self, symbol: str) -> Any:
+        # Entries are sized from the broker's pip value and refused without one:
+        # a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> Any:
+        # The entry-deviation gate wants a quote at the signal's entry price.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+        )
 
     async def submit_order(self, signal: Any, *, qty: float | None = None) -> str:
         self.submit_calls += 1
@@ -330,7 +351,6 @@ def test_windows_without_sigterm_still_installs_sigint(monkeypatch: pytest.Monke
 
 
 def test_unknown_signal_number_is_named_not_crashed(monkeypatch: pytest.MonkeyPatch) -> None:
-    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
     assert shutdown_module._signal_name(999) == "999"
 
 
@@ -446,6 +466,22 @@ def test_release_stops_the_reactor_thread_pool(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "twisted.internet", _ReactorModule)
     release_twisted_reactor_threads()
     assert stopped == ["stopped"]
+
+
+def test_release_warns_when_the_reactor_has_a_pool_but_no_stop_handler(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Twisted private-API change must be loud, not a silent exit hang."""
+
+    class _ReactorModule:
+        class reactor:  # noqa: N801 - mirrors twisted's own lowercase name
+            threadpool = object()
+
+    monkeypatch.setitem(sys.modules, "twisted.internet.reactor", _ReactorModule)
+    monkeypatch.setitem(sys.modules, "twisted.internet", _ReactorModule)
+    with caplog.at_level("WARNING"):
+        release_twisted_reactor_threads()
+    assert any("no _stopThreadPool handler" in r.getMessage() for r in caplog.records)
 
 
 def test_release_is_a_noop_without_the_reactor_or_its_thread_pool(
@@ -611,6 +647,38 @@ def test_cleanup_closes_connections_and_never_touches_broker_orders(
     assert scheduler.stopped == 1
     assert adapter.disconnect_calls == 1
     assert adapter.mutation_calls == []
+
+
+def test_a_failed_cleanup_phase_logs_its_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def _boom() -> None:
+        raise RuntimeError("scheduler exploded")
+
+    async def _probe() -> bool:
+        return await daemon._bounded(_boom(), timeout=1.0, phase="stop_scheduler")
+
+    with caplog.at_level("ERROR"):
+        assert asyncio.run(_probe()) is False
+    failed = [r for r in caplog.records if r.getMessage() == "Shutdown phase failed"]
+    assert failed and failed[0].exc_info is not None
+
+
+def test_a_timed_out_cleanup_phase_is_reported_false_and_cancelled() -> None:
+    cancelled: list[bool] = []
+
+    async def _hang() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    async def _probe() -> bool:
+        return await daemon._bounded(_hang(), timeout=0.05, phase="stop_scheduler")
+
+    assert asyncio.run(_probe()) is False
+    assert cancelled == [True]
 
 
 def test_cleanup_reports_a_phase_that_fails_but_still_runs_the_rest() -> None:

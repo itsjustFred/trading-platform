@@ -336,11 +336,124 @@ class TestCostBasedTieBreak:
         assert result.missing == []
         assert result.extra == []
 
-    def test_exact_tie_keeps_lowest_index(self) -> None:
-        from validation.comparison.matcher import TradeMatcher
+    def test_exact_tie_breaks_by_canonical_order(self) -> None:
+        """Ties resolve to the first actual in canonical order, not input order.
 
+        The two actuals are content-identical twins, so the id breaks the tie:
+        the canonical order is by id regardless of how the list was passed in.
+        """
         ref = [_make_trade(trade_id=1)]
-        act = [_make_trade(trade_id=2), _make_trade(trade_id=3)]
+        act = [_make_trade(trade_id=3), _make_trade(trade_id=2)]
         result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
         assert len(result.matched) == 1
         assert result.matched[0][1].id == 2
+
+    def test_nonfinite_price_pair_is_dropped_not_matched(self) -> None:
+        """A NaN price makes the cost NaN; such a pair must never be matched."""
+        ref = [_make_trade(trade_id=1, entry_price=1.1)]
+        act = [_make_trade(trade_id=2, entry_price=float("nan"))]
+        result = TradeMatcher.match(ref, act, time_tolerance_seconds=60)
+        assert result.matched == []
+        assert [t.id for t in result.missing] == [1]
+        assert [t.id for t in result.extra] == [2]
+
+
+def test_global_assignment_splits_into_components_without_a_full_matrix(monkeypatch) -> None:
+    """#131: the solver must not allocate a ref x act matrix for disjoint trades.
+
+    Long trade lists would otherwise need gigabytes; each disjoint pair is its
+    own component, so every dense solve here is 1 x 1.
+    """
+    import validation.comparison.matcher as matcher_module
+    from shared.models import Trade, TradeExit
+
+    shapes: list[tuple[int, int]] = []
+    real_solve = matcher_module._solve_dense
+
+    def spy(ref_count, act_count, feasible):
+        shapes.append((ref_count, act_count))
+        return real_solve(ref_count, act_count, feasible)
+
+    monkeypatch.setattr(matcher_module, "_solve_dense", spy)
+
+    def trade(trade_id: int, day: int) -> Trade:
+        entry = f"2024-01-{day:02d}T10:00:00Z"
+        exit_ = f"2024-01-{day:02d}T11:00:00Z"
+        return Trade(
+            id=trade_id, symbol="EURUSD", direction="LONG", entry_time=entry,
+            entry_price=1.0, quantity=1.0,
+            exits=[TradeExit(time=exit_, price=1.0, quantity=1.0)], pnl=0.0,
+        )
+
+    refs = [trade(i, i) for i in range(1, 29)]
+    acts = [trade(100 + i, i) for i in range(1, 29)]
+    result = matcher_module.TradeMatcher.match(refs, acts, time_tolerance_seconds=60)
+
+    assert len(result.matched) == 28 and not result.missing and not result.extra
+    assert shapes and max(r * a for r, a in shapes) == 1
+
+
+def _make_open_trade(trade_id: int = 1, entry_time: str = "2024-01-01T10:00:00Z") -> Trade:
+    """An open position: schema-legal, no exits, so it has no exit time (#138)."""
+    return Trade(
+        id=trade_id,
+        symbol="EURUSD",
+        direction="LONG",
+        entry_time=entry_time,
+        entry_price=1.1000,
+        quantity=1000.0,
+        exits=[],
+        pnl=0.0,
+    )
+
+
+class TestExitlessTrades:
+    def test_open_trade_does_not_abort_the_match(self):
+        """One open position must not abort the whole comparison run (#138 contract)."""
+        open_trade = _make_open_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z")
+        ref = [_make_trade(trade_id=1), open_trade]
+        act = [_make_trade(trade_id=1)]
+        result = TradeMatcher.match(ref, act)
+        assert len(result.matched) == 1
+        assert [t.id for t in result.missing] == [2]
+        assert result.extra == []
+
+    def test_open_trade_on_actual_side_is_extra_not_an_error(self):
+        ref = [_make_trade(trade_id=1)]
+        open_trade = _make_open_trade(trade_id=2, entry_time="2024-01-02T10:00:00Z")
+        act = [_make_trade(trade_id=1), open_trade]
+        result = TradeMatcher.match(ref, act)
+        assert len(result.matched) == 1
+        assert result.missing == []
+        assert [t.id for t in result.extra] == [2]
+
+    def test_open_trade_never_matches_a_closed_trade(self):
+        """An open trade has no exit to compare, so it cannot satisfy the exit tolerance."""
+        ref = [_make_open_trade(trade_id=1)]
+        act = [_make_trade(trade_id=1)]
+        result = TradeMatcher.match(ref, act)
+        assert result.matched == []
+        assert len(result.missing) == 1
+        assert len(result.extra) == 1
+
+    def test_open_and_closed_trade_sharing_an_entry_time_still_sort(self):
+        """With equal entries, the canonical sort must compare the exit keys.
+
+        Every other open-trade test puts the open and closed trades at
+        different entry times, so the first sort-key component decides the
+        order and the exit keys are never compared.  Here both references
+        enter at the same instant, which forces the ``None`` (open) and
+        ``datetime`` (closed) exit keys to be ordered against each other.
+        A raw ``None`` in the sort key crashes here instead of reporting the
+        open trade, which is exactly the abort #138/#251 removes.
+        """
+        entry = "2024-01-01T10:00:00Z"
+        ref = [
+            _make_trade(trade_id=1, entry_time=entry),
+            _make_open_trade(trade_id=2, entry_time=entry),
+        ]
+        act = [_make_trade(trade_id=3, entry_time=entry)]
+        result = TradeMatcher.match(ref, act)
+        assert [(r.id, a.id) for r, a, _key in result.matched] == [(1, 3)]
+        assert [t.id for t in result.missing] == [2]
+        assert result.extra == []

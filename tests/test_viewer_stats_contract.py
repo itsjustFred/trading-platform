@@ -515,6 +515,45 @@ def test_backtest_all_item_preserves_an_undefined_cagr():
     assert item["cagr"] is None
 
 
+def test_backtest_all_item_keeps_unmeasured_return_and_drawdown_null():
+    """A ruined run has no measured return or drawdown: it must not read as 0.
+
+    `_safe_float(..., 0.0)` folded a null total_return / max_drawdown into a
+    measured-looking 0%, so the list ranked the row as a real result.
+    """
+    import viewer.main as viewer_main_module
+
+    item = viewer_main_module._backtest_all_item_from_meta(
+        {
+            "id": "ruined-run",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "total_return": None,
+            "max_drawdown": None,
+        }
+    )
+
+    assert item["total_return"] is None
+    assert item["max_drawdown"] is None
+
+
+def test_backtest_all_item_keeps_measured_return_and_drawdown():
+    import viewer.main as viewer_main_module
+
+    item = viewer_main_module._backtest_all_item_from_meta(
+        {
+            "id": "measured-run",
+            "symbols": ["X"],
+            "timeframe": "1d",
+            "total_return": -0.25,
+            "max_drawdown": -0.4,
+        }
+    )
+
+    assert item["total_return"] == -0.25
+    assert item["max_drawdown"] == 0.4
+
+
 def test_portfolio_summary_preserves_an_undefined_p_value():
     """An empty portfolio has no p-value; 1.0 is the worst measured value."""
     import viewer.main as viewer_main_module

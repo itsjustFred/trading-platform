@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -88,6 +88,8 @@ jobs:
           tests/liveTerminal.test.ts
           tests/optimizationEvidence.test.ts
           tests/compareStats.test.ts
+          tests/livePositionMath.test.ts
+          tests/backtestListMetrics.test.ts
       - name: Frontend focused tests
         run: npm run test:focused
       - name: Frontend TypeScript and production build

@@ -14,7 +14,7 @@ def test_top_backtests_for_ctrader_ranks_by_live_score() -> None:
             "sharpe_ratio": 0.5,
             "cagr": 0.1,
             "psr": 0.4,
-            "max_drawdown": -5,
+            "max_drawdown": -0.05,
             "trade_count": 10,
             "oos_sharpe": 0.4,
         },
@@ -26,7 +26,7 @@ def test_top_backtests_for_ctrader_ranks_by_live_score() -> None:
             "sharpe_ratio": 2.0,
             "cagr": 0.3,
             "psr": 0.9,
-            "max_drawdown": -8,
+            "max_drawdown": -0.08,
             "trade_count": 20,
             "oos_sharpe": 1.2,
         },
@@ -49,7 +49,7 @@ def test_build_ctrader_deployment_plan_targets_first_ctrader_account() -> None:
                 "sharpe_ratio": 1.5,
                 "cagr": 0.2,
                 "psr": 0.8,
-            "max_drawdown": -6,
+            "max_drawdown": -0.06,
             "trade_count": 12,
             "oos_status": "available",
         }
@@ -76,7 +76,7 @@ def test_top_backtests_require_oos_evidence_by_default() -> None:
             "sharpe_ratio": 5.0,
             "cagr": 0.9,
             "psr": 0.99,
-            "max_drawdown": -1,
+            "max_drawdown": -0.01,
             "trade_count": 100,
         },
     ]
@@ -92,10 +92,39 @@ def test_score_is_unit_normalized() -> None:
         "sharpe_ratio": 1.5,
         "cagr": 0.2,
         "psr": 0.8,
-        "max_drawdown": -6,
+        "max_drawdown": -0.06,
         "trade_count": 12,
     }
     # 0.5 + 0.2 + 0.8 - 0.06
     assert score_backtest_for_live(modest) == pytest.approx(
         1.5 / 3.0 + 0.2 + 0.8 - 0.06
     )
+
+
+def test_drawdown_penalty_reads_max_drawdown_as_fraction() -> None:
+    """Payload `max_drawdown` is a fraction (-0.25 = 25 %), not a percentage.
+
+    The penalty must be the fraction itself (0..1). Dividing by 100 made a
+    25 % drawdown cost 0.0025 instead of 0.25, so the live shortlist was
+    effectively blind to drawdown.
+    """
+    from live_runner.ctrader_deployment import score_backtest_for_live
+
+    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    smooth = score_backtest_for_live({**base, "max_drawdown": -0.05})
+    deep = score_backtest_for_live({**base, "max_drawdown": -0.25})
+
+    assert deep == pytest.approx(1.5 / 3.0 + 0.2 + 0.8 - 0.25)
+    assert smooth - deep == pytest.approx(0.20)
+
+
+def test_drawdown_penalty_is_capped_at_one() -> None:
+    """A drawdown of 100 % or more costs at most 1.0 (documented 0..1 penalty)."""
+    from live_runner.ctrader_deployment import score_backtest_for_live
+
+    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    total = score_backtest_for_live({**base, "max_drawdown": -1.0})
+    beyond = score_backtest_for_live({**base, "max_drawdown": -3.0})
+
+    assert total == pytest.approx(1.5 / 3.0 + 0.2 + 0.8 - 1.0)
+    assert beyond == pytest.approx(total)

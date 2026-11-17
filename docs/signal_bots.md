@@ -38,7 +38,51 @@ pro Bot.
 
 ### RamJet
 - **Status:** Aktiv, registriert
-- **Features:** ATR + Supertrend BUY-only Setup mit TP1 und trailing metadata
+- **Features:** ATR + Supertrend BUY-only Setup mit TP1; Trailing-Modus konfigurierbar
+- **Trailing-Modus (`trailing_mode`):** `none` (Default), `percent` (benötigt `trailing_percent`
+  in (0, 1)) oder `supertrend_flip`. Der Modus ist eine Einstellung des Bots bzw. des Deployments
+  (`signal_config.signal_processor_config.trailing_mode`), nicht fest verdrahtet. Zentrale
+  Definition: `shared/trailing.py`.
+  - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
+    abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
+    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
+  - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
+    cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
+    live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
+    nachgezogen und der Stop beim Broker ersetzt; Details und Betriebsgrenzen in
+    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` wird live auf keinem
+    Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
+  - **`supertrend_flip` im Replay (#168):**
+    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
+       — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
+       (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
+       (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
+       kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
+       nicht. Die Position bleibt voll unter ihrem ursprünglichen Stop; im Trade-Meta steht
+       dann `supertrend_flip.tp1_skipped_time` (und `tp1_time` bleibt leer).
+    2. Danach Stop auf Einstand (Entry-Preis), wenn `breakeven_after_tp1`; wirksam ab der Kerze
+       nach der TP1-Kerze.
+    3. Aktivierung: erste geschlossene Kerze NACH der TP1-Kerze, deren Supertrend bereit und
+       grün ist. Die TP1-Kerze selbst wird nach dem TP1-Fill nicht mehr ausgewertet — nichts, was
+       in oder an der TP1-Kerze nach dem Fill passiert, darf den Trail bewegen oder auslösen.
+       "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
+    4. Ausstieg: erste bereite rote Kerze nach der Aktivierung; der Rest wird zum OPEN der
+       folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
+       Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
+       geschlossen (`end_of_data`).
+    - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
+      der Workflow setzt keinen eigenen.
+    - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
+      `resolve_same_bar_exit`); dann gibt es kein TP1.
+    - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
+      `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
+      Kerzen.
+    - Ein Trade mit mehreren Exits (`tp1`, dann `supertrend_flip`/`breakeven_stop`/`stop_loss`/
+      `end_of_data`); der TP1-Tranche ist auf ganze Shares abgerundet, MFE/MAE werden nach dem
+      Teilausstieg auf den verbleibenden Shares gemessen und die Equity-Kurve bucht die
+      gefloorten Beine. Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
+      Parameter brechen den Lauf ab (keine erfundenen Defaults). Nur Long-Einstiege.
+  - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 
 ### RocketFuel (Long-only & Long+Short)
@@ -50,6 +94,15 @@ pro Bot.
 - **Status:** Kein Processor — Discord-Quelle/Server (siehe Registry-Hinweis)
 - **Routing:** `live_runner/stockkit_routing.py` mappt die Discord-Bots
   (`nitro`, `ramjet`, `rocketfuel`) auf ihre Alpaca-Accounts
+- **Explizite Markierung (#121):** Ein StockKit-Deployment setzt
+  `signal_config.stockkit_route` (z. B. `rocketfuel`). Ist der Wert unbekannt,
+  leer oder kein String (etwa `rocketfuel_shortsonly`, `nitro_v2`), oder
+  widerspricht er der aus dem Bot-Namen abgeleiteten Route, wird das Deployment
+  beim Anlegen abgelehnt und beim Dispatch blockiert; der zugehörige
+  Discord-Service wird auf `FAILED` gesetzt (ein vom Operator gesetztes
+  `PAUSED`/`STOPPED` bleibt). Ohne Markierung ist es ein normaler Discord-Bot;
+  ein Bot-Name, der ein bekannter Alias ist, wird aber weiterhin gegen seinen
+  Account geprüft.
 
 ## Health-Check Status
 
@@ -122,13 +175,163 @@ Ohne Allowlist startet der Listener nicht (fail-closed). Zusätzlich gilt:
   nie überschrieben; ein normaler Teardown schreibt kein `FAILED`.
 - Preisparsing akzeptiert strenge Tausendergruppen (`$1,234.56` → 1234.56) und
   verwirft mehrdeutige Tokens (`$12,34`) statt sie als Dezimalzahl zu interpretieren.
+  Ein Komma nach dem Preis (`@ 100, stop $95`) gehört nicht zum Preis.
+
+### Exit-, Report- und Bedingungsnachrichten, Preis-Level (#121)
+
+Keine Nachricht, die einen Exit, einen Gewinnmitnahme-Bericht oder eine
+Bedingung nennt, erzeugt eine neue Entry-Order.
+
+- **Preis-Level:** Entry ist ein `Price:`-Label, sonst der erste `@`/`at`-Preis,
+  sonst der erste `$`-Preis. `target`/`TP`/`take profit`/`PT` wird Take-Profit,
+  `stop`/`SL`/`stop loss` Stop-Loss; diese Klauseln werden vor jeder anderen
+  Extraktion entfernt, können also nie Entry sein. Zwei verschiedene Werte für
+  dasselbe Level, ein fehlerhafter Level-Preis oder ein Level auf der falschen
+  Seite des Entrys → Nachricht verworfen. `at` nach einem Indikator (`RSI at 28`)
+  ist kein Preis.
+- **Reports** (`Took profit on …`, `stopped out`, `target hit`, `Closed …`,
+  `Exited …`) und **Bedingungen/Absicherungen** (`wait`, `if`, `once`, `when`,
+  `watch for`, `looking for`, `potential`, `before you buy` …) werden verworfen
+  und geloggt.
+- **Exit/Close** (`Exit long AAPL @ 100`, `Closing long AAPL at $100`,
+  `Close short TSLA @ 50`) wird ein Exit-only-Signal
+  (`metadata.signal_intent = "exit"`, `exit_fraction`, optional
+  `exit_position_side`). Die Close-Seite kommt aus der Position, nie aus der
+  Nachricht; ein Exit trägt kein SL/TP und läuft nicht durch den
+  Entry-Signal-Processor. Ein Exit braucht genau einen Ticker und einen Preis.
+  Ohne Preis (`Trim half AAPL`) wird er verworfen und auf `WARNING` geloggt
+  (`exit without a price`), weil ein Signal einen positiven Preis braucht.
+- **Exit ohne eindeutigen Ticker:** Ein Exit-Befehl, der eine Seite nennt
+  (`Exit long …`, `Close the short …`) oder dessen Objekt wie ein Ticker
+  geschrieben ist (Großbuchstaben, `$`, `**`), aus dem sich aber kein Exit
+  parsen lässt, wird verworfen (`WARNING`) und erreicht nie den Entry-Parser.
+  Ein nacktes `ON`, `IT`, `A`, `SO` ist ein englisches Wort, kein Ticker:
+  `Exit long ON @ 50` wird verworfen (früher BUY ON), `Exit long $ON @ 50` ist
+  ein Exit auf ON. Kleingeschriebene Prosa (`exit on close below 95`) in einem
+  Entry bleibt erlaubt.
+- **Teil-Exits** (`Trim half`, `Took partials 1/3`, `Sell 25%`, `Scale out 50%`)
+  schließen genau diesen Anteil. Ohne quantifizierbaren Anteil (`Took partials`,
+  `Trim AAPL`), mit zwei verschiedenen Anteilen oder einem Anteil außerhalb
+  (0, 1] → verworfen, nie geraten. Ein Voll-Exit mit Größenangabe ist mehrdeutig
+  und wird verworfen.
+- **Sizing im Daemon** (`live_runner/exit_signals.py`): geschlossen wird nur die
+  *eigene* Menge des Deployments, d. h. die Netto-Fills seiner Signale für das
+  Symbol (Ledger), gedeckelt auf die Broker-Position, mal Anteil; ganzzahlige
+  Positionen werden abgerundet, ein Teil-Exit, der auf 0 fällt, wird abgelehnt.
+  Keine Position → ignoriert, `INFO`; keine eigene Menge, aber eine
+  Broker-Position (gehört jemand anderem oder das Ledger hat einen Fill
+  verpasst) → ignoriert, `WARNING` mit `broker_qty` (`Exit signal ignored`).
+  Eigene Seite ≠ Broker-Seite oder ≠ in der Nachricht genannte Seite →
+  abgelehnt.
+- **Exit-Mengen werden nie aufgerundet:** Jeder Exit (Teil- und Voll-Exit) wird
+  auf den Mengenschritt des Instruments **ab**gerundet (`exit_qty_step` des
+  Adapters: cTrader `stepVolume` aus den Symbol-Properties, unbekannt → eine
+  Broker-Volumeneinheit; Alpaca 1e-9), im Daemon vor dem Persistieren und im
+  Adapter noch einmal (cTrader-Volumen per Floor statt `round()`). Ein Exit
+  schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
+  er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
+  und `qty_step`. Entries werden ebenfalls nie aufgerundet: der cTrader-Adapter
+  rundet das Entry-Volumen per Floor auf den Broker-`stepVolume` ab
+  (`_floor_to_volume_step`); liegt das Ergebnis unter `minVolume`, wird die
+  Order wie bisher abgelehnt, nie auf das Minimum hochgesetzt.
+- **Ledger-Überhang: Deckelung am Broker + Alert (#121, Entscheidung 2):** Ein
+  Exit schließt nur die eigene Ledger-Menge des Deployments, höchstens aber die
+  Broker-Position: `Menge = min(eigene Ledger-Menge, Broker-Menge)`, dann der
+  Anteil (Teil-Exit) und das Abrunden auf den Mengenschritt. Weichen die Ledger
+  aller Deployments auf demselben Account und Symbol (jeder Status,
+  `get_account_net_filled_qty_by_deployment`) vorzeichenrichtig summiert von der
+  Broker-Position ab (Toleranz: `position_qty_tolerance` des Adapters, cTrader
+  eine halbe Broker-Volumeneinheit, Alpaca 0,5e-9; unbekannt oder größer als
+  eine ganze Einheit → strikt 1e-9 + `WARNING`),
+  oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
+  **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
+  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
+  Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`), `broker_qty`
+  und `own_ledger_qty`. Grund der Abweichung sind meist Broker-seitige
+  Schließungen (SL/TP-Legs, cTrader-SL/TP, Flatten, manuelles Schließen), die
+  nicht im Ledger landen. **Restrisiko:** Auf einem genetteten Account senkt eine
+  Broker-seitige Schließung für ein anderes Deployment die Broker-Position; die
+  Deckelung schließt dann einen Teil von dessen Anteil mit. Der Alert nennt das,
+  das Ledger muss danach abgeglichen werden. Fills von Bracket-Legs gegen das
+  Parent-Signal zu buchen ist die eigentliche Lösung und ein eigenes Issue.
+  Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
+  → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
+  abgerundet → ignoriert + `WARNING`.
+- **Bekannte Einschränkung: Exits auf `PAUSED`-Deployments (#126).** Ein Exit
+  wird wie jede Order nur für `ACTIVE`-Deployments zugestellt (Fan-out und
+  Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
+  verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
+  unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
+- **Ein Exit nach dem anderen (pro Account und Symbol):** Ein früherer Exit
+  **desselben Deployments** für dasselbe Symbol, der beim Broker noch arbeitet
+  (nicht voll gefüllt und in den offenen Orders des Brokers, per Broker- oder
+  Client-Order-ID), blockiert einen neuen Exit: abgelehnt, `ERROR`, nicht
+  gequeued (sonst würde gegen ein Ledger ohne dessen Fills gesized). Ein noch
+  arbeitender Exit **eines anderen Deployments** desselben Accounts lehnt
+  dagegen **nicht** ab (eine Nachricht geht an alle Deployments; bei
+  geschlossenem Markt arbeitet der erste Exit immer noch, wenn der zweite dran
+  ist): seine noch ungefüllte Menge (`requested_qty − filled_qty`, gleiche
+  Schließ-Seite) wird reserviert, der Exit wird gegen
+  `|Broker-Position| − Σ Reserviert` (mindestens 0) gedeckelt, also
+  `min(eigene Menge, Broker − reserviert)`. Liegt die Obergrenze unter der
+  eigenen Menge, geht der gedeckelte Exit raus und der Ledger-Alert (`ERROR`)
+  feuert. Bleibt nichts übrig, wird nichts gesendet und mit `ERROR` geloggt
+  (die Position bleibt offen), mit den blockierenden Orders im Log. Jede
+  Ablehnung eines Exits, der eine Position offen lässt, loggt auf `ERROR`.
+  Innerhalb des Prozesses laufen Exits derselben Account/Symbol-Kombination
+  zudem strikt nacheinander (Lock von der Größenbestimmung bis zur
+  gespeicherten Order); die Broker-Position wird erst danach gelesen. Kann der
+  Adapter seine offenen Orders nicht auflisten, gilt das als „nicht bewiesen
+  beendet“ → ebenfalls abgelehnt (`ERROR`). Alpaca liest die offenen Orders mit
+  `nested=True` und `limit=500`; eine volle Seite gilt als unvollständig und
+  schlägt fehl.
+- **Jeder Exit schließt nur die eigene Menge:** Ein einfaches `SELL …` oder ein
+  Momentum-Reversal (RocketFuel long-only) auf einem Deployment ohne Shorts ist
+  ein Voll-Exit und wird nach derselben Regel gesized (Anteil 1, Seite aus der
+  eigenen Position, ein eigener Short wird zurückgekauft). Der Anteil eines
+  anderen Deployments an derselben genetteten Broker-Position bleibt offen; ohne
+  eigene Menge → ignoriert und geloggt. Auf einem Long+Short-Deployment bleibt
+  ein einfaches `SELL` ein Short-Entry.
+- **Abgelehnte Exits loggen auf `ERROR`:** Ein Exit, der vor dem Senden
+  abgelehnt wird (z. B. eigene Seite ≠ Broker-Seite), vom Adapter vor dem
+  Broker-Request abgelehnt wird (z. B. Mindestvolumen) oder dessen Broker-Antwort
+  ein Fehler ist, lässt die Position offen und wird auf `ERROR` geloggt
+  (`Exit signal refused …` bzw. `… unknown outcome`, mit `"exit": true`). Ein
+  abgelehnter Entry bleibt `WARNING`; „nichts zu schließen“ ist `INFO` bzw.
+  `WARNING` (siehe oben), ein noch laufender früherer Exit desselben Deployments (oder nichts übrig
+  neben anderen laufenden Exits) `ERROR`; ein als veraltet verworfener Exit `WARNING`.
 - Fallback-Ticker-Extraktion (erstes GROSSBUCHSTABEN-Wort) ist entfernt; ein Signal
   ohne strukturiertes Tickersymbol (`**$TICKER**`, `Ticker:`, `buy signal AAPL`,
   `$TICKER`, `TICKER $price`) wird verworfen.
 - Nachraten über `POLL_LIMIT` (20) hinaus werden nicht mehr still verworfen: der
-  Seen-Set ist kumulativ, Lücken werden als Warnung mit Kanal und den Grenz-IDs
-  (`last_seen_message_id`, `oldest_fetched_message_id`) geloggt. Snowflake-IDs
+  Poll paginiert **vorwärts** ab dem Cursor (`after=<letzte ID>`), jede Seite wird
+  nach Snowflake-ID chronologisch emittiert, und der Cursor rückt nur bis zur
+  neuesten tatsächlich emittierten Nachricht vor. Pro Poll werden höchstens
+  `MAX_BACKFILL_PAGES` (5) Seiten geholt; eine größere Lücke wird in den nächsten
+  Poll übernommen (im laufenden Betrieb geht dadurch nichts verloren) und als Warnung mit Kanal und den
+  Grenz-IDs (`last_seen_message_id`, `newest_fetched_message_id`, `pages_fetched`)
+  geloggt. IDs unterhalb des Cursors werden nie erneut emittiert; ein nicht
+  numerischer Cursor wird verworfen und neu aufgesetzt (Warnung). Eine Seite ganz ohne
+  numerische ID kann keinen Folge-Request verankern: der Poll stoppt mit Warnung,
+  der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
+  bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+  Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
+  die N Nachrichten direkt nach der ID, im Array neueste zuerst
+  ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
+  "Returns an array of message objects from newest to oldest"). Dass es die
+  ältesten N nach der ID sind, steht dort nicht wörtlich; discord.py verlässt sich
+  aber genauso darauf: in der gepinnten Version `discord-py==2.7.1`
+  (`discord/abc.py`, `Messageable.history`, `_after_strategy`) setzt die
+  Vorwärts-Paginierung `after` auf `data[0]` (die neueste Nachricht der Seite) und
+  dreht die Seite für die chronologische Ausgabe um; das funktioniert nur, wenn
+  `after` die direkt folgenden Nachrichten liefert.
+  Der Cursor liegt nur im Speicher: beim Start (`_prime_cursors`) wird er auf die
+  neueste Seite gesetzt, ohne sie zu emittieren. Nachrichten aus einer Downtime,
+  die älter als diese Seite sind, werden daher nicht nachgeholt und erreichen auch
+  die Altersprüfung (`max_signal_age_seconds`) nie. Bei langen Timeframes
+  (z. B. `1d`, Budget 2 Tage) kann so ein während eines Neustarts geposteter Exit
+  verloren gehen; ein persistierter Cursor ist als Follow-up offen.
 - Ein Discord-Signal wird auf jedes passende Deployment verteilt (Fan-out), nicht
   nur auf das erste.
 - Transiente Reconnect-Fehler schreiben einen Bot-Service nicht dauerhaft auf
