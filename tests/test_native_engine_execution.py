@@ -1,3 +1,4 @@
+import logging
 import math
 
 import pandas as pd
@@ -218,6 +219,145 @@ def test_fixed_risk_cap_below_min_lot_creates_no_order():  # Issue #151
     result = engine.run(frame, strategy)
 
     assert result.trades == []
+
+
+def test_fixed_risk_cap_binding_exactly_on_grid_keeps_full_size():  # Issue #151
+    # The leverage cap is exactly 0.5 units, which is on the 0.1 grid. The
+    # post-cap floor must keep it at 0.5; a float-safety epsilon with the
+    # wrong sign would floor the exact quotient 0.5 / 0.1 = 5.0 to 4 steps.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.1,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.0005,  # cap = 100_000 * 0.0005 / 100 = 0.5 units
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(0.5)
+
+
+def test_fixed_risk_max_lot_off_grid_is_floored_to_lot_step():  # Issue #151
+    # Raw size 500 units is capped by max_lot 99.95, which is off the 0.1
+    # grid. The broker never accepts an off-grid size, so the cap resolves
+    # to the largest grid value at or below it: 99.9. The leverage cap does
+    # not bind here, so this is the max_lot leg alone.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 50_000.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.1,
+            "max_lot": 99.95,
+        },
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=99.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(99.9)
+    assert quantity % 0.1 == pytest.approx(0.0, abs=1e-9)
+
+
+def test_fixed_risk_max_lot_on_grid_is_not_floored_below_itself():  # Issue #151
+    # max_lot = k * lot_step is on the grid, but `max_lot / lot_step` lands an
+    # ulp below k, so a plain floor would drop a whole step from a limit the
+    # broker does allow. The configured max_lot must be kept exactly.
+    lot_step = _NON_IDEMPOTENT_LOT_STEP
+    k = _NON_IDEMPOTENT_STEPS
+    engine = _engine(
+        {
+            "fixed_risk_amount": 1_000_000.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": lot_step,
+            "min_lot": lot_step,
+            "max_lot": k * lot_step,
+        },
+        initial_capital=1_000_000_000.0,
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=99.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(k * lot_step)
+
+
+def test_fixed_risk_max_lot_below_min_lot_skips_trade(caplog):  # Issue #151
+    # Misconfigured limits: max_lot 0.3 is below min_lot 0.5, so no size can
+    # satisfy both. Fail closed: size 0 with a warning, never max_lot.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 50_000.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.5,
+            "max_lot": 0.3,
+        },
+        max_leverage=10.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="runner.engine_pkg.trading_engine"):
+        quantity = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+    assert quantity == 0.0
+    assert any("below min_lot" in r.getMessage() for r in caplog.records)
+
+
+def test_fixed_risk_cap_below_min_lot_logs_skip(caplog):  # Issue #151
+    # A skipped trade must say so: the same cap-below-min_lot case as above,
+    # but the skip is logged at WARNING, not silent.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.5,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.00025,  # cap = 0.25 units, below min_lot after flooring
+    )
+
+    with caplog.at_level(logging.WARNING, logger="runner.engine_pkg.trading_engine"):
+        quantity = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+    assert quantity == 0.0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "below min_lot" in warnings[0].getMessage()
 
 
 def test_fixed_risk_prefers_explicit_stop_distance():
