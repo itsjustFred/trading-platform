@@ -332,7 +332,9 @@ class TradeEngine:
                     # Issue #151: max_lot is a broker limit too. Floor it once
                     # to the grid so the cap is a grid value and needs no
                     # re-normalisation of its own.
-                    max_lot_grid = _floor_to_lot_grid(max_lot, lot_step) if lot_step > 0 else max_lot
+                    max_lot_grid = (
+                        _floor_to_lot_grid(max_lot, lot_step) if lot_step > 0 else max_lot
+                    )
                     shares = min(shares, max_lot_grid)
                 uncapped_shares = shares
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
