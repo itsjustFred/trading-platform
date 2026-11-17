@@ -247,6 +247,32 @@ def test_fixed_risk_cap_binding_exactly_on_grid_keeps_full_size():  # Issue #151
     assert quantity == pytest.approx(0.5)
 
 
+def test_fixed_risk_uncapped_size_raised_to_min_lot_is_not_regridded():  # Issue #151
+    # Risk-derived size 0.01 is raised to min_lot 0.15 (off the 0.1 grid). No
+    # cap binds, so the size must stay 0.15: re-flooring it would give 0.1,
+    # below min_lot, and skip a trade the uncapped path always took.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 1.0,
+            "tick_size": 0.01,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.15,
+            "max_lot": 100.0,
+        },
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=99.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(0.15)
+
+
 def test_fixed_risk_max_lot_off_grid_is_floored_to_lot_step():  # Issue #151
     # Raw size 500 units is capped by max_lot 99.95, which is off the 0.1
     # grid. The broker never accepts an off-grid size, so the cap resolves

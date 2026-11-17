@@ -49,6 +49,22 @@ logger = logging.getLogger(__name__)
 TRADE_ENGINE_MAX_POSITIONS = 5
 
 
+def _floor_to_lot_grid(size: float, lot_step: float) -> float:
+    """Largest multiple of ``lot_step`` at or below ``size`` (#151).
+
+    A quotient within a relative 1e-9 of an integer counts as that integer, so
+    float noise (``k * lot_step / lot_step`` can land an ulp below ``k``) never
+    drops a whole step. Unlike a fixed absolute epsilon, the tolerance scales
+    with the quotient, so large step counts are handled too. Idempotent on
+    grid values.
+    """
+    quotient = size / lot_step
+    nearest = round(quotient)
+    if abs(quotient - nearest) <= 1e-9 * max(1.0, abs(quotient)):
+        return nearest * lot_step
+    return math.floor(quotient) * lot_step
+
+
 def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
     name = item[0]
@@ -309,11 +325,15 @@ class TradeEngine:
                 max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
                 if lot_step > 0:
-                    shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+                    shares = _floor_to_lot_grid(shares, lot_step)
                 if min_lot > 0:
                     shares = max(shares, min_lot)
                 if max_lot > 0:
-                    shares = min(shares, max_lot)
+                    # Issue #151: max_lot is a broker limit too. Floor it once
+                    # to the grid so the cap is a grid value and needs no
+                    # re-normalisation of its own.
+                    max_lot_grid = _floor_to_lot_grid(max_lot, lot_step) if lot_step > 0 else max_lot
+                    shares = min(shares, max_lot_grid)
                 uncapped_shares = shares
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
                     max_value = self.equity * position_notional_limit
@@ -322,21 +342,26 @@ class TradeEngine:
                     max_value = self.equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
                 # Issue #151: the leverage/exposure cap is a raw
-                # equity/price ratio, so it can leave a size that is below
-                # `min_lot` or off the `lot_step` grid -- a size the broker
-                # would reject. Re-normalise after the cap with the same
-                # float-safe floor as above. A floored size below `min_lot`
-                # is SKIPPED (size 0), not raised back up: the cap is
-                # binding, so the trade is not affordable at the minimum.
-                # Only a size the cap actually reduced is re-normalised:
-                # flooring `k * lot_step` a second time is not idempotent in
-                # floating point (the quotient can land an ulp below `k` and
-                # lose a whole step), so an uncapped size must stay untouched.
-                if shares < uncapped_shares:
-                    if lot_step > 0:
-                        shares = math.floor((shares / lot_step) + 1e-12) * lot_step
-                    if min_lot > 0 and shares < min_lot:
-                        return 0.0
+                # equity/price ratio, so it can leave a size off the
+                # `lot_step` grid -- a size the broker would reject. Only a
+                # size the cap actually reduced is re-floored: an uncapped
+                # size may legitimately sit off-grid (e.g. raised to an
+                # off-grid `min_lot`) and must stay untouched.
+                if shares < uncapped_shares and lot_step > 0:
+                    shares = _floor_to_lot_grid(shares, lot_step)
+                # A size below `min_lot` after the caps is SKIPPED (size 0),
+                # never raised back up: the caps make it unaffordable at the
+                # minimum, and a max_lot below min_lot admits no valid size.
+                if min_lot > 0 and shares < min_lot:
+                    logger.warning(
+                        "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
+                        "(size before leverage/exposure cap %.6g, max_lot %.6g)",
+                        shares,
+                        min_lot,
+                        uncapped_shares,
+                        max_lot,
+                    )
+                    return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(
